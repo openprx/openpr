@@ -1,0 +1,5 @@
+[alias]
+lint = "clippy -- -D warnings"
+fmtc = "fmt -- --check"
+check-all = "check --workspace --all-targets"
+test-all = "test --workspace"

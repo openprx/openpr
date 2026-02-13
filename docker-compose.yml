@@ -1,0 +1,70 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: openpr-postgres
+    environment:
+      POSTGRES_DB: openpr
+      POSTGRES_USER: openpr
+      POSTGRES_PASSWORD: openpr
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openpr -d openpr"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_BIN: api
+    environment:
+      APP_NAME: api
+      BIND_ADDR: 0.0.0.0:8080
+      DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_BIN: worker
+    environment:
+      APP_NAME: worker
+      DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_BIN: mcp-server
+    environment:
+      APP_NAME: mcp-server
+      RUST_LOG: info
+    command: ["/app/mcp-server", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
