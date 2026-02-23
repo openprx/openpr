@@ -18,53 +18,136 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+      start_period: 10s
+    networks:
+      - openpr-network
 
   api:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.prebuilt
       args:
         APP_BIN: api
+    container_name: openpr-api
+    command: ["/app/api"]
     environment:
       APP_NAME: api
       BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
-      RUST_LOG: info
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+      RUST_LOG: ${RUST_LOG:-info}
+      UPLOAD_DIR: /app/uploads
     ports:
-      - "8080:8080"
+      - "8081:8080"
+    volumes:
+      - ./uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - openpr-network
 
   worker:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.prebuilt
       args:
         APP_BIN: worker
+    container_name: openpr-worker
+    command: ["/app/worker"]
     environment:
       APP_NAME: worker
       DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
-      RUST_LOG: info
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+      RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres:
         condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - openpr-network
 
   mcp-server:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.prebuilt
       args:
         APP_BIN: mcp-server
+    container_name: openpr-mcp-server
     environment:
       APP_NAME: mcp-server
-      RUST_LOG: info
+      DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+      RUST_LOG: ${RUST_LOG:-info}
+      DEFAULT_AUTHOR_ID: ${DEFAULT_AUTHOR_ID:-9a74e332-11e5-4d30-b652-134afe808a79}
     command: ["/app/mcp-server", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
     ports:
       - "8090:8090"
     depends_on:
       postgres:
         condition: service_healthy
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - openpr-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: openpr-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - openpr-network
+
+  webhook:
+    container_name: openpr-webhook
+    image: debian:trixie-slim
+    volumes:
+      - /opt/working/code/openpr-webhook/target/release/openpr-webhook:/app/openpr-webhook:ro
+      - /opt/working/code/openpr-webhook/config.toml:/etc/openpr-webhook/config.toml:ro
+    command: /app/openpr-webhook /etc/openpr-webhook/config.toml
+    ports:
+      - "9090:9090"
+    networks:
+      - openpr-network
+    restart: unless-stopped
 
 volumes:
   pgdata:
+    driver: local
+
+networks:
+  openpr-network:
+    driver: bridge

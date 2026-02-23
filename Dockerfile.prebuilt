@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# Prebuilt binary Dockerfile - uses locally compiled binaries
+FROM debian:bookworm-slim
+ARG APP_BIN
+WORKDIR /app
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy prebuilt binary from local target directory
+COPY target/release/${APP_BIN} /app/${APP_BIN}
+
+# Create non-root user
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app/uploads && \
+    chown -R appuser:appuser /app && \
+    chmod +x /app/${APP_BIN}
+
+USER appuser
+
+EXPOSE 8080
+
+# Note: APP_BIN is only available at build time, not runtime
+# The actual binary path must be specified in docker-compose command

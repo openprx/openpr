@@ -28,3 +28,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.4", features = ["v4", "serde"] }
 rust-embed = { version = "8.7.2", features = ["interpolate-folder-path"] }
+jsonwebtoken = "9"
+bcrypt = "0.16"

@@ -6,7 +6,12 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 platform = { path = "../../crates/platform" }
+reqwest = { version = "0.12", features = ["json"] }
+sea-orm.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true

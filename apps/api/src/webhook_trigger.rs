@@ -42,6 +42,8 @@ pub enum WebhookEvent {
     EscalationStarted,
     AppealCreated,
     GovernanceConfigUpdated,
+    AiTaskCompleted,
+    AiTaskFailed,
 }
 
 impl WebhookEvent {
@@ -76,6 +78,8 @@ impl WebhookEvent {
             Self::EscalationStarted => "escalation.started",
             Self::AppealCreated => "appeal.created",
             Self::GovernanceConfigUpdated => "governance_config.updated",
+            Self::AiTaskCompleted => "ai.task_completed",
+            Self::AiTaskFailed => "ai.task_failed",
         }
     }
 }
@@ -558,7 +562,9 @@ async fn build_event_data(
         | WebhookEvent::VetoWithdrawn
         | WebhookEvent::EscalationStarted
         | WebhookEvent::AppealCreated
-        | WebhookEvent::GovernanceConfigUpdated => Ok(BuiltEventData {
+        | WebhookEvent::GovernanceConfigUpdated
+        | WebhookEvent::AiTaskCompleted
+        | WebhookEvent::AiTaskFailed => Ok(BuiltEventData {
             data: ctx.extra_data.clone().unwrap_or_else(|| json!({})),
             assignee_ids: Vec::new(),
         }),
@@ -1025,6 +1031,8 @@ fn default_trigger_reason(event: WebhookEvent) -> &'static str {
         WebhookEvent::IssueAssigned | WebhookEvent::IssueUpdated => "assigned",
         WebhookEvent::IssueStateChanged => "status_changed",
         WebhookEvent::CommentCreated => "mentioned",
+        WebhookEvent::AiTaskCompleted => "completed",
+        WebhookEvent::AiTaskFailed => "failed",
         _ => "assigned",
     }
 }

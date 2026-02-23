@@ -15,6 +15,7 @@ use crate::{
     entities::trust_score::ParticipantType,
     error::ApiError,
     response::{ApiResponse, PaginatedData},
+    services::ai_task_service::queue_vote_requested_tasks_for_project,
     services::governance_audit_service::{GovernanceAuditLogInput, write_governance_audit_log},
     services::impact_review_service::ImpactReviewService,
     services::permission_service::PermissionService,
@@ -584,8 +585,9 @@ async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(),
 }
 
 #[derive(Debug, FromQueryResult)]
-struct IdOnlyRow {
+struct VotingTransitionRow {
     id: String,
+    author_id: String,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -610,7 +612,7 @@ pub fn start_governance_watcher(state: AppState) {
 async fn governance_watcher_tick(state: &AppState) -> Result<(), ApiError> {
     let now = Utc::now();
 
-    let open_to_voting = IdOnlyRow::find_by_statement(Statement::from_sql_and_values(
+    let open_to_voting = VotingTransitionRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
             UPDATE proposals
@@ -627,7 +629,7 @@ async fn governance_watcher_tick(state: &AppState) -> Result<(), ApiError> {
                         ELSE submitted_at + INTERVAL '1 hours'
                     END
                   ) <= $1
-            RETURNING id
+            RETURNING id, author_id
         "#,
         vec![now.into()],
     ))
@@ -636,6 +638,23 @@ async fn governance_watcher_tick(state: &AppState) -> Result<(), ApiError> {
 
     if !open_to_voting.is_empty() {
         tracing::info!(count = open_to_voting.len(), "governance watcher moved proposals to voting");
+        for moved in &open_to_voting {
+            if let Some(project_id) =
+                resolve_project_id_for_proposal(state, &moved.id, &moved.author_id).await?
+            {
+                let _ = queue_vote_requested_tasks_for_project(
+                    &state.db,
+                    project_id,
+                    &moved.id,
+                    json!({
+                        "proposal_id": moved.id,
+                        "project_id": project_id.to_string(),
+                        "trigger": "proposal.auto_voting_transition",
+                    }),
+                )
+                .await?;
+            }
+        }
     }
 
     let expired_voting = ProposalRow::find_by_statement(Statement::from_sql_and_values(
@@ -1768,32 +1787,44 @@ pub async fn start_voting(
     )
     .await?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
-        && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
-    {
-        trigger_webhooks(
-            state.clone(),
-            TriggerContext {
-                event: WebhookEvent::ProposalVotingStarted,
-                workspace_id,
-                project_id,
-                actor_id: actor.user_id,
-                issue_id: None,
-                comment_id: None,
-                label_id: None,
-                sprint_id: None,
-                changes: None,
-                mentions: Vec::new(),
-                extra_data: Some(json!({
-                    "proposal": {
-                        "id": proposal.id,
-                        "status": "voting",
-                        "voting_started_at": now.to_rfc3339(),
-                        "voting_ends_at": voting_ends_at.to_rfc3339(),
-                    }
-                })),
-            },
-        );
+    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await? {
+        let _ = queue_vote_requested_tasks_for_project(
+            &state.db,
+            project_id,
+            &proposal.id,
+            json!({
+                "proposal_id": proposal.id,
+                "project_id": project_id.to_string(),
+                "trigger": "proposal.start_voting",
+            }),
+        )
+        .await?;
+
+        if let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await? {
+            trigger_webhooks(
+                state.clone(),
+                TriggerContext {
+                    event: WebhookEvent::ProposalVotingStarted,
+                    workspace_id,
+                    project_id,
+                    actor_id: actor.user_id,
+                    issue_id: None,
+                    comment_id: None,
+                    label_id: None,
+                    sprint_id: None,
+                    changes: None,
+                    mentions: Vec::new(),
+                    extra_data: Some(json!({
+                        "proposal": {
+                            "id": proposal.id,
+                            "status": "voting",
+                            "voting_started_at": now.to_rfc3339(),
+                            "voting_ends_at": voting_ends_at.to_rfc3339(),
+                        }
+                    })),
+                },
+            );
+        }
     }
 
     Ok(ApiResponse::success(json!({

@@ -7,9 +7,20 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+bcrypt.workspace = true
+chrono.workspace = true
+hmac = "0.12"
+hex = "0.4"
+jsonwebtoken.workspace = true
 platform = { path = "../../crates/platform" }
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+sea-orm.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+uuid.workspace = true
