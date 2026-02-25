@@ -9,6 +9,7 @@ use axum::{
 use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -106,15 +107,17 @@ async fn create_mention_notifications<C: ConnectionTrait>(
             DbBackend::Postgres,
             r#"
                 INSERT INTO notifications (
-                    id, user_id, workspace_id, type, title, content, link, related_issue_id, related_comment_id, is_read, created_at
+                    id, user_id, workspace_id, type, kind, payload, title, content, link, related_issue_id, related_comment_id, is_read, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, false, $9)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, NULL, false, $11)
             "#,
             vec![
                 Uuid::new_v4().into(),
                 (*mention_user_id).into(),
                 workspace_id.into(),
                 "mentioned".into(),
+                "mentioned".into(),
+                json!({}).into(),
                 "notification.mentionedTitle".into(),
                 format!("mentioned_by:{}", actor_name).into(),
                 link.clone().into(),

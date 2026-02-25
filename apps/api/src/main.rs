@@ -8,7 +8,7 @@ mod webhook_trigger;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     middleware as axum_middleware,
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
@@ -949,6 +949,7 @@ async fn main() -> anyhow::Result<()> {
                 middleware::auth::auth_middleware,
             )),
         )
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .layer(CompressionLayer::new())
@@ -1059,6 +1060,10 @@ async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
         (
             "0020_ai_tasks.sql",
             include_str!("../../../migrations/0020_ai_tasks.sql"),
+        ),
+        (
+            "0021_fix_cascade.sql",
+            include_str!("../../../migrations/0021_fix_cascade.sql"),
         ),
     ];
 

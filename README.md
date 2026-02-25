@@ -1,181 +1,200 @@
-# OpenPR - Open Source Project Management
+# OpenPR
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)](https://www.docker.com/)
+Open-source project management platform with built-in governance, AI agent integration, and MCP support.
 
-OpenPR is a modern, open-source project management platform built with Rust, PostgreSQL, and SvelteKit. It provides issue tracking, project management, and MCP (Model Context Protocol) integration for AI-powered workflows.
+Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL**.
 
-## ✨ Features
+## Features
 
-- 🔐 **JWT-based Authentication** - Secure user registration and login
-- 📊 **Project Management** - Workspaces, projects, and issue tracking
-- 🏷️ **Labels & Sprints** - Organize issues with labels and sprint planning
-- 🔔 **Notifications** - Real-time updates on project activities
-- 🪝 **Webhooks** - Integrate with external services
-- 🔍 **Full-text Search** - Fast search across issues and comments
-- 🤖 **MCP Server** - AI integration via Model Context Protocol
-- 🐳 **Docker Ready** - One-command deployment
+### Project Management
+- **Workspaces & Projects** — Multi-tenant workspace isolation with role-based access
+- **Issues & Board** — Kanban board with drag-and-drop, priority, assignees, labels
+- **Sprints & Cycles** — Sprint planning with cycle tracking
+- **Full-text Search** — PostgreSQL FTS5 across issues, comments, and proposals
+- **File Uploads** — Image and document attachments on issues and proposals
+- **Activity Feed** — Chronological activity stream per issue
+- **Notifications & Inbox** — In-app notification center with read/unread state
+- **Import / Export** — Bulk data import and export
 
-## 🚀 Quick Start
+### Governance Center
+- **Proposals** — Create, review, and vote on proposals with configurable approval thresholds
+- **Voting System** — Weighted voting with quorum requirements
+- **Decision Records** — Immutable decision log with full audit trail
+- **Veto & Escalation** — Veto power with escalation voting mechanism
+- **Trust Scores** — Per-user trust scoring across decision domains, with history and appeals
+- **Proposal Templates** — Reusable templates for rapid proposal creation
+- **Proposal Chains** — Link related proposals into decision chains
+- **Impact Reviews** — Post-decision impact assessment
+- **Audit Logs** — Complete governance action audit trail
+- **Analytics** — Decision analytics dashboard
+
+### AI Integration
+- **AI Agents** — Register AI participants in projects with configurable roles and permissions
+- **AI Tasks** — Create and assign tasks to AI agents with progress tracking and callbacks
+- **AI Review** — AI-generated review feedback on proposals with learning/alignment stats
+- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io) server for AI tool integration (HTTP + stdio transport)
+- **AI Callback API** — Webhook-style callbacks for task completion, failure, and progress reporting
+
+### MCP Server
+
+The built-in MCP server exposes OpenPR as a tool provider for AI assistants:
+
+| Tool | Description |
+|------|-------------|
+| `projects.list` / `projects.get` / `projects.create` | Project CRUD |
+| `work_items.list` / `work_items.get` / `work_items.create` | Issue management |
+| `comments.list` / `comments.create` | Comment on issues |
+| `proposals.list` / `proposals.get` / `proposals.create` | Governance proposals |
+| `sprints.list` | Sprint tracking |
+| `labels.list` | Label management |
+| `members.list` | Team members |
+| `search` | Full-text search |
+
+Supports **HTTP** (POST `/mcp`) and **stdio** transports. Compatible with Claude, OpenClaw, OpenPRX, and other MCP-capable agents.
+
+### Webhooks
+
+- **Outbound Webhooks** — HTTP POST notifications on issue/proposal/comment events
+- **Delivery Tracking** — Per-webhook delivery history with retry status
+- **[openpr-webhook](https://github.com/openprx/openpr-webhook)** — Standalone webhook receiver for integrating OpenPR events with external systems (Slack, Discord, CI/CD, etc.)
+
+### Admin
+- **User Management** — Admin panel for user accounts, roles, bot users
+- **Workspace Settings** — Configure workspace-level preferences
+- **Governance Config** — Tune voting thresholds, quorum, veto rules per workspace
+
+## Architecture
+
+```
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  Frontend    │────▶│  API Server │────▶│ PostgreSQL  │
+│  (SvelteKit) │     │  (Axum)     │     │             │
+└─────────────┘     └──────┬──────┘     └─────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │             │
+              ┌─────▼─────┐ ┌────▼────┐
+              │ MCP Server│ │ Worker  │
+              │ (Tools)   │ │ (Async) │
+              └───────────┘ └─────────┘
+```
+
+| Component | Port | Description |
+|-----------|------|-------------|
+| **API** | 8080 | REST API (Axum + SeaORM) |
+| **Frontend** | 3000 | SvelteKit app (Nginx in production) |
+| **MCP Server** | 8090 | MCP tool provider (HTTP/stdio) |
+| **Worker** | — | Background job processor |
+| **PostgreSQL** | 5432 | Primary data store |
+
+## Quick Start
 
 ### Prerequisites
 
 - Docker & Docker Compose
 - Git
 
-### One-Command Deployment
+### Deploy
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/openpr.git
+git clone https://github.com/openprx/openpr.git
 cd openpr
-
-# Copy environment file
 cp .env.example .env
-
-# Start all services
 docker-compose up -d
-
-# Verify deployment
-curl http://localhost:8080/health  # API
-curl http://localhost:8090/health  # MCP Server
-curl http://localhost:3000         # Frontend
 ```
 
-That's it! 🎉
-
+Services:
 - **Frontend**: http://localhost:3000
 - **API**: http://localhost:8080
-- **MCP Server**: http://localhost:8090
-- **PostgreSQL**: localhost:5432
+- **MCP**: http://localhost:8090
 
-## 📚 Documentation
-
-- [Deployment Guide](./DEPLOYMENT.md) - Detailed deployment instructions
-- [API Documentation](./API_DOCUMENTATION.md) - API endpoints and examples
-- [MCP Server Guide](./apps/mcp-server/README.md) - MCP integration
-- [Frontend Guide](./frontend/README.md) - Frontend development
-
-## 🏗️ Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌──────────────┐
-│   Frontend  │────▶│     API     │────▶│  PostgreSQL  │
-│  (Svelte)   │     │   (Rust)    │     │              │
-└─────────────┘     └─────────────┘     └──────────────┘
-                           │
-                           ▼
-                    ┌─────────────┐
-                    │ MCP Server  │
-                    │   (Rust)    │
-                    └─────────────┘
-```
-
-## 🛠️ Tech Stack
-
-### Backend
-- **Language**: Rust 1.83+
-- **Framework**: Axum (async web framework)
-- **Database**: PostgreSQL 16
-- **Authentication**: JWT
-- **Serialization**: serde_json
-
-### Frontend
-- **Framework**: SvelteKit 2
-- **Language**: TypeScript
-- **Runtime**: Bun
-- **Styling**: TailwindCSS
-- **UI Components**: shadcn-svelte
-
-### Infrastructure
-- **Containerization**: Docker & Docker Compose
-- **Web Server**: Nginx (for frontend)
-
-## 📁 Project Structure
-
-```
-openpr/
-├── apps/
-│   ├── api/              # REST API server
-│   ├── mcp-server/       # MCP protocol server
-│   └── worker/           # Background job worker
-├── crates/
-│   ├── openpr-core/      # Core domain models
-│   ├── openpr-db/        # Database layer
-│   └── openpr-mcp/       # MCP protocol implementation
-├── frontend/             # SvelteKit frontend
-├── migrations/           # Database migrations
-├── scripts/              # Deployment & test scripts
-├── docker-compose.yml    # Docker orchestration
-└── Dockerfile            # Multi-stage Docker build
-```
-
-## 🧪 Testing
+### Development
 
 ```bash
-# Run integration tests
-bash scripts/test-api.sh
+# Prerequisites: Rust 1.75+, Node.js 20+, PostgreSQL 15+
 
-# Run MCP tests
-bash scripts/test-mcp.sh
+# Backend
+cp .env.example .env
+# Edit .env with your database credentials
+cargo build
+cargo run --bin api
 
-# Run full end-to-end tests
-bash scripts/e2e-test.sh
-```
-
-## 🔧 Development
-
-### Local Development (without Docker)
-
-```bash
-# 1. Start PostgreSQL
-docker run -d -p 5432:5432 \
-  -e POSTGRES_DB=openpr \
-  -e POSTGRES_USER=openpr \
-  -e POSTGRES_PASSWORD=openpr \
-  postgres:16
-
-# 2. Run migrations
-bash scripts/init-db.sh
-
-# 3. Start API server
-cargo run -p api
-
-# 4. Start MCP server
-cargo run -p mcp-server -- --transport http --bind-addr 127.0.0.1:8090
-
-# 5. Start frontend
+# Frontend
 cd frontend
-bun install
-bun run dev
+cp .env.example .env
+npm install
+npm run dev
+
+# MCP Server
+cargo run --bin mcp-server -- --transport http --port 8090
 ```
 
-## 🤝 Contributing
+## MCP Configuration
 
-Contributions are welcome! Please read our [Contributing Guidelines](./CONTRIBUTING.md) first.
+### Claude Desktop / OpenClaw
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+```json
+{
+  "mcpServers": {
+    "openpr": {
+      "command": "./target/release/mcp-server",
+      "args": ["--transport", "stdio"],
+      "env": {
+        "DATABASE_URL": "postgres://openpr:openpr@localhost:5432/openpr"
+      }
+    }
+  }
+}
+```
 
-## 📄 License
+### HTTP Mode
 
-This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.
+```bash
+# Start MCP server
+cargo run --bin mcp-server -- --transport http --port 8090
 
-## 🙏 Acknowledgments
+# Test
+curl -X POST http://localhost:8090/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
 
-- Built with [Axum](https://github.com/tokio-rs/axum)
-- Frontend powered by [SvelteKit](https://kit.svelte.dev/)
-- MCP Protocol by [Anthropic](https://modelcontextprotocol.io/)
+## API Overview
 
-## 📞 Support
+| Category | Endpoints | Description |
+|----------|-----------|-------------|
+| Auth | `/api/auth/*` | Register, login, refresh token |
+| Projects | `/api/workspaces/*/projects/*` | CRUD, members, settings |
+| Issues | `/api/projects/*/issues/*` | CRUD, assign, label, comment |
+| Board | `/api/projects/*/board` | Kanban board state |
+| Sprints | `/api/projects/*/sprints/*` | Sprint CRUD and planning |
+| Proposals | `/api/proposals/*` | Create, vote, submit, archive |
+| Governance | `/api/governance/*` | Config, audit logs |
+| Decisions | `/api/decisions/*` | Decision records |
+| Trust | `/api/trust-scores/*` | Trust scores, history, appeals |
+| Veto | `/api/veto/*` | Veto, escalation, voting |
+| AI Agents | `/api/projects/*/ai-agents/*` | Register and manage AI agents |
+| AI Tasks | `/api/projects/*/ai-tasks/*` | Task assignment and callbacks |
+| Webhooks | `/api/workspaces/*/webhooks/*` | Webhook CRUD and delivery log |
+| Search | `/api/search` | Full-text search |
+| Admin | `/api/admin/*` | User and system management |
 
-- 🐛 **Bug Reports**: [GitHub Issues](https://github.com/yourusername/openpr/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/yourusername/openpr/discussions)
-- 📧 **Email**: support@openpr.dev
+## Related Projects
 
----
+| Repository | Description |
+|------------|-------------|
+| [openpr](https://github.com/openprx/openpr) | Core platform (this repo) |
+| [openpr-webhook](https://github.com/openprx/openpr-webhook) | Webhook receiver for external integrations |
+| [openprx](https://github.com/openprx/openprx) | AI assistant framework with built-in OpenPR MCP support |
 
-Made with ❤️ by the OpenPR Team
+## Tech Stack
+
+- **Backend**: Rust, Axum, SeaORM, PostgreSQL
+- **Frontend**: SvelteKit, TailwindCSS, shadcn-svelte
+- **MCP**: JSON-RPC 2.0 (HTTP + stdio)
+- **Auth**: JWT (access + refresh tokens)
+- **Deployment**: Docker Compose, Nginx
+
+## License
+
+MIT

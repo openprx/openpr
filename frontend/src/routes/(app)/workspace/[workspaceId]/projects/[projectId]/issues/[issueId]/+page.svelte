@@ -15,6 +15,12 @@
 	import { toast } from '$lib/stores/toast';
 	import { renderMarkdown } from '$lib/utils/markdown';
 	import { requireRouteParam } from '$lib/utils/route-params';
+	import {
+		isAllowedUploadMime,
+		MAX_UPLOAD_SIZE_BYTES,
+		mediaMarkdown,
+		UPLOAD_ACCEPT_ATTR
+	} from '$lib/utils/upload';
 	import Button from '$lib/components/Button.svelte';
 	import ImageUpload from '$lib/components/ImageUpload.svelte';
 	import Input from '$lib/components/Input.svelte';
@@ -768,8 +774,8 @@
 		return member.entity_type === 'bot';
 	}
 
-	function appendIssueDescriptionImage(url: string): void {
-		const markdown = `![image](${url})`;
+	function appendIssueDescriptionImage(url: string, mimeType: string): void {
+		const markdown = mediaMarkdown(url, mimeType);
 		if (!issueDescriptionTextarea) {
 			const suffix = issueForm.description.trim().length > 0 ? '\n\n' : '';
 			issueForm = {
@@ -799,18 +805,12 @@
 		});
 	}
 
-	function isAllowedImage(type: string): boolean {
-		return ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'].includes(
-			type.toLowerCase()
-		);
-	}
-
 	async function uploadIssueDescriptionImage(file: File): Promise<void> {
-		if (!isAllowedImage(file.type)) {
+		if (!isAllowedUploadMime(file.type)) {
 			toast.error(get(t)('toast.uploadTypeFail'));
 			return;
 		}
-		if (file.size > 10 * 1024 * 1024) {
+		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
 			toast.error(get(t)('toast.uploadSizeFail'));
 			return;
 		}
@@ -835,7 +835,7 @@
 				data?: { url?: string };
 			};
 			if (result.code === 0 && result.data?.url) {
-				appendIssueDescriptionImage(result.data.url);
+				appendIssueDescriptionImage(result.data.url, file.type);
 				toast.success(get(t)('toast.uploadSuccess'));
 				return;
 			}
@@ -853,7 +853,7 @@
 		}
 
 		for (const item of items) {
-			if (!item.type.startsWith('image/')) {
+			if (!isAllowedUploadMime(item.type)) {
 				continue;
 			}
 
@@ -868,8 +868,8 @@
 		}
 	}
 
-	function appendCommentImage(url: string): void {
-		const markdown = `![image](${url})`;
+	function appendCommentImage(url: string, mimeType: string): void {
+		const markdown = mediaMarkdown(url, mimeType);
 		if (!newCommentTextarea) {
 			const suffix = newComment.trim().length > 0 ? '\n\n' : '';
 			newComment = `${newComment}${suffix}${markdown}`;
@@ -894,11 +894,11 @@
 	}
 
 	async function uploadCommentImage(file: File): Promise<void> {
-		if (!isAllowedImage(file.type)) {
+		if (!isAllowedUploadMime(file.type)) {
 			toast.error(get(t)('toast.uploadTypeFail'));
 			return;
 		}
-		if (file.size > 10 * 1024 * 1024) {
+		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
 			toast.error(get(t)('toast.uploadSizeFail'));
 			return;
 		}
@@ -924,7 +924,7 @@
 				data?: { url?: string };
 			};
 			if (result.code === 0 && result.data?.url) {
-				appendCommentImage(result.data.url);
+				appendCommentImage(result.data.url, file.type);
 				toast.success(get(t)('toast.uploadSuccess'));
 			} else {
 				toast.error(result.message || get(t)('toast.uploadFail'));
@@ -943,7 +943,7 @@
 		}
 
 		for (const item of items) {
-			if (!item.type.startsWith('image/')) {
+			if (!isAllowedUploadMime(item.type)) {
 				continue;
 			}
 
@@ -1347,7 +1347,7 @@
 							</span>
 							<input 
 								type="file" 
-								accept="image/png,image/jpeg,image/gif,image/webp" 
+								accept={UPLOAD_ACCEPT_ATTR}
 								class="hidden" 
 								onchange={handleCommentImageSelect}
 								disabled={uploadingCommentImage}

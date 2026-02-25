@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{error::ApiError, response::ApiResponse};
 
-const MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_FILE_SIZE: usize = 200 * 1024 * 1024;
 const DEFAULT_UPLOAD_DIR: &str = "./uploads";
 
 #[derive(Serialize)]
@@ -22,7 +22,7 @@ pub struct UploadResponse {
     pub filename: String,
 }
 
-/// POST /api/v1/upload - Upload image files for markdown content
+/// POST /api/v1/upload - Upload image/video files for markdown content
 pub async fn upload_file(
     State(_state): State<AppState>,
     Extension(_claims): Extension<JwtClaims>,
@@ -47,7 +47,7 @@ pub async fn upload_file(
     }
     if part.data.len() > MAX_FILE_SIZE {
         return Err(ApiError::BadRequest(
-            "file size must be less than or equal to 10MB".to_string(),
+            "file size must be less than or equal to 200MB".to_string(),
         ));
     }
 
@@ -56,9 +56,13 @@ pub async fn upload_file(
         "image/jpeg" | "image/jpg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "video/x-msvideo" => "avi",
         _ => {
             return Err(ApiError::BadRequest(
-                "only png/jpg/gif/webp are supported".to_string(),
+                "only png/jpg/gif/webp/mp4/webm/mov/avi are supported".to_string(),
             ));
         }
     };
@@ -96,6 +100,14 @@ pub async fn get_uploaded_file(
         HeaderValue::from_static("image/gif")
     } else if file_name.ends_with(".webp") {
         HeaderValue::from_static("image/webp")
+    } else if file_name.ends_with(".mp4") {
+        HeaderValue::from_static("video/mp4")
+    } else if file_name.ends_with(".webm") {
+        HeaderValue::from_static("video/webm")
+    } else if file_name.ends_with(".mov") {
+        HeaderValue::from_static("video/quicktime")
+    } else if file_name.ends_with(".avi") {
+        HeaderValue::from_static("video/x-msvideo")
     } else {
         HeaderValue::from_static("application/octet-stream")
     };

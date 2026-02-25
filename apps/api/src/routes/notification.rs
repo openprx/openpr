@@ -6,6 +6,7 @@ use axum::{
 use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -267,13 +268,15 @@ pub async fn create_notification(
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             r#"INSERT INTO notifications 
-               (id, user_id, type, title, content, link, related_issue_id, 
+               (id, user_id, type, kind, payload, title, content, link, related_issue_id, 
                 related_comment_id, related_project_id, is_read, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)"#,
+               VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, false, $12)"#,
             vec![
                 notification_id.into(),
                 user_id.into(),
                 notification_type.into(),
+                notification_type.into(),
+                json!({}).into(),
                 title.into(),
                 content.into(),
                 link.into(),

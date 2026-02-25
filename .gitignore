@@ -1,7 +1,48 @@
+# Build artifacts
 /target
+/frontend/build
+/frontend/.svelte-kit
+/frontend/node_modules
+
+# Environment & secrets
 .env
 .env.*
 !.env.example
+/frontend/.env
+!/frontend/.env.example
+
+# Logs (project-level and frontend dev logs)
 *.log
-.DS_Store
 /log/
+/frontend/log/
+
+# User uploads (runtime data)
+/uploads/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Internal dev tools & notes (not for open source)
+/.dispatch_link
+/AGENTS.md
+/PHASE4_EXECUTION_SUMMARY.txt
+/PHASE5_SUMMARY.txt
+/docs/prd/
+
+# Test scripts (internal)
+/test-mcp-server.sh
+
+# Package manager locks (users generate their own)
+/frontend/bun.lock
+
+# Database files
+*.db
+*.sqlite

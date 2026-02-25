@@ -921,15 +921,17 @@ pub async fn update_issue(
                 DbBackend::Postgres,
                 r#"
                     INSERT INTO notifications (
-                        id, user_id, workspace_id, type, title, content, link, related_issue_id, is_read, created_at
+                        id, user_id, workspace_id, type, kind, payload, title, content, link, related_issue_id, is_read, created_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, false, $11)
                 "#,
                 vec![
                     Uuid::new_v4().into(),
                     new_assignee.into(),
                     current_issue.workspace_id.into(),
                     "assignment".into(),
+                    "assignment".into(),
+                    json!({}).into(),
                     "notification.issueAssignedTitle".into(),
                     format!("issue_assigned:{}", updated.title).into(),
                     link.into(),

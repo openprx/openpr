@@ -12,6 +12,7 @@
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { toast } from '$lib/stores/toast';
 	import { renderMarkdown } from '$lib/utils/markdown';
+	import { isAllowedUploadMime, MAX_UPLOAD_SIZE_BYTES, mediaMarkdown } from '$lib/utils/upload';
 	import { t } from 'svelte-i18n';
 	import Button from './Button.svelte';
 	import ImageUpload from './ImageUpload.svelte';
@@ -127,8 +128,8 @@
 		selectedLabelIds = [...selectedLabelIds, labelId];
 	}
 
-	function appendUploadedImage(url: string): void {
-		const markdown = `\n![image](${url})\n`;
+	function appendUploadedImage(url: string, mimeType: string): void {
+		const markdown = `\n${mediaMarkdown(url, mimeType)}\n`;
 		if (!descriptionTextarea) {
 			form = {
 				...form,
@@ -157,18 +158,12 @@
 		});
 	}
 
-	function isAllowedImage(type: string): boolean {
-		return ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'].includes(
-			type.toLowerCase()
-		);
-	}
-
 	async function uploadAndInsert(file: File): Promise<void> {
-		if (!isAllowedImage(file.type)) {
+		if (!isAllowedUploadMime(file.type)) {
 			toast.error($t('toast.uploadTypeFail'));
 			return;
 		}
-		if (file.size > 10 * 1024 * 1024) {
+		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
 			toast.error($t('toast.uploadSizeFail'));
 			return;
 		}
@@ -194,7 +189,7 @@
 			};
 
 			if (result.code === 0 && result.data?.url) {
-				appendUploadedImage(result.data.url);
+				appendUploadedImage(result.data.url, file.type);
 				toast.success($t('toast.uploadSuccess'));
 				return;
 			}
@@ -212,7 +207,7 @@
 		}
 
 		for (const item of items) {
-			if (!item.type.startsWith('image/')) {
+			if (!isAllowedUploadMime(item.type)) {
 				continue;
 			}
 

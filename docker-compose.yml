@@ -35,8 +35,8 @@ services:
       BIND_ADDR: 0.0.0.0:8080
       DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
-      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
-      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-2592000}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-2592000}
       RUST_LOG: ${RUST_LOG:-info}
       UPLOAD_DIR: /app/uploads
     ports:
@@ -68,8 +68,8 @@ services:
       APP_NAME: worker
       DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
-      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
-      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-2592000}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-2592000}
       RUST_LOG: ${RUST_LOG:-info}
     depends_on:
       postgres:
@@ -89,8 +89,8 @@ services:
       APP_NAME: mcp-server
       DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
-      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-900}
-      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-604800}
+      JWT_ACCESS_TTL_SECONDS: ${JWT_ACCESS_TTL_SECONDS:-2592000}
+      JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-2592000}
       RUST_LOG: ${RUST_LOG:-info}
       DEFAULT_AUTHOR_ID: ${DEFAULT_AUTHOR_ID:-9a74e332-11e5-4d30-b652-134afe808a79}
     command: ["/app/mcp-server", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]

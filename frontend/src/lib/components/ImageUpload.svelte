@@ -2,9 +2,15 @@
 	import { apiClient } from '$lib/api/client';
 	import { toast } from '$lib/stores/toast';
 	import { t } from 'svelte-i18n';
+	import {
+		isAllowedUploadMime,
+		isImageUploadMime,
+		MAX_UPLOAD_SIZE_BYTES,
+		UPLOAD_ACCEPT_ATTR
+	} from '$lib/utils/upload';
 
 	interface Props {
-		onUploaded: (url: string) => void;
+		onUploaded: (url: string, mimeType: string) => void;
 	}
 
 	let { onUploaded }: Props = $props();
@@ -12,17 +18,13 @@
 	let uploading = $state(false);
 	let progress = $state(0);
 	let previewUrl = $state('');
-
-	function isAllowedImage(type: string): boolean {
-		return ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'].includes(
-			type.toLowerCase()
-		);
-	}
+	let previewMimeType = $state('');
 
 	async function uploadFile(file: File): Promise<void> {
 		uploading = true;
 		progress = 0;
 		previewUrl = URL.createObjectURL(file);
+		previewMimeType = file.type;
 
 		const formData = new FormData();
 		formData.append('file', file);
@@ -57,7 +59,7 @@
 					};
 					if (result.code === 0 && result.data?.url) {
 						progress = 100;
-						onUploaded(result.data.url);
+						onUploaded(result.data.url, file.type);
 						toast.success($t('toast.uploadSuccess'));
 					} else {
 						toast.error(result.message || $t('toast.uploadFail'));
@@ -86,13 +88,13 @@
 			return;
 		}
 
-		if (!isAllowedImage(file.type)) {
+		if (!isAllowedUploadMime(file.type)) {
 			toast.error($t('toast.uploadTypeFail'));
 			input.value = '';
 			return;
 		}
 
-		if (file.size > 10 * 1024 * 1024) {
+		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
 			toast.error($t('toast.uploadSizeFail'));
 			input.value = '';
 			return;
@@ -111,7 +113,7 @@
 			</svg>
 			{$t('issue.uploadImage')}
 		</span>
-		<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden" onchange={handleUpload} />
+		<input type="file" accept={UPLOAD_ACCEPT_ATTR} class="hidden" onchange={handleUpload} />
 	</label>
 
 	{#if uploading}
@@ -128,7 +130,11 @@
 
 	{#if previewUrl}
 		<div class="overflow-hidden rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 p-2">
-			<img src={previewUrl} alt={$t('issue.previewMode')} class="max-h-32 rounded object-contain" />
+			{#if isImageUploadMime(previewMimeType)}
+				<img src={previewUrl} alt={$t('issue.previewMode')} class="max-h-32 rounded object-contain" />
+			{:else}
+				<video src={previewUrl} controls class="max-h-48 rounded object-contain"></video>
+			{/if}
 		</div>
 	{/if}
 </div>

@@ -167,7 +167,7 @@
     "noActivity": "暂无活动",
     "addComment": "添加评论（Markdown）",
     "submitComment": "提交评论",
-    "uploadImage": "上传图片",
+    "uploadImage": "上传图片/视频",
     "editMode": "编辑",
     "previewMode": "预览",
     "backlog": "待办",
@@ -472,11 +472,11 @@
   },
   "toast": {
     "uploadFail": "上传失败，请稍后重试",
-    "uploadSuccess": "图片上传成功",
+    "uploadSuccess": "文件上传成功",
     "uploadParseFail": "上传响应解析失败",
     "uploadNetworkFail": "上传失败，请检查网络后重试",
-    "uploadTypeFail": "仅支持 png/jpg/gif/webp 格式",
-    "uploadSizeFail": "图片大小不能超过 10MB"
+    "uploadTypeFail": "仅支持 png/jpg/gif/webp/mp4/webm/mov/avi 格式",
+    "uploadSizeFail": "文件大小不能超过 200MB"
   },
   "cycles": {
     "title": "Sprint 管理",

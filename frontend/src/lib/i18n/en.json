@@ -167,7 +167,7 @@
     "noActivity": "No activity",
     "addComment": "Add comment (Markdown)",
     "submitComment": "Submit comment",
-    "uploadImage": "Upload image",
+    "uploadImage": "Upload image/video",
     "editMode": "Edit",
     "previewMode": "Preview",
     "backlog": "Backlog",
@@ -472,11 +472,11 @@
   },
   "toast": {
     "uploadFail": "Upload failed. Please try again later",
-    "uploadSuccess": "Image uploaded successfully",
+    "uploadSuccess": "File uploaded successfully",
     "uploadParseFail": "Failed to parse upload response",
     "uploadNetworkFail": "Upload failed. Please check your network",
-    "uploadTypeFail": "Only png/jpg/gif/webp are supported",
-    "uploadSizeFail": "Image size must be less than 10MB"
+    "uploadTypeFail": "Only png/jpg/gif/webp/mp4/webm/mov/avi are supported",
+    "uploadSizeFail": "File size must be less than 200MB"
   },
   "cycles": {
     "title": "Sprint Management",

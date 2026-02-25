@@ -16,6 +16,12 @@
 	} from '$lib/api/proposals';
 	import { toast } from '$lib/stores/toast';
 	import { renderMarkdown } from '$lib/utils/markdown';
+	import {
+		isAllowedUploadMime,
+		MAX_UPLOAD_SIZE_BYTES,
+		mediaMarkdown,
+		UPLOAD_ACCEPT_ATTR
+	} from '$lib/utils/upload';
 
 	const proposalId = $derived($page.params.id || '');
 	const meId = $derived($authStore.user?.id || '');
@@ -129,12 +135,8 @@
 		goto(`/proposals/${proposal.id}`);
 	}
 
-	function isAllowedImage(type: string): boolean {
-		return ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp'].includes(type);
-	}
-
-	function appendContentImage(url: string): void {
-		const markdown = `![image](${url})`;
+	function appendContentImage(url: string, mimeType: string): void {
+		const markdown = mediaMarkdown(url, mimeType);
 		if (!contentTextareaEl) {
 			const suffix = content.trim().length > 0 ? '\n\n' : '';
 			content = `${content}${suffix}${markdown}`;
@@ -158,11 +160,11 @@
 	}
 
 	async function uploadContentImage(file: File): Promise<void> {
-		if (!isAllowedImage(file.type)) {
+		if (!isAllowedUploadMime(file.type)) {
 			toast.error(get(t)('toast.uploadTypeFail'));
 			return;
 		}
-		if (file.size > 10 * 1024 * 1024) {
+		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
 			toast.error(get(t)('toast.uploadSizeFail'));
 			return;
 		}
@@ -188,7 +190,7 @@
 				data?: { url?: string };
 			};
 			if (result.code === 0 && result.data?.url) {
-				appendContentImage(result.data.url);
+				appendContentImage(result.data.url, file.type);
 				toast.success(get(t)('toast.uploadSuccess'));
 			} else {
 				toast.error(result.message || get(t)('toast.uploadFail'));
@@ -206,7 +208,7 @@
 			return;
 		}
 		for (const item of items) {
-			if (!item.type.startsWith('image/')) {
+			if (!isAllowedUploadMime(item.type)) {
 				continue;
 			}
 			const file = item.getAsFile();
@@ -297,7 +299,7 @@
 						<div class="mt-2">
 							<label class="inline-flex cursor-pointer items-center gap-1 text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">
 								<span>{uploadingContentImage ? $t('search.searching') : $t('issue.uploadImage')}</span>
-								<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" class="hidden" onchange={handleContentImageSelect} disabled={uploadingContentImage} />
+								<input type="file" accept={UPLOAD_ACCEPT_ATTR} class="hidden" onchange={handleContentImageSelect} disabled={uploadingContentImage} />
 							</label>
 						</div>
 					{:else}
