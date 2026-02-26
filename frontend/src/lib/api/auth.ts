@@ -38,6 +38,9 @@ export const authApi = {
 		const result = await apiClient.post<LoginResponse>('/api/v1/auth/login', credentials);
 		if (result.code === 0 && result.data?.tokens?.access_token) {
 			apiClient.setToken(result.data.tokens.access_token);
+			if (result.data.tokens.refresh_token) {
+				apiClient.setRefreshToken(result.data.tokens.refresh_token);
+			}
 		}
 		return result;
 	},
@@ -52,7 +55,7 @@ export const authApi = {
 
 	async logout(): Promise<ApiResult<null>> {
 		const result = await apiClient.post<null>('/api/v1/auth/logout');
-		apiClient.setToken(null);
+		apiClient.clearAuth();
 		return result;
 	},
 
@@ -64,6 +67,9 @@ export const authApi = {
 
 		const token = result.data.tokens.access_token;
 		apiClient.setToken(token);
+		if (result.data.tokens.refresh_token) {
+			apiClient.setRefreshToken(result.data.tokens.refresh_token);
+		}
 		return { code: 0, message: result.message, data: { token } };
 	}
 };

@@ -17,11 +17,14 @@ export interface PaginatedData<T> {
 class ApiClient {
 	private baseUrl: string;
 	private token: string | null = null;
+	private refreshTokenValue: string | null = null;
+	private refreshInFlight: Promise<boolean> | null = null;
 
 	constructor(baseUrl: string = API_BASE_URL) {
 		this.baseUrl = baseUrl;
 		if (typeof window !== 'undefined') {
 			this.token = localStorage.getItem('auth_token');
+			this.refreshTokenValue = localStorage.getItem('refresh_token');
 		}
 	}
 
@@ -40,11 +43,89 @@ class ApiClient {
 		this.setToken(null);
 	}
 
+	setRefreshToken(token: string | null) {
+		this.refreshTokenValue = token;
+		if (typeof window !== 'undefined') {
+			if (token) {
+				localStorage.setItem('refresh_token', token);
+			} else {
+				localStorage.removeItem('refresh_token');
+			}
+		}
+	}
+
+	getRefreshToken(): string | null {
+		return this.refreshTokenValue;
+	}
+
+	clearAuth() {
+		this.setToken(null);
+		this.setRefreshToken(null);
+	}
+
+	private redirectToLogin() {
+		if (typeof window !== 'undefined') {
+			window.location.href = '/auth/login';
+		}
+	}
+
+	private async performTokenRefresh(): Promise<boolean> {
+		const refreshToken = this.getRefreshToken();
+		const body = refreshToken ? JSON.stringify({ refresh_token: refreshToken }) : undefined;
+		const url = `${this.baseUrl}/api/v1/auth/refresh`;
+		const headers = new Headers();
+		headers.set('Content-Type', 'application/json');
+
+		try {
+			const res = await fetch(url, {
+				method: 'POST',
+				headers,
+				body,
+				credentials: 'include'
+			});
+			const parsed = (await res.json()) as Partial<
+				ApiResult<{
+					tokens?: { access_token?: string; refresh_token?: string };
+				}>
+			>;
+
+			if (
+				parsed.code === 0 &&
+				parsed.data?.tokens?.access_token &&
+				typeof parsed.data.tokens.access_token === 'string'
+			) {
+				this.setToken(parsed.data.tokens.access_token);
+				if (typeof parsed.data.tokens.refresh_token === 'string') {
+					this.setRefreshToken(parsed.data.tokens.refresh_token);
+				}
+				return true;
+			}
+		} catch (_error) {
+			return false;
+		}
+
+		return false;
+	}
+
+	private async refreshAccessTokenOnce(): Promise<boolean> {
+		if (!this.refreshInFlight) {
+			this.refreshInFlight = this.performTokenRefresh().finally(() => {
+				this.refreshInFlight = null;
+			});
+		}
+		return this.refreshInFlight;
+	}
+
 	getToken(): string | null {
 		return this.token;
 	}
 
-	async request<T>(method: string, endpoint: string, body?: unknown): Promise<ApiResult<T>> {
+	async request<T>(
+		method: string,
+		endpoint: string,
+		body?: unknown,
+		retryAfterRefresh: boolean = true
+	): Promise<ApiResult<T>> {
 		const url = `${this.baseUrl}${endpoint}`;
 		const headers = new Headers();
 		headers.set('Content-Type', 'application/json');
@@ -56,7 +137,8 @@ class ApiClient {
 			const res = await fetch(url, {
 				method,
 				headers,
-				body: body ? JSON.stringify(body) : undefined
+				body: body ? JSON.stringify(body) : undefined,
+				credentials: 'include'
 			});
 
 			const parsed = (await res.json()) as Partial<ApiResult<T>>;
@@ -67,10 +149,15 @@ class ApiClient {
 			};
 
 			if (result.code === 401) {
-				this.clearToken();
-				if (typeof window !== 'undefined') {
-					window.location.href = '/auth/login';
+				const isRefreshEndpoint = endpoint === '/api/v1/auth/refresh';
+				if (!isRefreshEndpoint && retryAfterRefresh) {
+					const refreshed = await this.refreshAccessTokenOnce();
+					if (refreshed) {
+						return this.request<T>(method, endpoint, body, false);
+					}
 				}
+				this.clearAuth();
+				this.redirectToLogin();
 			}
 
 			return result;

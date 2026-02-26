@@ -25,11 +25,11 @@ impl AppConfig {
         let jwt_access_ttl_seconds = env::var("JWT_ACCESS_TTL_SECONDS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(900);
+            .unwrap_or(1296000);
         let jwt_refresh_ttl_seconds = env::var("JWT_REFRESH_TTL_SECONDS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(604800);
+            .unwrap_or(1728000);
         let default_author_id = env::var("DEFAULT_AUTHOR_ID")
             .ok()
             .and_then(|v| Uuid::parse_str(&v).ok());

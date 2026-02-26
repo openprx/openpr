@@ -49,7 +49,7 @@ function createAuthStore() {
 			update((state) => ({ ...state, error }));
 		},
 		logout: () => {
-			apiClient.setToken(null);
+			apiClient.clearAuth();
 			if (typeof window !== 'undefined') {
 				localStorage.removeItem('auth_user');
 			}
