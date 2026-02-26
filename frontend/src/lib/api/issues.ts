@@ -77,6 +77,7 @@ export interface ListIssuesParams {
 	state?: IssueStatus;
 	priority?: IssuePriority;
 	assignee_id?: string;
+	label_ids?: string;
 	search?: string;
 	sort_by?: 'updated_at' | 'created_at' | 'priority' | 'title';
 	sort_order?: 'asc' | 'desc';
@@ -130,6 +131,7 @@ export const issuesApi = {
 		if (params?.state) query.set('state', params.state);
 		if (params?.priority) query.set('priority', params.priority);
 		if (params?.assignee_id) query.set('assignee_id', params.assignee_id);
+		if (params?.label_ids) query.set('label_ids', params.label_ids);
 		if (params?.search) query.set('search', params.search);
 		if (params?.sort_by) query.set('sort_by', params.sort_by);
 		if (params?.sort_order) query.set('sort_order', params.sort_order);

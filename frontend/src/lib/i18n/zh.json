@@ -17,6 +17,7 @@
     "actions": "操作",
     "status": "状态",
     "priority": "优先级",
+    "label": "标签",
     "assignee": "指派人",
     "unassigned": "未指派",
     "createdAt": "创建时间",

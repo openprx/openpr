@@ -6,6 +6,7 @@
 	import { goto } from '$app/navigation';
 	import { membersApi } from '$lib/api/members';
 	import { issuesApi, type Issue, type IssuePriority, type IssueStatus } from '$lib/api/issues';
+	import { labelsApi, type Label } from '$lib/api/labels';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { toast } from '$lib/stores/toast';
 	import { requireRouteParam } from '$lib/utils/route-params';
@@ -24,6 +25,10 @@
 	let statusFilter = $state<'all' | IssueStatus>('all');
 	let priorityFilter = $state<'all' | IssuePriority>('all');
 	let assigneeFilter = $state('all');
+	let workspaceLabels = $state<Label[]>([]);
+	let selectedLabelIds = $state<string[]>([]);
+	let showLabelFilterDropdown = $state(false);
+	let labelFilterContainer: HTMLDivElement | null = null;
 	let memberNameMap = $state<Record<string, string>>({});
 	let memberEntityTypeMap = $state<Record<string, string>>({});
 	let sortBy = $state<'updated_at' | 'created_at' | 'priority' | 'title'>('updated_at');
@@ -34,9 +39,23 @@
 	let total = $state(0);
 	const perPage = 15;
 
-	onMount(async () => {
-		await Promise.all([loadSprints(), loadMembers()]);
-		await loadIssues(1);
+	onMount(() => {
+		const handleDocumentClick = (event: MouseEvent) => {
+			const target = event.target;
+			if (!(target instanceof Node)) return;
+			if (labelFilterContainer?.contains(target)) return;
+			showLabelFilterDropdown = false;
+		};
+
+		document.addEventListener('click', handleDocumentClick);
+		void (async () => {
+			await Promise.all([loadSprints(), loadMembers(), loadLabels()]);
+			await loadIssues(1);
+		})();
+
+		return () => {
+			document.removeEventListener('click', handleDocumentClick);
+		};
 	});
 
 	async function loadIssues(pageToLoad: number = currentPage) {
@@ -47,6 +66,7 @@
 			status: statusFilter === 'all' ? undefined : statusFilter,
 			priority: priorityFilter === 'all' ? undefined : priorityFilter,
 			assignee_id: assigneeFilter === 'all' ? undefined : assigneeFilter,
+			label_ids: selectedLabelIds.length ? selectedLabelIds.join(',') : undefined,
 			search: keyword.trim() || undefined,
 			sort_by: sortBy,
 			sort_order: sortOrder
@@ -94,6 +114,16 @@
 		}
 	}
 
+	async function loadLabels() {
+		const res = await labelsApi.list(workspaceId);
+		if (res.code !== 0) {
+			toast.error(res.message);
+			workspaceLabels = [];
+			return;
+		}
+		workspaceLabels = res.data?.items ?? [];
+	}
+
 	const assigneeOptions = $derived.by(() => {
 		return Object.keys(memberNameMap);
 	});
@@ -137,6 +167,26 @@
 	function getAssigneeLabel(assigneeId: string): string {
 		const name = memberNameMap[assigneeId] || assigneeId.substring(0, 8);
 		return isBotAssignee(assigneeId) ? `[Bot] ${name}` : name;
+	}
+
+	function toggleLabelSelection(labelId: string) {
+		if (selectedLabelIds.includes(labelId)) {
+			selectedLabelIds = selectedLabelIds.filter((id) => id !== labelId);
+		} else {
+			selectedLabelIds = [...selectedLabelIds, labelId];
+		}
+		resetPageAndLoad();
+	}
+
+	function getLabelFilterText(): string {
+		if (selectedLabelIds.length === 0) {
+			return get(t)('issue.all');
+		}
+		if (selectedLabelIds.length === 1) {
+			const selected = workspaceLabels.find((label) => label.id === selectedLabelIds[0]);
+			return selected?.name ?? get(t)('common.label');
+		}
+		return `${get(t)('common.label')} (${selectedLabelIds.length})`;
 	}
 
 	function handleIssueCreated(issue: Issue) {
@@ -206,7 +256,7 @@
 			</button>
 		</div>
 
-		<div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-6">
+		<div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-7">
 			<div class="xl:col-span-2">
 				<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300" for="keyword">{$t('common.search')}</label>
 				<input
@@ -261,6 +311,53 @@
 						<option value={assigneeId}>{getAssigneeLabel(assigneeId)}</option>
 					{/each}
 				</select>
+			</div>
+			<div class="relative" bind:this={labelFilterContainer}>
+				<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">{$t('common.label')}</label>
+				<button
+					type="button"
+					class="flex w-full items-center justify-between rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
+					onclick={(event) => {
+						event.stopPropagation();
+						showLabelFilterDropdown = !showLabelFilterDropdown;
+					}}
+				>
+					<span class="truncate text-left">{getLabelFilterText()}</span>
+					<svg class="ml-2 h-4 w-4 shrink-0 text-slate-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+					</svg>
+				</button>
+				{#if showLabelFilterDropdown}
+					<div class="absolute z-20 mt-1 w-full rounded-md border border-slate-200 bg-white p-2 shadow-lg dark:shadow-slate-900/50 dark:border-slate-700 dark:bg-slate-800">
+						<p class="mb-2 px-2 text-xs font-medium text-slate-500 dark:text-slate-400">{$t('common.label')}</p>
+						{#if workspaceLabels.length === 0}
+							<p class="px-2 py-1 text-xs text-slate-500 dark:text-slate-400">{$t('issue.noWorkspaceLabels')}</p>
+						{:else}
+							<div class="max-h-52 space-y-1 overflow-y-auto">
+								{#each workspaceLabels as label (label.id)}
+									<button
+										type="button"
+										class="flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-sm hover:bg-slate-50 dark:bg-slate-900 dark:hover:bg-slate-700"
+										onclick={() => toggleLabelSelection(label.id)}
+									>
+										<div class="flex min-w-0 items-center gap-2">
+											<input type="checkbox" checked={selectedLabelIds.includes(label.id)} readonly />
+											<span
+												class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium"
+												style={`background-color: ${label.color}20; color: ${label.color}; border: 1px solid ${label.color}40;`}
+											>
+												{label.name}
+											</span>
+										</div>
+										{#if selectedLabelIds.includes(label.id)}
+											<span class="text-xs text-blue-600 dark:text-blue-400">✓</span>
+										{/if}
+									</button>
+								{/each}
+							</div>
+						{/if}
+					</div>
+				{/if}
 			</div>
 			<div>
 				<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300" for="sortBy">{$t('issue.sortBy')}</label>

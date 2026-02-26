@@ -17,6 +17,7 @@
     "actions": "Actions",
     "status": "Status",
     "priority": "Priority",
+    "label": "Label",
     "assignee": "Assignee",
     "unassigned": "Unassigned",
     "createdAt": "Created at",

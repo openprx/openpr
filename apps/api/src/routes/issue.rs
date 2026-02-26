@@ -74,6 +74,7 @@ pub struct ListIssuesQuery {
     pub assignee_id: Option<Uuid>,
     pub priority: Option<String>,
     pub search: Option<String>,
+    pub label_ids: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
 }
@@ -380,6 +381,44 @@ pub async fn list_issues(
             ));
             values.push(format!("%{}%", search_text).into());
             param_idx += 1;
+        }
+    }
+
+    if let Some(label_ids_raw) = query.label_ids {
+        let mut label_ids: Vec<Uuid> = Vec::new();
+        for raw in label_ids_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let label_id = Uuid::parse_str(raw)
+                .map_err(|_| ApiError::BadRequest(format!("invalid label id: {}", raw)))?;
+            if !label_ids.contains(&label_id) {
+                label_ids.push(label_id);
+            }
+        }
+
+        if !label_ids.is_empty() {
+            let start_idx = param_idx;
+            let placeholders = (start_idx..start_idx + label_ids.len())
+                .map(|idx| format!("${idx}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            where_clauses.push(format!(
+                "id IN (
+                    SELECT wil.work_item_id
+                    FROM work_item_labels wil
+                    WHERE wil.label_id IN ({})
+                    GROUP BY wil.work_item_id
+                    HAVING COUNT(DISTINCT wil.label_id) = {}
+                )",
+                placeholders,
+                label_ids.len()
+            ));
+            for label_id in label_ids {
+                values.push(label_id.into());
+                param_idx += 1;
+            }
         }
     }
 
