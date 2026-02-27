@@ -66,13 +66,16 @@
 	}
 
 	function getNotificationTitle(notification: Notification): string {
+		// Prefer issue title when available
+		if (notification.issue_title) {
+			return notification.issue_title;
+		}
+
 		if (notification.title.startsWith('notification.')) {
 			return get(t)(notification.title);
 		}
 
 		switch (notification.type) {
-			case 'assignment':
-				return get(t)('notification.issueAssignedTitle');
 			case 'mentioned':
 			case 'mention':
 				return get(t)('notification.mentionedTitle');
@@ -255,9 +258,6 @@
 									<div class="min-w-0">
 										<p class="font-medium text-slate-900 dark:text-slate-100">{getNotificationTitle(item)}</p>
 										<p class="mt-1 text-sm text-slate-600 dark:text-slate-300">{getNotificationContent(item)}</p>
-										{#if item.issue_title}
-											<p class="mt-1 text-sm font-medium text-blue-600 dark:text-blue-400">📋 {item.issue_title}</p>
-										{/if}
 									</div>
 								</div>
 								<span class="shrink-0 text-xs text-slate-500 dark:text-slate-400">{formatRelativeTime(item.created_at)}</span>
@@ -310,9 +310,6 @@
 									<div class="min-w-0">
 										<p class="font-medium text-slate-900 dark:text-slate-100">{getNotificationTitle(item)}</p>
 										<p class="mt-1 text-sm text-slate-600 dark:text-slate-300">{getNotificationContent(item)}</p>
-										{#if item.issue_title}
-											<p class="mt-1 text-sm font-medium text-blue-600 dark:text-blue-400">📋 {item.issue_title}</p>
-										{/if}
 									</div>
 								</div>
 								<span class="shrink-0 text-xs text-slate-500 dark:text-slate-400">{formatRelativeTime(item.created_at)}</span>
