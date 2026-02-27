@@ -101,7 +101,7 @@ pub async fn list_notifications(
                 n.is_read, n.created_at, n.read_at,
                 i.title as issue_title
          FROM notifications n
-         LEFT JOIN issues i ON n.related_issue_id = i.id
+         LEFT JOIN work_items i ON n.related_issue_id = i.id
          WHERE n.user_id = $1 AND n.is_read = false
          ORDER BY n.created_at DESC
          LIMIT $2 OFFSET $3"
@@ -111,7 +111,7 @@ pub async fn list_notifications(
                 n.is_read, n.created_at, n.read_at,
                 i.title as issue_title
          FROM notifications n
-         LEFT JOIN issues i ON n.related_issue_id = i.id
+         LEFT JOIN work_items i ON n.related_issue_id = i.id
          WHERE n.user_id = $1
          ORDER BY n.created_at DESC
          LIMIT $2 OFFSET $3"
