@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod bot;
 pub mod admin;
 pub mod ai_callback;
 pub mod ai_agent;

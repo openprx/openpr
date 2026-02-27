@@ -759,6 +759,25 @@ async fn main() -> anyhow::Result<()> {
                 middleware::auth::auth_middleware,
             )),
         )
+        // Bot token management routes (protected — JWT only)
+        .route(
+            "/api/v1/workspaces/{workspace_id}/bots",
+            post(routes::bot::create_bot)
+                .get(routes::bot::list_bots)
+                .route_layer(axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::auth::auth_middleware,
+                )),
+        )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/bots/{bot_id}",
+            axum::routing::delete(routes::bot::revoke_bot).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::auth::auth_middleware,
+                ),
+            ),
+        )
         // Activity routes (protected)
         .route(
             "/api/v1/workspaces/{workspace_id}/activities",
@@ -1064,6 +1083,10 @@ async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
         (
             "0021_fix_cascade.sql",
             include_str!("../../../migrations/0021_fix_cascade.sql"),
+        ),
+        (
+            "0022_bot_tokens.sql",
+            include_str!("../../../migrations/0022_bot_tokens.sql"),
         ),
     ];
 
