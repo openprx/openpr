@@ -102,7 +102,7 @@
 	}
 
 	function goToIssue(workspaceId: string, projectId: string, issueId: string) {
-		goto(`/workspace/${workspaceId}/projects/${projectId}/issues/${issueId}`);
+		window.open(`/workspace/${workspaceId}/projects/${projectId}/issues/${issueId}`, '_blank');
 	}
 
 	function openCreateModal() {

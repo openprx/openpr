@@ -3,7 +3,6 @@
 	import { get } from 'svelte/store';
 	import { locale, t } from 'svelte-i18n';
 	import { page } from '$app/stores';
-	import { goto } from '$app/navigation';
 	import { membersApi } from '$lib/api/members';
 	import { issuesApi, type Issue, type IssuePriority, type IssueStatus } from '$lib/api/issues';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
@@ -106,8 +105,8 @@
 		return map;
 	});
 
-	function goToIssue(issueId: string) {
-		goto(`/workspace/${workspaceId}/projects/${projectId}/issues/${issueId}`);
+	function issueUrl(issueId: string): string {
+		return `/workspace/${workspaceId}/projects/${projectId}/issues/${issueId}`;
 	}
 
 	function formatIssueCode(issue: Issue): string {
@@ -314,7 +313,7 @@
 					</thead>
 					<tbody class="divide-y divide-slate-200 bg-white dark:divide-slate-700 dark:bg-slate-800">
 						{#each issues as issue (issue.id)}
-							<tr class="cursor-pointer hover:bg-slate-50 dark:bg-slate-950 dark:hover:bg-slate-700" onclick={() => goToIssue(issue.id)}>
+							<tr class="cursor-pointer hover:bg-slate-50 dark:bg-slate-950 dark:hover:bg-slate-700" onclick={() => window.open(issueUrl(issue.id), '_blank')}>
 								<td class="px-4 py-3">
 									<div class="space-y-1">
 										<p class="text-sm font-medium text-slate-900 dark:text-slate-100">{issue.title}</p>
@@ -365,7 +364,7 @@
 
 			<div class="divide-y divide-slate-200 dark:divide-slate-700 md:hidden">
 				{#each issues as issue (issue.id)}
-					<button class="w-full space-y-2 p-4 text-left hover:bg-slate-50 dark:bg-slate-950 dark:hover:bg-slate-700" onclick={() => goToIssue(issue.id)}>
+					<button class="w-full space-y-2 p-4 text-left hover:bg-slate-50 dark:bg-slate-950 dark:hover:bg-slate-700" onclick={() => window.open(issueUrl(issue.id), '_blank')}>
 						<div class="flex items-start justify-between gap-3">
 							<div>
 								<p class="text-sm font-medium text-slate-900 dark:text-slate-100">{issue.title}</p>

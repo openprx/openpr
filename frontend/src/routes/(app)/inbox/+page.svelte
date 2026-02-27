@@ -183,7 +183,7 @@
 			await markRead(notification.id);
 		}
 
-		goto(route);
+		window.open(route, '_blank');
 	}
 </script>
 
