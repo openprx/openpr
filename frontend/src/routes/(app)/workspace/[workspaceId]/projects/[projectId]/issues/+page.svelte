@@ -137,7 +137,7 @@
 	});
 
 	function goToIssue(issueId: string) {
-		goto(`/workspace/${workspaceId}/projects/${projectId}/issues/${issueId}`);
+		window.open(`/workspace/${workspaceId}/projects/${projectId}/issues/${issueId}`, '_blank');
 	}
 
 	function formatIssueCode(issue: Issue): string {
