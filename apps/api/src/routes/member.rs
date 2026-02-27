@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     error::ApiError,
+    middleware::bot_auth::{BotAuthContext, require_workspace_access},
     response::{ApiResponse, PaginatedData},
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
 };
@@ -252,13 +253,17 @@ pub async fn update_member_role(
 pub async fn list_members(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
     // Check workspace membership
-    get_workspace_role(&state, workspace_id, user_id).await?;
+    require_workspace_access(&state, &extensions, workspace_id).await?;
 
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct MemberRow {

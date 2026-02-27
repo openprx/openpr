@@ -1,14 +1,15 @@
 use axum::{
-    Extension, Json,
+    Extension,
     extract::{Path, State},
     response::IntoResponse,
 };
 use platform::{app::AppState, auth::JwtClaims};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{DbBackend, FromQueryResult, Statement};
 use serde::Serialize;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use crate::{error::ApiError, response::ApiResponse};
 
 #[derive(Debug, Serialize)]
@@ -38,31 +39,32 @@ pub struct BoardResponse {
 pub async fn get_project_board(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
-
-    // Verify access
-    let has_access = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE p.id = $1 AND wm.user_id = $2
-            "#,
-            vec![project_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if has_access.is_none() {
-        return Err(ApiError::NotFound(
-            "project not found or access denied".to_string(),
-        ));
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
     }
+
+    #[derive(Debug, FromQueryResult)]
+    struct ProjectWorkspace {
+        workspace_id: Uuid,
+    }
+
+    let project = ProjectWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![project_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     // Get all issues with labels
     #[derive(Debug, FromQueryResult)]

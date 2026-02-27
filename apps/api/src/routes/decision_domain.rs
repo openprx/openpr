@@ -83,7 +83,14 @@ pub async fn initialize_default_domains_for_project(
     project_id: Uuid,
 ) -> Result<(), ApiError> {
     let defaults = [
-        ("code_quality", "Code Quality", "simple_majority", "fast", 200, 300),
+        (
+            "code_quality",
+            "Code Quality",
+            "simple_majority",
+            "fast",
+            200,
+            300,
+        ),
         (
             "architecture",
             "Architecture",
@@ -93,7 +100,14 @@ pub async fn initialize_default_domains_for_project(
             350,
         ),
         ("priority", "Priority", "simple_majority", "fast", 200, 300),
-        ("ux_design", "UX Design", "simple_majority", "fast", 200, 300),
+        (
+            "ux_design",
+            "UX Design",
+            "simple_majority",
+            "fast",
+            200,
+            300,
+        ),
         ("security", "Security", "consensus", "critical", 180, 400),
         (
             "business",
@@ -103,7 +117,14 @@ pub async fn initialize_default_domains_for_project(
             250,
             999,
         ),
-        ("governance", "Governance", "consensus", "critical", 300, 999),
+        (
+            "governance",
+            "Governance",
+            "consensus",
+            "critical",
+            300,
+            999,
+        ),
     ];
 
     for (key, name, rule, cycle, veto_threshold, autonomous_threshold) in defaults {
@@ -186,9 +207,21 @@ pub async fn list_decision_domains_global(
         r#"EXISTS (
                 SELECT 1
                 FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
                 WHERE p.id = decision_domains.project_id
-                  AND wm.user_id = $1
+                  AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM workspace_members wm
+                        WHERE wm.workspace_id = p.workspace_id
+                          AND wm.user_id = $1
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workspace_bots wb
+                        WHERE wb.workspace_id = p.workspace_id
+                          AND wb.id = $1
+                    )
+                  )
             )"#,
     )];
     if let Some(project_id) = query.project_id {
@@ -232,21 +265,27 @@ pub async fn create_decision_domain(
     }
 
     if req.name.trim().is_empty() || req.key.trim().is_empty() {
-        return Err(ApiError::BadRequest("key and name are required".to_string()));
+        return Err(ApiError::BadRequest(
+            "key and name are required".to_string(),
+        ));
     }
 
     let voting_rule = req
         .default_voting_rule
         .unwrap_or_else(|| "simple_majority".to_string());
     if !validate_voting_rule(&voting_rule) {
-        return Err(ApiError::BadRequest("invalid default_voting_rule".to_string()));
+        return Err(ApiError::BadRequest(
+            "invalid default_voting_rule".to_string(),
+        ));
     }
 
     let cycle_template = req
         .default_cycle_template
         .unwrap_or_else(|| "fast".to_string());
     if !validate_cycle_template(&cycle_template) {
-        return Err(ApiError::BadRequest("invalid default_cycle_template".to_string()));
+        return Err(ApiError::BadRequest(
+            "invalid default_cycle_template".to_string(),
+        ));
     }
 
     let veto_threshold = req.veto_threshold.unwrap_or(200).max(0);
@@ -315,7 +354,9 @@ pub async fn update_decision_domain(
 
     if let Some(rule) = req.default_voting_rule.as_deref() {
         if !validate_voting_rule(rule) {
-            return Err(ApiError::BadRequest("invalid default_voting_rule".to_string()));
+            return Err(ApiError::BadRequest(
+                "invalid default_voting_rule".to_string(),
+            ));
         }
     }
     if let Some(cycle) = req.default_cycle_template.as_deref() {

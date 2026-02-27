@@ -6,15 +6,13 @@ use axum::{
 use chrono::Utc;
 use platform::{app::AppState, auth::JwtClaims};
 use rand::Rng;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{
-    error::ApiError,
-    response::ApiResponse,
-};
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
+use crate::{error::ApiError, response::ApiResponse};
 
 // ============================================================================
 // Request / Response types
@@ -35,7 +33,7 @@ pub struct CreateBotResponse {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
-    pub token: String,        // raw token, returned ONCE
+    pub token: String, // raw token, returned ONCE
     pub token_prefix: String,
     pub permissions: Vec<String>,
     pub expires_at: Option<String>,
@@ -72,24 +70,24 @@ fn generate_token() -> String {
     format!("opr_{}", hex::encode(&bytes))
 }
 
-async fn require_workspace_member(
-    state: &AppState,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<String, ApiError> {
-    #[derive(Debug, FromQueryResult)]
-    struct RoleRow {
-        role: String,
+fn build_auth_extensions(
+    claims: JwtClaims,
+    bot: Option<Extension<BotAuthContext>>,
+) -> axum::http::Extensions {
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
     }
-    let row = RoleRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-        vec![workspace_id.into(), user_id.into()],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("workspace not found or access denied".to_string()))?;
-    Ok(row.role)
+    extensions
+}
+
+fn workspace_role_from_permissions(perms: &[String]) -> &'static str {
+    if perms.iter().any(|p| p == "admin") {
+        "admin"
+    } else {
+        "member"
+    }
 }
 
 // ============================================================================
@@ -100,18 +98,20 @@ async fn require_workspace_member(
 pub async fn create_bot(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
     Json(req): Json<CreateBotRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".to_string()));
     }
 
     // Only owners/admins can create bots
-    let role = require_workspace_member(&state, workspace_id, user_id).await?;
+    let (_, role, _) = require_workspace_access(&state, &extensions, workspace_id).await?;
     if role != "owner" && role != "admin" {
         return Err(ApiError::Forbidden(
             "only workspace owners and admins can create bots".to_string(),
@@ -146,33 +146,69 @@ pub async fn create_bot(
     let bot_id = Uuid::new_v4();
     let now = Utc::now();
     let perms_json = serde_json::to_value(&perms).unwrap_or(serde_json::json!(["read"]));
+    let workspace_role = workspace_role_from_permissions(&perms);
+    let bot_email = format!("{bot_id}@bot.openpr.local");
+    let bot_name = req.name.clone();
 
-    state
-        .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"INSERT INTO workspace_bots
-               (id, workspace_id, name, token_hash, token_prefix, permissions,
-                created_by, expires_at, is_active, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)"#,
-            vec![
-                bot_id.into(),
-                workspace_id.into(),
-                req.name.clone().into(),
-                token_hash.into(),
-                token_prefix.clone().into(),
-                perms_json.into(),
-                user_id.into(),
-                expires_at.into(),
-                now.into(),
-            ],
-        ))
-        .await?;
+    let tx = state.db.begin().await?;
+
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"INSERT INTO users
+           (id, email, password_hash, name, role, is_active, entity_type, agent_type, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $8)"#,
+        vec![
+            bot_id.into(),
+            bot_email.into(),
+            "!".into(),
+            bot_name.clone().into(),
+            "user".into(),
+            "bot_mcp".into(),
+            "mcp".into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+           VALUES ($1, $2, $3, $4)"#,
+        vec![
+            workspace_id.into(),
+            bot_id.into(),
+            workspace_role.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"INSERT INTO workspace_bots
+           (id, workspace_id, name, token_hash, token_prefix, permissions,
+            created_by, expires_at, is_active, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)"#,
+        vec![
+            bot_id.into(),
+            workspace_id.into(),
+            bot_name.clone().into(),
+            token_hash.into(),
+            token_prefix.clone().into(),
+            perms_json.into(),
+            user_id.into(),
+            expires_at.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+
+    tx.commit().await?;
 
     Ok(ApiResponse::success(CreateBotResponse {
         id: bot_id,
         workspace_id,
-        name: req.name,
+        name: bot_name,
         token: raw_token,
         token_prefix,
         permissions: perms,
@@ -185,12 +221,14 @@ pub async fn create_bot(
 pub async fn list_bots(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
-    let role = require_workspace_member(&state, workspace_id, user_id).await?;
+    let (_, role, _) = require_workspace_access(&state, &extensions, workspace_id).await?;
     if role != "owner" && role != "admin" {
         return Err(ApiError::Forbidden(
             "only workspace owners and admins can list bots".to_string(),
@@ -255,12 +293,14 @@ pub async fn list_bots(
 pub async fn revoke_bot(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path((workspace_id, bot_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
-    let role = require_workspace_member(&state, workspace_id, user_id).await?;
+    let (_, role, _) = require_workspace_access(&state, &extensions, workspace_id).await?;
     if role != "owner" && role != "admin" {
         return Err(ApiError::Forbidden(
             "only workspace owners and admins can revoke bots".to_string(),

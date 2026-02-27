@@ -71,7 +71,8 @@ impl TryFrom<WebhookRow> for WebhookResponse {
     type Error = ApiError;
 
     fn try_from(row: WebhookRow) -> Result<Self, Self::Error> {
-        let events: Vec<String> = serde_json::from_value(row.events).map_err(|_| ApiError::Internal)?;
+        let events: Vec<String> =
+            serde_json::from_value(row.events).map_err(|_| ApiError::Internal)?;
         Ok(Self {
             id: row.id,
             workspace_id: row.workspace_id,

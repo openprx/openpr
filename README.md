@@ -4,97 +4,17 @@ Open-source project management platform with built-in governance, AI agent integ
 
 Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL**.
 
-## Features
+## What It Provides
 
-### Project Management
-- **Workspaces & Projects** — Multi-tenant workspace isolation with role-based access
-- **Issues & Board** — Kanban board with drag-and-drop, priority, assignees, labels
-- **Sprints & Cycles** — Sprint planning with cycle tracking
-- **Full-text Search** — PostgreSQL FTS5 across issues, comments, and proposals
-- **File Uploads** — Image and document attachments on issues and proposals
-- **Activity Feed** — Chronological activity stream per issue
-- **Notifications & Inbox** — In-app notification center with read/unread state
-- **Import / Export** — Bulk data import and export
-
-### Governance Center
-- **Proposals** — Create, review, and vote on proposals with configurable approval thresholds
-- **Voting System** — Weighted voting with quorum requirements
-- **Decision Records** — Immutable decision log with full audit trail
-- **Veto & Escalation** — Veto power with escalation voting mechanism
-- **Trust Scores** — Per-user trust scoring across decision domains, with history and appeals
-- **Proposal Templates** — Reusable templates for rapid proposal creation
-- **Proposal Chains** — Link related proposals into decision chains
-- **Impact Reviews** — Post-decision impact assessment
-- **Audit Logs** — Complete governance action audit trail
-- **Analytics** — Decision analytics dashboard
-
-### AI Integration
-- **AI Agents** — Register AI participants in projects with configurable roles and permissions
-- **AI Tasks** — Create and assign tasks to AI agents with progress tracking and callbacks
-- **AI Review** — AI-generated review feedback on proposals with learning/alignment stats
-- **MCP Server** — [Model Context Protocol](https://modelcontextprotocol.io) server for AI tool integration (HTTP + stdio transport)
-- **AI Callback API** — Webhook-style callbacks for task completion, failure, and progress reporting
-
-### MCP Server
-
-The built-in MCP server exposes OpenPR as a tool provider for AI assistants:
-
-| Tool | Description |
-|------|-------------|
-| `projects.list` / `projects.get` / `projects.create` | Project CRUD |
-| `work_items.list` / `work_items.get` / `work_items.create` | Issue management |
-| `comments.list` / `comments.create` | Comment on issues |
-| `proposals.list` / `proposals.get` / `proposals.create` | Governance proposals |
-| `sprints.list` | Sprint tracking |
-| `labels.list` | Label management |
-| `members.list` | Team members |
-| `search` | Full-text search |
-
-Supports **HTTP** (POST `/mcp`) and **stdio** transports. Compatible with Claude, OpenClaw, OpenPRX, and other MCP-capable agents.
-
-### Webhooks
-
-- **Outbound Webhooks** — HTTP POST notifications on issue/proposal/comment events
-- **Delivery Tracking** — Per-webhook delivery history with retry status
-- **[openpr-webhook](https://github.com/openprx/openpr-webhook)** — Standalone webhook receiver for integrating OpenPR events with external systems (Slack, Discord, CI/CD, etc.)
-
-### Admin
-- **User Management** — Admin panel for user accounts, roles, bot users
-- **Workspace Settings** — Configure workspace-level preferences
-- **Governance Config** — Tune voting thresholds, quorum, veto rules per workspace
-
-## Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  Frontend    │────▶│  API Server │────▶│ PostgreSQL  │
-│  (SvelteKit) │     │  (Axum)     │     │             │
-└─────────────┘     └──────┬──────┘     └─────────────┘
-                           │
-                    ┌──────┴──────┐
-                    │             │
-              ┌─────▼─────┐ ┌────▼────┐
-              │ MCP Server│ │ Worker  │
-              │ (Tools)   │ │ (Async) │
-              └───────────┘ └─────────┘
-```
-
-| Component | Port | Description |
-|-----------|------|-------------|
-| **API** | 8080 | REST API (Axum + SeaORM) |
-| **Frontend** | 3000 | SvelteKit app (Nginx in production) |
-| **MCP Server** | 8090 | MCP tool provider (HTTP/stdio) |
-| **Worker** | — | Background job processor |
-| **PostgreSQL** | 5432 | Primary data store |
+- Full project management: issues, kanban board, sprints, labels, comments, file attachments.
+- Governance center: proposals, voting, trust scores, decision records, veto & escalation.
+- AI integration: bot tokens, AI agents, AI tasks, AI review, webhook callbacks.
+- MCP server: 34 tools across 3 transport protocols (HTTP, stdio, SSE).
+- Skill distribution: `AGENTS.md` for coding agents, skill package for governed workflows.
 
 ## Quick Start
 
-### Prerequisites
-
-- Docker & Docker Compose
-- Git
-
-### Deploy
+### Docker Compose (Recommended)
 
 ```bash
 git clone https://github.com/openprx/openpr.git
@@ -115,49 +35,230 @@ Services:
 
 # Backend
 cp .env.example .env
-# Edit .env with your database credentials
 cargo build
 cargo run --bin api
 
 # Frontend
-cd frontend
-cp .env.example .env
-npm install
-npm run dev
+cd frontend && npm install && npm run dev
 
 # MCP Server
-cargo run --bin mcp-server -- --transport http --port 8090
+cargo run --bin mcp-server -- --transport http --bind-addr 0.0.0.0:8090
 ```
 
-## MCP Configuration
+## MCP Server
 
-### Claude Desktop / OpenClaw
+The built-in MCP server exposes OpenPR as a tool provider for AI assistants.
+Three transport protocols are supported simultaneously.
+
+### Transport Protocols
+
+| Protocol | Use Case | Endpoint |
+|----------|----------|----------|
+| **HTTP** | Web integrations, OpenClaw plugins | `POST /mcp/rpc` |
+| **stdio** | Claude Desktop, Codex, local CLI | stdin/stdout JSON-RPC |
+| **SSE** | Streaming clients, real-time UIs | `GET /sse` → `POST /messages?session_id=<id>` |
+
+> HTTP mode exposes all three protocols on a single port: `/mcp/rpc` (HTTP), `/sse` + `/messages` (SSE), and health at `/health`.
+
+### MCP Client Configuration
+
+#### Claude Desktop / Cursor / Codex (stdio)
 
 ```json
 {
   "mcpServers": {
     "openpr": {
-      "command": "./target/release/mcp-server",
+      "command": "/path/to/mcp-server",
       "args": ["--transport", "stdio"],
       "env": {
-        "DATABASE_URL": "postgres://openpr:openpr@localhost:5432/openpr"
+        "OPENPR_API_URL": "http://localhost:3000",
+        "OPENPR_BOT_TOKEN": "opr_your_token_here",
+        "OPENPR_WORKSPACE_ID": "your-workspace-uuid"
       }
     }
   }
 }
 ```
 
-### HTTP Mode
+#### HTTP Mode
 
 ```bash
-# Start MCP server
-cargo run --bin mcp-server -- --transport http --port 8090
+./target/release/mcp-server --transport http --bind-addr 0.0.0.0:8090
 
-# Test
-curl -X POST http://localhost:8090/mcp \
+# Verify
+curl -X POST http://localhost:8090/mcp/rpc \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
+
+#### SSE Mode
+
+```bash
+# 1. Connect SSE stream (returns session endpoint)
+curl -N -H "Accept: text/event-stream" http://localhost:8090/sse
+# → event: endpoint
+# → data: /messages?session_id=<uuid>
+
+# 2. POST request to the returned endpoint
+curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
+# → Response arrives via SSE stream as event: message
+```
+
+#### Docker Compose
+
+```yaml
+mcp-server:
+  build:
+    context: .
+    dockerfile: Dockerfile.prebuilt
+    args:
+      BINARY: mcp-server
+  environment:
+    - OPENPR_API_URL=http://api:8080
+    - OPENPR_BOT_TOKEN=opr_your_token
+    - OPENPR_WORKSPACE_ID=your-workspace-uuid
+  ports:
+    - "8090:8090"
+  command: ["./mcp-server", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
+```
+
+### Environment Variables
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `OPENPR_API_URL` | Yes | API server base URL | `http://localhost:3000` |
+| `OPENPR_BOT_TOKEN` | Yes | Bot token (`opr_` prefix) | `opr_abc123...` |
+| `OPENPR_WORKSPACE_ID` | Yes | Default workspace UUID | `e5166fd1-...` |
+
+### Bot Token Authentication
+
+MCP authenticates via **Bot Tokens** (prefix `opr_`), managed at **Workspace → Members → Bot Tokens** in the frontend.
+
+Each bot token:
+- Has a display name (shown in activity feeds)
+- Is scoped to one workspace
+- Creates a `bot_mcp` user entity for audit trail integrity
+- Supports all read/write operations available to workspace members
+
+### Tool Reference (34 tools)
+
+#### Projects (5)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `projects.list` | — | List all projects in workspace |
+| `projects.get` | `project_id` | Get project details with issue counts |
+| `projects.create` | `key`, `name` | Create a project (key e.g. `PRX`) |
+| `projects.update` | `project_id` | Update name/description |
+| `projects.delete` | `project_id` | Delete a project |
+
+#### Work Items / Issues (12)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `work_items.list` | `project_id` | List issues in a project |
+| `work_items.get` | `work_item_id` | Get issue by UUID |
+| `work_items.get_by_identifier` | `identifier` | Get by human ID (e.g. `PRX-42`) |
+| `work_items.create` | `project_id`, `title` | Create issue. Optional: `state` (backlog/todo/in_progress/done), `priority`, `description`, `assignee_id`, `due_at`, `attachments` |
+| `work_items.update` | `work_item_id` | Update any field. `attachments` appended as markdown links |
+| `work_items.delete` | `work_item_id` | Delete an issue |
+| `work_items.search` | `query` | Full-text search across all projects |
+| `work_items.add_label` | `work_item_id`, `label_id` | Add one label |
+| `work_items.add_labels` | `work_item_id`, `label_ids` | Add multiple labels |
+| `work_items.remove_label` | `work_item_id`, `label_id` | Remove a label |
+| `work_items.list_labels` | `work_item_id` | List labels on an issue |
+
+#### Comments (3)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `comments.create` | `work_item_id`, `content` | Create comment. Optional: `attachments` |
+| `comments.list` | `work_item_id` | List comments on an issue |
+| `comments.delete` | `comment_id` | Delete a comment |
+
+#### Files (1)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `files.upload` | `filename`, `content_base64` | Upload file (base64), returns `{ url, filename }`. Types: images, `.zip`, `.gz`, `.log`, `.txt`, `.pdf`, `.json`, `.csv`, `.xml` |
+
+#### Labels (5)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `labels.list` | — | List all workspace labels |
+| `labels.list_by_project` | `project_id` | List labels for a project |
+| `labels.create` | `name`, `color` | Create label (color: hex e.g. `#2563eb`) |
+| `labels.update` | `label_id` | Update name/color/description |
+| `labels.delete` | `label_id` | Delete a label |
+
+#### Sprints (4)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `sprints.list` | `project_id` | List sprints in a project |
+| `sprints.create` | `project_id`, `name` | Create sprint. Optional: `start_date`, `end_date` |
+| `sprints.update` | `sprint_id` | Update name/dates/status |
+| `sprints.delete` | `sprint_id` | Delete a sprint |
+
+#### Proposals (3)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `proposals.list` | `project_id` | List proposals, optional `status` filter |
+| `proposals.get` | `proposal_id` | Get proposal details |
+| `proposals.create` | `project_id`, `title`, `description` | Create a governance proposal |
+
+#### Members & Search (2)
+| Tool | Required Params | Description |
+|------|-----------------|-------------|
+| `members.list` | — | List workspace members and roles |
+| `search.all` | `query` | Global search across projects, issues, comments |
+
+### Response Format
+
+Success:
+```json
+{ "code": 0, "message": "success", "data": { ... } }
+```
+
+Error:
+```json
+{ "code": 400, "message": "error description" }
+```
+
+## Skills and Agent Integration
+
+- **Agent guide**: `apps/mcp-server/AGENTS.md` — workflow patterns and full tool examples for coding agents.
+- **Skill package**: `skills/openpr-mcp/SKILL.md` — governed skill with workflow lines, templates, and scripts.
+- **Client discovery**:
+  1. Load `AGENTS.md` for tool semantics.
+  2. Use `tools/list` to enumerate available tools at runtime.
+  3. Follow workflow patterns (search → create → label → comment) for structured task execution.
+
+## Features
+
+### Project Management
+- Workspaces & Projects — Multi-tenant isolation with role-based access
+- Issues & Board — Kanban with drag-and-drop, priority, assignees, labels
+- Sprints & Cycles — Sprint planning with cycle tracking
+- Full-text Search — PostgreSQL FTS across issues, comments, proposals
+- File Uploads — Attachments on issues, comments, proposals (images, docs, logs, archives)
+- Activity Feed — Per-issue activity stream
+- Notifications & Inbox — In-app notification center
+- Import / Export — Bulk data operations
+
+### Governance Center
+- Proposals — Create, review, vote with configurable thresholds
+- Voting System — Weighted voting with quorum
+- Decision Records — Immutable log with audit trail
+- Veto & Escalation — Veto power with escalation voting
+- Trust Scores — Per-user scoring with history and appeals
+- Proposal Templates, Chains, Impact Reviews
+- Audit Logs & Analytics
+
+### AI Integration
+- AI Agents — Register AI participants with roles and permissions
+- AI Tasks — Assign tasks to agents with progress tracking
+- AI Review — AI feedback on proposals
+- Bot Tokens — `opr_` prefixed workspace-scoped tokens
+- MCP Server — 34 tools, 3 transports
+- Webhook Callbacks — Task completion/failure/progress
 
 ## API Overview
 
@@ -173,11 +274,25 @@ curl -X POST http://localhost:8090/mcp \
 | Decisions | `/api/decisions/*` | Decision records |
 | Trust | `/api/trust-scores/*` | Trust scores, history, appeals |
 | Veto | `/api/veto/*` | Veto, escalation, voting |
-| AI Agents | `/api/projects/*/ai-agents/*` | Register and manage AI agents |
+| AI Agents | `/api/projects/*/ai-agents/*` | Agent registration and management |
 | AI Tasks | `/api/projects/*/ai-tasks/*` | Task assignment and callbacks |
+| Bots | `/api/workspaces/*/bots` | Bot token CRUD |
+| Upload | `/api/v1/upload` | File upload (multipart/form-data) |
 | Webhooks | `/api/workspaces/*/webhooks/*` | Webhook CRUD and delivery log |
 | Search | `/api/search` | Full-text search |
 | Admin | `/api/admin/*` | User and system management |
+
+## Documentation Map
+
+| Document | Location | Purpose |
+|----------|----------|---------|
+| Project overview | `README.md` | Setup, MCP config, tool reference |
+| Agent guide | `apps/mcp-server/AGENTS.md` | Coding agent workflow patterns |
+| Skill package | `skills/openpr-mcp/SKILL.md` | Governed MCP skill for agents |
+| API routes | `apps/api/src/main.rs` | Route registration |
+| MCP tools | `apps/mcp-server/src/tools/` | Tool implementations |
+| Frontend | `frontend/` | SvelteKit app |
+| Migrations | `migrations/` | Database schema |
 
 ## Related Projects
 
@@ -185,15 +300,17 @@ curl -X POST http://localhost:8090/mcp \
 |------------|-------------|
 | [openpr](https://github.com/openprx/openpr) | Core platform (this repo) |
 | [openpr-webhook](https://github.com/openprx/openpr-webhook) | Webhook receiver for external integrations |
-| [openprx](https://github.com/openprx/openprx) | AI assistant framework with built-in OpenPR MCP support |
+| [prx](https://github.com/openprx/prx) | AI assistant framework with built-in OpenPR MCP |
+| [prx-memory](https://github.com/openprx/prx-memory) | Local-first MCP memory for coding agents |
+| [wacli](https://github.com/openprx/wacli) | WhatsApp CLI with JSON-RPC daemon |
 
 ## Tech Stack
 
 - **Backend**: Rust, Axum, SeaORM, PostgreSQL
 - **Frontend**: SvelteKit, TailwindCSS, shadcn-svelte
-- **MCP**: JSON-RPC 2.0 (HTTP + stdio)
-- **Auth**: JWT (access + refresh tokens)
-- **Deployment**: Docker Compose, Nginx
+- **MCP**: JSON-RPC 2.0 (HTTP + stdio + SSE)
+- **Auth**: JWT (access + refresh) + Bot Tokens (`opr_`)
+- **Deployment**: Docker Compose, Podman, Nginx
 
 ## License
 

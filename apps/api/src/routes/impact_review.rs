@@ -189,7 +189,11 @@ pub async fn list_impact_reviews(
         .list_reviews(query.project_id, query.status, query.rating, page, per_page)
         .await?;
 
-    let total_pages = if total == 0 { 0 } else { (total + per_page - 1) / per_page };
+    let total_pages = if total == 0 {
+        0
+    } else {
+        (total + per_page - 1) / per_page
+    };
 
     Ok(ApiResponse::success(PaginatedData {
         items,

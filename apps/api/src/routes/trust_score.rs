@@ -121,9 +121,21 @@ async fn load_user_trust_scores(
             AND EXISTS (
                 SELECT 1
                 FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
                 WHERE p.id = ts.project_id
-                  AND wm.user_id = $2
+                  AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM workspace_members wm
+                        WHERE wm.workspace_id = p.workspace_id
+                          AND wm.user_id = $2
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workspace_bots wb
+                        WHERE wb.workspace_id = p.workspace_id
+                          AND wb.id = $2
+                    )
+                  )
             )
         "#,
     )];
@@ -150,13 +162,15 @@ async fn load_user_trust_scores(
         where_parts.join(" AND ")
     );
 
-    Ok(UserTrustScoreRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?)
+    Ok(
+        UserTrustScoreRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
+        .all(&state.db)
+        .await?,
+    )
 }
 
 fn build_user_trust_payload(
@@ -230,9 +244,21 @@ pub async fn list_trust_scores(
         r#"EXISTS (
                 SELECT 1
                 FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
                 WHERE p.id = ts.project_id
-                  AND wm.user_id = $1
+                  AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM workspace_members wm
+                        WHERE wm.workspace_id = p.workspace_id
+                          AND wm.user_id = $1
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workspace_bots wb
+                        WHERE wb.workspace_id = p.workspace_id
+                          AND wb.id = $1
+                    )
+                  )
             )"#,
     )];
     let mut values: Vec<sea_orm::Value> = vec![user_id.into()];
@@ -251,7 +277,8 @@ pub async fn list_trust_scores(
 
     let where_sql = where_parts.join(" AND ");
 
-    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM trust_scores ts WHERE {where_sql}");
+    let count_sql =
+        format!("SELECT COUNT(*)::bigint AS count FROM trust_scores ts WHERE {where_sql}");
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         count_sql,
@@ -284,7 +311,11 @@ pub async fn list_trust_scores(
     .all(&state.db)
     .await?;
 
-    let total_pages = if total == 0 { 0 } else { (total + per_page - 1) / per_page };
+    let total_pages = if total == 0 {
+        0
+    } else {
+        (total + per_page - 1) / per_page
+    };
     Ok(ApiResponse::success(PaginatedData {
         items,
         total,
@@ -303,7 +334,8 @@ pub async fn get_user_trust(
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
-    let rows = load_user_trust_scores(&state, user_id, target_user_id, query.project_id, None).await?;
+    let rows =
+        load_user_trust_scores(&state, user_id, target_user_id, query.project_id, None).await?;
     let payload = build_user_trust_payload(target_user_id, rows)?;
     Ok(ApiResponse::success(payload))
 }
@@ -321,9 +353,14 @@ pub async fn get_user_trust_by_domain(
         return Err(ApiError::BadRequest("invalid domain".to_string()));
     }
 
-    let rows =
-        load_user_trust_scores(&state, user_id, target_user_id, query.project_id, Some(domain))
-            .await?;
+    let rows = load_user_trust_scores(
+        &state,
+        user_id,
+        target_user_id,
+        query.project_id,
+        Some(domain),
+    )
+    .await?;
     let payload = build_user_trust_payload(target_user_id, rows)?;
     Ok(ApiResponse::success(payload))
 }
@@ -364,9 +401,21 @@ pub async fn list_user_trust_history(
             AND EXISTS (
                 SELECT 1
                 FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
                 WHERE p.id = t.project_id
-                  AND wm.user_id = $2
+                  AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM workspace_members wm
+                        WHERE wm.workspace_id = p.workspace_id
+                          AND wm.user_id = $2
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workspace_bots wb
+                        WHERE wb.workspace_id = p.workspace_id
+                          AND wb.id = $2
+                    )
+                  )
             )
         "#,
     )];

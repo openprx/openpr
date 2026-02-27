@@ -12,7 +12,8 @@ pub fn list_comments_tool() -> ToolDefinition {
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "UUID of the work item"
+                    "description": "UUID of the work item",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             },
             "required": ["work_item_id"]
@@ -49,11 +50,19 @@ pub fn create_comment_tool() -> ToolDefinition {
             "properties": {
                 "work_item_id": {
                     "type": "string",
-                    "description": "UUID of the work item"
+                    "description": "UUID of the work item",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "content": {
                     "type": "string",
                     "description": "Comment content"
+                },
+                "attachments": {
+                    "type": "array",
+                    "description": "Uploaded file URLs (optional)",
+                    "items": {
+                        "type": "string"
+                    }
                 }
             },
             "required": ["work_item_id", "content"]
@@ -65,6 +74,7 @@ pub fn create_comment_tool() -> ToolDefinition {
 struct CreateCommentInput {
     work_item_id: String,
     content: String,
+    attachments: Option<Vec<String>>,
 }
 
 pub async fn create_comment(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -73,7 +83,9 @@ pub async fn create_comment(client: &OpenPrClient, args: serde_json::Value) -> C
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let body = json!({ "content": input.content });
+    let body = json!({
+        "content": append_attachments_to_content(input.content, input.attachments)
+    });
 
     match client.create_comment(&input.work_item_id, body).await {
         Ok(comment) => {
@@ -82,6 +94,29 @@ pub async fn create_comment(client: &OpenPrClient, args: serde_json::Value) -> C
         }
         Err(e) => CallToolResult::error(e),
     }
+}
+
+fn append_attachments_to_content(content: String, attachments: Option<Vec<String>>) -> String {
+    match attachments {
+        Some(items) if !items.is_empty() => {
+            let mut output = content;
+            output.push_str("\n\n**附件：**\n");
+            for url in items {
+                let name = attachment_name_from_url(&url);
+                output.push_str(&format!("- [{}]({})\n", name, url));
+            }
+            output.trim_end().to_string()
+        }
+        _ => content,
+    }
+}
+
+fn attachment_name_from_url(url: &str) -> String {
+    url.rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(url)
+        .to_string()
 }
 
 pub fn delete_comment_tool() -> ToolDefinition {
@@ -93,7 +128,8 @@ pub fn delete_comment_tool() -> ToolDefinition {
             "properties": {
                 "comment_id": {
                     "type": "string",
-                    "description": "UUID of the comment"
+                    "description": "UUID of the comment",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             },
             "required": ["comment_id"]

@@ -162,7 +162,9 @@ impl PermissionService {
         .one(&self.db)
         .await?;
 
-        Ok(ai_row.filter(|ai| ai.is_active).map(|ai| ai.reason_min_length))
+        Ok(ai_row
+            .filter(|ai| ai.is_active)
+            .map(|ai| ai.reason_min_length))
     }
 
     pub async fn ai_can_veto_human_consensus(

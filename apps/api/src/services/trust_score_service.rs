@@ -598,7 +598,10 @@ pub fn scoped_domain_id(project_id: Uuid, key: &str) -> String {
 }
 
 pub fn split_domain_key(domain_id: &str) -> &str {
-    domain_id.split_once('-').map(|(_, right)| right).unwrap_or(domain_id)
+    domain_id
+        .split_once('-')
+        .map(|(_, right)| right)
+        .unwrap_or(domain_id)
 }
 
 pub async fn is_project_member(

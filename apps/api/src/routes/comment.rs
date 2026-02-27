@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{ApiError, localize_error, request_lang},
+    middleware::bot_auth::{BotAuthContext, require_workspace_access},
     response::{ApiResponse, PaginatedData},
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
 };
@@ -70,6 +71,18 @@ fn normalize_mentions(mentions: Option<Vec<Uuid>>, actor_id: Uuid) -> Vec<Uuid> 
         .filter(|id| *id != actor_id)
         .filter(|id| seen.insert(*id))
         .collect()
+}
+
+fn build_auth_extensions(
+    claims: JwtClaims,
+    bot: Option<Extension<BotAuthContext>>,
+) -> axum::http::Extensions {
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
+    extensions
 }
 
 async fn create_mention_notifications<C: ConnectionTrait>(
@@ -135,6 +148,7 @@ async fn create_mention_notifications<C: ConnectionTrait>(
 pub async fn create_comment(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     headers: HeaderMap,
     Path(issue_id): Path<Uuid>,
     Json(req): Json<CreateCommentRequest>,
@@ -142,10 +156,14 @@ pub async fn create_comment(
     let lang = request_lang(&headers);
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     let content = req.resolved_content().trim().to_string();
     if content.is_empty() {
-        return Err(ApiError::BadRequest(localize_error("content is required", lang)));
+        return Err(ApiError::BadRequest(localize_error(
+            "content is required",
+            lang,
+        )));
     }
 
     #[derive(Debug, FromQueryResult)]
@@ -154,21 +172,22 @@ pub async fn create_comment(
         workspace_id: Uuid,
     }
 
-    // Verify issue exists and user has access, and fetch project/workspace context.
+    // Verify issue exists and fetch project/workspace context.
     let issue_context = IssueContext::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
             SELECT wi.project_id, p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wi.id = $1 AND wm.user_id = $2
+            WHERE wi.id = $1
         "#,
-        vec![issue_id.into(), user_id.into()],
+        vec![issue_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound(localize_error("issue not found or access denied", lang)))?;
+    .ok_or_else(|| ApiError::NotFound(localize_error("issue not found", lang)))?;
+
+    require_workspace_access(&state, &extensions, issue_context.workspace_id).await?;
 
     #[derive(Debug, FromQueryResult)]
     struct UserInfo {
@@ -255,32 +274,33 @@ pub async fn create_comment(
 pub async fn list_comments(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
-    // Verify issue exists and user has access
-    let issue_exists = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM work_items wi
-                INNER JOIN projects p ON wi.project_id = p.id
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE wi.id = $1 AND wm.user_id = $2
-            "#,
-            vec![issue_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if issue_exists.is_none() {
-        return Err(ApiError::NotFound(
-            "issue not found or access denied".to_string(),
-        ));
+    #[derive(Debug, FromQueryResult)]
+    struct IssueWorkspace {
+        workspace_id: Uuid,
     }
+
+    let issue = IssueWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+            SELECT p.workspace_id
+            FROM work_items wi
+            INNER JOIN projects p ON wi.project_id = p.id
+            WHERE wi.id = $1
+        "#,
+        vec![issue_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, issue.workspace_id).await?;
 
     #[derive(Debug, FromQueryResult)]
     struct CommentRow {
@@ -340,7 +360,10 @@ pub async fn update_comment(
 
     let content = req.resolved_content().trim().to_string();
     if content.is_empty() {
-        return Err(ApiError::BadRequest(localize_error("content cannot be empty", lang)));
+        return Err(ApiError::BadRequest(localize_error(
+            "content cannot be empty",
+            lang,
+        )));
     }
 
     // Get comment and verify author.
@@ -508,10 +531,12 @@ pub async fn update_comment(
 pub async fn delete_comment(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(comment_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     // Get comment context.
     #[derive(Debug, FromQueryResult)]
@@ -542,30 +567,12 @@ pub async fn delete_comment(
     let is_author = comment_info.author_id == Some(user_id);
 
     if !is_author {
-        // If not author, check if user is owner/admin.
-        #[derive(Debug, FromQueryResult)]
-        struct RoleRow {
-            role: String,
-        }
-
-        let role = RoleRow::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-            vec![comment_info.workspace_id.into(), user_id.into()],
-        ))
-        .one(&state.db)
-        .await?;
-
-        match role {
-            Some(r) if r.role == "owner" || r.role == "admin" => {
-                // Owner/admin can delete.
-            }
-            _ => {
-                return Err(ApiError::Forbidden(
-                    "only the comment author or workspace owner/admin can delete comments"
-                        .to_string(),
-                ));
-            }
+        let (_, role, _) =
+            require_workspace_access(&state, &extensions, comment_info.workspace_id).await?;
+        if role != "owner" && role != "admin" {
+            return Err(ApiError::Forbidden(
+                "only the comment author or workspace owner/admin can delete comments".to_string(),
+            ));
         }
     }
 

@@ -317,7 +317,9 @@ pub async fn vote_escalation(
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let service = VetoService::new(state.db.clone());
-    let event = service.cast_escalation_vote(&id, user_id, req.overturn).await?;
+    let event = service
+        .cast_escalation_vote(&id, user_id, req.overturn)
+        .await?;
     write_veto_audit_log(
         &state,
         &id,
@@ -349,9 +351,21 @@ pub async fn list_vetoers(
         r#"EXISTS (
             SELECT 1
             FROM projects p
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
             WHERE p.id = v.project_id
-              AND wm.user_id = $1
+              AND (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+              )
         )"#,
     )];
     let mut idx = 2;
@@ -484,7 +498,10 @@ pub async fn delete_vetoer(
     Ok(ApiResponse::ok())
 }
 
-async fn resolve_project_for_proposal(state: &AppState, proposal_id: &str) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_project_for_proposal(
+    state: &AppState,
+    proposal_id: &str,
+) -> Result<Option<Uuid>, ApiError> {
     #[derive(Debug, FromQueryResult)]
     struct ProjectRow {
         project_id: Uuid,
@@ -520,7 +537,9 @@ async fn resolve_project_for_proposal(state: &AppState, proposal_id: &str) -> Re
     let Some(author) = author else {
         return Ok(None);
     };
-    let author_id: String = author.try_get("", "author_id").map_err(|_| ApiError::Internal)?;
+    let author_id: String = author
+        .try_get("", "author_id")
+        .map_err(|_| ApiError::Internal)?;
     let Ok(author_uuid) = Uuid::parse_str(&author_id) else {
         return Ok(None);
     };
@@ -530,8 +549,18 @@ async fn resolve_project_for_proposal(state: &AppState, proposal_id: &str) -> Re
         r#"
             SELECT p.id AS project_id
             FROM projects p
-            INNER JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-            WHERE wm.user_id = $1
+            WHERE EXISTS (
+                      SELECT 1
+                      FROM workspace_members wm
+                      WHERE wm.workspace_id = p.workspace_id
+                        AND wm.user_id = $1
+                  )
+               OR EXISTS (
+                      SELECT 1
+                      FROM workspace_bots wb
+                      WHERE wb.workspace_id = p.workspace_id
+                        AND wb.id = $1
+                  )
             ORDER BY p.created_at DESC
             LIMIT 2
         "#,
@@ -596,7 +625,10 @@ async fn write_veto_audit_log(
     .await
 }
 
-async fn fetch_actor_author_type(state: &AppState, user_id: Uuid) -> Result<ParticipantType, ApiError> {
+async fn fetch_actor_author_type(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<ParticipantType, ApiError> {
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(

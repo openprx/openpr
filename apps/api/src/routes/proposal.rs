@@ -310,6 +310,33 @@ fn gen_prefixed_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
 }
 
+fn parse_uuid_with_optional_prefix(value: &str) -> Option<Uuid> {
+    if let Ok(uuid) = Uuid::parse_str(value) {
+        return Some(uuid);
+    }
+
+    let (_, suffix) = value.split_once('-')?;
+    Uuid::parse_str(suffix).ok()
+}
+
+fn proposal_lookup_candidates(value: &str) -> Vec<String> {
+    let mut candidates = vec![value.to_string()];
+    let Some(uuid) = parse_uuid_with_optional_prefix(value) else {
+        return candidates;
+    };
+
+    let bare = uuid.to_string();
+    let prefixed = format!("PROP-{bare}");
+    if !candidates.iter().any(|v| v == &prefixed) {
+        candidates.push(prefixed);
+    }
+    if !candidates.iter().any(|v| v == &bare) {
+        candidates.push(bare);
+    }
+
+    candidates
+}
+
 fn optional_dt(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(format_dt)
 }
@@ -357,7 +384,10 @@ fn take_template_domains(content: &Value) -> Option<Vec<String>> {
     })
 }
 
-async fn build_actor_context(state: &AppState, claims: &JwtClaims) -> Result<ActorContext, ApiError> {
+async fn build_actor_context(
+    state: &AppState,
+    claims: &JwtClaims,
+) -> Result<ActorContext, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
@@ -385,22 +415,28 @@ async fn build_actor_context(state: &AppState, claims: &JwtClaims) -> Result<Act
 }
 
 async fn find_proposal(state: &AppState, proposal_id: &str) -> Result<ProposalRow, ApiError> {
-    ProposalRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r#"
-            SELECT id, title, proposal_type::text AS proposal_type, status::text AS status,
-                   author_id, author_type::text AS author_type, content, domains,
-                   voting_rule::text AS voting_rule, cycle_template::text AS cycle_template,
-                   template_id,
-                   created_at, submitted_at, voting_started_at, voting_ended_at, archived_at
-            FROM proposals
-            WHERE id = $1
-        "#,
-        vec![proposal_id.into()],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("proposal not found".to_string()))
+    for lookup_id in proposal_lookup_candidates(proposal_id) {
+        if let Some(proposal) = ProposalRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r#"
+                SELECT id, title, proposal_type::text AS proposal_type, status::text AS status,
+                       author_id, author_type::text AS author_type, content, domains,
+                       voting_rule::text AS voting_rule, cycle_template::text AS cycle_template,
+                       template_id,
+                       created_at, submitted_at, voting_started_at, voting_ended_at, archived_at
+                FROM proposals
+                WHERE id = $1
+            "#,
+            vec![lookup_id.into()],
+        ))
+        .one(&state.db)
+        .await?
+        {
+            return Ok(proposal);
+        }
+    }
+
+    Err(ApiError::NotFound("proposal not found".to_string()))
 }
 
 async fn proposal_tally(state: &AppState, proposal_id: &str) -> Result<VoteTally, ApiError> {
@@ -463,7 +499,10 @@ fn calculate_result(yes: f64, no: f64, rule: &str) -> DecisionResult {
     }
 }
 
-async fn ensure_voting_finalized_if_needed(state: &AppState, proposal: &ProposalRow) -> Result<(), ApiError> {
+async fn ensure_voting_finalized_if_needed(
+    state: &AppState,
+    proposal: &ProposalRow,
+) -> Result<(), ApiError> {
     if proposal.status != "voting" {
         return Ok(());
     }
@@ -562,7 +601,8 @@ async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(),
 
     if let Err(err) = decision_insert {
         let message = err.to_string();
-        if message.contains("decisions_proposal_id_key") || message.contains("duplicate key value") {
+        if message.contains("decisions_proposal_id_key") || message.contains("duplicate key value")
+        {
             let _ = tx.rollback().await;
             tracing::warn!(
                 proposal_id = proposal.id,
@@ -637,7 +677,10 @@ async fn governance_watcher_tick(state: &AppState) -> Result<(), ApiError> {
     .await?;
 
     if !open_to_voting.is_empty() {
-        tracing::info!(count = open_to_voting.len(), "governance watcher moved proposals to voting");
+        tracing::info!(
+            count = open_to_voting.len(),
+            "governance watcher moved proposals to voting"
+        );
         for moved in &open_to_voting {
             if let Some(project_id) =
                 resolve_project_id_for_proposal(state, &moved.id, &moved.author_id).await?
@@ -750,17 +793,36 @@ async fn resolve_project_id_for_proposal_with_conn<C: ConnectionTrait>(
         return Ok(None);
     }
 
+    let Some(author_uuid) = parse_uuid_with_optional_prefix(author_id) else {
+        tracing::warn!(
+            proposal_id = proposal_id,
+            author_id = author_id,
+            "skip trust score update: author id is not UUID-compatible"
+        );
+        return Ok(None);
+    };
+
     let fallback = ProposalProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
             SELECT p.id AS project_id
             FROM projects p
-            INNER JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
-            WHERE wm.user_id = $1::uuid
+            WHERE EXISTS (
+                      SELECT 1
+                      FROM workspace_members wm
+                      WHERE wm.workspace_id = p.workspace_id
+                        AND wm.user_id = $1
+                  )
+               OR EXISTS (
+                      SELECT 1
+                      FROM workspace_bots wb
+                      WHERE wb.workspace_id = p.workspace_id
+                        AND wb.id = $1
+                  )
             ORDER BY p.created_at DESC
             LIMIT 2
         "#,
-        vec![author_id.to_string().into()],
+        vec![author_uuid.into()],
     ))
     .all(db)
     .await;
@@ -815,10 +877,11 @@ async fn resolve_vote_weight_for_proposal(
         return Ok(1.0);
     };
 
-    let project_id = match resolve_project_id_for_proposal(state, proposal_id, &author.author_id).await? {
-        Some(id) => id,
-        None => return Ok(1.0),
-    };
+    let project_id =
+        match resolve_project_id_for_proposal(state, proposal_id, &author.author_id).await? {
+            Some(id) => id,
+            None => return Ok(1.0),
+        };
     let participant = parse_participant_type(voter_type);
     let participant_str = match participant {
         ParticipantType::Ai => "ai",
@@ -883,7 +946,9 @@ async fn resolve_vote_weight_from_trust_scores<C: ConnectionTrait>(
         ))
         .one(db)
         .await?;
-        return Ok(row.map(|item| item.vote_weight.clamp(0.5, 2.0)).unwrap_or(1.0));
+        return Ok(row
+            .map(|item| item.vote_weight.clamp(0.5, 2.0))
+            .unwrap_or(1.0));
     }
 
     let mut values: Vec<sea_orm::Value> = vec![
@@ -919,7 +984,9 @@ async fn resolve_vote_weight_from_trust_scores<C: ConnectionTrait>(
     .one(db)
     .await?;
 
-    Ok(row.map(|item| item.vote_weight.clamp(0.5, 2.0)).unwrap_or(1.0))
+    Ok(row
+        .map(|item| item.vote_weight.clamp(0.5, 2.0))
+        .unwrap_or(1.0))
 }
 
 async fn recalculate_and_tally_votes_with_conn<C: ConnectionTrait>(
@@ -934,7 +1001,8 @@ async fn recalculate_and_tally_votes_with_conn<C: ConnectionTrait>(
         weighted_no: Some(0.0),
     };
     let proposal_domains = parse_domains(&proposal.domains);
-    let project_id = resolve_project_id_for_proposal_with_conn(db, &proposal.id, &proposal.author_id).await?;
+    let project_id =
+        resolve_project_id_for_proposal_with_conn(db, &proposal.id, &proposal.author_id).await?;
 
     let votes = VoteForFinalizeRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1014,7 +1082,9 @@ async fn apply_trust_score_after_finalize_with_conn<C: ConnectionTrait>(
     };
 
     let project_id =
-        match resolve_project_id_for_proposal_with_conn(db, &proposal.id, &proposal.author_id).await? {
+        match resolve_project_id_for_proposal_with_conn(db, &proposal.id, &proposal.author_id)
+            .await?
+        {
             Some(id) => id,
             None => return Ok(()),
         };
@@ -1108,25 +1178,28 @@ pub async fn create_proposal(
     let mut template_project_id: Option<Uuid> = None;
 
     if let Some(template_id) = req.template_id.as_deref() {
-        let template = ProposalTemplateForCreateRow::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
+        let template =
+            ProposalTemplateForCreateRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r#"
                 SELECT id, project_id, template_type, content, is_active
                 FROM proposal_templates
                 WHERE id = $1
             "#,
-            vec![template_id.to_string().into()],
-        ))
-        .one(&state.db)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("proposal template not found".to_string()))?;
+                vec![template_id.to_string().into()],
+            ))
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| ApiError::NotFound("proposal template not found".to_string()))?;
 
         if !template.is_active {
             return Err(ApiError::BadRequest(
                 "proposal template is inactive".to_string(),
             ));
         }
-        if !actor.is_admin && !is_project_member(&state.db, template.project_id, actor.user_id).await? {
+        if !actor.is_admin
+            && !is_project_member(&state.db, template.project_id, actor.user_id).await?
+        {
             return Err(ApiError::Forbidden("project access denied".to_string()));
         }
 
@@ -1359,7 +1432,10 @@ pub async fn list_proposals(
     };
 
     let mut count_values = values.clone();
-    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM proposals {}", where_sql);
+    let count_sql = format!(
+        "SELECT COUNT(*)::bigint AS count FROM proposals {}",
+        where_sql
+    );
 
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1449,8 +1525,10 @@ pub async fn update_proposal(
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
     let proposal = find_proposal(&state, &id).await?;
-    let old_snapshot = serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
-    let old_snapshot = serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
+    let old_snapshot =
+        serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
+    let old_snapshot =
+        serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
 
     if proposal.author_id != actor.user_id_str {
         return Err(ApiError::Forbidden(
@@ -1545,13 +1623,18 @@ pub async fn update_proposal(
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            format!("UPDATE proposals SET {} WHERE id = ${}", set_parts.join(", "), idx),
+            format!(
+                "UPDATE proposals SET {} WHERE id = ${}",
+                set_parts.join(", "),
+                idx
+            ),
             values,
         ))
         .await?;
 
     let updated = find_proposal(&state, &id).await?;
-    let new_snapshot = serde_json::to_value(proposal_to_item(&updated)).map_err(|_| ApiError::Internal)?;
+    let new_snapshot =
+        serde_json::to_value(proposal_to_item(&updated)).map_err(|_| ApiError::Internal)?;
     write_proposal_audit_log(
         &state,
         &updated,
@@ -1596,7 +1679,8 @@ pub async fn delete_proposal(
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
     let proposal = find_proposal(&state, &id).await?;
-    let old_snapshot = serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
+    let old_snapshot =
+        serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
 
     if proposal.author_id != actor.user_id_str {
         return Err(ApiError::Forbidden(
@@ -1631,7 +1715,8 @@ pub async fn delete_proposal(
     )
     .await?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
+    if let Some(project_id) =
+        resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
         && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
     {
         trigger_webhooks(
@@ -1706,7 +1791,8 @@ pub async fn submit_proposal(
     )
     .await?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
+    if let Some(project_id) =
+        resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
         && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
     {
         trigger_webhooks(
@@ -1787,7 +1873,9 @@ pub async fn start_voting(
     )
     .await?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await? {
+    if let Some(project_id) =
+        resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
+    {
         let _ = queue_vote_requested_tasks_for_project(
             &state.db,
             project_id,
@@ -1867,7 +1955,8 @@ pub async fn archive_proposal(
     )
     .await?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
+    if let Some(project_id) =
+        resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
         && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
     {
         trigger_webhooks(
@@ -1924,8 +2013,7 @@ pub async fn create_vote(
     }
 
     if actor.author_type == "ai" {
-        let project_id =
-            resolve_project_id_for_proposal(&state, &id, &proposal.author_id).await?;
+        let project_id = resolve_project_id_for_proposal(&state, &id, &proposal.author_id).await?;
         let Some(project_id) = project_id else {
             return Err(ApiError::Forbidden(
                 "ai voting requires project context".to_string(),
@@ -1967,7 +2055,8 @@ pub async fn create_vote(
     let now = Utc::now();
     let reason = req.reason.map(|value| value.trim().to_string());
     let weight =
-        resolve_vote_weight_for_proposal(&state, &id, &actor.user_id_str, actor.author_type).await?;
+        resolve_vote_weight_for_proposal(&state, &id, &actor.user_id_str, actor.author_type)
+            .await?;
 
     let res = state
         .db
@@ -2033,7 +2122,8 @@ pub async fn create_vote(
     )
     .await?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
+    if let Some(project_id) =
+        resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
         && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
     {
         trigger_webhooks(
@@ -2221,8 +2311,7 @@ pub async fn create_proposal_comment(
     }
 
     if actor.author_type == "ai" {
-        let project_id =
-            resolve_project_id_for_proposal(&state, &id, &proposal.author_id).await?;
+        let project_id = resolve_project_id_for_proposal(&state, &id, &proposal.author_id).await?;
         let Some(project_id) = project_id else {
             return Err(ApiError::Forbidden(
                 "ai commenting requires project context".to_string(),
@@ -2280,7 +2369,8 @@ pub async fn create_proposal_comment(
     .await?
     .ok_or_else(|| ApiError::Internal)?;
 
-    if let Some(project_id) = resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
+    if let Some(project_id) =
+        resolve_project_id_for_proposal(&state, &proposal.id, &proposal.author_id).await?
         && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
     {
         trigger_webhooks(

@@ -85,7 +85,10 @@ struct AiAgentCommentStatsRow {
 }
 
 fn valid_max_level(value: &str) -> bool {
-    matches!(value, "observer" | "advisor" | "voter" | "vetoer" | "autonomous")
+    matches!(
+        value,
+        "observer" | "advisor" | "voter" | "vetoer" | "autonomous"
+    )
 }
 
 pub async fn list_ai_agents(
@@ -203,7 +206,12 @@ pub async fn create_ai_agent(
         return Err(ApiError::Database(err));
     }
 
-    get_ai_agent(State(state), Extension(claims), Path((project_id, req.id.trim().to_string()))).await
+    get_ai_agent(
+        State(state),
+        Extension(claims),
+        Path((project_id, req.id.trim().to_string())),
+    )
+    .await
 }
 
 pub async fn get_ai_agent(
@@ -376,7 +384,11 @@ pub async fn update_ai_agent(
 
     let updated = state
         .db
-        .query_one(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            values,
+        ))
         .await?;
 
     if updated.is_none() {
@@ -491,11 +503,15 @@ pub async fn get_ai_agent_stats(
     .await?
     .ok_or(ApiError::Internal)?;
 
-    let latest_activity = [agent.last_active_at, vote_stats.last_voted_at, comment_stats.last_commented_at]
-        .into_iter()
-        .flatten()
-        .max()
-        .map(|time| time.to_rfc3339());
+    let latest_activity = [
+        agent.last_active_at,
+        vote_stats.last_voted_at,
+        comment_stats.last_commented_at,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .map(|time| time.to_rfc3339());
 
     Ok(ApiResponse::success(json!({
         "id": agent.id,

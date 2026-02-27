@@ -81,28 +81,38 @@ impl McpServer {
             "projects.get" => tools::projects::get_project(&self.client, args).await,
             "projects.create" => tools::projects::create_project(&self.client, args).await,
             "projects.update" => tools::projects::update_project(&self.client, args).await,
-            "projects.delete" => {
-                tools::projects::handle_delete_project(&self.client, args).await
-            }
+            "projects.delete" => tools::projects::handle_delete_project(&self.client, args).await,
 
             // Work Items
             "work_items.list" => tools::work_items::list_work_items(&self.client, args).await,
             "work_items.get" => tools::work_items::get_work_item(&self.client, args).await,
+            "work_items.get_by_identifier" => {
+                tools::work_items::get_work_item_by_identifier(&self.client, args).await
+            }
             "work_items.create" => tools::work_items::create_work_item(&self.client, args).await,
             "work_items.update" => tools::work_items::update_work_item(&self.client, args).await,
+            "work_items.add_label" => {
+                tools::work_items::add_label_to_work_item(&self.client, args).await
+            }
+            "work_items.remove_label" => {
+                tools::work_items::remove_label_from_work_item(&self.client, args).await
+            }
+            "work_items.list_labels" => {
+                tools::work_items::list_work_item_labels(&self.client, args).await
+            }
             "work_items.delete" => {
                 tools::work_items::handle_delete_work_item(&self.client, args).await
             }
-            "work_items.search" => {
-                tools::work_items::search_work_items(&self.client, args).await
+            "work_items.search" => tools::work_items::search_work_items(&self.client, args).await,
+            "work_items.add_labels" => {
+                tools::work_items::add_labels_to_work_item(&self.client, args).await
             }
 
             // Comments
             "comments.list" => tools::comments::list_comments(&self.client, args).await,
             "comments.create" => tools::comments::create_comment(&self.client, args).await,
-            "comments.delete" => {
-                tools::comments::handle_delete_comment(&self.client, args).await
-            }
+            "comments.delete" => tools::comments::handle_delete_comment(&self.client, args).await,
+            "files.upload" => tools::files::upload_file(&self.client, args).await,
 
             // Proposals
             "proposals.list" => tools::proposals::list_proposals(&self.client, args).await,
@@ -114,10 +124,18 @@ impl McpServer {
 
             // Sprints
             "sprints.create" => tools::sprints::create_sprint(&self.client, args).await,
+            "sprints.list" => tools::sprints::list_sprints(&self.client, args).await,
             "sprints.update" => tools::sprints::update_sprint(&self.client, args).await,
+            "sprints.delete" => tools::sprints::handle_delete_sprint(&self.client, args).await,
 
             // Labels
             "labels.create" => tools::labels::create_label(&self.client, args).await,
+            "labels.list" => tools::labels::list_labels(&self.client, args).await,
+            "labels.list_by_project" => {
+                tools::labels::list_project_labels(&self.client, args).await
+            }
+            "labels.update" => tools::labels::update_label(&self.client, args).await,
+            "labels.delete" => tools::labels::handle_delete_label(&self.client, args).await,
 
             // Search
             "search.all" => tools::search::search_all(&self.client, args).await,

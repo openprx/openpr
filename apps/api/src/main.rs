@@ -6,6 +6,7 @@ mod routes;
 mod services;
 mod webhook_trigger;
 
+use crate::response::ApiResponse;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
@@ -21,7 +22,6 @@ use platform::{
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use serde::Serialize;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
-use crate::response::ApiResponse;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -45,7 +45,10 @@ async fn main() -> anyhow::Result<()> {
     routes::proposal::start_governance_watcher(state.clone());
 
     let app = Router::new()
-        .route("/uploads/{file_name}", get(routes::upload::get_uploaded_file))
+        .route(
+            "/uploads/{file_name}",
+            get(routes::upload::get_uploaded_file),
+        )
         .route(
             "/api/v1/uploads/{file_name}",
             get(routes::upload::get_uploaded_file),
@@ -60,14 +63,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/auth/logout",
             post(routes::auth::logout).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         .route(
             "/api/v1/auth/me",
             get(routes::auth::me).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Workspace routes (protected)
@@ -121,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::workspace::list_workspaces)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -131,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::workspace::delete_workspace)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         // Workspace member routes (protected)
@@ -141,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::member::list_members)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -150,14 +153,14 @@ async fn main() -> anyhow::Result<()> {
                 .patch(routes::member::update_member_role)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/users",
             get(routes::member::search_users).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Project routes (protected)
@@ -167,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::project::list_projects)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -177,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::project::delete_project)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -186,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(routes::decision_domain::create_decision_domain)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -195,7 +198,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::decision_domain::delete_decision_domain)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -203,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::decision_domain::list_domain_members).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -212,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::decision_domain::list_decision_domains_global).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -222,15 +225,17 @@ async fn main() -> anyhow::Result<()> {
                 .post(routes::ai_agent::create_ai_agent)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
             "/api/v1/projects/{project_id}/ai-participants/{id}/stats",
-            get(routes::ai_agent::get_ai_agent_stats).route_layer(axum_middleware::from_fn_with_state(
-                auth_state.clone(),
-                middleware::auth::auth_middleware,
-            )),
+            get(routes::ai_agent::get_ai_agent_stats).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
         )
         .route(
             "/api/v1/projects/{project_id}/ai-participants/{id}",
@@ -239,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::ai_agent::delete_ai_agent)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -248,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(routes::ai_callback::create_project_ai_task)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -256,25 +261,23 @@ async fn main() -> anyhow::Result<()> {
             post(routes::ai_callback::complete_task).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
         .route(
             "/api/v1/ai/callbacks/task/{task_id}/fail",
-            post(routes::ai_callback::fail_task).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            post(routes::ai_callback::fail_task).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/ai/callbacks/task/{task_id}/progress",
             post(routes::ai_callback::report_progress).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -283,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::trust_score::list_trust_scores).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -292,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::trust_score::get_user_trust).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -301,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::trust_score::get_user_trust).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -310,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::trust_score::list_user_trust_history).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -319,7 +322,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::trust_score::get_user_trust_by_domain).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -330,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::issue::list_issues)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -340,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::issue::delete_issue)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         // Comment routes (protected)
@@ -350,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::comment::list_comments)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -359,20 +362,17 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::comment::delete_comment)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         // Governance proposal routes
-        .route(
-            "/api/v1/proposals",
-            get(routes::proposal::list_proposals),
-        )
+        .route("/api/v1/proposals", get(routes::proposal::list_proposals))
         .route(
             "/api/v1/proposals",
             post(routes::proposal::create_proposal).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -386,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::proposal::delete_proposal)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -394,25 +394,23 @@ async fn main() -> anyhow::Result<()> {
             post(routes::proposal::submit_proposal).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
         .route(
             "/api/v1/proposals/{id}/start-voting",
-            post(routes::proposal::start_voting).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            post(routes::proposal::start_voting).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/proposals/{id}/archive",
             post(routes::proposal::archive_proposal).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -424,7 +422,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/proposals/{id}/votes",
             post(routes::proposal::create_vote).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         .route(
@@ -432,7 +430,7 @@ async fn main() -> anyhow::Result<()> {
             delete(routes::proposal::delete_my_vote).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -443,26 +441,22 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::veto::withdraw_veto)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
             "/api/v1/proposals/{id}/veto/escalation",
-            post(routes::veto::start_escalation).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            post(routes::veto::start_escalation).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/proposals/{id}/veto/escalation/vote",
-            post(routes::veto::vote_escalation).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            post(routes::veto::vote_escalation).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/vetoers",
@@ -471,7 +465,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::veto::delete_vetoer)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -480,7 +474,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(routes::appeal::create_appeal)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -490,7 +484,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::appeal::delete_appeal)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -502,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
             post(routes::proposal::create_proposal_comment).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -511,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
             delete(routes::proposal::delete_proposal_comment).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -520,7 +514,7 @@ async fn main() -> anyhow::Result<()> {
             delete(routes::proposal::delete_proposal_comment_under_proposal).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -530,7 +524,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::proposal::list_linked_issues)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -538,7 +532,7 @@ async fn main() -> anyhow::Result<()> {
             delete(routes::proposal::unlink_issue).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -548,7 +542,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(routes::proposal_template::create_proposal_template)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -558,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::proposal_template::delete_proposal_template)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -566,7 +560,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance::get_governance_config).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -584,24 +578,22 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance::list_governance_audit_logs).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
         .route(
             "/api/v1/decisions",
-            get(routes::decision::list_decisions).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            get(routes::decision::list_decisions).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/decisions/{id}",
             get(routes::decision::get_decision).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         .route(
@@ -609,7 +601,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::decision::get_proposal_decision).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -621,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::impact_review::delete_impact_review_by_proposal)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -629,7 +621,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::impact_review::list_impact_reviews).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -639,7 +631,7 @@ async fn main() -> anyhow::Result<()> {
                 .post(routes::impact_review::upsert_review_participant)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -648,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::impact_review::delete_review_participant)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -656,7 +648,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_proposal_chain).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -665,7 +657,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_proposal_timeline).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -674,7 +666,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_decision_analytics).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -684,7 +676,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::governance_ext::list_project_audit_reports)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -692,7 +684,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_project_audit_report).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -701,7 +693,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_ai_review_feedback).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -710,7 +702,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_ai_participant_learning).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -719,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance_ext::get_ai_participant_alignment_stats).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -730,7 +722,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::label::list_labels)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -739,7 +731,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::label::delete_label)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         // Issue label association routes (protected)
@@ -749,24 +741,52 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::label::remove_label_from_issue)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
             "/api/v1/issues/{issue_id}/labels",
             get(routes::label::get_issue_labels).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
-        // Bot token management routes (protected — JWT only)
+        // Bot-accessible routes (bot_or_user_auth_middleware)
+        .route(
+            "/api/v1/projects/{project_id}/labels",
+            get(routes::label::list_project_labels).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/issues/by-identifier/{identifier}",
+            get(routes::issue::get_issue_by_identifier).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/issues/{issue_id}/labels/batch",
+            post(routes::issue::add_labels_to_issue).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
+        // Bot token management routes (protected)
         .route(
             "/api/v1/workspaces/{workspace_id}/bots",
             post(routes::bot::create_bot)
                 .get(routes::bot::list_bots)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -774,7 +794,7 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::delete(routes::bot::revoke_bot).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -784,7 +804,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::activity::get_workspace_activities).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -793,7 +813,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::activity::get_project_activities).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -802,7 +822,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::activity::get_issue_activities).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -811,14 +831,14 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/my/issues",
             get(routes::my::get_my_issues).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         .route(
             "/api/v1/my/activities",
             get(routes::my::get_my_activities).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Board routes (protected)
@@ -826,7 +846,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/projects/{project_id}/board",
             get(routes::board::get_project_board).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Sprint routes (protected)
@@ -836,7 +856,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::sprint::list_sprints)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -845,7 +865,7 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::sprint::delete_sprint)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         // Webhook routes (protected)
@@ -855,7 +875,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(routes::webhook::list_webhooks)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
@@ -865,26 +885,22 @@ async fn main() -> anyhow::Result<()> {
                 .delete(routes::webhook::delete_webhook)
                 .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/webhooks/{webhook_id}/deliveries",
-            get(routes::webhook::list_deliveries).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            get(routes::webhook::list_deliveries).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/workspaces/{workspace_id}/webhooks/{webhook_id}/deliveries/{delivery_id}",
-            get(routes::webhook::get_delivery).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+            get(routes::webhook::get_delivery).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         // Notification routes (protected)
         .route(
@@ -892,7 +908,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::notification::list_notifications).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -901,7 +917,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::notification::get_unread_count).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -909,30 +925,26 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/notifications/{id}/read",
             patch(routes::notification::mark_notification_read)
                 .put(routes::notification::mark_notification_read)
-                .route_layer(
-                axum_middleware::from_fn_with_state(
+                .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                )),
         )
         .route(
             "/api/v1/notifications/read-all",
             patch(routes::notification::mark_all_read)
                 .put(routes::notification::mark_all_read)
-                .route_layer(
-                axum_middleware::from_fn_with_state(
+                .route_layer(axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
-                ),
-            ),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                )),
         )
         .route(
             "/api/v1/notifications/{id}",
             delete(routes::notification::delete_notification).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::auth::auth_middleware,
+                    middleware::bot_auth::bot_or_user_auth_middleware,
                 ),
             ),
         )
@@ -941,7 +953,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/search",
             get(routes::search::search).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Export route (protected)
@@ -949,7 +961,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/export/project/{id}",
             get(routes::export::export_project).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Import route (protected)
@@ -957,7 +969,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/workspaces/{workspace_id}/import/project",
             post(routes::import::import_project).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         // Upload route (protected)
@@ -965,7 +977,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/upload",
             post(routes::upload::upload_file).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
-                middleware::auth::auth_middleware,
+                middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
@@ -1088,6 +1100,10 @@ async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
             "0022_bot_tokens.sql",
             include_str!("../../../migrations/0022_bot_tokens.sql"),
         ),
+        (
+            "0023_work_item_identifier.sql",
+            include_str!("../../../migrations/0023_work_item_identifier.sql"),
+        ),
     ];
 
     for (name, sql) in MIGRATIONS {
@@ -1111,12 +1127,24 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
         ("proposal_status enum", "SELECT 'draft'::proposal_status"),
         ("author_type enum", "SELECT 'human'::author_type"),
         ("trust_scores table", "SELECT 1 FROM trust_scores LIMIT 1"),
-        ("trust_score_logs table", "SELECT 1 FROM trust_score_logs LIMIT 1"),
-        ("ai_participants table", "SELECT 1 FROM ai_participants LIMIT 1"),
-        ("decision_domains table", "SELECT 1 FROM decision_domains LIMIT 1"),
+        (
+            "trust_score_logs table",
+            "SELECT 1 FROM trust_score_logs LIMIT 1",
+        ),
+        (
+            "ai_participants table",
+            "SELECT 1 FROM ai_participants LIMIT 1",
+        ),
+        (
+            "decision_domains table",
+            "SELECT 1 FROM decision_domains LIMIT 1",
+        ),
         ("veto_events table", "SELECT 1 FROM veto_events LIMIT 1"),
         ("appeals table", "SELECT 1 FROM appeals LIMIT 1"),
-        ("impact_reviews table", "SELECT 1 FROM impact_reviews LIMIT 1"),
+        (
+            "impact_reviews table",
+            "SELECT 1 FROM impact_reviews LIMIT 1",
+        ),
         (
             "review_participants table",
             "SELECT 1 FROM review_participants LIMIT 1",
@@ -1151,7 +1179,10 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
 
     for (name, sql) in CHECKS {
         if let Err(e) = db
-            .query_one(Statement::from_string(DbBackend::Postgres, (*sql).to_string()))
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                (*sql).to_string(),
+            ))
             .await
         {
             return Err(anyhow::anyhow!(

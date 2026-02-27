@@ -200,7 +200,10 @@ pub fn trigger_webhooks(state: AppState, ctx: TriggerContext) {
     });
 }
 
-async fn trigger_webhooks_inner(state: AppState, ctx: TriggerContext) -> Result<(), sea_orm::DbErr> {
+async fn trigger_webhooks_inner(
+    state: AppState,
+    ctx: TriggerContext,
+) -> Result<(), sea_orm::DbErr> {
     let webhooks = ActiveWebhookRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
@@ -312,7 +315,9 @@ async fn build_payload(
             webhook_id: webhook.id.to_string(),
         });
     } else if matches!(ctx.event, WebhookEvent::CommentCreated) {
-        if let Some(identity) = check_bot_mention(&state.db, &ctx.mentions, webhook.bot_user_id).await {
+        if let Some(identity) =
+            check_bot_mention(&state.db, &ctx.mentions, webhook.bot_user_id).await
+        {
             bot_context = Some(BotContext {
                 is_bot_task: true,
                 bot_id: identity.bot_id.to_string(),
@@ -409,7 +414,9 @@ async fn build_event_data(
                 assignee_ids,
             })
         }
-        WebhookEvent::CommentCreated | WebhookEvent::CommentUpdated | WebhookEvent::CommentDeleted => {
+        WebhookEvent::CommentCreated
+        | WebhookEvent::CommentUpdated
+        | WebhookEvent::CommentDeleted => {
             let (comment, issue_summary) = if let Some(extra) = ctx.extra_data.clone() {
                 let issue = extra
                     .get("issue")
@@ -620,15 +627,9 @@ async fn fetch_issue_payload(
         .map(|row| row.label_id.to_string())
         .collect::<Vec<_>>();
 
-    let assignee_ids = issue
-        .assignee_id
-        .map(|v| vec![v])
-        .unwrap_or_default();
+    let assignee_ids = issue.assignee_id.map(|v| vec![v]).unwrap_or_default();
 
-    let assignee_id_values = assignee_ids
-        .iter()
-        .map(Uuid::to_string)
-        .collect::<Vec<_>>();
+    let assignee_id_values = assignee_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
 
     Ok((
         json!({
@@ -818,13 +819,11 @@ async fn deliver_webhook(
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static("OpenPR-Webhook/1.0"),
-    );
+    headers.insert(USER_AGENT, HeaderValue::from_static("OpenPR-Webhook/1.0"));
     headers.insert(
         "X-Webhook-Signature",
-        HeaderValue::from_str(&format!("sha256={signature}")).unwrap_or(HeaderValue::from_static("sha256=")),
+        HeaderValue::from_str(&format!("sha256={signature}"))
+            .unwrap_or(HeaderValue::from_static("sha256=")),
     );
     headers.insert(
         "X-Webhook-Event",

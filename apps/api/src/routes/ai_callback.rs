@@ -155,13 +155,7 @@ pub async fn complete_task(
     .ok_or_else(|| ApiError::Internal)?;
 
     task = updated.clone();
-    insert_ai_task_event(
-        &state.db,
-        task_id,
-        "completed",
-        json!({ "result": result }),
-    )
-    .await?;
+    insert_ai_task_event(&state.db, task_id, "completed", json!({ "result": result })).await?;
 
     let project = find_project(&state, task.project_id).await?;
     trigger_webhooks(
@@ -352,7 +346,8 @@ pub async fn list_project_ai_tasks(
 
     let (count_sql, count_values) = if let Some(status) = query.status.clone() {
         (
-            "SELECT COUNT(*)::bigint AS count FROM ai_tasks WHERE project_id = $1 AND status = $2".to_string(),
+            "SELECT COUNT(*)::bigint AS count FROM ai_tasks WHERE project_id = $1 AND status = $2"
+                .to_string(),
             vec![project_id.into(), status.into()],
         )
     } else {
@@ -510,7 +505,8 @@ pub async fn create_project_ai_task(
     )
     .await?;
 
-    let task = task.ok_or_else(|| ApiError::Conflict("idempotency key already exists".to_string()))?;
+    let task =
+        task.ok_or_else(|| ApiError::Conflict("idempotency key already exists".to_string()))?;
     Ok(ApiResponse::success(AiTaskResponse::from(task)))
 }
 

@@ -1,3 +1,4 @@
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -129,13 +130,17 @@ pub async fn create_label(
 pub async fn list_labels(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
     // Check workspace membership
-    get_workspace_role(&state, workspace_id, user_id).await?;
+    require_workspace_access(&state, &extensions, workspace_id).await?;
 
     #[derive(Debug, FromQueryResult)]
     struct LabelRow {
@@ -348,10 +353,16 @@ pub async fn delete_label(
 pub async fn add_label_to_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path((issue_id, label_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
     // Verify issue exists and user has access
     #[derive(Debug, FromQueryResult)]
@@ -366,14 +377,15 @@ pub async fn add_label_to_issue(
             SELECT wi.project_id, p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wi.id = $1 AND wm.user_id = $2
+            WHERE wi.id = $1
         "#,
-        vec![issue_id.into(), user_id.into()],
+        vec![issue_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("issue not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, issue_ws.workspace_id).await?;
 
     // Verify label belongs to same workspace
     let label_exists = state
@@ -442,32 +454,37 @@ pub async fn add_label_to_issue(
 pub async fn get_issue_labels(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
-    // Verify issue exists and user has access
-    let issue_exists = state
-        .db
-        .query_one(Statement::from_sql_and_values(
+    #[derive(Debug, FromQueryResult)]
+    struct IssueWorkspace {
+        workspace_id: Uuid,
+    }
+
+    let issue = IssueWorkspace::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
-            SELECT 1
+            SELECT p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wi.id = $1 AND wm.user_id = $2
+            WHERE wi.id = $1
         "#,
-        vec![issue_id.into(), user_id.into()],
+        vec![issue_id.into()],
     ))
-        .await?;
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
 
-    if issue_exists.is_none() {
-        return Err(ApiError::NotFound(
-            "issue not found or access denied".to_string(),
-        ));
-    }
+    require_workspace_access(&state, &extensions, issue.workspace_id).await?;
 
     #[derive(Debug, FromQueryResult)]
     struct LabelRow {
@@ -512,10 +529,16 @@ pub async fn get_issue_labels(
 pub async fn remove_label_from_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path((issue_id, label_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
     #[derive(Debug, FromQueryResult)]
     struct IssueContext {
@@ -530,14 +553,15 @@ pub async fn remove_label_from_issue(
             SELECT wi.project_id, p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wi.id = $1 AND wm.user_id = $2
+            WHERE wi.id = $1
         "#,
-        vec![issue_id.into(), user_id.into()],
+        vec![issue_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("issue not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, issue_context.workspace_id).await?;
 
     state
         .db
@@ -566,4 +590,66 @@ pub async fn remove_label_from_issue(
     );
 
     Ok(ApiResponse::ok())
+}
+
+/// GET /api/v1/projects/:project_id/labels (bot-auth)
+/// Lists all workspace labels available for a project.
+pub async fn list_project_labels(
+    State(state): State<AppState>,
+    Extension(bot): Extension<BotAuthContext>,
+    Path(project_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Verify project belongs to bot's workspace
+    #[derive(Debug, FromQueryResult)]
+    struct ProjectRow {
+        workspace_id: Uuid,
+    }
+
+    let project = ProjectRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![project_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    if project.workspace_id != bot.workspace_id {
+        return Err(ApiError::Forbidden(
+            "project not in bot workspace".to_string(),
+        ));
+    }
+
+    #[derive(Debug, FromQueryResult)]
+    struct LabelRow {
+        id: Uuid,
+        workspace_id: Uuid,
+        name: String,
+        color: String,
+        description: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    let labels = LabelRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id, workspace_id, name, color, description, created_at \
+         FROM labels WHERE workspace_id = $1 ORDER BY name ASC",
+        vec![project.workspace_id.into()],
+    ))
+    .all(&state.db)
+    .await?;
+
+    let response: Vec<LabelResponse> = labels
+        .into_iter()
+        .map(|l| LabelResponse {
+            id: l.id,
+            workspace_id: l.workspace_id,
+            name: l.name,
+            color: l.color,
+            description: l.description,
+            created_at: l.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(ApiResponse::success(PaginatedData::from_items(response)))
 }

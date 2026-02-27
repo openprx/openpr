@@ -3,12 +3,11 @@ use sea_orm::{
     ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    entities::trust_score::ParticipantType,
-    error::ApiError,
+    entities::trust_score::ParticipantType, error::ApiError,
     services::impact_review_service::ImpactReviewService,
     services::permission_service::PermissionService,
     services::trust_score_service::normalize_domain_key,
@@ -98,7 +97,9 @@ impl VetoService {
         let normalized_domain = select_veto_domain(&proposal.domains, domain);
         let project_id = resolve_project_id_for_proposal(&tx, proposal_id).await?;
         let Some(project_id) = project_id else {
-            return Err(ApiError::BadRequest("proposal project not found".to_string()));
+            return Err(ApiError::BadRequest(
+                "proposal project not found".to_string(),
+            ));
         };
 
         let can_veto = self
@@ -123,9 +124,7 @@ impl VetoService {
                 .permission_service
                 .ai_can_veto_human_consensus(vetoer_id, project_id)
                 .await?;
-            if !can_veto_human_consensus
-                && self.has_human_vote_consensus(&tx, proposal_id).await?
-            {
+            if !can_veto_human_consensus && self.has_human_vote_consensus(&tx, proposal_id).await? {
                 return Err(ApiError::Forbidden(
                     "ai veto is blocked because all human votes are in consensus".to_string(),
                 ));
@@ -192,7 +191,9 @@ impl VetoService {
         initiator_id: Uuid,
     ) -> Result<VetoEventRow, ApiError> {
         let tx = self.db.begin().await?;
-        let veto = self.get_active_veto_by_proposal_with_conn(&tx, proposal_id).await?;
+        let veto = self
+            .get_active_veto_by_proposal_with_conn(&tx, proposal_id)
+            .await?;
         let Some(veto) = veto else {
             return Err(ApiError::NotFound("active veto not found".to_string()));
         };
@@ -269,7 +270,9 @@ impl VetoService {
 
         let project_id = resolve_project_id_for_proposal(&tx, proposal_id).await?;
         let Some(project_id) = project_id else {
-            return Err(ApiError::BadRequest("proposal project not found".to_string()));
+            return Err(ApiError::BadRequest(
+                "proposal project not found".to_string(),
+            ));
         };
 
         let is_vetoer = self
@@ -290,12 +293,20 @@ impl VetoService {
             .ok_or(ApiError::Internal)?;
         ballots.insert(voter_id.to_string(), Value::Bool(overturn));
 
-        let overturn_count = ballots.values().filter(|v| v.as_bool() == Some(true)).count() as i64;
-        let uphold_count = ballots.values().filter(|v| v.as_bool() == Some(false)).count() as i64;
+        let overturn_count = ballots
+            .values()
+            .filter(|v| v.as_bool() == Some(true))
+            .count() as i64;
+        let uphold_count = ballots
+            .values()
+            .filter(|v| v.as_bool() == Some(false))
+            .count() as i64;
         votes_json["overturned"] = Value::from(overturn_count);
         votes_json["upheld"] = Value::from(uphold_count);
 
-        let total_vetoers = self.count_domain_vetoers(&tx, project_id, &veto.domain).await?;
+        let total_vetoers = self
+            .count_domain_vetoers(&tx, project_id, &veto.domain)
+            .await?;
         let threshold = ((total_vetoers as f64) * (2.0 / 3.0)).ceil() as i64;
 
         let mut status = veto.status.clone();
@@ -329,7 +340,12 @@ impl VetoService {
                           status::text AS status, escalation_started_at,
                           escalation_result, escalation_votes, created_at
             "#,
-            vec![veto.id.into(), status.into(), escalation_result.into(), votes_json.into()],
+            vec![
+                veto.id.into(),
+                status.into(),
+                escalation_result.into(),
+                votes_json.into(),
+            ],
         ))
         .one(&tx)
         .await?

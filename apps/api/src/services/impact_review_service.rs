@@ -118,9 +118,14 @@ impl ImpactReviewService {
         })
     }
 
-    pub async fn schedule_review(&self, proposal_id: &str) -> Result<impact_review::Model, ApiError> {
+    pub async fn schedule_review(
+        &self,
+        proposal_id: &str,
+    ) -> Result<impact_review::Model, ApiError> {
         let tx = self.db.begin().await?;
-        let review = self.schedule_review_with_conn(&tx, proposal_id, true).await?;
+        let review = self
+            .schedule_review_with_conn(&tx, proposal_id, true)
+            .await?;
         tx.commit().await?;
         Ok(review)
     }
@@ -132,7 +137,9 @@ impl ImpactReviewService {
         scheduled_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<impact_review::Model, ApiError> {
         let tx = self.db.begin().await?;
-        let mut review = self.schedule_review_with_conn(&tx, proposal_id, false).await?;
+        let mut review = self
+            .schedule_review_with_conn(&tx, proposal_id, false)
+            .await?;
         if reviewer_id.is_some() || scheduled_at.is_some() {
             let mut active: impact_review::ActiveModel = review.clone().into();
             if let Some(reviewer_id) = reviewer_id {
@@ -197,7 +204,9 @@ impl ImpactReviewService {
         let review = impact_review::ActiveModel {
             id: Set(Self::generate_review_id()),
             proposal_id: Set(proposal.id.clone()),
-            project_id: Set(resolve_project_id_for_proposal(db, &proposal.id, &proposal.author_id).await?),
+            project_id: Set(
+                resolve_project_id_for_proposal(db, &proposal.id, &proposal.author_id).await?,
+            ),
             status: Set(ReviewStatus::Pending),
             is_auto_triggered: Set(is_auto_triggered),
             scheduled_at: Set(scheduled_at),
@@ -207,7 +216,8 @@ impl ImpactReviewService {
         .insert(db)
         .await?;
 
-        self.populate_participants(db, &review.id, &proposal.id).await?;
+        self.populate_participants(db, &review.id, &proposal.id)
+            .await?;
         Ok(review)
     }
 
@@ -268,7 +278,9 @@ impl ImpactReviewService {
         .await?;
 
         let from_issues = all_closed_at.map(|row| row.value + Duration::days(7));
-        Ok(from_issues.map(|time| time.min(from_voting)).unwrap_or(from_voting))
+        Ok(from_issues
+            .map(|time| time.min(from_voting))
+            .unwrap_or(from_voting))
     }
 
     async fn populate_participants<C: ConnectionTrait>(
@@ -480,7 +492,11 @@ impl ImpactReviewService {
         }
         if let Some(v) = feedback_content {
             let trimmed = v.trim().to_string();
-            active.feedback_content = if trimmed.is_empty() { Set(None) } else { Set(Some(trimmed)) };
+            active.feedback_content = if trimmed.is_empty() {
+                Set(None)
+            } else {
+                Set(Some(trimmed))
+            };
         }
         if let Some(v) = role {
             let trimmed = v.trim().to_string();
@@ -638,8 +654,10 @@ impl ImpactReviewService {
             && updated.rating.is_some()
             && !updated.trust_score_applied
         {
-            self.apply_trust_score_updates_with_conn(&tx, &updated).await?;
-            self.write_ai_learning_records_with_conn(&tx, &updated).await?;
+            self.apply_trust_score_updates_with_conn(&tx, &updated)
+                .await?;
+            self.write_ai_learning_records_with_conn(&tx, &updated)
+                .await?;
             let mut mark_applied: impact_review::ActiveModel = updated.clone().into();
             mark_applied.trust_score_applied = Set(true);
             let updated = mark_applied.update(&tx).await?;
@@ -917,7 +935,10 @@ async fn infer_participant_type<C: ConnectionTrait>(
             WHERE proposal_id = $1 AND voter_id = $2
             LIMIT 1
         "#,
-        vec![proposal_id.to_string().into(), participant.user_id.clone().into()],
+        vec![
+            proposal_id.to_string().into(),
+            participant.user_id.clone().into(),
+        ],
     ))
     .one(db)
     .await?;

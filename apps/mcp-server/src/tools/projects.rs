@@ -12,7 +12,8 @@ pub fn list_projects_tool() -> ToolDefinition {
             "properties": {
                 "workspace_id": {
                     "type": "string",
-                    "description": "UUID of the workspace (optional, uses bot token workspace)"
+                    "description": "UUID of the workspace (optional, uses bot token workspace)",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             }
         }),
@@ -38,7 +39,8 @@ pub fn get_project_tool() -> ToolDefinition {
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project"
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             },
             "required": ["project_id"]
@@ -128,7 +130,8 @@ pub fn update_project_tool() -> ToolDefinition {
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project"
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "name": {
                     "type": "string",
@@ -186,7 +189,8 @@ pub fn delete_project_tool() -> ToolDefinition {
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project"
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             },
             "required": ["project_id"]

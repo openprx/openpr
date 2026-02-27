@@ -93,6 +93,9 @@ services:
       JWT_REFRESH_TTL_SECONDS: ${JWT_REFRESH_TTL_SECONDS:-2592000}
       RUST_LOG: ${RUST_LOG:-info}
       DEFAULT_AUTHOR_ID: ${DEFAULT_AUTHOR_ID:-9a74e332-11e5-4d30-b652-134afe808a79}
+      OPENPR_API_URL: http://host.containers.internal:3000
+      OPENPR_BOT_TOKEN: opr_0a5bc81ea108dad8077decc880abced0d923aa873b9ff774575ec152aecf15d5
+      OPENPR_WORKSPACE_ID: e5166fd1-3bb7-46d9-b907-273b1eef3f44
     command: ["/app/mcp-server", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
     ports:
       - "8090:8090"

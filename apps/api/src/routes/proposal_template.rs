@@ -76,7 +76,9 @@ pub async fn list_proposal_templates(
 
     if let Some(template_type) = query.template_type {
         if template_type.trim().is_empty() {
-            return Err(ApiError::BadRequest("template_type cannot be empty".to_string()));
+            return Err(ApiError::BadRequest(
+                "template_type cannot be empty".to_string(),
+            ));
         }
         where_parts.push(format!("template_type = ${idx}"));
         values.push(template_type.trim().to_string().into());
@@ -193,7 +195,8 @@ pub async fn create_proposal_template(
 
     if let Err(err) = insert {
         let msg = err.to_string();
-        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value") {
+        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value")
+        {
             return Err(ApiError::Conflict(
                 "template name already exists in this project".to_string(),
             ));
@@ -329,7 +332,8 @@ pub async fn update_proposal_template(
         .await;
     if let Err(err) = res {
         let msg = err.to_string();
-        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value") {
+        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value")
+        {
             return Err(ApiError::Conflict(
                 "template name already exists in this project".to_string(),
             ));
@@ -370,13 +374,12 @@ pub async fn delete_proposal_template(
 
     let tx = state.db.begin().await?;
 
-    tx
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "DELETE FROM proposal_templates WHERE id = $1",
-            vec![id.into()],
-        ))
-        .await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM proposal_templates WHERE id = $1",
+        vec![id.into()],
+    ))
+    .await?;
     write_governance_audit_log(
         &tx,
         GovernanceAuditLogInput {

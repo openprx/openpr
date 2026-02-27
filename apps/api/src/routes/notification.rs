@@ -174,7 +174,9 @@ pub async fn get_unread_count(
 
     let unread_count: i64 = unread_result.try_get("", "count")?;
 
-    Ok(ApiResponse::success(UnreadCountData { count: unread_count }))
+    Ok(ApiResponse::success(UnreadCountData {
+        count: unread_count,
+    }))
 }
 
 /// PATCH /api/v1/notifications/:id/read

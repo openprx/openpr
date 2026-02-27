@@ -227,7 +227,12 @@ async fn record_dispatch_failure(
                     updated_at = $4
                 WHERE id = $1
             "#,
-            vec![task.id.into(), error.clone().into(), next_retry_at.into(), now.into()],
+            vec![
+                task.id.into(),
+                error.clone().into(),
+                next_retry_at.into(),
+                now.into(),
+            ],
         ))
         .await?;
 

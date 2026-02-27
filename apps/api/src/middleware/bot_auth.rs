@@ -4,18 +4,19 @@
 ///   1. Bot Token (`opr_*`) — looks up `workspace_bots` table via SHA-256 hash.
 ///   2. JWT Bearer / cookie — falls back to the existing JWT path.
 ///
-/// On success the middleware injects ONE of the following extensions:
-///   - `JwtClaims`       — for human/JWT auth (existing handlers remain compatible)
-///   - `BotAuthContext`  — for bot token auth (new handlers or opt-in handlers)
+/// On success the middleware injects:
+///   - bot token auth: `BotAuthContext` + synthetic `JwtClaims`
+///   - JWT auth: `JwtClaims`
 use axum::{
     extract::{Request, State},
+    http::Extensions,
     middleware::Next,
     response::Response,
 };
 use chrono::Utc;
 use platform::{
     app::AppState,
-    auth::{JwtClaims, JwtManager},
+    auth::{JwtClaims, JwtManager, TokenType},
 };
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::Serialize;
@@ -35,6 +36,75 @@ pub struct BotAuthContext {
     pub permissions: Vec<String>,
 }
 
+pub fn extract_bot_context(extensions: &Extensions) -> Option<&BotAuthContext> {
+    extensions.get::<BotAuthContext>()
+}
+
+fn bot_role_from_permissions(permissions: &[String]) -> String {
+    if permissions.iter().any(|p| p == "admin") {
+        "admin".to_string()
+    } else if permissions.iter().any(|p| p == "write") {
+        "member".to_string()
+    } else {
+        "member".to_string()
+    }
+}
+
+/// Unified workspace access check for both bot-token and JWT auth paths.
+///
+/// Returns `(actor_id, role, is_bot)`:
+/// - `actor_id`: user id (JWT) or bot id (bot token)
+/// - `role`: workspace role for user, or a synthesized role from bot permissions
+/// - `is_bot`: whether the request used a bot token
+pub async fn require_workspace_access(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+) -> Result<(Uuid, String, bool), ApiError> {
+    let claims = extensions
+        .get::<JwtClaims>()
+        .ok_or_else(|| ApiError::Unauthorized("missing auth context".to_string()))?;
+    let bot = extract_bot_context(extensions);
+
+    require_workspace_access_from_auth(state, claims, bot, workspace_id).await
+}
+
+pub async fn require_workspace_access_from_auth(
+    state: &AppState,
+    claims: &JwtClaims,
+    bot: Option<&BotAuthContext>,
+    workspace_id: Uuid,
+) -> Result<(Uuid, String, bool), ApiError> {
+    if let Some(bot_ctx) = bot {
+        if bot_ctx.workspace_id != workspace_id {
+            return Err(ApiError::Forbidden(
+                "bot not authorized for this workspace".to_string(),
+            ));
+        }
+        let role = bot_role_from_permissions(&bot_ctx.permissions);
+        return Ok((bot_ctx.bot_id, role, true));
+    }
+
+    let user_id = Uuid::parse_str(&claims.sub)
+        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+
+    #[derive(Debug, FromQueryResult)]
+    struct RoleRow {
+        role: String,
+    }
+
+    let row = RoleRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        vec![workspace_id.into(), user_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("workspace not found or access denied".to_string()))?;
+
+    Ok((user_id, row.role, false))
+}
+
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
@@ -43,8 +113,8 @@ fn sha256_hex(input: &str) -> String {
 
 /// Middleware: authenticate as bot (opr_ token) or fall through to JWT.
 ///
-/// Injects `BotAuthContext` for bot tokens, `JwtClaims` for JWT tokens.
-/// Either extension can be extracted by downstream handlers.
+/// Injects `JwtClaims` for both paths to keep existing handlers compatible.
+/// For bot tokens, also injects `BotAuthContext`.
 pub async fn bot_or_user_auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
@@ -115,6 +185,13 @@ pub async fn bot_or_user_auth_middleware(
             bot_id: bot.id,
             workspace_id: bot.workspace_id,
             permissions,
+        });
+        req.extensions_mut().insert(JwtClaims {
+            sub: bot.id.to_string(),
+            email: format!("bot+{}@openpr.local", bot.id),
+            token_type: TokenType::Access,
+            iat: 0,
+            exp: 0,
         });
     } else {
         // ── JWT path (unchanged behaviour) ──

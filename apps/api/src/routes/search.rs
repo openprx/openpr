@@ -130,8 +130,20 @@ async fn search_issues(
         SELECT wi.id, wi.title, wi.description, wi.state, wi.project_id, p.workspace_id
         FROM work_items wi
         INNER JOIN projects p ON wi.project_id = p.id
-        INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-        WHERE wm.user_id = $1
+        WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+              )
           AND (wi.title ILIKE $2 OR wi.description ILIKE $2)
         ORDER BY wi.updated_at DESC
         LIMIT $3
@@ -162,8 +174,20 @@ async fn search_projects(
     let sql = r#"
         SELECT p.id, p.key, p.name, p.description, p.workspace_id
         FROM projects p
-        INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-        WHERE wm.user_id = $1
+        WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+              )
           AND (p.name ILIKE $2 OR p.key ILIKE $2 OR p.description ILIKE $2)
         ORDER BY p.updated_at DESC
         LIMIT $3
@@ -196,8 +220,20 @@ async fn search_comments(
         FROM comments c
         INNER JOIN work_items wi ON c.work_item_id = wi.id
         INNER JOIN projects p ON wi.project_id = p.id
-        INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-        WHERE wm.user_id = $1
+        WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+              )
           AND c.body ILIKE $2
         ORDER BY c.created_at DESC
         LIMIT $3

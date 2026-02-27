@@ -5,7 +5,9 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use platform::{app::AppState, auth::JwtClaims};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait, TryGetable};
+use sea_orm::{
+    ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait, TryGetable,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -14,9 +16,7 @@ use crate::{
     entities::trust_score::ParticipantType,
     error::ApiError,
     response::{ApiResponse, PaginatedData},
-    services::trust_score_service::{
-        TrustEventType, TrustScoreService, is_project_admin_or_owner,
-    },
+    services::trust_score_service::{TrustEventType, TrustScoreService, is_project_admin_or_owner},
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
 };
 
@@ -98,7 +98,9 @@ pub async fn create_appeal(
         .await?
         .is_some();
     if exists {
-        return Err(ApiError::Conflict("pending appeal already exists".to_string()));
+        return Err(ApiError::Conflict(
+            "pending appeal already exists".to_string(),
+        ));
     }
 
     let row = AppealRow::find_by_statement(Statement::from_sql_and_values(
@@ -193,10 +195,23 @@ pub async fn list_appeals(
                       AND EXISTS (
                         SELECT 1
                         FROM projects p
-                        INNER JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
                         WHERE p.id = t.project_id
-                          AND wm.user_id = ${0}
-                          AND wm.role IN ('owner', 'admin')
+                          AND (
+                            EXISTS (
+                                SELECT 1
+                                FROM workspace_members wm
+                                WHERE wm.workspace_id = p.workspace_id
+                                  AND wm.user_id = ${0}
+                                  AND wm.role IN ('owner', 'admin')
+                            )
+                            OR EXISTS (
+                                SELECT 1
+                                FROM workspace_bots wb
+                                WHERE wb.workspace_id = p.workspace_id
+                                  AND wb.id = ${0}
+                                  AND wb.permissions @> '["admin"]'::jsonb
+                            )
+                          )
                       )
                 )
             )"#,
@@ -448,7 +463,10 @@ async fn resolve_workspace_id_for_project(
     Ok(row.map(|v| v.workspace_id))
 }
 
-async fn find_log_with_conn<C: ConnectionTrait>(db: &C, log_id: i64) -> Result<TrustScoreLogRow, ApiError> {
+async fn find_log_with_conn<C: ConnectionTrait>(
+    db: &C,
+    log_id: i64,
+) -> Result<TrustScoreLogRow, ApiError> {
     TrustScoreLogRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
@@ -499,7 +517,11 @@ async fn ensure_can_review_appeal<C: ConnectionTrait>(
               AND project_id = $2
               AND domain = $3
         "#,
-        vec![user_id.into(), log.project_id.into(), log.domain.clone().into()],
+        vec![
+            user_id.into(),
+            log.project_id.into(),
+            log.domain.clone().into(),
+        ],
     ))
     .one(db)
     .await?
@@ -533,7 +555,11 @@ async fn can_review_in_project(
               AND project_id = $2
               AND domain = $3
         "#,
-        vec![user_id.into(), log.project_id.into(), log.domain.clone().into()],
+        vec![
+            user_id.into(),
+            log.project_id.into(),
+            log.domain.clone().into(),
+        ],
     ))
     .one(&state.db)
     .await?

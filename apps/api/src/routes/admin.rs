@@ -366,7 +366,8 @@ pub async fn update_user(
         }
     }
 
-    if target_entity_type == "bot" && req.agent_type.is_none() && current_user.agent_type.is_none() {
+    if target_entity_type == "bot" && req.agent_type.is_none() && current_user.agent_type.is_none()
+    {
         return Err(ApiError::BadRequest(
             "agent_type is required for bot user".to_string(),
         ));

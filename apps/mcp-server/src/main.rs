@@ -3,16 +3,32 @@ mod protocol;
 mod server;
 mod tools;
 
-use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
+};
 use clap::{Parser, ValueEnum};
 use client::OpenPrClient;
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use server::McpServer;
+use serde::Deserialize;
+use serde_json::json;
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{Mutex, mpsc};
+use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Transport {
     Http,
+    Sse,
     Stdio,
 }
 
@@ -37,8 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Read configuration from environment
-    let base_url = std::env::var("OPENPR_API_URL")
-        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let base_url =
+        std::env::var("OPENPR_API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let bot_token = std::env::var("OPENPR_BOT_TOKEN")
         .map_err(|_| anyhow::anyhow!("OPENPR_BOT_TOKEN environment variable is required"))?;
     let workspace_id = std::env::var("OPENPR_WORKSPACE_ID")
@@ -48,29 +64,159 @@ async fn main() -> anyhow::Result<()> {
 
     match args.transport {
         Transport::Http => run_http(&args.bind_addr, client).await,
+        Transport::Sse => run_sse(&args.bind_addr, client).await,
         Transport::Stdio => run_stdio(client).await,
     }
 }
 
 async fn run_http(bind_addr: &str, client: OpenPrClient) -> anyhow::Result<()> {
+    let state = SseState {
+        client,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
+
     let app = Router::new()
         .route("/mcp/rpc", post(handle_jsonrpc))
-        .route("/health", axum::routing::get(health_check))
-        .with_state(client);
+        .route("/sse", get(handle_sse_connect))
+        .route("/messages", post(handle_sse_message))
+        .route("/health", get(health_check))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    tracing::info!(bind_addr = %bind_addr, "MCP HTTP transport started");
+    tracing::info!(
+        bind_addr = %bind_addr,
+        "MCP HTTP transport started (JSON-RPC + SSE)"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 async fn handle_jsonrpc(
-    axum::extract::State(client): axum::extract::State<OpenPrClient>,
+    State(state): State<SseState>,
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
-    let server = McpServer::new(client);
+    let server = McpServer::new(state.client.clone());
     let response = server.handle_request(req).await;
     Json(response)
+}
+
+#[derive(Clone)]
+struct SseState {
+    client: OpenPrClient,
+    sessions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<SseServerEvent>>>>,
+}
+
+#[derive(Debug)]
+enum SseServerEvent {
+    Endpoint(String),
+    Message(String),
+}
+
+struct SessionGuard {
+    session_id: String,
+    sessions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<SseServerEvent>>>>,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let session_id = self.session_id.clone();
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            sessions.lock().await.remove(&session_id);
+        });
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesQuery {
+    session_id: String,
+}
+
+async fn run_sse(bind_addr: &str, client: OpenPrClient) -> anyhow::Result<()> {
+    let state = SseState {
+        client,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/sse", get(handle_sse_connect))
+        .route("/messages", post(handle_sse_message))
+        .route("/health", get(health_check))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    tracing::info!(bind_addr = %bind_addr, "MCP SSE transport started");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn handle_sse_connect(
+    State(state): State<SseState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let session_id = Uuid::new_v4().to_string();
+    let endpoint = format!("/messages?session_id={session_id}");
+    let (tx, rx) = mpsc::unbounded_channel::<SseServerEvent>();
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), tx.clone());
+
+    let _ = tx.send(SseServerEvent::Endpoint(endpoint));
+
+    let session_guard = SessionGuard {
+        session_id,
+        sessions: state.sessions.clone(),
+    };
+
+    let stream = UnboundedReceiverStream::new(rx).map(move |msg| {
+        let _keep_guard_alive = &session_guard;
+        let event = match msg {
+            SseServerEvent::Endpoint(url) => Event::default().event("endpoint").data(url),
+            SseServerEvent::Message(payload) => Event::default().event("message").data(payload),
+        };
+        Ok::<Event, Infallible>(event)
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn handle_sse_message(
+    State(state): State<SseState>,
+    Query(query): Query<MessagesQuery>,
+    Json(req): Json<JsonRpcRequest>,
+) -> impl IntoResponse {
+    let sender = state.sessions.lock().await.get(&query.session_id).cloned();
+    let Some(sender) = sender else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Unknown SSE session_id"})),
+        );
+    };
+
+    let server = McpServer::new(state.client.clone());
+    let response = server.handle_request(req).await;
+
+    let response_json = match serde_json::to_string(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to serialize response: {e}")})),
+            );
+        }
+    };
+
+    if sender.send(SseServerEvent::Message(response_json)).is_err() {
+        state.sessions.lock().await.remove(&query.session_id);
+        return (
+            StatusCode::GONE,
+            Json(json!({"error": "SSE session is closed"})),
+        );
+    }
+
+    (StatusCode::ACCEPTED, Json(json!({"status": "accepted"})))
 }
 
 async fn health_check() -> impl IntoResponse {

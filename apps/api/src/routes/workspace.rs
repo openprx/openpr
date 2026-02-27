@@ -141,10 +141,26 @@ pub async fn list_workspaces(
     let workspaces = WorkspaceRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
-            SELECT w.id, w.slug, w.name, wm.role, w.created_at, w.updated_at
+            SELECT w.id,
+                   w.slug,
+                   w.name,
+                   COALESCE(
+                       wm.role,
+                       CASE
+                           WHEN wb.permissions @> '["admin"]'::jsonb THEN 'admin'
+                           ELSE 'member'
+                       END
+                   ) AS role,
+                   w.created_at,
+                   w.updated_at
             FROM workspaces w
-            INNER JOIN workspace_members wm ON w.id = wm.workspace_id
-            WHERE wm.user_id = $1
+            LEFT JOIN workspace_members wm
+                   ON w.id = wm.workspace_id
+                  AND wm.user_id = $1
+            LEFT JOIN workspace_bots wb
+                   ON w.id = wb.workspace_id
+                  AND wb.id = $1
+            WHERE wm.user_id IS NOT NULL OR wb.id IS NOT NULL
             ORDER BY w.created_at DESC
         "#,
         vec![user_id.into()],
@@ -189,10 +205,27 @@ pub async fn get_workspace(
     let workspace = WorkspaceRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
-            SELECT w.id, w.slug, w.name, wm.role, w.created_at, w.updated_at
+            SELECT w.id,
+                   w.slug,
+                   w.name,
+                   COALESCE(
+                       wm.role,
+                       CASE
+                           WHEN wb.permissions @> '["admin"]'::jsonb THEN 'admin'
+                           ELSE 'member'
+                       END
+                   ) AS role,
+                   w.created_at,
+                   w.updated_at
             FROM workspaces w
-            INNER JOIN workspace_members wm ON w.id = wm.workspace_id
-            WHERE w.id = $1 AND wm.user_id = $2
+            LEFT JOIN workspace_members wm
+                   ON w.id = wm.workspace_id
+                  AND wm.user_id = $2
+            LEFT JOIN workspace_bots wb
+                   ON w.id = wb.workspace_id
+                  AND wb.id = $2
+            WHERE w.id = $1
+              AND (wm.user_id IS NOT NULL OR wb.id IS NOT NULL)
         "#,
         vec![workspace_id.into(), user_id.into()],
     ))
@@ -358,7 +391,7 @@ pub async fn delete_workspace(
 async fn get_user_role(
     state: &AppState,
     workspace_id: Uuid,
-    user_id: Uuid,
+    actor_id: Uuid,
 ) -> Result<String, ApiError> {
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct RoleRow {
@@ -367,8 +400,25 @@ async fn get_user_role(
 
     let row = RoleRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-        vec![workspace_id.into(), user_id.into()],
+        r#"
+            SELECT role
+            FROM (
+                SELECT wm.role AS role
+                FROM workspace_members wm
+                WHERE wm.workspace_id = $1
+                  AND wm.user_id = $2
+                UNION ALL
+                SELECT CASE
+                           WHEN wb.permissions @> '["admin"]'::jsonb THEN 'admin'
+                           ELSE 'member'
+                       END AS role
+                FROM workspace_bots wb
+                WHERE wb.workspace_id = $1
+                  AND wb.id = $2
+            ) roles
+            LIMIT 1
+        "#,
+        vec![workspace_id.into(), actor_id.into()],
     ))
     .one(&state.db)
     .await?

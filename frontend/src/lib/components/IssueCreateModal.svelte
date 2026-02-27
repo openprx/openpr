@@ -1,6 +1,4 @@
 <script lang="ts">
-	import { tick } from 'svelte';
-	import { apiClient } from '$lib/api/client';
 	import { labelsApi } from '$lib/api/labels';
 	import { membersApi, type WorkspaceMember } from '$lib/api/members';
 	import {
@@ -12,10 +10,15 @@
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { toast } from '$lib/stores/toast';
 	import { renderMarkdown } from '$lib/utils/markdown';
-	import { isAllowedUploadMime, MAX_UPLOAD_SIZE_BYTES, mediaMarkdown } from '$lib/utils/upload';
+	import {
+		appendAttachmentsMarkdown,
+		ISSUE_ATTACHMENT_ACCEPT,
+		ISSUE_ATTACHMENT_MAX_SIZE_BYTES,
+		type UploadedAttachment
+	} from '$lib/utils/attachments';
 	import { t } from 'svelte-i18n';
 	import Button from './Button.svelte';
-	import ImageUpload from './ImageUpload.svelte';
+	import FileUpload from './FileUpload.svelte';
 	import Input from './Input.svelte';
 	import Modal from './Modal.svelte';
 	import Tag from './Tag.svelte';
@@ -53,7 +56,7 @@
 	let sprints = $state<Sprint[]>([]);
 	let labels = $state<LabelOption[]>([]);
 	let selectedLabelIds = $state<string[]>([]);
-	let descriptionTextarea = $state<HTMLTextAreaElement | null>(null);
+	let attachments = $state<UploadedAttachment[]>([]);
 
 	let form = $state({
 		title: '',
@@ -83,6 +86,7 @@
 			sprint_id: initialSprintId
 		};
 		selectedLabelIds = [];
+		attachments = [];
 		descriptionTab = 'edit';
 	}
 
@@ -128,100 +132,6 @@
 		selectedLabelIds = [...selectedLabelIds, labelId];
 	}
 
-	function appendUploadedImage(url: string, mimeType: string): void {
-		const markdown = `\n${mediaMarkdown(url, mimeType)}\n`;
-		if (!descriptionTextarea) {
-			form = {
-				...form,
-				description: `${form.description}${markdown}`
-			};
-			return;
-		}
-
-		const current = form.description;
-		const start = descriptionTextarea.selectionStart ?? current.length;
-		const end = descriptionTextarea.selectionEnd ?? start;
-		const nextDescription = `${current.slice(0, start)}${markdown}${current.slice(end)}`;
-		form = {
-			...form,
-			description: nextDescription
-		};
-
-		void tick().then(() => {
-			if (!descriptionTextarea) {
-				return;
-			}
-			const cursor = start + markdown.length;
-			descriptionTextarea.selectionStart = cursor;
-			descriptionTextarea.selectionEnd = cursor;
-			descriptionTextarea.focus();
-		});
-	}
-
-	async function uploadAndInsert(file: File): Promise<void> {
-		if (!isAllowedUploadMime(file.type)) {
-			toast.error($t('toast.uploadTypeFail'));
-			return;
-		}
-		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-			toast.error($t('toast.uploadSizeFail'));
-			return;
-		}
-
-		const formData = new FormData();
-		formData.append('file', file);
-		const headers = new Headers();
-		const token = apiClient.getToken();
-		if (token) {
-			headers.set('Authorization', `Bearer ${token}`);
-		}
-
-		try {
-			const response = await fetch('/api/v1/upload', {
-				method: 'POST',
-				headers,
-				body: formData
-			});
-			const result = (await response.json()) as {
-				code?: number;
-				message?: string;
-				data?: { url?: string };
-			};
-
-			if (result.code === 0 && result.data?.url) {
-				appendUploadedImage(result.data.url, file.type);
-				toast.success($t('toast.uploadSuccess'));
-				return;
-			}
-
-			toast.error(result.message || $t('toast.uploadFail'));
-		} catch {
-			toast.error($t('toast.uploadNetworkFail'));
-		}
-	}
-
-	function handleDescriptionPaste(event: ClipboardEvent): void {
-		const items = event.clipboardData?.items;
-		if (!items) {
-			return;
-		}
-
-		for (const item of items) {
-			if (!isAllowedUploadMime(item.type)) {
-				continue;
-			}
-
-			const file = item.getAsFile();
-			if (!file) {
-				return;
-			}
-
-			event.preventDefault();
-			void uploadAndInsert(file);
-			return;
-		}
-	}
-
 	async function handleCreate(): Promise<void> {
 		if (creating) {
 			return;
@@ -232,9 +142,10 @@
 		}
 
 		creating = true;
+		const description = appendAttachmentsMarkdown(form.description, attachments).trim();
 		const createRes = await issuesApi.create(projectId, {
 			title: form.title.trim(),
-			description: form.description.trim() || undefined,
+			description: description || undefined,
 			status: form.status,
 			priority: form.priority,
 			assignee_id: form.assignee_id || undefined,
@@ -327,11 +238,15 @@
 					<textarea
 						id="issueDescription"
 						bind:value={form.description}
-						bind:this={descriptionTextarea}
-						onpaste={handleDescriptionPaste}
 						class="min-h-[220px] w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
 						placeholder={$t('issue.descriptionPlaceholder')}
 					></textarea>
+					<FileUpload
+						bind:value={attachments}
+						accept={ISSUE_ATTACHMENT_ACCEPT}
+						maxSize={ISSUE_ATTACHMENT_MAX_SIZE_BYTES}
+						multiple
+					/>
 				{:else}
 					<div class="markdown-body dark:prose-invert min-h-[220px] rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 px-3 py-2 text-sm text-slate-700 dark:text-slate-300">
 						{#if form.description.trim()}
@@ -341,8 +256,6 @@
 						{/if}
 					</div>
 				{/if}
-
-				<ImageUpload onUploaded={appendUploadedImage} />
 			</div>
 
 			<div class="grid grid-cols-1 gap-4 sm:grid-cols-2">

@@ -186,16 +186,32 @@ pub async fn export_project(
 async fn verify_project_access(
     state: &AppState,
     project_id: Uuid,
-    user_id: Uuid,
+    actor_id: Uuid,
 ) -> Result<(), ApiError> {
     let result = state
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"SELECT 1 FROM projects p
-               INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-               WHERE p.id = $1 AND wm.user_id = $2"#,
-            vec![project_id.into(), user_id.into()],
+            r#"
+                SELECT 1
+                FROM projects p
+                WHERE p.id = $1
+                  AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM workspace_members wm
+                        WHERE wm.workspace_id = p.workspace_id
+                          AND wm.user_id = $2
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM workspace_bots wb
+                        WHERE wb.workspace_id = p.workspace_id
+                          AND wb.id = $2
+                    )
+                  )
+            "#,
+            vec![project_id.into(), actor_id.into()],
         ))
         .await?;
 

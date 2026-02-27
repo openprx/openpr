@@ -153,9 +153,7 @@ pub async fn register(
         name: row
             .try_get::<String>("", "name")
             .map_err(|_| ApiError::Internal)?,
-        role: row
-            .try_get::<String>("", "role")
-            .ok(),
+        role: row.try_get::<String>("", "role").ok(),
     };
 
     let jwt = jwt_manager(&state);
@@ -196,7 +194,9 @@ pub async fn login(
         .try_get::<String>("", "password_hash")
         .map_err(|_| ApiError::Unauthorized("invalid email or password".to_string()))?;
     if password_hash.is_empty() {
-        return Err(ApiError::Unauthorized("invalid email or password".to_string()));
+        return Err(ApiError::Unauthorized(
+            "invalid email or password".to_string(),
+        ));
     }
     let verified = verify(req.password, &password_hash)
         .map_err(|_| ApiError::Unauthorized("invalid email or password".to_string()))?;
@@ -216,9 +216,7 @@ pub async fn login(
         name: row
             .try_get::<String>("", "name")
             .map_err(|_| ApiError::Internal)?,
-        role: row
-            .try_get::<String>("", "role")
-            .ok(),
+        role: row.try_get::<String>("", "role").ok(),
     };
 
     let jwt = jwt_manager(&state);
@@ -266,9 +264,7 @@ pub async fn refresh(
         name: row
             .try_get::<String>("", "name")
             .map_err(|_| ApiError::Internal)?,
-        role: row
-            .try_get::<String>("", "role")
-            .ok(),
+        role: row.try_get::<String>("", "role").ok(),
     };
 
     let (tokens, cookies) = build_auth_response(&jwt, &state, &user)?;
@@ -311,9 +307,7 @@ pub async fn me(
         name: row
             .try_get::<String>("", "name")
             .map_err(|_| ApiError::Internal)?,
-        role: row
-            .try_get::<String>("", "role")
-            .ok(),
+        role: row.try_get::<String>("", "role").ok(),
     };
 
     Ok(ApiResponse::success(MeResponse { user }))

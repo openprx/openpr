@@ -12,7 +12,8 @@ pub fn create_sprint_tool() -> ToolDefinition {
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project"
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "name": {
                     "type": "string",
@@ -61,6 +62,44 @@ pub async fn create_sprint(client: &OpenPrClient, args: serde_json::Value) -> Ca
     }
 }
 
+pub fn list_sprints_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "sprints.list".to_string(),
+        description: "List all sprints in a project".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                }
+            },
+            "required": ["project_id"]
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSprintsInput {
+    project_id: String,
+}
+
+pub async fn list_sprints(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
+    let input: ListSprintsInput = match serde_json::from_value(args) {
+        Ok(i) => i,
+        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+    };
+
+    match client.list_sprints(&input.project_id).await {
+        Ok(sprints) => {
+            let json = serde_json::to_string_pretty(&sprints).unwrap_or_default();
+            CallToolResult::success(json)
+        }
+        Err(e) => CallToolResult::error(e),
+    }
+}
+
 pub fn update_sprint_tool() -> ToolDefinition {
     ToolDefinition {
         name: "sprints.update".to_string(),
@@ -70,7 +109,8 @@ pub fn update_sprint_tool() -> ToolDefinition {
             "properties": {
                 "sprint_id": {
                     "type": "string",
-                    "description": "UUID of the sprint"
+                    "description": "UUID of the sprint",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "name": {
                     "type": "string",
@@ -131,6 +171,44 @@ pub async fn update_sprint(client: &OpenPrClient, args: serde_json::Value) -> Ca
             let json = serde_json::to_string_pretty(&sprint).unwrap_or_default();
             CallToolResult::success(json)
         }
+        Err(e) => CallToolResult::error(e),
+    }
+}
+
+pub fn delete_sprint_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "sprints.delete".to_string(),
+        description: "Delete a sprint".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "sprint_id": {
+                    "type": "string",
+                    "description": "UUID of the sprint",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                }
+            },
+            "required": ["sprint_id"]
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteSprintInput {
+    sprint_id: String,
+}
+
+pub async fn handle_delete_sprint(
+    client: &OpenPrClient,
+    args: serde_json::Value,
+) -> CallToolResult {
+    let input: DeleteSprintInput = match serde_json::from_value(args) {
+        Ok(i) => i,
+        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+    };
+
+    match client.delete_sprint(&input.sprint_id).await {
+        Ok(()) => CallToolResult::success("Sprint deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

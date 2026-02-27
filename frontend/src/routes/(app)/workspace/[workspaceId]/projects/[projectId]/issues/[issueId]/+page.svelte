@@ -8,7 +8,6 @@
 	import { commentsApi, type Comment } from '$lib/api/comments';
 	import { issuesApi, type Issue, type IssuePriority, type IssueStatus } from '$lib/api/issues';
 	import { labelsApi, type Label } from '$lib/api/labels';
-	import { apiClient } from '$lib/api/client';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { membersApi, type WorkspaceMember } from '$lib/api/members';
 	import { authStore } from '$lib/stores/auth';
@@ -16,13 +15,14 @@
 	import { renderMarkdown } from '$lib/utils/markdown';
 	import { requireRouteParam } from '$lib/utils/route-params';
 	import {
-		isAllowedUploadMime,
-		MAX_UPLOAD_SIZE_BYTES,
-		mediaMarkdown,
-		UPLOAD_ACCEPT_ATTR
-	} from '$lib/utils/upload';
+		appendAttachmentsMarkdown,
+		extractMarkdownAttachments,
+		ISSUE_ATTACHMENT_ACCEPT,
+		ISSUE_ATTACHMENT_MAX_SIZE_BYTES,
+		type UploadedAttachment
+	} from '$lib/utils/attachments';
 	import Button from '$lib/components/Button.svelte';
-	import ImageUpload from '$lib/components/ImageUpload.svelte';
+	import FileUpload from '$lib/components/FileUpload.svelte';
 	import Input from '$lib/components/Input.svelte';
 	import Select from '$lib/components/Select.svelte';
 	import Tag from '$lib/components/Tag.svelte';
@@ -71,7 +71,7 @@
 	});
 	let savingIssue = $state(false);
 	let deletingIssue = $state(false);
-	let issueDescriptionTextarea = $state<HTMLTextAreaElement | null>(null);
+	let issueDescriptionAttachments = $state<UploadedAttachment[]>([]);
 
 	let statusValue = $state<IssueStatus>('backlog');
 	let priorityValue = $state<IssuePriority>('medium');
@@ -100,8 +100,7 @@
 	let editMentionFilter = $state('');
 	let editMentionAnchorIndex = $state<number | null>(null);
 	let editTextareaEl = $state<HTMLTextAreaElement | null>(null);
-	let newCommentTextarea = $state<HTMLTextAreaElement | null>(null);
-	let uploadingCommentImage = $state(false);
+	let commentAttachments = $state<UploadedAttachment[]>([]);
 
 	onMount(async () => {
 		await loadPageData();
@@ -172,6 +171,8 @@
 			})
 			.slice(0, 8);
 	});
+
+	const existingIssueAttachments = $derived.by(() => extractMarkdownAttachments(issueForm.description));
 
 	async function loadPageData() {
 		loading = true;
@@ -339,15 +340,25 @@
 		}
 
 		savingIssue = true;
+		const description = appendAttachmentsMarkdown(
+			issueForm.description,
+			issueDescriptionAttachments
+		).trim();
 		const success = await updateIssue({
 			title,
-			description: issueForm.description.trim() || undefined
+			description: description || undefined
 		});
 		savingIssue = false;
 		if (success) {
 			editingIssue = false;
+			issueDescriptionAttachments = [];
 			toast.success(get(t)('issue.updated'));
 		}
+	}
+
+	function toggleIssueEditMode() {
+		editingIssue = !editingIssue;
+		issueDescriptionAttachments = [];
 	}
 
 	async function handleStatusChange() {
@@ -636,14 +647,19 @@
 	}
 
 	async function handleCreateComment() {
-		if (!newComment.trim() || commentSubmitting) {
+		if (commentSubmitting) {
+			return;
+		}
+
+		const content = appendAttachmentsMarkdown(newComment, commentAttachments).trim();
+		if (!content) {
 			return;
 		}
 
 		commentSubmitting = true;
 		const mentionIds = extractMentionIds(newComment);
 		const response = await commentsApi.create(issueId, {
-			content: newComment.trim(),
+			content,
 			mentions: mentionIds.length > 0 ? mentionIds : undefined
 		});
 		commentSubmitting = false;
@@ -656,6 +672,7 @@
 		if (response.data) {
 			comments = [...comments, response.data].sort(sortByCreatedAsc);
 			newComment = '';
+			commentAttachments = [];
 			mentionedUsers = [];
 			showMentionDropdown = false;
 			mentionFilter = '';
@@ -774,201 +791,6 @@
 		return member.entity_type === 'bot';
 	}
 
-	function appendIssueDescriptionImage(url: string, mimeType: string): void {
-		const markdown = mediaMarkdown(url, mimeType);
-		if (!issueDescriptionTextarea) {
-			const suffix = issueForm.description.trim().length > 0 ? '\n\n' : '';
-			issueForm = {
-				...issueForm,
-				description: `${issueForm.description}${suffix}${markdown}`
-			};
-			return;
-		}
-
-		const current = issueForm.description;
-		const start = issueDescriptionTextarea.selectionStart ?? current.length;
-		const end = issueDescriptionTextarea.selectionEnd ?? start;
-		const nextDescription = `${current.slice(0, start)}${markdown}${current.slice(end)}`;
-		issueForm = {
-			...issueForm,
-			description: nextDescription
-		};
-
-		void tick().then(() => {
-			if (!issueDescriptionTextarea) {
-				return;
-			}
-			const cursor = start + markdown.length;
-			issueDescriptionTextarea.selectionStart = cursor;
-			issueDescriptionTextarea.selectionEnd = cursor;
-			issueDescriptionTextarea.focus();
-		});
-	}
-
-	async function uploadIssueDescriptionImage(file: File): Promise<void> {
-		if (!isAllowedUploadMime(file.type)) {
-			toast.error(get(t)('toast.uploadTypeFail'));
-			return;
-		}
-		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-			toast.error(get(t)('toast.uploadSizeFail'));
-			return;
-		}
-
-		const formData = new FormData();
-		formData.append('file', file);
-		const headers = new Headers();
-		const token = apiClient.getToken();
-		if (token) {
-			headers.set('Authorization', `Bearer ${token}`);
-		}
-
-		try {
-			const response = await fetch('/api/v1/upload', {
-				method: 'POST',
-				headers,
-				body: formData
-			});
-			const result = (await response.json()) as {
-				code?: number;
-				message?: string;
-				data?: { url?: string };
-			};
-			if (result.code === 0 && result.data?.url) {
-				appendIssueDescriptionImage(result.data.url, file.type);
-				toast.success(get(t)('toast.uploadSuccess'));
-				return;
-			}
-
-			toast.error(result.message || get(t)('toast.uploadFail'));
-		} catch {
-			toast.error(get(t)('toast.uploadNetworkFail'));
-		}
-	}
-
-	function handleIssueDescriptionPaste(event: ClipboardEvent): void {
-		const items = event.clipboardData?.items;
-		if (!items) {
-			return;
-		}
-
-		for (const item of items) {
-			if (!isAllowedUploadMime(item.type)) {
-				continue;
-			}
-
-			const file = item.getAsFile();
-			if (!file) {
-				return;
-			}
-
-			event.preventDefault();
-			void uploadIssueDescriptionImage(file);
-			return;
-		}
-	}
-
-	function appendCommentImage(url: string, mimeType: string): void {
-		const markdown = mediaMarkdown(url, mimeType);
-		if (!newCommentTextarea) {
-			const suffix = newComment.trim().length > 0 ? '\n\n' : '';
-			newComment = `${newComment}${suffix}${markdown}`;
-			return;
-		}
-
-		const current = newComment;
-		const start = newCommentTextarea.selectionStart ?? current.length;
-		const end = newCommentTextarea.selectionEnd ?? start;
-		const nextContent = `${current.slice(0, start)}${markdown}${current.slice(end)}`;
-		newComment = nextContent;
-
-		void tick().then(() => {
-			if (!newCommentTextarea) {
-				return;
-			}
-			const cursor = start + markdown.length;
-			newCommentTextarea.selectionStart = cursor;
-			newCommentTextarea.selectionEnd = cursor;
-			newCommentTextarea.focus();
-		});
-	}
-
-	async function uploadCommentImage(file: File): Promise<void> {
-		if (!isAllowedUploadMime(file.type)) {
-			toast.error(get(t)('toast.uploadTypeFail'));
-			return;
-		}
-		if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-			toast.error(get(t)('toast.uploadSizeFail'));
-			return;
-		}
-
-		uploadingCommentImage = true;
-		const formData = new FormData();
-		formData.append('file', file);
-		const headers = new Headers();
-		const token = apiClient.getToken();
-		if (token) {
-			headers.set('Authorization', `Bearer ${token}`);
-		}
-
-		try {
-			const response = await fetch('/api/v1/upload', {
-				method: 'POST',
-				headers,
-				body: formData
-			});
-			const result = (await response.json()) as {
-				code?: number;
-				message?: string;
-				data?: { url?: string };
-			};
-			if (result.code === 0 && result.data?.url) {
-				appendCommentImage(result.data.url, file.type);
-				toast.success(get(t)('toast.uploadSuccess'));
-			} else {
-				toast.error(result.message || get(t)('toast.uploadFail'));
-			}
-		} catch {
-			toast.error(get(t)('toast.uploadNetworkFail'));
-		} finally {
-			uploadingCommentImage = false;
-		}
-	}
-
-	function handleCommentPaste(event: ClipboardEvent): void {
-		const items = event.clipboardData?.items;
-		if (!items) {
-			return;
-		}
-
-		for (const item of items) {
-			if (!isAllowedUploadMime(item.type)) {
-				continue;
-			}
-
-			const file = item.getAsFile();
-			if (!file) {
-				return;
-			}
-
-			event.preventDefault();
-			void uploadCommentImage(file);
-			return;
-		}
-	}
-
-	async function handleCommentImageSelect(event: Event): Promise<void> {
-		const input = event.target as HTMLInputElement;
-		const file = input.files?.[0];
-		if (!file) {
-			return;
-		}
-
-		await uploadCommentImage(file);
-		input.value = '';
-	}
-
 	function getSprintDisplay(sprintId: string | undefined): string {
 		if (!sprintId) {
 			return '';
@@ -1051,7 +873,7 @@
 					<span class="font-medium text-slate-900 dark:text-slate-100">{formatIssueCode(issue)}</span>
 				</div>
 				<div class="flex flex-wrap gap-2">
-					<Button variant="ghost" size="sm" onclick={() => (editingIssue = !editingIssue)}>
+					<Button variant="ghost" size="sm" onclick={toggleIssueEditMode}>
 						{editingIssue ? $t('issue.cancelEdit') : $t('common.edit')}
 					</Button>
 					<Button variant="danger" size="sm" onclick={handleDeleteIssue} loading={deletingIssue}>
@@ -1093,15 +915,35 @@
 								<Textarea
 									label={$t('issue.addDescription')}
 									bind:value={issueForm.description}
-									bind:element={issueDescriptionTextarea}
 									rows={8}
 									placeholder={$t('issue.descriptionInputPlaceholder')}
-									onpaste={handleIssueDescriptionPaste}
 								/>
-								<ImageUpload onUploaded={appendIssueDescriptionImage} />
+								<FileUpload
+									bind:value={issueDescriptionAttachments}
+									accept={ISSUE_ATTACHMENT_ACCEPT}
+									maxSize={ISSUE_ATTACHMENT_MAX_SIZE_BYTES}
+									multiple
+								/>
+								{#if existingIssueAttachments.length > 0}
+									<div class="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900">
+										<p class="mb-1 font-medium text-slate-700 dark:text-slate-200">{$t('issue.existingAttachments')}</p>
+										<div class="space-y-1">
+											{#each existingIssueAttachments as attachment (attachment.url)}
+												<a
+													href={attachment.url}
+													target="_blank"
+													rel="noreferrer"
+													class="block truncate text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+												>
+													{attachment.isImage ? '🖼️' : '📎'} {attachment.filename}
+												</a>
+											{/each}
+										</div>
+									</div>
+								{/if}
 								<div class="flex gap-2">
 									<Button onclick={saveIssueEdit} loading={savingIssue}>{$t('issue.saveChanges')}</Button>
-									<Button variant="ghost" onclick={() => (editingIssue = false)}>{$t('common.cancel')}</Button>
+									<Button variant="ghost" onclick={toggleIssueEditMode}>{$t('common.cancel')}</Button>
 								</div>
 							</div>
 						{:else}
@@ -1330,30 +1172,26 @@
 					<Textarea
 						label={$t('issue.addComment')}
 						bind:value={newComment}
-						bind:element={newCommentTextarea}
 						rows={3}
 						maxlength={5000}
 						placeholder={$t('issue.commentPlaceholder')}
 						oninput={handleNewCommentInput}
-						onpaste={handleCommentPaste}
 					/>
-					<div class="mt-2 flex items-center justify-between">
-						<label class="inline-flex cursor-pointer items-center gap-1 text-sm text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300">
-							<span class="inline-flex items-center gap-1">
-								<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-									<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-								</svg>
-								{uploadingCommentImage ? $t('search.searching') : $t('issue.uploadImage')}
-							</span>
-							<input 
-								type="file" 
-								accept={UPLOAD_ACCEPT_ATTR}
-								class="hidden" 
-								onchange={handleCommentImageSelect}
-								disabled={uploadingCommentImage}
+					<div class="mt-2 flex items-start justify-between gap-3">
+						<div class="min-w-0 flex-1">
+							<FileUpload
+								compact
+								bind:value={commentAttachments}
+								accept={ISSUE_ATTACHMENT_ACCEPT}
+								maxSize={ISSUE_ATTACHMENT_MAX_SIZE_BYTES}
+								multiple
 							/>
-						</label>
-						<Button onclick={handleCreateComment} disabled={!newComment.trim()} loading={commentSubmitting}>
+						</div>
+						<Button
+							onclick={handleCreateComment}
+							disabled={!newComment.trim() && commentAttachments.length === 0}
+							loading={commentSubmitting}
+						>
 							{$t('issue.submitComment')}
 						</Button>
 					</div>

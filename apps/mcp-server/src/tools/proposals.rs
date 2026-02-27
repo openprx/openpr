@@ -12,7 +12,8 @@ pub fn list_proposals_tool() -> ToolDefinition {
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project"
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "status": {
                     "type": "string",
@@ -57,7 +58,8 @@ pub fn get_proposal_tool() -> ToolDefinition {
             "properties": {
                 "proposal_id": {
                     "type": "string",
-                    "description": "Proposal ID"
+                    "description": "Proposal ID",
+                    "pattern": "^(PROP-)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
                 }
             },
             "required": ["proposal_id"]
@@ -102,7 +104,8 @@ pub fn create_proposal_tool() -> ToolDefinition {
                 },
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project"
+                    "description": "UUID of the project",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             },
             "required": ["title", "description", "project_id"]

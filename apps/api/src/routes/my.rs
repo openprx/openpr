@@ -94,9 +94,21 @@ pub async fn get_my_issues(
             SELECT COUNT(*) as count
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
             WHERE wi.assignee_id = $1
-              AND wm.user_id = $1
+              AND (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+              )
         "#,
         vec![user_id.into()],
     ))
@@ -119,13 +131,29 @@ pub async fn get_my_issues(
                    wi.updated_at
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
             WHERE wi.assignee_id = $1
-              AND wm.user_id = $1
+              AND (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+              )
             ORDER BY wi.updated_at DESC
             LIMIT $2 OFFSET $3
         "#,
-        vec![user_id.into(), (per_page as i64).into(), (offset as i64).into()],
+        vec![
+            user_id.into(),
+            (per_page as i64).into(),
+            (offset as i64).into(),
+        ],
     ))
     .all(&state.db)
     .await?;
@@ -145,7 +173,11 @@ pub async fn get_my_issues(
         })
         .collect();
 
-    let total_pages = if total == 0 { 0 } else { (total + per_page - 1) / per_page };
+    let total_pages = if total == 0 {
+        0
+    } else {
+        (total + per_page - 1) / per_page
+    };
 
     Ok(ApiResponse::success(PaginatedData {
         items,
@@ -196,8 +228,20 @@ pub async fn get_my_activities(
             FROM activities a
             INNER JOIN work_items wi ON wi.id = COALESCE(a.issue_id, CASE WHEN a.resource_type = 'issue' THEN a.resource_id END)
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wm.user_id = $1
+            WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+            )
         "#,
         vec![user_id.into()],
     ))
@@ -223,9 +267,21 @@ pub async fn get_my_activities(
             FROM activities a
             INNER JOIN work_items wi ON wi.id = COALESCE(a.issue_id, CASE WHEN a.resource_type = 'issue' THEN a.resource_id END)
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
             LEFT JOIN users u ON u.id = COALESCE(a.user_id, a.actor_id)
-            WHERE wm.user_id = $1
+            WHERE (
+                EXISTS (
+                    SELECT 1
+                    FROM workspace_members wm
+                    WHERE wm.workspace_id = p.workspace_id
+                      AND wm.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1
+                    FROM workspace_bots wb
+                    WHERE wb.workspace_id = p.workspace_id
+                      AND wb.id = $1
+                )
+            )
             ORDER BY a.created_at DESC
             LIMIT $2 OFFSET $3
         "#,
@@ -251,7 +307,11 @@ pub async fn get_my_activities(
         })
         .collect();
 
-    let total_pages = if total == 0 { 0 } else { (total + per_page - 1) / per_page };
+    let total_pages = if total == 0 {
+        0
+    } else {
+        (total + per_page - 1) / per_page
+    };
 
     Ok(ApiResponse::success(PaginatedData {
         items,

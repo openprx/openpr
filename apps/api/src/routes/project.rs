@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     error::ApiError,
+    middleware::bot_auth::{BotAuthContext, require_workspace_access},
     response::{ApiResponse, PaginatedData},
     routes::decision_domain,
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
@@ -68,7 +69,11 @@ pub async fn create_project(
     }
 
     // Validate key format (uppercase letters only)
-    if !req.key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    if !req
+        .key
+        .chars()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
         return Err(ApiError::BadRequest(
             "key must contain only uppercase letters and digits".to_string(),
         ));
@@ -160,13 +165,17 @@ pub async fn create_project(
 pub async fn list_projects(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
     // Check workspace membership
-    get_workspace_role(&state, workspace_id, user_id).await?;
+    require_workspace_access(&state, &extensions, workspace_id).await?;
 
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct ProjectRow {
@@ -229,7 +238,12 @@ pub async fn list_projects(
             description: p.description,
             created_at: p.created_at.to_rfc3339(),
             updated_at: p.updated_at.to_rfc3339(),
-            issue_counts: Some(issue_counts_by_project.get(&p.id).cloned().unwrap_or_default()),
+            issue_counts: Some(
+                issue_counts_by_project
+                    .get(&p.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
         })
         .collect();
 
@@ -240,10 +254,16 @@ pub async fn list_projects(
 pub async fn get_project(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
 
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct ProjectRow {
@@ -261,14 +281,15 @@ pub async fn get_project(
         r#"
             SELECT p.id, p.workspace_id, p.key, p.name, p.description, p.created_at, p.updated_at
             FROM projects p
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE p.id = $1 AND wm.user_id = $2
+            WHERE p.id = $1
         "#,
-        vec![project_id.into(), user_id.into()],
+        vec![project_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("project not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     Ok(ApiResponse::success(ProjectResponse {
         id: project.id,
@@ -316,7 +337,10 @@ pub async fn update_project(
 
     // Validate key if provided
     if let Some(ref key) = req.key {
-        if !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+        if !key
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        {
             return Err(ApiError::BadRequest(
                 "key must contain only uppercase letters and digits".to_string(),
             ));

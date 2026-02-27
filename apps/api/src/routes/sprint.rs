@@ -1,3 +1,4 @@
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -55,40 +56,49 @@ fn validate_status(status: &str) -> Result<(), ApiError> {
     }
 }
 
+fn build_auth_extensions(
+    claims: JwtClaims,
+    bot: Option<Extension<BotAuthContext>>,
+) -> axum::http::Extensions {
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
+    extensions
+}
+
 /// POST /api/v1/projects/:project_id/sprints - Create sprint
 pub async fn create_sprint(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
     Json(req): Json<CreateSprintRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     if req.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".to_string()));
     }
 
-    // Verify project access
-    let has_access = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE p.id = $1 AND wm.user_id = $2
-            "#,
-            vec![project_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if has_access.is_none() {
-        return Err(ApiError::NotFound(
-            "project not found or access denied".to_string(),
-        ));
+    #[derive(Debug, FromQueryResult)]
+    struct ProjectWorkspace {
+        workspace_id: Uuid,
     }
+
+    let project = ProjectWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![project_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     let sprint_status = req.status.unwrap_or_else(|| "planned".to_string());
     validate_status(&sprint_status)?;
@@ -169,31 +179,28 @@ pub async fn create_sprint(
 pub async fn list_sprints(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
-    // Verify access
-    let has_access = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE p.id = $1 AND wm.user_id = $2
-            "#,
-            vec![project_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if has_access.is_none() {
-        return Err(ApiError::NotFound(
-            "project not found or access denied".to_string(),
-        ));
+    #[derive(Debug, FromQueryResult)]
+    struct ProjectWorkspace {
+        workspace_id: Uuid,
     }
+
+    let project = ProjectWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![project_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     #[derive(Debug, FromQueryResult)]
     struct SprintRow {
@@ -238,11 +245,13 @@ pub async fn list_sprints(
 pub async fn update_sprint(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(sprint_id): Path<Uuid>,
     Json(req): Json<UpdateSprintRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     // Get sprint's project and verify access
     #[derive(Debug, FromQueryResult)]
@@ -258,14 +267,15 @@ pub async fn update_sprint(
             SELECT s.project_id, p.workspace_id, s.status
             FROM sprints s
             INNER JOIN projects p ON s.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE s.id = $1 AND wm.user_id = $2
+            WHERE s.id = $1
         "#,
-        vec![sprint_id.into(), user_id.into()],
+        vec![sprint_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("sprint not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("sprint not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, sprint.workspace_id).await?;
 
     let requested_status = req.status.clone();
 
@@ -436,32 +446,33 @@ pub async fn update_sprint(
 pub async fn delete_sprint(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(sprint_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
-    // Verify access (any workspace member can delete)
-    let has_access = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM sprints s
-                INNER JOIN projects p ON s.project_id = p.id
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE s.id = $1 AND wm.user_id = $2
-            "#,
-            vec![sprint_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if has_access.is_none() {
-        return Err(ApiError::NotFound(
-            "sprint not found or access denied".to_string(),
-        ));
+    #[derive(Debug, FromQueryResult)]
+    struct SprintWorkspace {
+        workspace_id: Uuid,
     }
+
+    let sprint = SprintWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+            SELECT p.workspace_id
+            FROM sprints s
+            INNER JOIN projects p ON s.project_id = p.id
+            WHERE s.id = $1
+        "#,
+        vec![sprint_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("sprint not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, sprint.workspace_id).await?;
 
     state
         .db

@@ -1,3 +1,4 @@
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -99,15 +100,29 @@ fn validate_priority(priority: &str) -> Result<(), ApiError> {
     }
 }
 
+fn build_auth_extensions(
+    claims: JwtClaims,
+    bot: Option<Extension<BotAuthContext>>,
+) -> axum::http::Extensions {
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
+    }
+    extensions
+}
+
 /// POST /api/v1/projects/:project_id/issues - Create a new issue
 pub async fn create_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
     Json(req): Json<CreateIssueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     if req.title.trim().is_empty() {
         return Err(ApiError::BadRequest("title is required".to_string()));
@@ -120,7 +135,7 @@ pub async fn create_issue(
     let issue_priority = req.priority.unwrap_or_else(|| "medium".to_string());
     validate_priority(&issue_priority)?;
 
-    // Check project exists and user has access (via workspace membership)
+    // Check project exists and require workspace access (user or bot).
     #[derive(Debug, FromQueryResult)]
     struct ProjectWorkspace {
         workspace_id: Uuid,
@@ -131,14 +146,15 @@ pub async fn create_issue(
         r#"
             SELECT p.workspace_id
             FROM projects p
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE p.id = $1 AND wm.user_id = $2
+            WHERE p.id = $1
         "#,
-        vec![project_id.into(), user_id.into()],
+        vec![project_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("project not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     // If assignee specified, verify they're a workspace member
     if let Some(assignee_id) = req.assignee_id {
@@ -201,7 +217,11 @@ pub async fn create_issue(
     values.push(user_id.into());
     values.push(now.into());
     values.push(now.into());
-    values.push(req.sprint_id.map(sea_orm::Value::from).unwrap_or(sea_orm::Value::from(None::<Uuid>)));
+    values.push(
+        req.sprint_id
+            .map(sea_orm::Value::from)
+            .unwrap_or(sea_orm::Value::from(None::<Uuid>)),
+    );
 
     state
         .db
@@ -316,32 +336,27 @@ pub async fn create_issue(
 pub async fn list_issues(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
     Query(query): Query<ListIssuesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
-    // Check project access
-    let project_exists = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE p.id = $1 AND wm.user_id = $2
-            "#,
-            vec![project_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if project_exists.is_none() {
-        return Err(ApiError::NotFound(
-            "project not found or access denied".to_string(),
-        ));
+    #[derive(Debug, FromQueryResult)]
+    struct ProjectWorkspace {
+        workspace_id: Uuid,
     }
+
+    let project = ProjectWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![project_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(15).clamp(1, 100);
@@ -447,7 +462,10 @@ pub async fn list_issues(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            &format!("SELECT COUNT(*) AS count FROM work_items WHERE {}", where_sql),
+            &format!(
+                "SELECT COUNT(*) AS count FROM work_items WHERE {}",
+                where_sql
+            ),
             values.clone(),
         ))
         .await?
@@ -581,15 +599,16 @@ pub async fn list_issues(
 pub async fn get_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     #[derive(Debug, FromQueryResult)]
     struct IssueRow {
         id: Uuid,
         project_id: Uuid,
+        workspace_id: Uuid,
         sprint_id: Option<Uuid>,
         title: String,
         description: String,
@@ -608,19 +627,20 @@ pub async fn get_issue(
     let issue = IssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r#"
-            SELECT wi.id, wi.project_id, wi.sprint_id, wi.title, wi.description, wi.state, wi.priority,
+            SELECT wi.id, wi.project_id, p.workspace_id, wi.sprint_id, wi.title, wi.description, wi.state, wi.priority,
                    wi.assignee_id, wi.due_at, wi.created_by, wi.created_at, wi.updated_at,
                    wi.proposal_id, wi.governance_exempt, wi.governance_exempt_reason
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wi.id = $1 AND wm.user_id = $2
+            WHERE wi.id = $1
         "#,
-        vec![issue_id.into(), user_id.into()],
+        vec![issue_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("issue not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, issue.workspace_id).await?;
 
     Ok(ApiResponse::success(IssueResponse {
         id: issue.id,
@@ -646,11 +666,13 @@ pub async fn get_issue(
 pub async fn update_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
     Json(req): Json<UpdateIssueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     // Get current issue values and verify access.
     #[derive(Debug, FromQueryResult)]
@@ -671,14 +693,15 @@ pub async fn update_issue(
             SELECT wi.project_id, p.workspace_id, wi.title, wi.description, wi.state, wi.priority, wi.assignee_id, wi.sprint_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
-            INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-            WHERE wi.id = $1 AND wm.user_id = $2
+            WHERE wi.id = $1
         "#,
-        vec![issue_id.into(), user_id.into()],
+        vec![issue_id.into()],
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound("issue not found or access denied".to_string()))?;
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, current_issue.workspace_id).await?;
 
     // Validate state and priority if provided
     if let Some(ref state_val) = req.state {
@@ -1118,10 +1141,12 @@ pub async fn update_issue(
 pub async fn delete_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let extensions = build_auth_extensions(claims, bot);
 
     // Get issue context and check permission
     #[derive(Debug, FromQueryResult)]
@@ -1155,22 +1180,8 @@ pub async fn delete_issue(
     .await?
     .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
 
-    // Check user role
-    #[derive(Debug, FromQueryResult)]
-    struct RoleRow {
-        role: String,
-    }
-
-    let role = RoleRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-        vec![issue_ws.workspace_id.into(), user_id.into()],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::Forbidden("access denied".to_string()))?;
-
-    if role.role != "owner" && role.role != "admin" {
+    let (_, role, _) = require_workspace_access(&state, &extensions, issue_ws.workspace_id).await?;
+    if role != "owner" && role != "admin" {
         return Err(ApiError::Forbidden(
             "only owners and admins can delete issues".to_string(),
         ));
@@ -1222,6 +1233,134 @@ pub async fn delete_issue(
             extra_data: Some(deleted_issue_payload),
         },
     );
+
+    Ok(ApiResponse::ok())
+}
+
+/// GET /api/v1/issues/by-identifier/:identifier (bot-auth)
+/// Get a work item by its short identifier, e.g. "PRX-42".
+pub async fn get_issue_by_identifier(
+    State(state): State<AppState>,
+    Extension(bot): Extension<BotAuthContext>,
+    Path(identifier): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    // Parse "PREFIX-N"
+    let (prefix, seq) = identifier.rsplit_once('-').ok_or_else(|| {
+        ApiError::BadRequest("identifier must be in format PREFIX-N, e.g. PRX-42".to_string())
+    })?;
+
+    let seq_num: i64 = seq.parse().map_err(|_| {
+        ApiError::BadRequest(format!("sequence number '{}' is not a valid integer", seq))
+    })?;
+
+    #[derive(Debug, FromQueryResult)]
+    struct IssueRow {
+        id: Uuid,
+        project_id: Uuid,
+        sprint_id: Option<Uuid>,
+        title: String,
+        description: String,
+        state: String,
+        priority: String,
+        assignee_id: Option<Uuid>,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        created_by: Option<Uuid>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+        proposal_id: Option<String>,
+        governance_exempt: bool,
+        governance_exempt_reason: Option<String>,
+    }
+
+    let issue = IssueRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+            SELECT wi.id, wi.project_id, wi.sprint_id, wi.title, wi.description,
+                   wi.state, wi.priority, wi.assignee_id, wi.due_at, wi.created_by,
+                   wi.created_at, wi.updated_at,
+                   wi.proposal_id, wi.governance_exempt, wi.governance_exempt_reason
+            FROM work_items wi
+            INNER JOIN projects p ON wi.project_id = p.id
+            WHERE p.workspace_id = $1
+              AND UPPER(p.key) = UPPER($2)
+              AND wi.sequence_number = $3
+        "#,
+        vec![bot.workspace_id.into(), prefix.into(), seq_num.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound(format!("work item '{}' not found", identifier)))?;
+
+    Ok(ApiResponse::success(IssueResponse {
+        id: issue.id,
+        project_id: issue.project_id,
+        sprint_id: issue.sprint_id,
+        title: issue.title,
+        description: issue.description,
+        state: issue.state,
+        priority: issue.priority,
+        assignee_id: issue.assignee_id,
+        due_at: issue.due_at.map(|d| d.to_rfc3339()),
+        created_by: issue.created_by,
+        created_at: issue.created_at.to_rfc3339(),
+        updated_at: issue.updated_at.to_rfc3339(),
+        proposal_id: issue.proposal_id,
+        governance_exempt: issue.governance_exempt,
+        governance_exempt_reason: issue.governance_exempt_reason,
+        labels: None,
+    }))
+}
+
+/// POST /api/v1/issues/:issue_id/labels/batch (bot-auth)
+/// Add multiple labels to a work item in one request.
+#[derive(Debug, serde::Deserialize)]
+pub struct AddLabelsRequest {
+    pub label_ids: Vec<Uuid>,
+}
+
+pub async fn add_labels_to_issue(
+    State(state): State<AppState>,
+    Extension(bot): Extension<BotAuthContext>,
+    Path(issue_id): Path<Uuid>,
+    Json(payload): Json<AddLabelsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if payload.label_ids.is_empty() {
+        return Err(ApiError::BadRequest(
+            "label_ids must not be empty".to_string(),
+        ));
+    }
+
+    // Verify issue belongs to bot's workspace
+    #[derive(Debug, FromQueryResult)]
+    struct IssueCheck {
+        project_id: Uuid,
+    }
+
+    let _check = IssueCheck::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+            SELECT wi.project_id
+            FROM work_items wi
+            INNER JOIN projects p ON wi.project_id = p.id
+            WHERE wi.id = $1 AND p.workspace_id = $2
+        "#,
+        vec![issue_id.into(), bot.workspace_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("work item not found or access denied".to_string()))?;
+
+    // Insert all label associations (ignore conflicts)
+    for label_id in &payload.label_ids {
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO work_item_labels (work_item_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                vec![issue_id.into(), (*label_id).into()],
+            ))
+            .await?;
+    }
 
     Ok(ApiResponse::ok())
 }

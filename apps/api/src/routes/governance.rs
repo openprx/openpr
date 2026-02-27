@@ -101,12 +101,16 @@ pub async fn update_governance_config(
 ) -> Result<impl IntoResponse, ApiError> {
     let actor_id = parse_claim_user_id(&claims)?;
     ensure_project_admin_or_owner_or_system_admin(&state, req.project_id, actor_id).await?;
-    if let Some(value) = req.auto_review_days && value < 0 {
+    if let Some(value) = req.auto_review_days
+        && value < 0
+    {
         return Err(ApiError::BadRequest(
             "auto_review_days must be >= 0".to_string(),
         ));
     }
-    if let Some(value) = req.review_reminder_days && value < 0 {
+    if let Some(value) = req.review_reminder_days
+        && value < 0
+    {
         return Err(ApiError::BadRequest(
             "review_reminder_days must be >= 0".to_string(),
         ));
@@ -114,16 +118,22 @@ pub async fn update_governance_config(
     if let Some(mode) = req.trust_update_mode.as_deref() {
         let mode = mode.trim();
         if mode.is_empty() || mode.len() > 30 {
-            return Err(ApiError::BadRequest("invalid trust_update_mode".to_string()));
+            return Err(ApiError::BadRequest(
+                "invalid trust_update_mode".to_string(),
+            ));
         }
     }
     if let Some(cron) = req.audit_report_cron.as_deref() {
         let cron = cron.trim();
         if cron.is_empty() || cron.len() > 100 {
-            return Err(ApiError::BadRequest("invalid audit_report_cron".to_string()));
+            return Err(ApiError::BadRequest(
+                "invalid audit_report_cron".to_string(),
+            ));
         }
     }
-    if let Some(config) = req.config.as_ref() && !config.is_object() {
+    if let Some(config) = req.config.as_ref()
+        && !config.is_object()
+    {
         return Err(ApiError::BadRequest(
             "config must be a JSON object".to_string(),
         ));
@@ -160,10 +170,9 @@ pub async fn update_governance_config(
 
     let tx = state.db.begin().await?;
 
-    tx
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
                 INSERT INTO governance_configs (
                     project_id,
                     review_required,
@@ -187,20 +196,20 @@ pub async fn update_governance_config(
                     updated_by = EXCLUDED.updated_by,
                     updated_at = EXCLUDED.updated_at
             "#,
-            vec![
-                req.project_id.into(),
-                new_review_required.into(),
-                new_auto_review_days.into(),
-                new_review_reminder_days.into(),
-                new_audit_report_cron.into(),
-                new_trust_update_mode.into(),
-                new_config.clone().into(),
-                Some(actor_id).into(),
-                now.into(),
-                now.into(),
-            ],
-        ))
-        .await?;
+        vec![
+            req.project_id.into(),
+            new_review_required.into(),
+            new_auto_review_days.into(),
+            new_review_reminder_days.into(),
+            new_audit_report_cron.into(),
+            new_trust_update_mode.into(),
+            new_config.clone().into(),
+            Some(actor_id).into(),
+            now.into(),
+            now.into(),
+        ],
+    ))
+    .await?;
 
     let updated = load_or_init_config_by_conn(&tx, req.project_id).await?;
     let new_value = serde_json::to_value(&updated).map_err(|_| ApiError::Internal)?;
@@ -329,9 +338,8 @@ pub async fn list_governance_audit_logs(
         format!("WHERE {}", where_parts.join(" AND "))
     };
 
-    let count_sql = format!(
-        "SELECT COUNT(*)::bigint AS count FROM governance_audit_logs {where_sql}"
-    );
+    let count_sql =
+        format!("SELECT COUNT(*)::bigint AS count FROM governance_audit_logs {where_sql}");
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         count_sql,

@@ -3,6 +3,7 @@
 	import { get } from 'svelte/store';
 	import { locale, t } from 'svelte-i18n';
 	import { page } from '$app/stores';
+	import { botsApi, type Bot, type CreateBotResponse } from '$lib/api/bots';
 	import { membersApi, type WorkspaceMember, type WorkspaceMemberRole } from '$lib/api/members';
 	import { toast } from '$lib/stores/toast';
 	import { requireRouteParam } from '$lib/utils/route-params';
@@ -12,6 +13,8 @@
 	import Modal from '$lib/components/Modal.svelte';
 
 	type EditableRole = Exclude<WorkspaceMemberRole, 'owner'>;
+	type BotPermission = 'read' | 'write' | 'admin';
+
 	interface SearchUser {
 		id: string;
 		email: string;
@@ -19,6 +22,7 @@
 	}
 
 	const workspaceId = requireRouteParam($page.params.workspaceId, 'workspaceId');
+	const botPermissionOptions: BotPermission[] = ['read', 'write', 'admin'];
 
 	let loading = $state(true);
 	let removingMemberId = $state<string | null>(null);
@@ -32,10 +36,21 @@
 	let searchKeyword = $state('');
 	let searchResults = $state<SearchUser[]>([]);
 
+	let botsLoading = $state(true);
+	let creatingToken = $state(false);
+	let revokingBotId = $state<string | null>(null);
+	let showCreateTokenModal = $state(false);
+	let showCreatedTokenModal = $state(false);
+	let tokenName = $state('');
+	let tokenExpiresAt = $state('');
+	let tokenPermissions = $state<BotPermission[]>(['read']);
+	let bots = $state<Bot[]>([]);
+	let createdToken = $state<CreateBotResponse | null>(null);
+
 	const memberIds = $derived(new Set(members.map((member) => member.user_id)));
 
 	onMount(async () => {
-		await loadMembers();
+		await Promise.all([loadMembers(), loadBots()]);
 	});
 
 	async function loadMembers() {
@@ -47,6 +62,18 @@
 			members = response.data.items ?? [];
 		}
 		loading = false;
+	}
+
+	async function loadBots() {
+		botsLoading = true;
+		const response = await botsApi.list(workspaceId);
+		if (response.code !== 0) {
+			toast.error(response.message);
+			bots = [];
+		} else {
+			bots = response.data ?? [];
+		}
+		botsLoading = false;
 	}
 
 	async function searchInternalUsers() {
@@ -119,7 +146,7 @@
 		changingRoleMemberId = null;
 	}
 
-	function formatDate(dateText: string): string {
+	function formatDate(dateText: string | null | undefined): string {
 		if (!dateText) return '-';
 		const parsed = new Date(dateText);
 		if (Number.isNaN(parsed.getTime())) return '-';
@@ -142,6 +169,117 @@
 		if (member.agent_type === 'webhook') return `${botLabel} (${get(t)('agentTypes.webhook')})`;
 		if (member.agent_type === 'custom') return `${botLabel} (${get(t)('agentTypes.custom')})`;
 		return botLabel;
+	}
+
+	function openCreateTokenModal() {
+		tokenName = '';
+		tokenExpiresAt = '';
+		tokenPermissions = ['read'];
+		showCreateTokenModal = true;
+	}
+
+	function togglePermission(permission: BotPermission) {
+		if (tokenPermissions.includes(permission)) {
+			if (tokenPermissions.length === 1) return;
+			tokenPermissions = tokenPermissions.filter((value) => value !== permission);
+			return;
+		}
+		tokenPermissions = [...tokenPermissions, permission];
+	}
+
+	function buildExpiresAt(dateInput: string): string | undefined {
+		if (!dateInput) return undefined;
+		const parsed = new Date(`${dateInput}T23:59:59`);
+		if (Number.isNaN(parsed.getTime())) return undefined;
+		return parsed.toISOString();
+	}
+
+	async function createToken() {
+		if (!tokenName.trim()) {
+			toast.error(get(t)('members.tokenNameRequired'));
+			return;
+		}
+
+		creatingToken = true;
+		const expiresAt = buildExpiresAt(tokenExpiresAt);
+		const response = await botsApi.create(workspaceId, {
+			name: tokenName.trim(),
+			permissions: tokenPermissions,
+			expires_at: expiresAt
+		});
+
+		if (response.code !== 0) {
+			toast.error(response.message);
+		} else if (response.data) {
+			createdToken = response.data;
+			showCreateTokenModal = false;
+			showCreatedTokenModal = true;
+			toast.success(get(t)('members.createTokenSuccess'));
+			await loadBots();
+		}
+
+		creatingToken = false;
+	}
+
+	async function revokeToken(bot: Bot) {
+		if (!confirm(get(t)('members.revokeConfirm', { values: { name: bot.name } }))) {
+			return;
+		}
+
+		revokingBotId = bot.id;
+		const response = await botsApi.revoke(workspaceId, bot.id);
+		if (response.code !== 0) {
+			toast.error(response.message);
+		} else {
+			toast.success(get(t)('members.revokeSuccess'));
+			await loadBots();
+		}
+		revokingBotId = null;
+	}
+
+	async function copyCreatedToken() {
+		if (!createdToken?.token) return;
+
+		try {
+			if (navigator.clipboard?.writeText) {
+				await navigator.clipboard.writeText(createdToken.token);
+			} else {
+				const ta = document.createElement('textarea');
+				ta.value = createdToken.token;
+				ta.style.position = 'fixed';
+				ta.style.opacity = '0';
+				document.body.appendChild(ta);
+				ta.select();
+				document.execCommand('copy');
+				document.body.removeChild(ta);
+			}
+			toast.success(get(t)('members.copyTokenSuccess'));
+		} catch {
+			toast.error(get(t)('members.copyTokenFailed'));
+		}
+	}
+
+	function closeCreatedTokenModal() {
+		showCreatedTokenModal = false;
+		createdToken = null;
+	}
+
+	function getPermissionClass(permission: string): string {
+		if (permission === 'admin') {
+			return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300';
+		}
+		if (permission === 'write') {
+			return 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300';
+		}
+		return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300';
+	}
+
+	function getPermissionLabel(permission: string): string {
+		const normalized = permission.toLowerCase();
+		if (normalized === 'admin' || normalized === 'write' || normalized === 'read') {
+			return get(t)(`members.permission.${normalized}`);
+		}
+		return permission;
 	}
 </script>
 
@@ -227,6 +365,83 @@
 			</div>
 		</div>
 	{/if}
+
+	<div class="overflow-hidden rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900">
+		<div class="flex flex-col gap-3 border-b border-slate-200 dark:border-slate-700 p-4 sm:flex-row sm:items-center sm:justify-between">
+			<div>
+				<h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100">{$t('members.apiTokensTitle')}</h2>
+				<p class="mt-1 text-sm text-slate-600 dark:text-slate-300">{$t('members.apiTokensSubtitle')}</p>
+			</div>
+			<Button size="sm" onclick={openCreateTokenModal}>{$t('members.createToken')}</Button>
+		</div>
+
+		{#if botsLoading}
+			<div class="p-6 text-sm text-slate-500 dark:text-slate-400">{$t('common.loading')}</div>
+		{:else if bots.length === 0}
+			<div class="p-10 text-center text-sm text-slate-500 dark:text-slate-400">{$t('members.apiTokensEmpty')}</div>
+		{:else}
+			<div class="overflow-x-auto">
+				<table class="min-w-full divide-y divide-slate-200 dark:divide-slate-700">
+					<thead class="bg-slate-50 dark:bg-slate-950">
+						<tr>
+							<th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('members.tokenName')}</th>
+							<th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('members.tokenPrefix')}</th>
+							<th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('members.permissions')}</th>
+							<th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('common.status')}</th>
+							<th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('members.lastUsedAt')}</th>
+							<th class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('common.createdAt')}</th>
+							<th class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider text-slate-500 dark:text-slate-400">{$t('common.actions')}</th>
+						</tr>
+					</thead>
+					<tbody class="divide-y divide-slate-200 dark:divide-slate-700 bg-white dark:bg-slate-900">
+						{#each bots as bot (bot.id)}
+							<tr>
+								<td class="px-4 py-3 text-sm font-medium text-slate-900 dark:text-slate-100">{bot.name}</td>
+								<td class="px-4 py-3 text-sm font-mono text-slate-600 dark:text-slate-300">{bot.token_prefix}</td>
+								<td class="px-4 py-3 text-sm text-slate-600 dark:text-slate-300">
+									<div class="flex flex-wrap gap-1.5">
+										{#if bot.permissions.length === 0}
+											<span>-</span>
+										{:else}
+											{#each bot.permissions as permission}
+												<span class={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${getPermissionClass(permission)}`}>
+													{getPermissionLabel(permission)}
+												</span>
+											{/each}
+										{/if}
+									</div>
+								</td>
+								<td class="px-4 py-3 text-sm">
+									{#if bot.is_active}
+										<span class="inline-flex rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
+											{$t('members.tokenStatus.active')}
+										</span>
+									{:else}
+										<span class="inline-flex rounded-full bg-slate-200 px-2.5 py-1 text-xs font-medium text-slate-700 dark:bg-slate-700 dark:text-slate-300">
+											{$t('members.tokenStatus.disabled')}
+										</span>
+									{/if}
+								</td>
+								<td class="px-4 py-3 text-sm text-slate-600 dark:text-slate-300">{formatDate(bot.last_used_at)}</td>
+								<td class="px-4 py-3 text-sm text-slate-600 dark:text-slate-300">{formatDate(bot.created_at)}</td>
+								<td class="px-4 py-3 text-right">
+									<Button
+										variant="danger"
+										size="sm"
+										disabled={!bot.is_active}
+										loading={revokingBotId === bot.id}
+										onclick={() => revokeToken(bot)}
+									>
+										{$t('members.revoke')}
+									</Button>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
+	</div>
 </div>
 
 <Modal bind:open={showInviteModal} title={$t('members.addInternalUser')}>
@@ -288,4 +503,90 @@
 			<Button variant="secondary" onclick={() => (showInviteModal = false)}>{$t('common.close')}</Button>
 		</div>
 	</div>
+</Modal>
+
+<Modal bind:open={showCreateTokenModal} title={$t('members.createToken')}>
+	<form
+		onsubmit={(event) => {
+			event.preventDefault();
+			createToken();
+		}}
+		class="space-y-4"
+	>
+		<Input
+			label={$t('members.tokenName')}
+			placeholder={$t('members.tokenNamePlaceholder')}
+			bind:value={tokenName}
+			required
+		/>
+
+		<div>
+			<p class="mb-2 block text-sm font-medium text-slate-700 dark:text-slate-300">{$t('members.permissions')}</p>
+			<div class="flex flex-wrap gap-2">
+				{#each botPermissionOptions as permission}
+					<label class="inline-flex items-center gap-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-300">
+						<input
+							type="checkbox"
+							checked={tokenPermissions.includes(permission)}
+							onchange={() => togglePermission(permission)}
+							class="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800"
+						/>
+						<span>{$t(`members.permission.${permission}`)}</span>
+					</label>
+				{/each}
+			</div>
+		</div>
+
+		<div>
+			<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300" for="tokenExpiresAt">{$t('members.expiresAt')}</label>
+			<input
+				id="tokenExpiresAt"
+				type="date"
+				bind:value={tokenExpiresAt}
+				class="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
+			/>
+			<p class="mt-1 text-xs text-slate-500 dark:text-slate-400">{$t('members.expiresAtHint')}</p>
+		</div>
+
+		<div class="flex justify-end gap-2 pt-2">
+			<Button variant="secondary" onclick={() => (showCreateTokenModal = false)}>{$t('common.cancel')}</Button>
+			<Button type="submit" loading={creatingToken}>{$t('members.createToken')}</Button>
+		</div>
+	</form>
+</Modal>
+
+<Modal
+	bind:open={showCreatedTokenModal}
+	title={$t('members.tokenCreatedTitle')}
+	maxWidthClass="max-w-2xl"
+	onclose={closeCreatedTokenModal}
+>
+	{#if createdToken}
+		<div class="space-y-4">
+			<div class="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+				{$t('members.tokenCreatedHint')}
+			</div>
+
+			<div>
+				<p class="mb-1 text-sm font-medium text-slate-700 dark:text-slate-300">{$t('members.fullToken')}</p>
+				<code class="block rounded-md bg-slate-100 dark:bg-slate-950 p-3 text-xs sm:text-sm text-slate-900 dark:text-slate-100 break-all">{createdToken.token}</code>
+			</div>
+
+			<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+				<div>
+					<p class="text-xs text-slate-500 dark:text-slate-400">{$t('members.tokenPrefix')}</p>
+					<p class="text-sm font-mono text-slate-700 dark:text-slate-200">{createdToken.token_prefix}</p>
+				</div>
+				<div>
+					<p class="text-xs text-slate-500 dark:text-slate-400">{$t('common.createdAt')}</p>
+					<p class="text-sm text-slate-700 dark:text-slate-200">{formatDate(createdToken.created_at)}</p>
+				</div>
+			</div>
+
+			<div class="flex justify-end gap-2 pt-2">
+				<Button variant="secondary" onclick={closeCreatedTokenModal}>{$t('common.close')}</Button>
+				<Button onclick={copyCreatedToken}>{$t('members.copyToken')}</Button>
+			</div>
+		</div>
+	{/if}
 </Modal>

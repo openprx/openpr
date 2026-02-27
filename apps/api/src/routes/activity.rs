@@ -1,13 +1,14 @@
 use axum::{
-    Extension, Json,
+    Extension,
     extract::{Path, Query, State},
     response::IntoResponse,
 };
 use platform::{app::AppState, auth::JwtClaims};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use crate::{
     error::ApiError,
     response::{ApiResponse, PaginatedData},
@@ -50,27 +51,19 @@ pub struct ListActivitiesQuery {
 pub async fn get_workspace_activities(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
     Query(query): Query<ListActivitiesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
-
-    // Verify user is workspace member
-    let is_member = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-            vec![workspace_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if is_member.is_none() {
-        return Err(ApiError::NotFound(
-            "workspace not found or access denied".to_string(),
-        ));
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
     }
+
+    require_workspace_access(&state, &extensions, workspace_id).await?;
 
     // Build query to get activities for workspace resources
     let mut where_clauses = Vec::new();
@@ -162,32 +155,33 @@ pub async fn get_workspace_activities(
 pub async fn get_project_activities(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
     Query(query): Query<ListActivitiesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
-
-    // Verify user has access to project
-    let has_access = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM projects p
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE p.id = $1 AND wm.user_id = $2
-            "#,
-            vec![project_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if has_access.is_none() {
-        return Err(ApiError::NotFound(
-            "project not found or access denied".to_string(),
-        ));
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
     }
+
+    #[derive(Debug, FromQueryResult)]
+    struct ProjectWorkspace {
+        workspace_id: Uuid,
+    }
+
+    let project = ProjectWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![project_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, project.workspace_id).await?;
 
     // Build query
     let mut where_clauses = vec![
@@ -275,32 +269,37 @@ pub async fn get_project_activities(
 pub async fn get_issue_activities(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
+    let _user_id = Uuid::parse_str(&claims.sub)
         .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
-
-    // Verify user has access to issue
-    let has_access = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"
-                SELECT 1
-                FROM work_items wi
-                INNER JOIN projects p ON wi.project_id = p.id
-                INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
-                WHERE wi.id = $1 AND wm.user_id = $2
-            "#,
-            vec![issue_id.into(), user_id.into()],
-        ))
-        .await?;
-
-    if has_access.is_none() {
-        return Err(ApiError::NotFound(
-            "issue not found or access denied".to_string(),
-        ));
+    let mut extensions = axum::http::Extensions::new();
+    extensions.insert(claims);
+    if let Some(Extension(bot_ctx)) = bot {
+        extensions.insert(bot_ctx);
     }
+
+    #[derive(Debug, FromQueryResult)]
+    struct IssueWorkspace {
+        workspace_id: Uuid,
+    }
+
+    let issue = IssueWorkspace::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+            SELECT p.workspace_id
+            FROM work_items wi
+            INNER JOIN projects p ON wi.project_id = p.id
+            WHERE wi.id = $1
+        "#,
+        vec![issue_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("issue not found".to_string()))?;
+
+    require_workspace_access(&state, &extensions, issue.workspace_id).await?;
 
     #[derive(Debug, FromQueryResult)]
     struct ActivityRow {

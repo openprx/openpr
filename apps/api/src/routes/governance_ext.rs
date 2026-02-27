@@ -13,7 +13,9 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     response::{ApiResponse, PaginatedData},
-    services::trust_score_service::{is_project_admin_or_owner, is_project_member, is_system_admin},
+    services::trust_score_service::{
+        is_project_admin_or_owner, is_project_member, is_system_admin,
+    },
 };
 
 #[derive(Debug, Serialize, FromQueryResult)]
@@ -699,8 +701,12 @@ pub async fn get_decision_analytics(
         ));
     }
 
-    if let (Some(start_at), Some(end_at)) = (query.start_at, query.end_at) && start_at > end_at {
-        return Err(ApiError::BadRequest("start_at must be <= end_at".to_string()));
+    if let (Some(start_at), Some(end_at)) = (query.start_at, query.end_at)
+        && start_at > end_at
+    {
+        return Err(ApiError::BadRequest(
+            "start_at must be <= end_at".to_string(),
+        ));
     }
 
     let (filter_sql, values) = filter_clause(query.project_id, query.start_at, query.end_at);
@@ -1460,7 +1466,8 @@ pub async fn get_ai_participant_learning(
     }
     let where_sql = format!("WHERE {}", where_parts.join(" AND "));
 
-    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM ai_learning_records {where_sql}");
+    let count_sql =
+        format!("SELECT COUNT(*)::bigint AS count FROM ai_learning_records {where_sql}");
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         count_sql,
