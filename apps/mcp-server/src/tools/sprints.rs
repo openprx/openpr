@@ -1,9 +1,7 @@
-use crate::db;
+use crate::client::OpenPrClient;
 use crate::protocol::{CallToolResult, ToolDefinition};
-use platform::app::AppState;
 use serde::Deserialize;
 use serde_json::json;
-use uuid::Uuid;
 
 pub fn create_sprint_tool() -> ToolDefinition {
     ToolDefinition {
@@ -42,26 +40,19 @@ struct CreateSprintInput {
     end_date: Option<String>,
 }
 
-pub async fn create_sprint(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn create_sprint(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateSprintInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
+    let body = json!({
+        "name": input.name,
+        "start_date": input.start_date,
+        "end_date": input.end_date
+    });
 
-    match db::sprints::create_sprint(
-        state,
-        project_id,
-        input.name,
-        input.start_date,
-        input.end_date,
-    )
-    .await
-    {
+    match client.create_sprint(&input.project_id, body).await {
         Ok(sprint) => {
             let json = serde_json::to_string_pretty(&sprint).unwrap_or_default();
             CallToolResult::success(json)
@@ -112,26 +103,29 @@ struct UpdateSprintInput {
     end_date: Option<String>,
 }
 
-pub async fn update_sprint(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn update_sprint(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: UpdateSprintInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let sprint_id = match Uuid::parse_str(&input.sprint_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid sprint_id format"),
-    };
+    let mut body = serde_json::Map::new();
+    if let Some(name) = input.name {
+        body.insert("name".to_string(), json!(name));
+    }
+    if let Some(status) = input.status {
+        body.insert("status".to_string(), json!(status));
+    }
+    if let Some(start) = input.start_date {
+        body.insert("start_date".to_string(), json!(start));
+    }
+    if let Some(end) = input.end_date {
+        body.insert("end_date".to_string(), json!(end));
+    }
 
-    match db::sprints::update_sprint(
-        state,
-        sprint_id,
-        input.name,
-        input.status,
-        input.start_date,
-        input.end_date,
-    )
-    .await
+    match client
+        .update_sprint(&input.sprint_id, serde_json::Value::Object(body))
+        .await
     {
         Ok(sprint) => {
             let json = serde_json::to_string_pretty(&sprint).unwrap_or_default();

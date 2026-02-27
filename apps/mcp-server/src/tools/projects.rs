@@ -1,9 +1,7 @@
-use crate::db;
+use crate::client::OpenPrClient;
 use crate::protocol::{CallToolResult, ToolDefinition};
-use platform::app::AppState;
 use serde::Deserialize;
 use serde_json::json;
-use uuid::Uuid;
 
 pub fn list_projects_tool() -> ToolDefinition {
     ToolDefinition {
@@ -14,31 +12,15 @@ pub fn list_projects_tool() -> ToolDefinition {
             "properties": {
                 "workspace_id": {
                     "type": "string",
-                    "description": "UUID of the workspace"
+                    "description": "UUID of the workspace (optional, uses bot token workspace)"
                 }
-            },
-            "required": ["workspace_id"]
+            }
         }),
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ListProjectsInput {
-    workspace_id: String,
-}
-
-pub async fn list_projects(state: &AppState, args: serde_json::Value) -> CallToolResult {
-    let input: ListProjectsInput = match serde_json::from_value(args) {
-        Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
-    };
-
-    let workspace_id = match Uuid::parse_str(&input.workspace_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid workspace_id format"),
-    };
-
-    match db::projects::list_projects(state, workspace_id).await {
+pub async fn list_projects(client: &OpenPrClient, _args: serde_json::Value) -> CallToolResult {
+    match client.list_projects().await {
         Ok(projects) => {
             let json = serde_json::to_string_pretty(&projects).unwrap_or_default();
             CallToolResult::success(json)
@@ -69,23 +51,17 @@ struct GetProjectInput {
     project_id: String,
 }
 
-pub async fn get_project(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn get_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
-
-    match db::projects::get_project(state, project_id).await {
-        Ok(Some(project)) => {
+    match client.get_project(&input.project_id).await {
+        Ok(project) => {
             let json = serde_json::to_string_pretty(&project).unwrap_or_default();
             CallToolResult::success(json)
         }
-        Ok(None) => CallToolResult::error("Project not found"),
         Err(e) => CallToolResult::error(e),
     }
 }
@@ -97,10 +73,6 @@ pub fn create_project_tool() -> ToolDefinition {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "workspace_id": {
-                    "type": "string",
-                    "description": "UUID of the workspace"
-                },
                 "key": {
                     "type": "string",
                     "description": "Project key (uppercase letters only, e.g., 'PROJ')"
@@ -112,56 +84,33 @@ pub fn create_project_tool() -> ToolDefinition {
                 "description": {
                     "type": "string",
                     "description": "Project description (optional)"
-                },
-                "created_by": {
-                    "type": "string",
-                    "description": "UUID of the creator (optional)"
                 }
             },
-            "required": ["workspace_id", "key", "name"]
+            "required": ["key", "name"]
         }),
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct CreateProjectInput {
-    workspace_id: String,
     key: String,
     name: String,
     description: Option<String>,
-    created_by: Option<String>,
 }
 
-pub async fn create_project(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn create_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let workspace_id = match Uuid::parse_str(&input.workspace_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid workspace_id format"),
-    };
+    let body = json!({
+        "key": input.key,
+        "name": input.name,
+        "description": input.description
+    });
 
-    let created_by = if let Some(cb) = input.created_by {
-        match Uuid::parse_str(&cb) {
-            Ok(id) => Some(id),
-            Err(_) => return CallToolResult::error("Invalid created_by format"),
-        }
-    } else {
-        None
-    };
-
-    match db::projects::create_project(
-        state,
-        workspace_id,
-        input.key,
-        input.name,
-        input.description.unwrap_or_default(),
-        created_by,
-    )
-    .await
-    {
+    match client.create_project(body).await {
         Ok(project) => {
             let json = serde_json::to_string_pretty(&project).unwrap_or_default();
             CallToolResult::success(json)
@@ -202,18 +151,24 @@ struct UpdateProjectInput {
     description: Option<String>,
 }
 
-pub async fn update_project(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn update_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: UpdateProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
+    let mut body = serde_json::Map::new();
+    if let Some(name) = input.name {
+        body.insert("name".to_string(), json!(name));
+    }
+    if let Some(desc) = input.description {
+        body.insert("description".to_string(), json!(desc));
+    }
 
-    match db::projects::update_project(state, project_id, input.name, input.description).await {
+    match client
+        .update_project(&input.project_id, serde_json::Value::Object(body))
+        .await
+    {
         Ok(project) => {
             let json = serde_json::to_string_pretty(&project).unwrap_or_default();
             CallToolResult::success(json)
@@ -244,20 +199,17 @@ struct DeleteProjectInput {
     project_id: String,
 }
 
-pub async fn handle_delete_project(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn handle_delete_project(
+    client: &OpenPrClient,
+    args: serde_json::Value,
+) -> CallToolResult {
     let input: DeleteProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
-
-    match db::projects::delete_project(state, project_id).await {
-        Ok(true) => CallToolResult::success("Project deleted"),
-        Ok(false) => CallToolResult::error("Project not found"),
+    match client.delete_project(&input.project_id).await {
+        Ok(()) => CallToolResult::success("Project deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

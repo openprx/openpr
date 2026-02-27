@@ -1,17 +1,17 @@
+use crate::client::OpenPrClient;
 use crate::protocol::{
     CallToolParams, CallToolResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ListToolsResult,
 };
 use crate::tools;
-use platform::app::AppState;
 use serde_json::Value;
 
 pub struct McpServer {
-    state: AppState,
+    client: OpenPrClient,
 }
 
 impl McpServer {
-    pub fn new(state: AppState) -> Self {
-        Self { state }
+    pub fn new(client: OpenPrClient) -> Self {
+        Self { client }
     }
 
     pub async fn handle_request(&self, req: JsonRpcRequest) -> JsonRpcResponse {
@@ -77,44 +77,50 @@ impl McpServer {
     async fn execute_tool(&self, name: &str, args: Value) -> CallToolResult {
         match name {
             // Projects
-            "projects.list" => tools::projects::list_projects(&self.state, args).await,
-            "projects.get" => tools::projects::get_project(&self.state, args).await,
-            "projects.create" => tools::projects::create_project(&self.state, args).await,
-            "projects.update" => tools::projects::update_project(&self.state, args).await,
-            "projects.delete" => tools::projects::handle_delete_project(&self.state, args).await,
+            "projects.list" => tools::projects::list_projects(&self.client, args).await,
+            "projects.get" => tools::projects::get_project(&self.client, args).await,
+            "projects.create" => tools::projects::create_project(&self.client, args).await,
+            "projects.update" => tools::projects::update_project(&self.client, args).await,
+            "projects.delete" => {
+                tools::projects::handle_delete_project(&self.client, args).await
+            }
 
             // Work Items
-            "work_items.list" => tools::work_items::list_work_items(&self.state, args).await,
-            "work_items.get" => tools::work_items::get_work_item(&self.state, args).await,
-            "work_items.create" => tools::work_items::create_work_item(&self.state, args).await,
-            "work_items.update" => tools::work_items::update_work_item(&self.state, args).await,
+            "work_items.list" => tools::work_items::list_work_items(&self.client, args).await,
+            "work_items.get" => tools::work_items::get_work_item(&self.client, args).await,
+            "work_items.create" => tools::work_items::create_work_item(&self.client, args).await,
+            "work_items.update" => tools::work_items::update_work_item(&self.client, args).await,
             "work_items.delete" => {
-                tools::work_items::handle_delete_work_item(&self.state, args).await
+                tools::work_items::handle_delete_work_item(&self.client, args).await
             }
-            "work_items.search" => tools::work_items::search_work_items(&self.state, args).await,
+            "work_items.search" => {
+                tools::work_items::search_work_items(&self.client, args).await
+            }
 
             // Comments
-            "comments.list" => tools::comments::list_comments(&self.state, args).await,
-            "comments.create" => tools::comments::create_comment(&self.state, args).await,
-            "comments.delete" => tools::comments::handle_delete_comment(&self.state, args).await,
+            "comments.list" => tools::comments::list_comments(&self.client, args).await,
+            "comments.create" => tools::comments::create_comment(&self.client, args).await,
+            "comments.delete" => {
+                tools::comments::handle_delete_comment(&self.client, args).await
+            }
 
             // Proposals
-            "proposals.list" => tools::proposals::list_proposals(&self.state, args).await,
-            "proposals.get" => tools::proposals::get_proposal(&self.state, args).await,
-            "proposals.create" => tools::proposals::create_proposal(&self.state, args).await,
+            "proposals.list" => tools::proposals::list_proposals(&self.client, args).await,
+            "proposals.get" => tools::proposals::get_proposal(&self.client, args).await,
+            "proposals.create" => tools::proposals::create_proposal(&self.client, args).await,
 
             // Members
-            "members.list" => tools::members::list_members(&self.state, args).await,
+            "members.list" => tools::members::list_members(&self.client, args).await,
 
             // Sprints
-            "sprints.create" => tools::sprints::create_sprint(&self.state, args).await,
-            "sprints.update" => tools::sprints::update_sprint(&self.state, args).await,
+            "sprints.create" => tools::sprints::create_sprint(&self.client, args).await,
+            "sprints.update" => tools::sprints::update_sprint(&self.client, args).await,
 
             // Labels
-            "labels.create" => tools::labels::create_label(&self.state, args).await,
+            "labels.create" => tools::labels::create_label(&self.client, args).await,
 
             // Search
-            "search.all" => tools::search::search_all(&self.state, args).await,
+            "search.all" => tools::search::search_all(&self.client, args).await,
 
             _ => CallToolResult::error(format!("Unknown tool: {}", name)),
         }

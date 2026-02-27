@@ -1,9 +1,7 @@
-use crate::db;
+use crate::client::OpenPrClient;
 use crate::protocol::{CallToolResult, ToolDefinition};
-use platform::app::AppState;
 use serde::Deserialize;
 use serde_json::json;
-use uuid::Uuid;
 
 pub fn list_comments_tool() -> ToolDefinition {
     ToolDefinition {
@@ -27,18 +25,13 @@ struct ListCommentsInput {
     work_item_id: String,
 }
 
-pub async fn list_comments(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn list_comments(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListCommentsInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let work_item_id = match Uuid::parse_str(&input.work_item_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid work_item_id format"),
-    };
-
-    match db::comments::list_comments(state, work_item_id).await {
+    match client.list_comments(&input.work_item_id).await {
         Ok(comments) => {
             let json = serde_json::to_string_pretty(&comments).unwrap_or_default();
             CallToolResult::success(json)
@@ -61,10 +54,6 @@ pub fn create_comment_tool() -> ToolDefinition {
                 "content": {
                     "type": "string",
                     "description": "Comment content"
-                },
-                "author_id": {
-                    "type": "string",
-                    "description": "UUID of the comment author (optional)"
                 }
             },
             "required": ["work_item_id", "content"]
@@ -76,32 +65,17 @@ pub fn create_comment_tool() -> ToolDefinition {
 struct CreateCommentInput {
     work_item_id: String,
     content: String,
-    author_id: Option<String>,
 }
 
-pub async fn create_comment(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn create_comment(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateCommentInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let work_item_id = match Uuid::parse_str(&input.work_item_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid work_item_id format"),
-    };
+    let body = json!({ "content": input.content });
 
-    // Use author_id from input, or fall back to configured default, or None
-    let author_id = if let Some(aid) = input.author_id {
-        match Uuid::parse_str(&aid) {
-            Ok(id) => Some(id),
-            Err(_) => return CallToolResult::error("Invalid author_id format"),
-        }
-    } else {
-        // Use configured default_author_id from app config (if set)
-        state.cfg.default_author_id
-    };
-
-    match db::comments::create_comment(state, work_item_id, input.content, author_id).await {
+    match client.create_comment(&input.work_item_id, body).await {
         Ok(comment) => {
             let json = serde_json::to_string_pretty(&comment).unwrap_or_default();
             CallToolResult::success(json)
@@ -132,20 +106,17 @@ struct DeleteCommentInput {
     comment_id: String,
 }
 
-pub async fn handle_delete_comment(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn handle_delete_comment(
+    client: &OpenPrClient,
+    args: serde_json::Value,
+) -> CallToolResult {
     let input: DeleteCommentInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let comment_id = match Uuid::parse_str(&input.comment_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid comment_id format"),
-    };
-
-    match db::comments::delete_comment(state, comment_id).await {
-        Ok(true) => CallToolResult::success("Comment deleted"),
-        Ok(false) => CallToolResult::error("Comment not found"),
+    match client.delete_comment(&input.comment_id).await {
+        Ok(()) => CallToolResult::success("Comment deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

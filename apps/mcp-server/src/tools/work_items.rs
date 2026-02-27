@@ -1,9 +1,7 @@
-use crate::db;
+use crate::client::OpenPrClient;
 use crate::protocol::{CallToolResult, ToolDefinition};
-use platform::app::AppState;
 use serde::Deserialize;
 use serde_json::json;
-use uuid::Uuid;
 
 pub fn list_work_items_tool() -> ToolDefinition {
     ToolDefinition {
@@ -27,18 +25,13 @@ struct ListWorkItemsInput {
     project_id: String,
 }
 
-pub async fn list_work_items(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListWorkItemsInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
-
-    match db::work_items::list_work_items(state, project_id).await {
+    match client.list_work_items(&input.project_id).await {
         Ok(items) => {
             let json = serde_json::to_string_pretty(&items).unwrap_or_default();
             CallToolResult::success(json)
@@ -69,23 +62,17 @@ struct GetWorkItemInput {
     work_item_id: String,
 }
 
-pub async fn get_work_item(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn get_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let work_item_id = match Uuid::parse_str(&input.work_item_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid work_item_id format"),
-    };
-
-    match db::work_items::get_work_item(state, work_item_id).await {
-        Ok(Some(item)) => {
+    match client.get_work_item(&input.work_item_id).await {
+        Ok(item) => {
             let json = serde_json::to_string_pretty(&item).unwrap_or_default();
             CallToolResult::success(json)
         }
-        Ok(None) => CallToolResult::error("Work item not found"),
         Err(e) => CallToolResult::error(e),
     }
 }
@@ -126,10 +113,6 @@ pub fn create_work_item_tool() -> ToolDefinition {
                 "due_at": {
                     "type": "string",
                     "description": "Due date in RFC3339 format (optional)"
-                },
-                "created_by": {
-                    "type": "string",
-                    "description": "UUID of the creator (optional)"
                 }
             },
             "required": ["project_id", "title"]
@@ -146,51 +129,24 @@ struct CreateWorkItemInput {
     priority: Option<String>,
     assignee_id: Option<String>,
     due_at: Option<String>,
-    created_by: Option<String>,
 }
 
-pub async fn create_work_item(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn create_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
+    let body = json!({
+        "title": input.title,
+        "description": input.description,
+        "state": input.state.unwrap_or_else(|| "open".to_string()),
+        "priority": input.priority.unwrap_or_else(|| "medium".to_string()),
+        "assignee_id": input.assignee_id,
+        "due_at": input.due_at
+    });
 
-    let assignee_id = if let Some(aid) = input.assignee_id {
-        match Uuid::parse_str(&aid) {
-            Ok(id) => Some(id),
-            Err(_) => return CallToolResult::error("Invalid assignee_id format"),
-        }
-    } else {
-        None
-    };
-
-    let created_by = if let Some(cb) = input.created_by {
-        match Uuid::parse_str(&cb) {
-            Ok(id) => Some(id),
-            Err(_) => return CallToolResult::error("Invalid created_by format"),
-        }
-    } else {
-        None
-    };
-
-    match db::work_items::create_work_item(
-        state,
-        project_id,
-        input.title,
-        input.description.unwrap_or_default(),
-        input.state.unwrap_or_else(|| "open".to_string()),
-        input.priority.unwrap_or_else(|| "medium".to_string()),
-        assignee_id,
-        input.due_at,
-        created_by,
-    )
-    .await
-    {
+    match client.create_work_item(&input.project_id, body).await {
         Ok(item) => {
             let json = serde_json::to_string_pretty(&item).unwrap_or_default();
             CallToolResult::success(json)
@@ -251,8 +207,7 @@ struct UpdateWorkItemInput {
     due_at: Option<String>,
 }
 
-pub async fn update_work_item(state: &AppState, args: serde_json::Value) -> CallToolResult {
-    // Clone args for later checking
+pub async fn update_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let args_obj = args.as_object().cloned();
 
     let input: UpdateWorkItemInput = match serde_json::from_value(args) {
@@ -260,59 +215,43 @@ pub async fn update_work_item(state: &AppState, args: serde_json::Value) -> Call
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let work_item_id = match Uuid::parse_str(&input.work_item_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid work_item_id format"),
-    };
-
-    // Handle assignee_id specially - need to distinguish between Some(Some(uuid)), Some(None), and None
-    let assignee_id = if args_obj
-        .as_ref()
-        .and_then(|o| o.get("assignee_id"))
-        .is_some()
-    {
-        if let Some(aid) = input.assignee_id {
-            if aid == "null" || aid.is_empty() {
-                Some(None)
-            } else {
-                match Uuid::parse_str(&aid) {
-                    Ok(id) => Some(Some(id)),
-                    Err(_) => return CallToolResult::error("Invalid assignee_id format"),
-                }
+    let mut body = serde_json::Map::new();
+    if let Some(title) = input.title {
+        body.insert("title".to_string(), json!(title));
+    }
+    if let Some(desc) = input.description {
+        body.insert("description".to_string(), json!(desc));
+    }
+    if let Some(state) = input.state {
+        body.insert("state".to_string(), json!(state));
+    }
+    if let Some(priority) = input.priority {
+        body.insert("priority".to_string(), json!(priority));
+    }
+    if args_obj.as_ref().and_then(|o| o.get("assignee_id")).is_some() {
+        match input.assignee_id.as_deref() {
+            Some("") | Some("null") | None => {
+                body.insert("assignee_id".to_string(), serde_json::Value::Null);
             }
-        } else {
-            Some(None)
-        }
-    } else {
-        None
-    };
-
-    // Handle due_at similarly
-    let due_at = if args_obj.as_ref().and_then(|o| o.get("due_at")).is_some() {
-        if let Some(d) = input.due_at {
-            if d == "null" || d.is_empty() {
-                Some(None)
-            } else {
-                Some(Some(d))
+            Some(aid) => {
+                body.insert("assignee_id".to_string(), json!(aid));
             }
-        } else {
-            Some(None)
         }
-    } else {
-        None
-    };
+    }
+    if args_obj.as_ref().and_then(|o| o.get("due_at")).is_some() {
+        match input.due_at.as_deref() {
+            Some("") | Some("null") | None => {
+                body.insert("due_at".to_string(), serde_json::Value::Null);
+            }
+            Some(d) => {
+                body.insert("due_at".to_string(), json!(d));
+            }
+        }
+    }
 
-    match db::work_items::update_work_item(
-        state,
-        work_item_id,
-        input.title,
-        input.description,
-        input.state,
-        input.priority,
-        assignee_id,
-        due_at,
-    )
-    .await
+    match client
+        .update_work_item(&input.work_item_id, serde_json::Value::Object(body))
+        .await
     {
         Ok(item) => {
             let json = serde_json::to_string_pretty(&item).unwrap_or_default();
@@ -329,42 +268,31 @@ pub fn search_work_items_tool() -> ToolDefinition {
         input_schema: json!({
             "type": "object",
             "properties": {
-                "workspace_id": {
-                    "type": "string",
-                    "description": "UUID of the workspace"
-                },
                 "query": {
                     "type": "string",
                     "description": "Search query (matches title and description)"
                 }
             },
-            "required": ["workspace_id", "query"]
+            "required": ["query"]
         }),
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchWorkItemsInput {
-    workspace_id: String,
     query: String,
 }
 
-pub async fn search_work_items(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn search_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: SearchWorkItemsInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let workspace_id = match Uuid::parse_str(&input.workspace_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid workspace_id format"),
-    };
-
-    match db::work_items::search_work_items(state, workspace_id, &input.query).await {
+    match client.search_work_items(&input.query).await {
         Ok(items) => {
-            let count = items.len();
             let json = serde_json::to_string_pretty(&items).unwrap_or_default();
-            CallToolResult::success(format!("Found {} work items:\n{}", count, json))
+            CallToolResult::success(json)
         }
         Err(e) => CallToolResult::error(e),
     }
@@ -393,7 +321,7 @@ struct DeleteWorkItemInput {
 }
 
 pub async fn handle_delete_work_item(
-    state: &AppState,
+    client: &OpenPrClient,
     args: serde_json::Value,
 ) -> CallToolResult {
     let input: DeleteWorkItemInput = match serde_json::from_value(args) {
@@ -401,14 +329,8 @@ pub async fn handle_delete_work_item(
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let work_item_id = match Uuid::parse_str(&input.work_item_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid work_item_id format"),
-    };
-
-    match db::work_items::delete_work_item(state, work_item_id).await {
-        Ok(true) => CallToolResult::success("Work item deleted"),
-        Ok(false) => CallToolResult::error("Work item not found"),
+    match client.delete_work_item(&input.work_item_id).await {
+        Ok(()) => CallToolResult::success("Work item deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

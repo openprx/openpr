@@ -1,9 +1,7 @@
-use crate::db;
+use crate::client::OpenPrClient;
 use crate::protocol::{CallToolResult, ToolDefinition};
-use platform::app::AppState;
 use serde::Deserialize;
 use serde_json::json;
-use uuid::Uuid;
 
 pub fn list_proposals_tool() -> ToolDefinition {
     ToolDefinition {
@@ -32,18 +30,16 @@ struct ListProposalsInput {
     status: Option<String>,
 }
 
-pub async fn list_proposals(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn list_proposals(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListProposalsInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
-
-    match db::proposals::list_proposals(state, project_id, input.status).await {
+    match client
+        .list_proposals(&input.project_id, input.status.as_deref())
+        .await
+    {
         Ok(proposals) => {
             let json = serde_json::to_string_pretty(&proposals).unwrap_or_default();
             CallToolResult::success(json)
@@ -74,18 +70,17 @@ struct GetProposalInput {
     proposal_id: String,
 }
 
-pub async fn get_proposal(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn get_proposal(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetProposalInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    match db::proposals::get_proposal(state, input.proposal_id).await {
-        Ok(Some(proposal)) => {
+    match client.get_proposal(&input.proposal_id).await {
+        Ok(proposal) => {
             let json = serde_json::to_string_pretty(&proposal).unwrap_or_default();
             CallToolResult::success(json)
         }
-        Ok(None) => CallToolResult::error("Proposal not found"),
         Err(e) => CallToolResult::error(e),
     }
 }
@@ -122,28 +117,19 @@ struct CreateProposalInput {
     project_id: String,
 }
 
-pub async fn create_proposal(state: &AppState, args: serde_json::Value) -> CallToolResult {
+pub async fn create_proposal(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateProposalInput = match serde_json::from_value(args) {
         Ok(i) => i,
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    let project_id = match Uuid::parse_str(&input.project_id) {
-        Ok(id) => id,
-        Err(_) => return CallToolResult::error("Invalid project_id format"),
-    };
+    let body = json!({
+        "title": input.title,
+        "description": input.description,
+        "project_id": input.project_id
+    });
 
-    let author_id = state.cfg.default_author_id;
-
-    match db::proposals::create_proposal(
-        state,
-        project_id,
-        input.title,
-        input.description,
-        author_id,
-    )
-    .await
-    {
+    match client.create_proposal(body).await {
         Ok(proposal) => {
             let json = serde_json::to_string_pretty(&proposal).unwrap_or_default();
             CallToolResult::success(json)
