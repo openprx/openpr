@@ -18,6 +18,7 @@ export interface Notification {
 	content: string;
 	link?: string;
 	related_issue_id?: string;
+	issue_title?: string;
 	related_comment_id?: string;
 	related_project_id?: string;
 	is_read: boolean;

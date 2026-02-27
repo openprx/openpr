@@ -30,6 +30,7 @@ pub struct NotificationResponse {
     pub is_read: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub read_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub issue_title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,20 +96,24 @@ pub async fn list_notifications(
 
     // Get notifications
     let list_query = if unread_only {
-        "SELECT id, user_id, type as notification_type, title, content, link, 
-                related_issue_id, related_comment_id, related_project_id, 
-                is_read, created_at, read_at 
-         FROM notifications 
-         WHERE user_id = $1 AND is_read = false 
-         ORDER BY created_at DESC 
+        "SELECT n.id, n.user_id, n.type as notification_type, n.title, n.content, n.link,
+                n.related_issue_id, n.related_comment_id, n.related_project_id,
+                n.is_read, n.created_at, n.read_at,
+                i.title as issue_title
+         FROM notifications n
+         LEFT JOIN issues i ON n.related_issue_id = i.id
+         WHERE n.user_id = $1 AND n.is_read = false
+         ORDER BY n.created_at DESC
          LIMIT $2 OFFSET $3"
     } else {
-        "SELECT id, user_id, type as notification_type, title, content, link, 
-                related_issue_id, related_comment_id, related_project_id, 
-                is_read, created_at, read_at 
-         FROM notifications 
-         WHERE user_id = $1 
-         ORDER BY created_at DESC 
+        "SELECT n.id, n.user_id, n.type as notification_type, n.title, n.content, n.link,
+                n.related_issue_id, n.related_comment_id, n.related_project_id,
+                n.is_read, n.created_at, n.read_at,
+                i.title as issue_title
+         FROM notifications n
+         LEFT JOIN issues i ON n.related_issue_id = i.id
+         WHERE n.user_id = $1
+         ORDER BY n.created_at DESC
          LIMIT $2 OFFSET $3"
     };
 
