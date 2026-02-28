@@ -20,7 +20,7 @@ use server::McpServer;
 use serde::Deserialize;
 use serde_json::json;
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
@@ -229,6 +229,49 @@ async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
 
+/// Whether the line is a Content-Length or Content-Type header (case-insensitive).
+fn is_stdio_header_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("content-length:") || lower.starts_with("content-type:")
+}
+
+/// Parse content-length value from a header line.
+fn parse_content_length(line: &str) -> Option<usize> {
+    let lower = line.to_ascii_lowercase();
+    if lower.starts_with("content-length:") {
+        line[15..].trim().parse::<usize>().ok()
+    } else {
+        None
+    }
+}
+
+/// Whether we used Content-Length framing or line-delimited.
+#[derive(Copy, Clone)]
+enum StdioFrame {
+    LineDelimited,
+    ContentLength,
+}
+
+async fn write_stdio_response(
+    stdout: &mut tokio::io::Stdout,
+    response_json: &str,
+    frame: StdioFrame,
+) -> anyhow::Result<()> {
+    match frame {
+        StdioFrame::LineDelimited => {
+            stdout.write_all(response_json.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+        }
+        StdioFrame::ContentLength => {
+            let header = format!("Content-Length: {}\r\n\r\n", response_json.len());
+            stdout.write_all(header.as_bytes()).await?;
+            stdout.write_all(response_json.as_bytes()).await?;
+        }
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
 async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
     tracing::info!("MCP stdio transport started");
 
@@ -245,14 +288,47 @@ async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
                 break;
             }
             Ok(_) => {
-                let line = line.trim();
-                if line.is_empty() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
                     continue;
                 }
 
-                tracing::debug!(request = %line, "Received request");
+                // Detect Content-Length framing (used by Codex, Claude Desktop)
+                let (payload, frame) = if is_stdio_header_line(trimmed) {
+                    // Read headers until empty line
+                    let mut content_length: Option<usize> = parse_content_length(trimmed);
+                    loop {
+                        let mut header_line = String::new();
+                        match reader.read_line(&mut header_line).await {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let ht = header_line.trim();
+                                if ht.is_empty() {
+                                    break; // End of headers
+                                }
+                                if content_length.is_none() {
+                                    content_length = parse_content_length(ht);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let cl = content_length.unwrap_or(0);
+                    if cl == 0 {
+                        continue;
+                    }
+                    let mut body = vec![0u8; cl];
+                    if let Err(e) = reader.read_exact(&mut body).await {
+                        tracing::error!(error = %e, "Failed to read Content-Length body");
+                        continue;
+                    }
+                    (body, StdioFrame::ContentLength)
+                } else {
+                    // Line-delimited JSON
+                    (trimmed.as_bytes().to_vec(), StdioFrame::LineDelimited)
+                };
 
-                let request: JsonRpcRequest = match serde_json::from_str(line) {
+                let request: JsonRpcRequest = match serde_json::from_slice(&payload) {
                     Ok(req) => req,
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to parse request");
@@ -260,14 +336,14 @@ async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
                             None,
                             protocol::JsonRpcError::parse_error(format!("Invalid JSON: {}", e)),
                         );
-                        if let Ok(response_json) = serde_json::to_string(&error_response) {
-                            stdout.write_all(response_json.as_bytes()).await?;
-                            stdout.write_all(b"\n").await?;
-                            stdout.flush().await?;
+                        if let Ok(rj) = serde_json::to_string(&error_response) {
+                            let _ = write_stdio_response(&mut stdout, &rj, frame).await;
                         }
                         continue;
                     }
                 };
+
+                tracing::debug!(method = %request.method, "Received request");
 
                 let response = server.handle_request(request).await;
                 let Some(response) = response else {
@@ -276,10 +352,9 @@ async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
 
                 match serde_json::to_string(&response) {
                     Ok(response_json) => {
-                        tracing::debug!(response = %response_json, "Sending response");
-                        stdout.write_all(response_json.as_bytes()).await?;
-                        stdout.write_all(b"\n").await?;
-                        stdout.flush().await?;
+                        if let Err(e) = write_stdio_response(&mut stdout, &response_json, frame).await {
+                            tracing::error!(error = %e, "Failed to write response");
+                        }
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to serialize response");
