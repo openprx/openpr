@@ -96,8 +96,10 @@ async fn handle_jsonrpc(
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
     let server = McpServer::new(state.client.clone());
-    let response = server.handle_request(req).await;
-    Json(response)
+    match server.handle_request(req).await {
+        Some(response) => (StatusCode::OK, Json(json!(response))),
+        None => (StatusCode::ACCEPTED, Json(json!({"status": "accepted"}))),
+    }
 }
 
 #[derive(Clone)]
@@ -197,6 +199,9 @@ async fn handle_sse_message(
 
     let server = McpServer::new(state.client.clone());
     let response = server.handle_request(req).await;
+    let Some(response) = response else {
+        return (StatusCode::ACCEPTED, Json(json!({"status": "accepted"})));
+    };
 
     let response_json = match serde_json::to_string(&response) {
         Ok(v) => v,
@@ -264,6 +269,9 @@ async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
                 };
 
                 let response = server.handle_request(request).await;
+                let Some(response) = response else {
+                    continue;
+                };
 
                 match serde_json::to_string(&response) {
                     Ok(response_json) => {
