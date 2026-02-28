@@ -61,7 +61,8 @@ pub async fn admin_middleware(
         return Err(ApiError::Forbidden("user is disabled".to_string()));
     }
 
-    if role.trim().to_lowercase() != "admin" {
+    let role_normalized = role.trim().to_lowercase();
+    if role_normalized != "admin" && role_normalized != "owner" {
         tracing::warn!(
             user_id = %claims.sub,
             role = %role,

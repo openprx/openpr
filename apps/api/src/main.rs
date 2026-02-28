@@ -578,7 +578,7 @@ async fn main() -> anyhow::Result<()> {
             get(routes::governance::list_governance_audit_logs).route_layer(
                 axum_middleware::from_fn_with_state(
                     auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
+                    middleware::admin::admin_middleware,
                 ),
             ),
         )

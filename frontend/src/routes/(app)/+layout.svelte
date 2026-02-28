@@ -10,6 +10,7 @@
 	import { isAdminUser } from '$lib/utils/auth';
 	import { t } from 'svelte-i18n';
 	import { projectOptionsStore } from '$lib/stores/project-options';
+	import { workspacesApi } from '$lib/api/workspaces';
 
 	let { children } = $props();
 
@@ -24,8 +25,10 @@
 	let unreadCount = $state(0);
 	let loadingProfile = $state(true);
 	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	let workspaceRole = $state<string | null>(null);
 
 	const isAdmin = $derived(isAdminUser($authStore.user));
+	const isWorkspaceAdmin = $derived(workspaceRole === 'owner' || workspaceRole === 'admin' || isAdmin);
 
 	const appPageTitle = $derived.by(() => {
 		const pathname = $page.url.pathname;
@@ -81,12 +84,17 @@
 			return [] as Array<{ href: string; label: string }>;
 		}
 
-		return [
-			{ href: `/workspace/${currentWorkspaceId}/projects`, label: $t('nav.projectList') },
-			{ href: `/workspace/${currentWorkspaceId}/members`, label: $t('nav.members') },
-			{ href: `/workspace/${currentWorkspaceId}/webhooks`, label: $t('nav.webhook') },
-			{ href: `/workspace/${currentWorkspaceId}/settings`, label: $t('nav.workspaceSettings') }
+		const links = [
+			{ href: `/workspace/${currentWorkspaceId}/projects`, label: $t('nav.projectList') }
 		];
+		if (isWorkspaceAdmin) {
+			links.push(
+				{ href: `/workspace/${currentWorkspaceId}/members`, label: $t('nav.members') },
+				{ href: `/workspace/${currentWorkspaceId}/webhooks`, label: $t('nav.webhook') },
+				{ href: `/workspace/${currentWorkspaceId}/settings`, label: $t('nav.workspaceSettings') }
+			);
+		}
+		return links;
 	});
 
 	onMount(() => {
@@ -104,6 +112,20 @@
 			}
 
 			await Promise.all([fetchUnreadCount(), projectOptionsStore.ensureLoaded()]);
+
+			// Fetch workspace role for current user
+			if (currentWorkspaceId && meResponse.data?.user) {
+				try {
+					const membersRes = await workspacesApi.getMembers(currentWorkspaceId);
+					if (membersRes.code === 0 && membersRes.data?.items) {
+						const me = membersRes.data.items.find((m) => m.user_id === meResponse.data!.user.id);
+						workspaceRole = me?.role ?? null;
+					}
+				} catch {
+					workspaceRole = null;
+				}
+			}
+
 			loadingProfile = false;
 		})();
 

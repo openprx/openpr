@@ -16,7 +16,10 @@
 		ISSUE_ATTACHMENT_MAX_SIZE_BYTES,
 		type UploadedAttachment
 	} from '$lib/utils/attachments';
+	import { get } from 'svelte/store';
 	import { t } from 'svelte-i18n';
+	import { apiClient } from '$lib/api/client';
+	import { isImageUploadMime, isAllowedUploadMime } from '$lib/utils/upload';
 	import Button from './Button.svelte';
 	import FileUpload from './FileUpload.svelte';
 	import Input from './Input.svelte';
@@ -189,6 +192,54 @@
 		creating = false;
 	}
 
+	async function pasteUpload(file: File): Promise<void> {
+		const formData = new FormData();
+		formData.append('file', file);
+		try {
+			const res = await fetch('/api/v1/upload', {
+				method: 'POST',
+				headers: { Authorization: `Bearer ${apiClient.getToken()}` },
+				body: formData
+			});
+			const result = await res.json();
+			const url = result?.data?.url ?? result?.url;
+			if (!url) { toast.error(get(t)('toast.uploadFail')); return; }
+			const mime = file.type;
+			const md = isImageUploadMime(mime) ? `![image](${url})` : mime.startsWith('video/') ? `<video controls src="${url}"></video>` : `[${file.name}](${url})`;
+			const suffix = form.description.endsWith('\n') || !form.description ? '' : '\n';
+			form.description = `${form.description}${suffix}${md}\n`;
+			toast.success(get(t)('toast.uploadSuccess'));
+		} catch { toast.error(get(t)('toast.uploadNetworkFail')); }
+	}
+
+	function handleDescriptionPaste(event: ClipboardEvent) {
+		const items = event.clipboardData?.items;
+		if (!items) return;
+		for (const item of items) {
+			if (item.kind === 'file' && isAllowedUploadMime(item.type)) {
+				event.preventDefault();
+				const file = item.getAsFile();
+				if (file) void pasteUpload(file);
+				return;
+			}
+		}
+	}
+
+	function handleUploadEvent(event: CustomEvent<{ url: string; filename: string }>) {
+		const { url, filename } = event.detail;
+		const att = attachments.find((a) => a.url === url);
+		const mime = att?.mimeType ?? '';
+		if (isImageUploadMime(mime)) {
+			const md = `![${filename}](${url})`;
+			const suffix = form.description.endsWith('\n') || !form.description ? '' : '\n';
+			form.description = `${form.description}${suffix}${md}\n`;
+		} else if (mime.startsWith('video/')) {
+			const md = `<video controls src="${url}"></video>`;
+			const suffix = form.description.endsWith('\n') || !form.description ? '' : '\n';
+			form.description = `${form.description}${suffix}${md}\n`;
+		}
+	}
+
 	function getMemberOptionLabel(member: WorkspaceMember): string {
 		const base = member.name || member.email;
 		return member.entity_type === 'bot' ? `[Bot] ${base}` : base;
@@ -240,12 +291,14 @@
 						bind:value={form.description}
 						class="min-h-[220px] w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500"
 						placeholder={$t('issue.descriptionPlaceholder')}
+						onpaste={handleDescriptionPaste}
 					></textarea>
 					<FileUpload
 						bind:value={attachments}
 						accept={ISSUE_ATTACHMENT_ACCEPT}
 						maxSize={ISSUE_ATTACHMENT_MAX_SIZE_BYTES}
 						multiple
+						on:upload={handleUploadEvent}
 					/>
 				{:else}
 					<div class="markdown-body dark:prose-invert min-h-[220px] rounded-md border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-950 px-3 py-2 text-sm text-slate-700 dark:text-slate-300">

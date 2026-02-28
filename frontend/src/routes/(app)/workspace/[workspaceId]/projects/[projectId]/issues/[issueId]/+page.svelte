@@ -22,6 +22,8 @@
 		type UploadedAttachment
 	} from '$lib/utils/attachments';
 	import Button from '$lib/components/Button.svelte';
+	import { isImageUploadMime, isAllowedUploadMime } from '$lib/utils/upload';
+	import { apiClient } from '$lib/api/client';
 	import FileUpload from '$lib/components/FileUpload.svelte';
 	import Input from '$lib/components/Input.svelte';
 	import Select from '$lib/components/Select.svelte';
@@ -646,6 +648,102 @@
 		editMentionAnchorIndex = null;
 	}
 
+	async function pasteUpload(
+		file: File,
+		target: 'description' | 'comment'
+	): Promise<void> {
+		const formData = new FormData();
+		formData.append('file', file);
+		try {
+			const res = await fetch('/api/v1/upload', {
+				method: 'POST',
+				headers: { Authorization: `Bearer ${apiClient.getToken()}` },
+				body: formData
+			});
+			const result = await res.json();
+			const url = result?.data?.url ?? result?.url;
+			if (!url) {
+				toast.error(get(t)('toast.uploadFail'));
+				return;
+			}
+			const mime = file.type;
+			let md: string;
+			if (isImageUploadMime(mime)) {
+				md = `![image](${url})`;
+			} else if (mime.startsWith('video/')) {
+				md = `<video controls src="${url}"></video>`;
+			} else {
+				md = `[${file.name}](${url})`;
+			}
+			if (target === 'description') {
+				const suffix = issueForm.description.endsWith('\n') || !issueForm.description ? '' : '\n';
+				issueForm.description = `${issueForm.description}${suffix}${md}\n`;
+			} else {
+				const suffix = newComment.endsWith('\n') || !newComment ? '' : '\n';
+				newComment = `${newComment}${suffix}${md}\n`;
+			}
+			toast.success(get(t)('toast.uploadSuccess'));
+		} catch {
+			toast.error(get(t)('toast.uploadNetworkFail'));
+		}
+	}
+
+	function handleDescriptionPaste(event: ClipboardEvent) {
+		const items = event.clipboardData?.items;
+		if (!items) return;
+		for (const item of items) {
+			if (item.kind === 'file' && isAllowedUploadMime(item.type)) {
+				event.preventDefault();
+				const file = item.getAsFile();
+				if (file) void pasteUpload(file, 'description');
+				return;
+			}
+		}
+	}
+
+	function handleCommentPaste(event: ClipboardEvent) {
+		const items = event.clipboardData?.items;
+		if (!items) return;
+		for (const item of items) {
+			if (item.kind === 'file' && isAllowedUploadMime(item.type)) {
+				event.preventDefault();
+				const file = item.getAsFile();
+				if (file) void pasteUpload(file, 'comment');
+				return;
+			}
+		}
+	}
+
+	function handleDescriptionUpload(event: CustomEvent<{ url: string; filename: string }>) {
+		const { url, filename } = event.detail;
+		const att = issueDescriptionAttachments.find((a) => a.url === url);
+		const mime = att?.mimeType ?? '';
+		if (isImageUploadMime(mime)) {
+			const md = `![${filename}](${url})`;
+			const suffix = issueForm.description.endsWith('\n') || !issueForm.description ? '' : '\n';
+			issueForm.description = `${issueForm.description}${suffix}${md}\n`;
+		} else if (mime.startsWith('video/')) {
+			const md = `<video controls src="${url}"></video>`;
+			const suffix = issueForm.description.endsWith('\n') || !issueForm.description ? '' : '\n';
+			issueForm.description = `${issueForm.description}${suffix}${md}\n`;
+		}
+	}
+
+	function handleCommentUpload(event: CustomEvent<{ url: string; filename: string }>) {
+		const { url, filename } = event.detail;
+		const att = commentAttachments.find((a) => a.url === url);
+		const mime = att?.mimeType ?? '';
+		if (isImageUploadMime(mime)) {
+			const md = `![${filename}](${url})`;
+			const suffix = newComment.endsWith('\n') || !newComment ? '' : '\n';
+			newComment = `${newComment}${suffix}${md}\n`;
+		} else if (mime.startsWith('video/')) {
+			const md = `<video controls src="${url}"></video>`;
+			const suffix = newComment.endsWith('\n') || !newComment ? '' : '\n';
+			newComment = `${newComment}${suffix}${md}\n`;
+		}
+	}
+
 	async function handleCreateComment() {
 		if (commentSubmitting) {
 			return;
@@ -917,12 +1015,14 @@
 									bind:value={issueForm.description}
 									rows={8}
 									placeholder={$t('issue.descriptionInputPlaceholder')}
+									onpaste={handleDescriptionPaste}
 								/>
 								<FileUpload
 									bind:value={issueDescriptionAttachments}
 									accept={ISSUE_ATTACHMENT_ACCEPT}
 									maxSize={ISSUE_ATTACHMENT_MAX_SIZE_BYTES}
 									multiple
+									on:upload={handleDescriptionUpload}
 								/>
 								{#if existingIssueAttachments.length > 0}
 									<div class="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900">
@@ -1176,6 +1276,7 @@
 						maxlength={5000}
 						placeholder={$t('issue.commentPlaceholder')}
 						oninput={handleNewCommentInput}
+						onpaste={handleCommentPaste}
 					/>
 					<div class="mt-2 flex items-start justify-between gap-3">
 						<div class="min-w-0 flex-1">
@@ -1185,6 +1286,7 @@
 								accept={ISSUE_ATTACHMENT_ACCEPT}
 								maxSize={ISSUE_ATTACHMENT_MAX_SIZE_BYTES}
 								multiple
+								on:upload={handleCommentUpload}
 							/>
 						</div>
 						<Button
