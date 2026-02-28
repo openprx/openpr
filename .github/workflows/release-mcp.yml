@@ -32,7 +32,7 @@ jobs:
             artifact: openpr-mcp-server-linux-arm64
             use_cross: true
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             artifact: openpr-mcp-server-macos-amd64
             use_cross: false
           - target: aarch64-apple-darwin
@@ -69,11 +69,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --release --bin mcp-server --target ${{ matrix.target }}
+        run: cross build --release -p mcp-server --bin mcp-server --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.use_cross"
-        run: cargo build --release --bin mcp-server --target ${{ matrix.target }}
+        run: cargo build --release -p mcp-server --bin mcp-server --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
