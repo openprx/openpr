@@ -44,8 +44,9 @@ struct McpArgs {
 async fn main() -> anyhow::Result<()> {
     let args = McpArgs::parse();
 
-    // Initialize tracing
+    // Initialize tracing — always write to stderr to keep stdout clean for JSON-RPC
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("mcp_server=info".parse().unwrap()),
