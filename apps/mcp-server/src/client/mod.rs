@@ -182,9 +182,17 @@ impl OpenPrClient {
 
     // ---- Work Items / Issues ----
 
-    pub async fn list_work_items(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{}/issues", project_id))
-            .await
+    pub async fn list_work_items(
+        &self,
+        project_id: &str,
+        page: u64,
+        per_page: u64,
+    ) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/projects/{}/issues?page={}&per_page={}",
+            project_id, page, per_page
+        ))
+        .await
     }
 
     pub async fn get_work_item(&self, work_item_id: &str) -> Result<Value, String> {

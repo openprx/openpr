@@ -18,10 +18,8 @@
 		footer
 	}: Props = $props();
 
-	function handleBackdropClick(e: MouseEvent) {
-		if (e.target === e.currentTarget) {
-			close();
-		}
+	function handleBackdropClick(_e: MouseEvent) {
+		// Do not close on backdrop click — require explicit close (X or Cancel)
 	}
 
 	function close() {
@@ -29,10 +27,8 @@
 		onclose?.();
 	}
 
-	function handleEscape(e: KeyboardEvent) {
-		if (e.key === 'Escape') {
-			close();
-		}
+	function handleEscape(_e: KeyboardEvent) {
+		// Do not close on Escape — require explicit close (X or Cancel)
 	}
 </script>
 

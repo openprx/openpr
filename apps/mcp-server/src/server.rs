@@ -361,7 +361,7 @@ impl McpServer {
         }
 
         if let Some(project_id) = parse_project_resource_uri(&uri, "/issues") {
-            return match self.client.list_work_items(project_id).await {
+            return match self.client.list_work_items(project_id, 1, 50).await {
                 Ok(issues) => JsonRpcResponse::success(
                     id,
                     json!({

@@ -3,6 +3,10 @@ use crate::protocol::{CallToolResult, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+const DEFAULT_PAGE: u64 = 1;
+const DEFAULT_PER_PAGE: u64 = 50;
+const MAX_PER_PAGE: u64 = 100;
+
 pub fn list_work_items_tool() -> ToolDefinition {
     ToolDefinition {
         name: "work_items.list".to_string(),
@@ -14,6 +18,19 @@ pub fn list_work_items_tool() -> ToolDefinition {
                     "type": "string",
                     "description": "UUID of the project",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "Page number (optional)",
+                    "minimum": 1,
+                    "default": 1
+                },
+                "per_page": {
+                    "type": "integer",
+                    "description": "Items per page (optional)",
+                    "minimum": 1,
+                    "maximum": 100,
+                    "default": 50
                 }
             },
             "required": ["project_id"]
@@ -24,6 +41,8 @@ pub fn list_work_items_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct ListWorkItemsInput {
     project_id: String,
+    page: Option<u64>,
+    per_page: Option<u64>,
 }
 
 pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -32,13 +51,81 @@ pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> 
         Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
     };
 
-    match client.list_work_items(&input.project_id).await {
+    let (page, per_page) = match resolve_pagination(input.page, input.per_page) {
+        Ok(v) => v,
+        Err(e) => return CallToolResult::error(e),
+    };
+
+    match client
+        .list_work_items(&input.project_id, page, per_page)
+        .await
+    {
         Ok(items) => {
-            let json = serde_json::to_string_pretty(&items).unwrap_or_default();
+            let output = build_paginated_output(&items, "items", page, per_page);
+            let json = serde_json::to_string_pretty(&output).unwrap_or_default();
             CallToolResult::success(json)
         }
         Err(e) => CallToolResult::error(e),
     }
+}
+
+fn resolve_pagination(page: Option<u64>, per_page: Option<u64>) -> Result<(u64, u64), String> {
+    let page = page.unwrap_or(DEFAULT_PAGE);
+    let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE);
+
+    if page == 0 {
+        return Err("Invalid input: page must be >= 1".to_string());
+    }
+    if per_page == 0 {
+        return Err("Invalid input: per_page must be >= 1".to_string());
+    }
+    if per_page > MAX_PER_PAGE {
+        return Err(format!(
+            "Invalid input: per_page must be <= {}",
+            MAX_PER_PAGE
+        ));
+    }
+
+    Ok((page, per_page))
+}
+
+fn extract_collection(data: &Value, key: &str) -> Vec<Value> {
+    if let Some(items) = data.get(key).and_then(Value::as_array) {
+        return items.clone();
+    }
+    if let Some(items) = data.as_array() {
+        return items.clone();
+    }
+    Vec::new()
+}
+
+fn build_paginated_output(payload: &Value, item_key: &str, page: u64, per_page: u64) -> Value {
+    let data = extract_data(payload);
+    let items = extract_collection(data, item_key);
+    let total_count = data
+        .get("total_count")
+        .or_else(|| data.get("total"))
+        .and_then(value_to_u64)
+        .unwrap_or(items.len() as u64);
+    let total_pages = data.get("total_pages").and_then(value_to_u64).unwrap_or_else(|| {
+        if total_count == 0 {
+            0
+        } else {
+            (total_count + per_page - 1) / per_page
+        }
+    });
+    let current_page = data
+        .get("current_page")
+        .or_else(|| data.get("page"))
+        .and_then(value_to_u64)
+        .unwrap_or(page);
+
+    json!({
+        "items": items,
+        "total_count": total_count,
+        "total_pages": total_pages,
+        "current_page": current_page
+    })
 }
 
 pub fn get_work_item_tool() -> ToolDefinition {
