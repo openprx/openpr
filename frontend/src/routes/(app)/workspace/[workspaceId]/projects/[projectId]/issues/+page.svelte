@@ -6,6 +6,7 @@
 	import { goto } from '$app/navigation';
 	import { membersApi } from '$lib/api/members';
 	import { issuesApi, type Issue, type IssuePriority, type IssueStatus } from '$lib/api/issues';
+	import { workflowsApi, type WorkflowStateDef } from '$lib/api/workflows';
 	import { labelsApi, type Label } from '$lib/api/labels';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { toast } from '$lib/stores/toast';
@@ -22,6 +23,7 @@
 	let sprints = $state<Sprint[]>([]);
 	let loading = $state(true);
 	let keyword = $state('');
+	let workflowStates = $state<WorkflowStateDef[]>([]);
 	let statusFilter = $state<'all' | IssueStatus>('all');
 	let priorityFilter = $state<'all' | IssuePriority>('all');
 	let assigneeFilter = $state('all');
@@ -49,7 +51,7 @@
 
 		document.addEventListener('click', handleDocumentClick);
 		void (async () => {
-			await Promise.all([loadSprints(), loadMembers(), loadLabels()]);
+			await Promise.all([loadWorkflow(), loadSprints(), loadMembers(), loadLabels()]);
 			await loadIssues(1);
 		})();
 
@@ -124,6 +126,13 @@
 		workspaceLabels = res.data?.items ?? [];
 	}
 
+	async function loadWorkflow() {
+		const response = await workflowsApi.getEffectiveByProject(projectId);
+		if (response.code === 0 && response.data?.states?.length) {
+			workflowStates = response.data.states;
+		}
+	}
+
 	const assigneeOptions = $derived.by(() => {
 		return Object.keys(memberNameMap);
 	});
@@ -187,6 +196,18 @@
 			return selected?.name ?? get(t)('common.label');
 		}
 		return `${get(t)('common.label')} (${selectedLabelIds.length})`;
+	}
+
+	function getStateLabel(stateKey: string): string {
+		const stateDef = workflowStates.find((state) => state.key === stateKey);
+		if (stateDef?.display_name) return stateDef.display_name;
+		const fallback: Record<string, string> = {
+			backlog: get(t)('issue.backlog'),
+			todo: get(t)('issue.todo'),
+			in_progress: get(t)('issue.inProgress'),
+			done: get(t)('issue.done')
+		};
+		return fallback[stateKey] || stateKey;
 	}
 
 	function handleIssueCreated(issue: Issue) {
@@ -277,10 +298,16 @@
 					class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
 				>
 					<option value="all">{$t('issue.all')}</option>
-					<option value="backlog">{$t('issue.backlog')}</option>
-					<option value="todo">{$t('issue.todo')}</option>
-					<option value="in_progress">{$t('issue.inProgress')}</option>
-					<option value="done">{$t('issue.done')}</option>
+					{#if workflowStates.length > 0}
+						{#each workflowStates as state (state.key)}
+							<option value={state.key}>{state.display_name || state.key}</option>
+						{/each}
+					{:else}
+						<option value="backlog">{$t('issue.backlog')}</option>
+						<option value="todo">{$t('issue.todo')}</option>
+						<option value="in_progress">{$t('issue.inProgress')}</option>
+						<option value="done">{$t('issue.done')}</option>
+					{/if}
 				</select>
 			</div>
 			<div>
@@ -550,5 +577,7 @@
 	bind:open={showCreateModal}
 	{workspaceId}
 	{projectId}
+	initialStatus={(workflowStates.find((s) => s.is_initial)?.key || workflowStates[0]?.key || 'backlog') as IssueStatus}
+	workflowStates={workflowStates}
 	onCreated={handleIssueCreated}
 />

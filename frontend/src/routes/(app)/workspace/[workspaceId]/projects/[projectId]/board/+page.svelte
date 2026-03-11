@@ -5,6 +5,7 @@
 	import { page } from '$app/stores';
 	import { membersApi } from '$lib/api/members';
 	import { issuesApi, type Issue, type IssuePriority, type IssueStatus } from '$lib/api/issues';
+	import { workflowsApi, type WorkflowStateDef } from '$lib/api/workflows';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { toast } from '$lib/stores/toast';
 	import { requireRouteParam } from '$lib/utils/route-params';
@@ -18,16 +19,19 @@
 	const workspaceId = $derived(requireRouteParam($page.params.workspaceId, 'workspaceId'));
 	const projectId = $derived(requireRouteParam($page.params.projectId, 'projectId'));
 
-	const columns: IssueStatus[] = ['backlog', 'todo', 'in_progress', 'done'];
+	let workflowStates = $state<WorkflowStateDef[]>([]);
+	const columns = $derived.by(() => workflowStates.map((state) => state.key as IssueStatus));
 	
 	function getColumnName(status: IssueStatus): string {
-		const keys: Record<IssueStatus, string> = {
+		const stateDef = workflowStates.find((s) => s.key === status);
+		if (stateDef?.display_name) return stateDef.display_name;
+		const keys: Record<string, string> = {
 			backlog: 'issue.backlog',
 			todo: 'issue.todo',
 			in_progress: 'issue.inProgress',
 			done: 'issue.done'
 		};
-		return get(t)(keys[status]);
+		return keys[status] ? get(t)(keys[status]) : status;
 	}
 
 	let issues = $state<Issue[]>([]);
@@ -50,8 +54,22 @@
 	let dropTargetStatus = $state<IssueStatus | null>(null);
 
 	onMount(async () => {
-		await Promise.all([loadIssues(), loadSprints()]);
+		await Promise.all([loadWorkflow(), loadIssues(), loadSprints()]);
 	});
+
+	async function loadWorkflow() {
+		const response = await workflowsApi.getEffectiveByProject(projectId);
+		if (response.code === 0 && response.data?.states?.length) {
+			workflowStates = response.data.states;
+		} else {
+			workflowStates = [
+				{ key: 'backlog', display_name: get(t)('issue.backlog'), category: 'active', position: 1, is_initial: true, is_terminal: false },
+				{ key: 'todo', display_name: get(t)('issue.todo'), category: 'active', position: 2, is_initial: false, is_terminal: false },
+				{ key: 'in_progress', display_name: get(t)('issue.inProgress'), category: 'active', position: 3, is_initial: false, is_terminal: false },
+				{ key: 'done', display_name: get(t)('issue.done'), category: 'done', position: 4, is_initial: false, is_terminal: true }
+			];
+		}
+	}
 
 	async function loadIssues() {
 		loading = true;
@@ -169,7 +187,7 @@
 		creatingQuick = true;
 		const response = await issuesApi.create(projectId, {
 			title,
-			status: 'backlog',
+			status: (workflowStates.find((s) => s.is_initial)?.key || workflowStates[0]?.key || 'backlog') as IssueStatus,
 			priority: 'medium',
 			sprint_id: sprintFilterId || undefined
 		});
@@ -443,6 +461,8 @@
 	bind:open={showDetailedCreate}
 	{workspaceId}
 	{projectId}
+	initialStatus={(workflowStates.find((s) => s.is_initial)?.key || workflowStates[0]?.key || 'backlog') as IssueStatus}
 	initialSprintId={sprintFilterId}
+	workflowStates={workflowStates}
 	onCreated={handleDetailedCreated}
 />

@@ -10,6 +10,7 @@
 	import { labelsApi, type Label } from '$lib/api/labels';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { membersApi, type WorkspaceMember } from '$lib/api/members';
+	import { workflowsApi, type WorkflowStateDef } from '$lib/api/workflows';
 	import { authStore } from '$lib/stores/auth';
 	import { toast } from '$lib/stores/toast';
 	import { renderMarkdown } from '$lib/utils/markdown';
@@ -41,12 +42,13 @@
 	const projectId = $derived(requireRouteParam($page.params.projectId, 'projectId'));
 	const issueId = $derived(requireRouteParam($page.params.issueId, 'issueId'));
 
-	const statusOptions: SelectOption[] = [
+	let workflowStates = $state<WorkflowStateDef[]>([]);
+	let statusOptions = $state<SelectOption[]>([
 		{ label: get(t)('issue.backlog'), value: 'backlog' },
 		{ label: get(t)('issue.todo'), value: 'todo' },
 		{ label: get(t)('issue.inProgress'), value: 'in_progress' },
 		{ label: get(t)('issue.done'), value: 'done' }
-	];
+	]);
 
 	const priorityOptions: SelectOption[] = [
 		{ label: get(t)('issue.low'), value: 'low' },
@@ -175,17 +177,19 @@
 	});
 
 	const existingIssueAttachments = $derived.by(() => extractMarkdownAttachments(issueForm.description));
+	const terminalStateKey = $derived.by(() => workflowStates.find((s) => s.is_terminal)?.key || 'done');
 
 	async function loadPageData() {
 		loading = true;
 
-		const [issueResponse, commentsResponse, activityResponse, labelsResponse, issueLabelsResponse, sprintsResponse] = await Promise.all([
+		const [issueResponse, commentsResponse, activityResponse, labelsResponse, issueLabelsResponse, sprintsResponse, workflowResponse] = await Promise.all([
 			issuesApi.get(issueId),
 			commentsApi.list(issueId),
 			activityApi.list(issueId),
 			labelsApi.list(workspaceId),
 			labelsApi.listForIssue(issueId),
-			sprintsApi.list(projectId)
+			sprintsApi.list(projectId),
+			workflowsApi.getEffectiveByProject(projectId)
 		]);
 
 		if (issueResponse.code !== 0) {
@@ -231,6 +235,14 @@
 			toast.error(sprintsResponse.message);
 		} else if (sprintsResponse.data) {
 			sprints = sprintsResponse.data.items ?? [];
+		}
+
+		if (workflowResponse.code === 0 && workflowResponse.data?.states?.length) {
+			workflowStates = workflowResponse.data.states;
+			statusOptions = workflowResponse.data.states.map((s) => ({
+				label: s.display_name || s.key,
+				value: s.key
+			}));
 		}
 
 		loading = false;
@@ -440,11 +452,16 @@
 	}
 
 	async function handleCloseIssue() {
-		if (!issue || issue.status === 'done') {
+		if (!issue) {
 			return;
 		}
 
-		statusValue = 'done';
+		const terminalState = workflowStates.find((s) => s.is_terminal)?.key || 'done';
+		if (issue.status === terminalState) {
+			return;
+		}
+
+		statusValue = terminalState;
 		await handleStatusChange();
 	}
 
@@ -977,7 +994,7 @@
 					<Button variant="danger" size="sm" onclick={handleDeleteIssue} loading={deletingIssue}>
 						{$t('common.delete')}
 					</Button>
-					<Button variant="secondary" size="sm" onclick={handleCloseIssue} disabled={issue.status === 'done'}>
+					<Button variant="secondary" size="sm" onclick={handleCloseIssue} disabled={issue.status === terminalStateKey}>
 						{$t('issue.close')}
 					</Button>
 				</div>

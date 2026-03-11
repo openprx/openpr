@@ -186,7 +186,7 @@
 	function getIssueCount(project: Project, state: 'backlog' | 'todo' | 'in_progress' | 'done'): number {
 		const counts = project.issue_counts;
 		if (!counts) return 0;
-		return counts[state] ?? 0;
+		return counts.by_state?.[state] ?? 0;
 	}
 </script>
 

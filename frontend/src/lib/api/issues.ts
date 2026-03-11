@@ -2,7 +2,7 @@ import { apiClient, type ApiResult, type PaginatedData } from './client';
 import { get } from 'svelte/store';
 import { t } from 'svelte-i18n';
 
-export type IssueStatus = 'backlog' | 'todo' | 'in_progress' | 'done';
+export type IssueStatus = string;
 export type IssuePriority = 'low' | 'medium' | 'high' | 'urgent';
 
 export interface Issue {

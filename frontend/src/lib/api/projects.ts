@@ -1,10 +1,7 @@
 import { apiClient, type ApiResult, type PaginatedData } from './client';
 
 export interface IssueCounts {
-	backlog: number;
-	todo: number;
-	in_progress: number;
-	done: number;
+	by_state: Record<string, number>;
 	total: number;
 }
 

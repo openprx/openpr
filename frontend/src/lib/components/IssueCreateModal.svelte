@@ -7,6 +7,7 @@
 		type IssuePriority,
 		type IssueStatus
 	} from '$lib/api/issues';
+	import type { WorkflowStateDef } from '$lib/api/workflows';
 	import { sprintsApi, type Sprint } from '$lib/api/sprints';
 	import { toast } from '$lib/stores/toast';
 	import { renderMarkdown } from '$lib/utils/markdown';
@@ -39,6 +40,7 @@
 		initialStatus?: IssueStatus;
 		initialPriority?: IssuePriority;
 		initialSprintId?: string;
+		workflowStates?: WorkflowStateDef[];
 		onCreated?: (issue: Issue) => void;
 	}
 
@@ -49,6 +51,7 @@
 		initialStatus = 'backlog',
 		initialPriority = 'medium',
 		initialSprintId = '',
+		workflowStates = [],
 		onCreated
 	}: Props = $props();
 
@@ -60,6 +63,18 @@
 	let labels = $state<LabelOption[]>([]);
 	let selectedLabelIds = $state<string[]>([]);
 	let attachments = $state<UploadedAttachment[]>([]);
+
+	const statusSelectOptions = $derived.by(() => {
+		if (workflowStates.length > 0) {
+			return workflowStates.map((s) => ({ value: s.key, label: s.display_name || s.key }));
+		}
+		return [
+			{ value: 'backlog', label: get(t)('issue.backlog') },
+			{ value: 'todo', label: get(t)('issue.todo') },
+			{ value: 'in_progress', label: get(t)('issue.inProgress') },
+			{ value: 'done', label: get(t)('issue.done') }
+		];
+	});
 
 	let form = $state({
 		title: '',
@@ -80,10 +95,15 @@
 	});
 
 	function resetForm(): void {
+		const defaultStatus =
+			initialStatus ||
+			workflowStates.find((s) => s.is_initial)?.key ||
+			workflowStates[0]?.key ||
+			'backlog';
 		form = {
 			title: '',
 			description: '',
-			status: initialStatus,
+			status: defaultStatus,
 			priority: initialPriority,
 			assignee_id: '',
 			sprint_id: initialSprintId
@@ -319,10 +339,9 @@
 						bind:value={form.status}
 						class="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
 					>
-						<option value="backlog">{$t('issue.backlog')}</option>
-						<option value="todo">{$t('issue.todo')}</option>
-						<option value="in_progress">{$t('issue.inProgress')}</option>
-						<option value="done">{$t('issue.done')}</option>
+						{#each statusSelectOptions as opt (opt.value)}
+							<option value={opt.value}>{opt.label}</option>
+						{/each}
 					</select>
 				</div>
 

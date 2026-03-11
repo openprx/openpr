@@ -500,18 +500,11 @@ fn value_to_u64(value: &Value) -> Option<u64> {
     value.as_str()?.trim().parse::<u64>().ok()
 }
 
-const VALID_WORK_ITEM_STATES: &[&str] = &["backlog", "todo", "in_progress", "done"];
-
 fn validate_work_item_state(state: &str) -> Result<(), String> {
-    if VALID_WORK_ITEM_STATES.contains(&state) {
-        return Ok(());
+    if state.trim().is_empty() {
+        return Err("Invalid state: must be a non-empty string".to_string());
     }
-
-    Err(format!(
-        "Invalid state '{}'. Expected one of: {}",
-        state,
-        VALID_WORK_ITEM_STATES.join(", ")
-    ))
+    Ok(())
 }
 
 fn append_attachments_to_text(
@@ -569,8 +562,7 @@ pub fn create_work_item_tool() -> ToolDefinition {
                 },
                 "state": {
                     "type": "string",
-                    "description": "Work item state. Valid values: backlog, todo, in_progress, done",
-                    "enum": ["backlog", "todo", "in_progress", "done"],
+                    "description": "Work item state key. Any configured workflow state is accepted.",
                     "default": "backlog"
                 },
                 "priority": {
@@ -665,8 +657,7 @@ pub fn update_work_item_tool() -> ToolDefinition {
                 },
                 "state": {
                     "type": "string",
-                    "description": "New state (optional). Valid values: backlog, todo, in_progress, done",
-                    "enum": ["backlog", "todo", "in_progress", "done"]
+                    "description": "New state key (optional). Any configured workflow state is accepted."
                 },
                 "priority": {
                     "type": "string",
