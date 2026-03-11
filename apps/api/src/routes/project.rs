@@ -31,10 +31,7 @@ pub struct ProjectResponse {
 
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct IssueCounts {
-    pub backlog: i64,
-    pub todo: i64,
-    pub in_progress: i64,
-    pub done: i64,
+    pub by_state: HashMap<String, i64>,
     pub total: i64,
 }
 
@@ -217,13 +214,7 @@ pub async fn list_projects(
 
         for row in issue_counts {
             let entry = issue_counts_by_project.entry(row.project_id).or_default();
-            match row.state.as_str() {
-                "backlog" => entry.backlog += row.count,
-                "todo" => entry.todo += row.count,
-                "in_progress" => entry.in_progress += row.count,
-                "done" => entry.done += row.count,
-                _ => {}
-            }
+            *entry.by_state.entry(row.state).or_insert(0) += row.count;
             entry.total += row.count;
         }
     }

@@ -10,7 +10,11 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
-use crate::{error::ApiError, response::ApiResponse};
+use crate::{
+    error::ApiError,
+    response::ApiResponse,
+    services::workflow_service::resolve_effective_workflow_for_project,
+};
 
 #[derive(Debug, Serialize)]
 pub struct BoardColumn {
@@ -141,13 +145,23 @@ pub async fn get_project_board(
             .push(board_issue);
     }
 
-    // Build ordered columns (todo, in_progress, done)
-    let ordered_states = vec!["todo", "in_progress", "done"];
+    // Build ordered columns by effective workflow states.
+    let workflow = resolve_effective_workflow_for_project(&state, project_id).await?;
     let mut columns = Vec::new();
-    for state in ordered_states {
+    for state_def in &workflow.states {
         columns.push(BoardColumn {
-            state: state.to_string(),
-            issues: columns_map.remove(state).unwrap_or_default(),
+            state: state_def.key.clone(),
+            issues: columns_map.remove(&state_def.key).unwrap_or_default(),
+        });
+    }
+
+    // Keep legacy/unknown states visible at the end for compatibility.
+    let mut leftovers: Vec<(String, Vec<BoardIssue>)> = columns_map.into_iter().collect();
+    leftovers.sort_by(|a, b| a.0.cmp(&b.0));
+    for (state_key, issues) in leftovers {
+        columns.push(BoardColumn {
+            state: state_key,
+            issues,
         });
     }
 

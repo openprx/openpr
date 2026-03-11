@@ -14,7 +14,12 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     response::{ApiResponse, PaginatedData},
-    services::ai_task_service::{CreateAiTaskInput, create_ai_task},
+    services::{
+        ai_task_service::{CreateAiTaskInput, create_ai_task},
+        workflow_service::{
+            allowed_state_values, default_project_state, resolve_effective_workflow_for_project,
+        },
+    },
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
 };
 
@@ -80,14 +85,21 @@ pub struct ListIssuesQuery {
     pub sort_order: Option<String>,
 }
 
-/// Validate state field
-fn validate_state(state: &str) -> Result<(), ApiError> {
-    match state {
-        "backlog" | "todo" | "in_progress" | "done" => Ok(()),
-        _ => Err(ApiError::BadRequest(
-            "state must be one of: backlog, todo, in_progress, done".to_string(),
-        )),
+/// Validate state field against project's effective workflow
+async fn validate_project_state(
+    state: &AppState,
+    project_id: Uuid,
+    state_key: &str,
+) -> Result<(), ApiError> {
+    let workflow = resolve_effective_workflow_for_project(state, project_id).await?;
+    if workflow.states.iter().any(|s| s.key == state_key) {
+        return Ok(());
     }
+
+    Err(ApiError::BadRequest(format!(
+        "state must be one of: {}",
+        allowed_state_values(&workflow)
+    )))
 }
 
 /// Validate priority field
@@ -128,10 +140,6 @@ pub async fn create_issue(
         return Err(ApiError::BadRequest("title is required".to_string()));
     }
 
-    // Validate state and priority
-    let issue_state = req.state.unwrap_or_else(|| "todo".to_string());
-    validate_state(&issue_state)?;
-
     let issue_priority = req.priority.unwrap_or_else(|| "medium".to_string());
     validate_priority(&issue_priority)?;
 
@@ -155,6 +163,14 @@ pub async fn create_issue(
     .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
 
     require_workspace_access(&state, &extensions, project.workspace_id).await?;
+
+    // Validate state by effective workflow (project > workspace > system)
+    let issue_state = if let Some(requested) = req.state {
+        validate_project_state(&state, project_id, &requested).await?;
+        requested
+    } else {
+        default_project_state(&state, project_id).await?
+    };
 
     // If assignee specified, verify they're a workspace member
     if let Some(assignee_id) = req.assignee_id {
@@ -368,7 +384,7 @@ pub async fn list_issues(
     let mut param_idx = 2;
 
     if let Some(state_filter) = query.state {
-        validate_state(&state_filter)?;
+        validate_project_state(&state, project_id, &state_filter).await?;
         where_clauses.push(format!("state = ${}", param_idx));
         values.push(state_filter.into());
         param_idx += 1;
@@ -705,7 +721,7 @@ pub async fn update_issue(
 
     // Validate state and priority if provided
     if let Some(ref state_val) = req.state {
-        validate_state(state_val)?;
+        validate_project_state(&state, current_issue.project_id, state_val).await?;
     }
 
     if let Some(ref priority) = req.priority {

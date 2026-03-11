@@ -849,6 +849,15 @@ async fn main() -> anyhow::Result<()> {
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
+        .route(
+            "/api/v1/projects/{project_id}/workflow/effective",
+            get(routes::workflow::get_effective_workflow_by_project).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
         // Sprint routes (protected)
         .route(
             "/api/v1/projects/{project_id}/sprints",
@@ -1103,6 +1112,10 @@ async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
         (
             "0023_work_item_identifier.sql",
             include_str!("../../../migrations/0023_work_item_identifier.sql"),
+        ),
+        (
+            "0024_workflow_config.sql",
+            include_str!("../../../migrations/0024_workflow_config.sql"),
         ),
     ];
 

@@ -4,3 +4,4 @@ pub mod impact_review_service;
 pub mod permission_service;
 pub mod trust_score_service;
 pub mod veto_service;
+pub mod workflow_service;

@@ -29,3 +29,4 @@ pub mod upload;
 pub mod veto;
 pub mod webhook;
 pub mod workspace;
+pub mod workflow;
