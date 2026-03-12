@@ -202,4 +202,4 @@ A: 这些是无障碍访问警告，不影响构建。建议添加 `aria-label` 
 
 ## 许可证
 
-MIT
+双许可证： [MIT](../LICENSE-MIT) 或 [Apache-2.0](../LICENSE-APACHE)。
