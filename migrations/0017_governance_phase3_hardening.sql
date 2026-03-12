@@ -1,19 +1,4 @@
 DO $$
-BEGIN
-  IF EXISTS (
-    SELECT 1
-    FROM information_schema.columns
-    WHERE table_schema = 'public'
-      AND table_name = 'review_participants'
-      AND column_name = 'user_id'
-      AND data_type <> 'character varying'
-  ) THEN
-    ALTER TABLE review_participants
-      ALTER COLUMN user_id TYPE varchar(100) USING user_id::text;
-  END IF;
-END $$;
-
-DO $$
 DECLARE
   fk_name text;
 BEGIN
@@ -35,6 +20,21 @@ BEGIN
 
   IF fk_name IS NOT NULL THEN
     EXECUTE format('ALTER TABLE review_participants DROP CONSTRAINT %I', fk_name);
+  END IF;
+END $$;
+
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'review_participants'
+      AND column_name = 'user_id'
+      AND data_type <> 'character varying'
+  ) THEN
+    ALTER TABLE review_participants
+      ALTER COLUMN user_id TYPE varchar(100) USING user_id::text;
   END IF;
 END $$;
 
