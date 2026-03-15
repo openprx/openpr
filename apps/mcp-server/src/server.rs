@@ -157,7 +157,7 @@ impl McpServer {
         }
     }
 
-    async fn execute_tool(&self, name: &str, args: Value) -> CallToolResult {
+    pub async fn execute_tool(&self, name: &str, args: Value) -> CallToolResult {
         match name {
             // Projects
             "projects.list" => tools::projects::list_projects(&self.client, args).await,

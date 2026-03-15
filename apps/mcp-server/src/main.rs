@@ -1,3 +1,4 @@
+mod cli;
 mod client;
 mod protocol;
 mod server;
@@ -13,8 +14,9 @@ use axum::{
     },
     routing::{get, post},
 };
-use clap::{Parser, ValueEnum};
+use cli::{Cli, Commands};
 use client::OpenPrClient;
+use clap::Parser;
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use server::McpServer;
 use serde::Deserialize;
@@ -25,24 +27,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, ValueEnum)]
-enum Transport {
-    Http,
-    Sse,
-    Stdio,
-}
-
-#[derive(Debug, Parser)]
-struct McpArgs {
-    #[arg(long, value_enum, default_value_t = Transport::Stdio)]
-    transport: Transport,
-    #[arg(long, default_value = "0.0.0.0:8090")]
-    bind_addr: String,
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = McpArgs::parse();
+    let cli = Cli::parse();
 
     // Initialize tracing — always write to stderr to keep stdout clean for JSON-RPC
     tracing_subscriber::fmt()
@@ -53,20 +40,47 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // Read configuration from environment
-    let base_url =
-        std::env::var("OPENPR_API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let bot_token = std::env::var("OPENPR_BOT_TOKEN")
-        .map_err(|_| anyhow::anyhow!("OPENPR_BOT_TOKEN environment variable is required"))?;
-    let workspace_id = std::env::var("OPENPR_WORKSPACE_ID")
-        .map_err(|_| anyhow::anyhow!("OPENPR_WORKSPACE_ID environment variable is required"))?;
+    // Resolve config: CLI flags override environment variables
+    let base_url = cli
+        .api_url
+        .clone()
+        .or_else(|| std::env::var("OPENPR_API_URL").ok())
+        .unwrap_or_else(|| "http://localhost:3000".to_string());
 
-    let client = OpenPrClient::new(base_url, bot_token, workspace_id);
+    let bot_token_opt = cli
+        .bot_token
+        .clone()
+        .or_else(|| std::env::var("OPENPR_BOT_TOKEN").ok());
 
-    match args.transport {
-        Transport::Http => run_http(&args.bind_addr, client).await,
-        Transport::Sse => run_sse(&args.bind_addr, client).await,
-        Transport::Stdio => run_stdio(client).await,
+    let workspace_id_opt = cli
+        .workspace_id
+        .clone()
+        .or_else(|| std::env::var("OPENPR_WORKSPACE_ID").ok());
+
+    match &cli.command {
+        Commands::Serve(serve_args) => {
+            let bot_token = bot_token_opt
+                .ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN environment variable is required"))?;
+            let workspace_id = workspace_id_opt
+                .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID environment variable is required"))?;
+
+            let client = OpenPrClient::new(base_url, bot_token, workspace_id);
+
+            match serve_args.transport {
+                cli::Transport::Http => run_http(&serve_args.bind_addr, client).await,
+                cli::Transport::Sse => run_sse(&serve_args.bind_addr, client).await,
+                cli::Transport::Stdio => run_stdio(client).await,
+            }
+        }
+        _ => {
+            let bot_token = bot_token_opt
+                .ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN is required (set env var or --bot-token)"))?;
+            let workspace_id = workspace_id_opt
+                .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID is required (set env var or --workspace-id)"))?;
+
+            let client = OpenPrClient::new(base_url, bot_token, workspace_id);
+            cli::run_cli_command(&cli.command, &cli.format, client).await
+        }
     }
 }
 
