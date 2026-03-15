@@ -15,6 +15,7 @@ pub enum OutputFormat {
 /// OpenPR MCP server and CLI tool
 #[derive(Debug, Parser)]
 #[command(name = "mcp-server", about = "OpenPR MCP server and CLI tool")]
+#[command(arg_required_else_help = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -53,6 +54,8 @@ pub enum Commands {
     Sprints(SprintsCmd),
     /// Global workspace search
     Search(SearchArgs),
+    /// Upload files
+    Files(FilesCmd),
 }
 
 // ---- Serve ----
@@ -223,6 +226,24 @@ pub struct SearchArgs {
     pub query: String,
 }
 
+// ---- Files ----
+
+#[derive(Debug, Args)]
+pub struct FilesCmd {
+    #[command(subcommand)]
+    pub action: FilesAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FilesAction {
+    /// Upload a file from disk (reads file, encodes to base64, posts to API)
+    Upload {
+        /// Path to the file to upload
+        #[arg(long)]
+        file: String,
+    },
+}
+
 // ---- Output formatting ----
 
 pub fn print_result(format: &OutputFormat, result: &CallToolResult) {
@@ -327,6 +348,13 @@ pub async fn run_cli_command(
 ) -> anyhow::Result<()> {
     let server = McpServer::new(client);
 
+    // Files upload requires async disk I/O before calling execute_tool, handle it separately
+    if let Commands::Files(files_cmd) = command {
+        let result = run_file_upload(files_cmd, &server).await?;
+        print_result(format, &result);
+        return Ok(());
+    }
+
     let (tool_name, args): (&'static str, Value) = match command {
         Commands::Serve(_) => unreachable!("serve is handled before run_cli_command"),
 
@@ -428,9 +456,40 @@ pub async fn run_cli_command(
         Commands::Search(search_args) => {
             ("search.all", json!({ "query": search_args.query }))
         }
+
+        // Files handled above via run_file_upload
+        Commands::Files(_) => unreachable!("Files handled before this match"),
     };
 
     let result = server.execute_tool(tool_name, args).await;
     print_result(format, &result);
     Ok(())
+}
+
+/// Handle file upload: read file from disk, base64-encode, then call files.upload tool.
+async fn run_file_upload(
+    cmd: &FilesCmd,
+    server: &McpServer,
+) -> anyhow::Result<CallToolResult> {
+    match &cmd.action {
+        FilesAction::Upload { file } => {
+            let path = std::path::Path::new(file.as_str());
+            let filename = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(file.as_str())
+                .to_string();
+            let content = tokio::fs::read(path)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file, e))?;
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+            Ok(server
+                .execute_tool(
+                    "files.upload",
+                    json!({ "filename": filename, "content_base64": encoded }),
+                )
+                .await)
+        }
+    }
 }
