@@ -96,7 +96,7 @@ services:
       OPENPR_API_URL: http://host.containers.internal:3000
       OPENPR_BOT_TOKEN: opr_0a5bc81ea108dad8077decc880abced0d923aa873b9ff774575ec152aecf15d5
       OPENPR_WORKSPACE_ID: e5166fd1-3bb7-46d9-b907-273b1eef3f44
-    command: ["/app/mcp-server", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
+    command: ["/app/mcp-server", "serve", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
     ports:
       - "8090:8090"
     depends_on:
@@ -138,8 +138,8 @@ services:
     container_name: openpr-webhook
     image: debian:trixie-slim
     volumes:
-      - /opt/working/code/openpr-webhook/target/release/openpr-webhook:/app/openpr-webhook:ro
-      - /opt/working/code/openpr-webhook/config.toml:/etc/openpr-webhook/config.toml:ro
+      - /opt/opsx/openpr-webhook/target/release/openpr-webhook:/app/openpr-webhook:ro
+      - /opt/opsx/openpr-webhook/config.toml:/etc/openpr-webhook/config.toml:ro
     command: /app/openpr-webhook /etc/openpr-webhook/config.toml
     ports:
       - "9090:9090"
