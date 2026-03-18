@@ -44,6 +44,7 @@ jobs:
             use_cross: false
 
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.use_cross }}
     steps:
       - uses: actions/checkout@v4
 
@@ -137,6 +138,7 @@ jobs:
 
   release:
     needs: [build, build-frontend]
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
