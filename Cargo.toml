@@ -8,9 +8,12 @@ members = [
 ]
 
 [workspace.package]
+authors = ["g1e2x87"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
 version = "0.2.0"
+description = "Open-source project management platform"
+repository = "https://github.com/openprx/openpr"
 
 [workspace.dependencies]
 anyhow = "1.0"
