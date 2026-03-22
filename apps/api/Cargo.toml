@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[package.metadata.cargo-machete]
+ignored = ["jsonwebtoken"]  # used via jwt module, machete false positive
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -24,3 +27,6 @@ tokio.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[lints]
+workspace = true
