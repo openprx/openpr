@@ -294,6 +294,12 @@ Error:
 | Frontend | `frontend/` | SvelteKit app |
 | Migrations | `migrations/` | Database schema |
 
+## Links
+
+- [Documentation](https://docs.openprx.dev/en/openpr/) — Full OpenPR documentation (10 languages)
+- [Community](https://community.openprx.dev) — OpenPRX community forum
+- [OpenPRX](https://openprx.dev) — Project homepage
+
 ## Related Projects
 
 | Repository | Description |
