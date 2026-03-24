@@ -9,7 +9,7 @@ use platform::{
     app::AppState,
     auth::{JwtClaims, JwtManager},
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use serde::{Deserialize, Serialize};
 
 use crate::{error::ApiError, response::ApiResponse};
@@ -144,15 +144,9 @@ pub async fn register(
         .ok_or(ApiError::Internal)?;
 
     let user = UserResponse {
-        id: row
-            .try_get::<String>("", "id")
-            .map_err(|_| ApiError::Internal)?,
-        email: row
-            .try_get::<String>("", "email")
-            .map_err(|_| ApiError::Internal)?,
-        name: row
-            .try_get::<String>("", "name")
-            .map_err(|_| ApiError::Internal)?,
+        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
+        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
+        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
         role: row.try_get::<String>("", "role").ok(),
     };
 
@@ -164,10 +158,7 @@ pub async fn register(
     Ok(resp)
 }
 
-pub async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Result<Response, ApiError> {
+pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Result<Response, ApiError> {
     let normalized_email = req.email.trim().to_lowercase();
 
     let row = state
@@ -194,28 +185,18 @@ pub async fn login(
         .try_get::<String>("", "password_hash")
         .map_err(|_| ApiError::Unauthorized("invalid email or password".to_string()))?;
     if password_hash.is_empty() {
-        return Err(ApiError::Unauthorized(
-            "invalid email or password".to_string(),
-        ));
+        return Err(ApiError::Unauthorized("invalid email or password".to_string()));
     }
     let verified = verify(req.password, &password_hash)
         .map_err(|_| ApiError::Unauthorized("invalid email or password".to_string()))?;
     if !verified {
-        return Err(ApiError::Unauthorized(
-            "invalid email or password".to_string(),
-        ));
+        return Err(ApiError::Unauthorized("invalid email or password".to_string()));
     }
 
     let user = UserResponse {
-        id: row
-            .try_get::<String>("", "id")
-            .map_err(|_| ApiError::Internal)?,
-        email: row
-            .try_get::<String>("", "email")
-            .map_err(|_| ApiError::Internal)?,
-        name: row
-            .try_get::<String>("", "name")
-            .map_err(|_| ApiError::Internal)?,
+        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
+        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
+        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
         role: row.try_get::<String>("", "role").ok(),
     };
 
@@ -255,15 +236,9 @@ pub async fn refresh(
         .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
 
     let user = UserResponse {
-        id: row
-            .try_get::<String>("", "id")
-            .map_err(|_| ApiError::Internal)?,
-        email: row
-            .try_get::<String>("", "email")
-            .map_err(|_| ApiError::Internal)?,
-        name: row
-            .try_get::<String>("", "name")
-            .map_err(|_| ApiError::Internal)?,
+        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
+        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
+        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
         role: row.try_get::<String>("", "role").ok(),
     };
 
@@ -298,15 +273,9 @@ pub async fn me(
         .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
 
     let user = UserResponse {
-        id: row
-            .try_get::<String>("", "id")
-            .map_err(|_| ApiError::Internal)?,
-        email: row
-            .try_get::<String>("", "email")
-            .map_err(|_| ApiError::Internal)?,
-        name: row
-            .try_get::<String>("", "name")
-            .map_err(|_| ApiError::Internal)?,
+        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
+        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
+        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
         role: row.try_get::<String>("", "role").ok(),
     };
 
@@ -341,50 +310,31 @@ fn build_auth_response(
         refresh_expires_in: state.cfg.jwt_refresh_ttl_seconds,
     };
 
-    let access_cookie = auth_cookie_header(
-        "access_token",
-        &access_token,
-        state.cfg.jwt_access_ttl_seconds,
-    )?;
-    let refresh_cookie = auth_cookie_header(
-        "refresh_token",
-        &refresh_token,
-        state.cfg.jwt_refresh_ttl_seconds,
-    )?;
+    let access_cookie = auth_cookie_header("access_token", &access_token, state.cfg.jwt_access_ttl_seconds)?;
+    let refresh_cookie = auth_cookie_header("refresh_token", &refresh_token, state.cfg.jwt_refresh_ttl_seconds)?;
 
     Ok((tokens, (access_cookie, refresh_cookie)))
 }
 
-fn auth_cookie_header(
-    name: &str,
-    value: &str,
-    max_age_seconds: i64,
-) -> Result<HeaderValue, ApiError> {
-    let cookie =
-        format!("{name}={value}; HttpOnly; Path=/; Max-Age={max_age_seconds}; SameSite=Lax");
+fn auth_cookie_header(name: &str, value: &str, max_age_seconds: i64) -> Result<HeaderValue, ApiError> {
+    let cookie = format!("{name}={value}; HttpOnly; Path=/; Max-Age={max_age_seconds}; SameSite=Lax");
     HeaderValue::from_str(&cookie).map_err(|_| ApiError::Internal)
 }
 
 fn clear_cookie_header(name: &str) -> HeaderValue {
-    HeaderValue::from_str(&format!(
-        "{name}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"
-    ))
-    .expect("static cookie header should be valid")
+    HeaderValue::from_str(&format!("{name}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"))
+        .unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    value
-        .strip_prefix("Bearer ")
-        .map(|token| token.trim().to_string())
+    value.strip_prefix("Bearer ").map(|token| token.trim().to_string())
 }
 
 pub fn extract_cookie_token(headers: &HeaderMap, key: &str) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
     cookie_header.split(';').find_map(|cookie| {
-        let mut parts = cookie.trim().splitn(2, '=');
-        let k = parts.next()?;
-        let v = parts.next()?;
+        let (k, v) = cookie.trim().split_once('=')?;
         if k == key { Some(v.to_string()) } else { None }
     })
 }
@@ -400,12 +350,8 @@ async fn ensure_admin_user(state: &AppState, user_id: &str) -> Result<(), ApiErr
         .await?
         .ok_or_else(|| ApiError::Forbidden("admin access required".to_string()))?;
 
-    let role = row
-        .try_get::<String>("", "role")
-        .map_err(|_| ApiError::Internal)?;
-    let is_active = row
-        .try_get::<bool>("", "is_active")
-        .map_err(|_| ApiError::Internal)?;
+    let role = row.try_get::<String>("", "role").map_err(|_| ApiError::Internal)?;
+    let is_active = row.try_get::<bool>("", "is_active").map_err(|_| ApiError::Internal)?;
 
     if !is_active || role != "admin" {
         return Err(ApiError::Forbidden("admin access required".to_string()));

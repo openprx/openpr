@@ -40,10 +40,7 @@ pub struct CreateCommentRequest {
 
 impl CreateCommentRequest {
     fn resolved_content(&self) -> &str {
-        self.content
-            .as_deref()
-            .or(self.body.as_deref())
-            .unwrap_or_default()
+        self.content.as_deref().or(self.body.as_deref()).unwrap_or_default()
     }
 }
 
@@ -56,10 +53,7 @@ pub struct UpdateCommentRequest {
 
 impl UpdateCommentRequest {
     fn resolved_content(&self) -> &str {
-        self.content
-            .as_deref()
-            .or(self.body.as_deref())
-            .unwrap_or_default()
+        self.content.as_deref().or(self.body.as_deref()).unwrap_or_default()
     }
 }
 
@@ -73,10 +67,7 @@ fn normalize_mentions(mentions: Option<Vec<Uuid>>, actor_id: Uuid) -> Vec<Uuid> 
         .collect()
 }
 
-fn build_auth_extensions(
-    claims: JwtClaims,
-    bot: Option<Extension<BotAuthContext>>,
-) -> axum::http::Extensions {
+fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext>>) -> axum::http::Extensions {
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -118,12 +109,12 @@ async fn create_mention_notifications<C: ConnectionTrait>(
 
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO notifications (
                     id, user_id, workspace_id, type, kind, payload, title, content, link, related_issue_id, related_comment_id, is_read, created_at
                 )
                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, NULL, false, $11)
-            "#,
+            ",
             vec![
                 Uuid::new_v4().into(),
                 (*mention_user_id).into(),
@@ -154,16 +145,12 @@ pub async fn create_comment(
     Json(req): Json<CreateCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let lang = request_lang(&headers);
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     let content = req.resolved_content().trim().to_string();
     if content.is_empty() {
-        return Err(ApiError::BadRequest(localize_error(
-            "content is required",
-            lang,
-        )));
+        return Err(ApiError::BadRequest(localize_error("content is required", lang)));
     }
 
     #[derive(Debug, FromQueryResult)]
@@ -175,12 +162,12 @@ pub async fn create_comment(
     // Verify issue exists and fetch project/workspace context.
     let issue_context = IssueContext::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.project_id, p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -277,8 +264,7 @@ pub async fn list_comments(
     bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     #[derive(Debug, FromQueryResult)]
@@ -288,12 +274,12 @@ pub async fn list_comments(
 
     let issue = IssueWorkspace::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -316,14 +302,14 @@ pub async fn list_comments(
 
     let comments = CommentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT c.id, c.work_item_id, c.author_id, u.name as author_name, u.email as author_email,
                    c.body, c.created_at, c.updated_at
             FROM comments c
             LEFT JOIN users u ON c.author_id = u.id
             WHERE c.work_item_id = $1
             ORDER BY c.created_at ASC
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .all(&state.db)
@@ -355,15 +341,11 @@ pub async fn update_comment(
     Json(req): Json<UpdateCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let lang = request_lang(&headers);
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let content = req.resolved_content().trim().to_string();
     if content.is_empty() {
-        return Err(ApiError::BadRequest(localize_error(
-            "content cannot be empty",
-            lang,
-        )));
+        return Err(ApiError::BadRequest(localize_error("content cannot be empty", lang)));
     }
 
     // Get comment and verify author.
@@ -377,13 +359,13 @@ pub async fn update_comment(
 
     let comment = CommentContext::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT c.author_id, c.work_item_id, wi.project_id, p.workspace_id
             FROM comments c
             INNER JOIN work_items wi ON c.work_item_id = wi.id
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE c.id = $1
-        "#,
+        ",
         vec![comment_id.into()],
     ))
     .one(&state.db)
@@ -391,9 +373,7 @@ pub async fn update_comment(
     .ok_or_else(|| ApiError::NotFound("comment not found".to_string()))?;
 
     if comment.author_id != Some(user_id) {
-        return Err(ApiError::Forbidden(
-            "only the comment author can update it".to_string(),
-        ));
+        return Err(ApiError::Forbidden("only the comment author can update it".to_string()));
     }
 
     #[derive(Debug, FromQueryResult)]
@@ -433,13 +413,13 @@ pub async fn update_comment(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO activities (
                 id, workspace_id, project_id, issue_id, user_id, action, detail, created_at,
                 resource_type, resource_id, event_type, actor_id, payload
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb)
-        "#,
+        ",
         vec![
             Uuid::new_v4().into(),
             comment.workspace_id.into(),
@@ -485,13 +465,13 @@ pub async fn update_comment(
 
     let updated = CommentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT c.id, c.work_item_id, c.author_id, u.name as author_name, u.email as author_email,
                    c.body, c.created_at, c.updated_at
             FROM comments c
             LEFT JOIN users u ON c.author_id = u.id
             WHERE c.id = $1
-        "#,
+        ",
         vec![comment_id.into()],
     ))
     .one(&state.db)
@@ -534,8 +514,7 @@ pub async fn delete_comment(
     bot: Option<Extension<BotAuthContext>>,
     Path(comment_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     // Get comment context.
@@ -550,13 +529,13 @@ pub async fn delete_comment(
 
     let comment_info = CommentInfo::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT c.author_id, p.workspace_id, wi.project_id, c.work_item_id, c.body
             FROM comments c
             INNER JOIN work_items wi ON c.work_item_id = wi.id
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE c.id = $1
-        "#,
+        ",
         vec![comment_id.into()],
     ))
     .one(&state.db)
@@ -567,8 +546,7 @@ pub async fn delete_comment(
     let is_author = comment_info.author_id == Some(user_id);
 
     if !is_author {
-        let (_, role, _) =
-            require_workspace_access(&state, &extensions, comment_info.workspace_id).await?;
+        let (_, role, _) = require_workspace_access(&state, &extensions, comment_info.workspace_id).await?;
         if role != "owner" && role != "admin" {
             return Err(ApiError::Forbidden(
                 "only the comment author or workspace owner/admin can delete comments".to_string(),
@@ -595,13 +573,13 @@ pub async fn delete_comment(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO activities (
                 id, workspace_id, project_id, issue_id, user_id, action, detail, created_at,
                 resource_type, resource_id, event_type, actor_id, payload
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb)
-        "#,
+        ",
         vec![
             Uuid::new_v4().into(),
             comment_info.workspace_id.into(),

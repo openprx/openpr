@@ -1,7 +1,5 @@
 use chrono::{Duration, Utc};
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement};
 use serde_json::Value;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -52,7 +50,6 @@ impl TrustLevel {
 pub enum TrustEventType {
     ProposalApproved,
     ProposalRejected,
-    InactivityPenalty,
     AppealAccepted,
     ImpactReviewCompleted,
 }
@@ -62,7 +59,6 @@ impl TrustEventType {
         match self {
             Self::ProposalApproved => "proposal_approved",
             Self::ProposalRejected => "proposal_rejected",
-            Self::InactivityPenalty => "inactivity_penalty",
             Self::AppealAccepted => "appeal_accepted",
             Self::ImpactReviewCompleted => "impact_review_completed",
         }
@@ -82,41 +78,15 @@ struct CountRow {
     count: i64,
 }
 
-pub struct TrustScoreService {
-    db: DatabaseConnection,
-}
+pub struct TrustScoreService {}
 
 impl TrustScoreService {
-    pub fn new(db: DatabaseConnection) -> Self {
-        Self { db }
+    pub fn new(_db: DatabaseConnection) -> Self {
+        Self {}
     }
 
     pub fn proposal_score_delta(is_approved: bool) -> i32 {
         if is_approved { 2 } else { -1 }
-    }
-
-    pub async fn apply_proposal_result(
-        &self,
-        user_id: Uuid,
-        user_type: ParticipantType,
-        project_id: Uuid,
-        proposal_id: &str,
-        is_approved: bool,
-        domains: &[String],
-    ) -> Result<(), ApiError> {
-        let tx = self.db.begin().await?;
-        self.apply_proposal_result_with_conn(
-            &tx,
-            user_id,
-            user_type,
-            project_id,
-            proposal_id,
-            is_approved,
-            domains,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
     }
 
     pub async fn apply_proposal_result_with_conn<C: ConnectionTrait>(
@@ -180,37 +150,7 @@ impl TrustScoreService {
         Ok(())
     }
 
-    pub async fn apply_inactivity_decay(
-        &self,
-        user_id: Uuid,
-        user_type: ParticipantType,
-        project_id: Uuid,
-        months: i32,
-        event_id: &str,
-    ) -> Result<(), ApiError> {
-        if months <= 0 {
-            return Ok(());
-        }
-
-        let delta = -(2 * months);
-        let reason = format!("{months} months inactivity penalty");
-        let tx = self.db.begin().await?;
-        self.apply_change(
-            &tx,
-            user_id,
-            user_type,
-            project_id,
-            "global",
-            delta,
-            TrustEventType::InactivityPenalty,
-            event_id,
-            &reason,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_manual_adjustment_with_conn<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -244,6 +184,7 @@ impl TrustScoreService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_impact_review_delta_with_conn<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -276,6 +217,7 @@ impl TrustScoreService {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_change<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -291,7 +233,7 @@ impl TrustScoreService {
         let already_applied = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"
+                r"
                     SELECT 1
                     FROM trust_score_logs
                     WHERE user_id = $1
@@ -300,7 +242,7 @@ impl TrustScoreService {
                       AND event_type = $4
                       AND event_id = $5
                     LIMIT 1
-                "#,
+                ",
                 vec![
                     user_id.into(),
                     project_id.into(),
@@ -322,7 +264,7 @@ impl TrustScoreService {
         let already_applied_after_lock = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"
+                r"
                     SELECT 1
                     FROM trust_score_logs
                     WHERE user_id = $1
@@ -331,7 +273,7 @@ impl TrustScoreService {
                       AND event_type = $4
                       AND event_id = $5
                     LIMIT 1
-                "#,
+                ",
                 vec![
                     user_id.into(),
                     project_id.into(),
@@ -368,7 +310,7 @@ impl TrustScoreService {
 
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 UPDATE trust_scores
                 SET score = $2,
                     level = $3::trust_level,
@@ -377,7 +319,7 @@ impl TrustScoreService {
                     cooldown_until = $6::timestamptz,
                     updated_at = $7
                 WHERE id = $1
-            "#,
+            ",
             vec![
                 current.id.into(),
                 new_score.into(),
@@ -392,12 +334,12 @@ impl TrustScoreService {
 
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO trust_score_logs (
                     user_id, project_id, domain, event_type, event_id, score_change, old_score,
                     new_score, old_level, new_level, reason, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::trust_level, $10::trust_level, $11, $12)
-            "#,
+            ",
             vec![
                 user_id.into(),
                 project_id.into(),
@@ -460,12 +402,12 @@ impl TrustScoreService {
     ) -> Result<TrustScoreRow, ApiError> {
         let existing = TrustScoreRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT id, score, level::text AS level, consecutive_rejections
                 FROM trust_scores
                 WHERE user_id = $1 AND project_id = $2 AND domain = $3
                 FOR UPDATE
-            "#,
+            ",
             vec![user_id.into(), project_id.into(), domain.to_string().into()],
         ))
         .one(db)
@@ -482,13 +424,13 @@ impl TrustScoreService {
 
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO trust_scores (
                     user_id, user_type, project_id, domain, score, level, vote_weight,
                     consecutive_rejections, cooldown_until, updated_at
                 ) VALUES ($1, $2::participant_type, $3, $4, 100, 'voter', 1.0, 0, NULL, $5)
                 ON CONFLICT (user_id, project_id, domain) DO NOTHING
-            "#,
+            ",
             vec![
                 user_id.into(),
                 user_type.into(),
@@ -501,12 +443,12 @@ impl TrustScoreService {
 
         let row = TrustScoreRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT id, score, level::text AS level, consecutive_rejections
                 FROM trust_scores
                 WHERE user_id = $1 AND project_id = $2 AND domain = $3
                 FOR UPDATE
-            "#,
+            ",
             vec![user_id.into(), project_id.into(), domain.to_string().into()],
         ))
         .one(db)
@@ -527,11 +469,11 @@ impl TrustScoreService {
         if matches!(level, TrustLevel::Vetoer | TrustLevel::Autonomous) {
             db.execute(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"
+                r"
                     INSERT INTO vetoers (user_id, project_id, domain, granted_by, granted_at)
                     VALUES ($1, $2, $3, 'trust_score', $4)
                     ON CONFLICT (user_id, project_id, domain) DO NOTHING
-                "#,
+                ",
                 vec![
                     user_id.into(),
                     project_id.into(),
@@ -580,9 +522,7 @@ pub fn normalize_domain_key(value: &str) -> String {
         .to_ascii_lowercase()
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch
-            } else if ch == '-' || ch == '_' {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
                 ch
             } else {
                 '_'
@@ -597,28 +537,17 @@ pub fn scoped_domain_id(project_id: Uuid, key: &str) -> String {
     format!("{}-{}", &short[..8], normalized)
 }
 
-pub fn split_domain_key(domain_id: &str) -> &str {
-    domain_id
-        .split_once('-')
-        .map(|(_, right)| right)
-        .unwrap_or(domain_id)
-}
-
-pub async fn is_project_member(
-    db: &DatabaseConnection,
-    project_id: Uuid,
-    user_id: Uuid,
-) -> Result<bool, ApiError> {
+pub async fn is_project_member(db: &DatabaseConnection, project_id: Uuid, user_id: Uuid) -> Result<bool, ApiError> {
     let exists = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT 1
                 FROM projects p
                 INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
                 WHERE p.id = $1 AND wm.user_id = $2
                 LIMIT 1
-            "#,
+            ",
             vec![project_id.into(), user_id.into()],
         ))
         .await?
@@ -633,14 +562,14 @@ pub async fn is_project_admin_or_owner(
 ) -> Result<bool, ApiError> {
     let count = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*)::bigint AS count
             FROM projects p
             INNER JOIN workspace_members wm ON p.workspace_id = wm.workspace_id
             WHERE p.id = $1
               AND wm.user_id = $2
               AND wm.role IN ('owner', 'admin')
-        "#,
+        ",
         vec![project_id.into(), user_id.into()],
     ))
     .one(db)
@@ -655,14 +584,14 @@ pub async fn is_system_admin(db: &DatabaseConnection, user_id: Uuid) -> Result<b
     let is_admin = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT 1
                 FROM users
                 WHERE id = $1
                   AND is_active = true
                   AND lower(trim(role)) = 'admin'
                 LIMIT 1
-            "#,
+            ",
             vec![user_id.into()],
         ))
         .await?

@@ -20,8 +20,7 @@ pub async fn get_effective_workflow_by_project(
     bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);

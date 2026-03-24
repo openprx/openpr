@@ -71,8 +71,7 @@ impl TryFrom<WebhookRow> for WebhookResponse {
     type Error = ApiError;
 
     fn try_from(row: WebhookRow) -> Result<Self, Self::Error> {
-        let events: Vec<String> =
-            serde_json::from_value(row.events).map_err(|_| ApiError::Internal)?;
+        let events: Vec<String> = serde_json::from_value(row.events).map_err(|_| ApiError::Internal)?;
         Ok(Self {
             id: row.id,
             workspace_id: row.workspace_id,
@@ -96,8 +95,7 @@ pub async fn list_deliveries(
     Path((workspace_id, webhook_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<ListDeliveriesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     verify_workspace_access(&state, workspace_id, user_id).await?;
     ensure_webhook_in_workspace(&state, workspace_id, webhook_id).await?;
@@ -127,7 +125,7 @@ pub async fn list_deliveries(
         .db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT
                     id,
                     webhook_id,
@@ -151,12 +149,8 @@ pub async fn list_deliveries(
                 WHERE webhook_id = $1
                 ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
-            "#,
-            vec![
-                webhook_id.into(),
-                (per_page as i64).into(),
-                (offset as i64).into(),
-            ],
+            ",
+            vec![webhook_id.into(), (per_page as i64).into(), (offset as i64).into()],
         ))
         .await?;
 
@@ -180,8 +174,7 @@ pub async fn get_delivery(
     Extension(claims): Extension<JwtClaims>,
     Path((workspace_id, webhook_id, delivery_id)): Path<(Uuid, Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     verify_workspace_access(&state, workspace_id, user_id).await?;
     ensure_webhook_in_workspace(&state, workspace_id, webhook_id).await?;
@@ -190,7 +183,7 @@ pub async fn get_delivery(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT
                     id,
                     webhook_id,
@@ -212,7 +205,7 @@ pub async fn get_delivery(
                     created_at
                 FROM webhook_deliveries
                 WHERE webhook_id = $1 AND id = $2
-            "#,
+            ",
             vec![webhook_id.into(), delivery_id.into()],
         ))
         .await?
@@ -230,8 +223,7 @@ pub async fn create_webhook(
     Json(req): Json<CreateWebhookRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let name = req.name.clone().unwrap_or_else(|| req.url.clone());
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Creating a webhook only requires authenticated workspace access.
     verify_workspace_access(&state, workspace_id, user_id).await?;
@@ -239,10 +231,7 @@ pub async fn create_webhook(
     // Validate events
     for event in &req.events {
         if !WEBHOOK_EVENTS.contains(&event.as_str()) {
-            return Err(ApiError::BadRequest(format!(
-                "Invalid event type: {}",
-                event
-            )));
+            return Err(ApiError::BadRequest(format!("Invalid event type: {}", event)));
         }
     }
 
@@ -261,16 +250,18 @@ pub async fn create_webhook(
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"INSERT INTO webhooks 
+            r"INSERT INTO webhooks 
                (id, workspace_id, name, url, secret, events, active, bot_user_id, created_by, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             vec![
                 webhook_id.into(),
                 workspace_id.into(),
                 name.into(),
                 req.url.into(),
                 secret.into(),
-                serde_json::to_value(&req.events).unwrap().into(),
+                serde_json::to_value(&req.events)
+                    .map_err(|_| ApiError::Internal)?
+                    .into(),
                 active.into(),
                 req.bot_user_id.into(),
                 user_id.into(),
@@ -301,8 +292,7 @@ pub async fn list_webhooks(
     Extension(claims): Extension<JwtClaims>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     verify_workspace_access(&state, workspace_id, user_id).await?;
 
@@ -332,8 +322,7 @@ pub async fn get_webhook(
     Extension(claims): Extension<JwtClaims>,
     Path((workspace_id, webhook_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     verify_workspace_access(&state, workspace_id, user_id).await?;
 
@@ -359,8 +348,7 @@ pub async fn update_webhook(
     Path((workspace_id, webhook_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<UpdateWebhookRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     verify_workspace_admin(&state, workspace_id, user_id).await?;
 
@@ -368,10 +356,7 @@ pub async fn update_webhook(
     if let Some(ref events) = req.events {
         for event in events {
             if !WEBHOOK_EVENTS.contains(&event.as_str()) {
-                return Err(ApiError::BadRequest(format!(
-                    "Invalid event type: {}",
-                    event
-                )));
+                return Err(ApiError::BadRequest(format!("Invalid event type: {}", event)));
             }
         }
     }
@@ -401,7 +386,7 @@ pub async fn update_webhook(
     }
     if let Some(events) = req.events {
         updates.push(format!("events = ${}", param_idx));
-        params.push(serde_json::to_value(&events).unwrap().into());
+        params.push(serde_json::to_value(&events).map_err(|_| ApiError::Internal)?.into());
         param_idx += 1;
     }
     if let Some(active) = req.enabled.or(req.active) {
@@ -412,7 +397,6 @@ pub async fn update_webhook(
     if req.bot_user_id.is_some() {
         updates.push(format!("bot_user_id = ${}", param_idx));
         params.push(req.bot_user_id.into());
-        param_idx += 1;
     }
 
     if updates.is_empty() {
@@ -435,11 +419,7 @@ pub async fn update_webhook(
 
     state
         .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            &sql,
-            params,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, &sql, params))
         .await?;
 
     let webhook = state
@@ -463,8 +443,7 @@ pub async fn delete_webhook(
     Extension(claims): Extension<JwtClaims>,
     Path((workspace_id, webhook_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     verify_workspace_admin(&state, workspace_id, user_id).await?;
 
@@ -485,11 +464,7 @@ pub async fn delete_webhook(
 }
 
 // Helper functions
-async fn verify_workspace_admin(
-    state: &AppState,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
+async fn verify_workspace_admin(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
     let result = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -504,9 +479,7 @@ async fn verify_workspace_admin(
             let role: String = row.try_get("", "role")?;
             let normalized_role = role.trim().to_lowercase();
             if normalized_role != "admin" && normalized_role != "owner" {
-                return Err(ApiError::Forbidden(
-                    "Workspace admin or owner required".to_string(),
-                ));
+                return Err(ApiError::Forbidden("Workspace admin or owner required".to_string()));
             }
             Ok(())
         }
@@ -514,11 +487,7 @@ async fn verify_workspace_admin(
     }
 }
 
-async fn verify_workspace_access(
-    state: &AppState,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
+async fn verify_workspace_access(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
     let result = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -552,11 +521,7 @@ async fn ensure_bot_user(state: &AppState, bot_user_id: Uuid) -> Result<(), ApiE
     Ok(())
 }
 
-async fn ensure_webhook_in_workspace(
-    state: &AppState,
-    workspace_id: Uuid,
-    webhook_id: Uuid,
-) -> Result<(), ApiError> {
+async fn ensure_webhook_in_workspace(state: &AppState, workspace_id: Uuid, webhook_id: Uuid) -> Result<(), ApiError> {
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -588,14 +553,23 @@ pub async fn build_webhook_payload(
 
     if let Some(bot_id) = webhook_bot_user_id {
         let is_bot_task = check_is_bot_task(event_type, issue_data, &bot_id);
-        payload["is_bot_task"] = json!(is_bot_task);
-        payload["bot_id"] = json!(bot_id);
-
-        if let Ok(Some(agent_type)) = get_bot_agent_type_by_id(state, bot_id).await {
-            payload["bot_agent_type"] = json!(agent_type);
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("is_bot_task".to_string(), json!(is_bot_task));
+            obj.insert("bot_id".to_string(), json!(bot_id));
         }
 
-        payload["trigger_reason"] = json!(get_trigger_reason(event_type, issue_data, &bot_id));
+        if let Ok(Some(agent_type)) = get_bot_agent_type_by_id(state, bot_id).await
+            && let Some(obj) = payload.as_object_mut()
+        {
+            obj.insert("bot_agent_type".to_string(), json!(agent_type));
+        }
+
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "trigger_reason".to_string(),
+                json!(get_trigger_reason(event_type, issue_data, &bot_id)),
+            );
+        }
     }
 
     payload
@@ -606,8 +580,7 @@ fn check_is_bot_task(event: &str, issue: &Value, bot_id: &Uuid) -> bool {
         "issue.created" | "issue.updated" => issue
             .get("assignee_id")
             .and_then(|v| v.as_str())
-            .map(|id| id == bot_id.to_string())
-            .unwrap_or(false),
+            .is_some_and(|id| id == bot_id.to_string()),
         "comment.created" => true,
         _ => false,
     }
@@ -624,10 +597,7 @@ fn get_trigger_reason(event: &str, issue: &Value, bot_id: &Uuid) -> String {
     }
 }
 
-async fn get_bot_agent_type_by_id(
-    state: &AppState,
-    bot_id: Uuid,
-) -> Result<Option<String>, ApiError> {
+async fn get_bot_agent_type_by_id(state: &AppState, bot_id: Uuid) -> Result<Option<String>, ApiError> {
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -652,7 +622,7 @@ fn generate_secret() -> String {
     (0..64)
         .map(|_| {
             let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
+            CHARSET.get(idx).copied().map_or('A', char::from)
         })
         .collect()
 }

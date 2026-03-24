@@ -56,21 +56,14 @@ pub async fn create_project(
     Path(workspace_id): Path<Uuid>,
     Json(req): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if req.key.trim().is_empty() || req.name.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "key and name are required".to_string(),
-        ));
+        return Err(ApiError::BadRequest("key and name are required".to_string()));
     }
 
     // Validate key format (uppercase letters only)
-    if !req
-        .key
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
+    if !req.key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
         return Err(ApiError::BadRequest(
             "key must contain only uppercase letters and digits".to_string(),
         ));
@@ -229,12 +222,7 @@ pub async fn list_projects(
             description: p.description,
             created_at: p.created_at.to_rfc3339(),
             updated_at: p.updated_at.to_rfc3339(),
-            issue_counts: Some(
-                issue_counts_by_project
-                    .get(&p.id)
-                    .cloned()
-                    .unwrap_or_default(),
-            ),
+            issue_counts: Some(issue_counts_by_project.get(&p.id).cloned().unwrap_or_default()),
         })
         .collect();
 
@@ -248,8 +236,7 @@ pub async fn get_project(
     bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -269,11 +256,11 @@ pub async fn get_project(
 
     let project = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.id, p.workspace_id, p.key, p.name, p.description, p.created_at, p.updated_at
             FROM projects p
             WHERE p.id = $1
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .one(&state.db)
@@ -301,8 +288,7 @@ pub async fn update_project(
     Path(project_id): Path<Uuid>,
     Json(req): Json<UpdateProjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Get project's workspace and check permission
     #[derive(Debug, sea_orm::FromQueryResult)]
@@ -328,10 +314,7 @@ pub async fn update_project(
 
     // Validate key if provided
     if let Some(ref key) = req.key {
-        if !key
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
-        {
+        if !key.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
             return Err(ApiError::BadRequest(
                 "key must contain only uppercase letters and digits".to_string(),
             ));
@@ -343,18 +326,12 @@ pub async fn update_project(
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT id FROM projects WHERE workspace_id = $1 AND key = $2 AND id != $3",
-                vec![
-                    project.workspace_id.into(),
-                    key.clone().into(),
-                    project_id.into(),
-                ],
+                vec![project.workspace_id.into(), key.clone().into(), project_id.into()],
             ))
             .await?;
 
         if existing.is_some() {
-            return Err(ApiError::Conflict(
-                "key already exists in this workspace".to_string(),
-            ));
+            return Err(ApiError::Conflict("key already exists in this workspace".to_string()));
         }
     }
 
@@ -391,19 +368,11 @@ pub async fn update_project(
 
     values.push(project_id.into());
 
-    let query = format!(
-        "UPDATE projects SET {} WHERE id = ${}",
-        updates.join(", "),
-        param_idx
-    );
+    let query = format!("UPDATE projects SET {} WHERE id = ${}", updates.join(", "), param_idx);
 
     state
         .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            &query,
-            values,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, &query, values))
         .await?;
 
     // Fetch updated project
@@ -472,8 +441,7 @@ pub async fn delete_project(
     Extension(claims): Extension<JwtClaims>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Get project's workspace and check permission
     #[derive(Debug, sea_orm::FromQueryResult)]
@@ -533,11 +501,7 @@ pub async fn delete_project(
 }
 
 /// Helper: Get user's role in workspace
-async fn get_workspace_role(
-    state: &AppState,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<String, ApiError> {
+async fn get_workspace_role(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct RoleRow {
         role: String,

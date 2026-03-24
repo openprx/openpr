@@ -138,11 +138,11 @@ pub enum ToolContent {
 
 impl ToolContent {
     pub fn text(text: impl Into<String>) -> Self {
-        ToolContent::Text { text: text.into() }
+        Self::Text { text: text.into() }
     }
 
     pub fn error(msg: impl Into<String>) -> Self {
-        ToolContent::Text {
+        Self::Text {
             text: format!("Error: {}", msg.into()),
         }
     }

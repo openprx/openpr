@@ -70,10 +70,7 @@ fn generate_token() -> String {
     format!("opr_{}", hex::encode(&bytes))
 }
 
-fn build_auth_extensions(
-    claims: JwtClaims,
-    bot: Option<Extension<BotAuthContext>>,
-) -> axum::http::Extensions {
+fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext>>) -> axum::http::Extensions {
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -102,8 +99,7 @@ pub async fn create_bot(
     Path(workspace_id): Path<Uuid>,
     Json(req): Json<CreateBotRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     if req.name.trim().is_empty() {
@@ -154,9 +150,9 @@ pub async fn create_bot(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"INSERT INTO users
+        r"INSERT INTO users
            (id, email, password_hash, name, role, is_active, entity_type, agent_type, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $8)"#,
+           VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $8)",
         vec![
             bot_id.into(),
             bot_email.into(),
@@ -172,23 +168,18 @@ pub async fn create_bot(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
-           VALUES ($1, $2, $3, $4)"#,
-        vec![
-            workspace_id.into(),
-            bot_id.into(),
-            workspace_role.into(),
-            now.into(),
-        ],
+        r"INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+           VALUES ($1, $2, $3, $4)",
+        vec![workspace_id.into(), bot_id.into(), workspace_role.into(), now.into()],
     ))
     .await?;
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"INSERT INTO workspace_bots
+        r"INSERT INTO workspace_bots
            (id, workspace_id, name, token_hash, token_prefix, permissions,
             created_by, expires_at, is_active, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)"#,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)",
         vec![
             bot_id.into(),
             workspace_id.into(),
@@ -224,8 +215,7 @@ pub async fn list_bots(
     bot: Option<Extension<BotAuthContext>>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     let (_, role, _) = require_workspace_access(&state, &extensions, workspace_id).await?;
@@ -250,11 +240,11 @@ pub async fn list_bots(
 
     let bots = BotRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"SELECT id, workspace_id, name, token_prefix, permissions,
+        r"SELECT id, workspace_id, name, token_prefix, permissions,
                   is_active, last_used_at, expires_at, created_at
            FROM workspace_bots
            WHERE workspace_id = $1
-           ORDER BY created_at DESC"#,
+           ORDER BY created_at DESC",
         vec![workspace_id.into()],
     ))
     .all(&state.db)
@@ -266,11 +256,7 @@ pub async fn list_bots(
             let perms: Vec<String> = b
                 .permissions
                 .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                 .unwrap_or_default();
             BotResponse {
                 id: b.id,
@@ -296,8 +282,7 @@ pub async fn revoke_bot(
     bot: Option<Extension<BotAuthContext>>,
     Path((workspace_id, bot_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     let (_, role, _) = require_workspace_access(&state, &extensions, workspace_id).await?;

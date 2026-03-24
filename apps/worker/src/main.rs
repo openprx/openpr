@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-            _ = &mut shutdown => {
+            () = &mut shutdown => {
                 tracing::info!("worker shutting down");
                 break;
             }
@@ -59,11 +59,11 @@ async fn main() -> anyhow::Result<()> {
         }
 
         tokio::select! {
-            _ = &mut shutdown => {
+            () = &mut shutdown => {
                 tracing::info!("worker shutting down");
                 break;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
         }
     }
 
@@ -75,7 +75,7 @@ async fn process_pending_tasks(
     client: &reqwest::Client,
     concurrency: usize,
 ) -> anyhow::Result<()> {
-    let limit = (concurrency.max(1) as i64) * 10;
+    let limit = i64::try_from(concurrency.max(1)).unwrap_or(i64::MAX) * 10;
     let tasks = pickup_pending_tasks(db, limit).await?;
 
     if tasks.is_empty() {
@@ -92,13 +92,10 @@ async fn process_pending_tasks(
     Ok(())
 }
 
-async fn pickup_pending_tasks(
-    db: &sea_orm::DatabaseConnection,
-    limit: i64,
-) -> anyhow::Result<Vec<AiTaskDispatchRow>> {
+async fn pickup_pending_tasks(db: &sea_orm::DatabaseConnection, limit: i64) -> anyhow::Result<Vec<AiTaskDispatchRow>> {
     let tasks = AiTaskDispatchRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             WITH picked AS (
                 SELECT id
                 FROM ai_tasks
@@ -127,7 +124,7 @@ async fn pickup_pending_tasks(
                 t.attempts,
                 t.max_attempts,
                 t.priority
-        "#,
+        ",
         vec![limit.into()],
     ))
     .all(db)
@@ -157,7 +154,7 @@ async fn dispatch_task(
 ) -> anyhow::Result<()> {
     let webhook = BotWebhookRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT w.id AS webhook_id, w.url
             FROM webhooks w
             INNER JOIN projects p ON p.workspace_id = w.workspace_id
@@ -166,7 +163,7 @@ async fn dispatch_task(
               AND w.active = true
             ORDER BY w.updated_at DESC
             LIMIT 1
-        "#,
+        ",
         vec![task.project_id.into(), task.ai_participant_id.into()],
     ))
     .one(db)
@@ -216,23 +213,18 @@ async fn record_dispatch_failure(
     let should_retry = task.attempts < task.max_attempts;
 
     if should_retry {
-        let next_retry_at = now + chrono::Duration::seconds((task.attempts.max(1) * 30) as i64);
+        let next_retry_at = now + chrono::Duration::seconds(i64::from(task.attempts.max(1) * 30));
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 UPDATE ai_tasks
                 SET status = 'pending',
                     error_message = $2,
                     next_retry_at = $3,
                     updated_at = $4
                 WHERE id = $1
-            "#,
-            vec![
-                task.id.into(),
-                error.clone().into(),
-                next_retry_at.into(),
-                now.into(),
-            ],
+            ",
+            vec![task.id.into(), error.clone().into(), next_retry_at.into(), now.into()],
         ))
         .await?;
 
@@ -251,14 +243,14 @@ async fn record_dispatch_failure(
     } else {
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 UPDATE ai_tasks
                 SET status = 'failed',
                     error_message = $2,
                     completed_at = $3,
                     updated_at = $3
                 WHERE id = $1
-            "#,
+            ",
             vec![task.id.into(), error.clone().into(), now.into()],
         ))
         .await?;
@@ -287,10 +279,10 @@ async fn insert_task_event(
 ) -> anyhow::Result<()> {
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO ai_task_events (id, task_id, event_type, payload, created_at)
             VALUES ($1, $2, $3, $4, $5)
-        "#,
+        ",
         vec![
             Uuid::new_v4().into(),
             task_id.into(),
@@ -306,15 +298,29 @@ async fn insert_task_event(
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("register SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(err) = res {
+                            tracing::warn!(error = %err, "ctrl_c signal error");
+                        }
+                    },
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to register SIGTERM handler, falling back to ctrl_c only");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(error = %err, "ctrl_c signal error");
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %err, "ctrl_c signal error");
+        }
     }
 }

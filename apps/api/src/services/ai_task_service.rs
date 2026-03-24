@@ -49,7 +49,7 @@ pub async fn create_ai_task<C: ConnectionTrait>(
 
     let created = AiTaskRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO ai_tasks (
                 id,
                 project_id,
@@ -87,7 +87,7 @@ pub async fn create_ai_task<C: ConnectionTrait>(
                 completed_at,
                 created_at,
                 updated_at
-        "#,
+        ",
         vec![
             Uuid::new_v4().into(),
             input.project_id.into(),
@@ -134,10 +134,10 @@ pub async fn insert_ai_task_event<C: ConnectionTrait>(
 ) -> Result<(), ApiError> {
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO ai_task_events (id, task_id, event_type, payload, created_at)
             VALUES ($1, $2, $3, $4, $5)
-        "#,
+        ",
         vec![
             Uuid::new_v4().into(),
             task_id.into(),
@@ -180,7 +180,7 @@ pub async fn queue_vote_requested_tasks_for_project<C: ConnectionTrait>(
 
     let bots = BotRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT u.id AS user_id
             FROM ai_participants ap
             INNER JOIN users u
@@ -188,7 +188,7 @@ pub async fn queue_vote_requested_tasks_for_project<C: ConnectionTrait>(
             WHERE ap.project_id = $1
               AND ap.is_active = true
               AND u.entity_type = 'bot'
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .all(db)
@@ -197,10 +197,7 @@ pub async fn queue_vote_requested_tasks_for_project<C: ConnectionTrait>(
     let proposal_uuid = Uuid::parse_str(proposal_id).ok();
     let mut created = 0usize;
     for bot in bots {
-        let idempotency_key = Some(format!(
-            "vote_requested:{project_id}:{proposal_id}:{}",
-            bot.user_id
-        ));
+        let idempotency_key = Some(format!("vote_requested:{project_id}:{proposal_id}:{}", bot.user_id));
         let task = create_ai_task(
             db,
             CreateAiTaskInput {

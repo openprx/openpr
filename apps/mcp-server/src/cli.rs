@@ -1,3 +1,12 @@
+// CLI output functions necessarily use print macros and indexing — allow these for this module.
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::unreachable,
+    clippy::indexing_slicing
+)]
+
+use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
@@ -12,7 +21,7 @@ pub enum OutputFormat {
     Table,
 }
 
-/// OpenPR MCP server and CLI tool
+/// `OpenPR` MCP server and CLI tool
 #[derive(Debug, Parser)]
 #[command(name = "mcp-server", about = "OpenPR MCP server and CLI tool")]
 #[command(arg_required_else_help = true)]
@@ -24,15 +33,15 @@ pub struct Cli {
     #[arg(long, value_enum, global = true, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
 
-    /// API URL (overrides OPENPR_API_URL)
+    /// API URL (overrides `OPENPR_API_URL`)
     #[arg(long, global = true)]
     pub api_url: Option<String>,
 
-    /// Bot authentication token (overrides OPENPR_BOT_TOKEN)
+    /// Bot authentication token (overrides `OPENPR_BOT_TOKEN`)
     #[arg(long, global = true)]
     pub bot_token: Option<String>,
 
-    /// Workspace ID (overrides OPENPR_WORKSPACE_ID)
+    /// Workspace ID (overrides `OPENPR_WORKSPACE_ID`)
     #[arg(long, global = true)]
     pub workspace_id: Option<String>,
 }
@@ -117,24 +126,22 @@ pub enum WorkItemsAction {
     List {
         #[arg(long)]
         project: String,
-        /// Filter by state (backlog|todo|in_progress|done)
+        /// Filter by state (`backlog|todo|in_progress|done`)
         #[arg(long)]
         state: Option<String>,
     },
     /// Get a work item by UUID or identifier (e.g. PRX-42)
-    Get {
-        id: String,
-    },
+    Get { id: String },
     /// Create a work item
     Create {
         #[arg(long)]
         project: String,
         #[arg(long)]
         title: String,
-        /// Initial state (backlog|todo|in_progress|done)
+        /// Initial state (`backlog|todo|in_progress|done`)
         #[arg(long, default_value = "backlog")]
         state: String,
-        /// Priority (none|low|medium|high|urgent)
+        /// Priority (`none|low|medium|high|urgent`)
         #[arg(long, default_value = "medium")]
         priority: String,
         #[arg(long)]
@@ -149,10 +156,10 @@ pub enum WorkItemsAction {
     Update {
         /// Work item UUID
         id: String,
-        /// New state (backlog|todo|in_progress|done)
+        /// New state (`backlog|todo|in_progress|done`)
         #[arg(long)]
         state: Option<String>,
-        /// New priority (none|low|medium|high|urgent)
+        /// New priority (`none|low|medium|high|urgent`)
         #[arg(long)]
         priority: Option<String>,
         #[arg(long)]
@@ -257,17 +264,17 @@ pub fn print_result(format: &OutputFormat, result: &CallToolResult) {
         .unwrap_or("");
 
     if result.is_error == Some(true) {
-        eprintln!("{}", text);
+        eprintln!("{text}");
         std::process::exit(1);
     }
 
     match format {
-        OutputFormat::Json => println!("{}", text),
+        OutputFormat::Json => println!("{text}"),
         OutputFormat::Table => {
             if let Ok(value) = serde_json::from_str::<Value>(text) {
                 print_table(&value);
             } else {
-                println!("{}", text);
+                println!("{text}");
             }
         }
     }
@@ -278,36 +285,32 @@ fn print_table(value: &Value) {
         Value::Array(arr) if !arr.is_empty() => {
             if let Some(Value::Object(first)) = arr.first() {
                 let keys: Vec<String> = first.keys().cloned().collect();
-                let mut widths: Vec<usize> = keys.iter().map(|k| k.len()).collect();
-                for item in arr.iter() {
+                let mut widths: Vec<usize> = keys.iter().map(String::len).collect();
+                for item in arr {
                     if let Value::Object(obj) = item {
-                        for (i, key) in keys.iter().enumerate() {
+                        for (width, key) in widths.iter_mut().zip(keys.iter()) {
                             let s = fmt_val(obj.get(key).unwrap_or(&Value::Null));
-                            widths[i] = widths[i].max(s.len().min(60));
+                            *width = (*width).max(s.len().min(60));
                         }
                     }
                 }
                 // header
-                for (i, key) in keys.iter().enumerate() {
-                    print!("{:<width$}  ", key, width = widths[i]);
+                for (key, width) in keys.iter().zip(widths.iter()) {
+                    print!("{key:<width$}  ");
                 }
                 println!();
                 // separator
                 for w in &widths {
-                    print!("{:-<width$}  ", "", width = w);
+                    print!("{:-<w$}  ", "");
                 }
                 println!();
                 // rows
                 for item in arr {
                     if let Value::Object(obj) = item {
-                        for (i, key) in keys.iter().enumerate() {
+                        for (key, width) in keys.iter().zip(widths.iter()) {
                             let s = fmt_val(obj.get(key).unwrap_or(&Value::Null));
-                            let truncated = if s.len() > 60 {
-                                format!("{}…", &s[..59])
-                            } else {
-                                s
-                            };
-                            print!("{:<width$}  ", truncated, width = widths[i]);
+                            let truncated = truncate_display(s, 59);
+                            print!("{truncated:<width$}  ");
                         }
                         println!();
                     }
@@ -320,13 +323,28 @@ fn print_table(value: &Value) {
         }
         Value::Array(_) => println!("(empty)"),
         Value::Object(obj) => {
-            let max_key = obj.keys().map(|k| k.len()).max().unwrap_or(0);
+            let max_key = obj.keys().map(String::len).max().unwrap_or(0);
             for (key, val) in obj {
-                println!("{:<width$}  {}", key, fmt_val(val), width = max_key);
+                println!("{key:<max_key$}  {}", fmt_val(val));
             }
         }
         _ => println!("{}", fmt_val(value)),
     }
+}
+
+/// Truncate a string to at most `max_bytes` bytes on a char boundary, appending `…` if truncated.
+fn truncate_display(s: String, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Find char boundary just before max_bytes
+    let end = s
+        .char_indices()
+        .take_while(|(i, _)| *i < max_bytes)
+        .last()
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let prefix = s.get(..end).unwrap_or(&s);
+    format!("{prefix}…")
 }
 
 fn fmt_val(v: &Value) -> String {
@@ -341,11 +359,7 @@ fn fmt_val(v: &Value) -> String {
 
 // ---- Dispatch ----
 
-pub async fn run_cli_command(
-    command: &Commands,
-    format: &OutputFormat,
-    client: OpenPrClient,
-) -> anyhow::Result<()> {
+pub async fn run_cli_command(command: &Commands, format: &OutputFormat, client: OpenPrClient) -> anyhow::Result<()> {
     let server = McpServer::new(client);
 
     // Files upload requires async disk I/O before calling execute_tool, handle it separately
@@ -404,9 +418,7 @@ pub async fn run_cli_command(
                 }
                 ("work_items.create", args)
             }
-            WorkItemsAction::Search { query } => {
-                ("work_items.search", json!({ "query": query }))
-            }
+            WorkItemsAction::Search { query } => ("work_items.search", json!({ "query": query })),
             WorkItemsAction::Update {
                 id,
                 state,
@@ -428,9 +440,7 @@ pub async fn run_cli_command(
         },
 
         Commands::Comments(cmd) => match &cmd.action {
-            CommentsAction::List { work_item } => {
-                ("comments.list", json!({ "work_item_id": work_item }))
-            }
+            CommentsAction::List { work_item } => ("comments.list", json!({ "work_item_id": work_item })),
             CommentsAction::Create { work_item, content } => (
                 "comments.create",
                 json!({ "work_item_id": work_item, "content": content }),
@@ -438,24 +448,17 @@ pub async fn run_cli_command(
         },
 
         Commands::Labels(cmd) => match &cmd.action {
-            LabelsAction::List { project } => {
-                if let Some(pid) = project {
-                    ("labels.list_by_project", json!({ "project_id": pid }))
-                } else {
-                    ("labels.list", json!({}))
-                }
-            }
+            LabelsAction::List { project } => project.as_ref().map_or_else(
+                || ("labels.list", json!({})),
+                |pid| ("labels.list_by_project", json!({ "project_id": pid })),
+            ),
         },
 
         Commands::Sprints(cmd) => match &cmd.action {
-            SprintsAction::List { project } => {
-                ("sprints.list", json!({ "project_id": project }))
-            }
+            SprintsAction::List { project } => ("sprints.list", json!({ "project_id": project })),
         },
 
-        Commands::Search(search_args) => {
-            ("search.all", json!({ "query": search_args.query }))
-        }
+        Commands::Search(search_args) => ("search.all", json!({ "query": search_args.query })),
 
         // Files handled above via run_file_upload
         Commands::Files(_) => unreachable!("Files handled before this match"),
@@ -467,10 +470,7 @@ pub async fn run_cli_command(
 }
 
 /// Handle file upload: read file from disk, base64-encode, then call files.upload tool.
-async fn run_file_upload(
-    cmd: &FilesCmd,
-    server: &McpServer,
-) -> anyhow::Result<CallToolResult> {
+async fn run_file_upload(cmd: &FilesCmd, server: &McpServer) -> anyhow::Result<CallToolResult> {
     match &cmd.action {
         FilesAction::Upload { file } => {
             let path = std::path::Path::new(file.as_str());
@@ -481,8 +481,7 @@ async fn run_file_upload(
                 .to_string();
             let content = tokio::fs::read(path)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to read file {}: {}", file, e))?;
-            use base64::Engine as _;
+                .map_err(|e| anyhow::anyhow!("Failed to read file {file}: {e}"))?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
             Ok(server
                 .execute_tool(

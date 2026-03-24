@@ -34,13 +34,10 @@ struct ListProposalsInput {
 pub async fn list_proposals(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListProposalsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
-    match client
-        .list_proposals(&input.project_id, input.status.as_deref())
-        .await
-    {
+    match client.list_proposals(&input.project_id, input.status.as_deref()).await {
         Ok(proposals) => {
             let json = serde_json::to_string_pretty(&proposals).unwrap_or_default();
             CallToolResult::success(json)
@@ -75,7 +72,7 @@ struct GetProposalInput {
 pub async fn get_proposal(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetProposalInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.get_proposal(&input.proposal_id).await {
@@ -123,7 +120,7 @@ struct CreateProposalInput {
 pub async fn create_proposal(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateProposalInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let body = json!({

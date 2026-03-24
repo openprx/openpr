@@ -57,14 +57,11 @@ pub async fn add_member(
     Path(workspace_id): Path<Uuid>,
     Json(req): Json<AddMemberRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Validate role
     if req.role != "admin" && req.role != "member" {
-        return Err(ApiError::BadRequest(
-            "role must be 'admin' or 'member'".to_string(),
-        ));
+        return Err(ApiError::BadRequest("role must be 'admin' or 'member'".to_string()));
     }
 
     // Check permission (only owner and admin can add members)
@@ -172,13 +169,10 @@ pub async fn update_member_role(
     Path((workspace_id, target_user_id)): Path<(Uuid, Uuid)>,
     Json(req): Json<UpdateMemberRoleRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if req.role != "admin" && req.role != "member" {
-        return Err(ApiError::BadRequest(
-            "role must be 'admin' or 'member'".to_string(),
-        ));
+        return Err(ApiError::BadRequest("role must be 'admin' or 'member'".to_string()));
     }
 
     let operator_role = get_workspace_role(&state, workspace_id, user_id).await?;
@@ -203,9 +197,7 @@ pub async fn update_member_role(
     .ok_or_else(|| ApiError::NotFound("member not found in workspace".to_string()))?;
 
     if target_role.role == "owner" {
-        return Err(ApiError::Forbidden(
-            "cannot change workspace owner role".to_string(),
-        ));
+        return Err(ApiError::Forbidden("cannot change workspace owner role".to_string()));
     }
 
     if operator_role == "admin" && (target_role.role == "admin" || req.role == "admin") {
@@ -278,13 +270,13 @@ pub async fn list_members(
 
     let members = MemberRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wm.user_id, u.email, u.name, u.entity_type, u.agent_type, wm.role, wm.created_at
             FROM workspace_members wm
             INNER JOIN users u ON wm.user_id = u.id
             WHERE wm.workspace_id = $1
             ORDER BY wm.created_at ASC
-        "#,
+        ",
         vec![workspace_id.into()],
     ))
     .all(&state.db)
@@ -312,8 +304,7 @@ pub async fn remove_member(
     Extension(claims): Extension<JwtClaims>,
     Path((workspace_id, target_user_id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Check permission (only owner and admin can remove members)
     let remover_role = get_workspace_role(&state, workspace_id, user_id).await?;
@@ -340,16 +331,12 @@ pub async fn remove_member(
 
     // Cannot remove owner
     if target_role.role == "owner" {
-        return Err(ApiError::Forbidden(
-            "cannot remove workspace owner".to_string(),
-        ));
+        return Err(ApiError::Forbidden("cannot remove workspace owner".to_string()));
     }
 
     // Admin cannot remove another admin, only owner can
     if target_role.role == "admin" && remover_role != "owner" {
-        return Err(ApiError::Forbidden(
-            "only owners can remove admins".to_string(),
-        ));
+        return Err(ApiError::Forbidden("only owners can remove admins".to_string()));
     }
 
     // Remove member
@@ -372,8 +359,7 @@ pub async fn search_users(
     Path(workspace_id): Path<Uuid>,
     Query(query): Query<SearchUsersQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let role = get_workspace_role(&state, workspace_id, user_id).await?;
     if role == "member" {
@@ -388,12 +374,12 @@ pub async fn search_users(
     let users = if search.is_empty() {
         SearchUserResponse::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT id, email, name
                 FROM users
                 ORDER BY created_at DESC
                 LIMIT $1
-            "#,
+            ",
             vec![limit.into()],
         ))
         .all(&state.db)
@@ -401,13 +387,13 @@ pub async fn search_users(
     } else {
         SearchUserResponse::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT id, email, name
                 FROM users
                 WHERE LOWER(name) LIKE $1 OR LOWER(email) LIKE $1
                 ORDER BY created_at DESC
                 LIMIT $2
-            "#,
+            ",
             vec![format!("%{}%", search).into(), limit.into()],
         ))
         .all(&state.db)
@@ -418,11 +404,7 @@ pub async fn search_users(
 }
 
 /// Helper: Get user's role in workspace
-async fn get_workspace_role(
-    state: &AppState,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<String, ApiError> {
+async fn get_workspace_role(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct RoleRow {
         role: String,

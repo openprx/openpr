@@ -13,9 +13,7 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     response::{ApiResponse, PaginatedData},
-    services::trust_score_service::{
-        is_project_admin_or_owner, is_project_member, is_system_admin,
-    },
+    services::trust_score_service::{is_project_admin_or_owner, is_project_member, is_system_admin},
 };
 
 #[derive(Debug, Serialize, FromQueryResult)]
@@ -239,13 +237,9 @@ fn parse_claim_user_id(claims: &JwtClaims) -> Result<Uuid, ApiError> {
     Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))
 }
 
-async fn ensure_project_visible(
-    state: &AppState,
-    project_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = is_project_member(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+async fn ensure_project_visible(state: &AppState, project_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+    let allowed =
+        is_project_member(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden("project access denied".to_string()));
     }
@@ -271,13 +265,13 @@ async fn get_project_id_for_proposal(
 
     let has_direct_project_id_column = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*)::bigint AS count
             FROM information_schema.columns
             WHERE table_schema = 'public'
               AND table_name = 'proposals'
               AND column_name = 'project_id'
-        "#,
+        ",
         vec![],
     ))
     .one(db)
@@ -293,23 +287,23 @@ async fn get_project_id_for_proposal(
         ))
         .one(db)
         .await?;
-        if let Some(row) = row {
-            if let Some(project_id) = row.project_id {
-                return Ok(ProposalProjectScope {
-                    project_ids: vec![project_id],
-                });
-            }
+        if let Some(row) = row
+            && let Some(project_id) = row.project_id
+        {
+            return Ok(ProposalProjectScope {
+                project_ids: vec![project_id],
+            });
         }
     }
 
     let rows = ProjectIdRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT DISTINCT wi.project_id
             FROM proposal_issue_links pil
             INNER JOIN work_items wi ON wi.id = pil.issue_id
             WHERE pil.proposal_id = $1
-        "#,
+        ",
         vec![proposal_id.to_string().into()],
     ))
     .all(db)
@@ -320,11 +314,7 @@ async fn get_project_id_for_proposal(
     })
 }
 
-async fn ensure_proposal_visible(
-    state: &AppState,
-    proposal_id: &str,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
+async fn ensure_proposal_visible(state: &AppState, proposal_id: &str, user_id: Uuid) -> Result<(), ApiError> {
     let scope = get_project_id_for_proposal(&state.db, proposal_id).await?;
     for project_id in scope.project_ids {
         ensure_project_visible(state, project_id, user_id).await?;
@@ -373,7 +363,7 @@ pub async fn get_proposal_chain(
 
     let proposal = ChainProposalRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id,
                 title,
@@ -388,7 +378,7 @@ pub async fn get_proposal_chain(
                 archived_at
             FROM proposals
             WHERE id = $1
-        "#,
+        ",
         vec![proposal_id.clone().into()],
     ))
     .one(&state.db)
@@ -397,7 +387,7 @@ pub async fn get_proposal_chain(
 
     let decision = ChainDecisionRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id,
                 result::text AS result,
@@ -409,7 +399,7 @@ pub async fn get_proposal_chain(
                 decided_at
             FROM decisions
             WHERE proposal_id = $1
-        "#,
+        ",
         vec![proposal_id.clone().into()],
     ))
     .one(&state.db)
@@ -417,7 +407,7 @@ pub async fn get_proposal_chain(
 
     let votes = ChainVoteRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 v.voter_id,
                 v.voter_type::text AS voter_type,
@@ -436,7 +426,7 @@ pub async fn get_proposal_chain(
             LEFT JOIN impact_reviews ir ON ir.proposal_id = v.proposal_id
             WHERE v.proposal_id = $1
             ORDER BY v.voted_at ASC
-        "#,
+        ",
         vec![proposal_id.clone().into()],
     ))
     .all(&state.db)
@@ -444,7 +434,7 @@ pub async fn get_proposal_chain(
 
     let issues = ChainIssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 pil.issue_id,
                 wi.title AS issue_title,
@@ -454,7 +444,7 @@ pub async fn get_proposal_chain(
             INNER JOIN work_items wi ON wi.id = pil.issue_id
             WHERE pil.proposal_id = $1
             ORDER BY pil.created_at ASC
-        "#,
+        ",
         vec![proposal_id.clone().into()],
     ))
     .all(&state.db)
@@ -462,7 +452,7 @@ pub async fn get_proposal_chain(
 
     let impact_review = ChainReviewRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id,
                 status::text AS status,
@@ -474,7 +464,7 @@ pub async fn get_proposal_chain(
                 created_at
             FROM impact_reviews
             WHERE proposal_id = $1
-        "#,
+        ",
         vec![proposal_id.clone().into()],
     ))
     .one(&state.db)
@@ -482,7 +472,7 @@ pub async fn get_proposal_chain(
 
     let feedback_proposals = Value::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT json_build_object(
                 'proposal_id', p.id,
                 'title', p.title,
@@ -495,7 +485,7 @@ pub async fn get_proposal_chain(
             INNER JOIN proposals p ON p.id = fll.derived_proposal_id
             WHERE ir.proposal_id = $1
             ORDER BY fll.created_at DESC
-        "#,
+        ",
         vec![proposal_id.clone().into()],
     ))
     .all(&state.db)
@@ -537,13 +527,10 @@ pub async fn get_proposal_timeline(
     })))
 }
 
-async fn build_timeline(
-    db: &impl ConnectionTrait,
-    proposal_id: &str,
-) -> Result<Vec<TimelineRow>, ApiError> {
+async fn build_timeline(db: &impl ConnectionTrait, proposal_id: &str) -> Result<Vec<TimelineRow>, ApiError> {
     let mut events = TimelineRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT created_at AS timestamp,
                    'proposal_created' AS event_type,
                    'proposal created' AS description,
@@ -676,7 +663,7 @@ async fn build_timeline(
             FROM trust_score_logs tsl
             INNER JOIN impact_reviews ir ON ir.id = tsl.event_id
             WHERE ir.proposal_id = $1 AND tsl.event_type = 'impact_review_completed'
-        "#,
+        ",
         vec![proposal_id.to_string().into()],
     ))
     .all(db)
@@ -704,15 +691,13 @@ pub async fn get_decision_analytics(
     if let (Some(start_at), Some(end_at)) = (query.start_at, query.end_at)
         && start_at > end_at
     {
-        return Err(ApiError::BadRequest(
-            "start_at must be <= end_at".to_string(),
-        ));
+        return Err(ApiError::BadRequest("start_at must be <= end_at".to_string()));
     }
 
     let (filter_sql, values) = filter_clause(query.project_id, query.start_at, query.end_at);
 
     let overview_sql = format!(
-        r#"
+        r"
             WITH filtered_proposals AS (
                 SELECT p.id, p.proposal_type::text AS proposal_type, p.created_at, p.domains, wi.project_id
                 FROM proposals p
@@ -729,7 +714,7 @@ pub async fn get_decision_analytics(
             FROM decisions d
             INNER JOIN filtered_proposals fp ON fp.id = d.proposal_id
             {filter_sql}
-        "#
+        "
     );
 
     let overview = DecisionOverviewRow::find_by_statement(Statement::from_sql_and_values(
@@ -748,7 +733,7 @@ pub async fn get_decision_analytics(
     });
 
     let by_type_sql = format!(
-        r#"
+        r"
             WITH filtered_proposals AS (
                 SELECT p.id, p.proposal_type::text AS proposal_type, p.created_at, p.domains, wi.project_id
                 FROM proposals p
@@ -768,7 +753,7 @@ pub async fn get_decision_analytics(
             {filter_sql}
             GROUP BY fp.proposal_type
             ORDER BY total_decisions DESC, fp.proposal_type ASC
-        "#
+        "
     );
 
     let by_type = DecisionTypeRow::find_by_statement(Statement::from_sql_and_values(
@@ -780,7 +765,7 @@ pub async fn get_decision_analytics(
     .await?;
 
     let by_domain_sql = format!(
-        r#"
+        r"
             WITH filtered_proposals AS (
                 SELECT p.id, p.proposal_type::text AS proposal_type, p.created_at, p.domains, wi.project_id
                 FROM proposals p
@@ -815,7 +800,7 @@ pub async fn get_decision_analytics(
             FROM expanded
             GROUP BY domain
             ORDER BY total_decisions DESC, domain ASC
-        "#
+        "
     );
 
     let by_domain = DecisionDomainRow::find_by_statement(Statement::from_sql_and_values(
@@ -888,8 +873,8 @@ pub async fn create_project_audit_report(
     Json(req): Json<GenerateAuditReportRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = parse_claim_user_id(&claims)?;
-    let allowed = is_project_admin_or_owner(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+    let allowed =
+        is_project_admin_or_owner(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden("admin or owner required".to_string()));
     }
@@ -908,7 +893,7 @@ pub async fn create_project_audit_report(
 
     let summary = DecisionOverviewRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             WITH decision_scope AS (
                 SELECT DISTINCT
                     d.id,
@@ -930,7 +915,7 @@ pub async fn create_project_audit_report(
                 COUNT(*) FILTER (WHERE ds.result = 'vetoed')::bigint AS vetoed_count,
                 AVG(EXTRACT(EPOCH FROM (ds.decided_at - ds.created_at)) / 3600.0)::double precision AS avg_cycle_hours
             FROM decision_scope ds
-        "#,
+        ",
         vec![project_id.into(), start_at.into(), end_at.into()],
     ))
     .one(&state.db)
@@ -945,7 +930,7 @@ pub async fn create_project_audit_report(
 
     let rating = RatingAggRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 COUNT(*) FILTER (WHERE ir.status = 'completed' AND ir.rating IS NOT NULL)::bigint AS reviewed_proposals,
                 AVG(
@@ -969,7 +954,7 @@ pub async fn create_project_audit_report(
             WHERE ir.project_id = $1
               AND ir.created_at >= $2
               AND ir.created_at <= $3
-        "#,
+        ",
         vec![project_id.into(), start_at.into(), end_at.into()],
     ))
     .one(&state.db)
@@ -982,7 +967,7 @@ pub async fn create_project_audit_report(
 
     let trust_distribution = Value::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT json_build_object(
                 'observer', COUNT(*) FILTER (WHERE level = 'observer'),
                 'advisor', COUNT(*) FILTER (WHERE level = 'advisor'),
@@ -992,7 +977,7 @@ pub async fn create_project_audit_report(
             ) AS value
             FROM trust_scores
             WHERE project_id = $1
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .one(&state.db)
@@ -1002,7 +987,7 @@ pub async fn create_project_audit_report(
 
     let veto_records = Value::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT json_agg(row_data) AS value
             FROM (
                 SELECT json_build_object(
@@ -1026,7 +1011,7 @@ pub async fn create_project_audit_report(
                 ORDER BY ve.created_at DESC
                 LIMIT 50
             ) t
-        "#,
+        ",
         vec![project_id.into(), start_at.into(), end_at.into()],
     ))
     .one(&state.db)
@@ -1036,7 +1021,7 @@ pub async fn create_project_audit_report(
 
     let domain_rows = DomainStatsRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             WITH proposal_scope AS (
                 SELECT DISTINCT p.id, p.domains, d.result::text AS decision_result
                 FROM proposals p
@@ -1087,7 +1072,7 @@ pub async fn create_project_audit_report(
             LEFT JOIN review_score rs ON rs.proposal_id = e.id
             GROUP BY e.domain
             ORDER BY total_decisions DESC, e.domain ASC
-        "#,
+        ",
         vec![project_id.into(), start_at.into(), end_at.into()],
     ))
     .all(&state.db)
@@ -1111,7 +1096,7 @@ pub async fn create_project_audit_report(
 
     let ai_participation_stats = Value::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT json_build_object(
                 'votes', COUNT(DISTINCT v.id) FILTER (WHERE v.voter_type = 'ai'),
                 'comments', (
@@ -1144,7 +1129,7 @@ pub async fn create_project_audit_report(
             )
               AND v.voted_at >= $2
               AND v.voted_at <= $3
-        "#,
+        ",
         vec![project_id.into(), start_at.into(), end_at.into()],
     ))
     .one(&state.db)
@@ -1154,7 +1139,7 @@ pub async fn create_project_audit_report(
 
     let top_contributors = Value::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COALESCE(json_agg(row_data), '[]'::json) AS value
             FROM (
                 SELECT json_build_object(
@@ -1170,7 +1155,7 @@ pub async fn create_project_audit_report(
                 ORDER BY ABS(SUM(tsl.score_change)) DESC, COUNT(*) DESC
                 LIMIT 20
             ) t
-        "#,
+        ",
         vec![project_id.into(), start_at.into(), end_at.into()],
     ))
     .one(&state.db)
@@ -1212,7 +1197,7 @@ pub async fn create_project_audit_report(
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO decision_audit_reports (
                     id, project_id, period_start, period_end,
                     total_proposals, approved_proposals, rejected_proposals, vetoed_proposals,
@@ -1226,7 +1211,7 @@ pub async fn create_project_audit_report(
                     $12, $13, $14, $15,
                     $16, $17
                 )
-            "#,
+            ",
             vec![
                 report_id.clone().into(),
                 project_id.into(),
@@ -1249,12 +1234,7 @@ pub async fn create_project_audit_report(
         ))
         .await?;
 
-    get_project_audit_report(
-        State(state),
-        Extension(claims),
-        Path((project_id, report_id)),
-    )
-    .await
+    get_project_audit_report(State(state), Extension(claims), Path((project_id, report_id))).await
 }
 
 fn resolve_period(
@@ -1264,9 +1244,7 @@ fn resolve_period(
     match (period_start, period_end) {
         (Some(start), Some(end)) => {
             if start > end {
-                return Err(ApiError::BadRequest(
-                    "period_start must be <= period_end".to_string(),
-                ));
+                return Err(ApiError::BadRequest("period_start must be <= period_end".to_string()));
             }
             Ok((start, end))
         }
@@ -1302,11 +1280,11 @@ pub async fn list_project_audit_reports(
 
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*)::bigint AS count
             FROM decision_audit_reports
             WHERE project_id = $1
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .one(&state.db)
@@ -1316,7 +1294,7 @@ pub async fn list_project_audit_reports(
 
     let items = AuditReportRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id, project_id, period_start, period_end,
                 total_proposals, approved_proposals, rejected_proposals, vetoed_proposals,
@@ -1327,7 +1305,7 @@ pub async fn list_project_audit_reports(
             WHERE project_id = $1
             ORDER BY generated_at DESC
             LIMIT $2 OFFSET $3
-        "#,
+        ",
         vec![project_id.into(), per_page.into(), offset.into()],
     ))
     .all(&state.db)
@@ -1358,7 +1336,7 @@ pub async fn get_project_audit_report(
 
     let report = AuditReportRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id, project_id, period_start, period_end,
                 total_proposals, approved_proposals, rejected_proposals, vetoed_proposals,
@@ -1367,7 +1345,7 @@ pub async fn get_project_audit_report(
                 generated_at, generated_by
             FROM decision_audit_reports
             WHERE project_id = $1 AND id = $2
-        "#,
+        ",
         vec![project_id.into(), report_id.into()],
     ))
     .one(&state.db)
@@ -1377,10 +1355,7 @@ pub async fn get_project_audit_report(
     Ok(ApiResponse::success(report))
 }
 
-async fn get_ai_participant_project_id(
-    db: &impl ConnectionTrait,
-    ai_participant_id: &str,
-) -> Result<Uuid, ApiError> {
+async fn get_ai_participant_project_id(db: &impl ConnectionTrait, ai_participant_id: &str) -> Result<Uuid, ApiError> {
     let row = ProjectIdRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT project_id FROM ai_participants WHERE id = $1",
@@ -1412,7 +1387,7 @@ pub async fn get_ai_review_feedback(
 
     let items = AiLearningRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id,
                 ai_participant_id,
@@ -1430,7 +1405,7 @@ pub async fn get_ai_review_feedback(
             FROM ai_learning_records
             WHERE review_id = $1
             ORDER BY created_at ASC
-        "#,
+        ",
         vec![review_id.into()],
     ))
     .all(&state.db)
@@ -1466,8 +1441,7 @@ pub async fn get_ai_participant_learning(
     }
     let where_sql = format!("WHERE {}", where_parts.join(" AND "));
 
-    let count_sql =
-        format!("SELECT COUNT(*)::bigint AS count FROM ai_learning_records {where_sql}");
+    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM ai_learning_records {where_sql}");
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         count_sql,
@@ -1479,7 +1453,7 @@ pub async fn get_ai_participant_learning(
     .unwrap_or(0);
 
     let sql = format!(
-        r#"
+        r"
             SELECT
                 id,
                 ai_participant_id,
@@ -1498,19 +1472,15 @@ pub async fn get_ai_participant_learning(
             {where_sql}
             ORDER BY created_at DESC
             LIMIT ${idx} OFFSET ${}
-        "#,
+        ",
         idx + 1
     );
     values.push(per_page.into());
     values.push(offset.into());
 
-    let items = AiLearningRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let items = AiLearningRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+        .all(&state.db)
+        .await?;
 
     let total_pages = if total == 0 {
         0
@@ -1538,7 +1508,7 @@ pub async fn get_ai_participant_alignment_stats(
 
     let stats = AlignmentStatsRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             WITH ordered AS (
                 SELECT
                     outcome_alignment,
@@ -1555,7 +1525,7 @@ pub async fn get_ai_participant_alignment_stats(
                 COUNT(*) FILTER (WHERE rn <= 5)::bigint AS recent_total,
                 COUNT(*) FILTER (WHERE rn <= 5 AND outcome_alignment = 'aligned')::bigint AS recent_aligned
             FROM ordered
-        "#,
+        ",
         vec![ai_participant_id.clone().into()],
     ))
     .one(&state.db)

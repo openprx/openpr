@@ -200,19 +200,16 @@ pub fn trigger_webhooks(state: AppState, ctx: TriggerContext) {
     });
 }
 
-async fn trigger_webhooks_inner(
-    state: AppState,
-    ctx: TriggerContext,
-) -> Result<(), sea_orm::DbErr> {
+async fn trigger_webhooks_inner(state: AppState, ctx: TriggerContext) -> Result<(), sea_orm::DbErr> {
     let webhooks = ActiveWebhookRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, url, secret, bot_user_id
             FROM webhooks
             WHERE workspace_id = $1
               AND active = true
               AND events ? $2
-        "#,
+        ",
         vec![ctx.workspace_id.into(), ctx.event.as_str().into()],
     ))
     .all(&state.db)
@@ -303,9 +300,7 @@ async fn build_payload(
     let built_data = build_event_data(state, ctx, &project.key).await?;
 
     let mut bot_context = None;
-    if let Some(identity) =
-        check_bot_context(&state.db, &built_data.assignee_ids, webhook.bot_user_id).await
-    {
+    if let Some(identity) = check_bot_context(&state.db, &built_data.assignee_ids, webhook.bot_user_id).await {
         bot_context = Some(BotContext {
             is_bot_task: true,
             bot_id: identity.bot_id.to_string(),
@@ -314,19 +309,17 @@ async fn build_payload(
             trigger_reason: default_trigger_reason(ctx.event).to_string(),
             webhook_id: webhook.id.to_string(),
         });
-    } else if matches!(ctx.event, WebhookEvent::CommentCreated) {
-        if let Some(identity) =
-            check_bot_mention(&state.db, &ctx.mentions, webhook.bot_user_id).await
-        {
-            bot_context = Some(BotContext {
-                is_bot_task: true,
-                bot_id: identity.bot_id.to_string(),
-                bot_name: identity.bot_name,
-                bot_agent_type: identity.bot_agent_type,
-                trigger_reason: "mentioned".to_string(),
-                webhook_id: webhook.id.to_string(),
-            });
-        }
+    } else if matches!(ctx.event, WebhookEvent::CommentCreated)
+        && let Some(identity) = check_bot_mention(&state.db, &ctx.mentions, webhook.bot_user_id).await
+    {
+        bot_context = Some(BotContext {
+            is_bot_task: true,
+            bot_id: identity.bot_id.to_string(),
+            bot_name: identity.bot_name,
+            bot_agent_type: identity.bot_agent_type,
+            trigger_reason: "mentioned".to_string(),
+            webhook_id: webhook.id.to_string(),
+        });
     }
 
     Ok(WebhookPayload {
@@ -414,9 +407,7 @@ async fn build_event_data(
                 assignee_ids,
             })
         }
-        WebhookEvent::CommentCreated
-        | WebhookEvent::CommentUpdated
-        | WebhookEvent::CommentDeleted => {
+        WebhookEvent::CommentCreated | WebhookEvent::CommentUpdated | WebhookEvent::CommentDeleted => {
             let (comment, issue_summary) = if let Some(extra) = ctx.extra_data.clone() {
                 let issue = extra
                     .get("issue")
@@ -603,11 +594,11 @@ async fn fetch_issue_payload(
 
     let issue = IssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, title, description, state, priority, assignee_id, sprint_id, created_at, updated_at
             FROM work_items
             WHERE id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -673,7 +664,7 @@ async fn fetch_comment_payload(
 
     let comment = CommentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT c.id,
                    c.work_item_id AS issue_id,
                    c.body AS content,
@@ -684,7 +675,7 @@ async fn fetch_comment_payload(
             FROM comments c
             LEFT JOIN users u ON c.author_id = u.id
             WHERE c.id = $1
-        "#,
+        ",
         vec![comment_id.into()],
     ))
     .one(&state.db)
@@ -744,9 +735,7 @@ async fn check_bot_context(
             continue;
         }
 
-        let bot_name: String = row
-            .try_get::<String>("", "name")
-            .unwrap_or_else(|_| "Bot".to_string());
+        let bot_name: String = row.try_get::<String>("", "name").unwrap_or_else(|_| "Bot".to_string());
         let bot_agent_type = row
             .try_get::<Option<String>>("", "agent_type")
             .ok()
@@ -787,9 +776,7 @@ async fn check_bot_mention(
         return None;
     }
 
-    let bot_name: String = row
-        .try_get::<String>("", "name")
-        .unwrap_or_else(|_| "Bot".to_string());
+    let bot_name: String = row.try_get::<String>("", "name").unwrap_or_else(|_| "Bot".to_string());
     let bot_agent_type = row
         .try_get::<Option<String>>("", "agent_type")
         .ok()
@@ -822,8 +809,7 @@ async fn deliver_webhook(
     headers.insert(USER_AGENT, HeaderValue::from_static("OpenPR-Webhook/1.0"));
     headers.insert(
         "X-Webhook-Signature",
-        HeaderValue::from_str(&format!("sha256={signature}"))
-            .unwrap_or(HeaderValue::from_static("sha256=")),
+        HeaderValue::from_str(&format!("sha256={signature}")).unwrap_or(HeaderValue::from_static("sha256=")),
     );
     headers.insert(
         "X-Webhook-Event",
@@ -848,12 +834,7 @@ async fn deliver_webhook(
         .map_err(|e| sea_orm::DbErr::Custom(format!("build reqwest client failed: {e}")))?;
 
     let started = Instant::now();
-    let sent = client
-        .post(&webhook.url)
-        .headers(headers)
-        .body(body)
-        .send()
-        .await;
+    let sent = client.post(&webhook.url).headers(headers).body(body).send().await;
 
     let (response_status, response_body, error, success) = match sent {
         Ok(resp) => {
@@ -903,12 +884,12 @@ async fn record_delivery(state: &AppState, rec: DeliveryRecord) -> Result<(), se
         .db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT column_name
                 FROM information_schema.columns
                 WHERE table_schema = 'public'
                   AND table_name = 'webhook_deliveries'
-            "#,
+            ",
             vec![],
         ))
         .await?;
@@ -987,19 +968,14 @@ async fn record_delivery(state: &AppState, rec: DeliveryRecord) -> Result<(), se
 
     state
         .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            &sql,
-            params,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, &sql, params))
         .await?;
 
     Ok(())
 }
 
 fn sign_payload(secret: &str, raw_body: &str) -> Result<String, String> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .map_err(|e| format!("invalid hmac secret: {e}"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|e| format!("invalid hmac secret: {e}"))?;
     mac.update(raw_body.as_bytes());
     let bytes = mac.finalize().into_bytes();
     Ok(hex::encode(bytes))

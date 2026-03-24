@@ -5,9 +5,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use platform::{app::AppState, auth::JwtClaims};
-use sea_orm::{
-    ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait, TryGetable,
-};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -74,8 +72,8 @@ pub async fn create_appeal(
     Extension(claims): Extension<JwtClaims>,
     Json(req): Json<CreateAppealRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let appellant_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let appellant_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if req.reason.trim().is_empty() {
         return Err(ApiError::BadRequest("reason is required".to_string()));
@@ -98,14 +96,12 @@ pub async fn create_appeal(
         .await?
         .is_some();
     if exists {
-        return Err(ApiError::Conflict(
-            "pending appeal already exists".to_string(),
-        ));
+        return Err(ApiError::Conflict("pending appeal already exists".to_string()));
     }
 
     let row = AppealRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO appeals (
                 log_id, appellant_id, reason, evidence, status, created_at
             ) VALUES ($1, $2, $3, $4, 'pending'::appeal_status, $5)
@@ -114,7 +110,7 @@ pub async fn create_appeal(
                       created_at, resolved_at,
                       (SELECT project_id FROM trust_score_logs WHERE id = log_id) AS project_id,
                       (SELECT domain FROM trust_score_logs WHERE id = log_id) AS domain
-        "#,
+        ",
         vec![
             req.log_id.into(),
             appellant_id.into(),
@@ -166,8 +162,7 @@ pub async fn list_appeals(
     Extension(claims): Extension<JwtClaims>,
     Query(query): Query<ListAppealsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let mut where_parts = Vec::new();
     let mut values: Vec<sea_orm::Value> = Vec::new();
@@ -231,7 +226,7 @@ pub async fn list_appeals(
     }
 
     let sql = format!(
-        r#"
+        r"
             SELECT a.id, a.log_id, a.appellant_id, a.reason, a.evidence,
                    a.status::text AS status, a.reviewer_id, a.review_note,
                    a.created_at, a.resolved_at,
@@ -240,17 +235,13 @@ pub async fn list_appeals(
             INNER JOIN trust_score_logs t ON t.id = a.log_id
             WHERE {}
             ORDER BY a.created_at DESC
-        "#,
+        ",
         where_parts.join(" AND ")
     );
 
-    let items = AppealRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let items = AppealRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+        .all(&state.db)
+        .await?;
 
     Ok(ApiResponse::success(PaginatedData::from_items(items)))
 }
@@ -260,12 +251,11 @@ pub async fn get_appeal(
     Extension(claims): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let row = AppealRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT a.id, a.log_id, a.appellant_id, a.reason, a.evidence,
                    a.status::text AS status, a.reviewer_id, a.review_note,
                    a.created_at, a.resolved_at,
@@ -273,7 +263,7 @@ pub async fn get_appeal(
             FROM appeals a
             INNER JOIN trust_score_logs t ON t.id = a.log_id
             WHERE a.id = $1
-        "#,
+        ",
         vec![id.into()],
     ))
     .one(&state.db)
@@ -290,21 +280,19 @@ pub async fn update_appeal(
     Path(id): Path<i64>,
     Json(req): Json<UpdateAppealRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let reviewer_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let reviewer_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let normalized = req.status.to_lowercase();
     if !matches!(normalized.as_str(), "accepted" | "rejected") {
-        return Err(ApiError::BadRequest(
-            "status must be accepted or rejected".to_string(),
-        ));
+        return Err(ApiError::BadRequest("status must be accepted or rejected".to_string()));
     }
 
     let tx = state.db.begin().await?;
 
     let appeal = AppealRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT a.id, a.log_id, a.appellant_id, a.reason, a.evidence,
                    a.status::text AS status, a.reviewer_id, a.review_note,
                    a.created_at, a.resolved_at,
@@ -313,7 +301,7 @@ pub async fn update_appeal(
             INNER JOIN trust_score_logs t ON t.id = a.log_id
             WHERE a.id = $1
             FOR UPDATE
-        "#,
+        ",
         vec![id.into()],
     ))
     .one(&tx)
@@ -348,19 +336,19 @@ pub async fn update_appeal(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             UPDATE trust_score_logs
             SET is_appealed = true,
                 appeal_result = $2
             WHERE id = $1
-        "#,
+        ",
         vec![log.id.into(), normalized.clone().into()],
     ))
     .await?;
 
     let updated = AppealRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             UPDATE appeals
             SET status = $2::appeal_status,
                 reviewer_id = $3,
@@ -372,7 +360,7 @@ pub async fn update_appeal(
                       created_at, resolved_at,
                       (SELECT project_id FROM trust_score_logs WHERE id = log_id) AS project_id,
                       (SELECT domain FROM trust_score_logs WHERE id = log_id) AS domain
-        "#,
+        ",
         vec![
             id.into(),
             normalized.into(),
@@ -395,12 +383,11 @@ pub async fn delete_appeal(
     Extension(claims): Extension<JwtClaims>,
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let appeal = AppealRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, log_id, appellant_id, reason, evidence,
                    status::text AS status, reviewer_id, review_note,
                    created_at, resolved_at,
@@ -408,7 +395,7 @@ pub async fn delete_appeal(
                    (SELECT domain FROM trust_score_logs WHERE id = log_id) AS domain
             FROM appeals
             WHERE id = $1
-        "#,
+        ",
         vec![id.into()],
     ))
     .one(&state.db)
@@ -416,15 +403,11 @@ pub async fn delete_appeal(
     .ok_or_else(|| ApiError::NotFound("appeal not found".to_string()))?;
 
     if appeal.appellant_id != user_id {
-        return Err(ApiError::Forbidden(
-            "only appellant can delete appeal".to_string(),
-        ));
+        return Err(ApiError::Forbidden("only appellant can delete appeal".to_string()));
     }
 
     if appeal.status != "pending" {
-        return Err(ApiError::BadRequest(
-            "only pending appeal can be deleted".to_string(),
-        ));
+        return Err(ApiError::BadRequest("only pending appeal can be deleted".to_string()));
     }
 
     state
@@ -443,10 +426,7 @@ async fn find_log(state: &AppState, log_id: i64) -> Result<TrustScoreLogRow, Api
     find_log_with_conn(&state.db, log_id).await
 }
 
-async fn resolve_workspace_id_for_project(
-    state: &AppState,
-    project_id: Uuid,
-) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_workspace_id_for_project(state: &AppState, project_id: Uuid) -> Result<Option<Uuid>, ApiError> {
     #[derive(Debug, FromQueryResult)]
     struct WorkspaceRow {
         workspace_id: Uuid,
@@ -463,17 +443,14 @@ async fn resolve_workspace_id_for_project(
     Ok(row.map(|v| v.workspace_id))
 }
 
-async fn find_log_with_conn<C: ConnectionTrait>(
-    db: &C,
-    log_id: i64,
-) -> Result<TrustScoreLogRow, ApiError> {
+async fn find_log_with_conn<C: ConnectionTrait>(db: &C, log_id: i64) -> Result<TrustScoreLogRow, ApiError> {
     TrustScoreLogRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, user_id, project_id, domain, score_change
             FROM trust_score_logs
             WHERE id = $1
-        "#,
+        ",
         vec![log_id.into()],
     ))
     .one(db)
@@ -481,11 +458,7 @@ async fn find_log_with_conn<C: ConnectionTrait>(
     .ok_or_else(|| ApiError::NotFound("trust score log not found".to_string()))
 }
 
-async fn ensure_can_view_appeal(
-    state: &AppState,
-    appeal: &AppealRow,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
+async fn ensure_can_view_appeal(state: &AppState, appeal: &AppealRow, user_id: Uuid) -> Result<(), ApiError> {
     if appeal.appellant_id == user_id {
         return Ok(());
     }
@@ -510,18 +483,14 @@ async fn ensure_can_review_appeal<C: ConnectionTrait>(
 
     let vetoer_count = VetoerCountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*)::bigint AS count
             FROM vetoers
             WHERE user_id = $1
               AND project_id = $2
               AND domain = $3
-        "#,
-        vec![
-            user_id.into(),
-            log.project_id.into(),
-            log.domain.clone().into(),
-        ],
+        ",
+        vec![user_id.into(), log.project_id.into(), log.domain.clone().into()],
     ))
     .one(db)
     .await?
@@ -531,35 +500,25 @@ async fn ensure_can_review_appeal<C: ConnectionTrait>(
     if vetoer_count > 0 {
         Ok(())
     } else {
-        Err(ApiError::Forbidden(
-            "admin or domain vetoer required".to_string(),
-        ))
+        Err(ApiError::Forbidden("admin or domain vetoer required".to_string()))
     }
 }
 
-async fn can_review_in_project(
-    state: &AppState,
-    user_id: Uuid,
-    log: &TrustScoreLogRow,
-) -> Result<bool, ApiError> {
+async fn can_review_in_project(state: &AppState, user_id: Uuid, log: &TrustScoreLogRow) -> Result<bool, ApiError> {
     if is_project_admin_or_owner(&state.db, log.project_id, user_id).await? {
         return Ok(true);
     }
 
     let count = VetoerCountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*)::bigint AS count
             FROM vetoers
             WHERE user_id = $1
               AND project_id = $2
               AND domain = $3
-        "#,
-        vec![
-            user_id.into(),
-            log.project_id.into(),
-            log.domain.clone().into(),
-        ],
+        ",
+        vec![user_id.into(), log.project_id.into(), log.domain.clone().into()],
     ))
     .one(&state.db)
     .await?
@@ -582,9 +541,7 @@ async fn resolve_user_participant_type_with_conn<C: ConnectionTrait>(
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
 
-    let entity_type: String = row
-        .try_get("", "entity_type")
-        .map_err(|_| ApiError::Internal)?;
+    let entity_type: String = row.try_get("", "entity_type").map_err(|_| ApiError::Internal)?;
 
     if entity_type == "bot" || entity_type == "ai" {
         Ok(ParticipantType::Ai)

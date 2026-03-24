@@ -63,8 +63,7 @@ pub async fn get_my_issues(
     Extension(claims): Extension<JwtClaims>,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let page = pagination.page.max(1);
     let per_page = pagination.per_page.clamp(1, 100);
@@ -90,7 +89,7 @@ pub async fn get_my_issues(
 
     let total_result = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*) as count
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
@@ -109,7 +108,7 @@ pub async fn get_my_issues(
                       AND wb.id = $1
                 )
               )
-        "#,
+        ",
         vec![user_id.into()],
     ))
     .one(&state.db)
@@ -119,7 +118,7 @@ pub async fn get_my_issues(
 
     let issues = MyIssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.id,
                    wi.project_id,
                    p.workspace_id,
@@ -148,12 +147,8 @@ pub async fn get_my_issues(
               )
             ORDER BY wi.updated_at DESC
             LIMIT $2 OFFSET $3
-        "#,
-        vec![
-            user_id.into(),
-            (per_page as i64).into(),
-            (offset as i64).into(),
-        ],
+        ",
+        vec![user_id.into(), per_page.into(), offset.into()],
     ))
     .all(&state.db)
     .await?;
@@ -194,8 +189,7 @@ pub async fn get_my_activities(
     Extension(claims): Extension<JwtClaims>,
     Query(pagination): Query<PaginationQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let page = pagination.page.max(1);
     let per_page = pagination.per_page.clamp(1, 100);
@@ -223,7 +217,7 @@ pub async fn get_my_activities(
 
     let total_result = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT COUNT(*) as count
             FROM activities a
             INNER JOIN work_items wi ON wi.id = COALESCE(a.issue_id, CASE WHEN a.resource_type = 'issue' THEN a.resource_id END)
@@ -242,7 +236,7 @@ pub async fn get_my_activities(
                       AND wb.id = $1
                 )
             )
-        "#,
+        ",
         vec![user_id.into()],
     ))
     .one(&state.db)
@@ -252,7 +246,7 @@ pub async fn get_my_activities(
 
     let activities = MyActivityRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT a.id,
                    COALESCE(a.issue_id, CASE WHEN a.resource_type = 'issue' THEN a.resource_id END) AS issue_id,
                    wi.project_id,
@@ -284,8 +278,8 @@ pub async fn get_my_activities(
             )
             ORDER BY a.created_at DESC
             LIMIT $2 OFFSET $3
-        "#,
-        vec![user_id.into(), (per_page as i64).into(), (offset as i64).into()],
+        ",
+        vec![user_id.into(), per_page.into(), offset.into()],
     ))
     .all(&state.db)
     .await?;

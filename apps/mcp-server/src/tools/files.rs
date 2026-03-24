@@ -34,13 +34,13 @@ struct UploadFileInput {
 pub async fn upload_file(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: UploadFileInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let base64_data = strip_base64_prefix(&input.content_base64);
     let bytes = match base64::engine::general_purpose::STANDARD.decode(base64_data) {
         Ok(b) => b,
-        Err(e) => return CallToolResult::error(format!("Invalid base64 content: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid base64 content: {e}")),
     };
 
     match client.upload_file(&input.filename, bytes).await {

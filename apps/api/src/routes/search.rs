@@ -72,13 +72,10 @@ pub async fn search(
     Extension(claims): Extension<JwtClaims>,
     Query(query): Query<SearchQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if query.q.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "Search query cannot be empty".to_string(),
-        ));
+        return Err(ApiError::BadRequest("Search query cannot be empty".to_string()));
     }
 
     let limit = query.limit.unwrap_or(50).min(100) as i64;
@@ -126,7 +123,7 @@ async fn search_issues(
     limit: i64,
 ) -> Result<Vec<IssueSearchResult>, ApiError> {
     let pattern = format!("%{}%", query);
-    let sql = r#"
+    let sql = r"
         SELECT wi.id, wi.title, wi.description, wi.state, wi.project_id, p.workspace_id
         FROM work_items wi
         INNER JOIN projects p ON wi.project_id = p.id
@@ -147,7 +144,7 @@ async fn search_issues(
           AND (wi.title ILIKE $2 OR wi.description ILIKE $2)
         ORDER BY wi.updated_at DESC
         LIMIT $3
-    "#;
+    ";
 
     let rows = state
         .db
@@ -171,7 +168,7 @@ async fn search_projects(
     limit: i64,
 ) -> Result<Vec<ProjectSearchResult>, ApiError> {
     let pattern = format!("%{}%", query);
-    let sql = r#"
+    let sql = r"
         SELECT p.id, p.key, p.name, p.description, p.workspace_id
         FROM projects p
         WHERE (
@@ -191,7 +188,7 @@ async fn search_projects(
           AND (p.name ILIKE $2 OR p.key ILIKE $2 OR p.description ILIKE $2)
         ORDER BY p.updated_at DESC
         LIMIT $3
-    "#;
+    ";
 
     let rows = state
         .db
@@ -215,7 +212,7 @@ async fn search_comments(
     limit: i64,
 ) -> Result<Vec<CommentSearchResult>, ApiError> {
     let pattern = format!("%{}%", query);
-    let sql = r#"
+    let sql = r"
         SELECT c.id, c.body, c.work_item_id AS issue_id, wi.project_id, p.workspace_id, c.author_id, c.created_at
         FROM comments c
         INNER JOIN work_items wi ON c.work_item_id = wi.id
@@ -237,7 +234,7 @@ async fn search_comments(
           AND c.body ILIKE $2
         ORDER BY c.created_at DESC
         LIMIT $3
-    "#;
+    ";
 
     let rows = state
         .db

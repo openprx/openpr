@@ -56,13 +56,13 @@ pub async fn list_decisions(
 
     let rows = DecisionRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, proposal_id, result::text AS result, approval_rate,
                    total_votes, yes_votes, no_votes, abstain_votes, decided_at
             FROM decisions
             ORDER BY decided_at DESC
             LIMIT $1 OFFSET $2
-        "#,
+        ",
         vec![per_page.into(), offset.into()],
     ))
     .all(&state.db)
@@ -89,12 +89,12 @@ pub async fn get_decision(
 ) -> Result<impl IntoResponse, ApiError> {
     let decision = DecisionRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, proposal_id, result::text AS result, approval_rate,
                    total_votes, yes_votes, no_votes, abstain_votes, decided_at
             FROM decisions
             WHERE id = $1
-        "#,
+        ",
         vec![id.into()],
     ))
     .one(&state.db)
@@ -110,12 +110,12 @@ pub async fn get_proposal_decision(
 ) -> Result<impl IntoResponse, ApiError> {
     let decision = DecisionRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, proposal_id, result::text AS result, approval_rate,
                    total_votes, yes_votes, no_votes, abstain_votes, decided_at
             FROM decisions
             WHERE proposal_id = $1
-        "#,
+        ",
         vec![proposal_id.into()],
     ))
     .one(&state.db)

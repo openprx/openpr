@@ -156,13 +156,9 @@ pub async fn list_users(
         values.len()
     );
 
-    let users = UserRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        &list_sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let users = UserRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, &list_sql, values))
+        .all(&state.db)
+        .await?;
 
     let items = users.into_iter().map(map_user_summary).collect();
 
@@ -191,18 +187,14 @@ pub async fn create_user(
 
     let role = req.role.unwrap_or_else(|| "user".to_string());
     if role != "admin" && role != "user" {
-        return Err(ApiError::BadRequest(
-            "role must be 'admin' or 'user'".to_string(),
-        ));
+        return Err(ApiError::BadRequest("role must be 'admin' or 'user'".to_string()));
     }
 
     let entity_type = normalize_entity_type(req.entity_type.as_deref())?;
     let agent_type = normalize_agent_type(req.agent_type)?;
 
     if entity_type == "bot" && agent_type.is_none() {
-        return Err(ApiError::BadRequest(
-            "agent_type is required for bot user".to_string(),
-        ));
+        return Err(ApiError::BadRequest("agent_type is required for bot user".to_string()));
     }
     if entity_type == "human" && agent_type.is_some() {
         return Err(ApiError::BadRequest(
@@ -262,15 +254,12 @@ pub async fn create_user(
     Ok(ApiResponse::success(map_user_summary(user)))
 }
 
-pub async fn get_user(
-    State(state): State<AppState>,
-    Path(user_id): Path<Uuid>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn get_user(State(state): State<AppState>, Path(user_id): Path<Uuid>) -> Result<impl IntoResponse, ApiError> {
     let user = find_user_by_id(&state, user_id).await?;
 
     let workspaces = UserWorkspaceRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 wm.workspace_id,
                 w.slug as workspace_slug,
@@ -281,7 +270,7 @@ pub async fn get_user(
             INNER JOIN workspaces w ON w.id = wm.workspace_id
             WHERE wm.user_id = $1
             ORDER BY wm.created_at DESC
-        "#,
+        ",
         vec![user_id.into()],
     ))
     .all(&state.db)
@@ -317,10 +306,10 @@ pub async fn update_user(
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
 
-    if let Some(name) = &req.name {
-        if name.trim().is_empty() {
-            return Err(ApiError::BadRequest("name cannot be empty".to_string()));
-        }
+    if let Some(name) = &req.name
+        && name.trim().is_empty()
+    {
+        return Err(ApiError::BadRequest("name cannot be empty".to_string()));
     }
 
     let normalized_email = req.email.as_ref().map(|email| email.trim().to_lowercase());
@@ -342,12 +331,11 @@ pub async fn update_user(
         }
     }
 
-    if let Some(role) = &req.role {
-        if role != "admin" && role != "user" {
-            return Err(ApiError::BadRequest(
-                "role must be 'admin' or 'user'".to_string(),
-            ));
-        }
+    if let Some(role) = &req.role
+        && role != "admin"
+        && role != "user"
+    {
+        return Err(ApiError::BadRequest("role must be 'admin' or 'user'".to_string()));
     }
 
     let current_user = find_user_by_id(&state, user_id).await?;
@@ -366,11 +354,8 @@ pub async fn update_user(
         }
     }
 
-    if target_entity_type == "bot" && req.agent_type.is_none() && current_user.agent_type.is_none()
-    {
-        return Err(ApiError::BadRequest(
-            "agent_type is required for bot user".to_string(),
-        ));
+    if target_entity_type == "bot" && req.agent_type.is_none() && current_user.agent_type.is_none() {
+        return Err(ApiError::BadRequest("agent_type is required for bot user".to_string()));
     }
 
     let mut set_parts: Vec<String> = Vec::new();
@@ -420,18 +405,10 @@ pub async fn update_user(
     param_idx += 1;
     values.push(user_id.into());
 
-    let update_sql = format!(
-        "UPDATE users SET {} WHERE id = ${}",
-        set_parts.join(", "),
-        param_idx
-    );
+    let update_sql = format!("UPDATE users SET {} WHERE id = ${}", set_parts.join(", "), param_idx);
     state
         .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            &update_sql,
-            values,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, &update_sql, values))
         .await?;
 
     let user = find_user_by_id(&state, user_id).await?;
@@ -517,12 +494,9 @@ pub async fn delete_user(
 
 pub async fn get_stats(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
     let total_users = fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM users").await?;
-    let total_workspaces =
-        fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM workspaces").await?;
-    let total_projects =
-        fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM projects").await?;
-    let total_issues =
-        fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM work_items").await?;
+    let total_workspaces = fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM workspaces").await?;
+    let total_projects = fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM projects").await?;
+    let total_issues = fetch_count(&state, "SELECT COUNT(*)::bigint as total FROM work_items").await?;
     let active_users_last_30d = fetch_count(
         &state,
         "SELECT COUNT(*)::bigint as total FROM users WHERE is_active = true AND updated_at >= now() - interval '30 days'",
@@ -539,11 +513,10 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<impl IntoRespons
 }
 
 async fn fetch_count(state: &AppState, sql: &str) -> Result<i64, ApiError> {
-    let row =
-        CountRow::find_by_statement(Statement::from_string(DbBackend::Postgres, sql.to_string()))
-            .one(&state.db)
-            .await?
-            .ok_or(ApiError::Internal)?;
+    let row = CountRow::find_by_statement(Statement::from_string(DbBackend::Postgres, sql.to_string()))
+        .one(&state.db)
+        .await?
+        .ok_or(ApiError::Internal)?;
     Ok(row.total)
 }
 
@@ -606,9 +579,7 @@ fn build_search_where(
 fn normalize_entity_type(entity_type: Option<&str>) -> Result<String, ApiError> {
     let normalized = entity_type.unwrap_or("human").trim().to_lowercase();
     if normalized != "human" && normalized != "bot" {
-        return Err(ApiError::BadRequest(
-            "entity_type must be 'human' or 'bot'".to_string(),
-        ));
+        return Err(ApiError::BadRequest("entity_type must be 'human' or 'bot'".to_string()));
     }
     Ok(normalized)
 }

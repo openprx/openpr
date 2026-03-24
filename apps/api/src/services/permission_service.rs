@@ -47,7 +47,7 @@ impl PermissionService {
 
         let score_row = TrustScoreValueRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT score
                 FROM trust_scores
                 WHERE user_id = $1
@@ -55,7 +55,7 @@ impl PermissionService {
                   AND user_type = $3::participant_type
                   AND domain = $4
                 LIMIT 1
-            "#,
+            ",
             vec![
                 user_id.into(),
                 project_id.into(),
@@ -74,13 +74,13 @@ impl PermissionService {
 
         let ai_row = AiParticipantCapRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT max_domain_level, domain_overrides, can_veto_human_consensus, is_active, reason_min_length
                 FROM ai_participants
                 WHERE id = $1
                   AND project_id = $2
                 LIMIT 1
-            "#,
+            ",
             vec![user_id.to_string().into(), project_id.into()],
         ))
         .one(&self.db)
@@ -105,9 +105,7 @@ impl PermissionService {
         domain: &str,
         user_type: ParticipantType,
     ) -> Result<bool, ApiError> {
-        let level = self
-            .get_effective_level(user_id, project_id, domain, user_type)
-            .await?;
+        let level = self.get_effective_level(user_id, project_id, domain, user_type).await?;
         Ok(matches!(
             level,
             TrustLevel::Voter | TrustLevel::Vetoer | TrustLevel::Autonomous
@@ -121,9 +119,7 @@ impl PermissionService {
         domain: &str,
         user_type: ParticipantType,
     ) -> Result<bool, ApiError> {
-        let level = self
-            .get_effective_level(user_id, project_id, domain, user_type)
-            .await?;
+        let level = self.get_effective_level(user_id, project_id, domain, user_type).await?;
         Ok(matches!(
             level,
             TrustLevel::Advisor | TrustLevel::Voter | TrustLevel::Vetoer | TrustLevel::Autonomous
@@ -137,50 +133,38 @@ impl PermissionService {
         domain: &str,
         user_type: ParticipantType,
     ) -> Result<bool, ApiError> {
-        let level = self
-            .get_effective_level(user_id, project_id, domain, user_type)
-            .await?;
+        let level = self.get_effective_level(user_id, project_id, domain, user_type).await?;
         Ok(matches!(level, TrustLevel::Vetoer | TrustLevel::Autonomous))
     }
 
-    pub async fn ai_reason_min_length(
-        &self,
-        user_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<Option<i32>, ApiError> {
+    pub async fn ai_reason_min_length(&self, user_id: Uuid, project_id: Uuid) -> Result<Option<i32>, ApiError> {
         let ai_row = AiParticipantCapRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT max_domain_level, domain_overrides, can_veto_human_consensus, is_active, reason_min_length
                 FROM ai_participants
                 WHERE id = $1
                   AND project_id = $2
                 LIMIT 1
-            "#,
+            ",
             vec![user_id.to_string().into(), project_id.into()],
         ))
         .one(&self.db)
         .await?;
 
-        Ok(ai_row
-            .filter(|ai| ai.is_active)
-            .map(|ai| ai.reason_min_length))
+        Ok(ai_row.filter(|ai| ai.is_active).map(|ai| ai.reason_min_length))
     }
 
-    pub async fn ai_can_veto_human_consensus(
-        &self,
-        user_id: Uuid,
-        project_id: Uuid,
-    ) -> Result<bool, ApiError> {
+    pub async fn ai_can_veto_human_consensus(&self, user_id: Uuid, project_id: Uuid) -> Result<bool, ApiError> {
         let ai_row = AiParticipantCapRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT max_domain_level, domain_overrides, can_veto_human_consensus, is_active, reason_min_length
                 FROM ai_participants
                 WHERE id = $1
                   AND project_id = $2
                 LIMIT 1
-            "#,
+            ",
             vec![user_id.to_string().into(), project_id.into()],
         ))
         .one(&self.db)

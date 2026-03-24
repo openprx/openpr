@@ -16,9 +16,7 @@ use crate::{
     response::{ApiResponse, PaginatedData},
     services::{
         ai_task_service::{CreateAiTaskInput, create_ai_task},
-        workflow_service::{
-            allowed_state_values, default_project_state, resolve_effective_workflow_for_project,
-        },
+        workflow_service::{allowed_state_values, default_project_state, resolve_effective_workflow_for_project},
     },
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
 };
@@ -86,11 +84,7 @@ pub struct ListIssuesQuery {
 }
 
 /// Validate state field against project's effective workflow
-async fn validate_project_state(
-    state: &AppState,
-    project_id: Uuid,
-    state_key: &str,
-) -> Result<(), ApiError> {
+async fn validate_project_state(state: &AppState, project_id: Uuid, state_key: &str) -> Result<(), ApiError> {
     let workflow = resolve_effective_workflow_for_project(state, project_id).await?;
     if workflow.states.iter().any(|s| s.key == state_key) {
         return Ok(());
@@ -112,10 +106,7 @@ fn validate_priority(priority: &str) -> Result<(), ApiError> {
     }
 }
 
-fn build_auth_extensions(
-    claims: JwtClaims,
-    bot: Option<Extension<BotAuthContext>>,
-) -> axum::http::Extensions {
+fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext>>) -> axum::http::Extensions {
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -132,8 +123,7 @@ pub async fn create_issue(
     Path(project_id): Path<Uuid>,
     Json(req): Json<CreateIssueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     if req.title.trim().is_empty() {
@@ -151,11 +141,11 @@ pub async fn create_issue(
 
     let project = ProjectWorkspace::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.workspace_id
             FROM projects p
             WHERE p.id = $1
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .one(&state.db)
@@ -184,9 +174,7 @@ pub async fn create_issue(
             .await?;
 
         if member_exists.is_none() {
-            return Err(ApiError::BadRequest(
-                "assignee must be a workspace member".to_string(),
-            ));
+            return Err(ApiError::BadRequest("assignee must be a workspace member".to_string()));
         }
     }
 
@@ -243,9 +231,8 @@ pub async fn create_issue(
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            &format!(
-                "INSERT INTO work_items (id, project_id, title, description, state, priority, assignee_id, due_at, created_by, created_at, updated_at, sprint_id) VALUES ($1, $2, $3, $4, $5, $6, {}, {}, $9, $10, $11, $12)",
-                assignee_param, due_param
+            format!(
+                "INSERT INTO work_items (id, project_id, title, description, state, priority, assignee_id, due_at, created_by, created_at, updated_at, sprint_id) VALUES ($1, $2, $3, $4, $5, $6, {assignee_param}, {due_param}, $9, $10, $11, $12)",
             ),
             values,
         ))
@@ -422,8 +409,8 @@ pub async fn list_issues(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let label_id = Uuid::parse_str(raw)
-                .map_err(|_| ApiError::BadRequest(format!("invalid label id: {}", raw)))?;
+            let label_id =
+                Uuid::parse_str(raw).map_err(|_| ApiError::BadRequest(format!("invalid label id: {}", raw)))?;
             if !label_ids.contains(&label_id) {
                 label_ids.push(label_id);
             }
@@ -478,10 +465,7 @@ pub async fn list_issues(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            &format!(
-                "SELECT COUNT(*) AS count FROM work_items WHERE {}",
-                where_sql
-            ),
+            format!("SELECT COUNT(*) AS count FROM work_items WHERE {where_sql}"),
             values.clone(),
         ))
         .await?
@@ -518,13 +502,9 @@ pub async fn list_issues(
         governance_exempt_reason: Option<String>,
     }
 
-    let issues = IssueRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        &sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let issues = IssueRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, &sql, values))
+        .all(&state.db)
+        .await?;
 
     #[derive(Debug, FromQueryResult)]
     struct IssueLabelRow {
@@ -543,13 +523,13 @@ pub async fn list_issues(
             .collect::<Vec<_>>()
             .join(", ");
         let label_sql = format!(
-            r#"
+            r"
                 SELECT wil.work_item_id, l.id AS label_id, l.name AS label_name, l.color AS label_color
                 FROM work_item_labels wil
                 INNER JOIN labels l ON wil.label_id = l.id
                 WHERE wil.work_item_id IN ({})
                 ORDER BY l.name ASC
-            "#,
+            ",
             placeholders
         );
         let label_values: Vec<sea_orm::Value> = issue_ids.into_iter().map(Into::into).collect();
@@ -642,14 +622,14 @@ pub async fn get_issue(
 
     let issue = IssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.id, wi.project_id, p.workspace_id, wi.sprint_id, wi.title, wi.description, wi.state, wi.priority,
                    wi.assignee_id, wi.due_at, wi.created_by, wi.created_at, wi.updated_at,
                    wi.proposal_id, wi.governance_exempt, wi.governance_exempt_reason
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -686,8 +666,7 @@ pub async fn update_issue(
     Path(issue_id): Path<Uuid>,
     Json(req): Json<UpdateIssueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     // Get current issue values and verify access.
@@ -705,12 +684,12 @@ pub async fn update_issue(
 
     let current_issue = CurrentIssue::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.project_id, p.workspace_id, wi.title, wi.description, wi.state, wi.priority, wi.assignee_id, wi.sprint_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -740,9 +719,7 @@ pub async fn update_issue(
             .await?;
 
         if member_exists.is_none() {
-            return Err(ApiError::BadRequest(
-                "assignee must be a workspace member".to_string(),
-            ));
+            return Err(ApiError::BadRequest("assignee must be a workspace member".to_string()));
         }
     }
 
@@ -810,25 +787,17 @@ pub async fn update_issue(
 
     let now = chrono::Utc::now();
     updates.push(format!("updated_at = ${}", param_idx));
-    values.push(now.clone().into());
+    values.push(now.into());
     param_idx += 1;
 
     values.push(issue_id.into());
 
-    let query = format!(
-        "UPDATE work_items SET {} WHERE id = ${}",
-        updates.join(", "),
-        param_idx
-    );
+    let query = format!("UPDATE work_items SET {} WHERE id = ${}", updates.join(", "), param_idx);
 
     let tx = state.db.begin().await?;
 
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        &query,
-        values,
-    ))
-    .await?;
+    tx.execute(Statement::from_sql_and_values(DbBackend::Postgres, &query, values))
+        .await?;
 
     // Fetch updated issue
     #[derive(Debug, FromQueryResult)]
@@ -867,94 +836,94 @@ pub async fn update_issue(
         .map(|new_state| *new_state != current_issue.state)
         .unwrap_or(false);
 
-    let mut updated_fields = Map::<String, Value>::new();
-    if let Some(new_title) = req.title.as_ref() {
-        if new_title != &current_issue.title {
-            updated_fields.insert(
-                "title".to_string(),
-                json!({
-                    "old": current_issue.title.clone(),
-                    "new": updated.title.clone(),
-                }),
-            );
-        }
-    }
-    if let Some(new_description) = req.description.as_ref() {
-        if new_description != &current_issue.description {
-            updated_fields.insert(
-                "description".to_string(),
-                json!({
-                    "old": current_issue.description.clone(),
-                    "new": updated.description.clone(),
-                }),
-            );
-        }
-    }
-    if let Some(new_priority) = req.priority.as_ref() {
-        if new_priority != &current_issue.priority {
-            updated_fields.insert(
-                "priority".to_string(),
-                json!({
-                    "old": current_issue.priority.clone(),
-                    "new": updated.priority.clone(),
-                }),
-            );
-        }
-    }
-
     struct ActivityChange {
         action: &'static str,
         detail: serde_json::Value,
     }
 
+    let mut updated_fields = Map::<String, Value>::new();
+    if let Some(new_title) = req.title.as_ref()
+        && new_title != &current_issue.title
+    {
+        updated_fields.insert(
+            "title".to_string(),
+            json!({
+                "old": current_issue.title.clone(),
+                "new": updated.title.clone(),
+            }),
+        );
+    }
+    if let Some(new_description) = req.description.as_ref()
+        && new_description != &current_issue.description
+    {
+        updated_fields.insert(
+            "description".to_string(),
+            json!({
+                "old": current_issue.description.clone(),
+                "new": updated.description.clone(),
+            }),
+        );
+    }
+    if let Some(new_priority) = req.priority.as_ref()
+        && new_priority != &current_issue.priority
+    {
+        updated_fields.insert(
+            "priority".to_string(),
+            json!({
+                "old": current_issue.priority.clone(),
+                "new": updated.priority.clone(),
+            }),
+        );
+    }
+
     let mut changes: Vec<ActivityChange> = Vec::new();
 
-    if let Some(new_assignee) = requested_assignee {
-        if Some(new_assignee) != current_issue.assignee_id {
-            changes.push(ActivityChange {
-                action: "assigned",
-                detail: serde_json::json!({
-                    "from": current_issue.assignee_id.map(|id| id.to_string()),
-                    "to": new_assignee.to_string()
-                }),
-            });
-        }
+    if let Some(new_assignee) = requested_assignee
+        && Some(new_assignee) != current_issue.assignee_id
+    {
+        changes.push(ActivityChange {
+            action: "assigned",
+            detail: serde_json::json!({
+                "from": current_issue.assignee_id.map(|id| id.to_string()),
+                "to": new_assignee.to_string()
+            }),
+        });
     }
 
-    if let Some(new_state) = requested_state {
-        if new_state != current_issue.state {
-            changes.push(ActivityChange {
-                action: "status_changed",
-                detail: serde_json::json!({
-                    "from": current_issue.state.clone(),
-                    "to": new_state
-                }),
-            });
-        }
+    if let Some(new_state) = requested_state
+        && new_state != current_issue.state
+    {
+        changes.push(ActivityChange {
+            action: "status_changed",
+            detail: serde_json::json!({
+                "from": current_issue.state.clone(),
+                "to": new_state
+            }),
+        });
     }
 
-    if let Some(new_priority) = requested_priority {
-        if new_priority != current_issue.priority {
-            changes.push(ActivityChange {
-                action: "priority_changed",
-                detail: serde_json::json!({
-                    "from": current_issue.priority.clone(),
-                    "to": new_priority
-                }),
-            });
-        }
+    if let Some(new_priority) = requested_priority
+        && new_priority != current_issue.priority
+    {
+        changes.push(ActivityChange {
+            action: "priority_changed",
+            detail: serde_json::json!({
+                "from": current_issue.priority.clone(),
+                "to": new_priority
+            }),
+        });
     }
 
-    if let Some(new_sprint_id) = requested_sprint {
-        if Some(new_sprint_id) != current_issue.sprint_id {
-            changes.push(ActivityChange {
-                action: "sprint_changed",
-                detail: serde_json::json!({
-                    "from": current_issue.sprint_id.map(|id| id.to_string()),
-                    "to": new_sprint_id.to_string()
-                }),
-            });
-        }
+    if let Some(new_sprint_id) = requested_sprint
+        && Some(new_sprint_id) != current_issue.sprint_id
+    {
+        changes.push(ActivityChange {
+            action: "sprint_changed",
+            detail: serde_json::json!({
+                "from": current_issue.sprint_id.map(|id| id.to_string()),
+                "to": new_sprint_id.to_string()
+            }),
+        });
     }
 
     for change in &changes {
@@ -962,13 +931,13 @@ pub async fn update_issue(
 
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO activities (
                     id, workspace_id, project_id, issue_id, user_id, action, detail, created_at,
                     resource_type, resource_id, event_type, actor_id, payload
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13::jsonb)
-            "#,
+            ",
             vec![
                 Uuid::new_v4().into(),
                 current_issue.workspace_id.into(),
@@ -977,7 +946,7 @@ pub async fn update_issue(
                 user_id.into(),
                 change.action.into(),
                 detail_text.clone().into(),
-                now.clone().into(),
+                now.into(),
                 "issue".into(),
                 issue_id.into(),
                 change.action.into(),
@@ -988,46 +957,42 @@ pub async fn update_issue(
         .await?;
     }
 
-    if let Some(new_assignee) = requested_assignee {
-        if Some(new_assignee) != current_issue.assignee_id {
-            let link = format!(
-                "/workspace/{}/projects/{}/issues/{}",
-                current_issue.workspace_id, current_issue.project_id, issue_id
-            );
+    if let Some(new_assignee) = requested_assignee
+        && Some(new_assignee) != current_issue.assignee_id
+    {
+        let link = format!(
+            "/workspace/{}/projects/{}/issues/{}",
+            current_issue.workspace_id, current_issue.project_id, issue_id
+        );
 
-            tx.execute(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                r#"
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
                     INSERT INTO notifications (
                         id, user_id, workspace_id, type, kind, payload, title, content, link, related_issue_id, is_read, created_at
                     )
                     VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, false, $11)
-                "#,
-                vec![
-                    Uuid::new_v4().into(),
-                    new_assignee.into(),
-                    current_issue.workspace_id.into(),
-                    "assignment".into(),
-                    "assignment".into(),
-                    json!({}).into(),
-                    "notification.issueAssignedTitle".into(),
-                    format!("issue_assigned:{}", updated.title).into(),
-                    link.into(),
-                    issue_id.into(),
-                    now.clone().into(),
-                ],
-            ))
-            .await?;
-        }
+                ",
+            vec![
+                Uuid::new_v4().into(),
+                new_assignee.into(),
+                current_issue.workspace_id.into(),
+                "assignment".into(),
+                "assignment".into(),
+                json!({}).into(),
+                "notification.issueAssignedTitle".into(),
+                format!("issue_assigned:{}", updated.title).into(),
+                link.into(),
+                issue_id.into(),
+                now.into(),
+            ],
+        ))
+        .await?;
     }
 
     tx.commit().await?;
 
-    let to_single_or_empty = |value: Option<Uuid>| {
-        value
-            .map(|id| vec![id.to_string()])
-            .unwrap_or_else(Vec::new)
-    };
+    let to_single_or_empty = |value: Option<Uuid>| value.map(|id| vec![id.to_string()]).unwrap_or_default();
 
     if assignee_changed {
         if let Some(new_assignee) = updated.assignee_id {
@@ -1160,8 +1125,7 @@ pub async fn delete_issue(
     bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     // Get issue context and check permission
@@ -1182,14 +1146,14 @@ pub async fn delete_issue(
 
     let issue_ws = IssueWorkspace::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.project_id, p.workspace_id, p.key AS project_key,
                    wi.title, wi.description, wi.state, wi.priority, wi.assignee_id, wi.sprint_id,
                    wi.created_at, wi.updated_at
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -1261,13 +1225,13 @@ pub async fn get_issue_by_identifier(
     Path(identifier): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     // Parse "PREFIX-N"
-    let (prefix, seq) = identifier.rsplit_once('-').ok_or_else(|| {
-        ApiError::BadRequest("identifier must be in format PREFIX-N, e.g. PRX-42".to_string())
-    })?;
+    let (prefix, seq) = identifier
+        .rsplit_once('-')
+        .ok_or_else(|| ApiError::BadRequest("identifier must be in format PREFIX-N, e.g. PRX-42".to_string()))?;
 
-    let seq_num: i64 = seq.parse().map_err(|_| {
-        ApiError::BadRequest(format!("sequence number '{}' is not a valid integer", seq))
-    })?;
+    let seq_num: i64 = seq
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("sequence number '{}' is not a valid integer", seq)))?;
 
     #[derive(Debug, FromQueryResult)]
     struct IssueRow {
@@ -1290,7 +1254,7 @@ pub async fn get_issue_by_identifier(
 
     let issue = IssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.id, wi.project_id, wi.sprint_id, wi.title, wi.description,
                    wi.state, wi.priority, wi.assignee_id, wi.due_at, wi.created_by,
                    wi.created_at, wi.updated_at,
@@ -1300,7 +1264,7 @@ pub async fn get_issue_by_identifier(
             WHERE p.workspace_id = $1
               AND UPPER(p.key) = UPPER($2)
               AND wi.sequence_number = $3
-        "#,
+        ",
         vec![bot.workspace_id.into(), prefix.into(), seq_num.into()],
     ))
     .one(&state.db)
@@ -1341,30 +1305,26 @@ pub async fn add_labels_to_issue(
     Json(payload): Json<AddLabelsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if payload.label_ids.is_empty() {
-        return Err(ApiError::BadRequest(
-            "label_ids must not be empty".to_string(),
-        ));
+        return Err(ApiError::BadRequest("label_ids must not be empty".to_string()));
     }
 
     // Verify issue belongs to bot's workspace
-    #[derive(Debug, FromQueryResult)]
-    struct IssueCheck {
-        project_id: Uuid,
+    let exists = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
+                SELECT 1 AS exists
+                FROM work_items wi
+                INNER JOIN projects p ON wi.project_id = p.id
+                WHERE wi.id = $1 AND p.workspace_id = $2
+            ",
+            vec![issue_id.into(), bot.workspace_id.into()],
+        ))
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError::NotFound("work item not found or access denied".to_string()));
     }
-
-    let _check = IssueCheck::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r#"
-            SELECT wi.project_id
-            FROM work_items wi
-            INNER JOIN projects p ON wi.project_id = p.id
-            WHERE wi.id = $1 AND p.workspace_id = $2
-        "#,
-        vec![issue_id.into(), bot.workspace_id.into()],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("work item not found or access denied".to_string()))?;
 
     // Insert all label associations (ignore conflicts)
     for label_id in &payload.label_ids {

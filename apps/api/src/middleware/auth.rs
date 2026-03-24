@@ -13,7 +13,7 @@ use crate::{
     routes::auth::{extract_bearer_token, extract_cookie_token},
 };
 
-pub async fn auth_middleware(
+pub async fn jwt_auth_middleware(
     State(state): State<AppState>,
     mut req: Request,
     next: Next,

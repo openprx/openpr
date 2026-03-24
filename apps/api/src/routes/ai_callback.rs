@@ -15,8 +15,8 @@ use crate::{
     response::{ApiResponse, PaginatedData},
     services::{
         ai_task_service::{
-            AiTaskRow, CreateAiTaskInput, create_ai_task, insert_ai_task_event, next_retry_time,
-            valid_reference_type, valid_task_type,
+            AiTaskRow, CreateAiTaskInput, create_ai_task, insert_ai_task_event, next_retry_time, valid_reference_type,
+            valid_task_type,
         },
         trust_score_service::{is_project_admin_or_owner, is_project_member, is_system_admin},
     },
@@ -111,15 +111,13 @@ pub async fn complete_task(
     ensure_actor_can_operate(&state, &task, actor_id).await?;
 
     if task.status != "processing" {
-        return Err(ApiError::BadRequest(
-            "task is not in processing status".to_string(),
-        ));
+        return Err(ApiError::BadRequest("task is not in processing status".to_string()));
     }
 
     let now = Utc::now();
     let updated = AiTaskRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             UPDATE ai_tasks
             SET status = 'completed',
                 result = $2,
@@ -147,7 +145,7 @@ pub async fn complete_task(
                 completed_at,
                 created_at,
                 updated_at
-        "#,
+        ",
         vec![task_id.into(), result.clone().into(), now.into()],
     ))
     .one(&state.db)
@@ -220,7 +218,7 @@ pub async fn fail_task(
 
     let updated = AiTaskRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             UPDATE ai_tasks
             SET status = $2,
                 error_message = $3,
@@ -248,7 +246,7 @@ pub async fn fail_task(
                 completed_at,
                 created_at,
                 updated_at
-        "#,
+        ",
         vec![
             task_id.into(),
             next_status.into(),
@@ -331,13 +329,13 @@ pub async fn list_project_ai_tasks(
         return Err(ApiError::Forbidden("project access denied".to_string()));
     }
 
-    if let Some(status) = query.status.as_ref() {
-        if !matches!(
+    if let Some(status) = query.status.as_ref()
+        && !matches!(
             status.as_str(),
             "pending" | "processing" | "completed" | "failed" | "cancelled"
-        ) {
-            return Err(ApiError::BadRequest("invalid status filter".to_string()));
-        }
+        )
+    {
+        return Err(ApiError::BadRequest("invalid status filter".to_string()));
     }
 
     let page = query.page.unwrap_or(1).max(1);
@@ -346,8 +344,7 @@ pub async fn list_project_ai_tasks(
 
     let (count_sql, count_values) = if let Some(status) = query.status.clone() {
         (
-            "SELECT COUNT(*)::bigint AS count FROM ai_tasks WHERE project_id = $1 AND status = $2"
-                .to_string(),
+            "SELECT COUNT(*)::bigint AS count FROM ai_tasks WHERE project_id = $1 AND status = $2".to_string(),
             vec![project_id.into(), status.into()],
         )
     } else {
@@ -376,7 +373,7 @@ pub async fn list_project_ai_tasks(
 
     let (list_sql, list_values) = if let Some(status) = query.status {
         (
-            r#"
+            r"
                 SELECT
                     id,
                     project_id,
@@ -401,18 +398,13 @@ pub async fn list_project_ai_tasks(
                 WHERE project_id = $1 AND status = $2
                 ORDER BY priority DESC, created_at DESC
                 LIMIT $3 OFFSET $4
-            "#
+            "
             .to_string(),
-            vec![
-                project_id.into(),
-                status.into(),
-                per_page.into(),
-                offset.into(),
-            ],
+            vec![project_id.into(), status.into(), per_page.into(), offset.into()],
         )
     } else {
         (
-            r#"
+            r"
                 SELECT
                     id,
                     project_id,
@@ -437,7 +429,7 @@ pub async fn list_project_ai_tasks(
                 WHERE project_id = $1
                 ORDER BY priority DESC, created_at DESC
                 LIMIT $2 OFFSET $3
-            "#
+            "
             .to_string(),
             vec![project_id.into(), per_page.into(), offset.into()],
         )
@@ -505,8 +497,7 @@ pub async fn create_project_ai_task(
     )
     .await?;
 
-    let task =
-        task.ok_or_else(|| ApiError::Conflict("idempotency key already exists".to_string()))?;
+    let task = task.ok_or_else(|| ApiError::Conflict("idempotency key already exists".to_string()))?;
     Ok(ApiResponse::success(AiTaskResponse::from(task)))
 }
 
@@ -519,7 +510,7 @@ async fn ensure_project_ai_participant(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT 1
                 FROM ai_participants ap
                 INNER JOIN users u ON u.id::text = ap.id
@@ -528,7 +519,7 @@ async fn ensure_project_ai_participant(
                   AND u.id = $2
                   AND u.entity_type = 'bot'
                 LIMIT 1
-            "#,
+            ",
             vec![project_id.into(), ai_participant_id.into()],
         ))
         .await?
@@ -543,11 +534,7 @@ async fn ensure_project_ai_participant(
     Ok(())
 }
 
-async fn ensure_actor_can_operate(
-    state: &AppState,
-    task: &AiTaskRow,
-    actor_id: Uuid,
-) -> Result<(), ApiError> {
+async fn ensure_actor_can_operate(state: &AppState, task: &AiTaskRow, actor_id: Uuid) -> Result<(), ApiError> {
     if task.ai_participant_id == actor_id {
         return Ok(());
     }
@@ -562,7 +549,7 @@ async fn ensure_actor_can_operate(
 async fn find_task(state: &AppState, task_id: Uuid) -> Result<AiTaskRow, ApiError> {
     AiTaskRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 id,
                 project_id,
@@ -585,7 +572,7 @@ async fn find_task(state: &AppState, task_id: Uuid) -> Result<AiTaskRow, ApiErro
                 updated_at
             FROM ai_tasks
             WHERE id = $1
-        "#,
+        ",
         vec![task_id.into()],
     ))
     .one(&state.db)

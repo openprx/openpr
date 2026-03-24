@@ -51,7 +51,7 @@ pub async fn resolve_effective_workflow_for_project(
 ) -> Result<EffectiveWorkflow, ApiError> {
     let row = WorkflowRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
         WITH project_ctx AS (
           SELECT p.id AS project_id,
                  p.workspace_id,
@@ -81,7 +81,7 @@ pub async fn resolve_effective_workflow_for_project(
         FROM project_ctx pc
         CROSS JOIN system_workflow sw
         INNER JOIN workflows w ON w.id = COALESCE(pc.project_workflow_id, pc.workspace_workflow_id, sw.id)
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .one(&state.db)
@@ -98,15 +98,6 @@ pub async fn resolve_effective_workflow_for_project(
         name: row.name,
         states,
     })
-}
-
-pub async fn is_valid_project_state(
-    state: &AppState,
-    project_id: Uuid,
-    state_key: &str,
-) -> Result<bool, ApiError> {
-    let workflow = resolve_effective_workflow_for_project(state, project_id).await?;
-    Ok(workflow.states.iter().any(|s| s.key == state_key))
 }
 
 pub async fn default_project_state(state: &AppState, project_id: Uuid) -> Result<String, ApiError> {
@@ -130,18 +121,15 @@ pub fn allowed_state_values(workflow: &EffectiveWorkflow) -> String {
         .join(", ")
 }
 
-async fn load_workflow_states(
-    state: &AppState,
-    workflow_id: Uuid,
-) -> Result<Vec<WorkflowStateDef>, ApiError> {
+async fn load_workflow_states(state: &AppState, workflow_id: Uuid) -> Result<Vec<WorkflowStateDef>, ApiError> {
     let rows = WorkflowStateRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
         SELECT key, display_name, category, position, color, is_initial, is_terminal
         FROM workflow_states
         WHERE workflow_id = $1
         ORDER BY position ASC
-        "#,
+        ",
         vec![workflow_id.into()],
     ))
     .all(&state.db)

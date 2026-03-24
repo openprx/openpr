@@ -11,9 +11,7 @@ use uuid::Uuid;
 
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use crate::{
-    error::ApiError,
-    response::ApiResponse,
-    services::workflow_service::resolve_effective_workflow_for_project,
+    error::ApiError, response::ApiResponse, services::workflow_service::resolve_effective_workflow_for_project,
 };
 
 #[derive(Debug, Serialize)]
@@ -46,8 +44,7 @@ pub async fn get_project_board(
     bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -84,14 +81,14 @@ pub async fn get_project_board(
 
     let issues = IssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.id, wi.title, wi.state, wi.priority, wi.assignee_id,
                    u.name as assignee_name, wi.updated_at
             FROM work_items wi
             LEFT JOIN users u ON wi.assignee_id = u.id
             WHERE wi.project_id = $1
             ORDER BY wi.updated_at DESC
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .all(&state.db)
@@ -106,12 +103,12 @@ pub async fn get_project_board(
 
     let issue_labels = IssueLabelRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wil.work_item_id, l.name as label_name
             FROM work_item_labels wil
             INNER JOIN labels l ON wil.label_id = l.id
             WHERE wil.work_item_id IN (SELECT id FROM work_items WHERE project_id = $1)
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .all(&state.db)
@@ -120,10 +117,7 @@ pub async fn get_project_board(
     // Build label map
     let mut label_map: HashMap<Uuid, Vec<String>> = HashMap::new();
     for il in issue_labels {
-        label_map
-            .entry(il.work_item_id)
-            .or_insert_with(Vec::new)
-            .push(il.label_name);
+        label_map.entry(il.work_item_id).or_default().push(il.label_name);
     }
 
     // Group issues by state
@@ -139,10 +133,7 @@ pub async fn get_project_board(
             labels,
             updated_at: issue.updated_at.to_rfc3339(),
         };
-        columns_map
-            .entry(issue.state)
-            .or_insert_with(Vec::new)
-            .push(board_issue);
+        columns_map.entry(issue.state).or_default().push(board_issue);
     }
 
     // Build ordered columns by effective workflow states.
@@ -165,8 +156,5 @@ pub async fn get_project_board(
         });
     }
 
-    Ok(ApiResponse::success(BoardResponse {
-        project_id,
-        columns,
-    }))
+    Ok(ApiResponse::success(BoardResponse { project_id, columns }))
 }

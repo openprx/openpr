@@ -63,20 +63,16 @@ impl JwtManager {
         self.verify_token(token, TokenType::Refresh)
     }
 
-    fn issue_token(
-        &self,
-        sub: &str,
-        email: &str,
-        token_type: TokenType,
-        ttl_seconds: i64,
-    ) -> AuthResult<String> {
+    fn issue_token(&self, sub: &str, email: &str, token_type: TokenType, ttl_seconds: i64) -> AuthResult<String> {
         let now = Utc::now().timestamp();
+        let iat = usize::try_from(now).unwrap_or(0);
+        let exp = usize::try_from(now + ttl_seconds).unwrap_or(0);
         let claims = JwtClaims {
             sub: sub.to_string(),
             email: email.to_string(),
             token_type,
-            iat: now as usize,
-            exp: (now + ttl_seconds) as usize,
+            iat,
+            exp,
         };
 
         Ok(encode(&Header::default(), &claims, &self.encoding_key)?)

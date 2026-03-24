@@ -12,7 +12,6 @@ use crate::{error::ApiError, response::ApiResponse};
 
 #[derive(Debug, Deserialize)]
 pub struct ImportIssue {
-    pub key: String,
     pub title: String,
     pub description: String,
     pub status: String,
@@ -23,7 +22,7 @@ pub struct ImportIssue {
 
 #[derive(Debug, Deserialize)]
 pub struct ImportProjectRequest {
-    pub project_key: Option<String>, // If provided, import into existing project
+    pub project_key: Option<String>,  // If provided, import into existing project
     pub project_name: Option<String>, // For new project creation
     pub project_description: Option<String>,
     pub issues: Vec<ImportIssue>,
@@ -45,8 +44,7 @@ pub async fn import_project(
     Path(workspace_id): Path<Uuid>,
     Json(req): Json<ImportProjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Verify user is admin of workspace
     verify_workspace_admin(&state, workspace_id, user_id).await?;
@@ -74,9 +72,9 @@ pub async fn import_project(
         (id, project_key)
     } else {
         // Create new project
-        let project_name = req.project_name.ok_or_else(|| {
-            ApiError::BadRequest("project_name required for new project".to_string())
-        })?;
+        let project_name = req
+            .project_name
+            .ok_or_else(|| ApiError::BadRequest("project_name required for new project".to_string()))?;
 
         let project_key = generate_project_key(&project_name);
         let project_id = Uuid::new_v4();
@@ -84,8 +82,8 @@ pub async fn import_project(
 
         txn.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"INSERT INTO projects (id, workspace_id, key, name, description, created_by, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+            r"INSERT INTO projects (id, workspace_id, key, name, description, created_by, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             vec![
                 project_id.into(),
                 workspace_id.into(),
@@ -124,9 +122,9 @@ pub async fn import_project(
         let result = txn
             .execute(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"INSERT INTO work_items 
+                r"INSERT INTO work_items 
                    (id, project_id, key, title, description, status, priority, type, reporter_id, created_at, updated_at)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"#,
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 vec![
                     issue_id.into(),
                     project_id.into(),
@@ -169,11 +167,7 @@ pub async fn import_project(
     Ok(ApiResponse::success(result))
 }
 
-async fn verify_workspace_admin(
-    state: &AppState,
-    workspace_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
+async fn verify_workspace_admin(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
     let result = state
         .db
         .query_one(Statement::from_sql_and_values(

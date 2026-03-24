@@ -1,11 +1,9 @@
 use crate::client::OpenPrClient;
-use crate::protocol::{
-    CallToolParams, CallToolResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ListToolsResult,
-};
+use crate::protocol::{CallToolParams, CallToolResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ListToolsResult};
 use crate::tools;
 use serde_json::{Value, json};
 
-const SKILL_GUIDE_MD: &str = r#"# OpenPR MCP Skill Guide
+const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
 ## Tools (34)
 
@@ -33,7 +31,7 @@ const SKILL_GUIDE_MD: &str = r#"# OpenPR MCP Skill Guide
 - state: backlog | todo | in_progress | done
 - priority: none | low | medium | high | urgent
 - attachments: array of URLs from files.upload
-"#;
+";
 
 const AGENTS_GUIDE_MD: &str = r#"# OpenPR Agent Guide
 
@@ -70,7 +68,7 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(client: OpenPrClient) -> Self {
+    pub const fn new(client: OpenPrClient) -> Self {
         Self { client }
     }
 
@@ -91,8 +89,7 @@ impl McpServer {
 
         let response = match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
-            "notifications/initialized" => JsonRpcResponse::success(req.id, json!({})),
-            "ping" => JsonRpcResponse::success(req.id, json!({})),
+            "notifications/initialized" | "ping" => JsonRpcResponse::success(req.id, json!({})),
             "tools/list" => self.handle_list_tools(req.id),
             "tools/call" => self.handle_call_tool(req.id, req.params).await,
             "resources/list" => self.handle_resources_list(req.id),
@@ -104,13 +101,10 @@ impl McpServer {
             ),
         };
 
-        if is_notification {
-            None
-        } else {
-            Some(response)
-        }
+        if is_notification { None } else { Some(response) }
     }
 
+    #[allow(clippy::unused_self)]
     fn handle_list_tools(&self, id: Option<Value>) -> JsonRpcResponse {
         let tools = tools::get_all_tool_definitions();
         let result = ListToolsResult { tools };
@@ -119,32 +113,26 @@ impl McpServer {
             Ok(value) => JsonRpcResponse::success(id, value),
             Err(e) => JsonRpcResponse::error(
                 id,
-                JsonRpcError::internal_error(format!("Failed to serialize tools: {}", e)),
+                JsonRpcError::internal_error(format!("Failed to serialize tools: {e}")),
             ),
         }
     }
 
     async fn handle_call_tool(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
-        let params = match params {
-            Some(p) => p,
-            None => {
-                return JsonRpcResponse::error(id, JsonRpcError::invalid_params("Missing params"));
-            }
+        let Some(params) = params else {
+            return JsonRpcResponse::error(id, JsonRpcError::invalid_params("Missing params"));
         };
 
         let call_params: CallToolParams = match serde_json::from_value(params) {
             Ok(p) => p,
             Err(e) => {
-                return JsonRpcResponse::error(
-                    id,
-                    JsonRpcError::invalid_params(format!("Invalid params: {}", e)),
-                );
+                return JsonRpcResponse::error(id, JsonRpcError::invalid_params(format!("Invalid params: {e}")));
             }
         };
 
         let args = call_params
             .arguments
-            .unwrap_or(Value::Object(Default::default()));
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
 
         let result = self.execute_tool(&call_params.name, args).await;
 
@@ -152,7 +140,7 @@ impl McpServer {
             Ok(value) => JsonRpcResponse::success(id, value),
             Err(e) => JsonRpcResponse::error(
                 id,
-                JsonRpcError::internal_error(format!("Failed to serialize result: {}", e)),
+                JsonRpcError::internal_error(format!("Failed to serialize result: {e}")),
             ),
         }
     }
@@ -169,27 +157,15 @@ impl McpServer {
             // Work Items
             "work_items.list" => tools::work_items::list_work_items(&self.client, args).await,
             "work_items.get" => tools::work_items::get_work_item(&self.client, args).await,
-            "work_items.get_by_identifier" => {
-                tools::work_items::get_work_item_by_identifier(&self.client, args).await
-            }
+            "work_items.get_by_identifier" => tools::work_items::get_work_item_by_identifier(&self.client, args).await,
             "work_items.create" => tools::work_items::create_work_item(&self.client, args).await,
             "work_items.update" => tools::work_items::update_work_item(&self.client, args).await,
-            "work_items.add_label" => {
-                tools::work_items::add_label_to_work_item(&self.client, args).await
-            }
-            "work_items.remove_label" => {
-                tools::work_items::remove_label_from_work_item(&self.client, args).await
-            }
-            "work_items.list_labels" => {
-                tools::work_items::list_work_item_labels(&self.client, args).await
-            }
-            "work_items.delete" => {
-                tools::work_items::handle_delete_work_item(&self.client, args).await
-            }
+            "work_items.add_label" => tools::work_items::add_label_to_work_item(&self.client, args).await,
+            "work_items.remove_label" => tools::work_items::remove_label_from_work_item(&self.client, args).await,
+            "work_items.list_labels" => tools::work_items::list_work_item_labels(&self.client, args).await,
+            "work_items.delete" => tools::work_items::handle_delete_work_item(&self.client, args).await,
             "work_items.search" => tools::work_items::search_work_items(&self.client, args).await,
-            "work_items.add_labels" => {
-                tools::work_items::add_labels_to_work_item(&self.client, args).await
-            }
+            "work_items.add_labels" => tools::work_items::add_labels_to_work_item(&self.client, args).await,
 
             // Comments
             "comments.list" => tools::comments::list_comments(&self.client, args).await,
@@ -214,19 +190,18 @@ impl McpServer {
             // Labels
             "labels.create" => tools::labels::create_label(&self.client, args).await,
             "labels.list" => tools::labels::list_labels(&self.client, args).await,
-            "labels.list_by_project" => {
-                tools::labels::list_project_labels(&self.client, args).await
-            }
+            "labels.list_by_project" => tools::labels::list_project_labels(&self.client, args).await,
             "labels.update" => tools::labels::update_label(&self.client, args).await,
             "labels.delete" => tools::labels::handle_delete_label(&self.client, args).await,
 
             // Search
             "search.all" => tools::search::search_all(&self.client, args).await,
 
-            _ => CallToolResult::error(format!("Unknown tool: {}", name)),
+            _ => CallToolResult::error(format!("Unknown tool: {name}")),
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn handle_initialize(&self, id: Option<Value>) -> JsonRpcResponse {
         let result = json!({
             "protocolVersion": "2024-11-05",
@@ -251,6 +226,7 @@ impl McpServer {
         JsonRpcResponse::success(id, result)
     }
 
+    #[allow(clippy::unused_self)]
     fn handle_resources_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let resources = vec![
             json!({
@@ -276,6 +252,7 @@ impl McpServer {
         JsonRpcResponse::success(id, json!({ "resources": resources }))
     }
 
+    #[allow(clippy::unused_self)]
     fn handle_resources_templates_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let templates = vec![
             json!({
@@ -301,11 +278,7 @@ impl McpServer {
         JsonRpcResponse::success(id, json!({ "resourceTemplates": templates }))
     }
 
-    async fn handle_resources_read(
-        &self,
-        id: Option<Value>,
-        params: Option<Value>,
-    ) -> JsonRpcResponse {
+    async fn handle_resources_read(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
         let uri = match params
             .as_ref()
             .and_then(|value| value.get("uri"))
@@ -313,10 +286,7 @@ impl McpServer {
         {
             Some(uri) if !uri.is_empty() => uri.to_string(),
             _ => {
-                return JsonRpcResponse::error(
-                    id,
-                    JsonRpcError::invalid_params("Missing required field: uri"),
-                );
+                return JsonRpcResponse::error(id, JsonRpcError::invalid_params("Missing required field: uri"));
             }
         };
 
@@ -374,10 +344,7 @@ impl McpServer {
                 ),
                 Err(error) => JsonRpcResponse::error(
                     id,
-                    JsonRpcError::internal_error(format!(
-                        "Failed to read project issues resource: {}",
-                        error
-                    )),
+                    JsonRpcError::internal_error(format!("Failed to read project issues resource: {error}")),
                 ),
             };
         }
@@ -396,10 +363,7 @@ impl McpServer {
                 ),
                 Err(error) => JsonRpcResponse::error(
                     id,
-                    JsonRpcError::internal_error(format!(
-                        "Failed to read project sprints resource: {}",
-                        error
-                    )),
+                    JsonRpcError::internal_error(format!("Failed to read project sprints resource: {error}")),
                 ),
             };
         }
@@ -418,25 +382,17 @@ impl McpServer {
                 ),
                 Err(error) => JsonRpcResponse::error(
                     id,
-                    JsonRpcError::internal_error(format!(
-                        "Failed to read issue resource: {}",
-                        error
-                    )),
+                    JsonRpcError::internal_error(format!("Failed to read issue resource: {error}")),
                 ),
             };
         }
 
-        JsonRpcResponse::error(
-            id,
-            JsonRpcError::invalid_params(format!("Unknown resource URI: {}", uri)),
-        )
+        JsonRpcResponse::error(id, JsonRpcError::invalid_params(format!("Unknown resource URI: {uri}")))
     }
 }
 
 fn parse_project_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str> {
-    let project_id = uri
-        .strip_prefix("openpr://projects/")?
-        .strip_suffix(suffix)?;
+    let project_id = uri.strip_prefix("openpr://projects/")?.strip_suffix(suffix)?;
     if project_id.is_empty() || project_id.contains('/') {
         return None;
     }

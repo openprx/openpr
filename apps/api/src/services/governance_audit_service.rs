@@ -35,7 +35,7 @@ pub async fn write_governance_audit_log<C: ConnectionTrait>(
 
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             INSERT INTO governance_audit_logs (
                 project_id,
                 actor_id,
@@ -47,7 +47,7 @@ pub async fn write_governance_audit_log<C: ConnectionTrait>(
                 metadata,
                 created_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        "#,
+        ",
         vec![
             input.project_id.into(),
             input.actor_id.into(),

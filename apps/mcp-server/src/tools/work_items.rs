@@ -48,7 +48,7 @@ struct ListWorkItemsInput {
 pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListWorkItemsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let (page, per_page) = match resolve_pagination(input.page, input.per_page) {
@@ -56,10 +56,7 @@ pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> 
         Err(e) => return CallToolResult::error(e),
     };
 
-    match client
-        .list_work_items(&input.project_id, page, per_page)
-        .await
-    {
+    match client.list_work_items(&input.project_id, page, per_page).await {
         Ok(items) => {
             let output = build_paginated_output(&items, "items", page, per_page);
             let json = serde_json::to_string_pretty(&output).unwrap_or_default();
@@ -80,10 +77,7 @@ fn resolve_pagination(page: Option<u64>, per_page: Option<u64>) -> Result<(u64, 
         return Err("Invalid input: per_page must be >= 1".to_string());
     }
     if per_page > MAX_PER_PAGE {
-        return Err(format!(
-            "Invalid input: per_page must be <= {}",
-            MAX_PER_PAGE
-        ));
+        return Err(format!("Invalid input: per_page must be <= {MAX_PER_PAGE}"));
     }
 
     Ok((page, per_page))
@@ -111,7 +105,7 @@ fn build_paginated_output(payload: &Value, item_key: &str, page: u64, per_page: 
         if total_count == 0 {
             0
         } else {
-            (total_count + per_page - 1) / per_page
+            total_count.div_ceil(per_page)
         }
     });
     let current_page = data
@@ -154,7 +148,7 @@ struct GetWorkItemInput {
 pub async fn get_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.get_work_item(&input.work_item_id).await {
@@ -189,13 +183,10 @@ struct GetWorkItemByIdentifierInput {
     identifier: String,
 }
 
-pub async fn get_work_item_by_identifier(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn get_work_item_by_identifier(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetWorkItemByIdentifierInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let identifier = input.identifier.trim();
@@ -215,44 +206,25 @@ pub async fn get_work_item_by_identifier(
         Err(e) => return CallToolResult::error(e),
     };
 
-    let project_id = match find_project_id_by_identifier(&projects, project_identifier) {
-        Some(id) => id,
-        None => {
-            return CallToolResult::error(format!(
-                "Project with identifier '{}' not found",
-                project_identifier
-            ));
-        }
+    let Some(project_id) = find_project_id_by_identifier(&projects, project_identifier) else {
+        return CallToolResult::error(format!("Project with identifier '{project_identifier}' not found"));
     };
 
     // Prefer project-scoped lookup to reduce false positives and payload size.
-    let project_search_path = format!(
-        "/api/v1/projects/{}/issues?search={}&per_page=100",
-        project_id, identifier
-    );
+    let project_search_path = format!("/api/v1/projects/{project_id}/issues?search={identifier}&per_page=100");
     let project_search: Value = match client.get(&project_search_path).await {
         Ok(v) => v,
         Err(e) => return CallToolResult::error(e),
     };
 
-    let mut work_item_id = find_work_item_id_by_identifier(
-        &project_search,
-        identifier,
-        project_identifier,
-        sequence_id,
-        true,
-    );
+    let mut work_item_id =
+        find_work_item_id_by_identifier(&project_search, identifier, project_identifier, sequence_id, true);
 
     if work_item_id.is_none() {
         // Fallback to global search for deployments where identifier search is indexed globally.
         if let Ok(global_search) = client.search_work_items(identifier).await {
-            work_item_id = find_work_item_id_by_identifier(
-                &global_search,
-                identifier,
-                project_identifier,
-                sequence_id,
-                false,
-            );
+            work_item_id =
+                find_work_item_id_by_identifier(&global_search, identifier, project_identifier, sequence_id, false);
         }
     }
 
@@ -265,14 +237,10 @@ pub async fn get_work_item_by_identifier(
         }
     }
 
-    let work_item_id = match work_item_id {
-        Some(id) => id,
-        None => {
-            return CallToolResult::error(format!(
-                "Work item '{}' not found in project '{}'",
-                identifier, project_identifier
-            ));
-        }
+    let Some(work_item_id) = work_item_id else {
+        return CallToolResult::error(format!(
+            "Work item '{identifier}' not found in project '{project_identifier}'"
+        ));
     };
 
     match client.get_work_item(&work_item_id).await {
@@ -299,8 +267,7 @@ async fn find_work_item_id_by_sequence_position(
 
     loop {
         let path = format!(
-            "/api/v1/projects/{}/issues?page={}&per_page={}&sort_by=created_at&sort_order=asc",
-            project_id, page, per_page
+            "/api/v1/projects/{project_id}/issues?page={page}&per_page={per_page}&sort_by=created_at&sort_order=asc"
         );
         let payload: Value = client.get(&path).await?;
         let data = extract_data(&payload);
@@ -320,18 +287,15 @@ async fn find_work_item_id_by_sequence_position(
         for item in items {
             current_sequence += 1;
             if current_sequence == sequence_id {
-                return Ok(item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string));
+                return Ok(item.get("id").and_then(Value::as_str).map(ToString::to_string));
             }
         }
 
+        let per_page_usize = usize::try_from(per_page).unwrap_or(usize::MAX);
         let reached_last_page = data
             .get("total_pages")
             .and_then(value_to_u64)
-            .map(|total_pages| page >= total_pages)
-            .unwrap_or(items.len() < per_page as usize);
+            .map_or(items.len() < per_page_usize, |total_pages| page >= total_pages);
 
         if reached_last_page {
             return Ok(None);
@@ -361,10 +325,7 @@ fn extract_data(value: &Value) -> &Value {
     value.get("data").unwrap_or(value)
 }
 
-fn find_project_id_by_identifier(
-    projects_payload: &Value,
-    project_identifier: &str,
-) -> Option<String> {
+fn find_project_id_by_identifier(projects_payload: &Value, project_identifier: &str) -> Option<String> {
     let project_identifier_upper = project_identifier.to_ascii_uppercase();
     let projects_data = extract_data(projects_payload);
 
@@ -383,8 +344,7 @@ fn find_project_id_by_identifier(
                 .get("key")
                 .and_then(Value::as_str)
                 .or_else(|| project.get("identifier").and_then(Value::as_str))
-                .map(|key| key.eq_ignore_ascii_case(&project_identifier_upper))
-                .unwrap_or(false)
+                .is_some_and(|key| key.eq_ignore_ascii_case(&project_identifier_upper))
         })
         .and_then(|project| project.get("id").and_then(Value::as_str))
         .map(ToString::to_string)
@@ -408,8 +368,7 @@ fn find_work_item_id_by_identifier(
             if result
                 .get("type")
                 .and_then(Value::as_str)
-                .map(|t| t.eq_ignore_ascii_case("issue"))
-                .unwrap_or(false)
+                .is_some_and(|t| t.eq_ignore_ascii_case("issue"))
             {
                 candidates.push(result);
             }
@@ -424,15 +383,7 @@ fn find_work_item_id_by_identifier(
 
     candidates
         .into_iter()
-        .find(|item| {
-            item_matches_identifier(
-                item,
-                identifier,
-                project_identifier,
-                sequence_id,
-                project_scoped,
-            )
-        })
+        .find(|item| item_matches_identifier(item, identifier, project_identifier, sequence_id, project_scoped))
         .and_then(|item| item.get("id").and_then(Value::as_str))
         .map(ToString::to_string)
 }
@@ -457,8 +408,7 @@ fn item_matches_identifier(
     if identifier_fields.iter().any(|field| {
         item.get(*field)
             .and_then(Value::as_str)
-            .map(|v| v.eq_ignore_ascii_case(&identifier_upper))
-            .unwrap_or(false)
+            .is_some_and(|v| v.eq_ignore_ascii_case(&identifier_upper))
     }) {
         return true;
     }
@@ -468,8 +418,7 @@ fn item_matches_identifier(
         .any(|field| {
             item.get(*field)
                 .and_then(value_to_u64)
-                .map(|n| n == sequence_id)
-                .unwrap_or(false)
+                .is_some_and(|n| n == sequence_id)
         });
 
     if !sequence_match {
@@ -485,8 +434,7 @@ fn item_matches_identifier(
         .any(|field| {
             item.get(*field)
                 .and_then(Value::as_str)
-                .map(|v| v.eq_ignore_ascii_case(&project_identifier_upper))
-                .unwrap_or(false)
+                .is_some_and(|v| v.eq_ignore_ascii_case(&project_identifier_upper))
         })
 }
 
@@ -507,17 +455,15 @@ fn validate_work_item_state(state: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn append_attachments_to_text(
-    text: Option<String>,
-    attachments: Option<Vec<String>>,
-) -> Option<String> {
+fn append_attachments_to_text(text: Option<String>, attachments: Option<Vec<String>>) -> Option<String> {
+    use std::fmt::Write as _;
     match attachments {
         Some(items) if !items.is_empty() => {
             let mut output = text.unwrap_or_default();
             output.push_str("\n\n**附件：**\n");
             for url in items {
                 let name = attachment_name_from_url(&url);
-                output.push_str(&format!("- [{}]({})\n", name, url));
+                let _ = writeln!(output, "- [{name}]({url})");
             }
             Some(output.trim_end().to_string())
         }
@@ -600,7 +546,7 @@ struct CreateWorkItemInput {
 pub async fn create_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let state = input.state.unwrap_or_else(|| "backlog".to_string());
@@ -695,7 +641,7 @@ pub async fn update_work_item(client: &OpenPrClient, args: serde_json::Value) ->
 
     let input: UpdateWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let mut body = serde_json::Map::new();
@@ -714,13 +660,9 @@ pub async fn update_work_item(client: &OpenPrClient, args: serde_json::Value) ->
     if let Some(priority) = input.priority {
         body.insert("priority".to_string(), json!(priority));
     }
-    if args_obj
-        .as_ref()
-        .and_then(|o| o.get("assignee_id"))
-        .is_some()
-    {
+    if args_obj.as_ref().and_then(|o| o.get("assignee_id")).is_some() {
         match input.assignee_id.as_deref() {
-            Some("") | Some("null") | None => {
+            Some("" | "null") | None => {
                 body.insert("assignee_id".to_string(), serde_json::Value::Null);
             }
             Some(aid) => {
@@ -730,7 +672,7 @@ pub async fn update_work_item(client: &OpenPrClient, args: serde_json::Value) ->
     }
     if args_obj.as_ref().and_then(|o| o.get("due_at")).is_some() {
         match input.due_at.as_deref() {
-            Some("") | Some("null") | None => {
+            Some("" | "null") | None => {
                 body.insert("due_at".to_string(), serde_json::Value::Null);
             }
             Some(d) => {
@@ -776,7 +718,7 @@ struct SearchWorkItemsInput {
 pub async fn search_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: SearchWorkItemsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.search_work_items(&input.query).await {
@@ -817,19 +759,13 @@ struct AddLabelToWorkItemInput {
     label_id: String,
 }
 
-pub async fn add_label_to_work_item(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn add_label_to_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: AddLabelToWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
-    match client
-        .add_label_to_issue(&input.work_item_id, &input.label_id)
-        .await
-    {
+    match client.add_label_to_issue(&input.work_item_id, &input.label_id).await {
         Ok(()) => CallToolResult::success("Label added to work item"),
         Err(e) => CallToolResult::error(e),
     }
@@ -864,13 +800,10 @@ struct RemoveLabelFromWorkItemInput {
     label_id: String,
 }
 
-pub async fn remove_label_from_work_item(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn remove_label_from_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: RemoveLabelFromWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client
@@ -905,13 +838,10 @@ struct ListWorkItemLabelsInput {
     work_item_id: String,
 }
 
-pub async fn list_work_item_labels(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn list_work_item_labels(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListWorkItemLabelsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.get_issue_labels(&input.work_item_id).await {
@@ -946,13 +876,10 @@ struct DeleteWorkItemInput {
     work_item_id: String,
 }
 
-pub async fn handle_delete_work_item(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn handle_delete_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: DeleteWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.delete_work_item(&input.work_item_id).await {
@@ -994,19 +921,13 @@ struct AddLabelsToWorkItemInput {
     label_ids: Vec<String>,
 }
 
-pub async fn add_labels_to_work_item(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn add_labels_to_work_item(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: AddLabelsToWorkItemInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
-    match client
-        .add_labels_to_issue(&input.work_item_id, &input.label_ids)
-        .await
-    {
+    match client.add_labels_to_issue(&input.work_item_id, &input.label_ids).await {
         Ok(()) => CallToolResult::success("Labels added to work item"),
         Err(e) => CallToolResult::error(e),
     }

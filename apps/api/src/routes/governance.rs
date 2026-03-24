@@ -104,39 +104,29 @@ pub async fn update_governance_config(
     if let Some(value) = req.auto_review_days
         && value < 0
     {
-        return Err(ApiError::BadRequest(
-            "auto_review_days must be >= 0".to_string(),
-        ));
+        return Err(ApiError::BadRequest("auto_review_days must be >= 0".to_string()));
     }
     if let Some(value) = req.review_reminder_days
         && value < 0
     {
-        return Err(ApiError::BadRequest(
-            "review_reminder_days must be >= 0".to_string(),
-        ));
+        return Err(ApiError::BadRequest("review_reminder_days must be >= 0".to_string()));
     }
     if let Some(mode) = req.trust_update_mode.as_deref() {
         let mode = mode.trim();
         if mode.is_empty() || mode.len() > 30 {
-            return Err(ApiError::BadRequest(
-                "invalid trust_update_mode".to_string(),
-            ));
+            return Err(ApiError::BadRequest("invalid trust_update_mode".to_string()));
         }
     }
     if let Some(cron) = req.audit_report_cron.as_deref() {
         let cron = cron.trim();
         if cron.is_empty() || cron.len() > 100 {
-            return Err(ApiError::BadRequest(
-                "invalid audit_report_cron".to_string(),
-            ));
+            return Err(ApiError::BadRequest("invalid audit_report_cron".to_string()));
         }
     }
     if let Some(config) = req.config.as_ref()
         && !config.is_object()
     {
-        return Err(ApiError::BadRequest(
-            "config must be a JSON object".to_string(),
-        ));
+        return Err(ApiError::BadRequest("config must be a JSON object".to_string()));
     }
 
     let old_row = load_or_init_config(&state, req.project_id, None, false).await?;
@@ -150,9 +140,7 @@ pub async fn update_governance_config(
 
     let new_review_required = req.review_required.unwrap_or(old_row.review_required);
     let new_auto_review_days = req.auto_review_days.unwrap_or(old_row.auto_review_days);
-    let new_review_reminder_days = req
-        .review_reminder_days
-        .unwrap_or(old_row.review_reminder_days);
+    let new_review_reminder_days = req.review_reminder_days.unwrap_or(old_row.review_reminder_days);
     let new_audit_report_cron = req
         .audit_report_cron
         .as_deref()
@@ -172,7 +160,7 @@ pub async fn update_governance_config(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
                 INSERT INTO governance_configs (
                     project_id,
                     review_required,
@@ -195,7 +183,7 @@ pub async fn update_governance_config(
                     config = EXCLUDED.config,
                     updated_by = EXCLUDED.updated_by,
                     updated_at = EXCLUDED.updated_at
-            "#,
+            ",
         vec![
             req.project_id.into(),
             new_review_required.into(),
@@ -282,8 +270,8 @@ pub async fn list_governance_audit_logs(
     let user_id = parse_claim_user_id(&claims)?;
 
     if let Some(project_id) = query.project_id {
-        let allowed = is_project_member(&state.db, project_id, user_id).await?
-            || is_system_admin(&state.db, user_id).await?;
+        let allowed =
+            is_project_member(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
         if !allowed {
             return Err(ApiError::Forbidden("project access denied".to_string()));
         }
@@ -338,8 +326,7 @@ pub async fn list_governance_audit_logs(
         format!("WHERE {}", where_parts.join(" AND "))
     };
 
-    let count_sql =
-        format!("SELECT COUNT(*)::bigint AS count FROM governance_audit_logs {where_sql}");
+    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM governance_audit_logs {where_sql}");
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         count_sql,
@@ -354,14 +341,14 @@ pub async fn list_governance_audit_logs(
     list_values.push(per_page.into());
     list_values.push(offset.into());
     let list_sql = format!(
-        r#"
+        r"
             SELECT id, project_id, actor_id, action, resource_type, resource_id,
                    old_value, new_value, metadata, created_at
             FROM governance_audit_logs
             {where_sql}
             ORDER BY created_at DESC, id DESC
             LIMIT ${idx} OFFSET ${}
-        "#,
+        ",
         idx + 1
     );
 
@@ -412,7 +399,7 @@ async fn load_or_init_config(
     let insert_result = tx
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO governance_configs (
                     project_id,
                     review_required,
@@ -425,7 +412,7 @@ async fn load_or_init_config(
                     updated_at
                 ) VALUES ($1, true, 30, 7, '0 0 1 * *', 'review_based', '{}'::jsonb, $2, $2)
                 ON CONFLICT (project_id) DO NOTHING
-            "#,
+            ",
             vec![project_id.into(), Utc::now().into()],
         ))
         .await?;
@@ -460,12 +447,12 @@ async fn load_or_init_config_by_conn<C: ConnectionTrait>(
 ) -> Result<GovernanceConfigRow, ApiError> {
     GovernanceConfigRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, project_id, review_required, auto_review_days, review_reminder_days,
                    audit_report_cron, trust_update_mode, config, updated_by, created_at, updated_at
             FROM governance_configs
             WHERE project_id = $1
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .one(db)
@@ -477,13 +464,9 @@ fn parse_claim_user_id(claims: &JwtClaims) -> Result<Uuid, ApiError> {
     Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))
 }
 
-async fn ensure_project_member_or_admin(
-    state: &AppState,
-    project_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = is_project_member(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+async fn ensure_project_member_or_admin(state: &AppState, project_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+    let allowed =
+        is_project_member(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden("project access denied".to_string()));
     }
@@ -495,8 +478,8 @@ async fn ensure_project_admin_or_owner_or_system_admin(
     project_id: Uuid,
     user_id: Uuid,
 ) -> Result<(), ApiError> {
-    let allowed = is_project_admin_or_owner(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+    let allowed =
+        is_project_admin_or_owner(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden(
             "admin or owner required for governance config update".to_string(),
@@ -505,10 +488,7 @@ async fn ensure_project_admin_or_owner_or_system_admin(
     Ok(())
 }
 
-async fn resolve_workspace_id_for_project(
-    state: &AppState,
-    project_id: Uuid,
-) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_workspace_id_for_project(state: &AppState, project_id: Uuid) -> Result<Option<Uuid>, ApiError> {
     #[derive(Debug, FromQueryResult)]
     struct WorkspaceRow {
         workspace_id: Uuid,

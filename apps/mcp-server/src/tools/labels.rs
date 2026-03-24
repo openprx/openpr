@@ -33,7 +33,7 @@ struct CreateLabelInput {
 pub async fn create_label(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateLabelInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let body = json!({ "name": input.name, "color": input.color });
@@ -94,7 +94,7 @@ struct ListProjectLabelsInput {
 pub async fn list_project_labels(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListProjectLabelsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.list_project_labels(&input.project_id).await {
@@ -147,7 +147,7 @@ struct UpdateLabelInput {
 pub async fn update_label(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: UpdateLabelInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let mut body = serde_json::Map::new();
@@ -199,7 +199,7 @@ struct DeleteLabelInput {
 pub async fn handle_delete_label(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: DeleteLabelInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.delete_label(&input.label_id).await {

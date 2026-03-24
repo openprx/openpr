@@ -72,8 +72,7 @@ pub async fn export_project(
     Path(project_id): Path<Uuid>,
     Query(query): Query<ExportQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Verify user has access to project
     verify_project_access(&state, project_id, user_id).await?;
@@ -96,9 +95,9 @@ pub async fn export_project(
         .db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"SELECT id, key, title, description, status, priority, type as issue_type, 
+            r"SELECT id, key, title, description, status, priority, type as issue_type, 
                       assignee_id, reporter_id, created_at, updated_at 
-               FROM work_items WHERE project_id = $1 ORDER BY created_at"#,
+               FROM work_items WHERE project_id = $1 ORDER BY created_at",
             vec![project_id.into()],
         ))
         .await?;
@@ -113,11 +112,11 @@ pub async fn export_project(
         .db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"SELECT c.id, c.work_item_id, c.content, c.created_by, c.created_at, c.updated_at
+            r"SELECT c.id, c.work_item_id, c.content, c.created_by, c.created_at, c.updated_at
                FROM comments c
                INNER JOIN work_items wi ON c.work_item_id = wi.id
                WHERE wi.project_id = $1
-               ORDER BY c.created_at"#,
+               ORDER BY c.created_at",
             vec![project_id.into()],
         ))
         .await?;
@@ -138,8 +137,7 @@ pub async fn export_project(
 
     match format {
         "json" => {
-            let json_data =
-                serde_json::to_string_pretty(&export).map_err(|_| ApiError::Internal)?;
+            let json_data = serde_json::to_string_pretty(&export).map_err(|_| ApiError::Internal)?;
             let filename = format!("project_{}_export.json", export.project.key);
             Ok(ApiResponse::success(ExportResponse {
                 format: "json".to_string(),
@@ -151,8 +149,7 @@ pub async fn export_project(
         "csv" => {
             // CSV export: create one CSV with all issues
             let mut csv_output = String::new();
-            csv_output
-                .push_str("Key,Title,Status,Priority,Type,Description,Created At,Updated At\n");
+            csv_output.push_str("Key,Title,Status,Priority,Type,Description,Created At,Updated At\n");
 
             for issue in &export.issues {
                 let description = issue.description.replace('"', "\"\"");
@@ -177,22 +174,16 @@ pub async fn export_project(
             })
             .into_response())
         }
-        _ => Err(ApiError::BadRequest(
-            "Invalid format. Use 'json' or 'csv'".to_string(),
-        )),
+        _ => Err(ApiError::BadRequest("Invalid format. Use 'json' or 'csv'".to_string())),
     }
 }
 
-async fn verify_project_access(
-    state: &AppState,
-    project_id: Uuid,
-    actor_id: Uuid,
-) -> Result<(), ApiError> {
+async fn verify_project_access(state: &AppState, project_id: Uuid, actor_id: Uuid) -> Result<(), ApiError> {
     let result = state
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT 1
                 FROM projects p
                 WHERE p.id = $1
@@ -210,7 +201,7 @@ async fn verify_project_access(
                           AND wb.id = $2
                     )
                   )
-            "#,
+            ",
             vec![project_id.into(), actor_id.into()],
         ))
         .await?;

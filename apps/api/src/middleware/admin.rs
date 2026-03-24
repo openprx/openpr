@@ -7,7 +7,7 @@ use platform::{
     app::AppState,
     auth::{JwtClaims, JwtManager},
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 use crate::{
     error::ApiError,
@@ -42,12 +42,8 @@ pub async fn admin_middleware(
         .await?
         .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
 
-    let role = row
-        .try_get::<String>("", "role")
-        .map_err(|_| ApiError::Internal)?;
-    let is_active = row
-        .try_get::<bool>("", "is_active")
-        .map_err(|_| ApiError::Internal)?;
+    let role = row.try_get::<String>("", "role").map_err(|_| ApiError::Internal)?;
+    let is_active = row.try_get::<bool>("", "is_active").map_err(|_| ApiError::Internal)?;
 
     tracing::debug!(
         user_id = %claims.sub,

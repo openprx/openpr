@@ -76,9 +76,7 @@ pub async fn list_proposal_templates(
 
     if let Some(template_type) = query.template_type {
         if template_type.trim().is_empty() {
-            return Err(ApiError::BadRequest(
-                "template_type cannot be empty".to_string(),
-            ));
+            return Err(ApiError::BadRequest("template_type cannot be empty".to_string()));
         }
         where_parts.push(format!("template_type = ${idx}"));
         values.push(template_type.trim().to_string().into());
@@ -91,23 +89,20 @@ pub async fn list_proposal_templates(
     }
 
     let sql = format!(
-        r#"
+        r"
             SELECT id, project_id, name, description, template_type, content,
                    is_default, is_active, created_by, created_at, updated_at
             FROM proposal_templates
             WHERE {}
             ORDER BY is_default DESC, updated_at DESC
-        "#,
+        ",
         where_parts.join(" AND ")
     );
 
-    let items = ProposalTemplateRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let items =
+        ProposalTemplateRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .all(&state.db)
+            .await?;
 
     Ok(ApiResponse::success(PaginatedData::from_items(items)))
 }
@@ -159,24 +154,23 @@ pub async fn create_proposal_template(
     let tx = state.db.begin().await?;
 
     if is_default {
-        tx
-            .execute(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "UPDATE proposal_templates SET is_default = false, updated_at = $2 WHERE project_id = $1",
-                vec![req.project_id.into(), now.into()],
-            ))
-            .await?;
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE proposal_templates SET is_default = false, updated_at = $2 WHERE project_id = $1",
+            vec![req.project_id.into(), now.into()],
+        ))
+        .await?;
     }
 
     let insert = tx
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO proposal_templates (
                     id, project_id, name, description, template_type, content,
                     is_default, is_active, created_by, created_at, updated_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            "#,
+            ",
             vec![
                 template_id.clone().into(),
                 req.project_id.into(),
@@ -195,8 +189,7 @@ pub async fn create_proposal_template(
 
     if let Err(err) = insert {
         let msg = err.to_string();
-        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value")
-        {
+        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value") {
             return Err(ApiError::Conflict(
                 "template name already exists in this project".to_string(),
             ));
@@ -293,13 +286,12 @@ pub async fn update_proposal_template(
 
     if let Some(is_default) = req.is_default {
         if is_default {
-            tx
-                .execute(Statement::from_sql_and_values(
-                    DbBackend::Postgres,
-                    "UPDATE proposal_templates SET is_default = false, updated_at = $2 WHERE project_id = $1",
-                    vec![existing.project_id.into(), Utc::now().into()],
-                ))
-                .await?;
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE proposal_templates SET is_default = false, updated_at = $2 WHERE project_id = $1",
+                vec![existing.project_id.into(), Utc::now().into()],
+            ))
+            .await?;
         }
         set_parts.push(format!("is_default = ${idx}"));
         values.push(is_default.into());
@@ -324,16 +316,11 @@ pub async fn update_proposal_template(
     );
 
     let res = tx
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            sql,
-            values,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
         .await;
     if let Err(err) = res {
         let msg = err.to_string();
-        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value")
-        {
+        if msg.contains("uq_proposal_templates_project_name") || msg.contains("duplicate key value") {
             return Err(ApiError::Conflict(
                 "template name already exists in this project".to_string(),
             ));
@@ -405,18 +392,15 @@ async fn find_template(state: &AppState, id: &str) -> Result<ProposalTemplateRow
     find_template_by_conn(&state.db, id).await
 }
 
-async fn find_template_by_conn<C: ConnectionTrait>(
-    db: &C,
-    id: &str,
-) -> Result<ProposalTemplateRow, ApiError> {
+async fn find_template_by_conn<C: ConnectionTrait>(db: &C, id: &str) -> Result<ProposalTemplateRow, ApiError> {
     ProposalTemplateRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, project_id, name, description, template_type, content,
                    is_default, is_active, created_by, created_at, updated_at
             FROM proposal_templates
             WHERE id = $1
-        "#,
+        ",
         vec![id.to_string().into()],
     ))
     .one(db)
@@ -428,13 +412,9 @@ fn parse_claim_user_id(claims: &JwtClaims) -> Result<Uuid, ApiError> {
     Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))
 }
 
-async fn ensure_project_member_or_admin(
-    state: &AppState,
-    project_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = is_project_member(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+async fn ensure_project_member_or_admin(state: &AppState, project_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+    let allowed =
+        is_project_member(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden("project access denied".to_string()));
     }
@@ -446,8 +426,8 @@ async fn ensure_project_admin_or_owner_or_system_admin(
     project_id: Uuid,
     user_id: Uuid,
 ) -> Result<(), ApiError> {
-    let allowed = is_project_admin_or_owner(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+    let allowed =
+        is_project_admin_or_owner(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden(
             "admin or owner required for template management".to_string(),

@@ -43,8 +43,6 @@ pub fn extract_bot_context(extensions: &Extensions) -> Option<&BotAuthContext> {
 fn bot_role_from_permissions(permissions: &[String]) -> String {
     if permissions.iter().any(|p| p == "admin") {
         "admin".to_string()
-    } else if permissions.iter().any(|p| p == "write") {
-        "member".to_string()
     } else {
         "member".to_string()
     }
@@ -77,16 +75,13 @@ pub async fn require_workspace_access_from_auth(
 ) -> Result<(Uuid, String, bool), ApiError> {
     if let Some(bot_ctx) = bot {
         if bot_ctx.workspace_id != workspace_id {
-            return Err(ApiError::Forbidden(
-                "bot not authorized for this workspace".to_string(),
-            ));
+            return Err(ApiError::Forbidden("bot not authorized for this workspace".to_string()));
         }
         let role = bot_role_from_permissions(&bot_ctx.permissions);
         return Ok((bot_ctx.bot_id, role, true));
     }
 
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     #[derive(Debug, FromQueryResult)]
     struct RoleRow {
@@ -139,9 +134,9 @@ pub async fn bot_or_user_auth_middleware(
 
         let bot = BotRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"SELECT id, workspace_id, permissions, is_active, expires_at
+            r"SELECT id, workspace_id, permissions, is_active, expires_at
                FROM workspace_bots
-               WHERE token_hash = $1"#,
+               WHERE token_hash = $1",
             vec![token_hash.into()],
         ))
         .one(&state.db)
@@ -152,10 +147,10 @@ pub async fn bot_or_user_auth_middleware(
         if !bot.is_active {
             return Err(ApiError::Unauthorized("bot token is disabled".to_string()));
         }
-        if let Some(expires_at) = bot.expires_at {
-            if expires_at < Utc::now() {
-                return Err(ApiError::Unauthorized("bot token has expired".to_string()));
-            }
+        if let Some(expires_at) = bot.expires_at
+            && expires_at < Utc::now()
+        {
+            return Err(ApiError::Unauthorized("bot token has expired".to_string()));
         }
 
         // Update last_used_at asynchronously (best-effort, don't block request)
@@ -174,11 +169,7 @@ pub async fn bot_or_user_auth_middleware(
         let permissions: Vec<String> = bot
             .permissions
             .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
         req.extensions_mut().insert(BotAuthContext {

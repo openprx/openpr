@@ -14,13 +14,13 @@ use axum::{
     },
     routing::{get, post},
 };
+use clap::Parser;
 use cli::{Cli, Commands};
 use client::OpenPrClient;
-use clap::Parser;
 use protocol::{JsonRpcRequest, JsonRpcResponse};
-use server::McpServer;
 use serde::Deserialize;
 use serde_json::json;
+use server::McpServer;
 use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, mpsc};
@@ -35,8 +35,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mcp_server=info".parse().unwrap()),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                "mcp_server=info"
+                    .parse()
+                    .unwrap_or_else(|_| tracing_subscriber::filter::Directive::default()),
+            ),
         )
         .init();
 
@@ -47,40 +50,34 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::var("OPENPR_API_URL").ok())
         .unwrap_or_else(|| "http://localhost:3000".to_string());
 
-    let bot_token_opt = cli
-        .bot_token
-        .clone()
-        .or_else(|| std::env::var("OPENPR_BOT_TOKEN").ok());
+    let bot_token_opt = cli.bot_token.clone().or_else(|| std::env::var("OPENPR_BOT_TOKEN").ok());
 
     let workspace_id_opt = cli
         .workspace_id
         .clone()
         .or_else(|| std::env::var("OPENPR_WORKSPACE_ID").ok());
 
-    match &cli.command {
-        Commands::Serve(serve_args) => {
-            let bot_token = bot_token_opt
-                .ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN environment variable is required"))?;
-            let workspace_id = workspace_id_opt
-                .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID environment variable is required"))?;
+    if let Commands::Serve(serve_args) = &cli.command {
+        let bot_token =
+            bot_token_opt.ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN environment variable is required"))?;
+        let workspace_id =
+            workspace_id_opt.ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID environment variable is required"))?;
 
-            let client = OpenPrClient::new(base_url, bot_token, workspace_id);
+        let client = OpenPrClient::new(base_url, bot_token, workspace_id).map_err(|e| anyhow::anyhow!(e))?;
 
-            match serve_args.transport {
-                cli::Transport::Http => run_http(&serve_args.bind_addr, client).await,
-                cli::Transport::Sse => run_sse(&serve_args.bind_addr, client).await,
-                cli::Transport::Stdio => run_stdio(client).await,
-            }
+        match serve_args.transport {
+            cli::Transport::Http => run_http(&serve_args.bind_addr, client).await,
+            cli::Transport::Sse => run_sse(&serve_args.bind_addr, client).await,
+            cli::Transport::Stdio => run_stdio(client).await,
         }
-        _ => {
-            let bot_token = bot_token_opt
-                .ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN is required (set env var or --bot-token)"))?;
-            let workspace_id = workspace_id_opt
-                .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID is required (set env var or --workspace-id)"))?;
+    } else {
+        let bot_token = bot_token_opt
+            .ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN is required (set env var or --bot-token)"))?;
+        let workspace_id = workspace_id_opt
+            .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID is required (set env var or --workspace-id)"))?;
 
-            let client = OpenPrClient::new(base_url, bot_token, workspace_id);
-            cli::run_cli_command(&cli.command, &cli.format, client).await
-        }
+        let client = OpenPrClient::new(base_url, bot_token, workspace_id).map_err(|e| anyhow::anyhow!(e))?;
+        cli::run_cli_command(&cli.command, &cli.format, client).await
     }
 }
 
@@ -106,15 +103,12 @@ async fn run_http(bind_addr: &str, client: OpenPrClient) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_jsonrpc(
-    State(state): State<SseState>,
-    Json(req): Json<JsonRpcRequest>,
-) -> impl IntoResponse {
+async fn handle_jsonrpc(State(state): State<SseState>, Json(req): Json<JsonRpcRequest>) -> impl IntoResponse {
     let server = McpServer::new(state.client.clone());
-    match server.handle_request(req).await {
-        Some(response) => (StatusCode::OK, Json(json!(response))),
-        None => (StatusCode::ACCEPTED, Json(json!({"status": "accepted"}))),
-    }
+    server.handle_request(req).await.map_or_else(
+        || (StatusCode::ACCEPTED, Json(json!({"status": "accepted"}))),
+        |response| (StatusCode::OK, Json(json!(response))),
+    )
 }
 
 #[derive(Clone)]
@@ -174,11 +168,7 @@ async fn handle_sse_connect(
     let endpoint = format!("/messages?session_id={session_id}");
     let (tx, rx) = mpsc::unbounded_channel::<SseServerEvent>();
 
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.clone(), tx.clone());
+    state.sessions.lock().await.insert(session_id.clone(), tx.clone());
 
     let _ = tx.send(SseServerEvent::Endpoint(endpoint));
 
@@ -206,10 +196,7 @@ async fn handle_sse_message(
 ) -> impl IntoResponse {
     let sender = state.sessions.lock().await.get(&query.session_id).cloned();
     let Some(sender) = sender else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Unknown SSE session_id"})),
-        );
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "Unknown SSE session_id"})));
     };
 
     let server = McpServer::new(state.client.clone());
@@ -230,10 +217,7 @@ async fn handle_sse_message(
 
     if sender.send(SseServerEvent::Message(response_json)).is_err() {
         state.sessions.lock().await.remove(&query.session_id);
-        return (
-            StatusCode::GONE,
-            Json(json!({"error": "SSE session is closed"})),
-        );
+        return (StatusCode::GONE, Json(json!({"error": "SSE session is closed"})));
     }
 
     (StatusCode::ACCEPTED, Json(json!({"status": "accepted"})))
@@ -277,13 +261,33 @@ async fn write_stdio_response(
             stdout.write_all(b"\n").await?;
         }
         StdioFrame::ContentLength => {
-            let header = format!("Content-Length: {}\r\n\r\n", response_json.len());
+            let len = response_json.len();
+            let header = format!("Content-Length: {len}\r\n\r\n");
             stdout.write_all(header.as_bytes()).await?;
             stdout.write_all(response_json.as_bytes()).await?;
         }
     }
     stdout.flush().await?;
     Ok(())
+}
+
+/// Read HTTP-style headers until empty line; return the Content-Length value (0 if absent).
+async fn read_headers_get_content_length(reader: &mut BufReader<tokio::io::Stdin>, first_line: &str) -> usize {
+    let mut content_length = parse_content_length(first_line);
+    loop {
+        let mut header_line = String::new();
+        match reader.read_line(&mut header_line).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let ht = header_line.trim();
+                if ht.is_empty() {
+                    break;
+                }
+                content_length = content_length.or_else(|| parse_content_length(ht));
+            }
+        }
+    }
+    content_length.unwrap_or(0)
 }
 
 async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
@@ -309,25 +313,7 @@ async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
 
                 // Detect Content-Length framing (used by Codex, Claude Desktop)
                 let (payload, frame) = if is_stdio_header_line(trimmed) {
-                    // Read headers until empty line
-                    let mut content_length: Option<usize> = parse_content_length(trimmed);
-                    loop {
-                        let mut header_line = String::new();
-                        match reader.read_line(&mut header_line).await {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let ht = header_line.trim();
-                                if ht.is_empty() {
-                                    break; // End of headers
-                                }
-                                if content_length.is_none() {
-                                    content_length = parse_content_length(ht);
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let cl = content_length.unwrap_or(0);
+                    let cl = read_headers_get_content_length(&mut reader, trimmed).await;
                     if cl == 0 {
                         continue;
                     }
@@ -348,7 +334,7 @@ async fn run_stdio(client: OpenPrClient) -> anyhow::Result<()> {
                         tracing::error!(error = %e, "Failed to parse request");
                         let error_response = JsonRpcResponse::error(
                             None,
-                            protocol::JsonRpcError::parse_error(format!("Invalid JSON: {}", e)),
+                            protocol::JsonRpcError::parse_error(format!("Invalid JSON: {e}")),
                         );
                         if let Ok(rj) = serde_json::to_string(&error_response) {
                             let _ = write_stdio_response(&mut stdout, &rj, frame).await;

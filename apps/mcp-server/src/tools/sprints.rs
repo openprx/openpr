@@ -44,7 +44,7 @@ struct CreateSprintInput {
 pub async fn create_sprint(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateSprintInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let body = json!({
@@ -88,7 +88,7 @@ struct ListSprintsInput {
 pub async fn list_sprints(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListSprintsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.list_sprints(&input.project_id).await {
@@ -146,7 +146,7 @@ struct UpdateSprintInput {
 pub async fn update_sprint(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: UpdateSprintInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let mut body = serde_json::Map::new();
@@ -198,13 +198,10 @@ struct DeleteSprintInput {
     sprint_id: String,
 }
 
-pub async fn handle_delete_sprint(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn handle_delete_sprint(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: DeleteSprintInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.delete_sprint(&input.sprint_id).await {

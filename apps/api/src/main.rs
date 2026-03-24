@@ -1,3 +1,12 @@
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_lossless
+)]
+
 mod entities;
 mod error;
 mod middleware;
@@ -37,10 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let db = connect_db(&cfg.database_url).await?;
     run_migrations(&db).await?;
     verify_governance_schema(&db).await?;
-    let state = AppState {
-        cfg: cfg.clone(),
-        db,
-    };
+    let state = AppState { cfg: cfg.clone(), db };
     let auth_state = state.clone();
     routes::proposal::start_governance_watcher(state.clone());
 
@@ -1021,22 +1027,10 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
     const MIGRATIONS: &[(&str, &str)] = &[
-        (
-            "0001_init.sql",
-            include_str!("../../../migrations/0001_init.sql"),
-        ),
-        (
-            "0002_users.sql",
-            include_str!("../../../migrations/0002_users.sql"),
-        ),
-        (
-            "0003_labels.sql",
-            include_str!("../../../migrations/0003_labels.sql"),
-        ),
-        (
-            "0004_sprints.sql",
-            include_str!("../../../migrations/0004_sprints.sql"),
-        ),
+        ("0001_init.sql", include_str!("../../../migrations/0001_init.sql")),
+        ("0002_users.sql", include_str!("../../../migrations/0002_users.sql")),
+        ("0003_labels.sql", include_str!("../../../migrations/0003_labels.sql")),
+        ("0004_sprints.sql", include_str!("../../../migrations/0004_sprints.sql")),
         (
             "0005_webhooks.sql",
             include_str!("../../../migrations/0005_webhooks.sql"),
@@ -1140,44 +1134,20 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
         ("proposal_status enum", "SELECT 'draft'::proposal_status"),
         ("author_type enum", "SELECT 'human'::author_type"),
         ("trust_scores table", "SELECT 1 FROM trust_scores LIMIT 1"),
-        (
-            "trust_score_logs table",
-            "SELECT 1 FROM trust_score_logs LIMIT 1",
-        ),
-        (
-            "ai_participants table",
-            "SELECT 1 FROM ai_participants LIMIT 1",
-        ),
-        (
-            "decision_domains table",
-            "SELECT 1 FROM decision_domains LIMIT 1",
-        ),
+        ("trust_score_logs table", "SELECT 1 FROM trust_score_logs LIMIT 1"),
+        ("ai_participants table", "SELECT 1 FROM ai_participants LIMIT 1"),
+        ("decision_domains table", "SELECT 1 FROM decision_domains LIMIT 1"),
         ("veto_events table", "SELECT 1 FROM veto_events LIMIT 1"),
         ("appeals table", "SELECT 1 FROM appeals LIMIT 1"),
-        (
-            "impact_reviews table",
-            "SELECT 1 FROM impact_reviews LIMIT 1",
-        ),
-        (
-            "review_participants table",
-            "SELECT 1 FROM review_participants LIMIT 1",
-        ),
-        (
-            "ai_learning_records table",
-            "SELECT 1 FROM ai_learning_records LIMIT 1",
-        ),
+        ("impact_reviews table", "SELECT 1 FROM impact_reviews LIMIT 1"),
+        ("review_participants table", "SELECT 1 FROM review_participants LIMIT 1"),
+        ("ai_learning_records table", "SELECT 1 FROM ai_learning_records LIMIT 1"),
         (
             "decision_audit_reports table",
             "SELECT 1 FROM decision_audit_reports LIMIT 1",
         ),
-        (
-            "feedback_loop_links table",
-            "SELECT 1 FROM feedback_loop_links LIMIT 1",
-        ),
-        (
-            "governance_configs table",
-            "SELECT 1 FROM governance_configs LIMIT 1",
-        ),
+        ("feedback_loop_links table", "SELECT 1 FROM feedback_loop_links LIMIT 1"),
+        ("governance_configs table", "SELECT 1 FROM governance_configs LIMIT 1"),
         (
             "governance_audit_logs table",
             "SELECT 1 FROM governance_audit_logs LIMIT 1",
@@ -1192,17 +1162,10 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
 
     for (name, sql) in CHECKS {
         if let Err(e) = db
-            .query_one(Statement::from_string(
-                DbBackend::Postgres,
-                (*sql).to_string(),
-            ))
+            .query_one(Statement::from_string(DbBackend::Postgres, (*sql).to_string()))
             .await
         {
-            return Err(anyhow::anyhow!(
-                "governance schema check failed for {}: {}",
-                name,
-                e
-            ));
+            return Err(anyhow::anyhow!("governance schema check failed for {}: {}", name, e));
         }
     }
 

@@ -42,9 +42,7 @@ pub async fn create_workspace(
     Json(req): Json<CreateWorkspaceRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     if req.slug.trim().is_empty() || req.name.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "slug and name are required".to_string(),
-        ));
+        return Err(ApiError::BadRequest("slug and name are required".to_string()));
     }
 
     // Validate slug format (lowercase alphanumeric + hyphens)
@@ -58,8 +56,7 @@ pub async fn create_workspace(
         ));
     }
 
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Check if slug already exists
     let existing = state
@@ -101,12 +98,7 @@ pub async fn create_workspace(
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, $3, $4)",
-            vec![
-                workspace_id.into(),
-                user_id.into(),
-                "owner".into(),
-                now.into(),
-            ],
+            vec![workspace_id.into(), user_id.into(), "owner".into(), now.into()],
         ))
         .await?;
 
@@ -125,8 +117,7 @@ pub async fn list_workspaces(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct WorkspaceRow {
@@ -189,8 +180,7 @@ pub async fn get_workspace(
     Extension(claims): Extension<JwtClaims>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct WorkspaceRow {
@@ -250,8 +240,7 @@ pub async fn update_workspace(
     Path(workspace_id): Path<Uuid>,
     Json(req): Json<UpdateWorkspaceRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Check permission (owner or admin)
     let role = get_user_role(&state, workspace_id, user_id).await?;
@@ -314,19 +303,11 @@ pub async fn update_workspace(
 
     values.push(workspace_id.into());
 
-    let query = format!(
-        "UPDATE workspaces SET {} WHERE id = ${}",
-        updates.join(", "),
-        param_idx
-    );
+    let query = format!("UPDATE workspaces SET {} WHERE id = ${}", updates.join(", "), param_idx);
 
     state
         .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            &query,
-            values,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, &query, values))
         .await?;
 
     // Fetch updated workspace
@@ -364,15 +345,12 @@ pub async fn delete_workspace(
     Extension(claims): Extension<JwtClaims>,
     Path(workspace_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     // Check permission (only owner can delete)
     let role = get_user_role(&state, workspace_id, user_id).await?;
     if role != "owner" {
-        return Err(ApiError::Forbidden(
-            "only owners can delete workspaces".to_string(),
-        ));
+        return Err(ApiError::Forbidden("only owners can delete workspaces".to_string()));
     }
 
     state
@@ -388,11 +366,7 @@ pub async fn delete_workspace(
 }
 
 /// Helper: Get user's role in workspace
-async fn get_user_role(
-    state: &AppState,
-    workspace_id: Uuid,
-    actor_id: Uuid,
-) -> Result<String, ApiError> {
+async fn get_user_role(state: &AppState, workspace_id: Uuid, actor_id: Uuid) -> Result<String, ApiError> {
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct RoleRow {
         role: String,

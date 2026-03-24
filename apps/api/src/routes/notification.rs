@@ -1,12 +1,11 @@
 use axum::{
-    Extension, Json,
+    Extension,
     extract::{Path, Query, State},
     response::IntoResponse,
 };
 use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -54,8 +53,7 @@ pub async fn list_notifications(
     Extension(claims): Extension<JwtClaims>,
     Query(query): Query<ListNotificationsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.limit.or(query.per_page).unwrap_or(20).min(100);
@@ -122,11 +120,7 @@ pub async fn list_notifications(
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
             list_query,
-            vec![
-                user_id.into(),
-                (per_page as i64).into(),
-                (offset as i64).into(),
-            ],
+            vec![user_id.into(), (per_page as i64).into(), (offset as i64).into()],
         ))
         .await?;
 
@@ -159,8 +153,7 @@ pub async fn get_unread_count(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let unread_result = state
         .db
@@ -174,9 +167,7 @@ pub async fn get_unread_count(
 
     let unread_count: i64 = unread_result.try_get("", "count")?;
 
-    Ok(ApiResponse::success(UnreadCountData {
-        count: unread_count,
-    }))
+    Ok(ApiResponse::success(UnreadCountData { count: unread_count }))
 }
 
 /// PATCH /api/v1/notifications/:id/read
@@ -185,8 +176,7 @@ pub async fn mark_notification_read(
     Extension(claims): Extension<JwtClaims>,
     Path(notification_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let now = chrono::Utc::now();
 
@@ -200,9 +190,7 @@ pub async fn mark_notification_read(
         .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound(
-            "Notification not found or already read".to_string(),
-        ));
+        return Err(ApiError::NotFound("Notification not found or already read".to_string()));
     }
 
     Ok(ApiResponse::ok())
@@ -213,8 +201,7 @@ pub async fn mark_all_read(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let now = chrono::Utc::now();
 
@@ -236,8 +223,7 @@ pub async fn delete_notification(
     Extension(claims): Extension<JwtClaims>,
     Path(notification_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let result = state
         .db
@@ -253,47 +239,4 @@ pub async fn delete_notification(
     }
 
     Ok(ApiResponse::ok())
-}
-
-/// Helper function to create a notification (called by other parts of the system)
-pub async fn create_notification(
-    state: &AppState,
-    user_id: Uuid,
-    notification_type: &str,
-    title: String,
-    content: String,
-    link: Option<String>,
-    related_issue_id: Option<Uuid>,
-    related_comment_id: Option<Uuid>,
-    related_project_id: Option<Uuid>,
-) -> Result<Uuid, ApiError> {
-    let notification_id = Uuid::new_v4();
-    let now = chrono::Utc::now();
-
-    state
-        .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r#"INSERT INTO notifications 
-               (id, user_id, type, kind, payload, title, content, link, related_issue_id, 
-                related_comment_id, related_project_id, is_read, created_at)
-               VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, false, $12)"#,
-            vec![
-                notification_id.into(),
-                user_id.into(),
-                notification_type.into(),
-                notification_type.into(),
-                json!({}).into(),
-                title.into(),
-                content.into(),
-                link.into(),
-                related_issue_id.into(),
-                related_comment_id.into(),
-                related_project_id.into(),
-                now.into(),
-            ],
-        ))
-        .await?;
-
-    Ok(notification_id)
 }

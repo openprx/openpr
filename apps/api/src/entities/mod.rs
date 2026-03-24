@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod activity;
 pub mod ai_learning_record;
 pub mod ai_participant;

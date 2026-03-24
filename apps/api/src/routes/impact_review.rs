@@ -82,11 +82,7 @@ pub async fn create_impact_review(
     ensure_project_member_or_admin(&state, project_id, reviewer_id).await?;
 
     let review = svc
-        .create_review(
-            &proposal_id,
-            req.reviewer_id.or(Some(reviewer_id)),
-            req.scheduled_at,
-        )
+        .create_review(&proposal_id, req.reviewer_id.or(Some(reviewer_id)), req.scheduled_at)
         .await?;
 
     Ok(ApiResponse::success(review))
@@ -288,13 +284,9 @@ fn parse_claim_user_id(claims: &JwtClaims) -> Result<Uuid, ApiError> {
     Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))
 }
 
-async fn ensure_project_member_or_admin(
-    state: &AppState,
-    project_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), ApiError> {
-    let allowed = is_project_member(&state.db, project_id, user_id).await?
-        || is_system_admin(&state.db, user_id).await?;
+async fn ensure_project_member_or_admin(state: &AppState, project_id: Uuid, user_id: Uuid) -> Result<(), ApiError> {
+    let allowed =
+        is_project_member(&state.db, project_id, user_id).await? || is_system_admin(&state.db, user_id).await?;
     if !allowed {
         return Err(ApiError::Forbidden("project access denied".to_string()));
     }

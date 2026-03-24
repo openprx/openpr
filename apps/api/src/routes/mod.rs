@@ -28,5 +28,5 @@ pub mod trust_score;
 pub mod upload;
 pub mod veto;
 pub mod webhook;
-pub mod workspace;
 pub mod workflow;
+pub mod workspace;

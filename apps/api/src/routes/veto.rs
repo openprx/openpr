@@ -5,7 +5,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use platform::{app::AppState, auth::JwtClaims};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -83,20 +83,13 @@ pub async fn exercise_veto(
     Path(id): Path<String>,
     Json(req): Json<ExerciseVetoRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let author_type = fetch_actor_author_type(&state, user_id).await?;
 
     let service = VetoService::new(state.db.clone());
     let event = service
-        .exercise_veto(
-            &id,
-            user_id,
-            &req.reason,
-            req.domain.as_deref(),
-            author_type,
-        )
+        .exercise_veto(&id, user_id, &req.reason, req.domain.as_deref(), author_type)
         .await?;
 
     write_veto_audit_log(
@@ -165,8 +158,7 @@ pub async fn get_veto(
     Extension(claims): Extension<JwtClaims>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let proposal_project = resolve_project_for_proposal(&state, &id).await?;
     let Some(project_id) = proposal_project else {
@@ -178,7 +170,7 @@ pub async fn get_veto(
 
     let row = VetoEventViewRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, proposal_id, vetoer_id, domain, reason,
                    status::text AS status, escalation_started_at,
                    escalation_result, escalation_votes, created_at
@@ -186,7 +178,7 @@ pub async fn get_veto(
             WHERE proposal_id = $1
             ORDER BY created_at DESC
             LIMIT 1
-        "#,
+        ",
         vec![id.into()],
     ))
     .one(&state.db)
@@ -201,8 +193,7 @@ pub async fn start_escalation(
     Extension(claims): Extension<JwtClaims>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let service = VetoService::new(state.db.clone());
     let event = service.start_escalation(&id, user_id).await?;
@@ -256,8 +247,7 @@ pub async fn withdraw_veto(
     Extension(claims): Extension<JwtClaims>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let service = VetoService::new(state.db.clone());
     let event = service.withdraw_veto(&id, user_id).await?;
@@ -313,13 +303,10 @@ pub async fn vote_escalation(
     Path(id): Path<String>,
     Json(req): Json<EscalationVoteRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let service = VetoService::new(state.db.clone());
-    let event = service
-        .cast_escalation_vote(&id, user_id, req.overturn)
-        .await?;
+    let event = service.cast_escalation_vote(&id, user_id, req.overturn).await?;
     write_veto_audit_log(
         &state,
         &id,
@@ -343,12 +330,11 @@ pub async fn list_vetoers(
     Extension(claims): Extension<JwtClaims>,
     Query(query): Query<ListVetoersQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     let mut values: Vec<sea_orm::Value> = vec![user_id.into()];
     let mut where_parts = vec![String::from(
-        r#"EXISTS (
+        r"EXISTS (
             SELECT 1
             FROM projects p
             WHERE p.id = v.project_id
@@ -366,7 +352,7 @@ pub async fn list_vetoers(
                       AND wb.id = $1
                 )
               )
-        )"#,
+        )",
     )];
     let mut idx = 2;
 
@@ -389,22 +375,18 @@ pub async fn list_vetoers(
     }
 
     let sql = format!(
-        r#"
+        r"
             SELECT v.id, v.user_id, v.project_id, v.domain, v.granted_by, v.granted_at
             FROM vetoers v
             WHERE {}
             ORDER BY v.granted_at DESC
-        "#,
+        ",
         where_parts.join(" AND ")
     );
 
-    let items = VetoerRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let items = VetoerRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+        .all(&state.db)
+        .await?;
 
     Ok(ApiResponse::success(PaginatedData::from_items(items)))
 }
@@ -414,8 +396,8 @@ pub async fn create_vetoer(
     Extension(claims): Extension<JwtClaims>,
     Json(req): Json<CreateVetoerRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let requester_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let requester_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_admin_or_owner(&state.db, req.project_id, requester_id).await? {
         return Err(ApiError::Forbidden("admin or owner required".to_string()));
@@ -440,10 +422,10 @@ pub async fn create_vetoer(
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO vetoers (user_id, project_id, domain, granted_by, granted_at)
                 VALUES ($1, $2, $3, $4, $5)
-            "#,
+            ",
             vec![
                 req.user_id.into(),
                 req.project_id.into(),
@@ -470,8 +452,8 @@ pub async fn delete_vetoer(
     Extension(claims): Extension<JwtClaims>,
     Json(req): Json<DeleteVetoerRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let requester_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let requester_id =
+        Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_admin_or_owner(&state.db, req.project_id, requester_id).await? {
         return Err(ApiError::Forbidden("admin or owner required".to_string()));
@@ -498,10 +480,7 @@ pub async fn delete_vetoer(
     Ok(ApiResponse::ok())
 }
 
-async fn resolve_project_for_proposal(
-    state: &AppState,
-    proposal_id: &str,
-) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_project_for_proposal(state: &AppState, proposal_id: &str) -> Result<Option<Uuid>, ApiError> {
     #[derive(Debug, FromQueryResult)]
     struct ProjectRow {
         project_id: Uuid,
@@ -509,13 +488,13 @@ async fn resolve_project_for_proposal(
 
     let by_issue = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.project_id
             FROM proposal_issue_links pil
             INNER JOIN work_items wi ON wi.id = pil.issue_id
             WHERE pil.proposal_id = $1
             LIMIT 1
-        "#,
+        ",
         vec![proposal_id.to_string().into()],
     ))
     .one(&state.db)
@@ -537,16 +516,14 @@ async fn resolve_project_for_proposal(
     let Some(author) = author else {
         return Ok(None);
     };
-    let author_id: String = author
-        .try_get("", "author_id")
-        .map_err(|_| ApiError::Internal)?;
+    let author_id: String = author.try_get("", "author_id").map_err(|_| ApiError::Internal)?;
     let Ok(author_uuid) = Uuid::parse_str(&author_id) else {
         return Ok(None);
     };
 
     let fallback = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.id AS project_id
             FROM projects p
             WHERE EXISTS (
@@ -563,23 +540,20 @@ async fn resolve_project_for_proposal(
                   )
             ORDER BY p.created_at DESC
             LIMIT 2
-        "#,
+        ",
         vec![author_uuid.into()],
     ))
     .all(&state.db)
     .await?;
 
     if fallback.len() == 1 {
-        Ok(Some(fallback[0].project_id))
+        Ok(fallback.first().map(|row| row.project_id))
     } else {
         Ok(None)
     }
 }
 
-async fn resolve_workspace_id_for_project(
-    state: &AppState,
-    project_id: Uuid,
-) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_workspace_id_for_project(state: &AppState, project_id: Uuid) -> Result<Option<Uuid>, ApiError> {
     #[derive(Debug, FromQueryResult)]
     struct WorkspaceRow {
         workspace_id: Uuid,
@@ -625,10 +599,7 @@ async fn write_veto_audit_log(
     .await
 }
 
-async fn fetch_actor_author_type(
-    state: &AppState,
-    user_id: Uuid,
-) -> Result<ParticipantType, ApiError> {
+async fn fetch_actor_author_type(state: &AppState, user_id: Uuid) -> Result<ParticipantType, ApiError> {
     let row = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -639,9 +610,7 @@ async fn fetch_actor_author_type(
         .await?
         .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
 
-    let entity_type: String = row
-        .try_get("", "entity_type")
-        .map_err(|_| ApiError::Internal)?;
+    let entity_type: String = row.try_get("", "entity_type").map_err(|_| ApiError::Internal)?;
 
     if entity_type == "bot" || entity_type == "ai" {
         Ok(ParticipantType::Ai)

@@ -32,9 +32,7 @@ pub async fn upload_file(
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     let upload_dir = upload_dir();
-    fs::create_dir_all(&upload_dir)
-        .await
-        .map_err(|_| ApiError::Internal)?;
+    fs::create_dir_all(&upload_dir).await.map_err(|_| ApiError::Internal)?;
 
     let content_type = headers
         .get("content-type")
@@ -69,9 +67,7 @@ pub async fn upload_file(
 }
 
 /// GET /uploads/:file_name - Serve uploaded file
-pub async fn get_uploaded_file(
-    Path(file_name): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
+pub async fn get_uploaded_file(Path(file_name): Path<String>) -> Result<impl IntoResponse, ApiError> {
     if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
         return Err(ApiError::NotFound("file not found".to_string()));
     }
@@ -141,19 +137,16 @@ fn parse_boundary(content_type: &str) -> Result<String, ApiError> {
         let trimmed = segment.trim();
         if let Some(boundary) = trimmed.strip_prefix("boundary=") {
             if boundary.is_empty() {
-                return Err(ApiError::BadRequest(
-                    "invalid multipart boundary".to_string(),
-                ));
+                return Err(ApiError::BadRequest("invalid multipart boundary".to_string()));
             }
             return Ok(boundary.trim_matches('"').to_string());
         }
     }
 
-    Err(ApiError::BadRequest(
-        "missing multipart boundary".to_string(),
-    ))
+    Err(ApiError::BadRequest("missing multipart boundary".to_string()))
 }
 
+#[allow(clippy::indexing_slicing)]
 fn extract_file_part(body: &[u8], boundary: &str) -> Result<ParsedFilePart, ApiError> {
     let boundary_marker = format!("--{boundary}");
     let boundary_bytes = boundary_marker.as_bytes();
@@ -299,7 +292,5 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
 
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    haystack.windows(needle.len()).position(|window| window == needle)
 }

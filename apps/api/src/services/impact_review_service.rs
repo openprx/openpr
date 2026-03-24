@@ -1,8 +1,7 @@
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    DbBackend, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, Statement,
-    TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -15,9 +14,7 @@ use crate::{
         proposal, review_participant,
     },
     error::ApiError,
-    services::trust_score_service::{
-        TrustScoreService, normalize_domain_key, parse_domains, parse_participant_type,
-    },
+    services::trust_score_service::{TrustScoreService, normalize_domain_key, parse_domains, parse_participant_type},
 };
 
 pub struct ImpactReviewService {
@@ -32,11 +29,6 @@ pub struct ReviewSummary {
     pub feedback_submitted_count: i64,
     pub trust_delta_total: i64,
     pub trust_delta_avg: f64,
-}
-
-#[derive(Debug, Clone, FromQueryResult)]
-struct CountRow {
-    count: i64,
 }
 
 #[derive(Debug, Clone, FromQueryResult)]
@@ -64,10 +56,7 @@ impl ImpactReviewService {
         format!("REV-{}", &Uuid::new_v4().simple().to_string()[..10])
     }
 
-    pub async fn get_by_proposal(
-        &self,
-        proposal_id: &str,
-    ) -> Result<Option<impact_review::Model>, ApiError> {
+    pub async fn get_by_proposal(&self, proposal_id: &str) -> Result<Option<impact_review::Model>, ApiError> {
         impact_review::Entity::find()
             .filter(impact_review::Column::ProposalId.eq(proposal_id))
             .one(&self.db)
@@ -75,10 +64,7 @@ impl ImpactReviewService {
             .map_err(Into::into)
     }
 
-    pub async fn get_participants(
-        &self,
-        review_id: &str,
-    ) -> Result<Vec<review_participant::Model>, ApiError> {
+    pub async fn get_participants(&self, review_id: &str) -> Result<Vec<review_participant::Model>, ApiError> {
         review_participant::Entity::find()
             .filter(review_participant::Column::ReviewId.eq(review_id))
             .all(&self.db)
@@ -89,7 +75,7 @@ impl ImpactReviewService {
     pub async fn summarize(&self, review_id: &str) -> Result<ReviewSummary, ApiError> {
         let row = SummaryRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT
                     COUNT(*)::bigint AS participants_count,
                     COUNT(*) FILTER (WHERE feedback_submitted = true)::bigint AS feedback_submitted_count,
@@ -97,7 +83,7 @@ impl ImpactReviewService {
                     COALESCE(AVG(COALESCE(trust_score_change, 0)), 0)::double precision AS trust_delta_avg
                 FROM review_participants
                 WHERE review_id = $1
-            "#,
+            ",
             vec![review_id.to_string().into()],
         ))
         .one(&self.db)
@@ -118,18 +104,6 @@ impl ImpactReviewService {
         })
     }
 
-    pub async fn schedule_review(
-        &self,
-        proposal_id: &str,
-    ) -> Result<impact_review::Model, ApiError> {
-        let tx = self.db.begin().await?;
-        let review = self
-            .schedule_review_with_conn(&tx, proposal_id, true)
-            .await?;
-        tx.commit().await?;
-        Ok(review)
-    }
-
     pub async fn create_review(
         &self,
         proposal_id: &str,
@@ -137,9 +111,7 @@ impl ImpactReviewService {
         scheduled_at: Option<chrono::DateTime<Utc>>,
     ) -> Result<impact_review::Model, ApiError> {
         let tx = self.db.begin().await?;
-        let mut review = self
-            .schedule_review_with_conn(&tx, proposal_id, false)
-            .await?;
+        let mut review = self.schedule_review_with_conn(&tx, proposal_id, false).await?;
         if reviewer_id.is_some() || scheduled_at.is_some() {
             let mut active: impact_review::ActiveModel = review.clone().into();
             if let Some(reviewer_id) = reviewer_id {
@@ -204,9 +176,7 @@ impl ImpactReviewService {
         let review = impact_review::ActiveModel {
             id: Set(Self::generate_review_id()),
             proposal_id: Set(proposal.id.clone()),
-            project_id: Set(
-                resolve_project_id_for_proposal(db, &proposal.id, &proposal.author_id).await?,
-            ),
+            project_id: Set(resolve_project_id_for_proposal(db, &proposal.id, &proposal.author_id).await?),
             status: Set(ReviewStatus::Pending),
             is_auto_triggered: Set(is_auto_triggered),
             scheduled_at: Set(scheduled_at),
@@ -216,8 +186,7 @@ impl ImpactReviewService {
         .insert(db)
         .await?;
 
-        self.populate_participants(db, &review.id, &proposal.id)
-            .await?;
+        self.populate_participants(db, &review.id, &proposal.id).await?;
         Ok(review)
     }
 
@@ -234,13 +203,13 @@ impl ImpactReviewService {
 
         let project = ProjectIdRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT wi.project_id
                 FROM proposal_issue_links pil
                 INNER JOIN work_items wi ON wi.id = pil.issue_id
                 WHERE pil.proposal_id = $1
                 LIMIT 1
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .one(db)
@@ -263,7 +232,7 @@ impl ImpactReviewService {
             + Duration::days(auto_review_days as i64);
         let all_closed_at = TimestampRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT MAX(wi.updated_at) AS value
                 FROM proposal_issue_links pil
                 INNER JOIN work_items wi ON wi.id = pil.issue_id
@@ -271,16 +240,14 @@ impl ImpactReviewService {
                 GROUP BY pil.proposal_id
                 HAVING COUNT(*) > 0
                    AND COUNT(*) FILTER (WHERE wi.state <> 'done') = 0
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .one(db)
         .await?;
 
         let from_issues = all_closed_at.map(|row| row.value + Duration::days(7));
-        Ok(from_issues
-            .map(|time| time.min(from_voting))
-            .unwrap_or(from_voting))
+        Ok(from_issues.map(|time| time.min(from_voting)).unwrap_or(from_voting))
     }
 
     async fn populate_participants<C: ConnectionTrait>(
@@ -315,23 +282,23 @@ impl ImpactReviewService {
 
         db.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO review_participants (
                     review_id, user_id, role, feedback_submitted, exercised_veto, veto_overturned
                 ) VALUES ($1, $2, 'proposer', false, false, false)
                 ON CONFLICT (review_id, user_id) DO NOTHING
-            "#,
+            ",
             vec![review_id.to_string().into(), proposal.author_id.into()],
         ))
         .await?;
 
         let votes = VoteActorRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT voter_id, choice::text AS choice
                 FROM votes
                 WHERE proposal_id = $1
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .all(db)
@@ -346,13 +313,13 @@ impl ImpactReviewService {
 
             db.execute(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"
+                r"
                     INSERT INTO review_participants (
                         review_id, user_id, role, vote_choice, feedback_submitted, exercised_veto, veto_overturned
                     ) VALUES ($1, $2, $3, $4, false, false, false)
                     ON CONFLICT (review_id, user_id)
                     DO UPDATE SET role = EXCLUDED.role, vote_choice = EXCLUDED.vote_choice
-                "#,
+                ",
                 vec![
                     review_id.to_string().into(),
                     vote.voter_id.into(),
@@ -365,12 +332,12 @@ impl ImpactReviewService {
 
         let vetoes = VetoActorRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT vetoer_id::text AS vetoer_id, status::text AS status
                 FROM veto_events
                 WHERE proposal_id = $1
                 ORDER BY created_at DESC
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .all(db)
@@ -379,7 +346,7 @@ impl ImpactReviewService {
         for veto in vetoes {
             db.execute(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                r#"
+                r"
                     INSERT INTO review_participants (
                         review_id, user_id, role, exercised_veto, veto_overturned, feedback_submitted
                     ) VALUES ($1, $2, 'vetoer', true, $3, false)
@@ -388,7 +355,7 @@ impl ImpactReviewService {
                         role = 'vetoer',
                         exercised_veto = true,
                         veto_overturned = EXCLUDED.veto_overturned
-                "#,
+                ",
                 vec![
                     review_id.to_string().into(),
                     veto.vetoer_id.into(),
@@ -467,6 +434,7 @@ impl ImpactReviewService {
         Ok(upserted)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_participant_feedback(
         &self,
         review_id: &str,
@@ -522,11 +490,7 @@ impl ImpactReviewService {
         active.update(&self.db).await.map_err(Into::into)
     }
 
-    pub async fn remove_participant(
-        &self,
-        review_id: &str,
-        user_id: String,
-    ) -> Result<(), ApiError> {
+    pub async fn remove_participant(&self, review_id: &str, user_id: String) -> Result<(), ApiError> {
         let user_id = user_id.trim().to_string();
         let deleted = review_participant::Entity::delete_many()
             .filter(review_participant::Column::ReviewId.eq(review_id))
@@ -553,13 +517,12 @@ impl ImpactReviewService {
             ));
         }
 
-        impact_review::Entity::delete_by_id(review.id)
-            .exec(&self.db)
-            .await?;
+        impact_review::Entity::delete_by_id(review.id).exec(&self.db).await?;
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn complete_review(
         &self,
         proposal_id: &str,
@@ -580,12 +543,12 @@ impl ImpactReviewService {
         }
         let locked = ReviewLockRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT id
                 FROM impact_reviews
                 WHERE proposal_id = $1
                 FOR UPDATE
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .one(&tx)
@@ -631,9 +594,7 @@ impl ImpactReviewService {
             _ => review.rating,
         };
         if final_status == ReviewStatus::Completed && final_rating.is_none() {
-            return Err(ApiError::BadRequest(
-                "completed review must include rating".to_string(),
-            ));
+            return Err(ApiError::BadRequest("completed review must include rating".to_string()));
         }
         if final_rating == Some(ReviewRating::F) {
             let mut ds = data_sources
@@ -642,7 +603,9 @@ impl ImpactReviewService {
             if !ds.is_object() {
                 ds = json!({});
             }
-            ds["repair_suggestion_required"] = json!(true);
+            if let Some(obj) = ds.as_object_mut() {
+                obj.insert("repair_suggestion_required".to_string(), json!(true));
+            }
             active.data_sources = Set(Some(ds));
         }
 
@@ -650,14 +613,9 @@ impl ImpactReviewService {
 
         let updated = active.update(&tx).await?;
 
-        if updated.status == ReviewStatus::Completed
-            && updated.rating.is_some()
-            && !updated.trust_score_applied
-        {
-            self.apply_trust_score_updates_with_conn(&tx, &updated)
-                .await?;
-            self.write_ai_learning_records_with_conn(&tx, &updated)
-                .await?;
+        if updated.status == ReviewStatus::Completed && updated.rating.is_some() && !updated.trust_score_applied {
+            self.apply_trust_score_updates_with_conn(&tx, &updated).await?;
+            self.write_ai_learning_records_with_conn(&tx, &updated).await?;
             let mut mark_applied: impact_review::ActiveModel = updated.clone().into();
             mark_applied.trust_score_applied = Set(true);
             let updated = mark_applied.update(&tx).await?;
@@ -687,11 +645,11 @@ impl ImpactReviewService {
 
         let proposal = ProposalCtxRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT author_id, author_type::text AS author_type, domains
                 FROM proposals
                 WHERE id = $1
-            "#,
+            ",
             vec![review.proposal_id.clone().into()],
         ))
         .one(db)
@@ -784,7 +742,7 @@ impl ImpactReviewService {
 
         let rows = AiLearningCandidateRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT
                     rp.user_id AS ai_participant_id,
                     COALESCE(NULLIF(trim(v.domain), ''), 'global') AS domain,
@@ -796,7 +754,7 @@ impl ImpactReviewService {
                 LEFT JOIN votes v
                        ON v.proposal_id = $2 AND v.voter_id = rp.user_id
                 WHERE rp.review_id = $3
-            "#,
+            ",
             vec![
                 review.project_id.into(),
                 review.proposal_id.clone().into(),
@@ -929,16 +887,13 @@ async fn infer_participant_type<C: ConnectionTrait>(
 
     let row = VoteTypeRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT voter_type::text AS voter_type
             FROM votes
             WHERE proposal_id = $1 AND voter_id = $2
             LIMIT 1
-        "#,
-        vec![
-            proposal_id.to_string().into(),
-            participant.user_id.clone().into(),
-        ],
+        ",
+        vec![proposal_id.to_string().into(), participant.user_id.clone().into()],
     ))
     .one(db)
     .await?;
@@ -971,13 +926,13 @@ async fn resolve_project_id_for_proposal<C: ConnectionTrait>(
 
     let direct = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.project_id
             FROM proposal_issue_links pil
             INNER JOIN work_items wi ON wi.id = pil.issue_id
             WHERE pil.proposal_id = $1
             LIMIT 1
-        "#,
+        ",
         vec![proposal_id.to_string().into()],
     ))
     .one(db)
@@ -987,19 +942,19 @@ async fn resolve_project_id_for_proposal<C: ConnectionTrait>(
         return Ok(project.project_id);
     }
 
-    let author_id = Uuid::parse_str(author_id)
-        .map_err(|_| ApiError::BadRequest("proposal author_id is not uuid".to_string()))?;
+    let author_id =
+        Uuid::parse_str(author_id).map_err(|_| ApiError::BadRequest("proposal author_id is not uuid".to_string()))?;
 
     let fallback = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.id AS project_id
             FROM projects p
             INNER JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
             WHERE wm.user_id = $1
             ORDER BY p.created_at DESC
             LIMIT 1
-        "#,
+        ",
         vec![author_id.into()],
     ))
     .one(db)

@@ -85,10 +85,7 @@ struct AiAgentCommentStatsRow {
 }
 
 fn valid_max_level(value: &str) -> bool {
-    matches!(
-        value,
-        "observer" | "advisor" | "voter" | "vetoer" | "autonomous"
-    )
+    matches!(value, "observer" | "advisor" | "voter" | "vetoer" | "autonomous")
 }
 
 pub async fn list_ai_agents(
@@ -96,8 +93,7 @@ pub async fn list_ai_agents(
     Extension(claims): Extension<JwtClaims>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_member(&state.db, project_id, user_id).await? {
         return Err(ApiError::Forbidden("project access denied".to_string()));
@@ -105,7 +101,7 @@ pub async fn list_ai_agents(
 
     let items = AiAgentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, project_id, name, model, provider, api_endpoint,
                    capabilities, domain_overrides, max_domain_level,
                    can_veto_human_consensus, reason_min_length, is_active,
@@ -113,7 +109,7 @@ pub async fn list_ai_agents(
             FROM ai_participants
             WHERE project_id = $1
             ORDER BY created_at DESC
-        "#,
+        ",
         vec![project_id.into()],
     ))
     .all(&state.db)
@@ -128,8 +124,7 @@ pub async fn create_ai_agent(
     Path(project_id): Path<Uuid>,
     Json(req): Json<CreateAiAgentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_admin_or_owner(&state.db, project_id, user_id).await? {
         return Err(ApiError::Forbidden("admin or owner required".to_string()));
@@ -145,9 +140,7 @@ pub async fn create_ai_agent(
         ));
     }
     if req.id.trim().len() > 100 {
-        return Err(ApiError::BadRequest(
-            "id length must be <= 100 characters".to_string(),
-        ));
+        return Err(ApiError::BadRequest("id length must be <= 100 characters".to_string()));
     }
 
     let max_domain_level = req
@@ -158,9 +151,7 @@ pub async fn create_ai_agent(
         return Err(ApiError::BadRequest("invalid max_domain_level".to_string()));
     }
 
-    if req.can_veto_human_consensus.unwrap_or(false)
-        && !matches!(max_domain_level.as_str(), "vetoer" | "autonomous")
-    {
+    if req.can_veto_human_consensus.unwrap_or(false) && !matches!(max_domain_level.as_str(), "vetoer" | "autonomous") {
         return Err(ApiError::BadRequest(
             "can_veto_human_consensus requires max_domain_level >= vetoer".to_string(),
         ));
@@ -172,14 +163,14 @@ pub async fn create_ai_agent(
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO ai_participants (
                     id, project_id, name, model, provider, api_endpoint,
                     capabilities, domain_overrides, max_domain_level,
                     can_veto_human_consensus, reason_min_length, is_active,
                     registered_by, created_at
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12, $13)
-            "#,
+            ",
             vec![
                 req.id.trim().to_string().into(),
                 project_id.into(),
@@ -219,8 +210,7 @@ pub async fn get_ai_agent(
     Extension(claims): Extension<JwtClaims>,
     Path((project_id, id)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_member(&state.db, project_id, user_id).await? {
         return Err(ApiError::Forbidden("project access denied".to_string()));
@@ -228,14 +218,14 @@ pub async fn get_ai_agent(
 
     let item = AiAgentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, project_id, name, model, provider, api_endpoint,
                    capabilities, domain_overrides, max_domain_level,
                    can_veto_human_consensus, reason_min_length, is_active,
                    registered_by, last_active_at, created_at
             FROM ai_participants
             WHERE project_id = $1 AND id = $2
-        "#,
+        ",
         vec![project_id.into(), id.into()],
     ))
     .one(&state.db)
@@ -251,8 +241,7 @@ pub async fn update_ai_agent(
     Path((project_id, id)): Path<(Uuid, String)>,
     Json(req): Json<UpdateAiAgentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_admin_or_owner(&state.db, project_id, user_id).await? {
         return Err(ApiError::Forbidden("admin or owner required".to_string()));
@@ -274,11 +263,11 @@ pub async fn update_ai_agent(
 
     let current = AiAgentPolicyRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT max_domain_level, can_veto_human_consensus
             FROM ai_participants
             WHERE project_id = $1 AND id = $2
-        "#,
+        ",
         vec![project_id.into(), id.clone().into()],
     ))
     .one(&state.db)
@@ -290,16 +279,12 @@ pub async fn update_ai_agent(
         .as_deref()
         .unwrap_or(&current.max_domain_level)
         .to_lowercase();
-    let merged_can_veto_human_consensus = req
-        .can_veto_human_consensus
-        .unwrap_or(current.can_veto_human_consensus);
+    let merged_can_veto_human_consensus = req.can_veto_human_consensus.unwrap_or(current.can_veto_human_consensus);
 
     if !valid_max_level(&merged_max_domain_level) {
         return Err(ApiError::BadRequest("invalid max_domain_level".to_string()));
     }
-    if merged_can_veto_human_consensus
-        && !matches!(merged_max_domain_level.as_str(), "vetoer" | "autonomous")
-    {
+    if merged_can_veto_human_consensus && !matches!(merged_max_domain_level.as_str(), "vetoer" | "autonomous") {
         return Err(ApiError::BadRequest(
             "can_veto_human_consensus requires max_domain_level >= vetoer".to_string(),
         ));
@@ -384,11 +369,7 @@ pub async fn update_ai_agent(
 
     let updated = state
         .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            sql,
-            values,
-        ))
+        .query_one(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
         .await?;
 
     if updated.is_none() {
@@ -403,8 +384,7 @@ pub async fn delete_ai_agent(
     Extension(claims): Extension<JwtClaims>,
     Path((project_id, id)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_admin_or_owner(&state.db, project_id, user_id).await? {
         return Err(ApiError::Forbidden("admin or owner required".to_string()));
@@ -431,8 +411,7 @@ pub async fn get_ai_agent_stats(
     Extension(claims): Extension<JwtClaims>,
     Path((project_id, id)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
     if !is_project_member(&state.db, project_id, user_id).await? {
         return Err(ApiError::Forbidden("project access denied".to_string()));
@@ -440,14 +419,14 @@ pub async fn get_ai_agent_stats(
 
     let agent = AiAgentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT id, project_id, name, model, provider, api_endpoint,
                    capabilities, domain_overrides, max_domain_level,
                    can_veto_human_consensus, reason_min_length, is_active,
                    registered_by, last_active_at, created_at
             FROM ai_participants
             WHERE project_id = $1 AND id = $2
-        "#,
+        ",
         vec![project_id.into(), id.clone().into()],
     ))
     .one(&state.db)
@@ -456,7 +435,7 @@ pub async fn get_ai_agent_stats(
 
     let vote_stats = AiAgentVoteStatsRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 COUNT(*)::bigint AS total_votes,
                 COUNT(*) FILTER (WHERE v.choice = 'yes')::bigint AS yes_votes,
@@ -473,7 +452,7 @@ pub async fn get_ai_agent_stats(
                   WHERE pil.proposal_id = v.proposal_id
                     AND wi.project_id = $1
               )
-        "#,
+        ",
         vec![project_id.into(), id.clone().into()],
     ))
     .one(&state.db)
@@ -482,7 +461,7 @@ pub async fn get_ai_agent_stats(
 
     let comment_stats = AiAgentCommentStatsRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT
                 COUNT(*)::bigint AS total_comments,
                 MAX(pc.created_at) AS last_commented_at
@@ -496,7 +475,7 @@ pub async fn get_ai_agent_stats(
                   WHERE pil.proposal_id = pc.proposal_id
                     AND wi.project_id = $1
               )
-        "#,
+        ",
         vec![project_id.into(), id.into()],
     ))
     .one(&state.db)

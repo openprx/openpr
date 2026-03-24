@@ -56,10 +56,7 @@ fn validate_status(status: &str) -> Result<(), ApiError> {
     }
 }
 
-fn build_auth_extensions(
-    claims: JwtClaims,
-    bot: Option<Extension<BotAuthContext>>,
-) -> axum::http::Extensions {
+fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext>>) -> axum::http::Extensions {
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -76,8 +73,7 @@ pub async fn create_sprint(
     Path(project_id): Path<Uuid>,
     Json(req): Json<CreateSprintRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     if req.name.trim().is_empty() {
@@ -125,9 +121,8 @@ pub async fn create_sprint(
 
     let start_date: Option<chrono::NaiveDate> = if let Some(s) = req.start_date {
         Some(
-            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|_| {
-                ApiError::BadRequest("invalid start_date format (use YYYY-MM-DD)".to_string())
-            })?,
+            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                .map_err(|_| ApiError::BadRequest("invalid start_date format (use YYYY-MM-DD)".to_string()))?,
         )
     } else {
         None
@@ -135,9 +130,8 @@ pub async fn create_sprint(
 
     let end_date: Option<chrono::NaiveDate> = if let Some(e) = req.end_date {
         Some(
-            chrono::NaiveDate::parse_from_str(&e, "%Y-%m-%d").map_err(|_| {
-                ApiError::BadRequest("invalid end_date format (use YYYY-MM-DD)".to_string())
-            })?,
+            chrono::NaiveDate::parse_from_str(&e, "%Y-%m-%d")
+                .map_err(|_| ApiError::BadRequest("invalid end_date format (use YYYY-MM-DD)".to_string()))?,
         )
     } else {
         None
@@ -182,8 +176,7 @@ pub async fn list_sprints(
     bot: Option<Extension<BotAuthContext>>,
     Path(project_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     #[derive(Debug, FromQueryResult)]
@@ -249,8 +242,7 @@ pub async fn update_sprint(
     Path(sprint_id): Path<Uuid>,
     Json(req): Json<UpdateSprintRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     // Get sprint's project and verify access
@@ -263,12 +255,12 @@ pub async fn update_sprint(
 
     let sprint = SprintProject::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT s.project_id, p.workspace_id, s.status
             FROM sprints s
             INNER JOIN projects p ON s.project_id = p.id
             WHERE s.id = $1
-        "#,
+        ",
         vec![sprint_id.into()],
     ))
     .one(&state.db)
@@ -294,18 +286,12 @@ pub async fn update_sprint(
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT id FROM sprints WHERE project_id = $1 AND name = $2 AND id != $3",
-                vec![
-                    sprint.project_id.into(),
-                    name.clone().into(),
-                    sprint_id.into(),
-                ],
+                vec![sprint.project_id.into(), name.clone().into(), sprint_id.into()],
             ))
             .await?;
 
         if existing.is_some() {
-            return Err(ApiError::Conflict(
-                "sprint with this name already exists".to_string(),
-            ));
+            return Err(ApiError::Conflict("sprint with this name already exists".to_string()));
         }
     }
 
@@ -358,19 +344,11 @@ pub async fn update_sprint(
 
     values.push(sprint_id.into());
 
-    let query = format!(
-        "UPDATE sprints SET {} WHERE id = ${}",
-        updates.join(", "),
-        param_idx
-    );
+    let query = format!("UPDATE sprints SET {} WHERE id = ${}", updates.join(", "), param_idx);
 
     state
         .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            &query,
-            values,
-        ))
+        .execute(Statement::from_sql_and_values(DbBackend::Postgres, &query, values))
         .await?;
 
     // Fetch updated sprint
@@ -396,36 +374,36 @@ pub async fn update_sprint(
     .await?
     .ok_or_else(|| ApiError::Internal)?;
 
-    if let Some(new_status) = requested_status {
-        if new_status != sprint.status {
-            let event = if new_status == "active" {
-                Some(WebhookEvent::SprintStarted)
-            } else if new_status == "completed" {
-                Some(WebhookEvent::SprintCompleted)
-            } else {
-                None
-            };
+    if let Some(new_status) = requested_status
+        && new_status != sprint.status
+    {
+        let event = if new_status == "active" {
+            Some(WebhookEvent::SprintStarted)
+        } else if new_status == "completed" {
+            Some(WebhookEvent::SprintCompleted)
+        } else {
+            None
+        };
 
-            if let Some(event) = event {
-                trigger_webhooks(
-                    state.clone(),
-                    TriggerContext {
-                        event,
-                        workspace_id: sprint.workspace_id,
-                        project_id: sprint.project_id,
-                        actor_id: user_id,
-                        issue_id: None,
-                        comment_id: None,
-                        label_id: None,
-                        sprint_id: Some(sprint_id),
-                        changes: Some(serde_json::json!({
-                            "status": {"old": sprint.status, "new": new_status}
-                        })),
-                        mentions: Vec::new(),
-                        extra_data: None,
-                    },
-                );
-            }
+        if let Some(event) = event {
+            trigger_webhooks(
+                state.clone(),
+                TriggerContext {
+                    event,
+                    workspace_id: sprint.workspace_id,
+                    project_id: sprint.project_id,
+                    actor_id: user_id,
+                    issue_id: None,
+                    comment_id: None,
+                    label_id: None,
+                    sprint_id: Some(sprint_id),
+                    changes: Some(serde_json::json!({
+                        "status": {"old": sprint.status, "new": new_status}
+                    })),
+                    mentions: Vec::new(),
+                    extra_data: None,
+                },
+            );
         }
     }
 
@@ -449,8 +427,7 @@ pub async fn delete_sprint(
     bot: Option<Extension<BotAuthContext>>,
     Path(sprint_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let extensions = build_auth_extensions(claims, bot);
 
     #[derive(Debug, FromQueryResult)]
@@ -460,12 +437,12 @@ pub async fn delete_sprint(
 
     let sprint = SprintWorkspace::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.workspace_id
             FROM sprints s
             INNER JOIN projects p ON s.project_id = p.id
             WHERE s.id = $1
-        "#,
+        ",
         vec![sprint_id.into()],
     ))
     .one(&state.db)

@@ -56,7 +56,7 @@ struct GetProjectInput {
 pub async fn get_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: GetProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.get_project(&input.project_id).await {
@@ -103,7 +103,7 @@ struct CreateProjectInput {
 pub async fn create_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let body = json!({
@@ -157,7 +157,7 @@ struct UpdateProjectInput {
 pub async fn update_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: UpdateProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let mut body = serde_json::Map::new();
@@ -203,13 +203,10 @@ struct DeleteProjectInput {
     project_id: String,
 }
 
-pub async fn handle_delete_project(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn handle_delete_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: DeleteProjectInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.delete_project(&input.project_id).await {

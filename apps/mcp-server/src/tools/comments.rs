@@ -29,7 +29,7 @@ struct ListCommentsInput {
 pub async fn list_comments(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: ListCommentsInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.list_comments(&input.work_item_id).await {
@@ -80,7 +80,7 @@ struct CreateCommentInput {
 pub async fn create_comment(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: CreateCommentInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     let body = json!({
@@ -97,13 +97,14 @@ pub async fn create_comment(client: &OpenPrClient, args: serde_json::Value) -> C
 }
 
 fn append_attachments_to_content(content: String, attachments: Option<Vec<String>>) -> String {
+    use std::fmt::Write as _;
     match attachments {
         Some(items) if !items.is_empty() => {
             let mut output = content;
             output.push_str("\n\n**附件：**\n");
             for url in items {
                 let name = attachment_name_from_url(&url);
-                output.push_str(&format!("- [{}]({})\n", name, url));
+                let _ = writeln!(output, "- [{name}]({url})");
             }
             output.trim_end().to_string()
         }
@@ -142,13 +143,10 @@ struct DeleteCommentInput {
     comment_id: String,
 }
 
-pub async fn handle_delete_comment(
-    client: &OpenPrClient,
-    args: serde_json::Value,
-) -> CallToolResult {
+pub async fn handle_delete_comment(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
     let input: DeleteCommentInput = match serde_json::from_value(args) {
         Ok(i) => i,
-        Err(e) => return CallToolResult::error(format!("Invalid input: {}", e)),
+        Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
     match client.delete_comment(&input.comment_id).await {

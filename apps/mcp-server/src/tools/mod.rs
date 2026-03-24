@@ -1,12 +1,12 @@
-pub(crate) mod comments;
-pub(crate) mod files;
-pub(crate) mod labels;
-pub(crate) mod members;
-pub(crate) mod projects;
-pub(crate) mod proposals;
-pub(crate) mod search;
-pub(crate) mod sprints;
-pub(crate) mod work_items;
+pub mod comments;
+pub mod files;
+pub mod labels;
+pub mod members;
+pub mod projects;
+pub mod proposals;
+pub mod search;
+pub mod sprints;
+pub mod work_items;
 
 use crate::protocol::ToolDefinition;
 

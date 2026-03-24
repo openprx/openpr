@@ -55,8 +55,7 @@ pub async fn get_workspace_activities(
     Path(workspace_id): Path<Uuid>,
     Query(query): Query<ListActivitiesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -92,13 +91,12 @@ pub async fn get_workspace_activities(
     if let Some(event_type) = query.event_type {
         where_clauses.push(format!("a.event_type = ${}", param_idx));
         values.push(event_type.into());
-        param_idx += 1;
     }
 
     let limit = query.limit.unwrap_or(50).min(200);
 
     let sql = format!(
-        r#"
+        r"
         SELECT a.id, a.resource_type, a.resource_id, a.event_type, a.actor_id,
                u.name as actor_name, u.email as actor_email,
                a.payload, a.created_at
@@ -107,7 +105,7 @@ pub async fn get_workspace_activities(
         WHERE {}
         ORDER BY a.created_at DESC
         LIMIT {}
-        "#,
+        ",
         where_clauses.join(" AND "),
         limit
     );
@@ -125,13 +123,9 @@ pub async fn get_workspace_activities(
         created_at: chrono::DateTime<chrono::Utc>,
     }
 
-    let activities = ActivityRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        &sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let activities = ActivityRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, &sql, values))
+        .all(&state.db)
+        .await?;
 
     let response: Vec<ActivityResponse> = activities
         .into_iter()
@@ -159,8 +153,7 @@ pub async fn get_project_activities(
     Path(project_id): Path<Uuid>,
     Query(query): Query<ListActivitiesQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -212,7 +205,7 @@ pub async fn get_project_activities(
     let limit = query.limit.unwrap_or(50).min(200);
 
     let sql = format!(
-        r#"
+        r"
         SELECT a.id, a.resource_type, a.resource_id, a.event_type, a.actor_id,
                u.name as actor_name, u.email as actor_email,
                a.payload, a.created_at
@@ -221,7 +214,7 @@ pub async fn get_project_activities(
         WHERE {}
         ORDER BY a.created_at DESC
         LIMIT {}
-        "#,
+        ",
         where_clauses.join(" AND "),
         limit
     );
@@ -239,13 +232,9 @@ pub async fn get_project_activities(
         created_at: chrono::DateTime<chrono::Utc>,
     }
 
-    let activities = ActivityRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        &sql,
-        values,
-    ))
-    .all(&state.db)
-    .await?;
+    let activities = ActivityRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, &sql, values))
+        .all(&state.db)
+        .await?;
 
     let response: Vec<ActivityResponse> = activities
         .into_iter()
@@ -272,8 +261,7 @@ pub async fn get_issue_activities(
     bot: Option<Extension<BotAuthContext>>,
     Path(issue_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let _user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    let _user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
     let mut extensions = axum::http::Extensions::new();
     extensions.insert(claims);
     if let Some(Extension(bot_ctx)) = bot {
@@ -287,12 +275,12 @@ pub async fn get_issue_activities(
 
     let issue = IssueWorkspace::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.workspace_id
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .one(&state.db)
@@ -314,7 +302,7 @@ pub async fn get_issue_activities(
 
     let activities = ActivityRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT a.id,
                    COALESCE(a.issue_id, a.resource_id) AS issue_id,
                    COALESCE(a.user_id, a.actor_id) AS user_id,
@@ -327,7 +315,7 @@ pub async fn get_issue_activities(
             WHERE (a.issue_id = $1) OR (a.resource_type = 'issue' AND a.resource_id = $1)
             ORDER BY a.created_at DESC
             LIMIT 100
-        "#,
+        ",
         vec![issue_id.into()],
     ))
     .all(&state.db)

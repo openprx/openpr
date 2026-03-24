@@ -1,16 +1,12 @@
 use chrono::{Duration, Utc};
-use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::Serialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    entities::trust_score::ParticipantType, error::ApiError,
-    services::impact_review_service::ImpactReviewService,
-    services::permission_service::PermissionService,
-    services::trust_score_service::normalize_domain_key,
+    entities::trust_score::ParticipantType, error::ApiError, services::impact_review_service::ImpactReviewService,
+    services::permission_service::PermissionService, services::trust_score_service::normalize_domain_key,
 };
 
 #[derive(Debug, Clone, Serialize, FromQueryResult)]
@@ -97,9 +93,7 @@ impl VetoService {
         let normalized_domain = select_veto_domain(&proposal.domains, domain);
         let project_id = resolve_project_id_for_proposal(&tx, proposal_id).await?;
         let Some(project_id) = project_id else {
-            return Err(ApiError::BadRequest(
-                "proposal project not found".to_string(),
-            ));
+            return Err(ApiError::BadRequest("proposal project not found".to_string()));
         };
 
         let can_veto = self
@@ -107,9 +101,7 @@ impl VetoService {
             .can_veto(vetoer_id, project_id, &normalized_domain, voter_type)
             .await?;
         if !can_veto {
-            return Err(ApiError::Forbidden(
-                "no veto permission in this domain".to_string(),
-            ));
+            return Err(ApiError::Forbidden("no veto permission in this domain".to_string()));
         }
 
         let has_vetoer_cache = self
@@ -133,14 +125,14 @@ impl VetoService {
 
         let inserted = VetoEventRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO veto_events (
                     proposal_id, vetoer_id, domain, reason, status, created_at
                 ) VALUES ($1, $2, $3, $4, 'active'::veto_status, $5)
                 RETURNING id, proposal_id, vetoer_id, domain, reason,
                           status::text AS status, escalation_started_at,
                           escalation_result, escalation_votes, created_at
-            "#,
+            ",
             vec![
                 proposal_id.to_string().into(),
                 vetoer_id.into(),
@@ -162,7 +154,7 @@ impl VetoService {
 
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 INSERT INTO decisions (
                     id, proposal_id, result, total_votes, yes_votes, no_votes, abstain_votes,
                     weighted_yes, weighted_no, weighted_approval_rate, is_weighted, veto_event_id, decided_at
@@ -171,7 +163,7 @@ impl VetoService {
                 SET result = 'vetoed'::decision_result,
                     veto_event_id = EXCLUDED.veto_event_id,
                     decided_at = EXCLUDED.decided_at
-            "#,
+            ",
             vec![
                 format!("DEC-{}", Uuid::new_v4()).into(),
                 proposal_id.to_string().into(),
@@ -185,15 +177,9 @@ impl VetoService {
         Ok(inserted)
     }
 
-    pub async fn start_escalation(
-        &self,
-        proposal_id: &str,
-        initiator_id: Uuid,
-    ) -> Result<VetoEventRow, ApiError> {
+    pub async fn start_escalation(&self, proposal_id: &str, initiator_id: Uuid) -> Result<VetoEventRow, ApiError> {
         let tx = self.db.begin().await?;
-        let veto = self
-            .get_active_veto_by_proposal_with_conn(&tx, proposal_id)
-            .await?;
+        let veto = self.get_active_veto_by_proposal_with_conn(&tx, proposal_id).await?;
         let Some(veto) = veto else {
             return Err(ApiError::NotFound("active veto not found".to_string()));
         };
@@ -209,9 +195,7 @@ impl VetoService {
         }
 
         if veto.status != "active" {
-            return Err(ApiError::BadRequest(
-                "only active veto can be escalated".to_string(),
-            ));
+            return Err(ApiError::BadRequest("only active veto can be escalated".to_string()));
         }
 
         if veto.escalation_started_at.is_some() {
@@ -225,14 +209,14 @@ impl VetoService {
 
         let updated = VetoEventRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 UPDATE veto_events
                 SET escalation_started_at = $2
                 WHERE id = $1
                 RETURNING id, proposal_id, vetoer_id, domain, reason,
                           status::text AS status, escalation_started_at,
                           escalation_result, escalation_votes, created_at
-            "#,
+            ",
             vec![veto.id.into(), Utc::now().into()],
         ))
         .one(&tx)
@@ -257,9 +241,7 @@ impl VetoService {
             .ok_or_else(|| ApiError::NotFound("active veto not found".to_string()))?;
 
         if veto.escalation_started_at.is_none() {
-            return Err(ApiError::BadRequest(
-                "escalation has not started".to_string(),
-            ));
+            return Err(ApiError::BadRequest("escalation has not started".to_string()));
         }
         let escalation_started_at = veto.escalation_started_at.ok_or(ApiError::Internal)?;
         if Utc::now() > escalation_started_at + Duration::hours(48) {
@@ -270,9 +252,7 @@ impl VetoService {
 
         let project_id = resolve_project_id_for_proposal(&tx, proposal_id).await?;
         let Some(project_id) = project_id else {
-            return Err(ApiError::BadRequest(
-                "proposal project not found".to_string(),
-            ));
+            return Err(ApiError::BadRequest("proposal project not found".to_string()));
         };
 
         let is_vetoer = self
@@ -293,20 +273,16 @@ impl VetoService {
             .ok_or(ApiError::Internal)?;
         ballots.insert(voter_id.to_string(), Value::Bool(overturn));
 
-        let overturn_count = ballots
-            .values()
-            .filter(|v| v.as_bool() == Some(true))
-            .count() as i64;
-        let uphold_count = ballots
-            .values()
-            .filter(|v| v.as_bool() == Some(false))
-            .count() as i64;
-        votes_json["overturned"] = Value::from(overturn_count);
-        votes_json["upheld"] = Value::from(uphold_count);
+        let overturn_count = ballots.values().filter(|v| v.as_bool() == Some(true)).count();
+        let uphold_count = ballots.values().filter(|v| v.as_bool() == Some(false)).count();
+        let overturn_count = i64::try_from(overturn_count).map_err(|_| ApiError::Internal)?;
+        let uphold_count = i64::try_from(uphold_count).map_err(|_| ApiError::Internal)?;
+        if let Some(obj) = votes_json.as_object_mut() {
+            obj.insert("overturned".to_string(), Value::from(overturn_count));
+            obj.insert("upheld".to_string(), Value::from(uphold_count));
+        }
 
-        let total_vetoers = self
-            .count_domain_vetoers(&tx, project_id, &veto.domain)
-            .await?;
+        let total_vetoers = self.count_domain_vetoers(&tx, project_id, &veto.domain).await?;
         let threshold = ((total_vetoers as f64) * (2.0 / 3.0)).ceil() as i64;
 
         let mut status = veto.status.clone();
@@ -330,7 +306,7 @@ impl VetoService {
 
         let updated = VetoEventRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 UPDATE veto_events
                 SET status = $2::veto_status,
                     escalation_result = $3,
@@ -339,7 +315,7 @@ impl VetoService {
                 RETURNING id, proposal_id, vetoer_id, domain, reason,
                           status::text AS status, escalation_started_at,
                           escalation_result, escalation_votes, created_at
-            "#,
+            ",
             vec![
                 veto.id.into(),
                 status.into(),
@@ -355,11 +331,7 @@ impl VetoService {
         Ok(updated)
     }
 
-    pub async fn withdraw_veto(
-        &self,
-        proposal_id: &str,
-        requester_id: Uuid,
-    ) -> Result<VetoEventRow, ApiError> {
+    pub async fn withdraw_veto(&self, proposal_id: &str, requester_id: Uuid) -> Result<VetoEventRow, ApiError> {
         let tx = self.db.begin().await?;
         let veto = self
             .get_active_veto_by_proposal_with_conn(&tx, proposal_id)
@@ -367,9 +339,7 @@ impl VetoService {
             .ok_or_else(|| ApiError::NotFound("active veto not found".to_string()))?;
 
         if veto.status != "active" {
-            return Err(ApiError::BadRequest(
-                "only active veto can be withdrawn".to_string(),
-            ));
+            return Err(ApiError::BadRequest("only active veto can be withdrawn".to_string()));
         }
         if veto.vetoer_id != requester_id {
             return Err(ApiError::Forbidden(
@@ -378,11 +348,7 @@ impl VetoService {
         }
 
         let timing = proposal_timing_by_id(&tx, proposal_id).await?;
-        if timing
-            .voting_ended_at
-            .map(|ended_at| ended_at <= Utc::now())
-            .unwrap_or(false)
-        {
+        if timing.voting_ended_at.is_some_and(|ended_at| ended_at <= Utc::now()) {
             return Err(ApiError::BadRequest(
                 "voting period has ended, veto cannot be withdrawn".to_string(),
             ));
@@ -400,7 +366,7 @@ impl VetoService {
 
         let updated = VetoEventRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 UPDATE veto_events
                 SET status = 'withdrawn'::veto_status,
                     escalation_result = 'withdrawn'
@@ -408,7 +374,7 @@ impl VetoService {
                 RETURNING id, proposal_id, vetoer_id, domain, reason,
                           status::text AS status, escalation_started_at,
                           escalation_result, escalation_votes, created_at
-            "#,
+            ",
             vec![veto.id.into()],
         ))
         .one(&tx)
@@ -419,14 +385,6 @@ impl VetoService {
         Ok(updated)
     }
 
-    pub async fn get_active_veto_by_proposal(
-        &self,
-        proposal_id: &str,
-    ) -> Result<Option<VetoEventRow>, ApiError> {
-        self.get_active_veto_by_proposal_with_conn(&self.db, proposal_id)
-            .await
-    }
-
     async fn get_active_veto_by_proposal_with_conn<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -434,7 +392,7 @@ impl VetoService {
     ) -> Result<Option<VetoEventRow>, ApiError> {
         VetoEventRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT id, proposal_id, vetoer_id, domain, reason,
                        status::text AS status, escalation_started_at,
                        escalation_result, escalation_votes, created_at
@@ -442,7 +400,7 @@ impl VetoService {
                 WHERE proposal_id = $1
                 ORDER BY created_at DESC
                 LIMIT 1
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .one(db)
@@ -459,13 +417,13 @@ impl VetoService {
     ) -> Result<bool, ApiError> {
         let count = VetoerCountRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT COUNT(*)::bigint AS count
                 FROM vetoers
                 WHERE user_id = $1
                   AND project_id = $2
                   AND domain = $3
-            "#,
+            ",
             vec![user_id.into(), project_id.into(), domain.to_string().into()],
         ))
         .one(db)
@@ -484,12 +442,12 @@ impl VetoService {
     ) -> Result<i64, ApiError> {
         let count = VetoerCountRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT COUNT(*)::bigint AS count
                 FROM vetoers
                 WHERE project_id = $1
                   AND domain = $2
-            "#,
+            ",
             vec![project_id.into(), domain.to_string().into()],
         ))
         .one(db)
@@ -500,21 +458,17 @@ impl VetoService {
         Ok(count)
     }
 
-    async fn has_human_vote_consensus<C: ConnectionTrait>(
-        &self,
-        db: &C,
-        proposal_id: &str,
-    ) -> Result<bool, ApiError> {
+    async fn has_human_vote_consensus<C: ConnectionTrait>(&self, db: &C, proposal_id: &str) -> Result<bool, ApiError> {
         let row = HumanVoteConsensusRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r#"
+            r"
                 SELECT
                     COUNT(*)::bigint AS total_human_votes,
                     COUNT(DISTINCT choice)::bigint AS distinct_choices
                 FROM votes
                 WHERE proposal_id = $1
                   AND voter_type = 'human'::author_type
-            "#,
+            ",
             vec![proposal_id.to_string().into()],
         ))
         .one(db)
@@ -527,10 +481,7 @@ impl VetoService {
     }
 }
 
-async fn proposal_author_with_conn<C: ConnectionTrait>(
-    db: &C,
-    proposal_id: &str,
-) -> Result<Option<Uuid>, ApiError> {
+async fn proposal_author_with_conn<C: ConnectionTrait>(db: &C, proposal_id: &str) -> Result<Option<Uuid>, ApiError> {
     #[derive(Debug, FromQueryResult)]
     struct ProposalAuthorRow {
         author_id: String,
@@ -579,13 +530,13 @@ async fn resolve_project_id_for_proposal<C: ConnectionTrait>(
 
     let direct = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT wi.project_id
             FROM proposal_issue_links pil
             INNER JOIN work_items wi ON wi.id = pil.issue_id
             WHERE pil.proposal_id = $1
             LIMIT 1
-        "#,
+        ",
         vec![proposal_id.to_string().into()],
     ))
     .one(db)
@@ -620,37 +571,34 @@ async fn resolve_project_id_for_proposal<C: ConnectionTrait>(
     // It is only safe when exactly one project matches; otherwise we return None to avoid misrouting.
     let fallback = ProjectRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT p.id AS project_id
             FROM projects p
             INNER JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
             WHERE wm.user_id = $1
             ORDER BY p.created_at DESC
             LIMIT 2
-        "#,
+        ",
         vec![author_id.into()],
     ))
     .all(db)
     .await?;
 
     if fallback.len() == 1 {
-        Ok(Some(fallback[0].project_id))
+        Ok(fallback.first().map(|row| row.project_id))
     } else {
         Ok(None)
     }
 }
 
-async fn proposal_timing_by_id<C: ConnectionTrait>(
-    db: &C,
-    proposal_id: &str,
-) -> Result<ProposalTimingRow, ApiError> {
+async fn proposal_timing_by_id<C: ConnectionTrait>(db: &C, proposal_id: &str) -> Result<ProposalTimingRow, ApiError> {
     ProposalTimingRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             SELECT voting_started_at, voting_ended_at
             FROM proposals
             WHERE id = $1
-        "#,
+        ",
         vec![proposal_id.to_string().into()],
     ))
     .one(db)
@@ -658,10 +606,7 @@ async fn proposal_timing_by_id<C: ConnectionTrait>(
     .ok_or_else(|| ApiError::NotFound("proposal not found".to_string()))
 }
 
-async fn proposal_status_after_veto_release<C: ConnectionTrait>(
-    db: &C,
-    proposal_id: &str,
-) -> Result<String, ApiError> {
+async fn proposal_status_after_veto_release<C: ConnectionTrait>(db: &C, proposal_id: &str) -> Result<String, ApiError> {
     let timing = proposal_timing_by_id(db, proposal_id).await?;
     let now = Utc::now();
     let in_voting_window = timing.voting_started_at.is_some()
@@ -676,13 +621,10 @@ async fn proposal_status_after_veto_release<C: ConnectionTrait>(
     }
 }
 
-async fn sync_decision_after_veto_release<C: ConnectionTrait>(
-    db: &C,
-    proposal_id: &str,
-) -> Result<(), ApiError> {
+async fn sync_decision_after_veto_release<C: ConnectionTrait>(db: &C, proposal_id: &str) -> Result<(), ApiError> {
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
+        r"
             UPDATE decisions d
             SET result = CASE
                     WHEN tally.weighted_yes > tally.weighted_no THEN 'approved'::decision_result
@@ -713,7 +655,7 @@ async fn sync_decision_after_veto_release<C: ConnectionTrait>(
                 WHERE proposal_id = $1
             ) AS tally
             WHERE d.proposal_id = $1
-        "#,
+        ",
         vec![proposal_id.to_string().into(), Utc::now().into()],
     ))
     .await?;
