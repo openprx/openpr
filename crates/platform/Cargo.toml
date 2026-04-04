@@ -13,5 +13,9 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 jsonwebtoken.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+temp-env = "0.3"
+
 [lints]
 workspace = true

@@ -5,6 +5,7 @@
 	import { page } from '$app/stores';
 	import { projectsApi, type Project } from '$lib/api/projects';
 	import { workspacesApi, type Workspace } from '$lib/api/workspaces';
+	import { workflowsApi, type WorkflowSummary } from '$lib/api/workflows';
 	import { toast } from '$lib/stores/toast';
 	import { goto } from '$app/navigation';
 	import Modal from '$lib/components/Modal.svelte';
@@ -30,8 +31,9 @@
 
 	let showEditModal = $state(false);
 	let editingProject = $state<Project | null>(null);
-	let editForm = $state({ name: '', description: '' });
+	let editForm = $state({ name: '', description: '', workflow_id: '' });
 	let updating = $state(false);
+	let availableWorkflows = $state<WorkflowSummary[]>([]);
 
 	let showDeleteModal = $state(false);
 	let deletingProject = $state<Project | null>(null);
@@ -123,13 +125,19 @@
 		creating = false;
 	}
 
-	function openEditModal(project: Project, event: Event) {
+	async function openEditModal(project: Project, event: Event) {
 		event.stopPropagation();
 		editingProject = project;
 		editForm = {
 			name: project.name,
-			description: project.description || ''
+			description: project.description || '',
+			workflow_id: ''
 		};
+		// Load available workflows for selection
+		const wfResponse = await workflowsApi.listByWorkspace(workspaceId);
+		if (wfResponse.code === 0 && wfResponse.data) {
+			availableWorkflows = wfResponse.data.items ?? [];
+		}
 		showEditModal = true;
 	}
 
@@ -147,11 +155,26 @@
 
 		if (response.code !== 0) {
 			toast.error(response.message);
-		} else if (response.data) {
-			toast.success(get(t)('project.updateSuccess'));
-			showEditModal = false;
-			await loadData();
+			updating = false;
+			return;
 		}
+
+		// Update project workflow if a workflow was selected
+		if (editForm.workflow_id !== '') {
+			const wfResponse = await workflowsApi.setProjectWorkflow(
+				editingProject.id,
+				editForm.workflow_id || null
+			);
+			if (wfResponse.code !== 0) {
+				toast.error(wfResponse.message);
+				updating = false;
+				return;
+			}
+		}
+
+		toast.success(get(t)('project.updateSuccess'));
+		showEditModal = false;
+		await loadData();
 
 		updating = false;
 	}
@@ -413,6 +436,21 @@
 				rows="3"
 			></textarea>
 			<p class="text-xs text-slate-400 text-right">{editForm.description.length}/350</p>
+		</div>
+		<div class="space-y-1">
+			<label class="block text-sm font-medium text-slate-700 dark:text-slate-300" for="edit-project-workflow">
+				Workflow
+			</label>
+			<select
+				id="edit-project-workflow"
+				bind:value={editForm.workflow_id}
+				class="block w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
+			>
+				<option value="">Use Workspace Default</option>
+				{#each availableWorkflows as wf (wf.id)}
+					<option value={wf.id}>{wf.name}{wf.is_system_default ? ' (System)' : ''}</option>
+				{/each}
+			</select>
 		</div>
 		<div class="text-sm text-slate-500 dark:text-slate-400">
 			<strong>{$t('project.note')}:</strong> {$t('project.keyImmutable', { values: { key: editingProject?.key } })}

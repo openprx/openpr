@@ -964,3 +964,148 @@ async fn resolve_project_id_for_proposal<C: ConnectionTrait>(
         .map(|r| r.project_id)
         .ok_or_else(|| ApiError::BadRequest("proposal project not found".to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::entities::impact_review::ReviewRating;
+
+    // ── compute_participant_delta ──────────────────────────────────────────────
+
+    #[test]
+    fn delta_proposer_s_rating_positive() {
+        // rating=S, role="proposer", no vote, no veto → base=5 + bonus=1 = 6
+        let delta = compute_participant_delta(ReviewRating::S, "proposer", None, false, false);
+        assert_eq!(delta, 6);
+    }
+
+    #[test]
+    fn delta_proposer_f_rating_negative() {
+        // rating=F, role="proposer", no vote, no veto → base=-3 + bonus=-2 = -5
+        let delta = compute_participant_delta(ReviewRating::F, "proposer", None, false, false);
+        assert_eq!(delta, -5);
+    }
+
+    #[test]
+    fn delta_voter_yes_on_a_rating_alignment_bonus() {
+        // rating=A, vote="yes" → base=3, bonus(yes+A)=+1 → 4
+        let delta = compute_participant_delta(ReviewRating::A, "voter_yes", Some("yes"), false, false);
+        assert_eq!(delta, 4);
+    }
+
+    #[test]
+    fn delta_voter_no_on_s_rating_misaligned_penalty() {
+        // rating=S, vote="no" → base=5, bonus(no+S)=-1 → 4
+        let delta = compute_participant_delta(ReviewRating::S, "voter_no", Some("no"), false, false);
+        assert_eq!(delta, 4);
+    }
+
+    #[test]
+    fn delta_voter_no_on_f_rating_alignment_bonus() {
+        // rating=F, vote="no" → base=-3, bonus(no+F)=+2 → -1
+        let delta = compute_participant_delta(ReviewRating::F, "voter_no", Some("no"), false, false);
+        assert_eq!(delta, -1);
+    }
+
+    #[test]
+    fn delta_veto_exercised_and_overturned_penalty() {
+        // rating=A (positive), exercised_veto=true, overturned=true → base=3, veto penalty=-1 → 2
+        let delta = compute_participant_delta(ReviewRating::A, "vetoer", None, true, true);
+        assert_eq!(delta, 2);
+    }
+
+    #[test]
+    fn delta_veto_exercised_not_overturned_negative_outcome_bonus() {
+        // rating=F (negative), exercised_veto=true, overturned=false → base=-3, veto bonus=+1 → -2
+        let delta = compute_participant_delta(ReviewRating::F, "vetoer", None, true, false);
+        assert_eq!(delta, -2);
+    }
+
+    #[test]
+    fn delta_veto_exercised_not_overturned_positive_outcome_no_bonus() {
+        // rating=S (positive), exercised_veto=true, overturned=false
+        // veto bonus only applies when !positive_outcome → no bonus
+        // base=5 + 0 = 5
+        let delta = compute_participant_delta(ReviewRating::S, "vetoer", None, true, false);
+        assert_eq!(delta, 5);
+    }
+
+    #[test]
+    fn delta_pure_proposer_no_vote_no_veto_b_rating() {
+        // rating=B, role="proposer", no vote, no veto → base=1 + bonus(positive)=1 = 2
+        let delta = compute_participant_delta(ReviewRating::B, "proposer", None, false, false);
+        assert_eq!(delta, 2);
+    }
+
+    #[test]
+    fn delta_non_proposer_no_vote_no_veto_c_rating() {
+        // rating=C, role="voter_abstain", no vote, no veto → base=-1 + 0 = -1
+        let delta = compute_participant_delta(ReviewRating::C, "voter_abstain", None, false, false);
+        assert_eq!(delta, -1);
+    }
+
+    // ── compute_outcome_alignment ──────────────────────────────────────────────
+
+    #[test]
+    fn alignment_s_yes_is_aligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::S, Some("yes")), "aligned");
+    }
+
+    #[test]
+    fn alignment_a_yes_is_aligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::A, Some("yes")), "aligned");
+    }
+
+    #[test]
+    fn alignment_b_yes_is_aligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::B, Some("yes")), "aligned");
+    }
+
+    #[test]
+    fn alignment_s_no_is_misaligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::S, Some("no")), "misaligned");
+    }
+
+    #[test]
+    fn alignment_a_no_is_misaligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::A, Some("no")), "misaligned");
+    }
+
+    #[test]
+    fn alignment_c_no_is_aligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::C, Some("no")), "aligned");
+    }
+
+    #[test]
+    fn alignment_f_no_is_aligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::F, Some("no")), "aligned");
+    }
+
+    #[test]
+    fn alignment_c_yes_is_misaligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::C, Some("yes")), "misaligned");
+    }
+
+    #[test]
+    fn alignment_f_yes_is_misaligned() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::F, Some("yes")), "misaligned");
+    }
+
+    #[test]
+    fn alignment_abstain_is_neutral_for_s() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::S, Some("abstain")), "neutral");
+    }
+
+    #[test]
+    fn alignment_abstain_is_neutral_for_f() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::F, Some("abstain")), "neutral");
+    }
+
+    #[test]
+    fn alignment_none_vote_is_neutral() {
+        assert_eq!(compute_outcome_alignment(ReviewRating::S, None), "neutral");
+        assert_eq!(compute_outcome_alignment(ReviewRating::F, None), "neutral");
+        assert_eq!(compute_outcome_alignment(ReviewRating::B, None), "neutral");
+    }
+}

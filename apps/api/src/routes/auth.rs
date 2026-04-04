@@ -359,3 +359,88 @@ async fn ensure_admin_user(state: &AppState, user_id: &str) -> Result<(), ApiErr
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    fn make_headers(key: axum::http::HeaderName, value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(key, HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    // ── extract_bearer_token ──────────────────────────────────────────────────
+
+    #[test]
+    fn bearer_token_standard() {
+        let headers = make_headers(header::AUTHORIZATION, "Bearer abc123");
+        assert_eq!(extract_bearer_token(&headers), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn bearer_token_trims_trailing_space() {
+        let headers = make_headers(header::AUTHORIZATION, "Bearer   mytoken  ");
+        assert_eq!(extract_bearer_token(&headers), Some("mytoken".to_string()));
+    }
+
+    #[test]
+    fn bearer_token_lowercase_bearer_returns_none() {
+        // "bearer " is not "Bearer " — case-sensitive prefix match
+        let headers = make_headers(header::AUTHORIZATION, "bearer abc123");
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn bearer_token_no_authorization_header_returns_none() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    #[test]
+    fn bearer_token_basic_scheme_returns_none() {
+        let headers = make_headers(header::AUTHORIZATION, "Basic dXNlcjpwYXNz");
+        assert_eq!(extract_bearer_token(&headers), None);
+    }
+
+    // ── extract_cookie_token ──────────────────────────────────────────────────
+
+    #[test]
+    fn cookie_single_match() {
+        let headers = make_headers(header::COOKIE, "access_token=tok123");
+        assert_eq!(extract_cookie_token(&headers, "access_token"), Some("tok123".to_string()));
+    }
+
+    #[test]
+    fn cookie_multi_find_correct_key() {
+        let headers = make_headers(header::COOKIE, "session=xyz; access_token=tok456; lang=en");
+        assert_eq!(extract_cookie_token(&headers, "access_token"), Some("tok456".to_string()));
+    }
+
+    #[test]
+    fn cookie_key_not_present_returns_none() {
+        let headers = make_headers(header::COOKIE, "session=xyz; lang=en");
+        assert_eq!(extract_cookie_token(&headers, "access_token"), None);
+    }
+
+    #[test]
+    fn cookie_no_cookie_header_returns_none() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_cookie_token(&headers, "access_token"), None);
+    }
+
+    #[test]
+    fn cookie_exact_match_no_prefix_overlap() {
+        // "access_token_ext" must NOT match key "access_token"
+        let headers = make_headers(header::COOKIE, "access_token_ext=val");
+        assert_eq!(extract_cookie_token(&headers, "access_token"), None);
+    }
+
+    #[test]
+    fn cookie_refresh_token_extracted() {
+        let headers = make_headers(header::COOKIE, "access_token=aaa; refresh_token=bbb");
+        assert_eq!(extract_cookie_token(&headers, "refresh_token"), Some("bbb".to_string()));
+    }
+}

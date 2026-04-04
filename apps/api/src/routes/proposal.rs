@@ -2571,3 +2571,147 @@ pub async fn unlink_issue(
 
     Ok(ApiResponse::ok())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calculate_result_handles_total_zero() {
+        assert_eq!(
+            calculate_result(0.0, 0.0, "simple_majority"),
+            DecisionResult::Rejected
+        );
+    }
+
+    #[test]
+    fn calculate_result_handles_simple_majority() {
+        assert_eq!(
+            calculate_result(3.0, 2.0, "simple_majority"),
+            DecisionResult::Approved
+        );
+        assert_eq!(
+            calculate_result(2.0, 3.0, "simple_majority"),
+            DecisionResult::Rejected
+        );
+        assert_eq!(
+            calculate_result(2.5, 2.5, "simple_majority"),
+            DecisionResult::Rejected
+        );
+    }
+
+    #[test]
+    fn calculate_result_handles_absolute_majority() {
+        assert_eq!(
+            calculate_result(67.0, 33.0, "absolute_majority"),
+            DecisionResult::Approved
+        );
+        assert_eq!(
+            calculate_result(66.0, 34.0, "absolute_majority"),
+            DecisionResult::Rejected
+        );
+    }
+
+    #[test]
+    fn calculate_result_handles_consensus() {
+        assert_eq!(
+            calculate_result(80.0, 20.0, "consensus"),
+            DecisionResult::Approved
+        );
+        assert_eq!(
+            calculate_result(79.0, 21.0, "consensus"),
+            DecisionResult::Rejected
+        );
+    }
+
+    #[test]
+    fn calculate_result_rejects_unknown_rule() {
+        assert_eq!(calculate_result(9.0, 1.0, "xyz"), DecisionResult::Rejected);
+    }
+
+    #[test]
+    fn validate_proposal_type_checks_allowed_values() {
+        for value in [
+            "feature",
+            "architecture",
+            "priority",
+            "resource",
+            "governance",
+            "bugfix",
+        ] {
+            assert!(validate_proposal_type(value));
+        }
+        assert!(!validate_proposal_type("other"));
+    }
+
+    #[test]
+    fn validate_status_checks_allowed_values() {
+        for value in [
+            "draft", "open", "voting", "approved", "rejected", "vetoed", "archived",
+        ] {
+            assert!(validate_status(value));
+        }
+        assert!(!validate_status("pending"));
+    }
+
+    #[test]
+    fn validate_voting_rule_checks_allowed_values() {
+        for value in ["simple_majority", "absolute_majority", "consensus"] {
+            assert!(validate_voting_rule(value));
+        }
+        assert!(!validate_voting_rule("unanimous"));
+    }
+
+    #[test]
+    fn validate_cycle_template_checks_allowed_values() {
+        for value in ["rapid", "fast", "standard", "critical"] {
+            assert!(validate_cycle_template(value));
+        }
+        assert!(!validate_cycle_template("slow"));
+    }
+
+    #[test]
+    fn validate_vote_choice_checks_allowed_values() {
+        for value in ["yes", "no", "abstain"] {
+            assert!(validate_vote_choice(value));
+        }
+        assert!(!validate_vote_choice("maybe"));
+    }
+
+    #[test]
+    fn cycle_hours_matches_templates_and_fallback() {
+        assert_eq!(cycle_hours("rapid"), (1, 1));
+        assert_eq!(cycle_hours("fast"), (24, 24));
+        assert_eq!(cycle_hours("standard"), (72, 48));
+        assert_eq!(cycle_hours("critical"), (168, 72));
+        assert_eq!(cycle_hours("other"), (1, 1));
+    }
+
+    #[test]
+    fn default_cycle_template_matches_types_and_fallback() {
+        assert_eq!(default_cycle_template("feature"), "rapid");
+        assert_eq!(default_cycle_template("priority"), "rapid");
+        assert_eq!(default_cycle_template("bugfix"), "rapid");
+        assert_eq!(default_cycle_template("architecture"), "standard");
+        assert_eq!(default_cycle_template("resource"), "standard");
+        assert_eq!(default_cycle_template("governance"), "critical");
+        assert_eq!(default_cycle_template("other"), "rapid");
+    }
+
+    #[test]
+    fn proposal_lookup_candidates_handles_uuid_and_non_uuid() {
+        let uuid = Uuid::nil().to_string();
+        let prefixed = format!("PROP-{uuid}");
+
+        let from_bare = proposal_lookup_candidates(&uuid);
+        assert!(from_bare.contains(&uuid));
+        assert!(from_bare.contains(&prefixed));
+
+        let from_prefixed = proposal_lookup_candidates(&prefixed);
+        assert!(from_prefixed.contains(&prefixed));
+        assert!(from_prefixed.contains(&uuid));
+
+        assert_eq!(proposal_lookup_candidates("abc"), vec!["abc".to_string()]);
+    }
+}

@@ -110,6 +110,18 @@
 		</Card>
 
 		<Card>
+			<div class="flex items-center justify-between">
+				<div>
+					<h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100">{$t('workflow.settingsTitle')}</h2>
+					<p class="mt-1 text-sm text-slate-600 dark:text-slate-300">{$t('workflow.settingsDesc')}</p>
+				</div>
+				<Button variant="secondary" onclick={() => goto(`/workspace/${workspaceId}/workflows`)}>
+					{$t('workflow.manageWorkflows')}
+				</Button>
+			</div>
+		</Card>
+
+		<Card>
 			<h2 class="text-lg font-semibold text-red-700">{$t('workspace.dangerZone')}</h2>
 			<p class="mt-2 text-sm text-slate-600 dark:text-slate-300">{$t('workspace.deleteDesc')}</p>
 			<div class="mt-4">

@@ -574,17 +574,28 @@
 	}
 
 	function extractMentionIds(text: string): string[] {
-		const content = text.toLowerCase();
+		let content = text.toLowerCase();
 		const ids: string[] = [];
 		const seen = new Set<string>();
 
-		for (const member of mentionCandidates) {
-			const marker = `@${member.name}`.toLowerCase();
-			if (!content.includes(marker) || seen.has(member.user_id)) {
+		// Sort by name length descending to match longest names first
+		const sorted = [...mentionCandidates].sort(
+			(a, b) => b.name.length - a.name.length
+		);
+
+		for (const member of sorted) {
+			const name = member.name.toLowerCase();
+			const marker = `@${name}`;
+			// Word-boundary check: marker must be followed by non-word char or end
+			const escapedMarker = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+			const regex = new RegExp(`${escapedMarker}(?=[\\s\\n,;.!?)\\]}>]|$)`, 'i');
+			if (!regex.test(content) || seen.has(member.user_id)) {
 				continue;
 			}
 			seen.add(member.user_id);
 			ids.push(member.user_id);
+			// Remove matched mention to prevent substring re-matching
+			content = content.replace(regex, '');
 		}
 
 		return ids;

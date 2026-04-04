@@ -599,3 +599,91 @@ pub async fn is_system_admin(db: &DatabaseConnection, user_id: Uuid) -> Result<b
 
     Ok(is_admin)
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::entities::trust_score::ParticipantType;
+    use serde_json::json;
+
+    #[test]
+    fn trust_level_from_score_boundaries() {
+        assert_eq!(TrustLevel::from_score(i32::MIN), TrustLevel::Observer);
+        assert_eq!(TrustLevel::from_score(-1), TrustLevel::Observer);
+        assert_eq!(TrustLevel::from_score(0), TrustLevel::Observer);
+        assert_eq!(TrustLevel::from_score(49), TrustLevel::Observer);
+        assert_eq!(TrustLevel::from_score(50), TrustLevel::Advisor);
+        assert_eq!(TrustLevel::from_score(99), TrustLevel::Advisor);
+        assert_eq!(TrustLevel::from_score(100), TrustLevel::Voter);
+        assert_eq!(TrustLevel::from_score(199), TrustLevel::Voter);
+        assert_eq!(TrustLevel::from_score(200), TrustLevel::Vetoer);
+        assert_eq!(TrustLevel::from_score(299), TrustLevel::Vetoer);
+        assert_eq!(TrustLevel::from_score(300), TrustLevel::Autonomous);
+        assert_eq!(TrustLevel::from_score(i32::MAX), TrustLevel::Autonomous);
+    }
+
+    #[test]
+    fn trust_level_vote_weight_for_score_boundaries() {
+        let cases = [
+            (0, 0.5),
+            (100, 1.0),
+            (200, 1.5),
+            (300, 2.0),
+            (-100, 0.5),
+            (500, 2.0),
+        ];
+
+        for (score, expected) in cases {
+            let result = TrustLevel::vote_weight_for_score(score);
+            assert!((result - expected).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn proposal_score_delta_both_branches() {
+        assert_eq!(TrustScoreService::proposal_score_delta(true), 2);
+        assert_eq!(TrustScoreService::proposal_score_delta(false), -1);
+    }
+
+    #[test]
+    fn normalize_domain_key_boundaries() {
+        assert_eq!(normalize_domain_key("  HeLLo  "), "hello");
+        assert_eq!(normalize_domain_key("A/B.C"), "a_b_c");
+        assert_eq!(normalize_domain_key(""), "");
+        assert_eq!(normalize_domain_key("  中文Domain  "), "__domain");
+    }
+
+    #[test]
+    fn scoped_domain_id_format() {
+        let project_id = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let result = scoped_domain_id(project_id, "  Core/Domain ");
+
+        assert_eq!(result, "123e4567-core_domain");
+        let parts: Vec<&str> = result.splitn(2, '-').collect();
+        assert_eq!(parts.len(), 2);
+        let prefix = parts.first().copied().unwrap_or("");
+        assert_eq!(prefix.len(), 8);
+        assert!(prefix.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn parse_domains_boundaries() {
+        let normal = json!(["alpha", "beta"]);
+        assert_eq!(parse_domains(&normal), vec!["alpha", "beta"]);
+
+        let not_array = json!({"k": "v"});
+        assert!(parse_domains(&not_array).is_empty());
+
+        let mixed = json!(["ok", 1, true, null, {"a": 1}, "still_ok"]);
+        assert_eq!(parse_domains(&mixed), vec!["ok", "still_ok"]);
+    }
+
+    #[test]
+    fn parse_participant_type_boundaries() {
+        assert_eq!(parse_participant_type("ai"), ParticipantType::Ai);
+        assert_eq!(parse_participant_type("human"), ParticipantType::Human);
+        assert_eq!(parse_participant_type("bot"), ParticipantType::Human);
+        assert_eq!(parse_participant_type(""), ParticipantType::Human);
+    }
+}

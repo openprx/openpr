@@ -226,3 +226,121 @@ fn level_rank(level: TrustLevel) -> i32 {
         TrustLevel::Autonomous => 4,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use crate::{entities::trust_score::ParticipantType, services::trust_score_service::TrustLevel};
+
+    // ── parse_level ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_level_observer() {
+        assert_eq!(parse_level("observer"), TrustLevel::Observer);
+    }
+
+    #[test]
+    fn parse_level_advisor() {
+        assert_eq!(parse_level("advisor"), TrustLevel::Advisor);
+    }
+
+    #[test]
+    fn parse_level_voter() {
+        assert_eq!(parse_level("voter"), TrustLevel::Voter);
+    }
+
+    #[test]
+    fn parse_level_vetoer() {
+        assert_eq!(parse_level("vetoer"), TrustLevel::Vetoer);
+    }
+
+    #[test]
+    fn parse_level_autonomous() {
+        assert_eq!(parse_level("autonomous"), TrustLevel::Autonomous);
+    }
+
+    #[test]
+    fn parse_level_unknown_fallback_observer() {
+        assert_eq!(parse_level("unknown"), TrustLevel::Observer);
+        assert_eq!(parse_level(""), TrustLevel::Observer);
+        assert_eq!(parse_level("VOTER"), TrustLevel::Observer);
+    }
+
+    // ── level_rank ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn level_rank_observer_is_zero() {
+        assert_eq!(level_rank(TrustLevel::Observer), 0);
+    }
+
+    #[test]
+    fn level_rank_advisor_is_one() {
+        assert_eq!(level_rank(TrustLevel::Advisor), 1);
+    }
+
+    #[test]
+    fn level_rank_voter_is_two() {
+        assert_eq!(level_rank(TrustLevel::Voter), 2);
+    }
+
+    #[test]
+    fn level_rank_vetoer_is_three() {
+        assert_eq!(level_rank(TrustLevel::Vetoer), 3);
+    }
+
+    #[test]
+    fn level_rank_autonomous_is_four() {
+        assert_eq!(level_rank(TrustLevel::Autonomous), 4);
+    }
+
+    #[test]
+    fn level_rank_strictly_increasing() {
+        assert!(level_rank(TrustLevel::Observer) < level_rank(TrustLevel::Advisor));
+        assert!(level_rank(TrustLevel::Advisor) < level_rank(TrustLevel::Voter));
+        assert!(level_rank(TrustLevel::Voter) < level_rank(TrustLevel::Vetoer));
+        assert!(level_rank(TrustLevel::Vetoer) < level_rank(TrustLevel::Autonomous));
+    }
+
+    // ── min_level ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn min_level_returns_lower_when_left_is_lower() {
+        assert_eq!(min_level(TrustLevel::Observer, TrustLevel::Autonomous), TrustLevel::Observer);
+    }
+
+    #[test]
+    fn min_level_returns_lower_when_right_is_lower() {
+        assert_eq!(min_level(TrustLevel::Autonomous, TrustLevel::Advisor), TrustLevel::Advisor);
+    }
+
+    #[test]
+    fn min_level_same_returns_that_level() {
+        assert_eq!(min_level(TrustLevel::Voter, TrustLevel::Voter), TrustLevel::Voter);
+    }
+
+    #[test]
+    fn min_level_observer_beats_all() {
+        for level in [
+            TrustLevel::Advisor,
+            TrustLevel::Voter,
+            TrustLevel::Vetoer,
+            TrustLevel::Autonomous,
+        ] {
+            assert_eq!(min_level(TrustLevel::Observer, level), TrustLevel::Observer);
+            assert_eq!(min_level(level, TrustLevel::Observer), TrustLevel::Observer);
+        }
+    }
+
+    // ── participant_type_str ──────────────────────────────────────────────────
+
+    #[test]
+    fn participant_type_str_ai() {
+        assert_eq!(participant_type_str(ParticipantType::Ai), "ai");
+    }
+
+    #[test]
+    fn participant_type_str_human() {
+        assert_eq!(participant_type_str(ParticipantType::Human), "human");
+    }
+}
