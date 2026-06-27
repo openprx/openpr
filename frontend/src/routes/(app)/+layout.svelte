@@ -64,10 +64,12 @@
 		if (/^\/workspace\/[^/]+\/settings$/.test(pathname)) return $t('pageTitle.workspaceSettings');
 		if (/^\/workspace\/[^/]+\/members$/.test(pathname)) return $t('pageTitle.workspaceMembers');
 		if (/^\/workspace\/[^/]+\/webhooks$/.test(pathname)) return $t('pageTitle.workspaceWebhooks');
+		if (/^\/workspace\/[^/]+\/connections$/.test(pathname)) return $t('pageTitle.workspaceConnections');
 		if (/^\/workspace\/[^/]+\/projects\/[^/]+\/issues\/[^/]+$/.test(pathname)) return $t('pageTitle.issueDetail');
 		if (/^\/workspace\/[^/]+\/projects\/[^/]+\/issues$/.test(pathname)) return $t('pageTitle.issueList');
 		if (/^\/workspace\/[^/]+\/projects\/[^/]+\/board$/.test(pathname)) return $t('pageTitle.projectBoard');
 		if (/^\/workspace\/[^/]+\/projects\/[^/]+\/cycles$/.test(pathname)) return $t('pageTitle.projectCycles');
+		if (/^\/workspace\/[^/]+\/projects\/[^/]+\/forms$/.test(pathname)) return $t('pageTitle.projectForms');
 		if (/^\/workspace\/[^/]+\/projects\/[^/]+$/.test(pathname)) return $t('pageTitle.projectDetail');
 		if (/^\/workspace\/[^/]+\/projects$/.test(pathname)) return $t('pageTitle.workspaceProjects');
 
@@ -91,6 +93,7 @@
 			links.push(
 				{ href: `/workspace/${currentWorkspaceId}/members`, label: $t('nav.members') },
 				{ href: `/workspace/${currentWorkspaceId}/webhooks`, label: $t('nav.webhook') },
+				{ href: `/workspace/${currentWorkspaceId}/connections`, label: $t('nav.connections') },
 				{ href: `/workspace/${currentWorkspaceId}/settings`, label: $t('nav.workspaceSettings') }
 			);
 		}

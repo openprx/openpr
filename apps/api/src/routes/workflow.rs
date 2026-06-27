@@ -171,7 +171,9 @@ fn validate_state_key(key: &str) -> Result<(), ApiError> {
         ));
     }
     let mut chars = key.chars();
-    let first = chars.next().ok_or_else(|| ApiError::BadRequest("state key is empty".to_string()))?;
+    let first = chars
+        .next()
+        .ok_or_else(|| ApiError::BadRequest("state key is empty".to_string()))?;
     if !first.is_ascii_lowercase() {
         return Err(ApiError::BadRequest(
             "state key must start with a lowercase letter".to_string(),
@@ -500,9 +502,8 @@ pub async fn update_workflow(
 
     let (_id, workspace_id_opt) = get_editable_workflow(&state, workflow_id).await?;
 
-    let workspace_id = workspace_id_opt.ok_or_else(|| {
-        ApiError::Forbidden("system default workflow cannot be modified".to_string())
-    })?;
+    let workspace_id = workspace_id_opt
+        .ok_or_else(|| ApiError::Forbidden("system default workflow cannot be modified".to_string()))?;
 
     require_workspace_access(&state, &extensions, workspace_id).await?;
 
@@ -621,9 +622,8 @@ pub async fn delete_workflow(
 
     let (_id, workspace_id_opt) = get_editable_workflow(&state, workflow_id).await?;
 
-    let workspace_id = workspace_id_opt.ok_or_else(|| {
-        ApiError::Forbidden("system default workflow cannot be deleted".to_string())
-    })?;
+    let workspace_id =
+        workspace_id_opt.ok_or_else(|| ApiError::Forbidden("system default workflow cannot be deleted".to_string()))?;
 
     require_workspace_access(&state, &extensions, workspace_id).await?;
 
@@ -661,9 +661,7 @@ pub async fn delete_workflow(
         .await?;
 
     if workspace_ref.is_some() {
-        return Err(ApiError::Conflict(
-            "workflow is set as workspace default".to_string(),
-        ));
+        return Err(ApiError::Conflict("workflow is set as workspace default".to_string()));
     }
 
     // workflow_states will cascade-delete
@@ -768,9 +766,8 @@ pub async fn create_workflow_state(
 
     let (_id, workspace_id_opt) = get_editable_workflow(&state, workflow_id).await?;
 
-    let workspace_id = workspace_id_opt.ok_or_else(|| {
-        ApiError::Forbidden("cannot add states to system default workflow".to_string())
-    })?;
+    let workspace_id = workspace_id_opt
+        .ok_or_else(|| ApiError::Forbidden("cannot add states to system default workflow".to_string()))?;
 
     require_workspace_access(&state, &extensions, workspace_id).await?;
 
@@ -921,9 +918,9 @@ pub async fn update_workflow_state(
         ));
     }
 
-    let workspace_id = ctx.workspace_id.ok_or_else(|| {
-        ApiError::Forbidden("cannot modify states of system default workflow".to_string())
-    })?;
+    let workspace_id = ctx
+        .workspace_id
+        .ok_or_else(|| ApiError::Forbidden("cannot modify states of system default workflow".to_string()))?;
 
     require_workspace_access(&state, &extensions, workspace_id).await?;
 
@@ -1006,7 +1003,11 @@ pub async fn update_workflow_state(
 
     values.push(state_id.into());
 
-    let query = format!("UPDATE workflow_states SET {} WHERE id = ${}", updates.join(", "), param_idx);
+    let query = format!(
+        "UPDATE workflow_states SET {} WHERE id = ${}",
+        updates.join(", "),
+        param_idx
+    );
     state
         .db
         .execute(Statement::from_sql_and_values(DbBackend::Postgres, &query, values))
@@ -1084,9 +1085,9 @@ pub async fn delete_workflow_state(
         ));
     }
 
-    let workspace_id = ctx.workspace_id.ok_or_else(|| {
-        ApiError::Forbidden("cannot delete states of system default workflow".to_string())
-    })?;
+    let workspace_id = ctx
+        .workspace_id
+        .ok_or_else(|| ApiError::Forbidden("cannot delete states of system default workflow".to_string()))?;
 
     require_workspace_access(&state, &extensions, workspace_id).await?;
 
@@ -1113,9 +1114,7 @@ pub async fn delete_workflow_state(
     .ok_or(ApiError::Internal)?;
 
     if count_row.cnt <= 2 {
-        return Err(ApiError::Conflict(
-            "workflow must have at least 2 states".to_string(),
-        ));
+        return Err(ApiError::Conflict("workflow must have at least 2 states".to_string()));
     }
 
     state
@@ -1143,9 +1142,8 @@ pub async fn reorder_workflow_states(
 
     let (_id, workspace_id_opt) = get_editable_workflow(&state, workflow_id).await?;
 
-    let workspace_id = workspace_id_opt.ok_or_else(|| {
-        ApiError::Forbidden("cannot reorder states of system default workflow".to_string())
-    })?;
+    let workspace_id = workspace_id_opt
+        .ok_or_else(|| ApiError::Forbidden("cannot reorder states of system default workflow".to_string()))?;
 
     require_workspace_access(&state, &extensions, workspace_id).await?;
 
@@ -1244,8 +1242,7 @@ pub async fn set_project_workflow(
         .await?
         .ok_or_else(|| ApiError::NotFound("workflow not found".to_string()))?;
 
-        let belongs = wf.is_system_default
-            || wf.workspace_id == Some(project.workspace_id);
+        let belongs = wf.is_system_default || wf.workspace_id == Some(project.workspace_id);
 
         if !belongs {
             return Err(ApiError::Forbidden(

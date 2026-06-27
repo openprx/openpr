@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/openpr-universal-forms-release-gate.schema.json",
+  "title": "OpenPR Universal Forms Release Gate JSON",
+  "description": "Machine-readable output emitted by scripts/gate-universal-forms-release.sh --json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "reports",
+    "mode",
+    "release_allowed",
+    "reason",
+    "stage",
+    "automated_checks",
+    "failed_automated_checks",
+    "non_manual_unresolved_items",
+    "manual_signoff_pending_rows",
+    "next_manual_signoff_key",
+    "final_acceptance_complete",
+    "manual_final_signoff_allowed",
+    "development_final_release_allowed",
+    "tracker_status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.release_gate.v1"
+    },
+    "schema_path": {
+      "type": "string",
+      "pattern": "/docs/schemas/openpr-universal-forms-release-gate\\.schema\\.json$"
+    },
+    "reports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "readiness_json",
+        "development_status_json",
+        "signoff_status_json",
+        "evidence",
+        "runbook"
+      ],
+      "properties": {
+        "readiness_json": { "type": "string", "minLength": 1 },
+        "development_status_json": { "type": "string", "minLength": 1 },
+        "signoff_status_json": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "runbook": { "type": "string", "minLength": 1 }
+      }
+    },
+    "mode": {
+      "enum": ["blocked", "pre_signoff", "release"]
+    },
+    "release_allowed": {
+      "type": "boolean"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stage": {
+      "type": "string",
+      "minLength": 1
+    },
+    "automated_checks": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "failed_automated_checks": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "non_manual_unresolved_items": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "manual_signoff_pending_rows": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_manual_signoff_key": {
+      "anyOf": [
+        { "$ref": "#/$defs/manual_key" },
+        { "const": "" }
+      ]
+    },
+    "final_acceptance_complete": {
+      "type": "boolean"
+    },
+    "manual_final_signoff_allowed": {
+      "type": "boolean"
+    },
+    "development_final_release_allowed": {
+      "type": "boolean"
+    },
+    "tracker_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "end_to_end_acceptance",
+        "user_side_manual_acceptance"
+      ],
+      "properties": {
+        "end_to_end_acceptance": { "type": "string", "minLength": 1 },
+        "user_side_manual_acceptance": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "$defs": {
+    "manual_key": {
+      "enum": [
+        "restaurant_template",
+        "frontend_usability",
+        "amounts",
+        "workflow",
+        "hub_consistency",
+        "docs",
+        "overall"
+      ]
+    }
+  }
+}

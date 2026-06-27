@@ -1,0 +1,34 @@
+package openpr:plugin@1.0.0;
+
+/// OpenPR plugin ABI v1.
+///
+/// Current runtime support uses the equivalent core WebAssembly ABI:
+///
+/// - export `memory`
+/// - export `openpr_alloc(len: i32) -> i32`
+/// - export `openpr_invoke(ptr: i32, len: i32) -> i64`
+/// - optionally export `openpr_plugin_abi_version() -> i32`, returning `1`
+///
+/// `openpr_invoke` receives UTF-8 JSON bytes and returns a packed pointer/length:
+///
+/// - high 32 bits: output pointer
+/// - low 32 bits: output length
+///
+/// The output must be UTF-8 JSON. Amount and decimal values must remain strings.
+interface plugin {
+  record invocation-input {
+    hook-kind: string,
+    plugin-key: string,
+    payload-json: string,
+  }
+
+  record invocation-output {
+    output-json: string,
+  }
+
+  invoke: func(input: invocation-input) -> result<invocation-output, string>;
+}
+
+world openpr-plugin {
+  export plugin;
+}

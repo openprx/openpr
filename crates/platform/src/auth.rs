@@ -123,7 +123,9 @@ mod tests {
     fn test_issue_and_verify_refresh_token() {
         // 正常签发 refresh token 后应能通过 verify_refresh_token 验证
         let mgr = make_manager();
-        let token = mgr.issue_refresh_token("user-2", "user2@example.com").expect("签发失败");
+        let token = mgr
+            .issue_refresh_token("user-2", "user2@example.com")
+            .expect("签发失败");
         let claims = mgr.verify_refresh_token(&token).expect("验证失败");
         assert_eq!(claims.sub, "user-2");
         assert_eq!(claims.email, "user2@example.com");
@@ -148,10 +150,7 @@ mod tests {
         assert!(claims.iat <= after, "iat 不应晚于签发后");
         // exp 应比 iat 大约多 3600 秒（允许 ±2 秒误差）
         let delta = claims.exp.saturating_sub(claims.iat);
-        assert!(
-            (3598..=3602).contains(&delta),
-            "exp-iat 偏差过大: {delta}"
-        );
+        assert!((3598..=3602).contains(&delta), "exp-iat 偏差过大: {delta}");
     }
 
     // ── Token 类型混用拒绝 ────────────────────────────────────────────────────
@@ -272,10 +271,7 @@ mod tests {
         let token = mgr.issue_access_token("u", "u@x.com").expect("签发失败");
         let claims = mgr.verify_access_token(&token).expect("验证失败");
         // exp 应远大于 iat
-        assert!(
-            claims.exp > claims.iat,
-            "大 TTL 下 exp 应大于 iat"
-        );
+        assert!(claims.exp > claims.iat, "大 TTL 下 exp 应大于 iat");
     }
 
     // ── Unicode / 特殊字符 round-trip ─────────────────────────────────────────

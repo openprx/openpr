@@ -20,7 +20,21 @@ impl AppConfig {
         let bind_addr = env::var("BIND_ADDR").unwrap_or_else(|_| default_bind.to_string());
         let database_url =
             env::var("DATABASE_URL").map_err(|_| AppError::Config("DATABASE_URL is required".to_string()))?;
+        if database_url.trim().is_empty() || database_url.contains("${") || database_url.contains("replace_with") {
+            return Err(AppError::Config(
+                "DATABASE_URL must be a concrete database URL".to_string(),
+            ));
+        }
         let jwt_secret = env::var("JWT_SECRET").map_err(|_| AppError::Config("JWT_SECRET is required".to_string()))?;
+        if jwt_secret.trim().is_empty()
+            || jwt_secret.contains("${")
+            || jwt_secret == "change-me-in-production"
+            || jwt_secret.contains("replace_with")
+        {
+            return Err(AppError::Config(
+                "JWT_SECRET must be a concrete deployment secret".to_string(),
+            ));
+        }
         let jwt_access_ttl_seconds = env::var("JWT_ACCESS_TTL_SECONDS")
             .ok()
             .and_then(|v| v.parse::<i64>().ok())
@@ -111,6 +125,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_from_env_rejects_placeholder_database_url() {
+        for database_url in [
+            "",
+            "postgres://openpr:replace_with_postgres_password@localhost:5432/openpr",
+            "postgres://openpr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for PostgreSQL}@postgres:5432/openpr",
+        ] {
+            temp_env::with_vars(
+                [
+                    ("DATABASE_URL", Some(database_url)),
+                    ("JWT_SECRET", Some("secret")),
+                    ("APP_NAME", None::<&str>),
+                    ("BIND_ADDR", None::<&str>),
+                    ("JWT_ACCESS_TTL_SECONDS", None::<&str>),
+                    ("JWT_REFRESH_TTL_SECONDS", None::<&str>),
+                    ("DEFAULT_AUTHOR_ID", None::<&str>),
+                ],
+                || {
+                    let result = AppConfig::from_env("app", "0.0.0.0:8080");
+                    assert!(result.is_err(), "placeholder DATABASE_URL should fail: {database_url}");
+                    let err_msg = result.unwrap_err().to_string();
+                    assert!(
+                        err_msg.contains("DATABASE_URL must be a concrete database URL"),
+                        "错误信息应说明 DATABASE_URL 不是可投产地址，实际: {err_msg}"
+                    );
+                },
+            );
+        }
+    }
+
     /// 缺少 JWT_SECRET 时应返回 Config 错误
     #[test]
     fn test_from_env_missing_jwt_secret() {
@@ -134,6 +178,37 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn test_from_env_rejects_placeholder_jwt_secret() {
+        for secret in [
+            "",
+            "change-me-in-production",
+            "replace_with_long_random_secret",
+            "${JWT_SECRET:?set JWT_SECRET for OpenPR services}",
+        ] {
+            temp_env::with_vars(
+                [
+                    ("DATABASE_URL", Some("postgres://localhost/db")),
+                    ("JWT_SECRET", Some(secret)),
+                    ("APP_NAME", None::<&str>),
+                    ("BIND_ADDR", None::<&str>),
+                    ("JWT_ACCESS_TTL_SECONDS", None::<&str>),
+                    ("JWT_REFRESH_TTL_SECONDS", None::<&str>),
+                    ("DEFAULT_AUTHOR_ID", None::<&str>),
+                ],
+                || {
+                    let result = AppConfig::from_env("app", "0.0.0.0:8080");
+                    assert!(result.is_err(), "placeholder JWT_SECRET should fail: {secret}");
+                    let err_msg = result.unwrap_err().to_string();
+                    assert!(
+                        err_msg.contains("JWT_SECRET must be a concrete deployment secret"),
+                        "错误信息应说明 JWT_SECRET 不是可投产密钥，实际: {err_msg}"
+                    );
+                },
+            );
+        }
     }
 
     /// 未设置 APP_NAME 时应使用传入的 default_name 参数
@@ -233,14 +308,8 @@ mod tests {
             ],
             || {
                 let cfg = AppConfig::from_env("app", "0.0.0.0:8080").expect("应成功");
-                assert_eq!(
-                    cfg.jwt_access_ttl_seconds, 1_296_000,
-                    "非法 access TTL 应回退默认值"
-                );
-                assert_eq!(
-                    cfg.jwt_refresh_ttl_seconds, 1_728_000,
-                    "非法 refresh TTL 应回退默认值"
-                );
+                assert_eq!(cfg.jwt_access_ttl_seconds, 1_296_000, "非法 access TTL 应回退默认值");
+                assert_eq!(cfg.jwt_refresh_ttl_seconds, 1_728_000, "非法 refresh TTL 应回退默认值");
             },
         );
     }
@@ -262,10 +331,7 @@ mod tests {
             || {
                 let cfg = AppConfig::from_env("app", "0.0.0.0:8080").expect("应成功");
                 assert!(cfg.default_author_id.is_some(), "合法 UUID 应被解析");
-                assert_eq!(
-                    cfg.default_author_id.unwrap().to_string(),
-                    uuid_str
-                );
+                assert_eq!(cfg.default_author_id.unwrap().to_string(), uuid_str);
             },
         );
     }

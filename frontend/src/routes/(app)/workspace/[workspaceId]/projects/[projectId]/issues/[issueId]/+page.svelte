@@ -1191,7 +1191,7 @@
 							disabled={updatingField !== null}
 						/>
 						<div class="space-y-1">
-							<p class="text-sm font-medium text-slate-700 dark:text-slate-300">Sprint</p>
+							<p class="text-sm font-medium text-slate-700 dark:text-slate-300">{$t('issue.sprint')}</p>
 							{#if currentSprintName && currentSprintName !== $t('issue.noSprint')}
 								<span class="inline-flex items-center rounded-full px-3 py-1 text-sm font-medium bg-indigo-50 text-indigo-700 border border-indigo-200">
 									<svg class="mr-1.5 h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">

@@ -8,9 +8,7 @@
 	import { isAdminUser } from '$lib/utils/auth';
 	import Card from '$lib/components/Card.svelte';
 	import Input from '$lib/components/Input.svelte';
-	import Button from '$lib/components/Button.svelte';
 
-	let saving = $state(false);
 	let basicSettings = $state({
 		siteName: 'OpenPR',
 		siteUrl: 'https://openpr.local',
@@ -29,13 +27,6 @@
 			goto('/workspace');
 		}
 	});
-
-	async function saveSettings() {
-		saving = true;
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		toast.success(get(t)('admin.settingsSavedPlaceholder'));
-		saving = false;
-	}
 </script>
 
 <div class="mx-auto max-w-5xl space-y-6">
@@ -47,13 +38,14 @@
 	<Card>
 		<h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100">{$t('admin.basicSettings')}</h2>
 		<div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
-			<Input label={$t('admin.siteName')} bind:value={basicSettings.siteName} />
-			<Input label={$t('admin.siteUrl')} bind:value={basicSettings.siteUrl} />
+			<Input label={$t('admin.siteName')} bind:value={basicSettings.siteName} disabled />
+			<Input label={$t('admin.siteUrl')} bind:value={basicSettings.siteUrl} disabled />
 			<div class="md:col-span-2">
 				<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300" for="allowWorkspaceCreate">{$t('admin.workspaceCreatePermission')}</label>
 				<select
 					id="allowWorkspaceCreate"
 					bind:value={basicSettings.allowWorkspaceCreate}
+					disabled
 					class="w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
 				>
 					<option value="admin_only">{$t('admin.adminOnly')}</option>
@@ -66,16 +58,16 @@
 	<Card>
 		<h2 class="text-lg font-semibold text-slate-900 dark:text-slate-100">{$t('admin.securitySettings')}</h2>
 		<div class="mt-4 grid grid-cols-1 gap-4 md:grid-cols-3">
-			<Input label={$t('admin.minPasswordLength')} type="number" bind:value={securitySettings.passwordMinLength} />
-			<Input label={$t('admin.sessionHours')} type="number" bind:value={securitySettings.sessionHours} />
+			<Input label={$t('admin.minPasswordLength')} type="number" bind:value={securitySettings.passwordMinLength} disabled />
+			<Input label={$t('admin.sessionHours')} type="number" bind:value={securitySettings.sessionHours} disabled />
 			<label class="flex items-center gap-2 rounded-md border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm text-slate-700 dark:text-slate-300">
-				<input type="checkbox" bind:checked={securitySettings.requireStrongPassword} />
+				<input type="checkbox" bind:checked={securitySettings.requireStrongPassword} disabled />
 				{$t('admin.strongPasswordPolicy')}
 			</label>
 		</div>
 	</Card>
 
-	<div class="flex justify-end">
-		<Button loading={saving} onclick={saveSettings}>{$t('settings.save')}</Button>
+	<div class="rounded-md border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300">
+		{$t('admin.settingsReadOnly')}
 	</div>
 </div>

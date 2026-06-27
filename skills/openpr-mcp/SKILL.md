@@ -1,6 +1,6 @@
 ---
 name: openpr-mcp
-description: Manage projects, issues, sprints, labels, comments, proposals, and files via the OpenPR MCP server. Supports HTTP, stdio, and SSE transports with bot token authentication.
+description: Manage projects, universal forms, WASM plugins, connectors, issues, sprints, labels, comments, proposals, and files via the OpenPR MCP server. Supports HTTP, stdio, and SSE transports with bot token authentication.
 ---
 
 # OpenPR MCP Skill
@@ -8,6 +8,9 @@ description: Manage projects, issues, sprints, labels, comments, proposals, and 
 ## When to use
 Use this skill when:
 - Creating, updating, or searching issues/work items
+- Creating and operating project-defined universal forms and records
+- Installing or invoking project WASM plugins
+- Reading business events and connector/invocation state
 - Managing sprints, labels, or project settings
 - Uploading files (logs, zips, screenshots) and attaching to issues or comments
 - Creating or reviewing governance proposals
@@ -20,7 +23,8 @@ Run these in order so a client can use OpenPR MCP immediately.
 
 ### 1. Capability line (verify connectivity)
 ```
-tools/list                          → enumerate all 34 tools
+tools/list                          → enumerate all 105 tools
+tools/list { project_id }           → enumerate tools enabled by the project capability registry
 members.list                       → verify auth + workspace access
 projects.list                      → verify project data
 ```
@@ -28,6 +32,23 @@ projects.list                      → verify project data
 ### 2. Read line (explore existing data)
 ```
 projects.list → projects.get → work_items.list → work_items.get
+context.get_project                → project type/resources/connectors/governance/workflow context
+context.get_governance             → review policy, workflow, recent decisions
+context.get_agent_policy           → effective AI/MCP action policy and tool registry
+release.readiness.get              → release/acceptance gates, blockers, next actions, and governance evidence
+project_types.list → project_types.get
+scenario_templates.list → scenario_templates.get → scenario_templates.install
+project_resources.list             → project context resources
+forms.list → forms.get → form_views.list
+forms.schema_summary → forms.field_usage → forms.field_dependencies → form_schema_versions.list → form_schema_versions.get
+form_permissions.get → form_permissions.update
+form_attachments.list → form_attachments.create → form_attachments.archive → form_attachments.restore
+form_records.list → form_records.export → form_records.import_preview → form_records.get
+form_records.relation_targets → form_records.children → form_records.child_create → form_records.child_update → form_records.child_archive → form_records.child_restore → form_records.aggregate
+plugins.list → plugins.get → plugin_invocations.list
+events.tail                        → recent business events
+connectors.list                    → automation connection inventory
+invocations.list                   → AI execution ledger
 search.all                         → full-text search
 work_items.get_by_identifier       → lookup by human ID (e.g. PRX-42)
 labels.list                        → available labels
@@ -42,6 +63,16 @@ comments.create → comments.delete
 labels.create → labels.update → labels.delete
 sprints.create → sprints.update → sprints.delete
 proposals.create
+check_results.create → proposals.create_from_result
+project_resources.create → project_resources.update → project_resources.delete
+forms.create → forms.create_from_template → scenario_templates.install → forms.update_schema → forms.duplicate
+form_records.create → form_records.import_commit → form_records.update → form_records.link
+plugins.install → plugins.invoke
+invocations.create → invocations.report_progress → invocations.complete
+invocations.create → invocations.fail
+code.change_proposal.create
+documents.extract_summary → documents.review_risk
+approval.request → inspection.report → corrective_action.propose
 ```
 
 ### 4. Label management line
@@ -173,7 +204,7 @@ comments.create {
 
 ## Scripts
 
-- Regression test: `scripts/mcp-regression.py` — tests all 34 tools across 3 transports
+- Regression test: `scripts/mcp-regression.py` — tests the core tool surface across 3 transports and checks the 105-tool registry includes universal forms and plugins
 - Validation: `scripts/validate-mcp.sh` — quick smoke test for connectivity
 
 ## References

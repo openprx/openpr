@@ -30,9 +30,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Unused deps
+        env:
+          RUSTFLAGS: ""
         run: |
           cargo install cargo-machete --locked
           cargo machete
@@ -48,6 +50,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --workspace --all-features
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install dependencies
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+      - name: Check
+        working-directory: frontend
+        run: bun run check
+      - name: Build
+        working-directory: frontend
+        run: bun run build
+
+  universal-forms:
+    name: Universal Forms Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install audit tools
+        env:
+          RUSTFLAGS: ""
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep
+          cargo install cargo-audit --locked
+
+      - name: Universal forms CI gates
+        run: bash scripts/ci-universal-forms-gates.sh
 
   build:
     name: Build

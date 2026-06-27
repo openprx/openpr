@@ -19,10 +19,10 @@
 	}
 </script>
 
-<div class="fixed bottom-4 right-4 z-50 space-y-2">
+<div class="fixed left-1/2 top-20 z-50 flex w-[calc(100%-2rem)] max-w-md -translate-x-1/2 flex-col gap-2">
 	{#each toasts as item (item.id)}
 		<div
-			class="flex items-center gap-3 min-w-[300px] max-w-md px-4 py-3 rounded-lg shadow-lg dark:shadow-slate-900/50 text-white {getToastColor(
+			class="flex w-full items-center gap-3 rounded-lg px-4 py-3 text-white shadow-lg dark:shadow-slate-900/50 {getToastColor(
 				item.type
 			)} animate-slide-in"
 		>
@@ -50,11 +50,11 @@
 <style>
 	@keyframes slide-in {
 		from {
-			transform: translateX(100%);
+			transform: translateY(-0.5rem);
 			opacity: 0;
 		}
 		to {
-			transform: translateX(0);
+			transform: translateY(0);
 			opacity: 1;
 		}
 	}

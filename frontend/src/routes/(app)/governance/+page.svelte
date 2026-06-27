@@ -262,22 +262,30 @@
 
 		if (openRes.code === 0 && openRes.data && votingRes.code === 0 && votingRes.data && allProposalsRes.code === 0 && allProposalsRes.data) {
 			const active = (openRes.data.total ?? 0) + (votingRes.data.total ?? 0);
-			nextStats.proposals = `活跃 ${active} 个 · 总计 ${allProposalsRes.data.total ?? 0} 个`;
+			nextStats.proposals = $t('governanceCenter.stats.proposals', {
+				values: { active, total: allProposalsRes.data.total ?? 0 }
+			});
 		}
 
 		if (decisionsRes.code === 0) {
-			nextStats.decisions = `本月 ${decisionsRes.total} 项决策 · 通过率 ${formatPercent(decisionsRes.passRate)}`;
+			nextStats.decisions = $t('governanceCenter.stats.decisions', {
+				values: { total: decisionsRes.total, rate: formatPercent(decisionsRes.passRate) }
+			});
 		}
 
 		if (trustRes.code === 0 && trustRes.data) {
 			const members = trustRes.data.total ?? trustRes.data.items.length;
 			const scoreList = trustRes.data.items.map((item) => item.score);
 			const avg = scoreList.length > 0 ? scoreList.reduce((sum, score) => sum + score, 0) / scoreList.length : 0;
-			nextStats.trustBoard = `${members} 名成员 · 平均 ${avg.toFixed(1)} 分`;
+			nextStats.trustBoard = $t('governanceCenter.stats.trustBoard', {
+				values: { members, average: avg.toFixed(1) }
+			});
 		}
 
 		if (impactPendingRes.code === 0 && impactPendingRes.data && impactDoneRes.code === 0 && impactDoneRes.data) {
-			nextStats.impactReviews = `待评审 ${impactPendingRes.data.total ?? 0} · 已完成 ${impactDoneRes.data.total ?? 0}`;
+			nextStats.impactReviews = $t('governanceCenter.stats.impactReviews', {
+				values: { pending: impactPendingRes.data.total ?? 0, completed: impactDoneRes.data.total ?? 0 }
+			});
 		}
 
 		if (selectedProjectId) {
@@ -295,30 +303,40 @@
 			]);
 
 			if (templateRes.code === 0 && templateRes.data) {
-				nextStats.proposalTemplates = `${templateRes.data.total ?? 0} 个模板`;
+				nextStats.proposalTemplates = $t('governanceCenter.stats.proposalTemplates', {
+					values: { count: templateRes.data.total ?? 0 }
+				});
 			}
 
 			if (auditReportsRes.code === 0 && auditReportsRes.data) {
 				if (auditReportsRes.data.items.length > 0) {
-					nextStats.auditReports = `最近报告：${formatDateLabel(auditReportsRes.data.items[0].generated_at)}`;
+					nextStats.auditReports = $t('governanceCenter.stats.latestReport', {
+						values: { date: formatDateLabel(auditReportsRes.data.items[0].generated_at) }
+					});
 				} else {
-					nextStats.auditReports = '暂无报告';
+					nextStats.auditReports = $t('governanceCenter.stats.noReports');
 				}
 			}
 
 			if (configRes.code === 0 && configRes.data) {
-				nextStats.config = `最后更新：${formatDateLabel(configRes.data.updated_at)}`;
+				nextStats.config = $t('governanceCenter.stats.configUpdated', {
+					values: { date: formatDateLabel(configRes.data.updated_at) }
+				});
 			}
 
 			if (auditLogsTodayRes.code === 0 && auditLogsTodayRes.data) {
-				nextStats.auditLogs = `今日 ${auditLogsTodayRes.data.total ?? 0} 条记录`;
+				nextStats.auditLogs = $t('governanceCenter.stats.auditLogs', {
+					values: { count: auditLogsTodayRes.data.total ?? 0 }
+				});
 			}
 		}
 
 		if (appealsPendingRes.code === 0 && appealsPendingRes.data && appealsAllRes.code === 0 && appealsAllRes.data) {
 			const pending = appealsPendingRes.data.total ?? 0;
 			const processed = Math.max(0, (appealsAllRes.data.total ?? 0) - pending);
-			nextStats.trustAppeals = `待处理 ${pending} · 已处理 ${processed}`;
+			nextStats.trustAppeals = $t('governanceCenter.stats.trustAppeals', {
+				values: { pending, processed }
+			});
 		}
 
 		moduleStats = nextStats;

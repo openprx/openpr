@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.local/schemas/openpr-universal-forms-signoff-status.schema.json",
+  "title": "OpenPR Universal Forms Manual Signoff Status",
+  "description": "Machine-readable user-side manual signoff state for the OpenPR universal forms delivery bundle.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "generated_at",
+    "repository",
+    "reports",
+    "gate_summary",
+    "manual_signoff",
+    "release_requirement"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.signoff_status.v1"
+    },
+    "schema_path": {
+      "type": "string",
+      "pattern": "/docs/schemas/openpr-universal-forms-signoff-status\\.schema\\.json$"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "reports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence", "runbook", "manual_evidence_map", "markdown_status"],
+      "properties": {
+        "evidence": { "type": "string" },
+        "runbook": { "type": "string" },
+        "manual_evidence_map": { "type": "string" },
+        "markdown_status": { "type": "string" }
+      }
+    },
+    "gate_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "automated_checks",
+        "pass_status_lines",
+        "failed_automated_checks",
+        "runbook_evidence_consistency"
+      ],
+      "properties": {
+        "automated_checks": { "type": "integer", "minimum": 0 },
+        "pass_status_lines": { "type": "integer", "minimum": 0 },
+        "failed_automated_checks": { "type": "integer", "minimum": 0 },
+        "runbook_evidence_consistency": { "$ref": "#/$defs/gate_status" }
+      }
+    },
+    "manual_signoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_rows",
+        "accepted_rows",
+        "pending_rows",
+        "blocked_rows",
+        "final_signoff_allowed",
+        "rows",
+        "pending_queue",
+        "next_row"
+      ],
+      "properties": {
+        "total_rows": { "type": "integer", "minimum": 0 },
+        "accepted_rows": { "type": "integer", "minimum": 0 },
+        "pending_rows": { "type": "integer", "minimum": 0 },
+        "blocked_rows": { "type": "integer", "minimum": 0 },
+        "final_signoff_allowed": { "type": "boolean" },
+        "rows": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "prefixItems": [
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "restaurant_template" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "frontend_usability" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "amounts" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "workflow" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "hub_consistency" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "docs" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "overall" } } }] }
+          ],
+          "items": false
+        },
+        "pending_queue": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pending_queue_row"
+          }
+        },
+        "next_row": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "key",
+            "item",
+            "status",
+            "actionable",
+            "automated_evidence",
+            "reviewer_check",
+            "suggested_evidence_note",
+            "recorder_command"
+          ],
+          "properties": {
+            "key": {
+              "anyOf": [
+                { "$ref": "#/$defs/manual_key" },
+                { "const": "" }
+              ]
+            },
+            "item": { "type": "string" },
+            "status": { "$ref": "#/$defs/manual_status" },
+            "actionable": { "type": "boolean" },
+            "automated_evidence": { "type": "string", "minLength": 1 },
+            "reviewer_check": { "type": "string", "minLength": 1 },
+            "suggested_evidence_note": { "type": "string" },
+            "recorder_command": { "type": "string" }
+          }
+        }
+      }
+    },
+    "release_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "failed_automated_checks",
+        "runbook_evidence_consistency",
+        "pending_rows",
+        "blocked_rows"
+      ],
+      "properties": {
+        "failed_automated_checks": { "const": 0 },
+        "runbook_evidence_consistency": { "const": "passed" },
+        "pending_rows": { "const": 0 },
+        "blocked_rows": { "const": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "manual_key": {
+      "enum": [
+        "restaurant_template",
+        "frontend_usability",
+        "amounts",
+        "workflow",
+        "hub_consistency",
+        "docs",
+        "overall"
+      ]
+    },
+    "gate_status": {
+      "enum": ["passed", "failed"]
+    },
+    "manual_status": {
+      "enum": ["accepted", "pending", "failed", "rework", "unknown"]
+    },
+    "manual_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "item",
+        "status",
+        "raw_status",
+        "reviewer",
+        "evidence",
+        "automated_evidence",
+        "reviewer_check",
+        "suggested_evidence_note",
+        "recorder_command"
+      ],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/manual_key"
+        },
+        "item": { "type": "string" },
+        "status": { "$ref": "#/$defs/manual_status" },
+        "raw_status": { "type": "string" },
+        "reviewer": { "type": "string" },
+        "evidence": { "type": "string" },
+        "automated_evidence": { "type": "string", "minLength": 1 },
+        "reviewer_check": { "type": "string", "minLength": 1 },
+        "suggested_evidence_note": { "type": "string" },
+        "recorder_command": { "type": "string" }
+      }
+    },
+    "pending_queue_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "review_order",
+        "key",
+        "item",
+        "status",
+        "is_next",
+        "actionable",
+        "automated_evidence",
+        "reviewer_check",
+        "suggested_evidence_note",
+        "recorder_command"
+      ],
+      "properties": {
+        "review_order": { "type": "integer", "minimum": 1, "maximum": 7 },
+        "key": { "$ref": "#/$defs/manual_key" },
+        "item": { "type": "string" },
+        "status": { "$ref": "#/$defs/manual_status" },
+        "is_next": { "type": "boolean" },
+        "actionable": { "type": "boolean" },
+        "automated_evidence": { "type": "string", "minLength": 1 },
+        "reviewer_check": { "type": "string", "minLength": 1 },
+        "suggested_evidence_note": { "type": "string" },
+        "recorder_command": { "type": "string" }
+      }
+    }
+  }
+}

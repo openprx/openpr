@@ -1,5 +1,7 @@
 [advisories]
-ignore = []
+# Lockfile-only through SQLx's inactive MySQL backend; OpenPR enables only
+# sqlx-postgres at build/runtime. Verified with cargo tree -i rsa/sqlx-mysql.
+ignore = ["RUSTSEC-2023-0071"]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"
 

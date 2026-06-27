@@ -306,12 +306,18 @@ mod tests {
 
     #[test]
     fn min_level_returns_lower_when_left_is_lower() {
-        assert_eq!(min_level(TrustLevel::Observer, TrustLevel::Autonomous), TrustLevel::Observer);
+        assert_eq!(
+            min_level(TrustLevel::Observer, TrustLevel::Autonomous),
+            TrustLevel::Observer
+        );
     }
 
     #[test]
     fn min_level_returns_lower_when_right_is_lower() {
-        assert_eq!(min_level(TrustLevel::Autonomous, TrustLevel::Advisor), TrustLevel::Advisor);
+        assert_eq!(
+            min_level(TrustLevel::Autonomous, TrustLevel::Advisor),
+            TrustLevel::Advisor
+        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Database Restore Script
 
@@ -11,7 +11,7 @@ echo "=========================="
 echo ""
 
 # Check for backup file argument
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
   echo "📁 Available backups:"
   ls -lh "$BACKUP_DIR"/openpr_backup_*.sql.gz 2>/dev/null || echo "  (none)"
   echo ""
@@ -29,9 +29,9 @@ if [ ! -f "$BACKUP_FILE" ]; then
 fi
 
 # Check if PostgreSQL container is running
-if ! docker-compose ps postgres | grep -q "Up"; then
+if ! docker compose ps postgres | grep -q "Up"; then
   echo "❌ PostgreSQL container is not running"
-  echo "Start it with: docker-compose up -d postgres"
+  echo "Start it with: docker compose up -d postgres"
   exit 1
 fi
 
@@ -49,13 +49,13 @@ echo ""
 echo "📦 Restoring database..."
 
 # Drop and recreate database
-docker-compose exec -T postgres psql -U openpr -d postgres -c "DROP DATABASE IF EXISTS openpr;"
-docker-compose exec -T postgres psql -U openpr -d postgres -c "CREATE DATABASE openpr;"
+docker compose exec -T postgres psql -U openpr -d postgres -c "DROP DATABASE IF EXISTS openpr;"
+docker compose exec -T postgres psql -U openpr -d postgres -c "CREATE DATABASE openpr;"
 
 # Restore from backup
-gunzip -c "$BACKUP_FILE" | docker-compose exec -T postgres psql -U openpr -d openpr
+gunzip -c "$BACKUP_FILE" | docker compose exec -T postgres psql -U openpr -d openpr
 
 echo "✅ Restore completed successfully"
 echo ""
 echo "🔄 Restart services to apply changes:"
-echo "  docker-compose restart api worker mcp-server"
+echo "  docker compose restart api worker mcp-server"

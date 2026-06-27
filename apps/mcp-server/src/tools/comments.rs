@@ -147,7 +147,9 @@ fn attachment_name_from_url(url: &str) -> String {
 /// Trailing whitespace on each captured name is trimmed.
 fn extract_mention_names(content: &str) -> Vec<String> {
     let mut names = Vec::new();
-    let delimiters: &[char] = &['@', '\n', '\r', ',', '，', '。', '.', '!', '！', '?', '？', ';', '；', ':'];
+    let delimiters: &[char] = &[
+        '@', '\n', '\r', ',', '，', '。', '.', '!', '！', '?', '？', ';', '；', ':',
+    ];
     let chars: Vec<char> = content.chars().collect();
     let len = chars.len();
     let mut i = 0;

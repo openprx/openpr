@@ -27,6 +27,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
 
+const DEFAULT_OPENPR_API_URL: &str = "http://localhost:8081";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -48,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .api_url
         .clone()
         .or_else(|| std::env::var("OPENPR_API_URL").ok())
-        .unwrap_or_else(|| "http://localhost:3000".to_string());
+        .unwrap_or_else(|| DEFAULT_OPENPR_API_URL.to_string());
 
     let bot_token_opt = cli.bot_token.clone().or_else(|| std::env::var("OPENPR_BOT_TOKEN").ok());
 
@@ -63,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
         let workspace_id =
             workspace_id_opt.ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID environment variable is required"))?;
 
+        validate_runtime_config(&base_url, &bot_token, &workspace_id)?;
         let client = OpenPrClient::new(base_url, bot_token, workspace_id).map_err(|e| anyhow::anyhow!(e))?;
 
         match serve_args.transport {
@@ -76,9 +79,36 @@ async fn main() -> anyhow::Result<()> {
         let workspace_id = workspace_id_opt
             .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID is required (set env var or --workspace-id)"))?;
 
+        validate_runtime_config(&base_url, &bot_token, &workspace_id)?;
         let client = OpenPrClient::new(base_url, bot_token, workspace_id).map_err(|e| anyhow::anyhow!(e))?;
         cli::run_cli_command(&cli.command, &cli.format, client).await
     }
+}
+
+fn validate_runtime_config(base_url: &str, bot_token: &str, workspace_id: &str) -> anyhow::Result<()> {
+    if base_url.trim().is_empty() || base_url.contains("${") {
+        anyhow::bail!("OPENPR_API_URL must be a concrete API URL");
+    }
+    let parsed_url =
+        reqwest::Url::parse(base_url).map_err(|e| anyhow::anyhow!("OPENPR_API_URL is not a valid URL: {e}"))?;
+    if !matches!(parsed_url.scheme(), "http" | "https") {
+        anyhow::bail!("OPENPR_API_URL must use http or https");
+    }
+
+    if bot_token.trim().is_empty() || bot_token.contains("${") || bot_token.contains("replace_with") {
+        anyhow::bail!("OPENPR_BOT_TOKEN must be a concrete production bot token");
+    }
+    if !bot_token.starts_with("opr_") {
+        anyhow::bail!("OPENPR_BOT_TOKEN must use the opr_ token prefix");
+    }
+
+    let workspace_uuid =
+        Uuid::parse_str(workspace_id).map_err(|e| anyhow::anyhow!("OPENPR_WORKSPACE_ID must be a valid UUID: {e}"))?;
+    if workspace_uuid.is_nil() {
+        anyhow::bail!("OPENPR_WORKSPACE_ID must not be the nil UUID placeholder");
+    }
+
+    Ok(())
 }
 
 async fn run_http(bind_addr: &str, client: OpenPrClient) -> anyhow::Result<()> {
@@ -225,6 +255,50 @@ async fn handle_sse_message(
 
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_OPENPR_API_URL, validate_runtime_config};
+
+    #[test]
+    fn accepts_concrete_runtime_config() {
+        validate_runtime_config(
+            "http://api:8080",
+            "opr_forms_mcp_test_token",
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .expect("valid runtime config should pass");
+    }
+
+    #[test]
+    fn default_api_url_targets_compose_api_host_port() {
+        assert_eq!(DEFAULT_OPENPR_API_URL, "http://localhost:8081");
+    }
+
+    #[test]
+    fn rejects_compose_placeholder_literals() {
+        assert!(
+            validate_runtime_config(
+                "${OPENPR_API_URL:-http://api:8080}",
+                "${OPENPR_BOT_TOKEN:?set OPENPR_BOT_TOKEN}",
+                "${OPENPR_WORKSPACE_ID:?set OPENPR_WORKSPACE_ID}",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_demo_token_and_nil_workspace() {
+        assert!(
+            validate_runtime_config(
+                "http://api:8080",
+                "opr_replace_with_workspace_bot_token",
+                "00000000-0000-0000-0000-000000000000",
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Whether the line is a Content-Length or Content-Type header (case-insensitive).

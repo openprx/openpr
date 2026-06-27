@@ -1,29 +1,50 @@
 # Repository Guidelines
 
 ## Project Overview
+
 - OpenPR is an open-source project management platform with governance and AI integration.
-- The MCP server exposes 34 tools for managing projects, issues, sprints, labels, comments, proposals, and files.
+- The MCP server exposes 105 tools for managing projects, context, project types/templates/resources, connectors, invocations, universal forms, WASM plugins, issues, sprints, labels, comments, proposals, check results, release next actions, files, and scenario-specific governed work.
 - Transports: HTTP (`POST /mcp/rpc`), stdio (stdin/stdout), SSE (`GET /sse` + `POST /messages`).
 
 ## MCP Surface (Quick Reference)
+
 - Transports:
   - `stdio` (default for Claude Desktop, Codex, local CLI)
   - `HTTP` (web integrations, OpenClaw plugins)
   - `SSE` (streaming clients; also available on HTTP port)
 - Core tools:
   - `projects.list`, `projects.get`, `projects.create`, `projects.update`, `projects.delete`
+  - `context.get_project`, `context.get_governance`, `context.get_agent_policy`
+  - `project_types.list`, `project_types.get`
+  - `project_resources.list`, `project_resources.create`, `project_resources.update`, `project_resources.delete`
+  - `connectors.list`, `connectors.get`
+  - `invocations.list`, `invocations.get`, `invocations.create`, `invocations.report_progress`, `invocations.complete`, `invocations.fail`
+  - `forms.list`, `forms.get`, `forms.create`, `forms.create_from_template`, `scenario_templates.install`, `forms.update_schema`, `forms.duplicate`
+  - `forms.schema_summary`, `forms.field_usage`, `forms.field_dependencies`
+  - `form_schema_versions.list`, `form_schema_versions.get`
+  - `form_views.list`
+  - `form_permissions.get`, `form_permissions.update`
+  - `form_attachments.list`, `form_attachments.create`, `form_attachments.archive`, `form_attachments.restore`
+  - `form_records.list`, `form_records.export`, `form_records.import_preview`, `form_records.import_commit`
+  - `form_records.get`, `form_records.create`, `form_records.update`, `form_records.link`, `form_records.relation_targets`, `form_records.children`, `form_records.child_create`, `form_records.child_update`, `form_records.child_archive`, `form_records.child_restore`, `form_records.aggregate`
+  - `events.tail`
+  - `plugins.list`, `plugins.get`, `plugins.install`, `plugins.invoke`, `plugin_invocations.list`
   - `work_items.list`, `work_items.get`, `work_items.get_by_identifier`, `work_items.create`, `work_items.update`, `work_items.delete`, `work_items.search`
   - `work_items.add_label`, `work_items.add_labels`, `work_items.remove_label`, `work_items.list_labels`
   - `comments.create`, `comments.list`, `comments.delete`
   - `files.upload`
   - `labels.list`, `labels.list_by_project`, `labels.create`, `labels.update`, `labels.delete`
   - `sprints.list`, `sprints.create`, `sprints.update`, `sprints.delete`
-  - `proposals.list`, `proposals.get`, `proposals.create`
+  - `proposals.list`, `proposals.get`, `proposals.create`, `proposals.create_from_result`
+  - `check_results.create`
+  - `code.resources.list`, `code.directory.get`, `code.task_context.get`, `code.change_proposal.create`
+  - `documents.extract_summary`, `documents.review_risk`, `approval.request`, `inspection.report`, `corrective_action.propose`
   - `members.list`, `search.all`
 - Authentication: Bot token via `OPENPR_BOT_TOKEN` env var (prefix `opr_`).
 - Skill package: `skills/openpr-mcp/SKILL.md`
 
 ## Project Structure & Module Organization
+
 - `apps/api/` — Axum REST API server
 - `apps/mcp-server/` — MCP server (tools, client, transport)
   - `src/tools/` — Tool implementations (one file per domain)
@@ -36,6 +57,7 @@
 - `skills/` — MCP skill packages for AI agents
 
 ## Build, Test, and Development Commands
+
 ```bash
 # Build
 source ~/.cargo/env
@@ -43,22 +65,27 @@ cargo build --release --bin api
 cargo build --release --bin mcp-server
 
 # Frontend
-cd frontend && bun run build  # or npm run build
+cd frontend && bun run build
 
 # Format and lint
 cargo fmt
 cargo clippy --all-targets -- -D warnings
 
 # Deploy (local)
-podman-compose down && podman-compose up -d --build
+docker compose down && docker compose up -d --build
 
 # Test MCP
 curl -X POST http://localhost:8090/mcp/rpc \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+curl -X POST http://localhost:8090/mcp/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"project_id":"<project-uuid>"}}'
 ```
 
 ## Coding Style & Naming Conventions
+
 - Rust 2021 idioms, 4-space indentation.
 - File/module: `snake_case`. Types: `PascalCase`. Functions: `snake_case`. Constants: `SCREAMING_SNAKE_CASE`.
 - MCP tool names: `domain.action` (e.g. `work_items.create`, `labels.update`).
@@ -67,7 +94,9 @@ curl -X POST http://localhost:8090/mcp/rpc \
 - Run `cargo fmt` before committing.
 
 ## Testing Guidelines
-- MCP regression: test all 34 tools across 3 transports (HTTP, stdio, SSE).
+
+- MCP regression: test all 105 tools across 3 transports (HTTP, stdio, SSE), plus project-aware `tools/list` when a project id is supplied.
+- CLI business-flow coverage: use `mcp-server tools call --name <tool> --args-json '{...}'` for universal forms, plugins, connectors, and scenario tools so CLI calls reuse the same MCP tool names and audit path.
 - API: test via `curl` or MCP client against running instance.
 - Frontend: `bun run build` must succeed.
 - When adding a new MCP tool:
@@ -78,6 +107,7 @@ curl -X POST http://localhost:8090/mcp/rpc \
   5. Test via all three transports
 
 ## Commit & Pull Request Guidelines
+
 - Conventional Commits:
   - `feat: add files.upload MCP tool`
   - `fix: PATCH→PUT method mismatch in work_items.update`
@@ -85,7 +115,8 @@ curl -X POST http://localhost:8090/mcp/rpc \
 - PRs should include: problem/solution summary, test evidence, config changes.
 
 ## Security & Configuration
+
 - Never commit bot tokens or API keys.
-- Environment variables for all secrets (`OPENPR_BOT_TOKEN`, `DATABASE_URL`).
+- Environment variables for all secrets (`OPENPR_BOT_TOKEN`, `OPENPR_WORKSPACE_ID`).
 - Bot tokens are workspace-scoped; each creates a `bot_mcp` user for audit integrity.
 - File uploads: server-side type validation and size limits.

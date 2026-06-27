@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/openpr-universal-forms-scenario-catalog.schema.json",
+  "title": "OpenPR Universal Forms Scenario Catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "generated_at",
+    "markdown_catalog",
+    "template_count",
+    "operator_entrypoints",
+    "templates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.scenario_catalog.v1"
+    },
+    "schema_path": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "markdown_catalog": {
+      "type": "string"
+    },
+    "template_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "operator_entrypoints": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/operator_entrypoint" },
+            { "properties": { "key": { "const": "frontend_project_wizard" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/operator_entrypoint" },
+            { "properties": { "key": { "const": "rest_projects_create" } } }
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/operator_entrypoint" },
+            { "properties": { "key": { "const": "mcp_projects_create" } } }
+          ]
+        }
+      ],
+      "items": false
+    },
+    "templates": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/template" }, { "properties": { "key": { "const": "code_delivery_default" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/template" }, { "properties": { "key": { "const": "contract_review_default" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/template" }, { "properties": { "key": { "const": "equipment_maintenance_default" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/template" }, { "properties": { "key": { "const": "quality_corrective_action_default" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/template" }, { "properties": { "key": { "const": "customer_delivery_default" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/template" }, { "properties": { "key": { "const": "restaurant_ordering_default" } } }] }
+      ],
+      "items": false
+    }
+  },
+  "$defs": {
+    "operator_entrypoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "consumer",
+        "command_hint"
+      ],
+      "properties": {
+        "key": {
+          "enum": [
+            "frontend_project_wizard",
+            "rest_projects_create",
+            "mcp_projects_create"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "consumer": {
+          "enum": [
+            "human_operator",
+            "integration_service",
+            "ai_or_automation_client"
+          ]
+        },
+        "command_hint": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "project_type",
+        "best_fit",
+        "forms",
+        "integrations",
+        "operator_steps",
+        "primary_mcp_tools",
+        "connector_kinds",
+        "plugin_keys",
+        "acceptance_focus"
+      ],
+      "properties": {
+        "key": {
+          "enum": [
+            "code_delivery_default",
+            "contract_review_default",
+            "equipment_maintenance_default",
+            "quality_corrective_action_default",
+            "customer_delivery_default",
+            "restaurant_ordering_default"
+          ]
+        },
+        "project_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "best_fit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "forms": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "integrations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "operator_steps": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "primary_mcp_tools": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z_]+\\.[a-z_]+$"
+          }
+        },
+        "connector_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "mcp",
+              "webhook",
+              "rest",
+              "print",
+              "device",
+              "cli",
+              "openprx_tunnel"
+            ]
+          }
+        },
+        "plugin_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          }
+        },
+        "acceptance_focus": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

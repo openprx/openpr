@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/openpr-project-release-readiness.schema.json",
+  "title": "OpenPR Project Release Readiness",
+  "description": "Machine-readable project release readiness gates, blockers, metrics, and next actions returned by GET /api/v1/projects/{project_id}/release-readiness and MCP release.readiness.get.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "project_id",
+    "status",
+    "blockers",
+    "gates",
+    "next_actions",
+    "metrics",
+    "generated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.project.release_readiness.v1"
+    },
+    "schema_path": {
+      "const": "docs/schemas/openpr-project-release-readiness.schema.json"
+    },
+    "project_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": ["ready", "blocked"]
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/gate_key"
+      }
+    },
+    "gates": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_pending_ai_tasks" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_active_invocations" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_failed_invocations" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_pending_governance_results" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_failed_connector_deliveries" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_stale_resources" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "audit_trail_present" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "result_artifact_present" } } }] }
+      ],
+      "items": false
+    },
+    "next_actions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/next_action"
+      }
+    },
+    "metrics": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "pending_ai_tasks" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "active_invocations" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "failed_invocations" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "pending_check_results" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "failed_connector_deliveries" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "stale_resources" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "governance_audit_events" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "result_artifacts" } } }] }
+      ],
+      "items": false
+    },
+    "generated_at": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "gate_key": {
+      "enum": [
+        "no_pending_ai_tasks",
+        "no_active_invocations",
+        "no_failed_invocations",
+        "no_pending_governance_results",
+        "no_failed_connector_deliveries",
+        "no_stale_resources",
+        "audit_trail_present",
+        "result_artifact_present"
+      ]
+    },
+    "gate_status": {
+      "enum": ["passed", "blocked"]
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "name", "status", "required", "observed", "details"],
+      "properties": {
+        "key": { "$ref": "#/$defs/gate_key" },
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/gate_status" },
+        "required": { "const": true },
+        "observed": { "type": "integer", "minimum": 0 },
+        "details": { "type": "string", "minLength": 1 }
+      }
+    },
+    "next_action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "review_order",
+        "key",
+        "source_gate",
+        "blocking",
+        "actor",
+        "action",
+        "recommended_tool",
+        "details"
+      ],
+      "properties": {
+        "review_order": { "type": "integer", "minimum": 1 },
+        "key": { "type": "string", "minLength": 1 },
+        "source_gate": {
+          "anyOf": [
+            { "$ref": "#/$defs/gate_key" },
+            { "const": "all_required_gates" }
+          ]
+        },
+        "blocking": { "type": "boolean" },
+        "actor": {
+          "enum": ["ai_operator", "operator", "reviewer", "project_owner"]
+        },
+        "action": { "type": "string", "minLength": 1 },
+        "recommended_tool": { "type": "string", "minLength": 1 },
+        "details": { "type": "string", "minLength": 1 }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "value"],
+      "properties": {
+        "key": {
+          "enum": [
+            "pending_ai_tasks",
+            "active_invocations",
+            "failed_invocations",
+            "pending_check_results",
+            "failed_connector_deliveries",
+            "stale_resources",
+            "governance_audit_events",
+            "result_artifacts"
+          ]
+        },
+        "value": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

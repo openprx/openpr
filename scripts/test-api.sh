@@ -4,7 +4,7 @@ set -e
 # API Integration Test Script
 # Tests authentication, workspace, project, and issue management
 
-API_URL="${API_URL:-http://localhost:8080}"
+API_URL="${API_URL:-http://localhost:8081}"
 TEST_EMAIL="test-$(date +%s)@example.com"
 TEST_PASSWORD="TestPassword123!"
 
@@ -34,10 +34,11 @@ api_call() {
 # Test 1: Health Check
 echo "📋 Test 1: Health Check"
 response=$(curl -s "$API_URL/health")
-if echo "$response" | grep -q "ok\|healthy"; then
+if echo "$response" | grep -Eiq "ok|healthy"; then
   echo "✅ Health check passed"
 else
   echo "❌ Health check failed"
+  echo "Response: $response"
   exit 1
 fi
 echo ""

@@ -69,10 +69,7 @@ mod tests {
 
         let result = caller();
         assert!(result.is_err(), "错误应向上传播");
-        assert!(
-            matches!(result, Err(AppError::Config(_))),
-            "传播后变体应保持 Config"
-        );
+        assert!(matches!(result, Err(AppError::Config(_))), "传播后变体应保持 Config");
     }
 
     /// Config 错误中的消息字符串应被完整保留，不截断也不改写
@@ -81,9 +78,6 @@ mod tests {
         let long_msg = "a".repeat(512);
         let err = AppError::Config(long_msg.clone());
         let display = err.to_string();
-        assert!(
-            display.contains(&long_msg),
-            "512 字符长消息应完整保留在 Display 输出中"
-        );
+        assert!(display.contains(&long_msg), "512 字符长消息应完整保留在 Display 输出中");
     }
 }

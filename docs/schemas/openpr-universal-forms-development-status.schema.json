@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/openpr-universal-forms-development-status.schema.json",
+  "title": "OpenPR Universal Forms Development Status",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "generated_at",
+    "tracker_path",
+    "readiness_json_path",
+    "status_summary",
+    "rows",
+    "next_action"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.development_status.v1"
+    },
+    "schema_path": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tracker_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "readiness_json_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_rows",
+        "tested_or_accepted_rows",
+        "accepted_rows",
+        "pending_rows",
+        "non_manual_unresolved_rows",
+        "manual_signoff_pending_rows",
+        "failed_automated_checks",
+        "final_release_allowed"
+      ],
+      "properties": {
+        "total_rows": { "type": "integer", "minimum": 0 },
+        "tested_or_accepted_rows": { "type": "integer", "minimum": 0 },
+        "accepted_rows": { "type": "integer", "minimum": 0 },
+        "pending_rows": { "type": "integer", "minimum": 0 },
+        "non_manual_unresolved_rows": { "type": "integer", "minimum": 0 },
+        "manual_signoff_pending_rows": { "type": "integer", "minimum": 0 },
+        "failed_automated_checks": { "type": "integer", "minimum": 0 },
+        "final_release_allowed": { "type": "boolean" }
+      }
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "requirements_protocol" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "database_model" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "backend_api" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "mcp" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "webhook_connector" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "wasm_plugin" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "frontend_ui" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "scenario_template" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "delivery_bundle" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_row" }, { "properties": { "key": { "const": "user_manual_acceptance" } } }] }
+      ],
+      "items": false
+    },
+    "next_action": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$defs": {
+    "status_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "phase",
+        "status",
+        "engineering_requirement",
+        "completion_rule",
+        "evidence",
+        "manual_gate"
+      ],
+      "properties": {
+        "key": {
+          "enum": [
+            "requirements_protocol",
+            "database_model",
+            "backend_api",
+            "mcp",
+            "webhook_connector",
+            "wasm_plugin",
+            "frontend_ui",
+            "scenario_template",
+            "delivery_bundle",
+            "user_manual_acceptance"
+          ]
+        },
+        "phase": { "type": "string", "minLength": 1 },
+        "status": {
+          "enum": [
+            "待处理",
+            "开发中",
+            "已完成",
+            "已测试",
+            "已验收",
+            "阻塞"
+          ]
+        },
+        "engineering_requirement": { "type": "string", "minLength": 1 },
+        "completion_rule": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "manual_gate": { "type": "boolean" }
+      }
+    }
+  }
+}

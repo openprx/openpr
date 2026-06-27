@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "openpr-universal-forms-delivery-manifest.schema.json",
+  "title": "OpenPR Universal Forms Delivery Manifest JSON",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generated_at",
+    "source_generated_at",
+    "repository",
+    "report_directory",
+    "artifact_directory",
+    "markdown_manifest",
+    "schema_path",
+    "gate_summary",
+    "file_count",
+    "files"
+  ],
+  "properties": {
+    "schema_version": { "const": "openpr.universal_forms.delivery_manifest.v1" },
+    "generated_at": { "type": "string" },
+    "source_generated_at": { "type": "string" },
+    "repository": { "type": "string" },
+    "report_directory": { "type": "string" },
+    "artifact_directory": { "type": "string" },
+    "markdown_manifest": { "type": "string" },
+    "schema_path": { "type": "string" },
+    "gate_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "automated_checks",
+        "pass_status_lines",
+        "failed_automated_checks",
+        "manual_signoff_rows_pending",
+        "end_to_end_acceptance",
+        "user_side_manual_acceptance"
+      ],
+      "properties": {
+        "automated_checks": { "type": "integer", "minimum": 0 },
+        "pass_status_lines": { "type": "integer", "minimum": 0 },
+        "failed_automated_checks": { "type": "integer", "minimum": 0 },
+        "manual_signoff_rows_pending": { "type": "integer", "minimum": 0 },
+        "end_to_end_acceptance": {
+          "enum": ["待处理", "开发中", "已完成", "已测试", "已验收", "阻塞", "missing"]
+        },
+        "user_side_manual_acceptance": {
+          "enum": ["待处理", "开发中", "已完成", "已测试", "已验收", "阻塞", "missing"]
+        }
+      }
+    },
+    "file_count": { "type": "integer", "minimum": 1 },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["label", "path", "bytes", "sha256"],
+        "properties": {
+          "label": { "type": "string", "minLength": 1 },
+          "path": { "type": "string", "pattern": "^/" },
+          "bytes": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      }
+    }
+  }
+}

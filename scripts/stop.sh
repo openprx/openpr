@@ -1,5 +1,5 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 echo "🛑 Stopping OpenPR Services"
 echo "==========================="
@@ -10,7 +10,7 @@ cd "$PROJECT_ROOT"
 
 # Stop services
 echo "📦 Stopping Docker Compose services..."
-docker-compose down
+docker compose down
 
 echo ""
 echo "✅ All services stopped"

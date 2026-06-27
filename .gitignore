@@ -1,5 +1,6 @@
 # Build artifacts
 /target
+/node_modules
 /frontend/build
 /frontend/.svelte-kit
 /frontend/node_modules
@@ -15,6 +16,8 @@
 *.log
 /log/
 /frontend/log/
+/playwright-report/
+/test-results/
 
 # User uploads (runtime data)
 /uploads/

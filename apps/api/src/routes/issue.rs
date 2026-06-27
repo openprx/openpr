@@ -273,6 +273,7 @@ pub async fn create_issue(
                 CreateAiTaskInput {
                     project_id,
                     ai_participant_id: assignee_id,
+                    actor_id: Some(user_id),
                     task_type: "issue_assigned".to_string(),
                     reference_type: Some("work_item".to_string()),
                     reference_id: Some(issue_id),
@@ -1012,6 +1013,7 @@ pub async fn update_issue(
                     CreateAiTaskInput {
                         project_id: current_issue.project_id,
                         ai_participant_id: new_assignee,
+                        actor_id: Some(user_id),
                         task_type: "issue_assigned".to_string(),
                         reference_type: Some("work_item".to_string()),
                         reference_id: Some(issue_id),

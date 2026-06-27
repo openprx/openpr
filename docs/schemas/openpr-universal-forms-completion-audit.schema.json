@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/openpr-universal-forms-completion-audit.schema.json",
+  "title": "OpenPR Universal Forms Completion Audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "generated_at",
+    "reports",
+    "gates",
+    "tracker_status",
+    "manual_signoff",
+    "finalization",
+    "conclusion",
+    "next_action"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.completion_audit.v1"
+    },
+    "schema_path": {
+      "type": "string",
+      "pattern": "/docs/schemas/openpr-universal-forms-completion-audit\\.schema\\.json$"
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracker",
+        "evidence",
+        "runbook",
+        "completion_audit",
+        "readiness_json",
+        "development_status_json",
+        "signoff_status_json"
+      ],
+      "properties": {
+        "tracker": { "type": "string", "minLength": 1 },
+        "evidence": { "type": "string", "minLength": 1 },
+        "runbook": { "type": "string", "minLength": 1 },
+        "completion_audit": { "type": "string", "minLength": 1 },
+        "readiness_json": { "type": "string", "minLength": 1 },
+        "development_status_json": { "type": "string", "minLength": 1 },
+        "signoff_status_json": { "type": "string", "minLength": 1 }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "automated_checks",
+        "pass_status_lines",
+        "failed_automated_checks",
+        "automated_check_index_rows",
+        "automated_check_index_failed_rows",
+        "non_manual_unresolved_items",
+        "manual_consistency_status",
+        "ui_artifact_status",
+        "ui_review_gallery_status",
+        "ui_review_gallery_render_status",
+        "finalizer_safety_status",
+        "automated_delivery_complete"
+      ],
+      "properties": {
+        "automated_checks": { "type": "integer", "minimum": 0 },
+        "pass_status_lines": { "type": "integer", "minimum": 0 },
+        "failed_automated_checks": { "type": "integer", "minimum": 0 },
+        "automated_check_index_rows": { "type": "integer", "minimum": 0 },
+        "automated_check_index_failed_rows": { "type": "integer", "minimum": 0 },
+        "non_manual_unresolved_items": { "type": "integer", "minimum": 0 },
+        "manual_consistency_status": { "enum": ["passed", "failed", "missing"] },
+        "ui_artifact_status": { "enum": ["passed", "failed", "missing"] },
+        "ui_review_gallery_status": { "enum": ["passed", "failed", "missing"] },
+        "ui_review_gallery_render_status": { "enum": ["passed", "failed", "missing"] },
+        "finalizer_safety_status": { "enum": ["candidate-strict-before-replace", "not-proven", "missing"] },
+        "automated_delivery_complete": { "type": "boolean" }
+      }
+    },
+    "tracker_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "end_to_end_acceptance",
+        "user_side_manual_acceptance"
+      ],
+      "properties": {
+        "end_to_end_acceptance": { "type": "string", "minLength": 1 },
+        "user_side_manual_acceptance": { "type": "string", "minLength": 1 }
+      }
+    },
+    "manual_signoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_rows",
+        "accepted_rows",
+        "pending_rows",
+        "blocked_rows",
+        "final_signoff_allowed"
+      ],
+      "properties": {
+        "total_rows": { "type": "integer", "minimum": 0 },
+        "accepted_rows": { "type": "integer", "minimum": 0 },
+        "pending_rows": { "type": "integer", "minimum": 0 },
+        "blocked_rows": { "type": "integer", "minimum": 0 },
+        "final_signoff_allowed": { "type": "boolean" }
+      }
+    },
+    "finalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "final_acceptance_complete",
+        "development_release_allowed",
+        "strict_release_required",
+        "strict_delivery_state_required",
+        "delivery_bundle_audit_required"
+      ],
+      "properties": {
+        "final_acceptance_complete": { "type": "boolean" },
+        "development_release_allowed": { "type": "boolean" },
+        "strict_release_required": { "type": "boolean" },
+        "strict_delivery_state_required": { "type": "boolean" },
+        "delivery_bundle_audit_required": { "type": "boolean" }
+      }
+    },
+    "conclusion": {
+      "enum": [
+        "pre_signoff_ready",
+        "ready_for_finalizer",
+        "finalized",
+        "not_proven"
+      ]
+    },
+    "next_action": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

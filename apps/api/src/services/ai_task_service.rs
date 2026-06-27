@@ -1,9 +1,13 @@
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::error::ApiError;
+use crate::{
+    error::ApiError,
+    events::{BusinessEventInput, insert_business_event},
+    services::invocation_service::create_invocation_for_ai_task,
+};
 
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct AiTaskRow {
@@ -31,6 +35,7 @@ pub struct AiTaskRow {
 pub struct CreateAiTaskInput {
     pub project_id: Uuid,
     pub ai_participant_id: Uuid,
+    pub actor_id: Option<Uuid>,
     pub task_type: String,
     pub reference_type: Option<String>,
     pub reference_id: Option<Uuid>,
@@ -38,6 +43,11 @@ pub struct CreateAiTaskInput {
     pub payload: Value,
     pub idempotency_key: Option<String>,
     pub max_attempts: i32,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ProjectWorkspaceRow {
+    workspace_id: Uuid,
 }
 
 pub async fn create_ai_task<C: ConnectionTrait>(
@@ -114,7 +124,7 @@ pub async fn create_ai_task<C: ConnectionTrait>(
         db,
         task.id,
         "created",
-        serde_json::json!({
+        json!({
             "task_type": task.task_type,
             "reference_type": task.reference_type,
             "reference_id": task.reference_id.map(|v| v.to_string()),
@@ -122,6 +132,23 @@ pub async fn create_ai_task<C: ConnectionTrait>(
         }),
     )
     .await?;
+    insert_ai_task_business_event(
+        db,
+        &task,
+        "ai_task.created",
+        input.actor_id,
+        json!({ "type": "ai_task_service", "actor_id": input.actor_id }),
+        json!({
+            "task_type": task.task_type,
+            "reference_type": task.reference_type,
+            "reference_id": task.reference_id.map(|v| v.to_string()),
+            "idempotency_key": task.idempotency_key,
+        }),
+        None,
+    )
+    .await?;
+
+    create_invocation_for_ai_task(db, &task, input.actor_id).await?;
 
     Ok(Some(task))
 }
@@ -146,6 +173,70 @@ pub async fn insert_ai_task_event<C: ConnectionTrait>(
             Utc::now().into(),
         ],
     ))
+    .await?;
+    Ok(())
+}
+
+pub async fn insert_ai_task_business_event<C: ConnectionTrait>(
+    db: &C,
+    task: &AiTaskRow,
+    event_type: &str,
+    actor_id: Option<Uuid>,
+    source: Value,
+    event_payload: Value,
+    previous_status: Option<&str>,
+) -> Result<(), ApiError> {
+    let project = ProjectWorkspaceRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM projects WHERE id = $1",
+        vec![task.project_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("project not found".to_string()))?;
+
+    insert_business_event(
+        db,
+        BusinessEventInput {
+            workspace_id: project.workspace_id,
+            project_id: Some(task.project_id),
+            event_type: event_type.to_string(),
+            aggregate_type: "ai_task".to_string(),
+            aggregate_id: task.id.to_string(),
+            actor_id,
+            source,
+            payload: json!({
+                "task_id": task.id,
+                "project_id": task.project_id,
+                "ai_participant_id": task.ai_participant_id,
+                "task_type": task.task_type,
+                "reference_type": task.reference_type,
+                "reference_id": task.reference_id,
+                "status": task.status,
+                "previous_status": previous_status,
+                "priority": task.priority,
+                "payload": task.payload,
+                "result": task.result,
+                "error_message": task.error_message,
+                "attempts": task.attempts,
+                "max_attempts": task.max_attempts,
+                "next_retry_at": task.next_retry_at.map(|v| v.to_rfc3339()),
+                "event_payload": event_payload
+            }),
+            metadata: json!({
+                "ai_task_id": task.id,
+                "ai_participant_id": task.ai_participant_id,
+                "task_type": task.task_type,
+                "reference_type": task.reference_type,
+                "reference_id": task.reference_id,
+                "status": task.status,
+                "previous_status": previous_status
+            }),
+            correlation_id: Some(task.id),
+            causation_id: task.reference_id,
+            idempotency_key: None,
+        },
+    )
     .await?;
     Ok(())
 }
@@ -203,6 +294,7 @@ pub async fn queue_vote_requested_tasks_for_project<C: ConnectionTrait>(
             CreateAiTaskInput {
                 project_id,
                 ai_participant_id: bot.user_id,
+                actor_id: None,
                 task_type: "vote_requested".to_string(),
                 reference_type: Some("proposal".to_string()),
                 reference_id: proposal_uuid,

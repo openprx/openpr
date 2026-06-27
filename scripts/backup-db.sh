@@ -1,5 +1,5 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 # Database Backup Script
 
@@ -18,14 +18,14 @@ echo "Backup file: $BACKUP_FILE"
 echo ""
 
 # Check if PostgreSQL container is running
-if ! docker-compose ps postgres | grep -q "Up"; then
+if ! docker compose ps postgres | grep -q "Up"; then
   echo "❌ PostgreSQL container is not running"
   exit 1
 fi
 
 # Create backup
 echo "📦 Creating backup..."
-docker-compose exec -T postgres pg_dump -U openpr openpr | gzip > "$BACKUP_FILE"
+docker compose exec -T postgres pg_dump -U openpr openpr | gzip > "$BACKUP_FILE"
 
 # Check if backup was successful
 if [ -f "$BACKUP_FILE" ] && [ -s "$BACKUP_FILE" ]; then

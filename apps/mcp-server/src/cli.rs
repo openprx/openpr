@@ -65,6 +65,8 @@ pub enum Commands {
     Search(SearchArgs),
     /// Upload files
     Files(FilesCmd),
+    /// Call any MCP tool by name
+    Tools(ToolsCmd),
 }
 
 // ---- Serve ----
@@ -82,7 +84,7 @@ pub struct ServeArgs {
     #[arg(long, value_enum, default_value_t = Transport::Stdio)]
     pub transport: Transport,
     /// Bind address for HTTP/SSE transports
-    #[arg(long, default_value = "0.0.0.0:8090")]
+    #[arg(long, default_value = "127.0.0.1:8090")]
     pub bind_addr: String,
 }
 
@@ -251,6 +253,27 @@ pub enum FilesAction {
     },
 }
 
+// ---- Generic Tools ----
+
+#[derive(Debug, Args)]
+pub struct ToolsCmd {
+    #[command(subcommand)]
+    pub action: ToolsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ToolsAction {
+    /// Call any MCP tool with a JSON object argument payload
+    Call {
+        /// Tool name, for example forms.list or plugins.invoke
+        #[arg(long)]
+        name: String,
+        /// JSON object passed as MCP tool arguments
+        #[arg(long, default_value = "{}")]
+        args_json: String,
+    },
+}
+
 // ---- Output formatting ----
 
 pub fn print_result(format: &OutputFormat, result: &CallToolResult) {
@@ -369,7 +392,7 @@ pub async fn run_cli_command(command: &Commands, format: &OutputFormat, client: 
         return Ok(());
     }
 
-    let (tool_name, args): (&'static str, Value) = match command {
+    let (tool_name, args): (&str, Value) = match command {
         Commands::Serve(_) => unreachable!("serve is handled before run_cli_command"),
 
         Commands::Projects(cmd) => match &cmd.action {
@@ -462,11 +485,25 @@ pub async fn run_cli_command(command: &Commands, format: &OutputFormat, client: 
 
         // Files handled above via run_file_upload
         Commands::Files(_) => unreachable!("Files handled before this match"),
+
+        Commands::Tools(cmd) => match &cmd.action {
+            ToolsAction::Call { name, args_json } => (name.as_str(), parse_tool_args_json(args_json)?),
+        },
     };
 
-    let result = server.execute_tool(tool_name, args).await;
+    let result = server.call_tool(tool_name, args).await;
     print_result(format, &result);
     Ok(())
+}
+
+fn parse_tool_args_json(args_json: &str) -> anyhow::Result<Value> {
+    let value = serde_json::from_str::<Value>(args_json)
+        .map_err(|error| anyhow::anyhow!("Invalid --args-json payload: {error}"))?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Err(anyhow::anyhow!("--args-json must be a JSON object"))
+    }
 }
 
 /// Handle file upload: read file from disk, base64-encode, then call files.upload tool.
@@ -489,6 +526,61 @@ async fn run_file_upload(cmd: &FilesCmd, server: &McpServer) -> anyhow::Result<C
                     json!({ "filename": filename, "content_base64": encoded }),
                 )
                 .await)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, ToolsAction, Transport, parse_tool_args_json};
+    use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn parses_generic_tool_call_command() {
+        let cli = Cli::try_parse_from([
+            "mcp-server",
+            "tools",
+            "call",
+            "--name",
+            "forms.list",
+            "--args-json",
+            r#"{"project_id":"project-1"}"#,
+        ])
+        .expect("generic tools call command should parse");
+
+        match cli.command {
+            Commands::Tools(cmd) => match cmd.action {
+                ToolsAction::Call { name, args_json } => {
+                    assert_eq!(name, "forms.list");
+                    assert_eq!(
+                        parse_tool_args_json(&args_json).unwrap(),
+                        json!({ "project_id": "project-1" })
+                    );
+                }
+            },
+            _ => panic!("expected tools command"),
+        }
+    }
+
+    #[test]
+    fn generic_tool_args_must_be_json_object() {
+        assert!(parse_tool_args_json(r#"{"project_id":"project-1"}"#).is_ok());
+        assert!(parse_tool_args_json("[]").is_err());
+        assert!(parse_tool_args_json("{not-json}").is_err());
+    }
+
+    #[test]
+    fn http_transport_defaults_to_localhost_bind() {
+        let cli = Cli::try_parse_from(["mcp-server", "serve", "--transport", "http"])
+            .expect("serve http command should parse");
+
+        match cli.command {
+            Commands::Serve(args) => {
+                assert!(matches!(args.transport, Transport::Http));
+                assert_eq!(args.bind_addr, "127.0.0.1:8090");
+            }
+            _ => panic!("expected serve command"),
         }
     }
 }

@@ -11,7 +11,11 @@ feature-depth = 1
 yanked = "deny"
 unmaintained = "all"
 unsound = "workspace"
-ignore = []
+ignore = [
+    # Lockfile-only through SQLx's inactive MySQL backend. OpenPR enables only
+    # sqlx-postgres at build/runtime; cargo tree -i rsa/sqlx-mysql prints no active tree.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 allow = [

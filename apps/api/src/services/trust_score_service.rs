@@ -625,14 +625,7 @@ mod tests {
 
     #[test]
     fn trust_level_vote_weight_for_score_boundaries() {
-        let cases = [
-            (0, 0.5),
-            (100, 1.0),
-            (200, 1.5),
-            (300, 2.0),
-            (-100, 0.5),
-            (500, 2.0),
-        ];
+        let cases = [(0, 0.5), (100, 1.0), (200, 1.5), (300, 2.0), (-100, 0.5), (500, 2.0)];
 
         for (score, expected) in cases {
             let result = TrustLevel::vote_weight_for_score(score);

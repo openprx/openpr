@@ -15,9 +15,10 @@ use crate::{
     response::{ApiResponse, PaginatedData},
     services::{
         ai_task_service::{
-            AiTaskRow, CreateAiTaskInput, create_ai_task, insert_ai_task_event, next_retry_time, valid_reference_type,
-            valid_task_type,
+            AiTaskRow, CreateAiTaskInput, create_ai_task, insert_ai_task_business_event, insert_ai_task_event,
+            next_retry_time, valid_reference_type, valid_task_type,
         },
+        invocation_service::update_invocation_for_ai_task,
         trust_score_service::{is_project_admin_or_owner, is_project_member, is_system_admin},
     },
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
@@ -114,6 +115,7 @@ pub async fn complete_task(
         return Err(ApiError::BadRequest("task is not in processing status".to_string()));
     }
 
+    let previous_status = task.status.clone();
     let now = Utc::now();
     let updated = AiTaskRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -154,6 +156,25 @@ pub async fn complete_task(
 
     task = updated.clone();
     insert_ai_task_event(&state.db, task_id, "completed", json!({ "result": result })).await?;
+    insert_ai_task_business_event(
+        &state.db,
+        &task,
+        "ai_task.completed",
+        Some(actor_id),
+        json!({ "type": "ai_callback", "actor_id": actor_id }),
+        json!({ "result": task.result }),
+        Some(previous_status.as_str()),
+    )
+    .await?;
+    update_invocation_for_ai_task(
+        &state.db,
+        task_id,
+        "completed",
+        task.result.clone(),
+        None,
+        Some(actor_id),
+    )
+    .await?;
 
     let project = find_project(&state, task.project_id).await?;
     trigger_webhooks(
@@ -199,6 +220,7 @@ pub async fn fail_task(
         ));
     }
 
+    let previous_status = task.status.clone();
     let now = Utc::now();
     let message = req
         .error_message
@@ -266,11 +288,41 @@ pub async fn fail_task(
         &event_type,
         json!({
             "error_message": message,
-            "payload": req.payload,
+            "payload": req.payload.clone(),
             "attempts": task.attempts,
             "max_attempts": task.max_attempts,
             "next_retry_at": task.next_retry_at.map(|v| v.to_rfc3339()),
         }),
+    )
+    .await?;
+    insert_ai_task_business_event(
+        &state.db,
+        &task,
+        if task.status == "failed" {
+            "ai_task.failed"
+        } else {
+            "ai_task.retried"
+        },
+        Some(actor_id),
+        json!({ "type": "ai_callback", "actor_id": actor_id }),
+        json!({
+            "error_message": message,
+            "payload": req.payload.clone(),
+            "attempts": task.attempts,
+            "max_attempts": task.max_attempts,
+            "next_retry_at": task.next_retry_at.map(|v| v.to_rfc3339()),
+        }),
+        Some(previous_status.as_str()),
+    )
+    .await?;
+
+    update_invocation_for_ai_task(
+        &state.db,
+        task_id,
+        if task.status == "failed" { "failed" } else { "pending" },
+        None,
+        task.error_message.clone(),
+        Some(actor_id),
     )
     .await?;
 
@@ -314,7 +366,18 @@ pub async fn report_progress(
     let task = find_task(&state, task_id).await?;
     ensure_actor_can_operate(&state, &task, actor_id).await?;
 
-    insert_ai_task_event(&state.db, task_id, "progress", payload).await?;
+    insert_ai_task_event(&state.db, task_id, "progress", payload.clone()).await?;
+    insert_ai_task_business_event(
+        &state.db,
+        &task,
+        "ai_task.progress",
+        Some(actor_id),
+        json!({ "type": "ai_callback", "actor_id": actor_id }),
+        json!({ "progress": payload }),
+        Some(task.status.as_str()),
+    )
+    .await?;
+    update_invocation_for_ai_task(&state.db, task_id, "running", None, None, Some(actor_id)).await?;
     Ok(ApiResponse::ok())
 }
 
@@ -486,6 +549,7 @@ pub async fn create_project_ai_task(
         CreateAiTaskInput {
             project_id,
             ai_participant_id: req.ai_participant_id,
+            actor_id: Some(user_id),
             task_type,
             reference_type: req.reference_type,
             reference_id: req.reference_id,

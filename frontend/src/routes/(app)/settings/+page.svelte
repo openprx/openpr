@@ -2,7 +2,7 @@
 	import { setLocale } from '$lib/i18n';
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
-	import { authApi, type User } from '$lib/api/auth';
+	import { authApi, type NotificationPreferences, type User } from '$lib/api/auth';
 	import { authStore } from '$lib/stores/auth';
 	import { toast } from '$lib/stores/toast';
 	import { setTheme, theme, type Theme } from '$lib/theme';
@@ -52,16 +52,34 @@
 			authStore.setUser(user);
 		}
 
+		const prefsResponse = await authApi.getPreferences();
+		if (prefsResponse.code === 0 && prefsResponse.data?.notification_prefs) {
+			notificationPrefs = fromApiPreferences(prefsResponse.data.notification_prefs);
+		}
+
 		loading = false;
 	});
 
 	async function saveProfile() {
 		savingProfile = true;
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		if ($authStore.user) {
-			authStore.setUser({ ...$authStore.user, name: profileForm.name, email: profileForm.email });
+		const response = await authApi.updateProfile({
+			name: profileForm.name,
+			email: profileForm.email,
+			avatar_url: profileForm.avatarUrl || null
+		});
+
+		if (response.code === 0 && response.data?.user) {
+			const user = response.data.user;
+			profileForm = {
+				name: user.name || '',
+				email: user.email || '',
+				avatarUrl: user.avatar_url || ''
+			};
+			authStore.setUser(user);
+			toast.success($t('settings.profileSaved'));
+		} else {
+			toast.error(response.message);
 		}
-		toast.success($t('settings.profileSaved'));
 		savingProfile = false;
 	}
 
@@ -80,17 +98,46 @@
 		}
 
 		savingPassword = true;
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		passwordForm = { currentPassword: '', newPassword: '', confirmPassword: '' };
-		toast.success($t('settings.passwordSaved'));
+		const response = await authApi.updatePassword({
+			current_password: passwordForm.currentPassword,
+			new_password: passwordForm.newPassword
+		});
+
+		if (response.code === 0) {
+			passwordForm = { currentPassword: '', newPassword: '', confirmPassword: '' };
+			toast.success($t('settings.passwordSaved'));
+		} else {
+			toast.error(response.message);
+		}
 		savingPassword = false;
 	}
 
 	async function saveNotificationPrefs() {
 		savingNotifications = true;
-		await new Promise((resolve) => setTimeout(resolve, 200));
-		toast.success($t('settings.notificationsSaved'));
+		const response = await authApi.updatePreferences(toApiPreferences(notificationPrefs));
+		if (response.code === 0 && response.data?.notification_prefs) {
+			notificationPrefs = fromApiPreferences(response.data.notification_prefs);
+			toast.success($t('settings.notificationsSaved'));
+		} else {
+			toast.error(response.message);
+		}
 		savingNotifications = false;
+	}
+
+	function toApiPreferences(prefs: typeof notificationPrefs): NotificationPreferences {
+		return {
+			email_notification: prefs.emailNotification,
+			mention_only: prefs.mentionOnly,
+			daily_digest: prefs.dailyDigest
+		};
+	}
+
+	function fromApiPreferences(prefs: NotificationPreferences) {
+		return {
+			emailNotification: prefs.email_notification,
+			mentionOnly: prefs.mention_only,
+			dailyDigest: prefs.daily_digest
+		};
 	}
 
 	function handleThemeChange(event: Event) {

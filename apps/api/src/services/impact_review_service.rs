@@ -285,7 +285,7 @@ impl ImpactReviewService {
             r"
                 INSERT INTO review_participants (
                     review_id, user_id, role, feedback_submitted, exercised_veto, veto_overturned
-                ) VALUES ($1, $2, 'proposer', false, false, false)
+                ) VALUES ($1, $2::uuid, 'proposer', false, false, false)
                 ON CONFLICT (review_id, user_id) DO NOTHING
             ",
             vec![review_id.to_string().into(), proposal.author_id.into()],
@@ -316,7 +316,7 @@ impl ImpactReviewService {
                 r"
                     INSERT INTO review_participants (
                         review_id, user_id, role, vote_choice, feedback_submitted, exercised_veto, veto_overturned
-                    ) VALUES ($1, $2, $3, $4, false, false, false)
+                    ) VALUES ($1, $2::uuid, $3, $4, false, false, false)
                     ON CONFLICT (review_id, user_id)
                     DO UPDATE SET role = EXCLUDED.role, vote_choice = EXCLUDED.vote_choice
                 ",
@@ -349,7 +349,7 @@ impl ImpactReviewService {
                 r"
                     INSERT INTO review_participants (
                         review_id, user_id, role, exercised_veto, veto_overturned, feedback_submitted
-                    ) VALUES ($1, $2, 'vetoer', true, $3, false)
+                    ) VALUES ($1, $2::uuid, 'vetoer', true, $3, false)
                     ON CONFLICT (review_id, user_id)
                     DO UPDATE SET
                         role = 'vetoer',

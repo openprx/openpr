@@ -1,0 +1,30 @@
+[server]
+listen = "0.0.0.0:9090"
+
+[security]
+webhook_secrets = ["replace_with_openpr_webhook_secret"]
+allow_unsigned = false
+
+[features]
+tunnel_enabled = false
+cli_enabled = false
+callback_enabled = false
+
+[runtime]
+cli_max_concurrency = 1
+http_timeout_secs = 15
+tunnel_reconnect_backoff_max_secs = 60
+
+[[agents]]
+id = "connector-log"
+name = "Connector Log"
+agent_type = "custom"
+message_template = "{event} {project_id} {form_key} {record_id} {connector_kind}"
+
+[agents.route]
+events = ["form.record.created", "form.record.updated", "print_job.created"]
+connector_kinds = ["webhook", "rest", "print", "device"]
+
+[agents.custom]
+command = "echo"
+args = ["{message}"]

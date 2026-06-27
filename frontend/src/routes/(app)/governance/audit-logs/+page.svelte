@@ -161,8 +161,8 @@
 								<td class="px-2 py-2 text-xs">{item.resource_id || '-'}</td>
 								<td class="max-w-xl px-2 py-2 text-xs text-slate-500">
 									<div class="space-y-1">
-										<p><span class="font-medium">old:</span> {renderJson(item.old_value)}</p>
-										<p><span class="font-medium">new:</span> {renderJson(item.new_value)}</p>
+										<p><span class="font-medium">{$t('governanceAuditLogs.old')}</span> {renderJson(item.old_value)}</p>
+										<p><span class="font-medium">{$t('governanceAuditLogs.new')}</span> {renderJson(item.new_value)}</p>
 									</div>
 								</td>
 							</tr>

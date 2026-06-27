@@ -58,7 +58,10 @@ impl IntoResponse for ApiError {
             Self::NotFound(msg) => (404, msg),
             Self::Conflict(msg) => (409, msg),
             Self::Internal => (500, "internal server error".to_string()),
-            Self::Database(_) => (500, "database error".to_string()),
+            Self::Database(err) => {
+                tracing::error!(error = %err, "database error");
+                (500, "database error".to_string())
+            }
         };
 
         (StatusCode::OK, ApiResponse::error(code, &message)).into_response()

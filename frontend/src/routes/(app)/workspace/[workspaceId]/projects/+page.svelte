@@ -3,22 +3,28 @@
 	import { get } from 'svelte/store';
 	import { t } from 'svelte-i18n';
 	import { page } from '$app/stores';
-	import { projectsApi, type Project } from '$lib/api/projects';
+	import { projectsApi, type Project, type ProjectType } from '$lib/api/projects';
 	import { workspacesApi, type Workspace } from '$lib/api/workspaces';
 	import { workflowsApi, type WorkflowSummary } from '$lib/api/workflows';
 	import { toast } from '$lib/stores/toast';
 	import { goto } from '$app/navigation';
+	import { CheckCircle2, Code2, TableProperties } from '@lucide/svelte';
 	import Modal from '$lib/components/Modal.svelte';
 	import Button from '$lib/components/Button.svelte';
 	import Input from '$lib/components/Input.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
 	import { requireRouteParam } from '$lib/utils/route-params';
 	import { timeAgo } from '$lib/utils/timeago';
+	import {
+		projectTypeDescription,
+		projectTypeName
+	} from '$lib/utils/project-type-i18n';
 
 	const workspaceId = requireRouteParam($page.params.workspaceId, 'workspaceId');
 
 	let workspace = $state<Workspace | null>(null);
 	let projects = $state<Project[]>([]);
+	let projectTypes = $state<ProjectType[]>([]);
 	let filteredProjects = $state<Project[]>([]);
 	let loading = $state(true);
 	let error = $state<string | null>(null);
@@ -26,7 +32,12 @@
 	let searchQuery = $state('');
 
 	let showCreateModal = $state(false);
-	let createForm = $state({ name: '', key: '', description: '' });
+	let createForm = $state({
+		name: '',
+		key: '',
+		description: '',
+		type_key: 'code_project'
+	});
 	let creating = $state(false);
 
 	let showEditModal = $state(false);
@@ -38,6 +49,17 @@
 	let showDeleteModal = $state(false);
 	let deletingProject = $state<Project | null>(null);
 	let deleting = $state(false);
+
+	const selectableProjectTypes = $derived.by(() => {
+		const preferred = ['code_project', 'custom_form'];
+		const ordered = preferred
+			.map((key) => projectTypes.find((item) => item.key === key))
+			.filter((item): item is ProjectType => Boolean(item));
+		return ordered.length > 0 ? ordered : projectTypes;
+	});
+	const selectedProjectType = $derived(
+		projectTypes.find((item) => item.key === createForm.type_key) ?? selectableProjectTypes[0] ?? null
+	);
 
 	onMount(async () => {
 		await loadData();
@@ -64,6 +86,14 @@
 			filteredProjects = projects;
 		}
 
+		const typeResponse = await projectsApi.listTypes(workspaceId);
+		if (typeResponse.code === 0 && typeResponse.data) {
+			projectTypes = typeResponse.data.items ?? [];
+			if (!projectTypes.some((item) => item.key === createForm.type_key) && projectTypes[0]) {
+				createForm.type_key = projectTypes[0].key;
+			}
+		}
+
 		loading = false;
 	}
 
@@ -81,13 +111,33 @@
 		}
 	});
 
-	function goToProject(projectId: string) {
-		goto(`/workspace/${workspaceId}/projects/${projectId}`);
+	function isFormsProject(project: Project): boolean {
+		return project.type_key === 'custom_form';
+	}
+
+	function projectHref(project: Project): string {
+		const baseHref = `/workspace/${workspaceId}/projects/${project.id}`;
+		return isFormsProject(project) ? `${baseHref}/forms` : baseHref;
+	}
+
+	function goToProject(project: Project) {
+		goto(projectHref(project));
 	}
 
 	function openCreateModal() {
-		createForm = { name: '', key: '', description: '' };
+		createForm = {
+			name: '',
+			key: '',
+			description: '',
+			type_key: projectTypes.some((item) => item.key === 'code_project')
+				? 'code_project'
+				: projectTypes[0]?.key ?? 'code_project'
+		};
 		showCreateModal = true;
+	}
+
+	function selectProjectType(typeKey: string) {
+		createForm.type_key = typeKey;
 	}
 
 	async function handleCreate() {
@@ -111,7 +161,8 @@
 		const response = await projectsApi.create(workspaceId, {
 			name: createForm.name.trim(),
 			key: createForm.key.toUpperCase(),
-			description: createForm.description.trim() || undefined
+			description: createForm.description.trim() || undefined,
+			type_key: createForm.type_key || 'code_project'
 		});
 
 		if (response.code !== 0) {
@@ -211,6 +262,14 @@
 		if (!counts) return 0;
 		return counts.by_state?.[state] ?? 0;
 	}
+
+	function getProjectTypeName(typeKey: string): string {
+		return projectTypeName(typeKey, projectTypes, $t);
+	}
+
+	function projectTypeIcon(typeKey: string) {
+		return typeKey === 'code_project' ? Code2 : TableProperties;
+	}
 </script>
 
 <div class="mx-auto max-w-7xl">
@@ -283,13 +342,13 @@
 				<article class="group rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-5 shadow-sm dark:shadow-slate-900/50 transition-all hover:-translate-y-0.5 hover:shadow-md dark:shadow-slate-900/50">
 					<div class="mb-3 flex items-start justify-between gap-3">
 						<div class="min-w-0">
-							<button
-								type="button"
-								onclick={() => goToProject(project.id)}
-								class="truncate text-left text-lg font-semibold text-slate-900 dark:text-slate-100 transition-colors hover:text-blue-600"
-							>
-								{project.name}
-							</button>
+								<button
+									type="button"
+									onclick={() => goToProject(project)}
+									class="truncate text-left text-lg font-semibold text-slate-900 dark:text-slate-100 transition-colors hover:text-blue-600"
+								>
+									{project.name}
+								</button>
 							<div class="mt-1">
 								<span class="inline-flex items-center rounded-md bg-blue-50 px-2 py-0.5 text-xs font-semibold text-blue-700">
 									{project.key}
@@ -330,46 +389,44 @@
 
 					<p class="mb-4 min-h-10 text-sm text-slate-600 dark:text-slate-300 line-clamp-2">{project.description || $t('project.noDescription')}</p>
 
-					<div class="mb-4 grid grid-cols-4 gap-2">
-						<div class="rounded-lg bg-slate-100 dark:bg-slate-800 px-2 py-2 text-center text-slate-600 dark:text-slate-300">
-							<div class="text-base font-semibold">{getIssueCount(project, 'backlog')}</div>
-							<div class="text-[11px] font-medium">Backlog</div>
-						</div>
-						<div class="rounded-lg bg-blue-50 px-2 py-2 text-center text-blue-600">
-							<div class="text-base font-semibold">{getIssueCount(project, 'todo')}</div>
-							<div class="text-[11px] font-medium">To Do</div>
-						</div>
-						<div class="rounded-lg bg-amber-50 px-2 py-2 text-center text-amber-600">
-							<div class="text-base font-semibold">{getIssueCount(project, 'in_progress')}</div>
-							<div class="text-[11px] font-medium">In Progress</div>
-						</div>
-						<div class="rounded-lg bg-emerald-50 px-2 py-2 text-center text-emerald-600">
-							<div class="text-base font-semibold">{getIssueCount(project, 'done')}</div>
-							<div class="text-[11px] font-medium">Done</div>
-						</div>
-					</div>
+						{#if isFormsProject(project)}
+							<div class="mb-4 flex min-h-16 items-center gap-3 rounded-lg border border-blue-100 bg-blue-50 px-3 py-3 text-blue-900 dark:border-blue-900/60 dark:bg-blue-950/30 dark:text-blue-100">
+								<TableProperties class="h-5 w-5 shrink-0 text-blue-600 dark:text-blue-300" aria-hidden="true" />
+								<div class="min-w-0">
+									<p class="text-sm font-semibold">{$t('project.formsProjectHome')}</p>
+									<p class="mt-0.5 line-clamp-2 text-xs leading-5 text-blue-700 dark:text-blue-200">
+										{$t('project.formsProjectHomeDesc')}
+									</p>
+								</div>
+							</div>
+						{:else}
+							<div class="mb-4 grid grid-cols-4 gap-2">
+								<div class="rounded-lg bg-slate-100 dark:bg-slate-800 px-2 py-2 text-center text-slate-600 dark:text-slate-300">
+									<div class="text-base font-semibold">{getIssueCount(project, 'backlog')}</div>
+									<div class="text-[11px] font-medium">{$t('workflow.backlog')}</div>
+								</div>
+								<div class="rounded-lg bg-blue-50 px-2 py-2 text-center text-blue-600">
+									<div class="text-base font-semibold">{getIssueCount(project, 'todo')}</div>
+									<div class="text-[11px] font-medium">{$t('workflow.todo')}</div>
+								</div>
+								<div class="rounded-lg bg-amber-50 px-2 py-2 text-center text-amber-600">
+									<div class="text-base font-semibold">{getIssueCount(project, 'in_progress')}</div>
+									<div class="text-[11px] font-medium">{$t('workflow.inProgress')}</div>
+								</div>
+								<div class="rounded-lg bg-emerald-50 px-2 py-2 text-center text-emerald-600">
+									<div class="text-base font-semibold">{getIssueCount(project, 'done')}</div>
+									<div class="text-[11px] font-medium">{$t('workflow.done')}</div>
+								</div>
+							</div>
+						{/if}
 
-					<div class="flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
-						<div class="flex flex-wrap items-center gap-2">
+						<div class="flex items-center justify-between gap-3 border-t border-slate-100 pt-3">
 							<a
-								href={`/workspace/${workspaceId}/projects/${project.id}/issues`}
+								href={projectHref(project)}
 								class="inline-flex items-center rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-300 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
 							>
-								{$t('project.workItems')}
+								{isFormsProject(project) ? $t('project.openForms') : $t('project.openProject')}
 							</a>
-							<a
-								href={`/workspace/${workspaceId}/projects/${project.id}/board`}
-								class="inline-flex items-center rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-300 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
-							>
-								{$t('project.boardView')}
-							</a>
-							<a
-								href={`/workspace/${workspaceId}/projects/${project.id}/cycles`}
-								class="inline-flex items-center rounded-md border border-slate-200 dark:border-slate-700 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-300 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700"
-							>
-								{$t('project.sprintPlan')}
-							</a>
-						</div>
 						<span class="text-xs text-slate-500 dark:text-slate-400">{$t('project.updatedAt')} {formatRelativeTime(project.updated_at)}</span>
 					</div>
 				</article>
@@ -378,8 +435,44 @@
 	{/if}
 </div>
 
-<Modal bind:open={showCreateModal} title={$t('project.create')}>
-	<form onsubmit={(e) => { e.preventDefault(); handleCreate(); }} class="space-y-4">
+<Modal bind:open={showCreateModal} title={$t('project.create')} maxWidthClass="max-w-4xl">
+	<form onsubmit={(e) => { e.preventDefault(); handleCreate(); }} class="space-y-5">
+		<div class="space-y-2">
+			<p class="text-sm font-medium text-slate-700 dark:text-slate-300">{$t('project.projectType')}</p>
+			<div class="grid gap-3 md:grid-cols-2">
+				{#each selectableProjectTypes as item (item.key)}
+					{@const Icon = projectTypeIcon(item.key)}
+					<button
+						type="button"
+						onclick={() => selectProjectType(item.key)}
+						class="min-h-32 rounded-lg border p-4 text-left transition-colors {createForm.type_key === item.key ? 'border-blue-500 bg-blue-50 shadow-sm dark:border-blue-400 dark:bg-blue-950/30' : 'border-slate-200 bg-white hover:border-blue-200 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-blue-900 dark:hover:bg-slate-800'}"
+					>
+						<div class="flex items-start justify-between gap-3">
+							<div class="min-w-0">
+								<div class="flex items-center gap-2">
+									<Icon class="h-5 w-5 text-blue-600 dark:text-blue-300" />
+									<p class="truncate text-sm font-semibold text-slate-900 dark:text-slate-100">
+										{getProjectTypeName(item.key)}
+									</p>
+								</div>
+								<p class="mt-3 line-clamp-3 text-xs leading-5 text-slate-600 dark:text-slate-300">
+									{projectTypeDescription(item, $t)}
+								</p>
+							</div>
+							{#if createForm.type_key === item.key}
+								<CheckCircle2 class="h-5 w-5 shrink-0 text-blue-600 dark:text-blue-300" />
+							{/if}
+						</div>
+					</button>
+				{/each}
+			</div>
+			{#if selectedProjectType}
+				<p class="text-xs text-slate-500 dark:text-slate-400">
+					{$t('project.projectTypeBoundary')}
+				</p>
+			{/if}
+		</div>
+
 		<Input
 			label={$t('project.name')}
 			placeholder={$t('project.namePlaceholder')}
@@ -446,7 +539,7 @@
 				bind:value={editForm.workflow_id}
 				class="block w-full rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400"
 			>
-				<option value="">Use Workspace Default</option>
+				<option value="">{$t('workflow.useWorkspaceDefault')}</option>
 				{#each availableWorkflows as wf (wf.id)}
 					<option value={wf.id}>{wf.name}{wf.is_system_default ? ' (System)' : ''}</option>
 				{/each}

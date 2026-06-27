@@ -21,6 +21,8 @@
 	import { t } from 'svelte-i18n';
 	import { apiClient } from '$lib/api/client';
 	import { isImageUploadMime, isAllowedUploadMime } from '$lib/utils/upload';
+	import { getScenarioFields, type EmbeddedScenarioTemplate, type ScenarioFieldDef } from '$lib/utils/scenario-template';
+	import { scenarioTemplateName } from '$lib/utils/project-type-i18n';
 	import Button from './Button.svelte';
 	import FileUpload from './FileUpload.svelte';
 	import Input from './Input.svelte';
@@ -41,6 +43,7 @@
 		initialPriority?: IssuePriority;
 		initialSprintId?: string;
 		workflowStates?: WorkflowStateDef[];
+		scenarioTemplate?: EmbeddedScenarioTemplate | null;
 		onCreated?: (issue: Issue) => void;
 	}
 
@@ -52,6 +55,7 @@
 		initialPriority = 'medium',
 		initialSprintId = '',
 		workflowStates = [],
+		scenarioTemplate = null,
 		onCreated
 	}: Props = $props();
 
@@ -63,6 +67,9 @@
 	let labels = $state<LabelOption[]>([]);
 	let selectedLabelIds = $state<string[]>([]);
 	let attachments = $state<UploadedAttachment[]>([]);
+	let scenarioFieldValues = $state<Record<string, string>>({});
+
+	const scenarioFields = $derived<ScenarioFieldDef[]>(getScenarioFields(scenarioTemplate));
 
 	const statusSelectOptions = $derived.by(() => {
 		if (workflowStates.length > 0) {
@@ -110,6 +117,7 @@
 		};
 		selectedLabelIds = [];
 		attachments = [];
+		scenarioFieldValues = Object.fromEntries(scenarioFields.map((field) => [field.key, '']));
 		descriptionTab = 'edit';
 	}
 
@@ -155,6 +163,13 @@
 		selectedLabelIds = [...selectedLabelIds, labelId];
 	}
 
+	function setScenarioFieldValue(fieldKey: string, value: string): void {
+		scenarioFieldValues = {
+			...scenarioFieldValues,
+			[fieldKey]: value
+		};
+	}
+
 	async function handleCreate(): Promise<void> {
 		if (creating) {
 			return;
@@ -163,9 +178,14 @@
 			toast.error($t('issue.enterTitle'));
 			return;
 		}
+		const missingField = scenarioFields.find((field) => field.required && !scenarioFieldValues[field.key]?.trim());
+		if (missingField) {
+			toast.error($t('issue.scenarioFieldRequired', { values: { field: missingField.label } }));
+			return;
+		}
 
 		creating = true;
-		const description = appendAttachmentsMarkdown(form.description, attachments).trim();
+		const description = appendScenarioFieldsMarkdown(appendAttachmentsMarkdown(form.description, attachments)).trim();
 		const createRes = await issuesApi.create(projectId, {
 			title: form.title.trim(),
 			description: description || undefined,
@@ -260,6 +280,26 @@
 		}
 	}
 
+	function appendScenarioFieldsMarkdown(description: string): string {
+		const filledFields = scenarioFields
+			.map((field) => ({
+				label: field.label,
+				value: scenarioFieldValues[field.key]?.trim() ?? ''
+			}))
+			.filter((field) => field.value.length > 0);
+		if (filledFields.length === 0) {
+			return description;
+		}
+
+		const lines = [
+			'',
+			'## Scenario Fields',
+			...filledFields.map((field) => `- **${field.label}:** ${field.value}`)
+		];
+		const separator = description.trim().length > 0 ? '\n' : '';
+		return `${description.trim()}${separator}${lines.join('\n')}\n`;
+	}
+
 	function getMemberOptionLabel(member: WorkspaceMember): string {
 		const base = member.name || member.email;
 		return member.entity_type === 'bot' ? `[Bot] ${base}` : base;
@@ -279,6 +319,53 @@
 	{:else}
 		<form class="space-y-5" onsubmit={(event) => { event.preventDefault(); handleCreate(); }}>
 			<Input label={$t('issue.title')} required bind:value={form.title} placeholder={$t('issue.titleExample')} />
+
+			{#if scenarioFields.length > 0}
+				<div class="rounded-lg border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950">
+					<div class="mb-3">
+						<p class="text-sm font-semibold text-slate-900 dark:text-slate-100">{$t('issue.scenarioFields')}</p>
+						<p class="text-xs text-slate-500 dark:text-slate-400">{scenarioTemplate ? scenarioTemplateName(scenarioTemplate, $t) : ''}</p>
+					</div>
+					<div class="grid gap-3 sm:grid-cols-2">
+						{#each scenarioFields as field (field.key)}
+							<div class={field.type === 'textarea' ? 'sm:col-span-2' : ''}>
+								<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300" for={`scenario-field-${field.key}`}>
+									{field.label}{field.required ? ' *' : ''}
+								</label>
+								{#if field.type === 'select' && field.options.length > 0}
+									<select
+										id={`scenario-field-${field.key}`}
+										value={scenarioFieldValues[field.key] ?? ''}
+										onchange={(event) => setScenarioFieldValue(field.key, event.currentTarget.value)}
+										class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:focus:ring-blue-400"
+									>
+										<option value="">{$t('issue.selectPlaceholder')}</option>
+										{#each field.options as option}
+											<option value={option}>{option.replaceAll('_', ' ')}</option>
+										{/each}
+									</select>
+								{:else if field.type === 'textarea'}
+									<textarea
+										id={`scenario-field-${field.key}`}
+										value={scenarioFieldValues[field.key] ?? ''}
+										oninput={(event) => setScenarioFieldValue(field.key, event.currentTarget.value)}
+										rows="3"
+										class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500 dark:focus:ring-blue-400"
+									></textarea>
+								{:else}
+									<input
+										id={`scenario-field-${field.key}`}
+										value={scenarioFieldValues[field.key] ?? ''}
+										oninput={(event) => setScenarioFieldValue(field.key, event.currentTarget.value)}
+										type={field.type === 'number' || field.type === 'date' ? field.type : 'text'}
+										class="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500 dark:focus:ring-blue-400"
+									/>
+								{/if}
+							</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
 
 			<div class="space-y-2">
 				<div class="flex items-center justify-between">

@@ -5,6 +5,7 @@
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
 	import { membersApi } from '$lib/api/members';
+	import { projectsApi, type Project } from '$lib/api/projects';
 	import { issuesApi, type Issue, type IssuePriority, type IssueStatus } from '$lib/api/issues';
 	import { workflowsApi, type WorkflowStateDef } from '$lib/api/workflows';
 	import { labelsApi, type Label } from '$lib/api/labels';
@@ -15,11 +16,13 @@
 	import Avatar from '$lib/components/Avatar.svelte';
 	import BotIcon from '$lib/components/BotIcon.svelte';
 	import IssueCreateModal from '$lib/components/IssueCreateModal.svelte';
+	import { getProjectScenarioTemplate } from '$lib/utils/scenario-template';
 
 	const workspaceId = $derived(requireRouteParam($page.params.workspaceId, 'workspaceId'));
 	const projectId = $derived(requireRouteParam($page.params.projectId, 'projectId'));
 
 	let issues = $state<Issue[]>([]);
+	let project = $state<Project | null>(null);
 	let sprints = $state<Sprint[]>([]);
 	let loading = $state(true);
 	let keyword = $state('');
@@ -40,6 +43,7 @@
 	let totalPages = $state(1);
 	let total = $state(0);
 	const perPage = 15;
+	const labelFilterLabelId = 'issue-label-filter-label';
 
 	onMount(() => {
 		const handleDocumentClick = (event: MouseEvent) => {
@@ -51,7 +55,7 @@
 
 		document.addEventListener('click', handleDocumentClick);
 		void (async () => {
-			await Promise.all([loadWorkflow(), loadSprints(), loadMembers(), loadLabels()]);
+			await Promise.all([loadProject(), loadWorkflow(), loadSprints(), loadMembers(), loadLabels()]);
 			await loadIssues(1);
 		})();
 
@@ -59,6 +63,15 @@
 			document.removeEventListener('click', handleDocumentClick);
 		};
 	});
+
+	async function loadProject() {
+		const response = await projectsApi.get(projectId);
+		if (response.code === 0 && response.data) {
+			project = response.data;
+		}
+	}
+
+	const scenarioTemplate = $derived(getProjectScenarioTemplate(project));
 
 	async function loadIssues(pageToLoad: number = currentPage) {
 		loading = true;
@@ -340,9 +353,12 @@
 				</select>
 			</div>
 			<div class="relative" bind:this={labelFilterContainer}>
-				<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">{$t('common.label')}</label>
+				<span id={labelFilterLabelId} class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300">{$t('common.label')}</span>
 				<button
 					type="button"
+					aria-expanded={showLabelFilterDropdown}
+					aria-haspopup="listbox"
+					aria-labelledby={labelFilterLabelId}
 					class="flex w-full items-center justify-between rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:focus:ring-blue-400 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100"
 					onclick={(event) => {
 						event.stopPropagation();
@@ -579,5 +595,6 @@
 	{projectId}
 	initialStatus={(workflowStates.find((s) => s.is_initial)?.key || workflowStates[0]?.key || 'backlog') as IssueStatus}
 	workflowStates={workflowStates}
+	{scenarioTemplate}
 	onCreated={handleIssueCreated}
 />

@@ -9,8 +9,9 @@ use platform::{
     app::AppState,
     auth::{JwtClaims, JwtManager},
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, QueryResult, Statement};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::{error::ApiError, response::ApiResponse};
 
@@ -21,6 +22,12 @@ struct UserResponse {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +48,31 @@ pub struct RefreshRequest {
     refresh_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateProfileRequest {
+    name: String,
+    email: String,
+    avatar_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NotificationPreferences {
+    email_notification: bool,
+    mention_only: bool,
+    daily_digest: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePreferencesRequest {
+    notification_prefs: NotificationPreferences,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AuthTokens {
     access_token: String,
@@ -59,6 +91,11 @@ pub struct AuthResponse {
 #[derive(Debug, Serialize)]
 pub struct MeResponse {
     user: UserResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PreferencesResponse {
+    notification_prefs: NotificationPreferences,
 }
 
 pub async fn register(
@@ -137,18 +174,14 @@ pub async fn register(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id::text as id, email, name, role FROM users WHERE email = $1".to_string(),
+            "SELECT id::text as id, email, name, role, avatar_url, created_at, updated_at FROM users WHERE email = $1"
+                .to_string(),
             vec![normalized_email.into()],
         ))
         .await?
         .ok_or(ApiError::Internal)?;
 
-    let user = UserResponse {
-        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
-        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
-        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
-        role: row.try_get::<String>("", "role").ok(),
-    };
+    let user = user_response_from_row(&row)?;
 
     let jwt = jwt_manager(&state);
     let (tokens, cookies) = build_auth_response(&jwt, &state, &user)?;
@@ -165,7 +198,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id::text as id, email, password_hash, name, role, entity_type FROM users WHERE email = $1"
+            "SELECT id::text as id, email, password_hash, name, role, entity_type, avatar_url, created_at, updated_at FROM users WHERE email = $1"
                 .to_string(),
             vec![normalized_email.into()],
         ))
@@ -193,12 +226,7 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
         return Err(ApiError::Unauthorized("invalid email or password".to_string()));
     }
 
-    let user = UserResponse {
-        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
-        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
-        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
-        role: row.try_get::<String>("", "role").ok(),
-    };
+    let user = user_response_from_row(&row)?;
 
     let jwt = jwt_manager(&state);
     let (tokens, response) = build_auth_response(&jwt, &state, &user)?;
@@ -229,18 +257,14 @@ pub async fn refresh(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id::text as id, email, name, role FROM users WHERE id = $1::uuid".to_string(),
+            "SELECT id::text as id, email, name, role, avatar_url, created_at, updated_at FROM users WHERE id = $1::uuid"
+                .to_string(),
             vec![claims.sub.clone().into()],
         ))
         .await?
         .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
 
-    let user = UserResponse {
-        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
-        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
-        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
-        role: row.try_get::<String>("", "role").ok(),
-    };
+    let user = user_response_from_row(&row)?;
 
     let (tokens, cookies) = build_auth_response(&jwt, &state, &user)?;
     let mut resp = ApiResponse::success(AuthResponse { user, tokens }).into_response();
@@ -266,20 +290,166 @@ pub async fn me(
         .db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT id::text as id, email, name, role FROM users WHERE id = $1::uuid".to_string(),
+            "SELECT id::text as id, email, name, role, avatar_url, created_at, updated_at FROM users WHERE id = $1::uuid"
+                .to_string(),
             vec![claims.sub.into()],
         ))
         .await?
         .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
 
-    let user = UserResponse {
-        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
-        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
-        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
-        role: row.try_get::<String>("", "role").ok(),
-    };
+    let user = user_response_from_row(&row)?;
 
     Ok(ApiResponse::success(MeResponse { user }))
+}
+
+pub async fn update_profile(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    Json(req): Json<UpdateProfileRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = claims.sub.clone();
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("name cannot be empty".to_string()));
+    }
+
+    let email = req.email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err(ApiError::BadRequest("email cannot be empty".to_string()));
+    }
+
+    let avatar_url = req.avatar_url.and_then(|value| {
+        let trimmed = value.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+
+    let existing = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM users WHERE email = $1 AND id != $2::uuid".to_string(),
+            vec![email.clone().into(), user_id.clone().into()],
+        ))
+        .await?;
+    if existing.is_some() {
+        return Err(ApiError::Conflict("email already exists".to_string()));
+    }
+
+    let result = state
+        .db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE users SET name = $1, email = $2, avatar_url = $3, updated_at = now() WHERE id = $4::uuid"
+                .to_string(),
+            vec![name.to_string().into(), email.into(), avatar_url.into(), user_id.into()],
+        ))
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::Unauthorized("user not found".to_string()));
+    }
+
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id::text as id, email, name, role, avatar_url, created_at, updated_at FROM users WHERE id = $1::uuid"
+                .to_string(),
+            vec![claims.sub.into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
+
+    Ok(ApiResponse::success(MeResponse {
+        user: user_response_from_row(&row)?,
+    }))
+}
+
+pub async fn update_password(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    Json(req): Json<UpdatePasswordRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    if req.current_password.trim().is_empty() || req.new_password.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "current_password and new_password are required".to_string(),
+        ));
+    }
+    if req.new_password.trim().len() < 8 {
+        return Err(ApiError::BadRequest(
+            "password must be at least 8 characters".to_string(),
+        ));
+    }
+
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT password_hash, entity_type FROM users WHERE id = $1::uuid".to_string(),
+            vec![claims.sub.clone().into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
+
+    let entity_type = row
+        .try_get::<String>("", "entity_type")
+        .map_err(|_| ApiError::Internal)?;
+    if entity_type == "bot" {
+        return Err(ApiError::Forbidden("bot user password cannot be changed".to_string()));
+    }
+
+    let password_hash = row
+        .try_get::<String>("", "password_hash")
+        .map_err(|_| ApiError::Internal)?;
+    let current_ok = verify(req.current_password, &password_hash)
+        .map_err(|_| ApiError::Unauthorized("invalid current password".to_string()))?;
+    if !current_ok {
+        return Err(ApiError::Unauthorized("invalid current password".to_string()));
+    }
+
+    let new_hash = hash(req.new_password, DEFAULT_COST).map_err(|_| ApiError::Internal)?;
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2::uuid".to_string(),
+            vec![new_hash.into(), claims.sub.into()],
+        ))
+        .await?;
+
+    Ok(ApiResponse::ok())
+}
+
+pub async fn get_preferences(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefs = load_notification_preferences(&state, &claims.sub).await?;
+    Ok(ApiResponse::success(PreferencesResponse {
+        notification_prefs: prefs,
+    }))
+}
+
+pub async fn update_preferences(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    Json(req): Json<UpdatePreferencesRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefs_value = serde_json::to_value(&req.notification_prefs).map_err(|_| ApiError::Internal)?;
+    let result = state
+        .db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE users SET notification_prefs = $1, updated_at = now() WHERE id = $2::uuid".to_string(),
+            vec![prefs_value.into(), claims.sub.clone().into()],
+        ))
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::Unauthorized("user not found".to_string()));
+    }
+
+    Ok(ApiResponse::success(PreferencesResponse {
+        notification_prefs: req.notification_prefs,
+    }))
 }
 
 fn jwt_manager(state: &AppState) -> JwtManager {
@@ -288,6 +458,57 @@ fn jwt_manager(state: &AppState) -> JwtManager {
         state.cfg.jwt_access_ttl_seconds,
         state.cfg.jwt_refresh_ttl_seconds,
     )
+}
+
+fn user_response_from_row(row: &QueryResult) -> Result<UserResponse, ApiError> {
+    let created_at = row
+        .try_get::<chrono::DateTime<chrono::Utc>>("", "created_at")
+        .ok()
+        .map(|value| value.to_rfc3339());
+    let updated_at = row
+        .try_get::<chrono::DateTime<chrono::Utc>>("", "updated_at")
+        .ok()
+        .map(|value| value.to_rfc3339());
+
+    Ok(UserResponse {
+        id: row.try_get::<String>("", "id").map_err(|_| ApiError::Internal)?,
+        email: row.try_get::<String>("", "email").map_err(|_| ApiError::Internal)?,
+        name: row.try_get::<String>("", "name").map_err(|_| ApiError::Internal)?,
+        role: row.try_get::<String>("", "role").ok(),
+        avatar_url: row.try_get::<Option<String>>("", "avatar_url").ok().flatten(),
+        created_at,
+        updated_at,
+    })
+}
+
+async fn load_notification_preferences(state: &AppState, user_id: &str) -> Result<NotificationPreferences, ApiError> {
+    let row = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT notification_prefs FROM users WHERE id = $1::uuid".to_string(),
+            vec![user_id.to_string().into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::Unauthorized("user not found".to_string()))?;
+
+    let value = row
+        .try_get::<serde_json::Value>("", "notification_prefs")
+        .unwrap_or_else(|_| default_notification_preferences_value());
+
+    Ok(serde_json::from_value(value).unwrap_or_else(|_| default_notification_preferences()))
+}
+
+fn default_notification_preferences() -> NotificationPreferences {
+    NotificationPreferences {
+        email_notification: true,
+        mention_only: false,
+        daily_digest: true,
+    }
+}
+
+fn default_notification_preferences_value() -> serde_json::Value {
+    json!(default_notification_preferences())
 }
 
 fn build_auth_response(
@@ -410,13 +631,19 @@ mod tests {
     #[test]
     fn cookie_single_match() {
         let headers = make_headers(header::COOKIE, "access_token=tok123");
-        assert_eq!(extract_cookie_token(&headers, "access_token"), Some("tok123".to_string()));
+        assert_eq!(
+            extract_cookie_token(&headers, "access_token"),
+            Some("tok123".to_string())
+        );
     }
 
     #[test]
     fn cookie_multi_find_correct_key() {
         let headers = make_headers(header::COOKIE, "session=xyz; access_token=tok456; lang=en");
-        assert_eq!(extract_cookie_token(&headers, "access_token"), Some("tok456".to_string()));
+        assert_eq!(
+            extract_cookie_token(&headers, "access_token"),
+            Some("tok456".to_string())
+        );
     }
 
     #[test]

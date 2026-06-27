@@ -15,6 +15,7 @@ use crate::{
     entities::trust_score::ParticipantType,
     error::ApiError,
     response::{ApiResponse, PaginatedData},
+    routes::check_result::sync_check_result_after_proposal_decision,
     services::ai_task_service::queue_vote_requested_tasks_for_project,
     services::governance_audit_service::{GovernanceAuditLogInput, write_governance_audit_log},
     services::impact_review_service::ImpactReviewService,
@@ -204,7 +205,7 @@ struct VoteForFinalizeRow {
 
 #[derive(Debug, FromQueryResult)]
 struct WeightRow {
-    vote_weight: f64,
+    vote_weight: Option<f64>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -596,6 +597,7 @@ async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(),
     }
 
     apply_trust_score_after_finalize_with_conn(state, &tx, proposal, result).await?;
+    sync_check_result_after_proposal_decision(&tx, &proposal.id, result.as_db_value(), Utc::now()).await?;
     if matches!(result, DecisionResult::Approved) {
         let review_svc = ImpactReviewService::new(state.db.clone());
         review_svc.schedule_review_with_conn(&tx, &proposal.id, true).await?;
@@ -913,7 +915,10 @@ async fn resolve_vote_weight_from_trust_scores<C: ConnectionTrait>(
         ))
         .one(db)
         .await?;
-        return Ok(row.map(|item| item.vote_weight.clamp(0.5, 2.0)).unwrap_or(1.0));
+        return Ok(row
+            .and_then(|item| item.vote_weight)
+            .map(|vote_weight| vote_weight.clamp(0.5, 2.0))
+            .unwrap_or(1.0));
     }
 
     let mut values: Vec<sea_orm::Value> =
@@ -942,7 +947,10 @@ async fn resolve_vote_weight_from_trust_scores<C: ConnectionTrait>(
         .one(db)
         .await?;
 
-    Ok(row.map(|item| item.vote_weight.clamp(0.5, 2.0)).unwrap_or(1.0))
+    Ok(row
+        .and_then(|item| item.vote_weight)
+        .map(|vote_weight| vote_weight.clamp(0.5, 2.0))
+        .unwrap_or(1.0))
 }
 
 async fn recalculate_and_tally_votes_with_conn<C: ConnectionTrait>(
@@ -2579,26 +2587,14 @@ mod tests {
 
     #[test]
     fn calculate_result_handles_total_zero() {
-        assert_eq!(
-            calculate_result(0.0, 0.0, "simple_majority"),
-            DecisionResult::Rejected
-        );
+        assert_eq!(calculate_result(0.0, 0.0, "simple_majority"), DecisionResult::Rejected);
     }
 
     #[test]
     fn calculate_result_handles_simple_majority() {
-        assert_eq!(
-            calculate_result(3.0, 2.0, "simple_majority"),
-            DecisionResult::Approved
-        );
-        assert_eq!(
-            calculate_result(2.0, 3.0, "simple_majority"),
-            DecisionResult::Rejected
-        );
-        assert_eq!(
-            calculate_result(2.5, 2.5, "simple_majority"),
-            DecisionResult::Rejected
-        );
+        assert_eq!(calculate_result(3.0, 2.0, "simple_majority"), DecisionResult::Approved);
+        assert_eq!(calculate_result(2.0, 3.0, "simple_majority"), DecisionResult::Rejected);
+        assert_eq!(calculate_result(2.5, 2.5, "simple_majority"), DecisionResult::Rejected);
     }
 
     #[test]
@@ -2615,14 +2611,8 @@ mod tests {
 
     #[test]
     fn calculate_result_handles_consensus() {
-        assert_eq!(
-            calculate_result(80.0, 20.0, "consensus"),
-            DecisionResult::Approved
-        );
-        assert_eq!(
-            calculate_result(79.0, 21.0, "consensus"),
-            DecisionResult::Rejected
-        );
+        assert_eq!(calculate_result(80.0, 20.0, "consensus"), DecisionResult::Approved);
+        assert_eq!(calculate_result(79.0, 21.0, "consensus"), DecisionResult::Rejected);
     }
 
     #[test]
@@ -2647,9 +2637,7 @@ mod tests {
 
     #[test]
     fn validate_status_checks_allowed_values() {
-        for value in [
-            "draft", "open", "voting", "approved", "rejected", "vetoed", "archived",
-        ] {
+        for value in ["draft", "open", "voting", "approved", "rejected", "vetoed", "archived"] {
             assert!(validate_status(value));
         }
         assert!(!validate_status("pending"));

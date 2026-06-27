@@ -4,11 +4,11 @@ set -e
 # Database initialization script
 # Runs all migration files in order
 
-PGHOST="${PGHOST:-localhost}"
+PGHOST="${PGHOST:-127.0.0.1}"
 PGPORT="${PGPORT:-5432}"
 PGDATABASE="${PGDATABASE:-openpr}"
 PGUSER="${PGUSER:-openpr}"
-PGPASSWORD="${PGPASSWORD:-openpr}"
+PGPASSWORD="${PGPASSWORD:-openpr_dev_password}"
 
 export PGPASSWORD
 

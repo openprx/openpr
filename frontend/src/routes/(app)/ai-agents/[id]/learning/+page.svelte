@@ -148,10 +148,10 @@
 				<table class="min-w-full text-left text-sm">
 					<thead>
 						<tr class="border-b border-slate-200 text-xs text-slate-500 dark:border-slate-700">
-							<th class="px-2 py-2">Review</th>
+							<th class="px-2 py-2">{$t('aiAgents.review')}</th>
 							<th class="px-2 py-2">{$t('governance.domainLabel')}</th>
 							<th class="px-2 py-2">{$t('governanceExt.alignment')}</th>
-							<th class="px-2 py-2">Rating</th>
+							<th class="px-2 py-2">{$t('aiAgents.rating')}</th>
 							<th class="px-2 py-2">{$t('common.createdAt')}</th>
 							<th class="px-2 py-2">{$t('common.actions')}</th>
 						</tr>

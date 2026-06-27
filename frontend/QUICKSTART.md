@@ -35,7 +35,7 @@ bun run dev
 创建 `.env` 文件：
 
 ```bash
-VITE_API_BASE_URL=http://localhost:3000
+VITE_API_BASE_URL=http://localhost:8081
 ```
 
 ## 📦 构建命令

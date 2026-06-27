@@ -16,6 +16,7 @@ use crate::{
     error::{ApiError, localize_error, request_lang},
     middleware::bot_auth::{BotAuthContext, require_workspace_access},
     response::{ApiResponse, PaginatedData},
+    services::ai_task_service::{CreateAiTaskInput, create_ai_task},
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
 };
 
@@ -135,6 +136,24 @@ async fn create_mention_notifications<C: ConnectionTrait>(
     Ok(())
 }
 
+async fn mentioned_bot_ids<C: ConnectionTrait>(db: &C, mention_user_ids: &[Uuid]) -> Result<Vec<Uuid>, ApiError> {
+    let mut bot_ids = Vec::new();
+    for mention_user_id in mention_user_ids {
+        let is_bot = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT 1 FROM users WHERE id = $1 AND entity_type = 'bot'",
+                vec![(*mention_user_id).into()],
+            ))
+            .await?
+            .is_some();
+        if is_bot {
+            bot_ids.push(*mention_user_id);
+        }
+    }
+    Ok(bot_ids)
+}
+
 /// POST /api/v1/issues/:issue_id/comments - Create a new comment
 pub async fn create_comment(
     State(state): State<AppState>,
@@ -157,13 +176,14 @@ pub async fn create_comment(
     struct IssueContext {
         project_id: Uuid,
         workspace_id: Uuid,
+        project_type: String,
     }
 
     // Verify issue exists and fetch project/workspace context.
     let issue_context = IssueContext::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            SELECT wi.project_id, p.workspace_id
+            SELECT wi.project_id, p.workspace_id, p.type_key AS project_type
             FROM work_items wi
             INNER JOIN projects p ON wi.project_id = p.id
             WHERE wi.id = $1
@@ -227,6 +247,36 @@ pub async fn create_comment(
     .await?;
 
     tx.commit().await?;
+
+    for bot_id in mentioned_bot_ids(&state.db, &mention_user_ids).await? {
+        let _ = create_ai_task(
+            &state.db,
+            CreateAiTaskInput {
+                project_id: issue_context.project_id,
+                ai_participant_id: bot_id,
+                actor_id: Some(user_id),
+                task_type: "comment_requested".to_string(),
+                reference_type: Some("comment".to_string()),
+                reference_id: Some(comment_id),
+                priority: 10,
+                payload: json!({
+                    "issue_id": issue_id.to_string(),
+                    "comment_id": comment_id.to_string(),
+                    "project_id": issue_context.project_id.to_string(),
+                    "project_type": issue_context.project_type,
+                    "bot_id": bot_id.to_string(),
+                    "trigger": "comment.created",
+                    "comment": {
+                        "id": comment_id.to_string(),
+                        "body": content,
+                    },
+                }),
+                idempotency_key: Some(format!("comment_requested:{comment_id}:{bot_id}")),
+                max_attempts: 3,
+            },
+        )
+        .await?;
+    }
 
     trigger_webhooks(
         state.clone(),

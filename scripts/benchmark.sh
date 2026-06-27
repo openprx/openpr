@@ -4,7 +4,7 @@ set -e
 # API Performance Benchmark Script
 # Tests API response times and throughput
 
-API_URL="${API_URL:-http://localhost:8080}"
+API_URL="${API_URL:-http://localhost:8081}"
 
 echo "⚡ OpenPR API Performance Benchmark"
 echo "==================================="

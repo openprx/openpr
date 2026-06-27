@@ -1,5 +1,5 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 echo "🧹 OpenPR Clean Slate"
 echo "===================="
@@ -22,7 +22,7 @@ cd "$PROJECT_ROOT"
 
 echo ""
 echo "🗑️  Removing all services and data..."
-docker-compose down -v --remove-orphans
+docker compose down -v --remove-orphans
 
 echo ""
 echo "✅ Clean complete"

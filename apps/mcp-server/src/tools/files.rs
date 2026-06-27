@@ -47,7 +47,11 @@ pub async fn upload_file(client: &OpenPrClient, args: serde_json::Value) -> Call
         Ok(uploaded) => {
             let payload = json!({
                 "url": uploaded.url,
-                "filename": uploaded.filename
+                "filename": uploaded.filename,
+                "storage_backend": uploaded.storage_backend,
+                "object_key": uploaded.object_key,
+                "thumbnail_url": uploaded.thumbnail_url,
+                "thumbnail_object_key": uploaded.thumbnail_object_key
             });
             let text = serde_json::to_string_pretty(&payload).unwrap_or_default();
             CallToolResult::success(text)

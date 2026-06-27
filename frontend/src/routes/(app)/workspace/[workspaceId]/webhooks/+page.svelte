@@ -433,7 +433,7 @@
 		}}
 		class="space-y-4"
 	>
-		<Input type="url" label="Webhook URL" bind:value={form.url} required placeholder={$t('placeholders.webhookUrl')} />
+		<Input type="url" label={$t('webhook.url')} bind:value={form.url} required placeholder={$t('placeholders.webhookUrl')} />
 		<Input label={$t('webhook.secretOptional')} bind:value={form.secret} />
 		<div>
 			<label class="mb-1 block text-sm font-medium text-slate-700 dark:text-slate-300" for="botUserId">{$t('webhook.linkedBot')}</label>

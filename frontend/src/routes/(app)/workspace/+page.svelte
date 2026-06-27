@@ -525,7 +525,7 @@
 									disabled={loadingMoreActivities}
 									class="rounded-md px-4 py-2 text-sm text-blue-600 hover:bg-blue-50 disabled:opacity-50 dark:text-blue-400 dark:hover:bg-slate-800"
 								>
-									{loadingMoreActivities ? $t('common.loading') : '查看更多'}
+									{loadingMoreActivities ? $t('common.loading') : $t('workspace.loadMore')}
 								</button>
 							</div>
 						{/if}

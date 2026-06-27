@@ -64,8 +64,8 @@ bash scripts/e2e-test.sh
 # Run Rust tests
 cargo test
 
-# Run frontend tests
-cd frontend && bun run test
+# Run frontend checks
+cd frontend && bun run check && bun run build
 ```
 
 ### 4. Format Your Code
@@ -117,8 +117,13 @@ cargo run -p api
 cd frontend && bun run dev
 
 # Database only
-docker run -p 5432:5432 -e POSTGRES_PASSWORD=openpr postgres:16
+bash scripts/dev-up.sh
 ```
+
+`scripts/dev-up.sh` is for local host development. It starts PostgreSQL through
+the compose service with a temporary localhost-only port override and prints
+the matching `DATABASE_URL`/`PGPASSWORD` values for `cargo run` and
+`scripts/init-db.sh`.
 
 ### Debugging
 
@@ -127,10 +132,10 @@ docker run -p 5432:5432 -e POSTGRES_PASSWORD=openpr postgres:16
 RUST_LOG=debug cargo run -p api
 
 # Check database
-docker-compose exec postgres psql -U openpr -d openpr
+docker compose exec postgres psql -U openpr -d openpr
 
 # View API logs
-docker-compose logs -f api
+docker compose logs -f api
 ```
 
 ### Database Migrations

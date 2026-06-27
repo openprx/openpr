@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.local/schemas/openpr-universal-forms-readiness.schema.json",
+  "title": "OpenPR Universal Forms Readiness",
+  "description": "Machine-readable readiness state for the OpenPR universal forms delivery bundle.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "generated_at",
+    "repository",
+    "reports",
+    "stage",
+    "final_acceptance_complete",
+    "next_action",
+    "gates",
+    "tracker_status",
+    "manual_signoff",
+    "release_requirement"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.readiness.v1"
+    },
+    "schema_path": {
+      "type": "string",
+      "pattern": "/docs/schemas/openpr-universal-forms-readiness\\.schema\\.json$"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "reports": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tracker",
+        "evidence",
+        "completion_audit",
+        "user_acceptance_packet",
+        "readiness_summary",
+        "signoff_status",
+        "signoff_status_json",
+        "delivery_manifest",
+        "ui_review_gallery"
+      ],
+      "properties": {
+        "tracker": { "type": "string" },
+        "evidence": { "type": "string" },
+        "completion_audit": { "type": "string" },
+        "user_acceptance_packet": { "type": "string" },
+        "readiness_summary": { "type": "string" },
+        "signoff_status": { "type": "string" },
+        "signoff_status_json": { "type": "string" },
+        "delivery_manifest": { "type": "string" },
+        "ui_review_gallery": { "type": "string" }
+      }
+    },
+    "stage": {
+      "enum": ["Not ready", "Ready for user-side manual signoff", "Signed, not finalized", "Accepted"]
+    },
+    "final_acceptance_complete": {
+      "type": "boolean"
+    },
+    "next_action": {
+      "type": "string"
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "automated_checks",
+        "pass_status_lines",
+        "failed_automated_checks",
+        "automated_check_index_rows",
+        "automated_check_index_failed_rows",
+        "tracker_non_manual_unresolved_items",
+        "manual_signoff_consistency",
+        "ui_review_gallery_verification",
+        "ui_review_gallery_browser_render",
+        "delivery_manifest_exists"
+      ],
+      "properties": {
+        "automated_checks": { "type": "integer", "minimum": 0 },
+        "pass_status_lines": { "type": "integer", "minimum": 0 },
+        "failed_automated_checks": { "type": "integer", "minimum": 0 },
+        "automated_check_index_rows": { "type": "integer", "minimum": 0 },
+        "automated_check_index_failed_rows": { "type": "integer", "minimum": 0 },
+        "tracker_non_manual_unresolved_items": { "type": "integer", "minimum": 0 },
+        "manual_signoff_consistency": { "$ref": "#/$defs/gate_status" },
+        "ui_review_gallery_verification": { "$ref": "#/$defs/gate_status" },
+        "ui_review_gallery_browser_render": { "$ref": "#/$defs/gate_status" },
+        "delivery_manifest_exists": { "type": "boolean" }
+      }
+    },
+    "tracker_status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["end_to_end_acceptance", "user_side_manual_acceptance"],
+      "properties": {
+        "end_to_end_acceptance": { "$ref": "#/$defs/tracker_status" },
+        "user_side_manual_acceptance": { "$ref": "#/$defs/tracker_status" }
+      }
+    },
+    "manual_signoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pending_rows", "rows", "next_row"],
+      "properties": {
+        "pending_rows": { "type": "integer", "minimum": 0 },
+        "rows": {
+          "type": "array",
+          "minItems": 7,
+          "maxItems": 7,
+          "prefixItems": [
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "restaurant_template" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "frontend_usability" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "amounts" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "workflow" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "hub_consistency" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "docs" } } }] },
+            { "allOf": [{ "$ref": "#/$defs/manual_row" }, { "properties": { "key": { "const": "overall" } } }] }
+          ],
+          "items": false
+        },
+        "next_row": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key", "item", "suggested_evidence_note", "recorder_command"],
+          "properties": {
+            "key": {
+              "anyOf": [
+                { "$ref": "#/$defs/manual_key" },
+                { "const": "" }
+              ]
+            },
+            "item": { "type": "string" },
+            "suggested_evidence_note": { "type": "string" },
+            "recorder_command": { "type": "string" }
+          }
+        }
+      }
+    },
+    "release_requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stage",
+        "failed_automated_checks",
+        "tracker_non_manual_unresolved_items",
+        "manual_signoff_pending_rows",
+        "end_to_end_acceptance",
+        "user_side_manual_acceptance"
+      ],
+      "properties": {
+        "stage": { "const": "Accepted" },
+        "failed_automated_checks": { "const": 0 },
+        "tracker_non_manual_unresolved_items": { "const": 0 },
+        "manual_signoff_pending_rows": { "const": 0 },
+        "end_to_end_acceptance": { "const": "已验收" },
+        "user_side_manual_acceptance": { "const": "已验收" }
+      }
+    }
+  },
+  "$defs": {
+    "gate_status": {
+      "enum": ["passed", "failed"]
+    },
+    "tracker_status": {
+      "enum": ["待处理", "开发中", "已完成", "已测试", "已验收", "阻塞", "missing"]
+    },
+    "manual_key": {
+      "enum": [
+        "restaurant_template",
+        "frontend_usability",
+        "amounts",
+        "workflow",
+        "hub_consistency",
+        "docs",
+        "overall"
+      ]
+    },
+    "manual_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "item", "status", "reviewer", "evidence"],
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/manual_key"
+        },
+        "item": { "type": "string" },
+        "status": {
+          "enum": ["Pending", "Accepted", "Failed", "Needs rework"]
+        },
+        "reviewer": { "type": "string" },
+        "evidence": { "type": "string" }
+      }
+    }
+  }
+}

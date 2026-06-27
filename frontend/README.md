@@ -121,7 +121,7 @@ src/
 
 ```bash
 # API 基础 URL
-VITE_API_BASE_URL=http://localhost:3000
+VITE_API_BASE_URL=http://localhost:8081
 ```
 
 ## API 对接
@@ -192,9 +192,9 @@ bun run build
 
 A: Bun 速度更快，安装依赖和运行脚本比 npm 快 2-10 倍。
 
-### Q: 如何处理 CORS 问题？
+### Q: 如何处理 API 连接问题？
 
-A: 在开发环境，Vite 的 proxy 功能可以代理 API 请求（见 `vite.config.ts`）。生产环境需后端配置 CORS。
+A: 开发环境请把 `.env` 中的 `VITE_API_BASE_URL` 指向后端 API，例如 `http://localhost:8081`。生产 Docker Compose 前端通过 nginx 同源代理转发 API 请求。
 
 ### Q: 构建报错 a11y 警告？
 

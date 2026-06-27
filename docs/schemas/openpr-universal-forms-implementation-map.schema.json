@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/openpr-universal-forms-implementation-map.schema.json",
+  "title": "OpenPR Universal Forms Implementation Map",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "generated_at",
+    "implementation_map_path",
+    "status_markers",
+    "module_count",
+    "modules",
+    "release_boundary"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "openpr.universal_forms.implementation_map.v1"
+    },
+    "schema_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "implementation_map_path": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status_markers": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/status_marker" }, { "properties": { "marker": { "const": "待处理" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_marker" }, { "properties": { "marker": { "const": "开发中" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_marker" }, { "properties": { "marker": { "const": "已完成" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_marker" }, { "properties": { "marker": { "const": "已测试" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/status_marker" }, { "properties": { "marker": { "const": "已验收" } } }] }
+      ],
+      "items": false
+    },
+    "module_count": {
+      "type": "integer",
+      "minimum": 12,
+      "maximum": 12
+    },
+    "modules": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "project_types_scenario_templates" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "universal_form_records" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "decimal_amount_fields" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "subforms_record_links" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "business_events_delivery_ledger" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "connectors_webhooks_print" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "wasm_plugin_runtime" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "mcp_business_surface" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "frontend_operator_workflow" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "restaurant_reference_scenario" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "delivery_evidence_release_gates" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/module" }, { "properties": { "key": { "const": "user_side_manual_acceptance" } } }] }
+      ],
+      "items": false
+    },
+    "release_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status_command",
+        "delivery_bundle_audit",
+        "strict_release_gate",
+        "manual_signoff_required"
+      ],
+      "properties": {
+        "status_command": { "type": "string", "minLength": 1 },
+        "delivery_bundle_audit": { "type": "string", "minLength": 1 },
+        "strict_release_gate": { "type": "string", "minLength": 1 },
+        "manual_signoff_required": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "status_marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "marker",
+        "meaning",
+        "allowed_transition"
+      ],
+      "properties": {
+        "marker": {
+          "enum": [
+            "待处理",
+            "开发中",
+            "已完成",
+            "已测试",
+            "已验收"
+          ]
+        },
+        "meaning": { "type": "string", "minLength": 1 },
+        "allowed_transition": { "type": "string", "minLength": 1 }
+      }
+    },
+    "module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "delivery_area",
+        "implementation_paths",
+        "public_surface",
+        "primary_verification",
+        "current_marker",
+        "manual_gate"
+      ],
+      "properties": {
+        "key": {
+          "enum": [
+            "project_types_scenario_templates",
+            "universal_form_records",
+            "decimal_amount_fields",
+            "subforms_record_links",
+            "business_events_delivery_ledger",
+            "connectors_webhooks_print",
+            "wasm_plugin_runtime",
+            "mcp_business_surface",
+            "frontend_operator_workflow",
+            "restaurant_reference_scenario",
+            "delivery_evidence_release_gates",
+            "user_side_manual_acceptance"
+          ]
+        },
+        "delivery_area": { "type": "string", "minLength": 1 },
+        "implementation_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "public_surface": { "type": "string", "minLength": 1 },
+        "primary_verification": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "current_marker": {
+          "enum": [
+            "待处理",
+            "开发中",
+            "已完成",
+            "已测试",
+            "已验收",
+            "阻塞"
+          ]
+        },
+        "manual_gate": { "type": "boolean" }
+      }
+    }
+  }
+}

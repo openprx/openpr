@@ -21,9 +21,19 @@ axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.38", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }
-sea-orm = { version = "1", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm = { version = "1", default-features = false, features = [
+  "sqlx-postgres",
+  "runtime-tokio-rustls",
+  "macros",
+  "with-chrono",
+  "with-json",
+  "with-time",
+  "with-uuid",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+base64 = "0.22"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5.2"
@@ -33,6 +43,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.4", features = ["v4", "serde"] }
 jsonwebtoken = "9"
 bcrypt = "0.16"
+wasmtime = "45.0.0"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -86,6 +86,18 @@ pub fn create_project_tool() -> ToolDefinition {
                 "description": {
                     "type": "string",
                     "description": "Project description (optional)"
+                },
+                "type_key": {
+                    "type": "string",
+                    "description": "Project type key, e.g. code_project, contract_review, equipment_maintenance"
+                },
+                "type_settings": {
+                    "type": "object",
+                    "description": "Project type-specific settings"
+                },
+                "scenario_template_key": {
+                    "type": "string",
+                    "description": "Optional scenario template key, for example contract_review_default"
                 }
             },
             "required": ["key", "name"]
@@ -98,6 +110,9 @@ struct CreateProjectInput {
     key: String,
     name: String,
     description: Option<String>,
+    type_key: Option<String>,
+    type_settings: Option<serde_json::Value>,
+    scenario_template_key: Option<String>,
 }
 
 pub async fn create_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -109,7 +124,10 @@ pub async fn create_project(client: &OpenPrClient, args: serde_json::Value) -> C
     let body = json!({
         "key": input.key,
         "name": input.name,
-        "description": input.description
+        "description": input.description,
+        "type_key": input.type_key,
+        "type_settings": input.type_settings,
+        "scenario_template_key": input.scenario_template_key
     });
 
     match client.create_project(body).await {
@@ -140,6 +158,14 @@ pub fn update_project_tool() -> ToolDefinition {
                 "description": {
                     "type": "string",
                     "description": "New project description (optional)"
+                },
+                "type_key": {
+                    "type": "string",
+                    "description": "New project type key (optional)"
+                },
+                "type_settings": {
+                    "type": "object",
+                    "description": "Project type-specific settings (optional)"
                 }
             },
             "required": ["project_id"]
@@ -152,6 +178,8 @@ struct UpdateProjectInput {
     project_id: String,
     name: Option<String>,
     description: Option<String>,
+    type_key: Option<String>,
+    type_settings: Option<serde_json::Value>,
 }
 
 pub async fn update_project(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -166,6 +194,12 @@ pub async fn update_project(client: &OpenPrClient, args: serde_json::Value) -> C
     }
     if let Some(desc) = input.description {
         body.insert("description".to_string(), json!(desc));
+    }
+    if let Some(type_key) = input.type_key {
+        body.insert("type_key".to_string(), json!(type_key));
+    }
+    if let Some(type_settings) = input.type_settings {
+        body.insert("type_settings".to_string(), type_settings);
     }
 
     match client
