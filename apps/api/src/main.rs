@@ -42,46 +42,52 @@ async fn main() -> anyhow::Result<()> {
     let auth_state = state.clone();
     routes::proposal::start_governance_watcher(state.clone());
 
+    // Uploaded object downloads are gated by `uploads_access_middleware`: it accepts either a
+    // signed download URL or a normal session, and the handlers then scope the object to the
+    // workspace that owns it.
+    let uploads_access_layer =
+        || axum_middleware::from_fn_with_state(auth_state.clone(), routes::upload::uploads_access_middleware);
+
     let app = Router::new()
         .route(
             "/uploads/{file_name}",
-            get(routes::upload::get_uploaded_file),
+            get(routes::upload::get_uploaded_file).route_layer(uploads_access_layer()),
         )
         .route(
             "/uploads/thumbnails/{file_name}",
-            get(routes::upload::get_uploaded_thumbnail),
+            get(routes::upload::get_uploaded_thumbnail).route_layer(uploads_access_layer()),
         )
         .route(
             "/uploads/previews/{file_name}",
-            get(routes::upload::get_uploaded_preview),
+            get(routes::upload::get_uploaded_preview).route_layer(uploads_access_layer()),
         )
         .route(
             "/uploads/variants/{file_name}",
-            get(routes::upload::get_uploaded_variant),
+            get(routes::upload::get_uploaded_variant).route_layer(uploads_access_layer()),
         )
         .route(
             "/uploads/signatures/{file_name}",
-            get(routes::upload::get_uploaded_signature),
+            get(routes::upload::get_uploaded_signature).route_layer(uploads_access_layer()),
         )
         .route(
             "/api/v1/uploads/{file_name}",
-            get(routes::upload::get_uploaded_file),
+            get(routes::upload::get_uploaded_file).route_layer(uploads_access_layer()),
         )
         .route(
             "/api/v1/uploads/thumbnails/{file_name}",
-            get(routes::upload::get_uploaded_thumbnail),
+            get(routes::upload::get_uploaded_thumbnail).route_layer(uploads_access_layer()),
         )
         .route(
             "/api/v1/uploads/previews/{file_name}",
-            get(routes::upload::get_uploaded_preview),
+            get(routes::upload::get_uploaded_preview).route_layer(uploads_access_layer()),
         )
         .route(
             "/api/v1/uploads/variants/{file_name}",
-            get(routes::upload::get_uploaded_variant),
+            get(routes::upload::get_uploaded_variant).route_layer(uploads_access_layer()),
         )
         .route(
             "/api/v1/uploads/signatures/{file_name}",
-            get(routes::upload::get_uploaded_signature),
+            get(routes::upload::get_uploaded_signature).route_layer(uploads_access_layer()),
         )
         .route(
             "/api/v1/uploads/signatures/{file_name}/download",

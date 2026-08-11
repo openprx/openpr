@@ -1,26 +1,39 @@
 use axum::{
     Extension,
     body::Bytes,
-    extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue},
-    response::IntoResponse,
+    extract::{FromRequestParts, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, request::Parts},
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use chrono::{Duration, Utc};
 use hmac::{Hmac, Mac};
 use image::{ImageFormat, ImageReader};
 use platform::{app::AppState, auth::JwtClaims};
+use sea_orm::{DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::Sha256;
-use std::io::Cursor;
+use std::{convert::Infallible, io::Cursor};
 use uuid::Uuid;
 
-use crate::{error::ApiError, response::ApiResponse, services::object_storage::ObjectStorage};
+use crate::{
+    error::ApiError,
+    middleware::bot_auth::{BotAuthContext, bot_or_user_auth_middleware, require_workspace_access_from_auth},
+    response::ApiResponse,
+    services::object_storage::ObjectStorage,
+};
 
 const MAX_FILE_SIZE: usize = 50 * 1024 * 1024;
 pub(crate) const THUMBNAIL_MAX_DIMENSION: u32 = 320;
 const SIGNATURE_SIGNED_DOWNLOAD_TTL_MINUTES: i64 = 10;
 const SUPPORTED_FILE_TYPES_MESSAGE: &str =
     "only png/jpg/gif/webp/mp4/webm/mov/avi/zip/gz/tar.gz/log/txt/pdf/json/csv/xml are supported";
+const UPLOAD_PATH_PREFIXES: [&str; 2] = ["/api/v1/uploads/", "/uploads/"];
+const UPLOAD_DERIVATIVE_PREFIXES: [&str; 4] = ["thumbnails/", "previews/", "variants/", "signatures/"];
+const UPLOAD_NOT_FOUND_MESSAGE: &str = "file not found";
+const SIGNATURE_FILE_NAME_PREFIX: &str = "signature-";
+const UUID_TEXT_LENGTH: usize = 36;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageDerivativeFormat {
@@ -51,6 +64,132 @@ pub struct SignatureDownloadQuery {
 pub struct SignatureSignedDownloadResponse {
     pub url: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Query parameters accepted by every uploaded-object download route.
+#[derive(Debug, Default, Deserialize)]
+pub struct UploadAccessQuery {
+    pub expires: Option<i64>,
+    pub signature: Option<String>,
+}
+
+/// Marker injected by [`uploads_access_middleware`] once a request proved it carries a
+/// valid, unexpired signed download URL for the requested object key.
+#[derive(Debug, Clone, Copy)]
+pub struct SignedUploadAccess;
+
+/// Authorization context of an uploaded-object download request.
+///
+/// Exactly one of the two legitimate access paths must be present:
+/// a session (JWT cookie/bearer or bot token) or a validated signed URL.
+#[derive(Debug)]
+pub struct UploadAccess {
+    claims: Option<JwtClaims>,
+    bot: Option<BotAuthContext>,
+    signed: bool,
+}
+
+impl<S> FromRequestParts<S> for UploadAccess
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self {
+            claims: parts.extensions.get::<JwtClaims>().cloned(),
+            bot: parts.extensions.get::<BotAuthContext>().cloned(),
+            signed: parts.extensions.get::<SignedUploadAccess>().is_some(),
+        })
+    }
+}
+
+/// The access path a download request qualified for.
+#[derive(Debug)]
+enum UploadAccessMode<'a> {
+    /// Anonymous request carrying a signed URL already validated by the middleware.
+    SignedUrl,
+    /// Authenticated request; the object still has to belong to a workspace the actor is in.
+    Session(&'a JwtClaims),
+}
+
+impl UploadAccess {
+    /// Classify the request, rejecting anything that carries neither a session nor a signed URL.
+    fn mode(&self) -> Result<UploadAccessMode<'_>, ApiError> {
+        match (self.claims.as_ref(), self.signed) {
+            (Some(claims), _) => Ok(UploadAccessMode::Session(claims)),
+            (None, true) => Ok(UploadAccessMode::SignedUrl),
+            (None, false) => Err(ApiError::Unauthorized("missing access token".to_string())),
+        }
+    }
+
+    /// Reject the request unless the caller may read `object_key`.
+    ///
+    /// Signed URLs are trusted as-is: they are only minted after a workspace check and are bound
+    /// to a single object key with an expiry, which is what keeps anonymous `<img src>` rendering
+    /// working. Session requests are additionally scoped to the workspace that owns the object
+    /// whenever that ownership is recorded in the database.
+    async fn authorize(&self, state: &AppState, object_key: &str) -> Result<(), ApiError> {
+        let claims = match self.mode()? {
+            UploadAccessMode::SignedUrl => return Ok(()),
+            UploadAccessMode::Session(claims) => claims,
+        };
+        let workspace_id = resolve_upload_object_workspace(state, object_key).await?;
+        self.authorize_owner_workspace(state, claims, workspace_id).await
+    }
+
+    /// Require workspace membership for the resolved owner of the object.
+    ///
+    /// Ownership that cannot be resolved (markdown uploads have no ownership row) leaves the
+    /// request at "any authenticated actor". Denials are reported as a plain not-found so the
+    /// endpoint cannot be used to probe which object keys exist in other workspaces.
+    async fn authorize_owner_workspace(
+        &self,
+        state: &AppState,
+        claims: &JwtClaims,
+        workspace_id: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        let Some(workspace_id) = workspace_id else {
+            return Ok(());
+        };
+        match require_workspace_access_from_auth(state, claims, self.bot.as_ref(), workspace_id).await {
+            Ok(_) => Ok(()),
+            Err(ApiError::Database(err)) => Err(ApiError::Database(err)),
+            Err(ApiError::Internal) => Err(ApiError::Internal),
+            Err(_) => Err(ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string())),
+        }
+    }
+}
+
+/// Access gate shared by every `GET /uploads/...` route.
+///
+/// Two access paths are accepted:
+/// 1. a signed download URL (`?expires=...&signature=...`), which stays anonymous on purpose so
+///    that expiring links keep rendering in `<img>` tags outside an authenticated session;
+/// 2. a normal session, delegated to the shared bot/user auth middleware so the handlers can
+///    run per-object workspace checks on the injected claims.
+pub async fn uploads_access_middleware(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let query = Query::<UploadAccessQuery>::try_from_uri(req.uri())
+        .map(|Query(query)| query)
+        .unwrap_or_default();
+    let (Some(expires), Some(signature)) = (query.expires, query.signature.as_deref()) else {
+        return bot_or_user_auth_middleware(State(state), req, next).await;
+    };
+    let object_key = upload_object_key_from_path(req.uri().path())
+        .ok_or_else(|| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))?;
+    verify_upload_download_signature(
+        &state.cfg.jwt_secret,
+        &object_key,
+        expires,
+        signature,
+        Utc::now().timestamp(),
+    )?;
+    req.extensions_mut().insert(SignedUploadAccess);
+    Ok(next.run(req).await)
 }
 
 /// POST /api/v1/upload - Upload files for markdown content
@@ -116,15 +255,18 @@ async fn upload_file_from_multipart(headers: HeaderMap, body: Bytes) -> Result<U
 }
 
 /// GET /uploads/:file_name - Serve uploaded file
-pub async fn get_uploaded_file(Path(file_name): Path<String>) -> Result<impl IntoResponse, ApiError> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
-        return Err(ApiError::NotFound("file not found".to_string()));
-    }
+pub async fn get_uploaded_file(
+    State(state): State<AppState>,
+    access: UploadAccess,
+    Path(file_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_upload_file_name(&file_name)?;
+    access.authorize(&state, &file_name).await?;
 
     let data = ObjectStorage::from_env()?
         .get(&file_name)
         .await
-        .map_err(|_| ApiError::NotFound("file not found".to_string()))?;
+        .map_err(|_| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))?;
 
     let content_type = if file_name.ends_with(".png") {
         HeaderValue::from_static("image/png")
@@ -166,15 +308,12 @@ pub async fn get_uploaded_file(Path(file_name): Path<String>) -> Result<impl Int
 }
 
 /// GET /uploads/thumbnails/:file_name - Serve uploaded thumbnail derivative
-pub async fn get_uploaded_thumbnail(Path(file_name): Path<String>) -> Result<impl IntoResponse, ApiError> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
-        return Err(ApiError::NotFound("file not found".to_string()));
-    }
-
-    let data = ObjectStorage::from_env()?
-        .get(&format!("thumbnails/{file_name}"))
-        .await
-        .map_err(|_| ApiError::NotFound("file not found".to_string()))?;
+pub async fn get_uploaded_thumbnail(
+    State(state): State<AppState>,
+    access: UploadAccess,
+    Path(file_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let data = read_derivative_object(&state, &access, "thumbnails", &file_name).await?;
 
     Ok((
         [(axum::http::header::CONTENT_TYPE, derivative_content_type(&file_name))],
@@ -183,15 +322,12 @@ pub async fn get_uploaded_thumbnail(Path(file_name): Path<String>) -> Result<imp
 }
 
 /// GET /uploads/previews/:file_name - Serve uploaded preview derivative
-pub async fn get_uploaded_preview(Path(file_name): Path<String>) -> Result<impl IntoResponse, ApiError> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
-        return Err(ApiError::NotFound("file not found".to_string()));
-    }
-
-    let data = ObjectStorage::from_env()?
-        .get(&format!("previews/{file_name}"))
-        .await
-        .map_err(|_| ApiError::NotFound("file not found".to_string()))?;
+pub async fn get_uploaded_preview(
+    State(state): State<AppState>,
+    access: UploadAccess,
+    Path(file_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let data = read_derivative_object(&state, &access, "previews", &file_name).await?;
 
     Ok((
         [(axum::http::header::CONTENT_TYPE, derivative_content_type(&file_name))],
@@ -200,15 +336,12 @@ pub async fn get_uploaded_preview(Path(file_name): Path<String>) -> Result<impl 
 }
 
 /// GET /uploads/variants/:file_name - Serve uploaded configured variant derivative
-pub async fn get_uploaded_variant(Path(file_name): Path<String>) -> Result<impl IntoResponse, ApiError> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") {
-        return Err(ApiError::NotFound("file not found".to_string()));
-    }
-
-    let data = ObjectStorage::from_env()?
-        .get(&format!("variants/{file_name}"))
-        .await
-        .map_err(|_| ApiError::NotFound("file not found".to_string()))?;
+pub async fn get_uploaded_variant(
+    State(state): State<AppState>,
+    access: UploadAccess,
+    Path(file_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let data = read_derivative_object(&state, &access, "variants", &file_name).await?;
 
     Ok((
         [(axum::http::header::CONTENT_TYPE, derivative_content_type(&file_name))],
@@ -217,7 +350,13 @@ pub async fn get_uploaded_variant(Path(file_name): Path<String>) -> Result<impl 
 }
 
 /// GET /uploads/signatures/:file_name - Serve stored signature image
-pub async fn get_uploaded_signature(Path(file_name): Path<String>) -> Result<impl IntoResponse, ApiError> {
+pub async fn get_uploaded_signature(
+    State(state): State<AppState>,
+    access: UploadAccess,
+    Path(file_name): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    ensure_signature_file_name(&file_name)?;
+    access.authorize(&state, &format!("signatures/{file_name}")).await?;
     let data = read_signature_object(&file_name).await?;
 
     Ok((
@@ -229,10 +368,11 @@ pub async fn get_uploaded_signature(Path(file_name): Path<String>) -> Result<imp
 /// POST /api/v1/uploads/signatures/:file_name/signed-url - Create signed signature download URL
 pub async fn create_uploaded_signature_signed_url(
     State(state): State<AppState>,
-    Extension(_claims): Extension<JwtClaims>,
+    access: UploadAccess,
     Path(file_name): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     ensure_signature_file_name(&file_name)?;
+    access.authorize(&state, &format!("signatures/{file_name}")).await?;
     let _ = read_signature_object(&file_name).await?;
     let expires_at = Utc::now() + Duration::minutes(SIGNATURE_SIGNED_DOWNLOAD_TTL_MINUTES);
     Ok(ApiResponse::success(signature_signed_download_response(
@@ -579,19 +719,160 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
+async fn read_derivative_object(
+    state: &AppState,
+    access: &UploadAccess,
+    prefix: &str,
+    file_name: &str,
+) -> Result<Vec<u8>, ApiError> {
+    ensure_upload_file_name(file_name)?;
+    let object_key = format!("{prefix}/{file_name}");
+    access.authorize(state, &object_key).await?;
+    ObjectStorage::from_env()?
+        .get(&object_key)
+        .await
+        .map_err(|_| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))
+}
+
 async fn read_signature_object(file_name: &str) -> Result<Vec<u8>, ApiError> {
     ensure_signature_file_name(file_name)?;
     ObjectStorage::from_env()?
         .get(&format!("signatures/{file_name}"))
         .await
-        .map_err(|_| ApiError::NotFound("file not found".to_string()))
+        .map_err(|_| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))
+}
+
+fn ensure_upload_file_name(file_name: &str) -> Result<(), ApiError> {
+    if is_safe_upload_file_name(file_name) {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))
+    }
 }
 
 fn ensure_signature_file_name(file_name: &str) -> Result<(), ApiError> {
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains("..") || !file_name.ends_with(".png") {
-        return Err(ApiError::NotFound("file not found".to_string()));
+    if !is_safe_upload_file_name(file_name) || !file_name.ends_with(".png") {
+        return Err(ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()));
     }
     Ok(())
+}
+
+fn is_safe_upload_file_name(file_name: &str) -> bool {
+    !file_name.is_empty() && !file_name.contains('/') && !file_name.contains('\\') && !file_name.contains("..")
+}
+
+/// Map a request path to the object storage key it serves, or `None` when the path is not a
+/// download route or the file name is unsafe.
+pub(crate) fn upload_object_key_from_path(path: &str) -> Option<String> {
+    let remainder = UPLOAD_PATH_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))?;
+    let (directory, file_name) = match remainder.split_once('/') {
+        Some((directory, file_name)) => {
+            let directory = format!("{directory}/");
+            if !UPLOAD_DERIVATIVE_PREFIXES.contains(&directory.as_str()) {
+                return None;
+            }
+            (Some(directory), file_name)
+        }
+        None => (None, remainder),
+    };
+    if !is_safe_upload_file_name(file_name) {
+        return None;
+    }
+    Some(directory.map_or_else(|| file_name.to_string(), |directory| format!("{directory}{file_name}")))
+}
+
+/// Resolve the workspace that owns `object_key`, when that ownership is recorded.
+///
+/// Objects uploaded through the generic markdown upload endpoint have no ownership row, so
+/// `None` is returned for them and the caller falls back to "any authenticated actor".
+async fn resolve_upload_object_workspace(state: &AppState, object_key: &str) -> Result<Option<Uuid>, ApiError> {
+    if let Some(file_name) = object_key.strip_prefix("signatures/") {
+        return resolve_signature_object_workspace(state, file_name).await;
+    }
+    resolve_attachment_object_workspace(state, object_key).await
+}
+
+#[derive(Debug, FromQueryResult)]
+struct WorkspaceIdRow {
+    workspace_id: Uuid,
+}
+
+/// Look up the owning workspace of a form attachment source file or one of its derivatives.
+async fn resolve_attachment_object_workspace(state: &AppState, object_key: &str) -> Result<Option<Uuid>, ApiError> {
+    let api_url = format!("/api/v1/uploads/{object_key}");
+    let legacy_url = format!("/uploads/{object_key}");
+    let thumbnail_match = json!({ "thumbnail": { "object_key": object_key } }).to_string();
+    let preview_match = json!({ "preview": { "object_key": object_key } }).to_string();
+    let variant_match = json!({ "variants": [{ "policy": { "object_key": object_key } }] }).to_string();
+    let row = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"SELECT workspace_id
+            FROM form_attachments
+           WHERE storage_key = $1
+              OR url IN ($2, $3)
+              OR thumbnail_url IN ($2, $3)
+              OR media_metadata @> $4::text::jsonb
+              OR media_metadata @> $5::text::jsonb
+              OR media_metadata @> $6::text::jsonb
+           LIMIT 1",
+        vec![
+            object_key.to_string().into(),
+            api_url.into(),
+            legacy_url.into(),
+            thumbnail_match.into(),
+            preview_match.into(),
+            variant_match.into(),
+        ],
+    ))
+    .one(&state.db)
+    .await?;
+    Ok(row.map(|row| row.workspace_id))
+}
+
+/// Look up the owning workspace of a materialized signature image.
+///
+/// Signature values are stored on the record itself, so the record that currently references the
+/// image identifies the tenant. The lookup rides the `gin(values jsonb_path_ops)` index.
+async fn resolve_signature_object_workspace(state: &AppState, file_name: &str) -> Result<Option<Uuid>, ApiError> {
+    let Some(field_key) = signature_field_key_from_file_name(file_name) else {
+        return Ok(None);
+    };
+    let value_match = json!({ field_key: format!("/api/v1/uploads/signatures/{file_name}") }).to_string();
+    let row = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"SELECT workspace_id
+             FROM form_records
+            WHERE form_records."values" @> $1::text::jsonb
+            LIMIT 1"#,
+        vec![value_match.into()],
+    ))
+    .one(&state.db)
+    .await?;
+    Ok(row.map(|row| row.workspace_id))
+}
+
+/// Extract the form field key from a materialized signature file name
+/// (`signature-{field_key}-{uuid}.png`). Field keys never contain `-`, so the split is exact.
+fn signature_field_key_from_file_name(file_name: &str) -> Option<&str> {
+    let rest = file_name
+        .strip_suffix(".png")?
+        .strip_prefix(SIGNATURE_FILE_NAME_PREFIX)?;
+    let separator_index = rest.len().checked_sub(UUID_TEXT_LENGTH + 1)?;
+    if rest.get(separator_index..=separator_index) != Some("-") {
+        return None;
+    }
+    let field_key = rest.get(..separator_index)?;
+    Uuid::parse_str(rest.get(separator_index + 1..)?).ok()?;
+    if field_key.is_empty()
+        || !field_key
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_')
+    {
+        return None;
+    }
+    Some(field_key)
 }
 
 type HmacSha256 = Hmac<Sha256>;
@@ -601,6 +882,30 @@ fn sign_signature_download(secret: &str, file_name: &str, expires: i64) -> Resul
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::Internal)?;
     mac.update(format!("signature:{file_name}:{expires}").as_bytes());
     Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn sign_upload_download(secret: &str, object_key: &str, expires: i64) -> Result<String, ApiError> {
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).map_err(|_| ApiError::Internal)?;
+    mac.update(format!("upload:{object_key}:{expires}").as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Validate a signed download URL bound to a single object key and expiry timestamp.
+pub(crate) fn verify_upload_download_signature(
+    secret: &str,
+    object_key: &str,
+    expires: i64,
+    signature: &str,
+    now: i64,
+) -> Result<(), ApiError> {
+    if expires < now {
+        return Err(ApiError::Unauthorized("upload download link expired".to_string()));
+    }
+    let expected = sign_upload_download(secret, object_key, expires)?;
+    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        return Err(ApiError::Unauthorized("invalid upload download signature".to_string()));
+    }
+    Ok(())
 }
 
 fn signature_signed_download_response(
@@ -632,7 +937,232 @@ mod tests {
     use axum::body::to_bytes;
     use chrono::Utc;
     use image::{ImageBuffer, Rgba};
+    use platform::{app::AppState, auth::TokenType, config::AppConfig};
+    use sea_orm::DatabaseConnection;
     use std::env;
+
+    const TEST_SECRET: &str = "upload-access-test-secret";
+
+    fn test_state() -> AppState {
+        AppState {
+            cfg: AppConfig {
+                app_name: "api".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                database_url: "postgres://disconnected/openpr".to_string(),
+                jwt_secret: TEST_SECRET.to_string(),
+                jwt_access_ttl_seconds: 3600,
+                jwt_refresh_ttl_seconds: 7200,
+                default_author_id: None,
+            },
+            db: DatabaseConnection::default(),
+        }
+    }
+
+    fn test_claims(subject: Uuid) -> JwtClaims {
+        JwtClaims {
+            sub: subject.to_string(),
+            email: "member@openpr.local".to_string(),
+            token_type: TokenType::Access,
+            iat: 0,
+            exp: 0,
+        }
+    }
+
+    fn bot_access(bot_id: Uuid, workspace_id: Uuid) -> UploadAccess {
+        UploadAccess {
+            claims: Some(test_claims(bot_id)),
+            bot: Some(BotAuthContext {
+                bot_id,
+                workspace_id,
+                permissions: vec!["admin".to_string()],
+            }),
+            signed: false,
+        }
+    }
+
+    #[test]
+    fn upload_access_rejects_requests_without_session_or_signed_url() {
+        let anonymous = UploadAccess {
+            claims: None,
+            bot: None,
+            signed: false,
+        };
+
+        let error = anonymous.mode().expect_err("anonymous download must be rejected");
+
+        assert!(matches!(error, ApiError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn upload_access_accepts_validated_signed_url_without_session() {
+        let signed = UploadAccess {
+            claims: None,
+            bot: None,
+            signed: true,
+        };
+
+        assert!(matches!(
+            signed.mode().expect("signed download must be accepted"),
+            UploadAccessMode::SignedUrl
+        ));
+    }
+
+    #[tokio::test]
+    async fn upload_access_denies_object_owned_by_another_workspace() {
+        let state = test_state();
+        let bot_id = Uuid::new_v4();
+        let access = bot_access(bot_id, Uuid::new_v4());
+
+        let error = access
+            .authorize_owner_workspace(&state, &test_claims(bot_id), Some(Uuid::new_v4()))
+            .await
+            .expect_err("cross-workspace download must be rejected");
+
+        assert!(matches!(error, ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn upload_access_allows_object_owned_by_the_actor_workspace() {
+        let state = test_state();
+        let bot_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let access = bot_access(bot_id, workspace_id);
+
+        access
+            .authorize_owner_workspace(&state, &test_claims(bot_id), Some(workspace_id))
+            .await
+            .expect("same-workspace download must be allowed");
+    }
+
+    #[tokio::test]
+    async fn upload_access_allows_unowned_object_for_authenticated_actor() {
+        let state = test_state();
+        let bot_id = Uuid::new_v4();
+        let access = bot_access(bot_id, Uuid::new_v4());
+
+        access
+            .authorize_owner_workspace(&state, &test_claims(bot_id), None)
+            .await
+            .expect("objects without an ownership row stay readable for authenticated actors");
+    }
+
+    #[test]
+    fn upload_object_key_maps_download_routes_to_storage_keys() {
+        assert_eq!(
+            upload_object_key_from_path("/api/v1/uploads/9f1a.png").as_deref(),
+            Some("9f1a.png")
+        );
+        assert_eq!(
+            upload_object_key_from_path("/uploads/9f1a.png").as_deref(),
+            Some("9f1a.png")
+        );
+        assert_eq!(
+            upload_object_key_from_path("/api/v1/uploads/thumbnails/thumb-9f1a-320.png").as_deref(),
+            Some("thumbnails/thumb-9f1a-320.png")
+        );
+        assert_eq!(
+            upload_object_key_from_path("/uploads/signatures/signature-consent-9f1a.png").as_deref(),
+            Some("signatures/signature-consent-9f1a.png")
+        );
+        assert_eq!(upload_object_key_from_path("/api/v1/uploads/"), None);
+        assert_eq!(upload_object_key_from_path("/api/v1/uploads/../secrets.env"), None);
+        assert_eq!(upload_object_key_from_path("/api/v1/uploads/other/9f1a.png"), None);
+        assert_eq!(
+            upload_object_key_from_path("/api/v1/uploads/signatures/9f1a.png/download"),
+            None
+        );
+        assert_eq!(upload_object_key_from_path("/api/v1/form-attachments/9f1a"), None);
+    }
+
+    #[test]
+    fn upload_download_signature_is_bound_to_object_key_and_expiry() {
+        let expires = 1_800_000_000;
+        let signature =
+            sign_upload_download(TEST_SECRET, "thumbnails/thumb-9f1a-320.png", expires).expect("signature should sign");
+
+        verify_upload_download_signature(
+            TEST_SECRET,
+            "thumbnails/thumb-9f1a-320.png",
+            expires,
+            &signature,
+            expires - 1,
+        )
+        .expect("fresh signed URL should be accepted");
+
+        let expired = verify_upload_download_signature(
+            TEST_SECRET,
+            "thumbnails/thumb-9f1a-320.png",
+            expires,
+            &signature,
+            expires + 1,
+        )
+        .expect_err("expired signed URL must be rejected");
+        assert!(matches!(expired, ApiError::Unauthorized(_)));
+
+        let other_object = verify_upload_download_signature(
+            TEST_SECRET,
+            "thumbnails/thumb-other-320.png",
+            expires,
+            &signature,
+            expires - 1,
+        )
+        .expect_err("signed URL must not transfer to another object");
+        assert!(matches!(other_object, ApiError::Unauthorized(_)));
+
+        let other_secret = verify_upload_download_signature(
+            "another-secret",
+            "thumbnails/thumb-9f1a-320.png",
+            expires,
+            &signature,
+            expires - 1,
+        )
+        .expect_err("signed URL must not validate under another secret");
+        assert!(matches!(other_secret, ApiError::Unauthorized(_)));
+
+        let tampered = verify_upload_download_signature(
+            TEST_SECRET,
+            "thumbnails/thumb-9f1a-320.png",
+            expires,
+            "deadbeef",
+            expires - 1,
+        )
+        .expect_err("truncated signature must be rejected");
+        assert!(matches!(tampered, ApiError::Unauthorized(_)));
+    }
+
+    #[test]
+    fn signature_field_key_is_parsed_from_materialized_file_names() {
+        let signature_id = Uuid::new_v4();
+        assert_eq!(
+            signature_field_key_from_file_name(&format!("signature-approval_sign-{signature_id}.png")),
+            Some("approval_sign")
+        );
+        assert_eq!(
+            signature_field_key_from_file_name(&format!("signature-{signature_id}.png")),
+            None
+        );
+        assert_eq!(
+            signature_field_key_from_file_name("signature-approval-not-a-uuid.png"),
+            None
+        );
+        assert_eq!(
+            signature_field_key_from_file_name(&format!("thumb-approval-{signature_id}.png")),
+            None
+        );
+        assert_eq!(
+            signature_field_key_from_file_name(&format!("signature-approval-{signature_id}.jpg")),
+            None
+        );
+    }
+
+    #[test]
+    fn upload_file_name_guard_rejects_traversal() {
+        assert!(ensure_upload_file_name("9f1a.png").is_ok());
+        assert!(ensure_upload_file_name("").is_err());
+        assert!(ensure_upload_file_name("../9f1a.png").is_err());
+        assert!(ensure_upload_file_name("nested/9f1a.png").is_err());
+        assert!(ensure_upload_file_name("nested\\9f1a.png").is_err());
+    }
 
     #[test]
     fn thumbnail_file_name_uses_png_derivative_extension() {
@@ -847,7 +1377,12 @@ mod tests {
             .expect("source object should be in MinIO");
         assert_eq!(stored_source, source_bytes);
 
-        let source_response = get_uploaded_file(Path(uploaded.filename.clone()))
+        let signed_access = || UploadAccess {
+            claims: None,
+            bot: None,
+            signed: true,
+        };
+        let source_response = get_uploaded_file(State(test_state()), signed_access(), Path(uploaded.filename.clone()))
             .await
             .expect("source GET should succeed")
             .into_response();
@@ -860,10 +1395,14 @@ mod tests {
         let thumbnail_file_name = thumbnail_key
             .strip_prefix("thumbnails/")
             .expect("thumbnail key should include prefix");
-        let thumbnail_response = get_uploaded_thumbnail(Path(thumbnail_file_name.to_string()))
-            .await
-            .expect("thumbnail GET should succeed")
-            .into_response();
+        let thumbnail_response = get_uploaded_thumbnail(
+            State(test_state()),
+            signed_access(),
+            Path(thumbnail_file_name.to_string()),
+        )
+        .await
+        .expect("thumbnail GET should succeed")
+        .into_response();
         assert_eq!(thumbnail_response.status(), axum::http::StatusCode::OK);
         let thumbnail_response_bytes = to_bytes(thumbnail_response.into_body(), usize::MAX)
             .await
