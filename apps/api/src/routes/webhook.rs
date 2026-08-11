@@ -14,6 +14,7 @@ use crate::{
     error::ApiError,
     events::{BusinessEventInput, insert_business_event},
     response::{ApiResponse, PaginatedData},
+    routes::connector::validate_outbound_url,
 };
 
 #[derive(Debug, FromQueryResult)]
@@ -237,8 +238,13 @@ pub async fn create_webhook(
     let name = req.name.clone().unwrap_or_else(|| req.url.clone());
     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
-    // Creating a webhook only requires authenticated workspace access.
-    verify_workspace_access(&state, workspace_id, user_id).await?;
+    // Creating an outbound webhook is an infrastructure change: it must match the privilege
+    // required by update/delete in this module.
+    verify_workspace_admin(&state, workspace_id, user_id).await?;
+
+    validate_outbound_url(&req.url)
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("invalid url: {err}")))?;
 
     // Validate events
     for event in &req.events {
@@ -367,6 +373,11 @@ pub async fn update_webhook(
     }
     if let Some(bot_user_id) = req.bot_user_id {
         ensure_bot_user(&state, bot_user_id).await?;
+    }
+    if let Some(url) = req.url.as_deref() {
+        validate_outbound_url(url)
+            .await
+            .map_err(|err| ApiError::BadRequest(format!("invalid url: {err}")))?;
     }
 
     // Build dynamic UPDATE query
@@ -520,7 +531,18 @@ where
                     'webhook',
                     $4,
                     $5,
-                    jsonb_build_object('mode', 'hmac', 'legacy_webhook', true),
+                    jsonb_build_object(
+                        'mode',
+                        CASE
+                            WHEN EXISTS (
+                                SELECT 1 FROM webhooks w
+                                WHERE w.id = $3 AND w.secret IS NOT NULL AND btrim(w.secret) <> ''
+                            ) THEN 'hmac'
+                            ELSE 'none'
+                        END,
+                        'legacy_webhook', true,
+                        'secret_source', 'webhook'
+                    ),
                     jsonb_build_object('events', $6::jsonb, 'bot_user_id', $7::uuid),
                     $8,
                     $9,
@@ -530,6 +552,7 @@ where
                 ON CONFLICT (webhook_id) DO UPDATE
                 SET name = EXCLUDED.name,
                     endpoint = EXCLUDED.endpoint,
+                    auth_policy = EXCLUDED.auth_policy,
                     capability_manifest = EXCLUDED.capability_manifest,
                     is_active = EXCLUDED.is_active,
                     updated_at = EXCLUDED.updated_at
