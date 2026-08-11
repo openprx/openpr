@@ -15,6 +15,11 @@ pub fn list_connectors_tool() -> ToolDefinition {
                 "project_id": {
                     "type": "string",
                     "description": "Optional project UUID to filter project-scoped connectors"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["webhook", "mcp", "rest", "cli", "openprx_tunnel", "print", "device"],
+                    "description": "Optional connector kind filter"
                 }
             }
         }),
@@ -24,6 +29,7 @@ pub fn list_connectors_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct ListConnectorsInput {
     project_id: Option<String>,
+    kind: Option<String>,
 }
 
 pub async fn list_connectors(client: &OpenPrClient, args: Value) -> CallToolResult {
@@ -32,7 +38,10 @@ pub async fn list_connectors(client: &OpenPrClient, args: Value) -> CallToolResu
         Err(err) => return CallToolResult::error(format!("Invalid input: {err}")),
     };
 
-    match client.list_connectors(input.project_id.as_deref()).await {
+    match client
+        .list_connectors(input.project_id.as_deref(), input.kind.as_deref())
+        .await
+    {
         Ok(value) => CallToolResult::success(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(err) => CallToolResult::error(err),
     }
@@ -75,14 +84,22 @@ pub async fn get_connector(client: &OpenPrClient, args: Value) -> CallToolResult
 pub fn list_invocations_tool() -> ToolDefinition {
     ToolDefinition {
         name: "invocations.list".to_string(),
-        description: "List AI execution invocation ledger entries for a project".to_string(),
+        description: "List AI execution invocation ledger entries for a project, newest first. Paginated: \
+per_page defaults to 20 (max 100), so pass page/per_page explicitly when auditing more than the latest entries."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "project_id": {
                     "type": "string",
                     "description": "Project UUID"
-                }
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Optional invocation status filter"
+                },
+                "page": { "type": "integer", "minimum": 1, "description": "1-based page number (default 1)" },
+                "per_page": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Page size, default 20, clamped to 100" }
             },
             "required": ["project_id"]
         }),
@@ -92,6 +109,9 @@ pub fn list_invocations_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct ListInvocationsInput {
     project_id: String,
+    status: Option<String>,
+    page: Option<u32>,
+    per_page: Option<u32>,
 }
 
 pub async fn list_invocations(client: &OpenPrClient, args: Value) -> CallToolResult {
@@ -100,7 +120,10 @@ pub async fn list_invocations(client: &OpenPrClient, args: Value) -> CallToolRes
         Err(err) => return CallToolResult::error(format!("Invalid input: {err}")),
     };
 
-    match client.list_invocations(&input.project_id).await {
+    match client
+        .list_invocations(&input.project_id, input.status.as_deref(), input.page, input.per_page)
+        .await
+    {
         Ok(value) => CallToolResult::success(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(err) => CallToolResult::error(err),
     }

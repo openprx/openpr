@@ -1,7 +1,24 @@
-use reqwest::{Client, multipart};
+use reqwest::{Client, RequestBuilder, multipart};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+
+/// The `OpenPR` API always answers with HTTP 200 and carries the real status in the
+/// response envelope (`{ "code": 0, "message": "...", "data": ... }`), see
+/// `apps/api/src/error.rs`. Any non-zero `code` is an API error and must never be
+/// handed to callers as a successful payload.
+fn check_response_envelope(payload: &Value, path: &str) -> Result<(), String> {
+    match payload.get("code").and_then(Value::as_i64) {
+        None | Some(0) => Ok(()),
+        Some(code) => {
+            let message = payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown API error");
+            Err(format!("API error {code} from {path}: {message}"))
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct OpenPrClient {
@@ -10,6 +27,68 @@ pub struct OpenPrClient {
     bot_token: String,
     pub workspace_id: String,
     invocation_id: Option<String>,
+}
+
+fn join_query(params: &[String]) -> String {
+    if params.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", params.join("&"))
+    }
+}
+
+fn event_query_params(event_type: Option<&str>, page: Option<u32>, per_page: Option<u32>) -> Vec<String> {
+    let mut params = Vec::new();
+    if let Some(event_type) = event_type {
+        params.push(format!("event_type={}", urlencoding::encode(event_type)));
+    }
+    if let Some(page) = page {
+        params.push(format!("page={page}"));
+    }
+    if let Some(per_page) = per_page {
+        params.push(format!("per_page={per_page}"));
+    }
+    params
+}
+
+/// Query parameters supported by `GET /api/v1/projects/{project_id}/issues`
+/// (`apps/api/src/routes/issue.rs` `ListIssuesQuery`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListWorkItemsQuery<'a> {
+    pub page: Option<u64>,
+    pub per_page: Option<u64>,
+    pub state: Option<&'a str>,
+    pub assignee_id: Option<&'a str>,
+    pub priority: Option<&'a str>,
+    pub search: Option<&'a str>,
+    pub label_ids: Option<&'a str>,
+    pub sort_by: Option<&'a str>,
+    pub sort_order: Option<&'a str>,
+}
+
+/// Query parameters supported by `GET /api/v1/proposals`
+/// (`apps/api/src/routes/proposal.rs` `ListProposalsQuery`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListProposalsQuery<'a> {
+    pub status: Option<&'a str>,
+    pub proposal_type: Option<&'a str>,
+    pub domain: Option<&'a str>,
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+    pub sort: Option<&'a str>,
+}
+
+/// Query parameters supported by `GET /api/v1/forms/{form_id}/records`
+/// (`apps/api/src/routes/form.rs` `ListRecordsQuery`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListRecordsQuery<'a> {
+    pub page: Option<u32>,
+    pub per_page: Option<u32>,
+    pub view_id: Option<&'a str>,
+    pub sort: Option<&'a str>,
+    pub filter_field: Option<&'a str>,
+    pub filter_op: Option<&'a str>,
+    pub filter_value: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,110 +123,60 @@ impl OpenPrClient {
         self.invocation_id.as_deref()
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
-        let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
+    /// Sends an authenticated request and rejects both transport-level failures and
+    /// API-level envelope errors before the payload reaches the caller.
+    async fn send<T: DeserializeOwned>(&self, request: RequestBuilder, path: &str) -> Result<T, String> {
+        let resp = request
             .header("Authorization", format!("Bearer {}", self.bot_token))
             .send()
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response body from {path}: {e}"))?;
+
+        if !status.is_success() {
             return Err(format!("HTTP {status} from {path}: {body}"));
         }
 
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("Failed to deserialize response: {e}"))
+        let payload: Value = if body.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&body).map_err(|e| format!("Failed to deserialize response from {path}: {e}"))?
+        };
+        check_response_envelope(&payload, path)?;
+
+        serde_json::from_value(payload).map_err(|e| format!("Failed to deserialize response from {path}: {e}"))
+    }
+
+    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, String> {
+        let url = format!("{}{path}", self.base_url);
+        self.send(self.client.get(&url), path).await
     }
 
     pub async fn post<T: DeserializeOwned, B: Serialize + Sync>(&self, path: &str, body: &B) -> Result<T, String> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status} from {path}: {body}"));
-        }
-
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("Failed to deserialize response: {e}"))
+        self.send(self.client.post(&url).json(body), path).await
     }
 
     pub async fn patch<T: DeserializeOwned, B: Serialize + Sync>(&self, path: &str, body: &B) -> Result<T, String> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .patch(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status} from {path}: {body}"));
-        }
-
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("Failed to deserialize response: {e}"))
+        self.send(self.client.patch(&url).json(body), path).await
     }
 
     pub async fn put<T: DeserializeOwned, B: Serialize + Sync>(&self, path: &str, body: &B) -> Result<T, String> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .put(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status} from {path}: {body}"));
-        }
-
-        resp.json::<T>()
-            .await
-            .map_err(|e| format!("Failed to deserialize response: {e}"))
+        self.send(self.client.put(&url).json(body), path).await
     }
 
-    pub async fn delete(&self, path: &str) -> Result<(), String> {
+    /// Returns the parsed response envelope so callers can report what the API actually
+    /// did instead of assuming success.
+    pub async fn delete(&self, path: &str) -> Result<Value, String> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .delete(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status} from {path}: {body}"));
-        }
-
-        Ok(())
+        self.send(self.client.delete(&url), path).await
     }
 
     // ---- Projects ----
@@ -170,7 +199,7 @@ impl OpenPrClient {
         self.patch(&format!("/api/v1/projects/{project_id}"), &body).await
     }
 
-    pub async fn delete_project(&self, project_id: &str) -> Result<(), String> {
+    pub async fn delete_project(&self, project_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/projects/{project_id}")).await
     }
 
@@ -241,25 +270,27 @@ impl OpenPrClient {
             .await
     }
 
-    pub async fn delete_project_resource(&self, project_id: &str, resource_id: &str) -> Result<(), String> {
+    pub async fn delete_project_resource(&self, project_id: &str, resource_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/projects/{project_id}/resources/{resource_id}"))
             .await
     }
 
     // ---- Connectors / Invocations ----
 
-    pub async fn list_connectors(&self, project_id: Option<&str>) -> Result<Value, String> {
-        let path = project_id.map_or_else(
-            || format!("/api/v1/workspaces/{}/connectors", self.workspace_id),
-            |project_id| {
-                format!(
-                    "/api/v1/workspaces/{}/connectors?project_id={}",
-                    self.workspace_id,
-                    urlencoding::encode(project_id)
-                )
-            },
-        );
-        self.get(&path).await
+    pub async fn list_connectors(&self, project_id: Option<&str>, kind: Option<&str>) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(project_id) = project_id {
+            params.push(format!("project_id={}", urlencoding::encode(project_id)));
+        }
+        if let Some(kind) = kind {
+            params.push(format!("kind={}", urlencoding::encode(kind)));
+        }
+        self.get(&format!(
+            "/api/v1/workspaces/{}/connectors{}",
+            self.workspace_id,
+            join_query(&params)
+        ))
+        .await
     }
 
     pub async fn get_connector(&self, connector_id: &str) -> Result<Value, String> {
@@ -271,8 +302,28 @@ impl OpenPrClient {
         .await
     }
 
-    pub async fn list_invocations(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/invocations")).await
+    pub async fn list_invocations(
+        &self,
+        project_id: &str,
+        status: Option<&str>,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(status) = status {
+            params.push(format!("status={}", urlencoding::encode(status)));
+        }
+        if let Some(page) = page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(per_page) = per_page {
+            params.push(format!("per_page={per_page}"));
+        }
+        self.get(&format!(
+            "/api/v1/projects/{project_id}/invocations{}",
+            join_query(&params)
+        ))
+        .await
     }
 
     pub async fn get_invocation(&self, invocation_id: &str) -> Result<Value, String> {
@@ -319,8 +370,21 @@ impl OpenPrClient {
 
     // ---- Universal Forms ----
 
-    pub async fn list_forms(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/forms")).await
+    pub async fn list_forms(
+        &self,
+        project_id: &str,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Value, String> {
+        let mut query = Vec::new();
+        if let Some(page) = page {
+            query.push(format!("page={page}"));
+        }
+        if let Some(per_page) = per_page {
+            query.push(format!("per_page={per_page}"));
+        }
+        self.get(&format!("/api/v1/projects/{project_id}/forms{}", join_query(&query)))
+            .await
     }
 
     pub async fn get_form(&self, form_id: &str) -> Result<Value, String> {
@@ -451,7 +515,7 @@ impl OpenPrClient {
         .await
     }
 
-    pub async fn archive_form_attachment(&self, attachment_id: &str) -> Result<(), String> {
+    pub async fn archive_form_attachment(&self, attachment_id: &str) -> Result<Value, String> {
         self.delete(&format!(
             "/api/v1/form-attachments/{}",
             urlencoding::encode(attachment_id)
@@ -470,9 +534,35 @@ impl OpenPrClient {
         .await
     }
 
-    pub async fn list_form_records(&self, form_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/forms/{}/records", urlencoding::encode(form_id)))
-            .await
+    pub async fn list_form_records(&self, form_id: &str, query: &ListRecordsQuery<'_>) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(page) = query.page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(per_page) = query.per_page {
+            params.push(format!("per_page={per_page}"));
+        }
+        if let Some(view_id) = query.view_id {
+            params.push(format!("view_id={}", urlencoding::encode(view_id)));
+        }
+        if let Some(sort) = query.sort {
+            params.push(format!("sort={}", urlencoding::encode(sort)));
+        }
+        if let Some(filter_field) = query.filter_field {
+            params.push(format!("filter_field={}", urlencoding::encode(filter_field)));
+        }
+        if let Some(filter_op) = query.filter_op {
+            params.push(format!("filter_op={}", urlencoding::encode(filter_op)));
+        }
+        if let Some(filter_value) = query.filter_value {
+            params.push(format!("filter_value={}", urlencoding::encode(filter_value)));
+        }
+        self.get(&format!(
+            "/api/v1/forms/{}/records{}",
+            urlencoding::encode(form_id),
+            join_query(&params)
+        ))
+        .await
     }
 
     pub async fn export_form_records(
@@ -584,7 +674,7 @@ impl OpenPrClient {
         record_id: &str,
         child_record_id: &str,
         relation_key: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<Value, String> {
         let query = relation_key
             .map(|relation_key| format!("?relation_key={}", urlencoding::encode(relation_key)))
             .unwrap_or_default();
@@ -713,38 +803,53 @@ impl OpenPrClient {
         .await
     }
 
-    pub async fn list_form_events(&self, form_id: &str, event_type: Option<&str>) -> Result<Value, String> {
-        let path = event_type.map_or_else(
-            || format!("/api/v1/forms/{}/events", urlencoding::encode(form_id)),
-            |event_type| {
-                format!(
-                    "/api/v1/forms/{}/events?event_type={}",
-                    urlencoding::encode(form_id),
-                    urlencoding::encode(event_type)
-                )
-            },
-        );
-        self.get(&path).await
+    pub async fn list_form_events(
+        &self,
+        form_id: &str,
+        event_type: Option<&str>,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/forms/{}/events{}",
+            urlencoding::encode(form_id),
+            join_query(&event_query_params(event_type, page, per_page))
+        ))
+        .await
     }
 
-    pub async fn list_form_record_events(&self, record_id: &str, event_type: Option<&str>) -> Result<Value, String> {
-        let path = event_type.map_or_else(
-            || format!("/api/v1/form-records/{}/events", urlencoding::encode(record_id)),
-            |event_type| {
-                format!(
-                    "/api/v1/form-records/{}/events?event_type={}",
-                    urlencoding::encode(record_id),
-                    urlencoding::encode(event_type)
-                )
-            },
-        );
-        self.get(&path).await
+    pub async fn list_form_record_events(
+        &self,
+        record_id: &str,
+        event_type: Option<&str>,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/form-records/{}/events{}",
+            urlencoding::encode(record_id),
+            join_query(&event_query_params(event_type, page, per_page))
+        ))
+        .await
     }
 
     // ---- Plugins ----
 
-    pub async fn list_plugins(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/plugins")).await
+    pub async fn list_plugins(
+        &self,
+        project_id: &str,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(page) = page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(per_page) = per_page {
+            params.push(format!("per_page={per_page}"));
+        }
+        self.get(&format!("/api/v1/projects/{project_id}/plugins{}", join_query(&params)))
+            .await
     }
 
     pub async fn get_plugin(&self, plugin_id: &str) -> Result<Value, String> {
@@ -765,10 +870,23 @@ impl OpenPrClient {
         .await
     }
 
-    pub async fn list_plugin_invocations(&self, plugin_id: &str) -> Result<Value, String> {
+    pub async fn list_plugin_invocations(
+        &self,
+        plugin_id: &str,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(page) = page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(per_page) = per_page {
+            params.push(format!("per_page={per_page}"));
+        }
         self.get(&format!(
-            "/api/v1/plugins/{}/invocations",
-            urlencoding::encode(plugin_id)
+            "/api/v1/plugins/{}/invocations{}",
+            urlencoding::encode(plugin_id),
+            join_query(&params)
         ))
         .await
     }
@@ -795,11 +913,37 @@ impl OpenPrClient {
 
     // ---- Work Items / Issues ----
 
-    pub async fn list_work_items(&self, project_id: &str, page: u64, per_page: u64) -> Result<Value, String> {
-        self.get(&format!(
-            "/api/v1/projects/{project_id}/issues?page={page}&per_page={per_page}"
-        ))
-        .await
+    pub async fn list_work_items(&self, project_id: &str, query: &ListWorkItemsQuery<'_>) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(page) = query.page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(per_page) = query.per_page {
+            params.push(format!("per_page={per_page}"));
+        }
+        if let Some(state) = query.state {
+            params.push(format!("state={}", urlencoding::encode(state)));
+        }
+        if let Some(assignee_id) = query.assignee_id {
+            params.push(format!("assignee_id={}", urlencoding::encode(assignee_id)));
+        }
+        if let Some(priority) = query.priority {
+            params.push(format!("priority={}", urlencoding::encode(priority)));
+        }
+        if let Some(search) = query.search {
+            params.push(format!("search={}", urlencoding::encode(search)));
+        }
+        if let Some(label_ids) = query.label_ids {
+            params.push(format!("label_ids={}", urlencoding::encode(label_ids)));
+        }
+        if let Some(sort_by) = query.sort_by {
+            params.push(format!("sort_by={}", urlencoding::encode(sort_by)));
+        }
+        if let Some(sort_order) = query.sort_order {
+            params.push(format!("sort_order={}", urlencoding::encode(sort_order)));
+        }
+        self.get(&format!("/api/v1/projects/{project_id}/issues{}", join_query(&params)))
+            .await
     }
 
     pub async fn get_work_item(&self, work_item_id: &str) -> Result<Value, String> {
@@ -814,41 +958,32 @@ impl OpenPrClient {
         self.put(&format!("/api/v1/issues/{work_item_id}"), &body).await
     }
 
-    pub async fn delete_work_item(&self, work_item_id: &str) -> Result<(), String> {
+    pub async fn delete_work_item(&self, work_item_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/issues/{work_item_id}")).await
     }
 
-    pub async fn search_work_items(&self, query: &str) -> Result<Value, String> {
-        self.get(&format!(
-            "/api/v1/search?q={}&workspace_id={}",
-            urlencoding::encode(query),
-            self.workspace_id
-        ))
+    /// Searches the workspace. `search_type` maps to the backend `type` filter
+    /// (`issue` / `project` / `comment`), `limit` caps the returned rows.
+    pub async fn search(&self, query: &str, search_type: Option<&str>, limit: Option<u32>) -> Result<Value, String> {
+        let mut params = vec![format!("q={}", urlencoding::encode(query))];
+        if let Some(search_type) = search_type {
+            params.push(format!("type={}", urlencoding::encode(search_type)));
+        }
+        if let Some(limit) = limit {
+            params.push(format!("limit={limit}"));
+        }
+        self.get(&format!("/api/v1/search{}", join_query(&params))).await
+    }
+
+    pub async fn add_label_to_issue(&self, issue_id: &str, label_id: &str) -> Result<Value, String> {
+        self.post(
+            &format!("/api/v1/issues/{issue_id}/labels/{label_id}"),
+            &serde_json::json!({}),
+        )
         .await
     }
 
-    pub async fn add_label_to_issue(&self, issue_id: &str, label_id: &str) -> Result<(), String> {
-        let url = format!("{}/api/v1/issues/{issue_id}/labels/{label_id}", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "HTTP {status} from /api/v1/issues/{issue_id}/labels/{label_id}: {body}"
-            ));
-        }
-        Ok(())
-    }
-
-    pub async fn remove_label_from_issue(&self, issue_id: &str, label_id: &str) -> Result<(), String> {
+    pub async fn remove_label_from_issue(&self, issue_id: &str, label_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/issues/{issue_id}/labels/{label_id}"))
             .await
     }
@@ -867,7 +1002,7 @@ impl OpenPrClient {
         self.post(&format!("/api/v1/issues/{issue_id}/comments"), &body).await
     }
 
-    pub async fn delete_comment(&self, comment_id: &str) -> Result<(), String> {
+    pub async fn delete_comment(&self, comment_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/comments/{comment_id}")).await
     }
 
@@ -901,14 +1036,7 @@ impl OpenPrClient {
             .await
             .map_err(|e| format!("Failed to deserialize response: {e}"))?;
 
-        let code = payload.get("code").and_then(Value::as_i64).unwrap_or(-1);
-        if code != 0 {
-            let message = payload
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("upload failed");
-            return Err(format!("API error {code} from /api/v1/upload: {message}"));
-        }
+        check_response_envelope(&payload, "/api/v1/upload")?;
 
         let data = payload
             .get("data")
@@ -944,13 +1072,29 @@ impl OpenPrClient {
 
     // ---- Proposals ----
 
-    pub async fn list_proposals(&self, project_id: &str, status: Option<&str>) -> Result<Value, String> {
-        use std::fmt::Write as _;
-        let mut url = format!("/api/v1/proposals?project_id={project_id}");
-        if let Some(s) = status {
-            let _ = write!(url, "&status={s}");
+    /// The backend proposal list is workspace-wide: `apps/api/src/routes/proposal.rs`
+    /// `ListProposalsQuery` has no project filter, so no `project_id` is sent.
+    pub async fn list_proposals(&self, query: &ListProposalsQuery<'_>) -> Result<Value, String> {
+        let mut params = Vec::new();
+        if let Some(status) = query.status {
+            params.push(format!("status={}", urlencoding::encode(status)));
         }
-        self.get(&url).await
+        if let Some(proposal_type) = query.proposal_type {
+            params.push(format!("proposal_type={}", urlencoding::encode(proposal_type)));
+        }
+        if let Some(domain) = query.domain {
+            params.push(format!("domain={}", urlencoding::encode(domain)));
+        }
+        if let Some(page) = query.page {
+            params.push(format!("page={page}"));
+        }
+        if let Some(per_page) = query.per_page {
+            params.push(format!("per_page={per_page}"));
+        }
+        if let Some(sort) = query.sort {
+            params.push(format!("sort={}", urlencoding::encode(sort)));
+        }
+        self.get(&format!("/api/v1/proposals{}", join_query(&params))).await
     }
 
     pub async fn get_proposal(&self, proposal_id: &str) -> Result<Value, String> {
@@ -999,7 +1143,7 @@ impl OpenPrClient {
         self.put(&format!("/api/v1/sprints/{sprint_id}"), &body).await
     }
 
-    pub async fn delete_sprint(&self, sprint_id: &str) -> Result<(), String> {
+    pub async fn delete_sprint(&self, sprint_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/sprints/{sprint_id}")).await
     }
 
@@ -1027,45 +1171,20 @@ impl OpenPrClient {
         .await
     }
 
-    pub async fn add_labels_to_issue(&self, issue_id: &str, label_ids: &[String]) -> Result<(), String> {
-        let url = format!("{}/api/v1/issues/{issue_id}/labels/batch", self.base_url);
-        let body = serde_json::json!({ "label_ids": label_ids });
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "HTTP {status} from /api/v1/issues/{issue_id}/labels/batch: {body}"
-            ));
-        }
-        Ok(())
+    pub async fn add_labels_to_issue(&self, issue_id: &str, label_ids: &[String]) -> Result<Value, String> {
+        self.post(
+            &format!("/api/v1/issues/{issue_id}/labels/batch"),
+            &serde_json::json!({ "label_ids": label_ids }),
+        )
+        .await
     }
 
     pub async fn update_label(&self, label_id: &str, body: Value) -> Result<Value, String> {
         self.put(&format!("/api/v1/labels/{label_id}"), &body).await
     }
 
-    pub async fn delete_label(&self, label_id: &str) -> Result<(), String> {
+    pub async fn delete_label(&self, label_id: &str) -> Result<Value, String> {
         self.delete(&format!("/api/v1/labels/{label_id}")).await
-    }
-
-    // ---- Search All ----
-
-    pub async fn search_all(&self, query: &str) -> Result<Value, String> {
-        self.get(&format!(
-            "/api/v1/search?q={}&workspace_id={}",
-            urlencoding::encode(query),
-            self.workspace_id
-        ))
-        .await
     }
 }
 
@@ -1111,6 +1230,148 @@ fn detect_mime_type_from_filename(filename: &str) -> &'static str {
         "application/xml"
     } else {
         "application/octet-stream"
+    }
+}
+
+#[cfg(test)]
+pub mod test_api {
+    use axum::Router;
+    use std::error::Error;
+
+    /// Starts a throwaway API server bound to an ephemeral port and returns its base URL.
+    pub async fn spawn(router: Router) -> Result<String, Box<dyn Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok(format!("http://{addr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ListRecordsQuery, OpenPrClient, check_response_envelope, test_api};
+    use axum::{
+        Json, Router,
+        extract::RawQuery,
+        routing::{delete, get},
+    };
+    use serde_json::{Value, json};
+    use std::error::Error;
+
+    fn client(base_url: String) -> Result<OpenPrClient, String> {
+        OpenPrClient::new(base_url, "opr_test_token".to_string(), "workspace-1".to_string())
+    }
+
+    #[test]
+    fn envelope_without_error_code_is_accepted() {
+        assert!(check_response_envelope(&json!({ "code": 0, "data": {} }), "/p").is_ok());
+        assert!(check_response_envelope(&json!({ "items": [] }), "/p").is_ok());
+    }
+
+    #[test]
+    fn envelope_with_error_code_is_rejected_with_api_message() {
+        let error = check_response_envelope(&json!({ "code": 403, "message": "forbidden" }), "/p")
+            .err()
+            .unwrap_or_default();
+
+        assert!(error.contains("403"), "{error}");
+        assert!(error.contains("forbidden"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn http_200_error_envelopes_become_errors_on_every_verb() -> Result<(), Box<dyn Error>> {
+        async fn error_envelope() -> Json<Value> {
+            Json(json!({ "code": 404, "message": "form not found", "data": null }))
+        }
+        let router = Router::new()
+            .route("/api/v1/forms/f1/records", get(error_envelope).post(error_envelope))
+            .route("/api/v1/form-attachments/a1", delete(error_envelope));
+        let base_url = test_api::spawn(router).await?;
+        let client = client(base_url)?;
+
+        let listed = client.list_form_records("f1", &ListRecordsQuery::default()).await;
+        let created = client.create_form_record("f1", json!({ "values": {} })).await;
+        let archived = client.archive_form_attachment("a1").await;
+
+        for result in [listed, created, archived] {
+            let error = result.err().unwrap_or_default();
+            assert!(error.contains("API error 404"), "{error}");
+            assert!(error.contains("form not found"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_envelope_is_returned_unchanged() -> Result<(), Box<dyn Error>> {
+        let router = Router::new().route(
+            "/api/v1/forms/f1/records",
+            get(|| async { Json(json!({ "code": 0, "data": { "items": [], "total": 0 } })) }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = client(base_url)?;
+
+        let value = client.list_form_records("f1", &ListRecordsQuery::default()).await?;
+
+        assert_eq!(value.get("code").and_then(Value::as_i64), Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_form_records_forwards_every_query_parameter() -> Result<(), Box<dyn Error>> {
+        let router = Router::new().route(
+            "/api/v1/forms/f1/records",
+            get(|RawQuery(query): RawQuery| async move {
+                Json(json!({ "code": 0, "data": { "query": query.unwrap_or_default() } }))
+            }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = client(base_url)?;
+
+        let value = client
+            .list_form_records(
+                "f1",
+                &ListRecordsQuery {
+                    page: Some(3),
+                    per_page: Some(200),
+                    view_id: Some("v1"),
+                    sort: Some("amount:desc"),
+                    filter_field: Some("amount"),
+                    filter_op: Some("gte"),
+                    filter_value: Some("10000.00"),
+                },
+            )
+            .await?;
+        let query = value
+            .get("data")
+            .and_then(|data| data.get("query"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        for expected in [
+            "page=3",
+            "per_page=200",
+            "view_id=v1",
+            "sort=amount%3Adesc",
+            "filter_field=amount",
+            "filter_op=gte",
+            "filter_value=10000.00",
+        ] {
+            assert!(query.contains(expected), "missing {expected} in {query}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_failures_still_surface_as_errors() -> Result<(), Box<dyn Error>> {
+        let client = client("http://127.0.0.1:1".to_string())?;
+
+        let error = client.get_form("f1").await.err().unwrap_or_default();
+
+        assert!(error.contains("Request failed"), "{error}");
+        Ok(())
     }
 }
 

@@ -14,11 +14,14 @@ fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolR
 pub fn list_plugins_tool() -> ToolDefinition {
     ToolDefinition {
         name: "plugins.list".to_string(),
-        description: "List WASM plugins installed in a project".to_string(),
+        description: "List WASM plugins installed in a project. Paginated: per_page defaults to 50 (max 200)."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "project_id": { "type": "string", "description": "Project UUID" }
+                "project_id": { "type": "string", "description": "Project UUID" },
+                "page": { "type": "integer", "minimum": 1, "description": "1-based page number (default 1)" },
+                "per_page": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Page size, default 50, clamped to 200" }
             },
             "required": ["project_id"]
         }),
@@ -79,11 +82,15 @@ pub fn invoke_plugin_tool() -> ToolDefinition {
 pub fn list_plugin_invocations_tool() -> ToolDefinition {
     ToolDefinition {
         name: "plugin_invocations.list".to_string(),
-        description: "List invocation logs for one WASM plugin".to_string(),
+        description: "List invocation logs for one WASM plugin, newest first. Paginated: per_page defaults to \
+50 (max 200)."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "plugin_id": { "type": "string" }
+                "plugin_id": { "type": "string" },
+                "page": { "type": "integer", "minimum": 1, "description": "1-based page number (default 1)" },
+                "per_page": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Page size, default 50, clamped to 200" }
             },
             "required": ["plugin_id"]
         }),
@@ -91,13 +98,22 @@ pub fn list_plugin_invocations_tool() -> ToolDefinition {
 }
 
 #[derive(Debug, Deserialize)]
-struct ProjectInput {
+struct ListPluginsInput {
     project_id: String,
+    page: Option<u32>,
+    per_page: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PluginInput {
     plugin_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListPluginInvocationsInput {
+    plugin_id: String,
+    page: Option<u32>,
+    per_page: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,11 +132,11 @@ struct InvokePluginInput {
 }
 
 pub async fn list_plugins(client: &OpenPrClient, args: Value) -> CallToolResult {
-    let input: ProjectInput = match parse_input(args) {
+    let input: ListPluginsInput = match parse_input(args) {
         Ok(value) => value,
         Err(err) => return err,
     };
-    match client.list_plugins(&input.project_id).await {
+    match client.list_plugins(&input.project_id, input.page, input.per_page).await {
         Ok(value) => CallToolResult::success(pretty(&value)),
         Err(err) => CallToolResult::error(err),
     }
@@ -169,11 +185,14 @@ pub async fn invoke_plugin(client: &OpenPrClient, args: Value) -> CallToolResult
 }
 
 pub async fn list_plugin_invocations(client: &OpenPrClient, args: Value) -> CallToolResult {
-    let input: PluginInput = match parse_input(args) {
+    let input: ListPluginInvocationsInput = match parse_input(args) {
         Ok(value) => value,
         Err(err) => return err,
     };
-    match client.list_plugin_invocations(&input.plugin_id).await {
+    match client
+        .list_plugin_invocations(&input.plugin_id, input.page, input.per_page)
+        .await
+    {
         Ok(value) => CallToolResult::success(pretty(&value)),
         Err(err) => CallToolResult::error(err),
     }

@@ -1,4 +1,4 @@
-use crate::client::OpenPrClient;
+use crate::client::{ListProposalsQuery, OpenPrClient};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -6,19 +6,34 @@ use serde_json::{Value, json};
 pub fn list_proposals_tool() -> ToolDefinition {
     ToolDefinition {
         name: "proposals.list".to_string(),
-        description: "List proposals for a project, optionally filtered by status".to_string(),
+        description: "List governance proposals. The API has no project filter, so results are not scoped to \
+project_id; project_id is only used to apply this project's agent policy. Paginated: per_page defaults to the \
+API page size, so page through the result set explicitly."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project",
+                    "description": "UUID of the project whose agent policy governs this call. It does NOT filter the returned proposals",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "status": {
                     "type": "string",
+                    "enum": ["draft", "open", "voting", "approved", "rejected", "vetoed", "archived"],
                     "description": "Proposal status filter (optional)"
-                }
+                },
+                "proposal_type": {
+                    "type": "string",
+                    "enum": ["feature", "architecture", "priority", "resource", "governance", "bugfix"],
+                    "description": "Proposal type filter (optional)"
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Decision domain filter (optional)"
+                },
+                "page": { "type": "integer", "minimum": 1, "description": "1-based page number (optional)" },
+                "per_page": { "type": "integer", "minimum": 1, "description": "Page size (optional)" }
             },
             "required": ["project_id"]
         }),
@@ -27,8 +42,16 @@ pub fn list_proposals_tool() -> ToolDefinition {
 
 #[derive(Debug, Deserialize)]
 struct ListProposalsInput {
+    #[allow(
+        dead_code,
+        reason = "Only used for project agent-policy scoping; the API list is workspace-wide"
+    )]
     project_id: String,
     status: Option<String>,
+    proposal_type: Option<String>,
+    domain: Option<String>,
+    page: Option<u32>,
+    per_page: Option<u32>,
 }
 
 pub async fn list_proposals(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -37,7 +60,16 @@ pub async fn list_proposals(client: &OpenPrClient, args: serde_json::Value) -> C
         Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
-    match client.list_proposals(&input.project_id, input.status.as_deref()).await {
+    let query = ListProposalsQuery {
+        status: input.status.as_deref(),
+        proposal_type: input.proposal_type.as_deref(),
+        domain: input.domain.as_deref(),
+        page: input.page,
+        per_page: input.per_page,
+        sort: None,
+    };
+
+    match client.list_proposals(&query).await {
         Ok(proposals) => {
             let json = serde_json::to_string_pretty(&proposals).unwrap_or_default();
             CallToolResult::success(json)
@@ -87,25 +119,55 @@ pub async fn get_proposal(client: &OpenPrClient, args: serde_json::Value) -> Cal
 pub fn create_proposal_tool() -> ToolDefinition {
     ToolDefinition {
         name: "proposals.create".to_string(),
-        description: "Create a new proposal".to_string(),
+        description: "Create a governance proposal in draft state. The project is derived from the issues \
+linked to the proposal, not from project_id."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Proposal title"
+                    "minLength": 10,
+                    "maxLength": 200,
+                    "description": "Proposal title, 10 to 200 characters"
                 },
-                "description": {
+                "content": {
                     "type": "string",
-                    "description": "Proposal description"
+                    "minLength": 50,
+                    "description": "Proposal body, at least 50 characters"
+                },
+                "proposal_type": {
+                    "type": "string",
+                    "enum": ["feature", "architecture", "priority", "resource", "governance", "bugfix"],
+                    "description": "Required unless template_id supplies it"
+                },
+                "domains": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Decision domains; required unless template_id supplies them"
+                },
+                "voting_rule": {
+                    "type": "string",
+                    "enum": ["simple_majority", "absolute_majority", "consensus"],
+                    "description": "Defaults to simple_majority"
+                },
+                "cycle_template": {
+                    "type": "string",
+                    "enum": ["rapid", "fast", "standard", "critical"],
+                    "description": "Defaults to the cycle template of the proposal type"
+                },
+                "template_id": {
+                    "type": "string",
+                    "description": "Optional proposal template id supplying title, type, content and domains"
                 },
                 "project_id": {
                     "type": "string",
-                    "description": "UUID of the project",
+                    "description": "UUID of the project whose agent policy governs this call. It is NOT stored on the proposal",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 }
             },
-            "required": ["title", "description", "project_id"]
+            "required": ["title", "content", "project_id"]
         }),
     }
 }
@@ -113,7 +175,16 @@ pub fn create_proposal_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct CreateProposalInput {
     title: String,
-    description: String,
+    content: String,
+    proposal_type: Option<String>,
+    domains: Option<Vec<String>>,
+    voting_rule: Option<String>,
+    cycle_template: Option<String>,
+    template_id: Option<String>,
+    #[allow(
+        dead_code,
+        reason = "Only used for project agent-policy scoping; the API derives the project from linked issues"
+    )]
     project_id: String,
 }
 
@@ -125,8 +196,12 @@ pub async fn create_proposal(client: &OpenPrClient, args: serde_json::Value) -> 
 
     let body = json!({
         "title": input.title,
-        "description": input.description,
-        "project_id": input.project_id
+        "content": input.content,
+        "proposal_type": input.proposal_type,
+        "domains": input.domains,
+        "voting_rule": input.voting_rule,
+        "cycle_template": input.cycle_template,
+        "template_id": input.template_id
     });
 
     match client.create_proposal(body).await {
@@ -150,14 +225,14 @@ pub fn create_check_result_tool() -> ToolDefinition {
                 "connector_id": { "type": "string", "description": "Optional connector UUID" },
                 "action_class": {
                     "type": "string",
-                    "description": "read_only, comment_result, low_risk_mutation, high_risk_mutation, external_side_effect, or financial_legal_compliance"
+                    "enum": ["read_only", "comment_result", "low_risk_mutation", "high_risk_mutation", "external_side_effect", "financial_legal_compliance"]
                 },
                 "risk_level": {
                     "type": "string",
-                    "description": "low, medium, high, or critical"
+                    "enum": ["low", "medium", "high", "critical"]
                 },
-                "title": { "type": "string" },
-                "summary": { "type": "string" },
+                "title": { "type": "string", "minLength": 10, "maxLength": 200 },
+                "summary": { "type": "string", "minLength": 10 },
                 "result": { "type": "object" }
             },
             "required": ["project_id", "title", "summary"]
@@ -174,20 +249,20 @@ pub fn create_proposal_from_result_tool() -> ToolDefinition {
             "type": "object",
             "properties": {
                 "check_result_id": { "type": "string", "description": "Check result UUID" },
-                "title": { "type": "string" },
+                "title": { "type": "string", "minLength": 10, "maxLength": 200 },
                 "proposal_type": {
                     "type": "string",
-                    "description": "feature, architecture, priority, resource, governance, or bugfix"
+                    "enum": ["feature", "architecture", "priority", "resource", "governance", "bugfix"]
                 },
-                "content": { "type": "string" },
+                "content": { "type": "string", "minLength": 50, "description": "Proposal body, at least 50 characters" },
                 "domains": { "type": "array", "items": { "type": "string" } },
                 "voting_rule": {
                     "type": "string",
-                    "description": "simple_majority, absolute_majority, or consensus"
+                    "enum": ["simple_majority", "absolute_majority", "consensus"]
                 },
                 "cycle_template": {
                     "type": "string",
-                    "description": "rapid, fast, standard, or critical"
+                    "enum": ["rapid", "fast", "standard", "critical"]
                 },
                 "submit": {
                     "type": "boolean",

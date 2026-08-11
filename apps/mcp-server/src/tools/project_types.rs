@@ -251,7 +251,7 @@ pub async fn delete_project_resource(client: &OpenPrClient, args: Value) -> Call
         .delete_project_resource(&input.project_id, &input.resource_id)
         .await
     {
-        Ok(()) => CallToolResult::success("Project resource deleted"),
+        Ok(_) => CallToolResult::success("Project resource deleted"),
         Err(err) => CallToolResult::error(err),
     }
 }

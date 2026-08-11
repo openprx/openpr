@@ -1,8 +1,10 @@
-use crate::client::OpenPrClient;
+use crate::client::{ListRecordsQuery, ListWorkItemsQuery, OpenPrClient};
 use crate::protocol::{CallToolParams, CallToolResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ListToolsResult};
 use crate::tools;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
@@ -40,10 +42,11 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 3. work_items.update -> assign and set state
 
 ## Field Values
-- state: backlog | todo | in_progress | done
-- priority: none | low | medium | high | urgent
+- state: any key of the project workflow (default set: backlog | todo | in_progress | done); omit on create to use the workflow's initial state
+- priority: low | medium | high | urgent
 - attachments: array of URLs from files.upload
 - decimal/amount form fields: send decimal strings, never JSON numbers
+- list tools are paginated: read pagination_hint / total_pages before summarising
 ";
 
 const AGENTS_GUIDE_MD: &str = r#"# OpenPR Agent Guide
@@ -76,13 +79,56 @@ work_items.list { project_id }
 work_items.update { work_item_id, state: "todo" }
 "#;
 
+/// Tools that address a form or a form record instead of a project. The owning
+/// project has to be resolved from the API before the project agent policy can be
+/// applied to them.
+const FORM_SCOPED_TOOLS: [&str; 28] = [
+    "forms.get",
+    "forms.update_schema",
+    "forms.duplicate",
+    "forms.schema_summary",
+    "forms.field_usage",
+    "forms.field_dependencies",
+    "form_schema_versions.list",
+    "form_schema_versions.get",
+    "form_permissions.get",
+    "form_permissions.update",
+    "form_views.list",
+    "form_attachments.list",
+    "form_attachments.create",
+    "form_records.list",
+    "form_records.export",
+    "form_records.import_preview",
+    "form_records.import_commit",
+    "form_records.get",
+    "form_records.create",
+    "form_records.update",
+    "form_records.link",
+    "form_records.relation_targets",
+    "form_records.children",
+    "form_records.child_create",
+    "form_records.child_update",
+    "form_records.child_archive",
+    "form_records.child_restore",
+    "form_records.aggregate",
+];
+
+/// Upper bound for the form/record to project mapping cache.
+const PROJECT_ID_CACHE_LIMIT: usize = 1_024;
+
 pub struct McpServer {
     client: OpenPrClient,
+    /// Maps `form:<id>` / `record:<id>` to the owning project id. Forms never move
+    /// between projects, so the mapping is stable for the lifetime of the process.
+    project_id_cache: Mutex<HashMap<String, String>>,
 }
 
 impl McpServer {
-    pub const fn new(client: OpenPrClient) -> Self {
-        Self { client }
+    pub fn new(client: OpenPrClient) -> Self {
+        Self {
+            client,
+            project_id_cache: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn handle_request(&self, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
@@ -329,8 +375,64 @@ impl McpServer {
         }
     }
 
+    /// Resolves the project whose agent policy governs this call. Form and record
+    /// scoped tools carry no `project_id`, so the owning project is looked up from the
+    /// API; without this every form tool would bypass the policy entirely.
+    async fn resolve_policy_project_id(&self, tool_name: &str, args: &Value) -> Result<Option<String>, String> {
+        if let Some(project_id) = extract_call_project_id(args) {
+            return Ok(Some(project_id));
+        }
+        if !FORM_SCOPED_TOOLS.contains(&tool_name) {
+            return Ok(None);
+        }
+        if let Some(form_id) = string_argument(args, "form_id") {
+            return self.lookup_project_id("form", &form_id).await.map(Some);
+        }
+        if let Some(record_id) = string_argument(args, "record_id") {
+            return self.lookup_project_id("record", &record_id).await.map(Some);
+        }
+
+        tracing::warn!(
+            tool_name = %tool_name,
+            "Project agent policy not enforced: call carries no project, form, or record identifier"
+        );
+        Ok(None)
+    }
+
+    async fn lookup_project_id(&self, kind: &str, id: &str) -> Result<String, String> {
+        let cache_key = format!("{kind}:{id}");
+        {
+            let cache = self.project_id_cache.lock().await;
+            if let Some(project_id) = cache.get(&cache_key) {
+                return Ok(project_id.clone());
+            }
+        }
+
+        let response = match kind {
+            "form" => self.client.get_form(id).await,
+            _ => self.client.get_form_record(id).await,
+        }
+        .map_err(|error| format!("Failed to resolve owning project for {kind} {id}: {error}"))?;
+
+        let project_id = response
+            .get("data")
+            .and_then(|data| data.get("project_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("API response for {kind} {id} carries no project_id"))?;
+
+        {
+            let mut cache = self.project_id_cache.lock().await;
+            if cache.len() >= PROJECT_ID_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(cache_key, project_id.clone());
+        }
+        Ok(project_id)
+    }
+
     async fn enforce_project_tool_policy(&self, tool_name: &str, args: &Value) -> Result<(), String> {
-        let Some(project_id) = extract_call_project_id(args) else {
+        let Some(project_id) = self.resolve_policy_project_id(tool_name, args).await? else {
             return Ok(());
         };
 
@@ -398,7 +500,7 @@ impl McpServer {
             },
             "serverInfo": {
                 "name": "openpr-mcp-server",
-                "version": "0.1.0"
+                "version": env!("CARGO_PKG_VERSION")
             }
         });
 
@@ -649,7 +751,18 @@ impl McpServer {
         }
 
         if let Some(project_id) = parse_project_resource_uri(&uri, "/issues") {
-            return match self.client.list_work_items(project_id, 1, 50).await {
+            return match self
+                .client
+                .list_work_items(
+                    project_id,
+                    &ListWorkItemsQuery {
+                        page: Some(1),
+                        per_page: Some(50),
+                        ..ListWorkItemsQuery::default()
+                    },
+                )
+                .await
+            {
                 Ok(issues) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -668,7 +781,7 @@ impl McpServer {
         }
 
         if let Some(project_id) = parse_project_resource_uri(&uri, "/forms") {
-            return match self.client.list_forms(project_id).await {
+            return match self.client.list_forms(project_id, None, None).await {
                 Ok(forms) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -706,7 +819,11 @@ impl McpServer {
         }
 
         if let Some(form_id) = parse_form_resource_uri(&uri, "/records") {
-            return match self.client.list_form_records(form_id).await {
+            return match self
+                .client
+                .list_form_records(form_id, &ListRecordsQuery::default())
+                .await
+            {
                 Ok(records) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -725,7 +842,7 @@ impl McpServer {
         }
 
         if let Some(form_id) = parse_form_resource_uri(&uri, "/events") {
-            return match self.client.list_form_events(form_id, None).await {
+            return match self.client.list_form_events(form_id, None, None, None).await {
                 Ok(events) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -763,7 +880,7 @@ impl McpServer {
         }
 
         if let Some(record_id) = parse_form_record_resource_uri(&uri, "/events") {
-            return match self.client.list_form_record_events(record_id, None).await {
+            return match self.client.list_form_record_events(record_id, None, None, None).await {
                 Ok(events) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -896,7 +1013,7 @@ impl McpServer {
         }
 
         if let Some(project_id) = parse_project_resource_uri(&uri, "/connectors") {
-            return match self.client.list_connectors(Some(project_id)).await {
+            return match self.client.list_connectors(Some(project_id), None).await {
                 Ok(connectors) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -915,7 +1032,7 @@ impl McpServer {
         }
 
         if let Some(project_id) = parse_project_resource_uri(&uri, "/invocations") {
-            return match self.client.list_invocations(project_id).await {
+            return match self.client.list_invocations(project_id, None, None, None).await {
                 Ok(invocations) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -1050,6 +1167,14 @@ fn extract_tools_list_project_id(params: Option<&Value>) -> Option<String> {
         .or_else(|| params.get("projectId"))
         .or_else(|| params.get("context").and_then(|context| context.get("project_id")))
         .or_else(|| params.get("context").and_then(|context| context.get("projectId")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn string_argument(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -1212,6 +1337,136 @@ mod tests {
                 .and_then(Value::as_str),
             Some("[REDACTED]")
         );
+    }
+
+    #[test]
+    fn form_scoped_tool_list_covers_every_registered_form_tool() {
+        let unresolvable = ["form_attachments.archive", "form_attachments.restore"];
+        let form_tools = crate::tools::get_all_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .filter(|name| {
+                (name.starts_with("forms.") || name.starts_with("form_")) && !unresolvable.contains(&name.as_str())
+            })
+            .collect::<Vec<_>>();
+
+        for name in form_tools {
+            // forms.list/create/create_from_template already carry project_id.
+            if matches!(
+                name.as_str(),
+                "forms.list" | "forms.create" | "forms.create_from_template"
+            ) {
+                continue;
+            }
+            assert!(
+                super::FORM_SCOPED_TOOLS.contains(&name.as_str()),
+                "{name} would bypass the project agent policy"
+            );
+        }
+    }
+
+    #[test]
+    fn string_argument_ignores_blank_and_non_string_values() {
+        assert_eq!(
+            super::string_argument(&json!({ "form_id": " f1 " }), "form_id").as_deref(),
+            Some("f1")
+        );
+        assert_eq!(super::string_argument(&json!({ "form_id": "  " }), "form_id"), None);
+        assert_eq!(super::string_argument(&json!({ "form_id": 7 }), "form_id"), None);
+    }
+
+    #[tokio::test]
+    async fn form_scoped_calls_are_denied_by_project_policy() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let form_lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&form_lookups);
+        let router = Router::new()
+            .route(
+                "/api/v1/forms/f1",
+                get(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "code": 0, "data": { "id": "f1", "project_id": "p1" } }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/form-records/r1",
+                get(|| async { Json(json!({ "code": 0, "data": { "id": "r1", "project_id": "p1" } })) }),
+            )
+            .route(
+                "/api/v1/projects/p1/agent-policy",
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "mcp": { "tool_registry": { "enabled_tools": ["forms.get"] } } }
+                    }))
+                }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        let by_form = server.call_tool("form_records.list", json!({ "form_id": "f1" })).await;
+        let by_record = server
+            .call_tool("form_records.update", json!({ "record_id": "r1", "values": {} }))
+            .await;
+
+        assert_eq!(by_form.is_error, Some(true));
+        assert_eq!(by_record.is_error, Some(true));
+        assert!(
+            summarize_tool_result(&by_form)
+                .unwrap_or_default()
+                .contains("disabled by project agent policy")
+        );
+
+        // Second call for the same form must be served from the cache.
+        let repeat = server.call_tool("form_records.list", json!({ "form_id": "f1" })).await;
+        assert_eq!(repeat.is_error, Some(true));
+        assert_eq!(form_lookups.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn form_scoped_calls_pass_when_policy_enables_the_tool() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::get};
+
+        let router = Router::new()
+            .route(
+                "/api/v1/forms/f1",
+                get(|| async { Json(json!({ "code": 0, "data": { "id": "f1", "project_id": "p1" } })) }),
+            )
+            .route(
+                "/api/v1/forms/f1/records",
+                get(|| async { Json(json!({ "code": 0, "data": { "items": [], "total": 0, "page": 1, "per_page": 50, "total_pages": 0 } })) }),
+            )
+            .route(
+                "/api/v1/projects/p1/agent-policy",
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "mcp": { "tool_registry": { "enabled_tools": ["form_records.list"] } } }
+                    }))
+                }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        let result = server.call_tool("form_records.list", json!({ "form_id": "f1" })).await;
+
+        assert_eq!(result.is_error, None, "{:?}", summarize_tool_result(&result));
+        Ok(())
     }
 
     #[test]

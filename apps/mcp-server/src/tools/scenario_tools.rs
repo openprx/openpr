@@ -257,9 +257,9 @@ fn governed_result_schema(title_description: &str, summary_description: &str) ->
             "project_id": { "type": "string", "description": "Project UUID" },
             "invocation_id": { "type": "string", "description": "Optional invocation UUID" },
             "connector_id": { "type": "string", "description": "Optional connector UUID" },
-            "title": { "type": "string", "description": title_description },
-            "summary": { "type": "string", "description": summary_description },
-            "risk_level": { "type": "string", "description": "Optional override: low, medium, high, or critical" },
+            "title": { "type": "string", "minLength": 10, "maxLength": 200, "description": title_description },
+            "summary": { "type": "string", "minLength": 10, "description": summary_description },
+            "risk_level": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": "Optional risk level override" },
             "result": { "type": "object", "description": "Structured AI result payload" }
         },
         "required": ["project_id", "title", "summary"]

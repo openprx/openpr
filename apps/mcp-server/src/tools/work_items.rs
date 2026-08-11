@@ -1,4 +1,4 @@
-use crate::client::OpenPrClient;
+use crate::client::{ListWorkItemsQuery, OpenPrClient};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,7 +10,9 @@ const MAX_PER_PAGE: u64 = 100;
 pub fn list_work_items_tool() -> ToolDefinition {
     ToolDefinition {
         name: "work_items.list".to_string(),
-        description: "List all work items in a project".to_string(),
+        description: "List work items in a project with optional filters. Paginated: per_page defaults to 50 \
+(max 100); check total_pages before treating the result as complete."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -31,6 +33,37 @@ pub fn list_work_items_tool() -> ToolDefinition {
                     "minimum": 1,
                     "maximum": 100,
                     "default": 50
+                },
+                "state": {
+                    "type": "string",
+                    "description": "Filter by workflow state key (optional)"
+                },
+                "assignee_id": {
+                    "type": "string",
+                    "description": "Filter by assignee UUID (optional)",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high", "urgent"],
+                    "description": "Filter by priority (optional)"
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Filter by title/description text (optional)"
+                },
+                "label_ids": {
+                    "type": "string",
+                    "description": "Comma-separated label UUIDs to filter by (optional)"
+                },
+                "sort_by": {
+                    "type": "string",
+                    "description": "Sort column (optional)"
+                },
+                "sort_order": {
+                    "type": "string",
+                    "enum": ["asc", "desc"],
+                    "description": "Sort direction (optional)"
                 }
             },
             "required": ["project_id"]
@@ -43,6 +76,13 @@ struct ListWorkItemsInput {
     project_id: String,
     page: Option<u64>,
     per_page: Option<u64>,
+    state: Option<String>,
+    assignee_id: Option<String>,
+    priority: Option<String>,
+    search: Option<String>,
+    label_ids: Option<String>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
 }
 
 pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -56,7 +96,19 @@ pub async fn list_work_items(client: &OpenPrClient, args: serde_json::Value) -> 
         Err(e) => return CallToolResult::error(e),
     };
 
-    match client.list_work_items(&input.project_id, page, per_page).await {
+    let query = ListWorkItemsQuery {
+        page: Some(page),
+        per_page: Some(per_page),
+        state: input.state.as_deref(),
+        assignee_id: input.assignee_id.as_deref(),
+        priority: input.priority.as_deref(),
+        search: input.search.as_deref(),
+        label_ids: input.label_ids.as_deref(),
+        sort_by: input.sort_by.as_deref(),
+        sort_order: input.sort_order.as_deref(),
+    };
+
+    match client.list_work_items(&input.project_id, &query).await {
         Ok(items) => {
             let output = build_paginated_output(&items, "items", page, per_page);
             let json = serde_json::to_string_pretty(&output).unwrap_or_default();
@@ -222,7 +274,7 @@ pub async fn get_work_item_by_identifier(client: &OpenPrClient, args: serde_json
 
     if work_item_id.is_none() {
         // Fallback to global search for deployments where identifier search is indexed globally.
-        if let Ok(global_search) = client.search_work_items(identifier).await {
+        if let Ok(global_search) = client.search(identifier, Some("issue"), None).await {
             work_item_id =
                 find_work_item_id_by_identifier(&global_search, identifier, project_identifier, sequence_id, false);
         }
@@ -329,12 +381,9 @@ fn find_project_id_by_identifier(projects_payload: &Value, project_identifier: &
     let project_identifier_upper = project_identifier.to_ascii_uppercase();
     let projects_data = extract_data(projects_payload);
 
-    let projects = if let Some(items) = projects_data.get("items").and_then(Value::as_array) {
-        items
-    } else if let Some(arr) = projects_data.as_array() {
-        arr
-    } else {
-        return None;
+    let projects = match projects_data.get("items").and_then(Value::as_array) {
+        Some(items) => items,
+        None => projects_data.as_array()?,
     };
 
     projects
@@ -508,13 +557,18 @@ pub fn create_work_item_tool() -> ToolDefinition {
                 },
                 "state": {
                     "type": "string",
-                    "description": "Work item state key. Any configured workflow state is accepted.",
-                    "default": "backlog"
+                    "description": "Work item state key. Any configured workflow state is accepted. When omitted the project workflow's initial state is used."
                 },
                 "priority": {
                     "type": "string",
-                    "description": "Work item priority (e.g., 'low', 'medium', 'high', 'critical')",
+                    "enum": ["low", "medium", "high", "urgent"],
+                    "description": "Work item priority",
                     "default": "medium"
+                },
+                "sprint_id": {
+                    "type": "string",
+                    "description": "UUID of the sprint to place the work item in (optional)",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "assignee_id": {
                     "type": "string",
@@ -539,6 +593,7 @@ struct CreateWorkItemInput {
     attachments: Option<Vec<String>>,
     state: Option<String>,
     priority: Option<String>,
+    sprint_id: Option<String>,
     assignee_id: Option<String>,
     due_at: Option<String>,
 }
@@ -549,8 +604,11 @@ pub async fn create_work_item(client: &OpenPrClient, args: serde_json::Value) ->
         Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
-    let state = input.state.unwrap_or_else(|| "backlog".to_string());
-    if let Err(e) = validate_work_item_state(&state) {
+    // No client-side state default: the backend resolves the project workflow's initial
+    // state, which is not always "backlog".
+    if let Some(state) = input.state.as_deref()
+        && let Err(e) = validate_work_item_state(state)
+    {
         return CallToolResult::error(e);
     }
 
@@ -559,8 +617,9 @@ pub async fn create_work_item(client: &OpenPrClient, args: serde_json::Value) ->
     let body = json!({
         "title": input.title,
         "description": description,
-        "state": state,
+        "state": input.state,
         "priority": input.priority.unwrap_or_else(|| "medium".to_string()),
+        "sprint_id": input.sprint_id,
         "assignee_id": input.assignee_id,
         "due_at": input.due_at
     });
@@ -607,16 +666,22 @@ pub fn update_work_item_tool() -> ToolDefinition {
                 },
                 "priority": {
                     "type": "string",
+                    "enum": ["low", "medium", "high", "urgent"],
                     "description": "New priority (optional)"
+                },
+                "sprint_id": {
+                    "type": "string",
+                    "description": "New sprint UUID (optional)",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "assignee_id": {
                     "type": "string",
-                    "description": "New assignee UUID or null to unassign (optional)",
+                    "description": "New assignee UUID (optional). The API cannot clear an assignee: sending null or an empty string leaves the current assignee unchanged",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
                 "due_at": {
                     "type": "string",
-                    "description": "New due date in RFC3339 format or null to clear (optional)"
+                    "description": "New due date in RFC3339 format (optional). The API cannot clear a due date: sending null or an empty string leaves the current value unchanged"
                 }
             },
             "required": ["work_item_id"]
@@ -632,6 +697,7 @@ struct UpdateWorkItemInput {
     attachments: Option<Vec<String>>,
     state: Option<String>,
     priority: Option<String>,
+    sprint_id: Option<String>,
     assignee_id: Option<String>,
     due_at: Option<String>,
 }
@@ -659,6 +725,9 @@ pub async fn update_work_item(client: &OpenPrClient, args: serde_json::Value) ->
     }
     if let Some(priority) = input.priority {
         body.insert("priority".to_string(), json!(priority));
+    }
+    if let Some(sprint_id) = input.sprint_id {
+        body.insert("sprint_id".to_string(), json!(sprint_id));
     }
     if args_obj.as_ref().and_then(|o| o.get("assignee_id")).is_some() {
         match input.assignee_id.as_deref() {
@@ -696,13 +765,18 @@ pub async fn update_work_item(client: &OpenPrClient, args: serde_json::Value) ->
 pub fn search_work_items_tool() -> ToolDefinition {
     ToolDefinition {
         name: "work_items.search".to_string(),
-        description: "Search work items across all projects in a workspace".to_string(),
+        description: "Search work items across all projects the caller can access".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
                     "description": "Search query (matches title and description)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional maximum number of matches to return"
                 }
             },
             "required": ["query"]
@@ -713,6 +787,7 @@ pub fn search_work_items_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct SearchWorkItemsInput {
     query: String,
+    limit: Option<u32>,
 }
 
 pub async fn search_work_items(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -721,7 +796,7 @@ pub async fn search_work_items(client: &OpenPrClient, args: serde_json::Value) -
         Err(e) => return CallToolResult::error(format!("Invalid input: {e}")),
     };
 
-    match client.search_work_items(&input.query).await {
+    match client.search(&input.query, Some("issue"), input.limit).await {
         Ok(items) => {
             let json = serde_json::to_string_pretty(&items).unwrap_or_default();
             CallToolResult::success(json)
@@ -766,7 +841,7 @@ pub async fn add_label_to_work_item(client: &OpenPrClient, args: serde_json::Val
     };
 
     match client.add_label_to_issue(&input.work_item_id, &input.label_id).await {
-        Ok(()) => CallToolResult::success("Label added to work item"),
+        Ok(_) => CallToolResult::success("Label added to work item"),
         Err(e) => CallToolResult::error(e),
     }
 }
@@ -810,7 +885,7 @@ pub async fn remove_label_from_work_item(client: &OpenPrClient, args: serde_json
         .remove_label_from_issue(&input.work_item_id, &input.label_id)
         .await
     {
-        Ok(()) => CallToolResult::success("Label removed from work item"),
+        Ok(_) => CallToolResult::success("Label removed from work item"),
         Err(e) => CallToolResult::error(e),
     }
 }
@@ -883,7 +958,7 @@ pub async fn handle_delete_work_item(client: &OpenPrClient, args: serde_json::Va
     };
 
     match client.delete_work_item(&input.work_item_id).await {
-        Ok(()) => CallToolResult::success("Work item deleted"),
+        Ok(_) => CallToolResult::success("Work item deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }
@@ -928,7 +1003,7 @@ pub async fn add_labels_to_work_item(client: &OpenPrClient, args: serde_json::Va
     };
 
     match client.add_labels_to_issue(&input.work_item_id, &input.label_ids).await {
-        Ok(()) => CallToolResult::success("Labels added to work item"),
+        Ok(_) => CallToolResult::success("Labels added to work item"),
         Err(e) => CallToolResult::error(e),
     }
 }
