@@ -16,10 +16,10 @@ pub fn create_label_tool() -> ToolDefinition {
                 },
                 "color": {
                     "type": "string",
-                    "description": "Label color"
+                    "description": "Label color (optional, defaults to gray)"
                 }
             },
-            "required": ["name", "color"]
+            "required": ["name"]
         }),
     }
 }
@@ -27,7 +27,7 @@ pub fn create_label_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct CreateLabelInput {
     name: String,
-    color: String,
+    color: Option<String>,
 }
 
 pub async fn create_label(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -203,7 +203,7 @@ pub async fn handle_delete_label(client: &OpenPrClient, args: serde_json::Value)
     };
 
     match client.delete_label(&input.label_id).await {
-        Ok(()) => CallToolResult::success("Label deleted"),
+        Ok(_) => CallToolResult::success("Label deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

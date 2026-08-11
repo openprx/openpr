@@ -48,6 +48,9 @@ mod tests {
 
         assert_eq!(tool.name, "release.readiness.get");
         assert!(tool.description.contains("next actions"));
-        assert_eq!(tool.input_schema["required"], serde_json::json!(["project_id"]));
+        assert_eq!(
+            tool.input_schema.get("required"),
+            Some(&serde_json::json!(["project_id"]))
+        );
     }
 }

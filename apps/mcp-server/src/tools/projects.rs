@@ -6,16 +6,12 @@ use serde_json::json;
 pub fn list_projects_tool() -> ToolDefinition {
     ToolDefinition {
         name: "projects.list".to_string(),
-        description: "List all projects in a workspace".to_string(),
+        description: "List all projects in the workspace bound to this MCP server's bot token. The workspace \
+cannot be chosen per call."
+            .to_string(),
         input_schema: json!({
             "type": "object",
-            "properties": {
-                "workspace_id": {
-                    "type": "string",
-                    "description": "UUID of the workspace (optional, uses bot token workspace)",
-                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-                }
-            }
+            "properties": {}
         }),
     }
 }
@@ -77,7 +73,7 @@ pub fn create_project_tool() -> ToolDefinition {
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Project key (uppercase letters only, e.g., 'PROJ')"
+                    "description": "Project key: uppercase letters and digits only, e.g. 'PROJ' or 'API2'"
                 },
                 "name": {
                     "type": "string",
@@ -151,6 +147,10 @@ pub fn update_project_tool() -> ToolDefinition {
                     "description": "UUID of the project",
                     "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
                 },
+                "key": {
+                    "type": "string",
+                    "description": "New project key (optional); uppercase letters and digits only, must be unique in the workspace"
+                },
                 "name": {
                     "type": "string",
                     "description": "New project name (optional)"
@@ -176,6 +176,7 @@ pub fn update_project_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct UpdateProjectInput {
     project_id: String,
+    key: Option<String>,
     name: Option<String>,
     description: Option<String>,
     type_key: Option<String>,
@@ -189,6 +190,9 @@ pub async fn update_project(client: &OpenPrClient, args: serde_json::Value) -> C
     };
 
     let mut body = serde_json::Map::new();
+    if let Some(key) = input.key {
+        body.insert("key".to_string(), json!(key));
+    }
     if let Some(name) = input.name {
         body.insert("name".to_string(), json!(name));
     }
@@ -244,7 +248,7 @@ pub async fn handle_delete_project(client: &OpenPrClient, args: serde_json::Valu
     };
 
     match client.delete_project(&input.project_id).await {
-        Ok(()) => CallToolResult::success("Project deleted"),
+        Ok(_) => CallToolResult::success("Project deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

@@ -7,7 +7,9 @@ use serde_json::json;
 pub fn upload_file_tool() -> ToolDefinition {
     ToolDefinition {
         name: "files.upload".to_string(),
-        description: "Upload a file and return its URL".to_string(),
+        description: "Upload a file and return its URL. Maximum 50 MB. Only these extensions are accepted: \
+png, jpg, jpeg, gif, webp, mp4, webm, mov, avi, zip, gz, tar.gz, log, txt, pdf, json, csv, xml."
+            .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {

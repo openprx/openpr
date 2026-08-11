@@ -302,7 +302,7 @@ pub async fn handle_delete_comment(client: &OpenPrClient, args: serde_json::Valu
     };
 
     match client.delete_comment(&input.comment_id).await {
-        Ok(()) => CallToolResult::success("Comment deleted"),
+        Ok(_) => CallToolResult::success("Comment deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }

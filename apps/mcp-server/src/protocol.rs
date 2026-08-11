@@ -121,7 +121,9 @@ pub struct CallToolParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallToolResult {
     pub content: Vec<ToolContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// MCP clients read the camelCase `isError` flag; without the rename standard
+    /// clients treat every failed tool call as a success.
+    #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
 }
 
@@ -161,5 +163,43 @@ impl CallToolResult {
             content: vec![ToolContent::error(msg)],
             is_error: Some(true),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CallToolResult, ToolDefinition};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn call_tool_error_serializes_mcp_is_error_field() {
+        let value = serde_json::to_value(CallToolResult::error("boom")).unwrap_or(Value::Null);
+
+        assert_eq!(value.get("isError").and_then(Value::as_bool), Some(true));
+        assert!(
+            value.get("is_error").is_none(),
+            "snake_case is_error is not part of the MCP schema"
+        );
+    }
+
+    #[test]
+    fn call_tool_success_omits_is_error_field() {
+        let value = serde_json::to_value(CallToolResult::success("ok")).unwrap_or(Value::Null);
+
+        assert!(value.get("isError").is_none());
+        assert!(value.get("is_error").is_none());
+    }
+
+    #[test]
+    fn tool_definition_serializes_camel_case_input_schema() {
+        let value = serde_json::to_value(ToolDefinition {
+            name: "forms.get".to_string(),
+            description: "desc".to_string(),
+            input_schema: json!({ "type": "object" }),
+        })
+        .unwrap_or(Value::Null);
+
+        assert!(value.get("inputSchema").is_some());
+        assert!(value.get("input_schema").is_none());
     }
 }

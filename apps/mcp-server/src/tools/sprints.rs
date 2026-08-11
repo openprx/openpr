@@ -26,6 +26,15 @@ pub fn create_sprint_tool() -> ToolDefinition {
                 "end_date": {
                     "type": "string",
                     "description": "End date (YYYY-MM-DD, optional)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Sprint description (optional)"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["planned", "active", "completed", "cancelled"],
+                    "description": "Initial sprint status (optional, defaults to planned)"
                 }
             },
             "required": ["project_id", "name"]
@@ -39,6 +48,8 @@ struct CreateSprintInput {
     name: String,
     start_date: Option<String>,
     end_date: Option<String>,
+    description: Option<String>,
+    status: Option<String>,
 }
 
 pub async fn create_sprint(client: &OpenPrClient, args: serde_json::Value) -> CallToolResult {
@@ -50,7 +61,9 @@ pub async fn create_sprint(client: &OpenPrClient, args: serde_json::Value) -> Ca
     let body = json!({
         "name": input.name,
         "start_date": input.start_date,
-        "end_date": input.end_date
+        "end_date": input.end_date,
+        "description": input.description,
+        "status": input.status
     });
 
     match client.create_sprint(&input.project_id, body).await {
@@ -118,6 +131,7 @@ pub fn update_sprint_tool() -> ToolDefinition {
                 },
                 "status": {
                     "type": "string",
+                    "enum": ["planned", "active", "completed", "cancelled"],
                     "description": "Sprint status (optional)"
                 },
                 "start_date": {
@@ -205,7 +219,7 @@ pub async fn handle_delete_sprint(client: &OpenPrClient, args: serde_json::Value
     };
 
     match client.delete_sprint(&input.sprint_id).await {
-        Ok(()) => CallToolResult::success("Sprint deleted"),
+        Ok(_) => CallToolResult::success("Sprint deleted"),
         Err(e) => CallToolResult::error(e),
     }
 }
