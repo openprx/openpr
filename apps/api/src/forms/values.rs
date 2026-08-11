@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Value, json};
 
 use super::{
@@ -21,15 +23,42 @@ pub fn normalize_record_values_with_existing(
     let input = values
         .as_object()
         .ok_or_else(|| "values must be a JSON object".to_string())?;
-    let mut normalized = Map::new();
 
-    for field in fields {
-        let raw = input.get(&field.key);
-        if field_hidden_by_condition(&field, input, existing_values) {
+    // Whole-map rebuild: fields the caller could not see (e.g. field-level `read:false`,
+    // which is stripped from API responses before the client ever gets them) or simply
+    // did not mention must not be deleted from the record. Seed the rebuilt map from the
+    // existing stored values, restricted to keys that are still declared schema fields so
+    // stale/removed fields are not resurrected, then let the loop below overwrite it with
+    // normalized input and honor explicit clears. On the create path (`existing_values` is
+    // `None`) there is nothing to preserve, so start empty as before.
+    let declared_keys: BTreeSet<&str> = fields.iter().map(|field| field.key.as_str()).collect();
+    let mut normalized: Map<String, Value> = Map::new();
+    if let Some(existing) = existing_values.and_then(Value::as_object) {
+        for (key, value) in existing {
+            if declared_keys.contains(key.as_str()) {
+                normalized.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    for field in &fields {
+        // A field hidden by its `hidden_when` condition is not visible to the caller, so
+        // whatever was already seeded from `existing_values` (or its absence) is kept as-is:
+        // no re-validation/re-normalization, and it is never treated as required while hidden.
+        if field_hidden_by_condition(field, input, existing_values) {
             continue;
         }
+        let raw = input.get(&field.key);
+        let required_exempt = field.field_type == "autonumber" || field.field_type == "child_table";
         if is_missing(raw) {
-            if field.required && field.field_type != "autonumber" {
+            if input.contains_key(&field.key) {
+                // The caller explicitly sent an empty/null value: treat it as an explicit
+                // clear and drop any seeded existing value for this field.
+                normalized.remove(&field.key);
+            }
+            // Otherwise the caller simply did not mention this field; whatever was seeded
+            // from `existing_values` for it (if anything) is left untouched.
+            if field.required && !required_exempt && !normalized.contains_key(&field.key) {
                 return Err(format!("field '{}' is required", field.key));
             }
             continue;
@@ -37,15 +66,15 @@ pub fn normalize_record_values_with_existing(
         let Some(raw_value) = raw else {
             continue;
         };
-        let value = normalize_field_value(&field, raw_value, existing_values.and_then(|item| item.get(&field.key)))?;
-        if field_read_only_by_condition(&field, input, existing_values) {
+        let value = normalize_field_value(field, raw_value, existing_values.and_then(|item| item.get(&field.key)))?;
+        if field_read_only_by_condition(field, input, existing_values) {
             if let Some(existing) = existing_values.and_then(|item| item.get(&field.key)) {
                 if existing != &value {
                     return Err(format!("field '{}' is read-only by condition", field.key));
                 }
             }
         }
-        normalized.insert(field.key, value);
+        normalized.insert(field.key.clone(), value);
     }
 
     Ok(Value::Object(normalized))
@@ -953,5 +982,127 @@ mod tests {
             Some("user-smoke")
         );
         assert!(normalize_record_values(&schema, json!({"assignee": {"name": "Smoke Admin"}})).is_err());
+    }
+
+    #[test]
+    fn hidden_field_keeps_existing_value_after_update() {
+        let schema = json!({
+            "fields": [
+                {
+                    "field_id": "fld_status",
+                    "key": "status",
+                    "type": "single_select",
+                    "options": ["normal", "priority"]
+                },
+                {
+                    "field_id": "fld_vip_note",
+                    "key": "vip_note",
+                    "type": "text",
+                    "conditional": {
+                        "hidden_when": {"field": "status", "equals": "normal"}
+                    }
+                }
+            ]
+        });
+        let existing = json!({"status": "priority", "vip_note": "handled by concierge"});
+        let normalized = normalize_record_values_with_existing(&schema, json!({"status": "normal"}), Some(&existing))
+            .expect("update that hides a field should not error");
+        assert_eq!(
+            normalized.get("vip_note").and_then(serde_json::Value::as_str),
+            Some("handled by concierge")
+        );
+    }
+
+    #[test]
+    fn field_absent_from_input_keeps_existing_value_on_update() {
+        let schema = json!({
+            "fields": [
+                {
+                    "field_id": "fld_status",
+                    "key": "status",
+                    "type": "single_select",
+                    "options": ["open", "closed"]
+                },
+                {
+                    "field_id": "fld_internal_note",
+                    "key": "internal_note",
+                    "type": "text"
+                }
+            ]
+        });
+        let existing = json!({"status": "open", "internal_note": "flagged for review"});
+        // Simulates a field-level `read:false` field: the client never received it in the
+        // read response, so it cannot echo it back in the update payload.
+        let normalized = normalize_record_values_with_existing(&schema, json!({"status": "closed"}), Some(&existing))
+            .expect("field the caller never mentioned should not error");
+        assert_eq!(
+            normalized.get("internal_note").and_then(serde_json::Value::as_str),
+            Some("flagged for review")
+        );
+        assert_eq!(
+            normalized.get("status").and_then(serde_json::Value::as_str),
+            Some("closed")
+        );
+    }
+
+    #[test]
+    fn explicit_null_clears_only_the_targeted_field() {
+        let schema = json!({
+            "fields": [
+                {"field_id": "fld_note", "key": "note", "type": "text"},
+                {"field_id": "fld_owner", "key": "owner", "type": "text"}
+            ]
+        });
+        let existing = json!({"note": "old value", "owner": "Ada"});
+        let normalized = normalize_record_values_with_existing(&schema, json!({"note": null}), Some(&existing))
+            .expect("explicit clear should not error");
+        assert!(normalized.get("note").is_none());
+        assert_eq!(normalized.get("owner").and_then(serde_json::Value::as_str), Some("Ada"));
+    }
+
+    #[test]
+    fn undeclared_existing_key_is_not_resurrected() {
+        let schema = json!({
+            "fields": [{"field_id": "fld_note", "key": "note", "type": "text"}]
+        });
+        let existing = json!({"note": "kept", "legacy_field": "should be dropped"});
+        let normalized = normalize_record_values_with_existing(&schema, json!({}), Some(&existing))
+            .expect("update without input should not error");
+        assert_eq!(normalized.get("note").and_then(serde_json::Value::as_str), Some("kept"));
+        assert!(normalized.get("legacy_field").is_none());
+    }
+
+    #[test]
+    fn required_field_omitted_by_caller_uses_existing_value_or_errors_without_one() {
+        let schema = json!({
+            "fields": [{
+                "field_id": "fld_owner",
+                "key": "owner",
+                "type": "text",
+                "required": true
+            }]
+        });
+        let existing = json!({"owner": "Ada"});
+        let normalized = normalize_record_values_with_existing(&schema, json!({}), Some(&existing))
+            .expect("required field preserved from existing should not error");
+        assert_eq!(normalized.get("owner").and_then(serde_json::Value::as_str), Some("Ada"));
+
+        assert!(normalize_record_values_with_existing(&schema, json!({}), Some(&json!({}))).is_err());
+        assert!(normalize_record_values_with_existing(&schema, json!({}), None).is_err());
+    }
+
+    #[test]
+    fn required_child_table_field_does_not_error_on_create() {
+        let schema = json!({
+            "fields": [{
+                "field_id": "fld_line_items",
+                "key": "line_items",
+                "type": "child_table",
+                "required": true
+            }]
+        });
+        let normalized = normalize_record_values(&schema, json!({}))
+            .expect("required child_table should be exempt from creation-time validation");
+        assert!(normalized.get("line_items").is_none());
     }
 }

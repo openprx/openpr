@@ -28,6 +28,7 @@ use crate::{
             sanitize_file_stem, sanitize_zip_file_name,
         },
         calculation::evaluate_calculated_values,
+        event_redaction::{redact_event_metadata, redact_event_payload, redact_event_source},
         job_context::{add_form_job_worker_context, form_job_worker_context},
         permissions::{
             append_record_scope_sql, denied_read_field_keys, ensure_field_read_policy_allows,
@@ -79,6 +80,7 @@ use crate::{
     middleware::bot_auth::{BotAuthContext, require_workspace_access_from_auth},
     plugins::hooks::{run_event_handler_hooks, run_field_validator_hooks, run_formula_hooks},
     response::{ApiResponse, PaginatedData},
+    routes::upload::{UploadObjectOwner, resolve_upload_object_owner, upload_object_key_from_path},
     services::object_storage::ObjectStorage,
 };
 use rust_decimal::Decimal;
@@ -2854,6 +2856,46 @@ pub async fn update_form_permissions(
     )))
 }
 
+/// Object keys an attachment registration would bind to `workspace_id`.
+///
+/// `storage_key`, `url` and `thumbnail_url` arrive straight from the client and are exactly the
+/// columns the upload download check reads back to decide which workspace owns an object. Without
+/// this check a member could register an attachment row pointing at another tenant's object and
+/// make the download check resolve to their own workspace ("claiming" someone else's file).
+fn attachment_claimed_object_keys(storage_key: &str, url: &str, thumbnail_url: Option<&str>) -> BTreeSet<String> {
+    let mut claimed = BTreeSet::new();
+    claimed.insert(storage_key.to_string());
+    if let Some(object_key) = upload_object_key_from_path(url) {
+        claimed.insert(object_key);
+    }
+    if let Some(object_key) = thumbnail_url.and_then(upload_object_key_from_path) {
+        claimed.insert(object_key);
+    }
+    claimed
+}
+
+/// Reject an attachment registration that points at an object another workspace already owns.
+async fn ensure_attachment_objects_claimable(
+    state: &AppState,
+    workspace_id: Uuid,
+    storage_key: &str,
+    url: &str,
+    thumbnail_url: Option<&str>,
+) -> Result<(), ApiError> {
+    for object_key in attachment_claimed_object_keys(storage_key, url, thumbnail_url) {
+        match resolve_upload_object_owner(state, &object_key).await? {
+            UploadObjectOwner::Unowned => {}
+            UploadObjectOwner::Owned(owner_workspace_id) if owner_workspace_id == workspace_id => {}
+            UploadObjectOwner::Owned(_) | UploadObjectOwner::Ambiguous => {
+                return Err(ApiError::Forbidden(
+                    "attachment references an upload object owned by another workspace".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn create_form_attachment(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -2890,6 +2932,14 @@ pub async fn create_form_attachment(
         return Err(ApiError::BadRequest("byte_size must be non-negative".to_string()));
     }
     validate_attachment_create_policy(&form.schema, &field.key, &file_name, &content_type, byte_size, &url)?;
+    ensure_attachment_objects_claimable(
+        &state,
+        form.workspace_id,
+        &storage_key,
+        &url,
+        req.thumbnail_url.as_deref(),
+    )
+    .await?;
     let media = ensure_attachment_media(
         &form.schema,
         &field.key,
@@ -3478,14 +3528,20 @@ pub async fn list_form_events(
     Query(query): Query<ListEventsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (_, role, is_bot) =
+    let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let owned_by = if form_record_scope(&state, form.id, &role, is_bot).await? == "owned" {
+        Some(actor_id)
+    } else {
+        None
+    };
     let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
     list_business_events(
         &state,
         EventScope::Form {
             project_id: form.project_id,
             form_id,
+            owned_by,
         },
         query,
         &denied_read_fields,
@@ -4871,7 +4927,9 @@ async fn recalculate_parent_records_for_child(
             SELECT links.source_record_id
             FROM form_record_links links
             JOIN form_records parent ON parent.id = links.source_record_id
-            JOIN form_records child ON child.id::text = links.target_id
+            JOIN form_records child
+              ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
+             AND child.id = links.target_id::uuid
             WHERE links.target_type = 'form_record'
               AND links.relation_type = 'parent_child'
               AND links.target_id = $1
@@ -5912,9 +5970,12 @@ fn filter_record_response_values(mut record: RecordResponse, denied_read_fields:
     record
 }
 
-/// Payload keys that carry a record value map and therefore must obey field level read permissions.
-const EVENT_PAYLOAD_VALUE_KEYS: [&str; 4] = ["values", "previous_values", "normalized_values", "changes"];
-
+/// Applies field level read permissions to an event before it leaves the API.
+///
+/// The payload is pruned to what its event type declares in `forms::event_redaction`; source and
+/// metadata are pruned to the keys that are generated server side. Anything undeclared is withheld
+/// because event payloads carry field values in shapes a key name list cannot enumerate (rendered
+/// titles, bare values at the top level, signature audit trails).
 fn filter_event_response_values(
     mut event: BusinessEventResponse,
     denied_read_fields: &BTreeSet<String>,
@@ -5922,38 +5983,10 @@ fn filter_event_response_values(
     if denied_read_fields.is_empty() {
         return event;
     }
-    event.payload = filter_event_payload_values(event.payload, denied_read_fields);
-    event.metadata = filter_event_payload_values(event.metadata, denied_read_fields);
-    event.source = filter_event_payload_values(event.source, denied_read_fields);
+    event.payload = redact_event_payload(&event.event_type, event.payload, denied_read_fields);
+    event.metadata = redact_event_metadata(event.metadata, denied_read_fields);
+    event.source = redact_event_source(event.source, denied_read_fields);
     event
-}
-
-/// Strips fields the actor may not read from every value map nested in an event payload. The walk is
-/// iterative so that a deeply nested payload cannot exhaust the stack.
-fn filter_event_payload_values(mut payload: Value, denied_read_fields: &BTreeSet<String>) -> Value {
-    if denied_read_fields.is_empty() {
-        return payload;
-    }
-    let mut pending: Vec<&mut Value> = vec![&mut payload];
-    while let Some(node) = pending.pop() {
-        match node {
-            Value::Object(entries) => {
-                for (key, child) in entries.iter_mut() {
-                    if EVENT_PAYLOAD_VALUE_KEYS.contains(&key.as_str())
-                        && let Some(values) = child.as_object_mut()
-                    {
-                        for denied_key in denied_read_fields {
-                            values.remove(denied_key);
-                        }
-                    }
-                    pending.push(child);
-                }
-            }
-            Value::Array(items) => pending.extend(items.iter_mut()),
-            _ => {}
-        }
-    }
-    payload
 }
 
 fn filter_relation_target_values(
@@ -6232,9 +6265,80 @@ async fn find_idempotent_record(
     Ok(Some(record))
 }
 
+#[derive(Debug, Clone, Copy)]
 enum EventScope {
-    Form { project_id: Uuid, form_id: Uuid },
-    Record { project_id: Uuid, record_id: Uuid },
+    Form {
+        project_id: Uuid,
+        form_id: Uuid,
+        /// Set when the actor's record scope is `owned`: form level events stay visible, record
+        /// events are restricted to records the actor created.
+        owned_by: Option<Uuid>,
+    },
+    Record {
+        project_id: Uuid,
+        record_id: Uuid,
+    },
+}
+
+/// Restricts a form scoped event listing to records the actor created. Events that carry no record
+/// (form and view lifecycle events) stay visible because they expose no record data.
+const OWNED_RECORD_EVENT_SQL: &str = r"
+    (metadata->>'record_id' IS NULL
+     OR EXISTS (
+        SELECT 1
+          FROM form_records owned_record
+         WHERE owned_record.form_id = $FORM_ID
+           AND owned_record.created_by = $ACTOR_ID
+           AND owned_record.id::text = metadata->>'record_id'
+     ))
+";
+
+/// Binds `OWNED_RECORD_EVENT_SQL` to concrete placeholder positions. Only code generated
+/// placeholder numbers are interpolated; the form id and actor id stay bound values.
+fn owned_record_event_predicate(form_id_idx: usize, actor_id_idx: usize) -> String {
+    OWNED_RECORD_EVENT_SQL
+        .replace("$FORM_ID", &format!("${form_id_idx}"))
+        .replace("$ACTOR_ID", &format!("${actor_id_idx}"))
+}
+
+/// Translate an event listing scope into bound where clauses.
+///
+/// A form scope with `owned_by` set also restricts record events to the actor's own records, which
+/// the record scoped listing enforces through `ensure_record_scope_allows_created_by`.
+fn push_event_scope_filters(
+    scope: EventScope,
+    where_parts: &mut Vec<String>,
+    values: &mut Vec<sea_orm::Value>,
+    idx: &mut usize,
+) {
+    match scope {
+        EventScope::Form {
+            project_id,
+            form_id,
+            owned_by,
+        } => {
+            where_parts.push(format!("project_id = ${idx}"));
+            values.push(project_id.into());
+            *idx += 1;
+            where_parts.push(format!("metadata->>'form_id' = ${idx}"));
+            values.push(form_id.to_string().into());
+            *idx += 1;
+            if let Some(actor_id) = owned_by {
+                where_parts.push(owned_record_event_predicate(*idx, *idx + 1));
+                values.push(form_id.into());
+                values.push(actor_id.into());
+                *idx += 2;
+            }
+        }
+        EventScope::Record { project_id, record_id } => {
+            where_parts.push(format!("project_id = ${idx}"));
+            values.push(project_id.into());
+            *idx += 1;
+            where_parts.push(format!("aggregate_id = ${idx}"));
+            values.push(record_id.to_string().into());
+            *idx += 1;
+        }
+    }
 }
 
 async fn list_business_events(
@@ -6253,24 +6357,7 @@ async fn list_business_events(
     let mut values = Vec::new();
     let mut idx = 1;
 
-    match scope {
-        EventScope::Form { project_id, form_id } => {
-            where_parts.push(format!("project_id = ${idx}"));
-            values.push(project_id.into());
-            idx += 1;
-            where_parts.push(format!("metadata->>'form_id' = ${idx}"));
-            values.push(form_id.to_string().into());
-            idx += 1;
-        }
-        EventScope::Record { project_id, record_id } => {
-            where_parts.push(format!("project_id = ${idx}"));
-            values.push(project_id.into());
-            idx += 1;
-            where_parts.push(format!("aggregate_id = ${idx}"));
-            values.push(record_id.to_string().into());
-            idx += 1;
-        }
-    }
+    push_event_scope_filters(scope, &mut where_parts, &mut values, &mut idx);
 
     if let Some(event_type) = query.event_type {
         where_parts.push(format!("event_type = ${idx}"));
@@ -6850,11 +6937,11 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
 mod tests {
     use super::{
         AttachmentPackageArtifact, BusinessEventResponse, CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL,
-        ImportRecordsFileRequest, default_form_key_from_template, default_title_template_from_schema,
-        ensure_can_read_job_result, ensure_link_target_scope, filter_event_payload_values,
+        EventScope, ImportRecordsFileRequest, attachment_claimed_object_keys, default_form_key_from_template,
+        default_title_template_from_schema, ensure_can_read_job_result, ensure_link_target_scope,
         filter_event_response_values, import_records_request_from_uploaded_file_without_mapping,
-        job_listing_owner_filter, normalize_scenario_field_schema, summarize_job_result,
-        write_attachment_package_artifact,
+        job_listing_owner_filter, normalize_scenario_field_schema, owned_record_event_predicate,
+        push_event_scope_filters, summarize_job_result, write_attachment_package_artifact,
     };
     use crate::{
         error::ApiError,
@@ -6958,48 +7045,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn event_payloads_drop_fields_denied_by_the_read_policy() {
-        let denied = denied_fields(&["salary"]);
-        let filtered = filter_event_payload_values(
-            json!({
-                "record_id": "01234567-89ab-cdef-0123-456789abcdef",
-                "values": {"salary": "9000", "name": "Ada"},
-                "rows": [{"values": {"salary": "8000", "name": "Bob"}}],
-                "previous_values": {"salary": "7000"}
-            }),
-            &denied,
-        );
-
-        assert!(filtered.pointer("/values/salary").is_none());
-        assert_eq!(filtered.pointer("/values/name").and_then(Value::as_str), Some("Ada"));
-        assert!(filtered.pointer("/rows/0/values/salary").is_none());
-        assert_eq!(
-            filtered.pointer("/rows/0/values/name").and_then(Value::as_str),
-            Some("Bob")
-        );
-        assert!(filtered.pointer("/previous_values/salary").is_none());
-    }
-
-    #[test]
-    fn event_responses_apply_field_level_read_permissions() {
-        let now = chrono::Utc::now();
-        let event = BusinessEventResponse {
+    fn business_event(event_type: &str, payload: Value, source: Value) -> BusinessEventResponse {
+        BusinessEventResponse {
             id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             project_id: Some(Uuid::new_v4()),
-            event_type: "form.record.updated".to_string(),
+            event_type: event_type.to_string(),
             aggregate_type: "form_record".to_string(),
             aggregate_id: Uuid::new_v4().to_string(),
             actor_id: None,
-            source: json!({"type": "user", "values": {"salary": "9000"}}),
-            payload: json!({"record_id": "r1", "values": {"salary": "9000", "name": "Ada"}}),
+            source,
+            payload,
             metadata: json!({"form_id": "f1", "values": {"salary": "9000"}}),
             correlation_id: None,
             causation_id: None,
             idempotency_key: None,
-            created_at: now,
-        };
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn event_responses_apply_field_level_read_permissions() {
+        let event = business_event(
+            "form.record.updated",
+            json!({"record_id": "r1", "values": {"salary": "9000", "name": "Ada"}}),
+            json!({"type": "user", "values": {"salary": "9000"}}),
+        );
 
         let filtered = filter_event_response_values(event, &denied_fields(&["salary"]));
 
@@ -7010,6 +7081,143 @@ mod tests {
         );
         assert!(filtered.metadata.pointer("/values/salary").is_none());
         assert!(filtered.source.pointer("/values/salary").is_none());
+    }
+
+    #[test]
+    fn archived_record_events_do_not_leak_the_rendered_title() {
+        let event = business_event(
+            "form.record.archived",
+            json!({"record_id": "r1", "title": "Ada earns 9000"}),
+            json!({"type": "user"}),
+        );
+
+        let filtered = filter_event_response_values(event, &denied_fields(&["salary"]));
+
+        assert!(filtered.payload.get("title").is_none());
+        assert_eq!(filtered.payload.get("record_id").and_then(Value::as_str), Some("r1"));
+    }
+
+    #[test]
+    fn signature_audit_sources_do_not_leak_signature_values() {
+        let event = business_event(
+            "form.record.updated",
+            json!({"record_id": "r1", "values": {"name": "Ada"}}),
+            json!({
+                "type": "user",
+                "signature_media": {"entries": [{
+                    "field_key": "signature",
+                    "url": "/api/v1/uploads/signatures/signature-signature-1.png",
+                    "reason": "approved"
+                }]}
+            }),
+        );
+
+        let filtered = filter_event_response_values(event, &denied_fields(&["signature"]));
+
+        assert!(filtered.source.get("signature_media").is_none());
+        assert!(!filtered.source.to_string().contains("approved"));
+    }
+
+    #[test]
+    fn order_table_change_events_do_not_leak_top_level_field_values() {
+        let event = business_event(
+            "order.table_changed",
+            json!({
+                "record_id": "r1",
+                "previous_table_id": "T1",
+                "table_id": "T2",
+                "values": {"table_id": "T2"}
+            }),
+            json!({"type": "system"}),
+        );
+
+        let filtered = filter_event_response_values(event, &denied_fields(&["table_id"]));
+
+        assert!(filtered.payload.get("table_id").is_none());
+        assert!(filtered.payload.get("previous_table_id").is_none());
+        assert!(filtered.payload.pointer("/values/table_id").is_none());
+    }
+
+    #[test]
+    fn form_event_listings_are_restricted_to_records_an_owned_scope_member_created() {
+        let actor_id = Uuid::new_v4();
+        let mut where_parts = Vec::new();
+        let mut values = Vec::new();
+        let mut idx = 1;
+
+        push_event_scope_filters(
+            EventScope::Form {
+                project_id: Uuid::new_v4(),
+                form_id: Uuid::new_v4(),
+                owned_by: Some(actor_id),
+            },
+            &mut where_parts,
+            &mut values,
+            &mut idx,
+        );
+
+        assert_eq!(where_parts.len(), 3, "owned scope must add an ownership predicate");
+        assert!(
+            where_parts
+                .iter()
+                .any(|part| part.contains("owned_record.created_by = $4"))
+        );
+        assert_eq!(values.len(), 4);
+        assert_eq!(idx, 5);
+    }
+
+    #[test]
+    fn form_event_listings_stay_unfiltered_for_members_that_may_read_every_record() {
+        let mut where_parts = Vec::new();
+        let mut values = Vec::new();
+        let mut idx = 1;
+
+        push_event_scope_filters(
+            EventScope::Form {
+                project_id: Uuid::new_v4(),
+                form_id: Uuid::new_v4(),
+                owned_by: None,
+            },
+            &mut where_parts,
+            &mut values,
+            &mut idx,
+        );
+
+        assert_eq!(where_parts.len(), 2);
+        assert!(!where_parts.iter().any(|part| part.contains("owned_record")));
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn owned_record_event_predicate_binds_the_expected_placeholders() {
+        let predicate = owned_record_event_predicate(3, 4);
+
+        assert!(predicate.contains("owned_record.form_id = $3"));
+        assert!(predicate.contains("owned_record.created_by = $4"));
+        assert!(predicate.contains("metadata->>'record_id' IS NULL"));
+        assert!(!predicate.contains("$FORM_ID"));
+        assert!(!predicate.contains("$ACTOR_ID"));
+    }
+
+    #[test]
+    fn attachment_claims_cover_every_column_the_download_check_reads_back() {
+        let claimed = attachment_claimed_object_keys(
+            "form-records/r1/photo/1-photo.png",
+            "/api/v1/uploads/victim-object.png",
+            Some("/uploads/thumbnails/victim-thumb.png"),
+        );
+
+        assert!(claimed.contains("form-records/r1/photo/1-photo.png"));
+        assert!(claimed.contains("victim-object.png"));
+        assert!(claimed.contains("thumbnails/victim-thumb.png"));
+    }
+
+    #[test]
+    fn attachment_claims_ignore_external_urls() {
+        let claimed = attachment_claimed_object_keys("storage/key.png", "https://cdn.example.com/key.png", None);
+
+        assert_eq!(claimed.len(), 1);
+        assert!(claimed.contains("storage/key.png"));
     }
 
     #[test]
