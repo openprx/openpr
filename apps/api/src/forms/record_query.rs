@@ -119,7 +119,7 @@ fn record_filter_groups_from_config(config: &Value) -> Vec<RecordFilterGroupConf
 }
 
 fn record_filter_expression_from_groups(groups: Vec<RecordFilterGroupConfig>) -> RecordFilterExpressionConfig {
-    let children = groups
+    let mut children = groups
         .into_iter()
         .map(|group| RecordFilterExpressionConfig::Group {
             logic: group.logic,
@@ -130,13 +130,14 @@ fn record_filter_expression_from_groups(groups: Vec<RecordFilterGroupConfig>) ->
                 .collect(),
         })
         .collect::<Vec<_>>();
-    if children.len() == 1 {
-        children.into_iter().next().unwrap()
-    } else {
-        RecordFilterExpressionConfig::Group {
-            logic: RecordFilterLogic::All,
-            children,
-        }
+    if children.len() == 1
+        && let Some(single) = children.pop()
+    {
+        return single;
+    }
+    RecordFilterExpressionConfig::Group {
+        logic: RecordFilterLogic::All,
+        children,
     }
 }
 
@@ -459,6 +460,33 @@ mod tests {
         assert!(where_parts[0].contains("filter_idx_1.value_decimal > $4::numeric"));
         assert_eq!(values.len(), 4);
         assert_eq!(next_idx, 5);
+    }
+
+    #[test]
+    fn builds_sql_for_a_single_filter_group_without_panicking() {
+        let expression = record_filter_expression_from_config(&json!({
+            "filter_groups": [{
+                "logic": "any",
+                "filters": [{"field": "status", "operator": "equals", "value": "open"}]
+            }]
+        }));
+        let fields = vec![test_field("status", "Status", "text")];
+        let mut where_parts = Vec::new();
+        let mut values = Vec::new();
+        let mut next_idx = 1;
+
+        append_record_filter_expression_sql(
+            &fields,
+            expression.as_ref(),
+            &mut where_parts,
+            &mut values,
+            &mut next_idx,
+        )
+        .unwrap();
+
+        assert_eq!(where_parts.len(), 1);
+        assert!(where_parts[0].contains("filter_idx_0.value_text = $2"));
+        assert_eq!(values.len(), 2);
     }
 
     #[test]

@@ -341,7 +341,10 @@ fn env_any(keys: &[&str]) -> Option<String> {
 }
 
 fn required_env_any(keys: &[&str]) -> Result<String, ApiError> {
-    env_any(keys).ok_or_else(|| ApiError::BadRequest(format!("{} is required", keys[0])))
+    env_any(keys).ok_or_else(|| {
+        let key = keys.first().copied().unwrap_or("object storage configuration");
+        ApiError::BadRequest(format!("{key} is required"))
+    })
 }
 
 pub fn validate_object_key(key: &str) -> Result<(), ApiError> {

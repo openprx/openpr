@@ -275,7 +275,9 @@ pub fn import_rows_from_csv_text(
             "import CSV must include a header and at least one row".to_string(),
         ));
     }
-    let headers = lines[0]
+    let headers = lines
+        .first()
+        .ok_or_else(|| ApiError::BadRequest("import CSV must include a header row".to_string()))?
         .iter()
         .map(|header| header.trim().to_string())
         .collect::<Vec<_>>();
@@ -356,7 +358,9 @@ pub fn apply_import_mapping_transform(value: &str, transform: &str) -> Result<St
         "normalize_spaces" => Ok(trimmed.split_whitespace().collect::<Vec<_>>().join(" ")),
         "strip_non_digits" => Ok(trimmed.chars().filter(char::is_ascii_digit).collect()),
         "slugify" => Ok(slugify_import_value(trimmed)),
-        _ => unreachable!(),
+        other => Err(ApiError::BadRequest(format!(
+            "unsupported import mapping transform: {other}"
+        ))),
     }
 }
 
@@ -579,6 +583,20 @@ mod tests {
             apply_import_mapping_transform("  mIXed value  ", "capitalize").unwrap(),
             "Mixed value"
         );
+    }
+
+    #[test]
+    fn reports_unsupported_import_mapping_transforms_as_errors() {
+        let error = apply_import_mapping_transform("value", "explode");
+        assert!(error.is_err());
+        assert!(apply_import_mapping_transform("value", "").is_err());
+    }
+
+    #[test]
+    fn rejects_csv_without_a_header_and_a_data_row() {
+        let fields = vec![test_field("status", "Status", "text")];
+        assert!(import_rows_from_csv_text(&fields, "", "/api/v1/uploads/import.csv", None).is_err());
+        assert!(import_rows_from_csv_text(&fields, "Title,Status", "/api/v1/uploads/import.csv", None).is_err());
     }
 
     #[test]

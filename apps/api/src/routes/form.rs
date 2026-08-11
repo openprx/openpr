@@ -32,9 +32,9 @@ use crate::{
         permissions::{
             append_record_scope_sql, denied_read_field_keys, ensure_field_read_policy_allows,
             ensure_field_write_policy_allows, ensure_record_scope_allows_created_by, filter_values_for_read_policy,
-            form_action_allowed, form_permissions_response, list_form_permission_policies,
+            form_action_allowed, form_permissions_response, form_record_scope, list_form_permission_policies,
             normalize_permission_subject_id, normalize_permission_subject_type, role_is_form_admin,
-            validate_permission_action, validate_permission_policy,
+            role_record_scope_predicate_sql, validate_permission_action, validate_permission_policy,
         },
         projections::refresh_record_projection,
         record_comments::{
@@ -1400,21 +1400,33 @@ pub async fn list_form_export_jobs(
     Path(form_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let mut values: Vec<sea_orm::Value> = vec![form_id.into()];
+    let owner_filter = job_listing_owner_filter(actor_id, &role, is_bot, &mut values);
     let jobs = FormExportJobResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
+        format!(
+            r"
             SELECT id, workspace_id, project_id, form_id, status, input, result, error,
                    created_by, started_at, completed_at, created_at, updated_at
             FROM form_export_jobs
-            WHERE form_id = $1
+            WHERE form_id = $1{owner_filter}
             ORDER BY created_at DESC
             LIMIT 100
-        ",
-        vec![form_id.into()],
+        "
+        ),
+        values,
     ))
     .all(&state.db)
     .await?;
+    let jobs = jobs
+        .into_iter()
+        .map(|mut job| {
+            job.result = summarize_job_result(job.result);
+            job
+        })
+        .collect::<Vec<_>>();
     Ok(ApiResponse::success(jobs))
 }
 
@@ -1426,7 +1438,9 @@ pub async fn get_form_export_job(
 ) -> Result<impl IntoResponse, ApiError> {
     let job = find_export_job(&state, job_id).await?;
     let form = find_form(&state, job.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    ensure_can_read_job_result(job.created_by, actor_id, &role, is_bot)?;
     Ok(ApiResponse::success(job))
 }
 
@@ -1675,21 +1689,33 @@ pub async fn list_form_attachment_package_jobs(
     Path(form_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let mut values: Vec<sea_orm::Value> = vec![form_id.into()];
+    let owner_filter = job_listing_owner_filter(actor_id, &role, is_bot, &mut values);
     let jobs = FormAttachmentPackageJobResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
+        format!(
+            r"
             SELECT id, workspace_id, project_id, form_id, status, input, result, error,
                    created_by, started_at, completed_at, created_at, updated_at
             FROM form_attachment_package_jobs
-            WHERE form_id = $1
+            WHERE form_id = $1{owner_filter}
             ORDER BY created_at DESC
             LIMIT 100
-        ",
-        vec![form_id.into()],
+        "
+        ),
+        values,
     ))
     .all(&state.db)
     .await?;
+    let jobs = jobs
+        .into_iter()
+        .map(|mut job| {
+            job.result = summarize_job_result(job.result);
+            job
+        })
+        .collect::<Vec<_>>();
     Ok(ApiResponse::success(jobs))
 }
 
@@ -1701,7 +1727,9 @@ pub async fn get_form_attachment_package_job(
 ) -> Result<impl IntoResponse, ApiError> {
     let job = find_attachment_package_job(&state, job_id).await?;
     let form = find_form(&state, job.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    ensure_can_read_job_result(job.created_by, actor_id, &role, is_bot)?;
     Ok(ApiResponse::success(job))
 }
 
@@ -1713,7 +1741,9 @@ pub async fn download_form_attachment_package_job(
 ) -> Result<Response, ApiError> {
     let job = find_attachment_package_job(&state, job_id).await?;
     let form = find_form(&state, job.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
+    ensure_can_read_job_result(job.created_by, actor_id, &role, is_bot)?;
     if job.status != "completed" {
         return Err(ApiError::BadRequest(
             "attachment package job is not completed".to_string(),
@@ -2102,21 +2132,33 @@ pub async fn list_form_import_jobs(
     Path(form_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
+    let mut values: Vec<sea_orm::Value> = vec![form_id.into()];
+    let owner_filter = job_listing_owner_filter(actor_id, &role, is_bot, &mut values);
     let jobs = FormImportJobResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
+        format!(
+            r"
             SELECT id, workspace_id, project_id, form_id, status, input, result, error,
                    created_by, started_at, completed_at, created_at, updated_at
             FROM form_import_jobs
-            WHERE form_id = $1
+            WHERE form_id = $1{owner_filter}
             ORDER BY created_at DESC
             LIMIT 100
-        ",
-        vec![form_id.into()],
+        "
+        ),
+        values,
     ))
     .all(&state.db)
     .await?;
+    let jobs = jobs
+        .into_iter()
+        .map(|mut job| {
+            job.result = summarize_job_result(job.result);
+            job
+        })
+        .collect::<Vec<_>>();
     Ok(ApiResponse::success(jobs))
 }
 
@@ -2128,7 +2170,9 @@ pub async fn get_form_import_job(
 ) -> Result<impl IntoResponse, ApiError> {
     let job = find_import_job(&state, job_id).await?;
     let form = find_form(&state, job.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
+    ensure_can_read_job_result(job.created_by, actor_id, &role, is_bot)?;
     Ok(ApiResponse::success(job))
 }
 
@@ -3088,7 +3132,7 @@ pub async fn aggregate_form_records(
     Query(query): Query<AggregateQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (_, role, is_bot) =
+    let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
     let field_key = normalize_key(&query.field_key).map_err(ApiError::BadRequest)?;
     ensure_field_read_policy_allows(&state, form.id, &role, is_bot, &field_key).await?;
@@ -3112,6 +3156,25 @@ pub async fn aggregate_form_records(
         "count" => "COUNT(value_decimal)::text",
         _ => return Err(ApiError::BadRequest("unsupported aggregate".to_string())),
     };
+    let amount = field.amount.as_ref();
+    let mut values: Vec<sea_orm::Value> = vec![
+        form_id.into(),
+        field_key.into(),
+        field.field_type.into(),
+        aggregate.into(),
+        amount.map(|config| config.currency.clone()).into(),
+        amount
+            .map(|config| i32::try_from(config.scale).unwrap_or(i32::MAX))
+            .into(),
+    ];
+    // Aggregates must honour the same row-level scope as the record list, otherwise `owned` scope
+    // leaks other members' values through sums and counts.
+    let scope_sql = if form_record_scope(&state, form.id, &role, is_bot).await? == "owned" {
+        values.push(actor_id.into());
+        format!("\n              AND form_records.created_by = ${}", values.len())
+    } else {
+        String::new()
+    };
     let sql = format!(
         r"
             SELECT
@@ -3128,27 +3191,14 @@ pub async fn aggregate_form_records(
             WHERE form_record_field_index.form_id = $1
               AND form_record_field_index.field_key = $2
               AND form_record_field_index.value_decimal IS NOT NULL
-              AND form_records.archived_at IS NULL
+              AND form_records.archived_at IS NULL{scope_sql}
         "
     );
-    let amount = field.amount.as_ref();
-    let row = FormAggregateResponse::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        &sql,
-        vec![
-            form_id.into(),
-            field_key.into(),
-            field.field_type.into(),
-            aggregate.into(),
-            amount.map(|config| config.currency.clone()).into(),
-            amount
-                .map(|config| i32::try_from(config.scale).unwrap_or(i32::MAX))
-                .into(),
-        ],
-    ))
-    .one(&state.db)
-    .await?
-    .ok_or_else(|| ApiError::Internal)?;
+    let row =
+        FormAggregateResponse::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, &sql, values))
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| ApiError::Internal)?;
 
     Ok(ApiResponse::success(row))
 }
@@ -3315,8 +3365,9 @@ pub async fn get_form_record(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (_, role, is_bot) =
+    let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
     let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
     Ok(ApiResponse::success(filter_record_response_values(
         record,
@@ -3332,7 +3383,9 @@ pub async fn verify_form_record_signature_audit(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
     let verification = verify_signature_audit_source(&record.source).await?;
     let lifecycle = signature_lifecycle_summary(&form.schema, &record.values, &record.source)?;
     let workflow = signature_workflow_verification_summary(&verification, &lifecycle);
@@ -3355,6 +3408,7 @@ pub async fn recalculate_form_record(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.update").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
     let updated_by = if is_bot { None } else { Some(actor_id) };
     let source =
         json!({ "type": if is_bot { "bot" } else { "user" }, "actor_id": actor_id, "operation": "recalculate" });
@@ -3424,7 +3478,9 @@ pub async fn list_form_events(
     Query(query): Query<ListEventsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let (_, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
     list_business_events(
         &state,
         EventScope::Form {
@@ -3432,6 +3488,7 @@ pub async fn list_form_events(
             form_id,
         },
         query,
+        &denied_read_fields,
     )
     .await
 }
@@ -3445,7 +3502,10 @@ pub async fn list_form_record_events(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
     list_business_events(
         &state,
         EventScope::Record {
@@ -3453,6 +3513,7 @@ pub async fn list_form_record_events(
             record_id,
         },
         query,
+        &denied_read_fields,
     )
     .await
 }
@@ -3817,12 +3878,42 @@ pub async fn create_record_link(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (actor_id, _, is_bot) =
+    let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.update").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
     let target_type = normalize_target_type(&req.target_type)?;
     let relation_type = normalize_relation_type(&req.relation_type)?;
     let relation_key = normalize_key(&req.relation_key).map_err(ApiError::BadRequest)?;
     let metadata = ensure_json_object(req.metadata.unwrap_or_else(|| json!({})), "metadata")?;
+    let target_id = if target_type == "form_record" {
+        let target_record_id = Uuid::parse_str(req.target_id.trim())
+            .map_err(|_| ApiError::BadRequest("target_id must be a form record id".to_string()))?;
+        let target_record = find_record(&state, target_record_id).await?;
+        ensure_link_target_scope(
+            record.workspace_id,
+            record.project_id,
+            target_record.workspace_id,
+            target_record.project_id,
+        )?;
+        let target_form = find_form(&state, target_record.form_id).await?;
+        let (_, target_role, target_is_bot) =
+            require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &target_form, "form.view").await?;
+        ensure_record_scope_allows_created_by(
+            &state,
+            target_form.id,
+            &target_role,
+            actor_id,
+            target_is_bot,
+            target_record.created_by,
+        )
+        .await?;
+        if relation_type == "parent_child" {
+            validate_parent_child_relation(&form.schema, &target_form.key, &relation_key)?;
+        }
+        target_record_id.to_string()
+    } else {
+        req.target_id
+    };
     let link_id = Uuid::new_v4();
     let created_by = if is_bot { None } else { Some(actor_id) };
     let tx = state.db.begin().await?;
@@ -3842,7 +3933,7 @@ pub async fn create_record_link(
             record.project_id.into(),
             record_id.into(),
             target_type.clone().into(),
-            req.target_id.into(),
+            target_id.into(),
             relation_key.into(),
             relation_type.clone().into(),
             metadata.into(),
@@ -3877,7 +3968,9 @@ pub async fn list_record_links(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
     let links = LinkResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
@@ -3924,12 +4017,16 @@ pub async fn list_relation_targets(
     .one(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound("relation target form not found".to_string()))?;
-    let (_, target_role, target_is_bot) =
+    let (target_actor_id, target_role, target_is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &target_form, "form.view").await?;
     let denied_read_fields = denied_read_field_keys(&state, target_form.id, &target_role, target_is_bot).await?;
 
     let mut where_parts = vec!["form_id = $1".to_string(), "archived_at IS NULL".to_string()];
     let mut values: Vec<sea_orm::Value> = vec![target_form.id.into()];
+    if form_record_scope(&state, target_form.id, &target_role, target_is_bot).await? == "owned" {
+        values.push(target_actor_id.into());
+        where_parts.push(format!("created_by = ${}", values.len()));
+    }
     if let Some(q) = query
         .q
         .as_ref()
@@ -3938,7 +4035,12 @@ pub async fn list_relation_targets(
     {
         values.push(format!("%{q}%").into());
         let idx = values.len();
-        where_parts.push(format!("(title ILIKE ${idx} OR values::text ILIKE ${idx})"));
+        // Searching the raw value document would let an actor probe fields they cannot read.
+        if denied_read_fields.is_empty() {
+            where_parts.push(format!("(title ILIKE ${idx} OR values::text ILIKE ${idx})"));
+        } else {
+            where_parts.push(format!("title ILIKE ${idx}"));
+        }
     }
 
     let total_sql = format!(
@@ -4002,7 +4104,9 @@ pub async fn list_record_children(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    let (actor_id, role, is_bot) =
+        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(1, 200);
     let offset = (page - 1) * per_page;
@@ -4014,6 +4118,18 @@ pub async fn list_record_children(
         "child.archived_at IS NULL".to_string(),
     ];
     let mut values: Vec<sea_orm::Value> = vec![record_id.into()];
+    // A forged link row must never expose a record from another tenant.
+    values.push(record.workspace_id.into());
+    where_parts.push(format!("child.workspace_id = ${}", values.len()));
+    values.push(record.project_id.into());
+    where_parts.push(format!("child.project_id = ${}", values.len()));
+    if !is_bot && !role_is_form_admin(&role) {
+        values.push(actor_id.into());
+        let actor_idx = values.len();
+        values.push(normalize_permission_subject_id(&role)?.into());
+        let role_idx = values.len();
+        where_parts.push(role_record_scope_predicate_sql("child", actor_idx, role_idx)?);
+    }
     if let Some(relation_key) = normalize_optional_relation_key(query.relation_key.as_deref())? {
         values.push(relation_key.into());
         where_parts.push(format!("links.relation_key = ${}", values.len()));
@@ -4623,8 +4739,15 @@ async fn apply_child_aggregates(
             .ok_or_else(|| ApiError::BadRequest("child aggregate formula requires relation_key".to_string()))
             .and_then(|value| normalize_key(value).map_err(ApiError::BadRequest))?;
         let child_field = formula.get("field").and_then(Value::as_str).map(str::to_string);
-        let aggregate =
-            child_aggregate_decimal(state, parent_record_id, &relation_key, child_field.as_deref(), op).await?;
+        let aggregate = child_aggregate_decimal(
+            state,
+            (form.workspace_id, form.project_id),
+            parent_record_id,
+            &relation_key,
+            child_field.as_deref(),
+            op,
+        )
+        .await?;
         let field_value = child_aggregate_field_value(&field, aggregate)?;
         output.insert(field.key.clone(), field_value);
     }
@@ -4632,29 +4755,61 @@ async fn apply_child_aggregates(
     Ok(Value::Object(output))
 }
 
+/// Child rows are restricted to the parent's workspace and project so a forged link row can never
+/// pull a decimal value out of another tenant.
+const CHILD_AGGREGATE_COUNT_SQL: &str = r"
+    SELECT COUNT(*)::bigint AS count
+    FROM form_record_links links
+    JOIN form_records child
+      ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
+     AND child.id = links.target_id::uuid
+    WHERE links.source_record_id = $1
+      AND links.target_type = 'form_record'
+      AND links.relation_type = 'parent_child'
+      AND links.relation_key = $2
+      AND child.workspace_id = $3
+      AND child.project_id = $4
+      AND child.archived_at IS NULL
+";
+
+const CHILD_AGGREGATE_DECIMAL_SQL: &str = r"
+    SELECT field_index.value_decimal::text AS decimal
+    FROM form_record_links links
+    JOIN form_records child
+      ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
+     AND child.id = links.target_id::uuid
+    JOIN form_record_field_index field_index
+      ON field_index.record_id = child.id
+     AND field_index.field_key = $3
+    WHERE links.source_record_id = $1
+      AND links.target_type = 'form_record'
+      AND links.relation_type = 'parent_child'
+      AND links.relation_key = $2
+      AND child.workspace_id = $4
+      AND child.project_id = $5
+      AND child.archived_at IS NULL
+      AND field_index.value_decimal IS NOT NULL
+";
+
 async fn child_aggregate_decimal(
     state: &AppState,
+    tenant: (Uuid, Uuid),
     parent_record_id: Uuid,
     relation_key: &str,
     child_field: Option<&str>,
     op: &str,
 ) -> Result<Decimal, ApiError> {
+    let (workspace_id, project_id) = tenant;
     if op == "child_count" && child_field.is_none() {
         let count = count_query(
             state,
-            r"
-                SELECT COUNT(*)::bigint AS count
-                FROM form_record_links links
-                JOIN form_records child
-                  ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
-                 AND child.id = links.target_id::uuid
-                WHERE links.source_record_id = $1
-                  AND links.target_type = 'form_record'
-                  AND links.relation_type = 'parent_child'
-                  AND links.relation_key = $2
-                  AND child.archived_at IS NULL
-            ",
-            vec![parent_record_id.into(), relation_key.to_string().into()],
+            CHILD_AGGREGATE_COUNT_SQL,
+            vec![
+                parent_record_id.into(),
+                relation_key.to_string().into(),
+                workspace_id.into(),
+                project_id.into(),
+            ],
         )
         .await?;
         return Ok(Decimal::from(count));
@@ -4664,26 +4819,13 @@ async fn child_aggregate_decimal(
         .and_then(|value| normalize_key(value).map_err(ApiError::BadRequest))?;
     let rows = ChildDecimalRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
-            SELECT field_index.value_decimal::text AS decimal
-            FROM form_record_links links
-            JOIN form_records child
-              ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
-             AND child.id = links.target_id::uuid
-            JOIN form_record_field_index field_index
-              ON field_index.record_id = child.id
-             AND field_index.field_key = $3
-            WHERE links.source_record_id = $1
-              AND links.target_type = 'form_record'
-              AND links.relation_type = 'parent_child'
-              AND links.relation_key = $2
-              AND child.archived_at IS NULL
-              AND field_index.value_decimal IS NOT NULL
-        ",
+        CHILD_AGGREGATE_DECIMAL_SQL,
         vec![
             parent_record_id.into(),
             relation_key.to_string().into(),
             child_field.into(),
+            workspace_id.into(),
+            project_id.into(),
         ],
     ))
     .all(&state.db)
@@ -4726,11 +4868,15 @@ async fn recalculate_parent_records_for_child(
     let parents = ParentRecordRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            SELECT source_record_id
-            FROM form_record_links
-            WHERE target_type = 'form_record'
-              AND relation_type = 'parent_child'
-              AND target_id = $1
+            SELECT links.source_record_id
+            FROM form_record_links links
+            JOIN form_records parent ON parent.id = links.source_record_id
+            JOIN form_records child ON child.id::text = links.target_id
+            WHERE links.target_type = 'form_record'
+              AND links.relation_type = 'parent_child'
+              AND links.target_id = $1
+              AND parent.workspace_id = child.workspace_id
+              AND parent.project_id = child.project_id
         ",
         vec![child_record_id.to_string().into()],
     ))
@@ -5134,6 +5280,83 @@ async fn write_attachment_package_artifact(
         "generated_at": generated_at,
         "expires_at": expires_at,
     }))
+}
+
+/// Result keys that are safe to expose in a job listing. Everything else (exported rows, rendered
+/// CSV, imported records, per row previews) stays out of list responses.
+const JOB_RESULT_SUMMARY_KEYS: [&str; 16] = [
+    "form_id",
+    "format",
+    "file_name",
+    "export_policy",
+    "schema_version",
+    "total_rows",
+    "created_count",
+    "invalid_rows",
+    "attachment_count",
+    "binary_file_count",
+    "byte_size",
+    "content_type",
+    "download_url",
+    "expires_at",
+    "stored_file_name",
+    "artifact_storage",
+];
+
+/// A record link may only point at a record inside the same tenant boundary as its source record.
+/// Cross tenant targets are reported as missing so the endpoint cannot be used to probe foreign ids.
+fn ensure_link_target_scope(
+    source_workspace_id: Uuid,
+    source_project_id: Uuid,
+    target_workspace_id: Uuid,
+    target_project_id: Uuid,
+) -> Result<(), ApiError> {
+    if source_workspace_id == target_workspace_id && source_project_id == target_project_id {
+        return Ok(());
+    }
+    Err(ApiError::NotFound("link target record not found".to_string()))
+}
+
+/// Async job results are computed with the creating actor's field and record permissions, so they may
+/// only be read back by that actor (or by a form administrator).
+fn ensure_can_read_job_result(
+    created_by: Option<Uuid>,
+    actor_id: Uuid,
+    role: &str,
+    is_bot: bool,
+) -> Result<(), ApiError> {
+    if is_bot || role_is_form_admin(role) || created_by == Some(actor_id) {
+        return Ok(());
+    }
+    Err(ApiError::NotFound("form job not found".to_string()))
+}
+
+/// Reduces a job result to its metadata so that listing jobs never ships bulk record data.
+fn summarize_job_result(result: Option<Value>) -> Option<Value> {
+    let result = result?;
+    let Some(entries) = result.as_object() else {
+        return Some(json!({ "result_omitted": true }));
+    };
+    let mut summary = serde_json::Map::new();
+    let mut omitted = false;
+    for (key, value) in entries {
+        if JOB_RESULT_SUMMARY_KEYS.contains(&key.as_str()) {
+            summary.insert(key.clone(), value.clone());
+        } else {
+            omitted = true;
+        }
+    }
+    summary.insert("result_omitted".to_string(), json!(omitted));
+    Some(Value::Object(summary))
+}
+
+/// Restricts a job listing to the jobs the actor created, unless the actor administers the form.
+fn job_listing_owner_filter(actor_id: Uuid, role: &str, is_bot: bool, values: &mut Vec<sea_orm::Value>) -> String {
+    if is_bot || role_is_form_admin(role) {
+        return String::new();
+    }
+    values.push(actor_id.into());
+    format!(" AND created_by = ${}", values.len())
 }
 
 fn ensure_can_manage_import_mapping_template(
@@ -5689,6 +5912,50 @@ fn filter_record_response_values(mut record: RecordResponse, denied_read_fields:
     record
 }
 
+/// Payload keys that carry a record value map and therefore must obey field level read permissions.
+const EVENT_PAYLOAD_VALUE_KEYS: [&str; 4] = ["values", "previous_values", "normalized_values", "changes"];
+
+fn filter_event_response_values(
+    mut event: BusinessEventResponse,
+    denied_read_fields: &BTreeSet<String>,
+) -> BusinessEventResponse {
+    if denied_read_fields.is_empty() {
+        return event;
+    }
+    event.payload = filter_event_payload_values(event.payload, denied_read_fields);
+    event.metadata = filter_event_payload_values(event.metadata, denied_read_fields);
+    event.source = filter_event_payload_values(event.source, denied_read_fields);
+    event
+}
+
+/// Strips fields the actor may not read from every value map nested in an event payload. The walk is
+/// iterative so that a deeply nested payload cannot exhaust the stack.
+fn filter_event_payload_values(mut payload: Value, denied_read_fields: &BTreeSet<String>) -> Value {
+    if denied_read_fields.is_empty() {
+        return payload;
+    }
+    let mut pending: Vec<&mut Value> = vec![&mut payload];
+    while let Some(node) = pending.pop() {
+        match node {
+            Value::Object(entries) => {
+                for (key, child) in entries.iter_mut() {
+                    if EVENT_PAYLOAD_VALUE_KEYS.contains(&key.as_str())
+                        && let Some(values) = child.as_object_mut()
+                    {
+                        for denied_key in denied_read_fields {
+                            values.remove(denied_key);
+                        }
+                    }
+                    pending.push(child);
+                }
+            }
+            Value::Array(items) => pending.extend(items.iter_mut()),
+            _ => {}
+        }
+    }
+    payload
+}
+
 fn filter_relation_target_values(
     mut target: RelationTargetResponse,
     denied_read_fields: &BTreeSet<String>,
@@ -5974,6 +6241,7 @@ async fn list_business_events(
     state: &AppState,
     scope: EventScope,
     query: ListEventsQuery,
+    denied_read_fields: &BTreeSet<String>,
 ) -> Result<Json<ApiResponse<PaginatedData<BusinessEventResponse>>>, ApiError> {
     if let Some(event_type) = query.event_type.as_deref() {
         normalize_event_type(event_type)?;
@@ -6036,6 +6304,10 @@ async fn list_business_events(
         BusinessEventResponse::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, &sql, values))
             .all(&state.db)
             .await?;
+    let items = items
+        .into_iter()
+        .map(|event| filter_event_response_values(event, denied_read_fields))
+        .collect();
 
     Ok(ApiResponse::success(PaginatedData {
         items,
@@ -6577,17 +6849,168 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachmentPackageArtifact, ImportRecordsFileRequest, default_form_key_from_template,
-        default_title_template_from_schema, import_records_request_from_uploaded_file_without_mapping,
-        normalize_scenario_field_schema, write_attachment_package_artifact,
+        AttachmentPackageArtifact, BusinessEventResponse, CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL,
+        ImportRecordsFileRequest, default_form_key_from_template, default_title_template_from_schema,
+        ensure_can_read_job_result, ensure_link_target_scope, filter_event_payload_values,
+        filter_event_response_values, import_records_request_from_uploaded_file_without_mapping,
+        job_listing_owner_filter, normalize_scenario_field_schema, summarize_job_result,
+        write_attachment_package_artifact,
     };
     use crate::{
+        error::ApiError,
         forms::attachment_package::{ZipEntry, attachment_package_artifact_key, build_stored_zip},
         services::object_storage::ObjectStorage,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use std::collections::BTreeSet;
     use std::env;
     use uuid::Uuid;
+
+    fn denied_fields(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    #[test]
+    fn rejects_record_link_targets_outside_the_source_tenant() {
+        let workspace_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        assert!(ensure_link_target_scope(workspace_id, project_id, workspace_id, project_id).is_ok());
+        assert!(matches!(
+            ensure_link_target_scope(workspace_id, project_id, Uuid::new_v4(), project_id),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            ensure_link_target_scope(workspace_id, project_id, workspace_id, Uuid::new_v4()),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn child_aggregate_queries_stay_inside_the_parent_tenant() {
+        for sql in [CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL] {
+            assert!(
+                sql.contains("child.workspace_id = $"),
+                "missing workspace filter: {sql}"
+            );
+            assert!(sql.contains("child.project_id = $"), "missing project filter: {sql}");
+        }
+    }
+
+    #[test]
+    fn job_results_are_readable_only_by_their_creator_or_a_form_admin() {
+        let creator = Uuid::new_v4();
+        let other_member = Uuid::new_v4();
+
+        assert!(ensure_can_read_job_result(Some(creator), creator, "member", false).is_ok());
+        assert!(ensure_can_read_job_result(Some(creator), other_member, "admin", false).is_ok());
+        assert!(ensure_can_read_job_result(Some(creator), other_member, "owner", false).is_ok());
+        assert!(ensure_can_read_job_result(Some(creator), other_member, "member", true).is_ok());
+        assert!(matches!(
+            ensure_can_read_job_result(Some(creator), other_member, "member", false),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            ensure_can_read_job_result(None, other_member, "member", false),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn job_listings_are_restricted_to_jobs_the_member_created() {
+        let actor_id = Uuid::new_v4();
+        let mut member_values: Vec<sea_orm::Value> = vec![Uuid::new_v4().into()];
+        assert_eq!(
+            job_listing_owner_filter(actor_id, "member", false, &mut member_values),
+            " AND created_by = $2"
+        );
+        assert_eq!(member_values.len(), 2);
+
+        let mut admin_values: Vec<sea_orm::Value> = vec![Uuid::new_v4().into()];
+        assert!(job_listing_owner_filter(actor_id, "admin", false, &mut admin_values).is_empty());
+        assert_eq!(admin_values.len(), 1);
+    }
+
+    #[test]
+    fn job_listing_results_drop_bulk_export_payloads() {
+        let summary = summarize_job_result(Some(json!({
+            "form_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "file_name": "records.csv",
+            "export_policy": {"row_count": 2, "truncated": false},
+            "columns": [{"key": "salary"}],
+            "rows": [{"values": {"salary": "9000"}}],
+            "csv": "salary\n9000\n"
+        })))
+        .expect("completed jobs keep a summary");
+
+        assert!(summary.get("rows").is_none());
+        assert!(summary.get("csv").is_none());
+        assert!(summary.get("columns").is_none());
+        assert_eq!(summary.get("file_name").and_then(Value::as_str), Some("records.csv"));
+        assert_eq!(summary.get("result_omitted").and_then(Value::as_bool), Some(true));
+        assert!(summarize_job_result(None).is_none());
+
+        let metadata_only =
+            summarize_job_result(Some(json!({"file_name": "records.csv"}))).expect("completed jobs keep a summary");
+        assert_eq!(
+            metadata_only.get("result_omitted").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn event_payloads_drop_fields_denied_by_the_read_policy() {
+        let denied = denied_fields(&["salary"]);
+        let filtered = filter_event_payload_values(
+            json!({
+                "record_id": "01234567-89ab-cdef-0123-456789abcdef",
+                "values": {"salary": "9000", "name": "Ada"},
+                "rows": [{"values": {"salary": "8000", "name": "Bob"}}],
+                "previous_values": {"salary": "7000"}
+            }),
+            &denied,
+        );
+
+        assert!(filtered.pointer("/values/salary").is_none());
+        assert_eq!(filtered.pointer("/values/name").and_then(Value::as_str), Some("Ada"));
+        assert!(filtered.pointer("/rows/0/values/salary").is_none());
+        assert_eq!(
+            filtered.pointer("/rows/0/values/name").and_then(Value::as_str),
+            Some("Bob")
+        );
+        assert!(filtered.pointer("/previous_values/salary").is_none());
+    }
+
+    #[test]
+    fn event_responses_apply_field_level_read_permissions() {
+        let now = chrono::Utc::now();
+        let event = BusinessEventResponse {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
+            event_type: "form.record.updated".to_string(),
+            aggregate_type: "form_record".to_string(),
+            aggregate_id: Uuid::new_v4().to_string(),
+            actor_id: None,
+            source: json!({"type": "user", "values": {"salary": "9000"}}),
+            payload: json!({"record_id": "r1", "values": {"salary": "9000", "name": "Ada"}}),
+            metadata: json!({"form_id": "f1", "values": {"salary": "9000"}}),
+            correlation_id: None,
+            causation_id: None,
+            idempotency_key: None,
+            created_at: now,
+        };
+
+        let filtered = filter_event_response_values(event, &denied_fields(&["salary"]));
+
+        assert!(filtered.payload.pointer("/values/salary").is_none());
+        assert_eq!(
+            filtered.payload.pointer("/values/name").and_then(Value::as_str),
+            Some("Ada")
+        );
+        assert!(filtered.metadata.pointer("/values/salary").is_none());
+        assert!(filtered.source.pointer("/values/salary").is_none());
+    }
 
     #[test]
     fn normalizes_scenario_template_field_schema_for_form_use() {
