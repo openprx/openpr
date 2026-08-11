@@ -106,25 +106,24 @@ async fn materialize_signature_values_with_existing_storage(
         let object_key = format!("signatures/{file_name}");
         let object_ref = object_storage.put(&object_key, &bytes).await?;
         let url = format!("/api/v1/uploads/signatures/{file_name}");
-        let mut audit_entry = json!({
-            "action": "materialize",
-            "field_key": field.key,
-            "file_name": file_name,
-            "url": url,
-            "object_key": object_ref.key,
-            "storage_backend": object_ref.backend,
-            "content_type": "image/png",
-            "byte_size": bytes.len(),
-            "sha256": signature_sha256_hex(&bytes),
-            "materialized_at": Utc::now()
-        });
+        let mut audit_entry = serde_json::Map::new();
+        audit_entry.insert("action".to_string(), json!("materialize"));
+        audit_entry.insert("field_key".to_string(), json!(field.key));
+        audit_entry.insert("file_name".to_string(), json!(file_name));
+        audit_entry.insert("url".to_string(), json!(url));
+        audit_entry.insert("object_key".to_string(), json!(object_ref.key));
+        audit_entry.insert("storage_backend".to_string(), json!(object_ref.backend));
+        audit_entry.insert("content_type".to_string(), json!("image/png"));
+        audit_entry.insert("byte_size".to_string(), json!(bytes.len()));
+        audit_entry.insert("sha256".to_string(), json!(signature_sha256_hex(&bytes)));
+        audit_entry.insert("materialized_at".to_string(), json!(Utc::now()));
         if let Some(previous_url) = existing_values
             .and_then(|values| values.get(&field.key))
             .and_then(Value::as_str)
             && let Some(previous_object_key) = signature_object_key_from_url(previous_url)
         {
-            audit_entry["previous_url"] = json!(previous_url);
-            audit_entry["previous_object_key"] = json!(previous_object_key);
+            audit_entry.insert("previous_url".to_string(), json!(previous_url));
+            audit_entry.insert("previous_object_key".to_string(), json!(previous_object_key));
         }
         if let Some(signature) = &field.signature {
             if let Some(reason_field) = signature.reason_field.as_deref() {
@@ -139,17 +138,17 @@ async fn materialize_signature_values_with_existing_storage(
                         field.key, reason_field
                     )));
                 }
-                audit_entry["reason_field"] = json!(reason_field);
+                audit_entry.insert("reason_field".to_string(), json!(reason_field));
                 if let Some(reason) = reason {
-                    audit_entry["reason"] = json!(reason);
+                    audit_entry.insert("reason".to_string(), json!(reason));
                 }
-                audit_entry["reason_required"] = json!(signature.reason_required);
+                audit_entry.insert("reason_required".to_string(), json!(signature.reason_required));
             }
             if let Some(consent_statement) = signature.consent_statement.as_deref() {
-                audit_entry["consent_statement"] = json!(consent_statement);
+                audit_entry.insert("consent_statement".to_string(), json!(consent_statement));
             }
         }
-        audit_entries.push(audit_entry);
+        audit_entries.push(Value::Object(audit_entry));
         object.insert(field.key, json!(url));
     }
 
@@ -883,12 +882,11 @@ fn is_safe_signature_file_name(file_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        annotate_signature_audit_entries, append_signature_audit_source,
+        SignatureAuditVerificationSummary, annotate_signature_audit_entries, append_signature_audit_source,
         cleanup_expired_replaced_signature_audit_entries_with_storage, cleanup_expired_signature_values_with_storage,
         decode_signature_data_url, expired_signature_object_key, materialize_signature_values_with_existing_storage,
         materialize_signature_values_with_storage, signature_lifecycle_summary, signature_object_key_from_url,
         signature_retention_days, signature_sha256_hex, signature_workflow_verification_summary,
-        SignatureAuditVerificationSummary,
         verify_signature_audit_entry_with_storage, verify_signature_audit_source_with_storage,
     };
     use crate::{error::ApiError, services::object_storage::ObjectStorage};

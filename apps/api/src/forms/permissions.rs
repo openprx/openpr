@@ -316,6 +316,43 @@ pub async fn append_record_scope_sql(
     Ok(())
 }
 
+/// Builds a row-level ownership predicate for joined records.
+///
+/// Used by queries whose per-row form is only known at runtime (child records, relation targets).
+/// The predicate keeps a row when the actor created it, or when the row's form does not restrict the
+/// actor's role to `record_scope = owned`.
+///
+/// `record_alias` is a caller-controlled SQL alias and is validated before interpolation; every
+/// value that can originate from a request is bound as a placeholder.
+pub fn role_record_scope_predicate_sql(
+    record_alias: &str,
+    actor_idx: usize,
+    role_idx: usize,
+) -> Result<String, ApiError> {
+    validate_sql_identifier(record_alias)?;
+    Ok(format!(
+        "({record_alias}.created_by = ${actor_idx} OR NOT EXISTS (\
+             SELECT 1 FROM form_permissions scope_policy \
+             WHERE scope_policy.form_id = {record_alias}.form_id \
+               AND scope_policy.subject_type = 'role' \
+               AND scope_policy.subject_id = ${role_idx} \
+               AND scope_policy.policy->>'record_scope' IN ('owned', 'own', 'created_by_me')))"
+    ))
+}
+
+fn validate_sql_identifier(value: &str) -> Result<(), ApiError> {
+    let mut chars = value.chars();
+    let valid_start = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first == '_');
+    let valid_rest = chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+    if valid_start && valid_rest && value.len() <= 63 {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest("invalid SQL identifier".to_string()))
+    }
+}
+
 pub async fn ensure_record_scope_allows_created_by(
     state: &AppState,
     form_id: Uuid,
@@ -467,7 +504,7 @@ mod tests {
     use super::{
         FormPermissionPolicyResponse, filter_values_for_read_policy, form_permissions_response,
         permission_policy_field_allows, permission_policy_fields, permission_policy_record_scope,
-        validate_permission_policy,
+        role_record_scope_predicate_sql, validate_permission_policy,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -552,6 +589,24 @@ mod tests {
             "owned"
         );
         assert_eq!(permission_policy_record_scope(&json!({"record_scope": "all"})), "all");
+    }
+
+    #[test]
+    fn builds_row_level_scope_predicate_from_bound_parameters() {
+        let predicate = role_record_scope_predicate_sql("child", 3, 4).expect("alias is a valid identifier");
+
+        assert!(predicate.contains("child.created_by = $3"));
+        assert!(predicate.contains("scope_policy.form_id = child.form_id"));
+        assert!(predicate.contains("scope_policy.subject_id = $4"));
+        assert!(predicate.contains("record_scope"));
+        assert!(!predicate.contains("$5"));
+    }
+
+    #[test]
+    fn rejects_row_level_scope_predicate_for_untrusted_aliases() {
+        assert!(role_record_scope_predicate_sql("child; DROP TABLE form_records --", 1, 2).is_err());
+        assert!(role_record_scope_predicate_sql("", 1, 2).is_err());
+        assert!(role_record_scope_predicate_sql("Child", 1, 2).is_err());
     }
 
     #[test]
