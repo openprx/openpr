@@ -79,10 +79,15 @@ work_items.list { project_id }
 work_items.update { work_item_id, state: "todo" }
 "#;
 
-/// Tools that address a form or a form record instead of a project. The owning
-/// project has to be resolved from the API before the project agent policy can be
-/// applied to them.
-const FORM_SCOPED_TOOLS: [&str; 28] = [
+/// Tools that address a form, a form record or a form attachment instead of a
+/// project. The owning project has to be resolved from the API before the project
+/// agent policy can be applied to them; a `project_id` supplied by the caller is
+/// never authoritative for these tools.
+///
+/// `server::tests::form_scoped_tool_list_covers_every_registered_form_tool` derives
+/// the expected membership from the registered tool schemas, so a new form scoped
+/// tool cannot silently miss this list.
+const FORM_SCOPED_TOOLS: [&str; 31] = [
     "forms.get",
     "forms.update_schema",
     "forms.duplicate",
@@ -111,7 +116,50 @@ const FORM_SCOPED_TOOLS: [&str; 28] = [
     "form_records.child_archive",
     "form_records.child_restore",
     "form_records.aggregate",
+    "form_attachments.archive",
+    "form_attachments.restore",
+    "events.tail",
 ];
+
+/// The object a form scoped call operates on. The governing project is always
+/// resolved from this object through the API, never from the call arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FormScopeTarget {
+    Form(String),
+    Record(String),
+    Attachment(String),
+}
+
+impl FormScopeTarget {
+    fn cache_key(&self) -> String {
+        match self {
+            Self::Form(id) => format!("form:{id}"),
+            Self::Record(id) => format!("record:{id}"),
+            Self::Attachment(id) => format!("attachment:{id}"),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Self::Form(id) => format!("form {id}"),
+            Self::Record(id) => format!("record {id}"),
+            Self::Attachment(id) => format!("attachment {id}"),
+        }
+    }
+}
+
+/// Picks the identifier that decides which project owns the data a form scoped
+/// call touches. Order matters: `form_id` is the most specific handle, records fall
+/// back to their form, attachments only carry their own id.
+fn form_scope_target(args: &Value) -> Option<FormScopeTarget> {
+    if let Some(form_id) = string_argument(args, "form_id") {
+        return Some(FormScopeTarget::Form(form_id));
+    }
+    if let Some(record_id) = string_argument(args, "record_id") {
+        return Some(FormScopeTarget::Record(record_id));
+    }
+    string_argument(args, "attachment_id").map(FormScopeTarget::Attachment)
+}
 
 /// Upper bound for the form/record to project mapping cache.
 const PROJECT_ID_CACHE_LIMIT: usize = 1_024;
@@ -375,60 +423,145 @@ impl McpServer {
         }
     }
 
-    /// Resolves the project whose agent policy governs this call. Form and record
-    /// scoped tools carry no `project_id`, so the owning project is looked up from the
-    /// API; without this every form tool would bypass the policy entirely.
+    /// Resolves the project whose agent policy governs this call.
+    ///
+    /// Form scoped tools carry no trustworthy `project_id`: the data they touch is
+    /// addressed by `form_id` / `record_id` / `attachment_id`, so the owning project is
+    /// always looked up from the API. A `project_id` smuggled into the arguments is
+    /// never used as the policy subject; when it disagrees with the real owner the call
+    /// is refused, because a caller naming a foreign project is itself a bypass attempt.
+    /// When the owner cannot be resolved the call is refused as well (fail closed).
     async fn resolve_policy_project_id(&self, tool_name: &str, args: &Value) -> Result<Option<String>, String> {
-        if let Some(project_id) = extract_call_project_id(args) {
-            return Ok(Some(project_id));
-        }
+        let declared_project_id = extract_call_project_id(args);
         if !FORM_SCOPED_TOOLS.contains(&tool_name) {
-            return Ok(None);
-        }
-        if let Some(form_id) = string_argument(args, "form_id") {
-            return self.lookup_project_id("form", &form_id).await.map(Some);
-        }
-        if let Some(record_id) = string_argument(args, "record_id") {
-            return self.lookup_project_id("record", &record_id).await.map(Some);
+            return Ok(declared_project_id);
         }
 
-        tracing::warn!(
-            tool_name = %tool_name,
-            "Project agent policy not enforced: call carries no project, form, or record identifier"
-        );
-        Ok(None)
+        let Some(target) = form_scope_target(args) else {
+            tracing::warn!(
+                tool_name = %tool_name,
+                "Refusing form scoped call: no form_id, record_id or attachment_id to resolve the owning project"
+            );
+            return Err(format!(
+                "Tool '{tool_name}' carries no form_id, record_id or attachment_id, so the owning project cannot be \
+                 resolved and the project agent policy cannot be evaluated"
+            ));
+        };
+
+        let owning_project_id = self.lookup_target_project_id(tool_name, &target).await?;
+        if let Some(declared) = declared_project_id.as_deref()
+            && declared != owning_project_id
+        {
+            tracing::warn!(
+                tool_name = %tool_name,
+                declared_project_id = %declared,
+                owning_project_id = %owning_project_id,
+                target = %target.describe(),
+                "Refusing form scoped call: caller supplied a project_id that does not own the target"
+            );
+            return Err(format!(
+                "Tool '{tool_name}' was called with project_id '{declared}', but {} belongs to project \
+                 '{owning_project_id}'; refusing to evaluate the project agent policy against a foreign project",
+                target.describe()
+            ));
+        }
+        Ok(Some(owning_project_id))
     }
 
-    async fn lookup_project_id(&self, kind: &str, id: &str) -> Result<String, String> {
-        let cache_key = format!("{kind}:{id}");
-        {
-            let cache = self.project_id_cache.lock().await;
-            if let Some(project_id) = cache.get(&cache_key) {
-                return Ok(project_id.clone());
+    /// Looks up the owning project of a form scoped target. Attachments have no read
+    /// endpoint on the API today, so they fail closed with an actionable message
+    /// instead of silently skipping the policy.
+    async fn lookup_target_project_id(&self, tool_name: &str, target: &FormScopeTarget) -> Result<String, String> {
+        let resolved = self.lookup_project_id(target).await;
+        match (target, resolved) {
+            (_, Ok(project_id)) => Ok(project_id),
+            (FormScopeTarget::Attachment(id), Err(error)) => {
+                tracing::warn!(
+                    tool_name = %tool_name,
+                    attachment_id = %id,
+                    error = %error,
+                    "Refusing attachment tool call: owning project cannot be resolved"
+                );
+                Err(format!(
+                    "Tool '{tool_name}' is refused because the owning project of attachment {id} cannot be resolved \
+                     ({error}); the API has to expose GET /api/v1/form-attachments/{{attachment_id}} returning \
+                     project_id or form_id before attachment tools can be authorized"
+                ))
             }
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    async fn lookup_project_id(&self, target: &FormScopeTarget) -> Result<String, String> {
+        let cache_key = target.cache_key();
+        if let Some(project_id) = self.cached_project_id(&cache_key).await {
+            return Ok(project_id);
         }
 
-        let response = match kind {
-            "form" => self.client.get_form(id).await,
-            _ => self.client.get_form_record(id).await,
+        let response = match target {
+            FormScopeTarget::Form(id) => self.client.get_form(id).await,
+            FormScopeTarget::Record(id) => self.client.get_form_record(id).await,
+            FormScopeTarget::Attachment(id) => self.client.get_form_attachment(id).await,
         }
-        .map_err(|error| format!("Failed to resolve owning project for {kind} {id}: {error}"))?;
+        .map_err(|error| format!("Failed to resolve owning project for {}: {error}", target.describe()))?;
 
+        let data = response.get("data");
+        let project_id = if let Some(project_id) = data.and_then(|data| data.get("project_id")).and_then(Value::as_str)
+        {
+            project_id.to_string()
+        } else {
+            // Payloads that only identify the owning form (attachments) are resolved
+            // one level further instead of being treated as unresolvable.
+            let form_id = data
+                .and_then(|data| data.get("form_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!(
+                        "API response for {} carries neither project_id nor form_id",
+                        target.describe()
+                    )
+                })?;
+            self.fetch_form_project_id(form_id).await?
+        };
+
+        self.cache_project_id(cache_key, &project_id).await;
+        Ok(project_id)
+    }
+
+    async fn fetch_form_project_id(&self, form_id: &str) -> Result<String, String> {
+        let target = FormScopeTarget::Form(form_id.to_string());
+        let cache_key = target.cache_key();
+        if let Some(project_id) = self.cached_project_id(&cache_key).await {
+            return Ok(project_id);
+        }
+
+        let response = self
+            .client
+            .get_form(form_id)
+            .await
+            .map_err(|error| format!("Failed to resolve owning project for {}: {error}", target.describe()))?;
         let project_id = response
             .get("data")
             .and_then(|data| data.get("project_id"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| format!("API response for {kind} {id} carries no project_id"))?;
+            .ok_or_else(|| format!("API response for {} carries no project_id", target.describe()))?;
 
-        {
-            let mut cache = self.project_id_cache.lock().await;
-            if cache.len() >= PROJECT_ID_CACHE_LIMIT {
-                cache.clear();
-            }
-            cache.insert(cache_key, project_id.clone());
-        }
+        self.cache_project_id(cache_key, &project_id).await;
         Ok(project_id)
+    }
+
+    async fn cached_project_id(&self, cache_key: &str) -> Option<String> {
+        let cache = self.project_id_cache.lock().await;
+        cache.get(cache_key).cloned()
+    }
+
+    async fn cache_project_id(&self, cache_key: String, project_id: &str) {
+        let mut cache = self.project_id_cache.lock().await;
+        if cache.len() >= PROJECT_ID_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(cache_key, project_id.to_string());
     }
 
     async fn enforce_project_tool_policy(&self, tool_name: &str, args: &Value) -> Result<(), String> {
@@ -1339,30 +1472,68 @@ mod tests {
         );
     }
 
+    /// Membership of `FORM_SCOPED_TOOLS` is derived from the registered tool schemas
+    /// instead of from name prefixes: every tool that addresses form data (`form_id`,
+    /// `record_id`, `attachment_id`) without carrying its own `project_id` must be
+    /// governed through an API lookup. A prefix based filter cannot see `events.tail`,
+    /// which is exactly how that tool stayed unguarded while the guard test was green.
     #[test]
     fn form_scoped_tool_list_covers_every_registered_form_tool() {
-        let unresolvable = ["form_attachments.archive", "form_attachments.restore"];
-        let form_tools = crate::tools::get_all_tool_definitions()
-            .into_iter()
-            .map(|tool| tool.name)
-            .filter(|name| {
-                (name.starts_with("forms.") || name.starts_with("form_")) && !unresolvable.contains(&name.as_str())
-            })
-            .collect::<Vec<_>>();
+        let tools = crate::tools::get_all_tool_definitions();
+        let registered = tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<std::collections::HashSet<_>>();
 
-        for name in form_tools {
-            // forms.list/create/create_from_template already carry project_id.
-            if matches!(
-                name.as_str(),
-                "forms.list" | "forms.create" | "forms.create_from_template"
-            ) {
+        for tool in &tools {
+            let Some(properties) = tool.input_schema.get("properties").and_then(Value::as_object) else {
                 continue;
+            };
+            let addresses_form_data = ["form_id", "record_id", "attachment_id"]
+                .iter()
+                .any(|key| properties.contains_key(*key));
+            let carries_own_project = properties.contains_key("project_id");
+            let listed = super::FORM_SCOPED_TOOLS.contains(&tool.name.as_str());
+
+            if addresses_form_data && !carries_own_project {
+                assert!(
+                    listed,
+                    "{} addresses form data without a project_id and would bypass the project agent policy",
+                    tool.name
+                );
+            } else {
+                assert!(
+                    !listed,
+                    "{} does not address form data and must not be resolved through a form lookup",
+                    tool.name
+                );
             }
+        }
+
+        for name in super::FORM_SCOPED_TOOLS {
             assert!(
-                super::FORM_SCOPED_TOOLS.contains(&name.as_str()),
-                "{name} would bypass the project agent policy"
+                registered.contains(name),
+                "FORM_SCOPED_TOOLS references an unregistered tool: {name}"
             );
         }
+        assert!(super::FORM_SCOPED_TOOLS.contains(&"events.tail"));
+    }
+
+    #[test]
+    fn form_scope_target_prefers_the_most_specific_identifier() {
+        assert_eq!(
+            super::form_scope_target(&json!({ "form_id": "f1", "record_id": "r1" })),
+            Some(super::FormScopeTarget::Form("f1".to_string()))
+        );
+        assert_eq!(
+            super::form_scope_target(&json!({ "record_id": "r1", "attachment_id": "a1" })),
+            Some(super::FormScopeTarget::Record("r1".to_string()))
+        );
+        assert_eq!(
+            super::form_scope_target(&json!({ "attachment_id": "a1" })),
+            Some(super::FormScopeTarget::Attachment("a1".to_string()))
+        );
+        assert_eq!(super::form_scope_target(&json!({ "project_id": "p1" })), None);
     }
 
     #[test]
@@ -1466,6 +1637,419 @@ mod tests {
         let result = server.call_tool("form_records.list", json!({ "form_id": "f1" })).await;
 
         assert_eq!(result.is_error, None, "{:?}", summarize_tool_result(&result));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn form_scoped_call_rejects_a_smuggled_foreign_project_id() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let updates = Arc::new(AtomicUsize::new(0));
+        let foreign_policy_reads = Arc::new(AtomicUsize::new(0));
+        let update_counter = Arc::clone(&updates);
+        let foreign_counter = Arc::clone(&foreign_policy_reads);
+
+        let router = Router::new()
+            .route(
+                "/api/v1/form-records/r1",
+                get(|| async { Json(json!({ "code": 0, "data": { "id": "r1", "project_id": "victim-project" } })) })
+                    .patch(move || {
+                        let counter = Arc::clone(&update_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({ "code": 0, "data": { "id": "r1" } }))
+                        }
+                    }),
+            )
+            .route(
+                "/api/v1/projects/victim-project/agent-policy",
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "mcp": { "tool_registry": { "enabled_tools": ["forms.get"] } } }
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/projects/attacker-project/agent-policy",
+                get(move || {
+                    let counter = Arc::clone(&foreign_counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "code": 0,
+                            "data": { "mcp": { "tool_registry": { "enabled_tools": ["form_records.update"] } } }
+                        }))
+                    }
+                }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        let smuggled = server
+            .call_tool(
+                "form_records.update",
+                json!({ "record_id": "r1", "values": {}, "project_id": "attacker-project" }),
+            )
+            .await;
+
+        assert_eq!(smuggled.is_error, Some(true));
+        let message = summarize_tool_result(&smuggled).unwrap_or_default();
+        assert!(message.contains("belongs to project 'victim-project'"), "{message}");
+        assert!(message.contains("foreign project"), "{message}");
+
+        // The same trick through the nested payload object must fail as well.
+        let nested = server
+            .call_tool(
+                "form_records.update",
+                json!({ "record_id": "r1", "values": {}, "payload": { "project_id": "attacker-project" } }),
+            )
+            .await;
+        assert_eq!(nested.is_error, Some(true));
+
+        // Without the smuggled id the owning project decides, and it says no.
+        let honest = server
+            .call_tool("form_records.update", json!({ "record_id": "r1", "values": {} }))
+            .await;
+        assert_eq!(honest.is_error, Some(true));
+        assert!(
+            summarize_tool_result(&honest)
+                .unwrap_or_default()
+                .contains("disabled by project agent policy")
+        );
+
+        assert_eq!(updates.load(Ordering::SeqCst), 0, "the record must never be written");
+        assert_eq!(
+            foreign_policy_reads.load(Ordering::SeqCst),
+            0,
+            "the policy of a project that does not own the record must never be consulted"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn form_scoped_call_accepts_a_project_id_that_matches_the_owner() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let updates = Arc::new(AtomicUsize::new(0));
+        let update_counter = Arc::clone(&updates);
+        let router = Router::new()
+            .route(
+                "/api/v1/form-records/r1",
+                get(|| async { Json(json!({ "code": 0, "data": { "id": "r1", "project_id": "p1" } })) }).patch(
+                    move || {
+                        let counter = Arc::clone(&update_counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({ "code": 0, "data": { "id": "r1" } }))
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/projects/p1/agent-policy",
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "mcp": { "tool_registry": { "enabled_tools": ["form_records.update"] } } }
+                    }))
+                }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        let result = server
+            .call_tool(
+                "form_records.update",
+                json!({ "record_id": "r1", "values": {}, "project_id": "p1" }),
+            )
+            .await;
+
+        assert_eq!(result.is_error, None, "{:?}", summarize_tool_result(&result));
+        assert_eq!(updates.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn events_tail_is_governed_by_the_owning_project_policy() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let read_counter = Arc::clone(&reads);
+        let router = Router::new()
+            .route(
+                "/api/v1/forms/f1",
+                get(|| async { Json(json!({ "code": 0, "data": { "id": "f1", "project_id": "p1" } })) }),
+            )
+            .route(
+                "/api/v1/forms/f1/events",
+                get(move || {
+                    let counter = Arc::clone(&read_counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "code": 0, "data": { "items": [] } }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/projects/p1/agent-policy",
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "mcp": { "tool_registry": { "enabled_tools": ["forms.get"] } } }
+                    }))
+                }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        let denied = server.call_tool("events.tail", json!({ "form_id": "f1" })).await;
+        assert_eq!(denied.is_error, Some(true));
+        assert!(
+            summarize_tool_result(&denied)
+                .unwrap_or_default()
+                .contains("disabled by project agent policy")
+        );
+
+        let smuggled = server
+            .call_tool("events.tail", json!({ "form_id": "f1", "project_id": "p2" }))
+            .await;
+        assert_eq!(smuggled.is_error, Some(true));
+
+        let unscoped = server.call_tool("events.tail", json!({ "per_page": 50 })).await;
+        assert_eq!(unscoped.is_error, Some(true));
+        assert!(
+            summarize_tool_result(&unscoped)
+                .unwrap_or_default()
+                .contains("carries no form_id, record_id or attachment_id")
+        );
+
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "events must never be read");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachment_tools_fail_closed_while_the_api_has_no_lookup() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::delete, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let archive_counter = Arc::clone(&mutations);
+        let restore_counter = Arc::clone(&mutations);
+        // Only the mutating routes exist, exactly like the current API surface.
+        let router = Router::new()
+            .route(
+                "/api/v1/form-attachments/a1",
+                delete(move || {
+                    let counter = Arc::clone(&archive_counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "code": 0, "message": "ok" }))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/form-attachments/a1/restore",
+                post(move || {
+                    let counter = Arc::clone(&restore_counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "code": 0, "data": { "id": "a1" } }))
+                    }
+                }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        for tool in ["form_attachments.archive", "form_attachments.restore"] {
+            let result = server.call_tool(tool, json!({ "attachment_id": "a1" })).await;
+            assert_eq!(result.is_error, Some(true), "{tool} must not be allowed through");
+            let message = summarize_tool_result(&result).unwrap_or_default();
+            assert!(
+                message.contains("GET /api/v1/form-attachments/{attachment_id}"),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            0,
+            "attachments must not be mutated while the policy cannot be evaluated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attachment_tools_are_governed_once_the_api_exposes_the_lookup() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{Json, Router, routing::get};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn router(enabled_tools: Value, archives: &Arc<AtomicUsize>) -> Router {
+            let counter = Arc::clone(archives);
+            Router::new()
+                .route(
+                    "/api/v1/form-attachments/a1",
+                    // The lookup only knows the owning form; the project is resolved from it.
+                    get(|| async { Json(json!({ "code": 0, "data": { "id": "a1", "form_id": "f1" } })) }).delete(
+                        move || {
+                            let counter = Arc::clone(&counter);
+                            async move {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                Json(json!({ "code": 0, "message": "ok" }))
+                            }
+                        },
+                    ),
+                )
+                .route(
+                    "/api/v1/forms/f1",
+                    get(|| async { Json(json!({ "code": 0, "data": { "id": "f1", "project_id": "p1" } })) }),
+                )
+                .route(
+                    "/api/v1/projects/p1/agent-policy",
+                    get(move || {
+                        let enabled_tools = enabled_tools.clone();
+                        async move {
+                            Json(json!({
+                                "code": 0,
+                                "data": { "mcp": { "tool_registry": { "enabled_tools": enabled_tools } } }
+                            }))
+                        }
+                    }),
+                )
+        }
+
+        let denied_archives = Arc::new(AtomicUsize::new(0));
+        let denied_url = crate::client::test_api::spawn(router(json!(["forms.get"]), &denied_archives)).await?;
+        let denied_server = super::McpServer::new(crate::client::OpenPrClient::new(
+            denied_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+        let denied = denied_server
+            .call_tool("form_attachments.archive", json!({ "attachment_id": "a1" }))
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+        assert!(
+            summarize_tool_result(&denied)
+                .unwrap_or_default()
+                .contains("disabled by project agent policy")
+        );
+        assert_eq!(denied_archives.load(Ordering::SeqCst), 0);
+
+        let allowed_archives = Arc::new(AtomicUsize::new(0));
+        let allowed_url =
+            crate::client::test_api::spawn(router(json!(["form_attachments.archive"]), &allowed_archives)).await?;
+        let allowed_server = super::McpServer::new(crate::client::OpenPrClient::new(
+            allowed_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+        let allowed = allowed_server
+            .call_tool("form_attachments.archive", json!({ "attachment_id": "a1" }))
+            .await;
+        assert_eq!(allowed.is_error, None, "{:?}", summarize_tool_result(&allowed));
+        assert_eq!(allowed_archives.load(Ordering::SeqCst), 1);
+
+        // A foreign project_id stays refused even when the lookup works.
+        let smuggled = allowed_server
+            .call_tool(
+                "form_attachments.archive",
+                json!({ "attachment_id": "a1", "project_id": "p2" }),
+            )
+            .await;
+        assert_eq!(smuggled.is_error, Some(true));
+        assert_eq!(allowed_archives.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Every `Ok(_) => success("... deleted")` call site must still report backend
+    /// failures, because the API answers HTTP 200 and carries the real status in the
+    /// response envelope.
+    #[tokio::test]
+    async fn mutation_tools_report_envelope_errors_instead_of_fake_success() -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{
+            Json, Router,
+            routing::{delete, get, post},
+        };
+
+        async fn denied() -> Json<Value> {
+            Json(json!({ "code": 403, "message": "policy denied", "data": null }))
+        }
+
+        let router = Router::new()
+            .route("/api/v1/comments/c1", delete(denied))
+            .route("/api/v1/projects/p1", delete(denied))
+            .route("/api/v1/projects/p1/resources/res1", delete(denied))
+            .route("/api/v1/labels/l1", delete(denied))
+            .route("/api/v1/sprints/s1", delete(denied))
+            .route("/api/v1/issues/w1", delete(denied))
+            .route("/api/v1/issues/w1/labels/l1", post(denied).delete(denied))
+            .route("/api/v1/issues/w1/labels/batch", post(denied))
+            .route(
+                "/api/v1/projects/p1/agent-policy",
+                get(|| async { Json(json!({ "code": 0, "data": {} })) }),
+            );
+        let base_url = crate::client::test_api::spawn(router).await?;
+        let server = super::McpServer::new(crate::client::OpenPrClient::new(
+            base_url,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?);
+
+        let calls = [
+            ("comments.delete", json!({ "comment_id": "c1" })),
+            ("projects.delete", json!({ "project_id": "p1" })),
+            (
+                "project_resources.delete",
+                json!({ "project_id": "p1", "resource_id": "res1" }),
+            ),
+            ("labels.delete", json!({ "label_id": "l1" })),
+            ("sprints.delete", json!({ "sprint_id": "s1" })),
+            ("work_items.delete", json!({ "work_item_id": "w1" })),
+            (
+                "work_items.add_label",
+                json!({ "work_item_id": "w1", "label_id": "l1" }),
+            ),
+            (
+                "work_items.remove_label",
+                json!({ "work_item_id": "w1", "label_id": "l1" }),
+            ),
+            (
+                "work_items.add_labels",
+                json!({ "work_item_id": "w1", "label_ids": ["l1"] }),
+            ),
+        ];
+
+        for (tool, args) in calls {
+            let result = server.call_tool(tool, args).await;
+            let message = summarize_tool_result(&result).unwrap_or_default();
+            assert_eq!(result.is_error, Some(true), "{tool} reported success: {message}");
+            assert!(message.contains("API error 403"), "{tool}: {message}");
+            assert!(message.contains("policy denied"), "{tool}: {message}");
+        }
         Ok(())
     }
 

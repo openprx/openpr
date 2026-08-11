@@ -515,6 +515,17 @@ impl OpenPrClient {
         .await
     }
 
+    /// Reads one attachment so the MCP server can resolve which project owns it.
+    /// The API does not expose this route yet; until it does the call fails and the
+    /// attachment tools are refused instead of skipping the project agent policy.
+    pub async fn get_form_attachment(&self, attachment_id: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/form-attachments/{}",
+            urlencoding::encode(attachment_id)
+        ))
+        .await
+    }
+
     pub async fn archive_form_attachment(&self, attachment_id: &str) -> Result<Value, String> {
         self.delete(&format!(
             "/api/v1/form-attachments/{}",
