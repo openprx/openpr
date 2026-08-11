@@ -27,6 +27,7 @@
 	import OptionValueBadges from '$lib/components/forms/OptionValueBadges.svelte';
 	import { toast } from '$lib/stores/toast';
 	import { requireRouteParam } from '$lib/utils/route-params';
+	import { safeImageUrl, safeLinkUrl } from '$lib/utils/safe-url';
 	import { locale, t } from 'svelte-i18n';
 
 	type DetailLayoutSectionDensity = 'comfortable' | 'compact';
@@ -495,11 +496,11 @@
 	}
 
 	function attachmentSignedUrl(attachment: FormAttachment): string {
-		return attachmentSignedUrls[attachment.id] || attachment.url;
+		return safeLinkUrl(attachmentSignedUrls[attachment.id] || attachment.url);
 	}
 
 	function attachmentThumbnailUrl(attachment: FormAttachment): string {
-		return attachment.thumbnail_url || attachment.url;
+		return safeImageUrl(attachment.thumbnail_url || attachment.url);
 	}
 
 	async function loadAttachmentSignedUrls(items: FormAttachment[]) {
@@ -1163,7 +1164,7 @@
 													</div>
 													</div>
 													<a
-														href={attachmentSignedUrl(attachment)}
+														href={attachmentSignedUrl(attachment) || undefined}
 														target="_blank"
 														rel="noreferrer"
 														class="rounded px-2 py-1 font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30"
@@ -1174,15 +1175,25 @@
 											</div>
 										{/each}
 										{#each valueUrls as url}
-											<a
-												href={url}
-												target="_blank"
-												rel="noreferrer"
-												class="block truncate rounded bg-slate-50 px-2 py-1.5 font-mono text-[11px] text-blue-700 dark:bg-slate-950 dark:text-blue-300"
-												data-durable-record-detail-attachment-value={`${field.key}:${url}`}
-											>
-												{url}
-											</a>
+											{#if safeLinkUrl(url)}
+												<a
+													href={safeLinkUrl(url)}
+													target="_blank"
+													rel="noreferrer"
+													class="block truncate rounded bg-slate-50 px-2 py-1.5 font-mono text-[11px] text-blue-700 dark:bg-slate-950 dark:text-blue-300"
+													data-durable-record-detail-attachment-value={`${field.key}:${url}`}
+												>
+													{url}
+												</a>
+											{:else}
+												<span
+													class="block truncate rounded bg-slate-50 px-2 py-1.5 font-mono text-[11px] text-amber-700 dark:bg-slate-950 dark:text-amber-300"
+													data-durable-record-detail-attachment-value={`${field.key}:${url}`}
+													data-durable-record-detail-attachment-value-blocked={field.key}
+												>
+													{url}
+												</span>
+											{/if}
 										{/each}
 										{#if metadataAttachments.length === 0 && valueUrls.length === 0}
 											<p class="text-sm text-slate-500 dark:text-slate-400">
@@ -1214,7 +1225,7 @@
 											</div>
 											</div>
 											<a
-												href={attachmentSignedUrl(attachment)}
+												href={attachmentSignedUrl(attachment) || undefined}
 												target="_blank"
 												rel="noreferrer"
 												class="rounded px-2 py-1 font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30"

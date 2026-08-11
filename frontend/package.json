@@ -16,6 +16,7 @@
 		"smoke:project-template": "node scripts/smoke-project-template-wizard.mjs",
 		"smoke:template-work-items": "node scripts/smoke-template-work-items.mjs",
 		"smoke:forms-ui": "node scripts/smoke-forms-ui.mjs",
+		"test:record-values": "bun tests/record-values-roundtrip.test.ts",
 		"smoke:restaurant-ordering": "node scripts/smoke-restaurant-ordering.mjs",
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write ."
