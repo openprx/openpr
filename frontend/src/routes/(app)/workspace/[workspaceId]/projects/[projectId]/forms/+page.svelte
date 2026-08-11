@@ -61,7 +61,15 @@
 		type FormWorkflowMode
 	} from '$lib/components/forms/FormWorkflowTabs.svelte';
 	import Modal from '$lib/components/Modal.svelte';
+	import {
+		draftValueFromRecordValue,
+		emptyDraftValue,
+		isMissingRequiredValue,
+		parseJsonish,
+		recordValueFromDraftValue
+	} from '$lib/forms/record-values';
 	import { toast } from '$lib/stores/toast';
+	import { safeImageUrl, safeLinkUrl } from '$lib/utils/safe-url';
 	import {
 		scenarioTemplateDescription,
 		scenarioTemplateIndustry,
@@ -480,6 +488,9 @@
 	let linkSubmitting = $state(false);
 	let recordCommentSubmitting = $state(false);
 	let deletingRecordId = $state<string | null>(null);
+	let restoringRecordId = $state<string | null>(null);
+	let lastDeletedRecord = $state<{ id: string; title: string } | null>(null);
+	let recordEditorPanel = $state<HTMLElement | null>(null);
 	let updatingKanbanRecordId = $state<string | null>(null);
 	let draggingKanbanRecordId = $state<string | null>(null);
 	let selectedKanbanRecordIds = $state<string[]>([]);
@@ -933,6 +944,10 @@
 		editingRecordId = null;
 		recordEditorOpen = false;
 		recordPage = 1;
+		// Record ids belong to the form they were focused from; keeping them
+		// across a form switch filters every view down to zero rows.
+		focusedRecordIds = [];
+		lastDeletedRecord = null;
 		selectedRecord = null;
 		selectedRecordLinks = [];
 		selectedRecordChildren = [];
@@ -1292,6 +1307,10 @@
 	}
 
 	async function handleDeleteRecord(record: FormRecord) {
+		const label = record.title || record.id;
+		if (!window.confirm($t('forms.deleteRecordConfirm', { values: { title: label } }))) {
+			return;
+		}
 		deletingRecordId = record.id;
 		const response = await formsApi.deleteRecord(record.id);
 		deletingRecordId = null;
@@ -1299,6 +1318,7 @@
 			toast.error(response.message);
 			return;
 		}
+		lastDeletedRecord = { id: record.id, title: label };
 		records = records.filter((item) => item.id !== record.id);
 		filterPreviewRecords = filterPreviewRecords.filter((item) => item.id !== record.id);
 		printJobs = printJobs.filter((item) => item.id !== record.id);
@@ -1312,8 +1332,32 @@
 		if (editingRecordId === record.id) {
 			cancelEditRecord();
 		}
+		focusedRecordIds = focusedRecordIds.filter((item) => item !== record.id);
 		toast.success($t('forms.recordDeleted'));
 		await loadAggregates();
+	}
+
+	/**
+	 * Deletes are soft on the server, so surface the only entry point that can
+	 * undo one instead of leaving the record unreachable.
+	 */
+	async function handleRestoreLastDeletedRecord() {
+		const target = lastDeletedRecord;
+		if (!target) return;
+		restoringRecordId = target.id;
+		const response = await formsApi.restoreRecord(target.id);
+		restoringRecordId = null;
+		if (response.code !== 0 || !response.data) {
+			toast.error(response.message);
+			return;
+		}
+		lastDeletedRecord = null;
+		toast.success($t('forms.recordRestored'));
+		await loadRecords();
+	}
+
+	function dismissLastDeletedRecord() {
+		lastDeletedRecord = null;
 	}
 
 	async function copyRecordId(record: FormRecord) {
@@ -2242,6 +2286,55 @@
 		cancelEditRecord();
 	}
 
+	const FOCUSABLE_SELECTOR =
+		'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+	function focusableElementsIn(container: HTMLElement): HTMLElement[] {
+		return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+			(element) => element.offsetParent !== null || element === document.activeElement
+		);
+	}
+
+	/** The record drawer is a modal: Escape closes it and Tab stays inside it. */
+	function handleGlobalKeydown(event: KeyboardEvent) {
+		if (!recordEditorOpen) return;
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			closeRecordEditorDrawer();
+			return;
+		}
+		if (event.key !== 'Tab') return;
+		const panel = recordEditorPanel;
+		if (!panel) return;
+		const focusable = focusableElementsIn(panel);
+		const first = focusable[0];
+		const last = focusable[focusable.length - 1];
+		if (!first || !last) return;
+		const active = document.activeElement;
+		const inside = panel.contains(active);
+		if (event.shiftKey) {
+			if (!inside || active === first) {
+				event.preventDefault();
+				last.focus();
+			}
+			return;
+		}
+		if (!inside || active === last) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
+
+	$effect(() => {
+		if (!recordEditorOpen) return;
+		const panel = recordEditorPanel;
+		if (!panel) return;
+		const previouslyFocused =
+			document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		focusableElementsIn(panel)[0]?.focus({ preventScroll: true });
+		return () => previouslyFocused?.focus({ preventScroll: true });
+	});
+
 	function goToRecordPage(page: number) {
 		recordPage = Math.min(Math.max(page, 1), recordPageCount);
 	}
@@ -2526,9 +2619,16 @@
 		const relationField = fields.find((field) => field.key === childEditor?.relationFieldKey);
 		const childForm = forms.find((form) => form.id === childEditor?.childFormId);
 		if (!relationField || !childForm) return;
+		const editedChild = childEditor.recordId
+			? selectedRecordChildren.find((item) => item.record.id === childEditor?.recordId)
+			: undefined;
 		let values: Record<string, unknown>;
 		try {
-			values = buildValuesFromDraft(parseFields(childForm.schema), childEditor.draft);
+			values = buildValuesFromDraft(
+				parseFields(childForm.schema),
+				childEditor.draft,
+				editedChild?.record.values
+			);
 		} catch (error) {
 			toast.error(error instanceof Error ? error.message : $t('forms.invalidRecordValues'));
 			return;
@@ -2574,6 +2674,10 @@
 	}
 
 	async function deleteChildRecord(child: FormChildRecord) {
+		const label = child.record.title || child.record.id;
+		if (!window.confirm($t('forms.deleteChildRecordConfirm', { values: { title: label } }))) {
+			return;
+		}
 		deletingChildRecordId = child.record.id;
 		const response = await formsApi.deleteRecord(child.record.id);
 		deletingChildRecordId = null;
@@ -2624,101 +2728,56 @@
 
 	function defaultDraftValueForField(field: FormField): unknown {
 		if (field.default_value !== undefined && field.default_value !== null) {
-			if (Array.isArray(field.default_value)) return field.default_value;
-			if (isRecord(field.default_value)) return JSON.stringify(field.default_value);
-			return field.default_value;
+			return draftValueFromRecordValue(field, field.default_value);
 		}
-		if (field.type === 'boolean') return false;
-		return '';
+		return emptyDraftValue(field);
 	}
 
 	function buildRecordPayload(formFields: FormField[]): Record<string, unknown> {
-		return buildValuesFromDraft(formFields, recordDraft);
+		return buildValuesFromDraft(formFields, recordDraft, editedRecordValues());
 	}
 
+	function editedRecordValues(): Record<string, unknown> | undefined {
+		if (!editingRecordId) return undefined;
+		const current = records.find((record) => record.id === editingRecordId) ?? selectedRecord;
+		return current?.id === editingRecordId ? current.values : undefined;
+	}
+
+	/**
+	 * The API replaces the whole `values` map on PATCH, so every field the
+	 * payload omits is deleted from the stored record. The per-type mapping in
+	 * `$lib/forms/record-values` is exhaustive over `FormFieldType` to keep that
+	 * from silently happening again.
+	 */
 	function buildValuesFromDraft(
 		formFields: FormField[],
-		draft: Record<string, unknown>
+		draft: Record<string, unknown>,
+		existingValues?: Record<string, unknown>
 	): Record<string, unknown> {
 		const values: Record<string, unknown> = {};
 		for (const field of formFields) {
 			if (fieldHiddenByCondition(field, draft)) continue;
-			const raw = draft[field.key];
-			const type = field.type ?? 'text';
-			if (type === 'autonumber' || type === 'child_table') continue;
-			if (type === 'boolean') {
-				values[field.key] = Boolean(raw);
-				continue;
+			const value = recordValueFromDraftValue(field, draft[field.key], {
+				relationTarget: (relationField, recordId) =>
+					relationTargets[relationField.key]?.find((item) => item.record_id === recordId),
+				member: (userId) => workspaceMembers.find((item) => item.user_id === userId),
+				existingValue: existingValues?.[field.key]
+			});
+			if (isMissingRequiredValue(field, value)) {
+				throw new Error(
+					fieldType(field) === 'child_table'
+						? $t('forms.childTableRequiredAfterSave', { values: { field: fieldLabel(field) } })
+						: $t('forms.fieldRequired', { values: { field: fieldLabel(field) } })
+				);
 			}
-			const text = typeof raw === 'string' ? raw.trim() : '';
-			if (!text && !field.required) continue;
-			if (!text && field.required) {
-				throw new Error($t('forms.fieldRequired', { values: { field: fieldLabel(field) } }));
-			}
-			if (type === 'multi_select') {
-				const selected = Array.isArray(raw)
-					? raw.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-					: text
-							.split(',')
-							.map((item) => item.trim())
-							.filter(Boolean);
-				if (selected.length === 0 && field.required) {
-					throw new Error($t('forms.fieldRequired', { values: { field: fieldLabel(field) } }));
-				}
-				if (selected.length > 0) values[field.key] = selected;
-			} else if (type === 'relation') {
-				if (text) {
-					const target = relationTargets[field.key]?.find((item) => item.record_id === text);
-					values[field.key] = {
-						record_id: text,
-						title: target?.display || target?.title || text,
-						form_key: target?.form_key ?? field.relation?.form_key
-					};
-				}
-			} else if (type === 'member') {
-				if (text) {
-					const member = workspaceMembers.find((item) => item.user_id === text);
-					values[field.key] = {
-						user_id: text,
-						...(member?.name ? { name: member.name } : {}),
-						...(member?.email ? { email: member.email } : {})
-					};
-				}
-			} else if (['attachment', 'image', 'relation', 'formula'].includes(type)) {
-				values[field.key] = parseAdvancedRecordField(text);
-			} else {
-				values[field.key] = text;
-			}
+			if (value === undefined) continue;
+			values[field.key] = value;
 		}
 		return values;
 	}
 
-	function parseAdvancedRecordField(value: string): unknown {
-		const trimmed = value.trim();
-		if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return trimmed;
-		try {
-			return JSON.parse(trimmed) as unknown;
-		} catch {
-			return trimmed;
-		}
-	}
-
 	function draftValueForField(field: FormField, record: FormRecord): unknown {
-		const value = record.values[field.key];
-		const type = field.type ?? 'text';
-		if (type === 'boolean') return Boolean(value);
-		if (Array.isArray(value)) return type === 'multi_select' ? value : value.join(', ');
-		if (isRecord(value)) {
-			if (type === 'relation' && typeof value.record_id === 'string') return value.record_id;
-			if (type === 'member' && typeof value.user_id === 'string') return value.user_id;
-			if (type === 'amount' && typeof value.decimal === 'string') return value.decimal;
-			if (['integer', 'number'].includes(type) && typeof value.value === 'number') {
-				return String(value.value);
-			}
-			return JSON.stringify(value);
-		}
-		if (value === null || value === undefined) return '';
-		return String(value);
+		return draftValueFromRecordValue(field, record.values[field.key]);
 	}
 
 	function parseFields(schema: Record<string, unknown>): FormField[] {
@@ -5106,7 +5165,7 @@
 	}
 
 	function cardCoverUrl(record: FormRecord): string {
-		return recordMediaUrl(record, viewCardCoverField());
+		return safeImageUrl(recordMediaUrl(record, viewCardCoverField()));
 	}
 
 	function timelineTitle(record: FormRecord): string {
@@ -7717,7 +7776,7 @@
 					.filter(Boolean);
 			}
 			if (['attachment', 'image', 'relation', 'child_table', 'formula'].includes(type)) {
-				return parseAdvancedRecordField(trimmed);
+				return parseJsonish(trimmed);
 			}
 			return trimmed;
 		}
@@ -9039,6 +9098,10 @@
 		return '';
 	}
 
+	function attachmentPreviewUrl(field: FormField): string {
+		return safeImageUrl(attachmentUrl(field));
+	}
+
 	function attachmentFileName(url: string, field: FormField): string {
 		const cleaned = url.trim();
 		if (!cleaned) return field.type === 'image' ? `${field.key}.png` : `${field.key}.bin`;
@@ -9115,11 +9178,11 @@
 	}
 
 	function attachmentSignedUrl(attachment: FormAttachment): string {
-		return recordAttachmentSignedUrls[attachment.id] || attachment.url;
+		return safeLinkUrl(recordAttachmentSignedUrls[attachment.id] || attachment.url);
 	}
 
 	function attachmentThumbnailUrl(attachment: FormAttachment): string {
-		return attachment.thumbnail_url || attachment.url;
+		return safeImageUrl(attachment.thumbnail_url || attachment.url);
 	}
 
 	async function loadAttachmentSignedUrls(attachments: FormAttachment[]) {
@@ -9206,6 +9269,10 @@
 		const url = attachmentUrl(field);
 		if (!url) {
 			toast.error($t('forms.attachmentUrlRequired'));
+			return;
+		}
+		if (!safeLinkUrl(url)) {
+			toast.error($t('forms.attachmentUrlUnsafe'));
 			return;
 		}
 		attachmentSubmittingField = field.key;
@@ -9581,6 +9648,8 @@
 		return event.currentTarget instanceof HTMLSelectElement ? event.currentTarget.value : '';
 	}
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 <div class="mx-auto max-w-7xl space-y-5">
 	<div
@@ -13422,6 +13491,7 @@
 										data-record-editor-drawer
 										role="dialog"
 										aria-modal="true"
+										aria-labelledby="record-editor-title"
 									>
 										<button
 											type="button"
@@ -13431,11 +13501,15 @@
 											onclick={closeRecordEditorDrawer}
 										></button>
 										<section
+											bind:this={recordEditorPanel}
 											class="relative z-10 flex h-full w-full max-w-3xl flex-col overflow-y-auto bg-white p-4 shadow-xl dark:bg-slate-900"
 										>
 									<div class="mb-3 flex items-center justify-between gap-3">
 										<div>
-											<h3 class="text-base font-semibold text-slate-950 dark:text-slate-100">
+											<h3
+												id="record-editor-title"
+												class="text-base font-semibold text-slate-950 dark:text-slate-100"
+											>
 											{editingRecordId ? $t('forms.editRecord') : $t('forms.newRecord')}
 										</h3>
 										<span class="text-xs text-slate-500 dark:text-slate-400"
@@ -13650,9 +13724,9 @@
 															{$t('forms.attachmentSaveRecordFirst')}
 														</p>
 													{/if}
-													{#if attachmentUrl(field) && fieldType(field) === 'image'}
+													{#if attachmentPreviewUrl(field) && fieldType(field) === 'image'}
 														<img
-															src={attachmentUrl(field)}
+															src={attachmentPreviewUrl(field)}
 															alt={fieldLabel(field)}
 															class="h-24 w-full rounded-md border border-slate-200 object-cover dark:border-slate-700"
 															data-attachment-preview={field.key}
@@ -13676,9 +13750,9 @@
 																		<div class="truncate font-medium text-slate-900 dark:text-slate-100">{attachment.file_name}</div>
 																		<div class="truncate font-mono text-[11px] text-slate-500 dark:text-slate-400">{attachment.content_type || attachment.storage_key}</div>
 																	</div>
-																		{#if attachment.url}
+																		{#if attachmentSignedUrl(attachment)}
 																			<a
-																				href={attachmentSignedUrl(attachment)}
+																				href={attachmentSignedUrl(attachment) || undefined}
 																				target="_blank"
 																				rel="noreferrer"
 																				class="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30"
@@ -13688,7 +13762,7 @@
 																				{$t('forms.attachmentOpen')}
 																			</a>
 																			<a
-																				href={attachmentSignedUrl(attachment)}
+																				href={attachmentSignedUrl(attachment) || undefined}
 																				download={attachment.file_name}
 																				class="inline-flex items-center rounded-md px-2 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
 																				data-attachment-download={attachment.id}
@@ -13834,6 +13908,32 @@
 										class="w-full overflow-hidden rounded-lg border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900"
 										data-record-list-panel
 									>
+										{#if lastDeletedRecord}
+											<div
+												class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-amber-50 px-4 py-2 text-sm text-amber-900 dark:border-slate-700 dark:bg-amber-950/30 dark:text-amber-100"
+												data-record-restore-banner={lastDeletedRecord.id}
+											>
+												<span>
+													{$t('forms.recordDeletedRestoreHint', {
+														values: { title: lastDeletedRecord.title }
+													})}
+												</span>
+												<div class="flex items-center gap-2">
+													<Button
+														size="sm"
+														variant="secondary"
+														loading={restoringRecordId === lastDeletedRecord.id}
+														onclick={handleRestoreLastDeletedRecord}
+													>
+														<RefreshCw class="mr-2 h-4 w-4" aria-hidden="true" />
+														{$t('forms.restoreRecord')}
+													</Button>
+													<Button size="sm" variant="ghost" onclick={dismissLastDeletedRecord}>
+														{$t('common.close')}
+													</Button>
+												</div>
+											</div>
+										{/if}
 										{#if focusedRecords.length > 0}
 										<div
 											class="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-blue-50 px-4 py-2 text-sm text-blue-900 dark:border-slate-700 dark:bg-blue-950/30 dark:text-blue-100"
@@ -17484,7 +17584,7 @@
 																		</div>
 																		</div>
 																		<a
-																			href={attachmentSignedUrl(attachment)}
+																			href={attachmentSignedUrl(attachment) || undefined}
 																			target="_blank"
 																			rel="noreferrer"
 																			class="rounded px-2 py-1 font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30"
@@ -17494,7 +17594,7 @@
 																			{$t('forms.attachmentOpen')}
 																		</a>
 																		<a
-																			href={attachmentSignedUrl(attachment)}
+																			href={attachmentSignedUrl(attachment) || undefined}
 																			download={attachment.file_name}
 																			class="rounded px-2 py-1 font-medium text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
 																			data-record-detail-attachment-download={attachment.id}
@@ -17512,15 +17612,24 @@
 																	<div class="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-500 dark:text-slate-400">
 																		{url}
 																	</div>
-																	<a
-																		href={url}
-																		target="_blank"
-																		rel="noreferrer"
-																		class="rounded px-2 py-1 font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30"
-																		data-record-detail-attachment-value-open={field.key}
-																	>
-																		{$t('forms.attachmentOpen')}
-																	</a>
+																	{#if safeLinkUrl(url)}
+																		<a
+																			href={safeLinkUrl(url)}
+																			target="_blank"
+																			rel="noreferrer"
+																			class="rounded px-2 py-1 font-medium text-blue-700 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-950/30"
+																			data-record-detail-attachment-value-open={field.key}
+																		>
+																			{$t('forms.attachmentOpen')}
+																		</a>
+																	{:else}
+																		<span
+																			class="rounded px-2 py-1 text-[11px] font-medium text-amber-700 dark:text-amber-300"
+																			data-record-detail-attachment-value-blocked={field.key}
+																		>
+																			{$t('forms.attachmentUrlUnsafe')}
+																		</span>
+																	{/if}
 																</div>
 															{/each}
 																{#if metadataAttachments.length === 0 && valueUrls.length === 0}
