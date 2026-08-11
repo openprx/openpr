@@ -1173,7 +1173,6 @@ pub async fn report_invocation_progress(
         "running",
         req.payload.map(|payload| json!({ "progress": payload })),
         None,
-        false,
     )
     .await?;
     get_invocation(State(state), Extension(claims), bot, Path(invocation_id)).await
@@ -1194,7 +1193,6 @@ pub async fn complete_invocation(
         "completed",
         req.result,
         None,
-        true,
     )
     .await?;
     get_invocation(State(state), Extension(claims), bot, Path(invocation_id)).await
@@ -1215,7 +1213,6 @@ pub async fn fail_invocation(
         "failed",
         req.result,
         req.error_message.or_else(|| Some("invocation failed".to_string())),
-        true,
     )
     .await?;
     get_invocation(State(state), Extension(claims), bot, Path(invocation_id)).await
@@ -1330,17 +1327,19 @@ pub async fn report_connector_receipt(
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
+        format!(
+            r"
             UPDATE agent_invocations
             SET status = CASE
                     WHEN status IN ('completed', 'failed', 'cancelled') THEN status
                     ELSE $2
                 END,
-                result = COALESCE($3, result),
+                result = {RESULT_MERGE_KEEPING_DELIVERY},
                 error_message = COALESCE($4, error_message),
                 updated_at = now()
             WHERE id = $1
-        ",
+        "
+        ),
         vec![
             invocation_id.into(),
             invocation_status.to_string().into(),
@@ -1372,6 +1371,21 @@ pub async fn report_connector_receipt(
     get_invocation(State(state), Extension(claims), bot, Path(invocation_id)).await
 }
 
+/// SQL expression that merges a caller supplied `result` payload into the stored one.
+///
+/// The delivery bookkeeping the worker relies on lives under `result.connector_delivery`.
+/// Replacing the whole column (what a progress report or a receipt used to do) erased the lease
+/// and the retry schedule, which left the invocation invisible to the pickup query forever: it was
+/// never retried, never dead lettered and never logged. The bookkeeping key is therefore always
+/// carried over, whatever the caller sends.
+const RESULT_MERGE_KEEPING_DELIVERY: &str = r"CASE
+                    WHEN $3::jsonb IS NULL THEN result
+                    WHEN jsonb_typeof($3::jsonb) = 'object'
+                         AND jsonb_typeof(result -> 'connector_delivery') = 'object'
+                        THEN $3::jsonb || jsonb_build_object('connector_delivery', result -> 'connector_delivery')
+                    ELSE $3::jsonb
+                END";
+
 async fn update_invocation_status(
     state: &AppState,
     claims: &JwtClaims,
@@ -1380,25 +1394,29 @@ async fn update_invocation_status(
     status: &str,
     result: Option<Value>,
     error_message: Option<String>,
-    terminal: bool,
 ) -> Result<(), ApiError> {
     let invocation = find_invocation(state, invocation_id).await?;
     ensure_workspace_access(state, claims, bot, invocation.workspace_id).await?;
-    if terminal && matches!(invocation.status.as_str(), "completed" | "failed" | "cancelled") {
+    // Terminal invocations are frozen for every caller, including progress reports: resurrecting a
+    // completed delivery to `running` puts it back in the state the pickup query cannot resolve.
+    if matches!(invocation.status.as_str(), "completed" | "failed" | "cancelled") {
         return Err(ApiError::BadRequest("invocation is already terminal".to_string()));
     }
 
     let tx = state.db.begin().await?;
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
+        format!(
+            r"
                 UPDATE agent_invocations
                 SET status = $2,
-                    result = COALESCE($3, result),
+                    result = {RESULT_MERGE_KEEPING_DELIVERY},
                     error_message = $4,
                     updated_at = now()
                 WHERE id = $1
-            ",
+                  AND status NOT IN ('completed', 'failed', 'cancelled')
+            "
+        ),
         vec![
             invocation_id.into(),
             status.to_string().into(),
@@ -1422,7 +1440,9 @@ async fn update_invocation_status(
         .await?;
     }
 
-    if terminal && let Some(task_id) = invocation.source_task_id {
+    // `sync_source_task_terminal_status` ignores non terminal statuses, so a progress report
+    // still leaves the source task untouched.
+    if let Some(task_id) = invocation.source_task_id {
         sync_source_task_terminal_status(&tx, task_id, status, result, error_message).await?;
     }
     tx.commit().await?;
@@ -2007,6 +2027,22 @@ pub const DELIVERY_ID_HEADER: &str = "X-Webhook-Delivery";
 pub const OUTBOUND_ALLOWED_HOSTS_ENV: &str = "OPENPR_OUTBOUND_ALLOWED_HOSTS";
 /// Set to `1`/`true` to disable outbound private address checks entirely.
 pub const OUTBOUND_ALLOW_PRIVATE_ENV: &str = "OPENPR_OUTBOUND_ALLOW_PRIVATE";
+/// Namespace a connector credential environment variable must live in.
+///
+/// A connector endpoint is attacker controlled by design, so an unconstrained `env:NAME`
+/// reference would turn every connector into a read primitive for the whole process
+/// environment (`JWT_SECRET`, `DATABASE_URL`, object storage keys). Credentials meant for
+/// connectors must be provisioned under this prefix and nowhere else.
+pub const CONNECTOR_SECRET_ENV_PREFIX: &str = "OPENPR_CONNECTOR_SECRET_";
+
+/// Environment variables that must never be reachable through a credential reference.
+///
+/// [`CONNECTOR_SECRET_ENV_PREFIX`] already excludes all of them; this list is a second,
+/// independent gate that keeps holding if the namespace rule is ever widened.
+const DENIED_CREDENTIAL_ENV_NAMES: &[&str] = &["JWT_SECRET", "DATABASE_URL", "OPENPR_BOT_TOKEN", "RUST_LOG"];
+
+/// Environment variable prefixes that must never be reachable through a credential reference.
+const DENIED_CREDENTIAL_ENV_PREFIXES: &[&str] = &["POSTGRES_", "PG", "AWS_", "OPENPR_OBJECT_STORAGE_"];
 
 /// Authentication mode a connector declares in `auth_policy.mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2114,6 +2150,20 @@ fn parse_credential_ref(raw: &str) -> Result<ConnectorCredentialSource, String> 
     if !valid {
         return Err("credential reference env name must match [A-Z_][A-Z0-9_]*".to_string());
     }
+    if DENIED_CREDENTIAL_ENV_NAMES.contains(&name)
+        || DENIED_CREDENTIAL_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    {
+        return Err(format!(
+            "credential reference env name {name} is reserved by the platform"
+        ));
+    }
+    if name.len() <= CONNECTOR_SECRET_ENV_PREFIX.len() || !name.starts_with(CONNECTOR_SECRET_ENV_PREFIX) {
+        return Err(format!(
+            "credential reference env name must start with {CONNECTOR_SECRET_ENV_PREFIX}"
+        ));
+    }
     Ok(ConnectorCredentialSource::Env(name.to_string()))
 }
 
@@ -2195,7 +2245,8 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
 
 fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
     let [first, second, ..] = ip.octets();
-    ip.is_unspecified()
+    first == 0
+        || ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_private()
         || ip.is_link_local()
@@ -2209,15 +2260,42 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    // Checked before any embedded IPv4 extraction: `::1` and `::` also look like the deprecated
+    // IPv4-compatible form and would otherwise be read as 0.0.0.1 / 0.0.0.0.
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return true;
+    }
     if let Some(mapped) = ip.to_ipv4_mapped() {
         return is_blocked_ipv4(mapped);
     }
-    let [first, ..] = ip.segments();
-    ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || (first & 0xfe00) == 0xfc00
+    let segments = ip.segments();
+    let [first, second, ..] = segments;
+    // NAT64: the well known prefix carries the IPv4 target in its last 32 bits, every other
+    // 64:ff9b::/32 form (the local-use /48 with a configurable suffix) is refused outright.
+    if first == 0x0064 && second == 0xff9b {
+        return if segments[2..6].iter().all(|segment| *segment == 0) {
+            is_blocked_ipv4(embedded_ipv4(segments[6], segments[7]))
+        } else {
+            true
+        };
+    }
+    // 6to4: 2002:V4ADDR::/16 reaches the embedded IPv4 target.
+    if first == 0x2002 {
+        return is_blocked_ipv4(embedded_ipv4(segments[1], segments[2]));
+    }
+    // Deprecated IPv4-compatible form `::a.b.c.d`.
+    if segments[..6].iter().all(|segment| *segment == 0) {
+        return is_blocked_ipv4(embedded_ipv4(segments[6], segments[7]));
+    }
+    (first & 0xfe00) == 0xfc00
         || (first & 0xffc0) == 0xfe80
+        || (first & 0xffc0) == 0xfec0
+        || first == 0x2001 && second == 0x0db8
+}
+
+/// Rebuilds the IPv4 address carried by a transition format from its two IPv6 segments.
+fn embedded_ipv4(high: u16, low: u16) -> Ipv4Addr {
+    Ipv4Addr::from((u32::from(high) << 16) | u32::from(low))
 }
 
 fn literal_host_ip(host: &str) -> Option<IpAddr> {
@@ -2516,11 +2594,16 @@ mod tests {
         assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "vault:x" }), false).is_err());
         assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "env:bad-name" }), false).is_err());
 
-        let env_backed =
-            connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "env:OPENPR_TEST" }), false).unwrap();
+        let env_backed = connector_auth_plan(
+            &json!({ "mode": "hmac", "secret_ref": "env:OPENPR_CONNECTOR_SECRET_TEST" }),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             env_backed.source,
-            Some(ConnectorCredentialSource::Env("OPENPR_TEST".to_string()))
+            Some(ConnectorCredentialSource::Env(
+                "OPENPR_CONNECTOR_SECRET_TEST".to_string()
+            ))
         );
 
         let empty = connector_auth_plan(&json!({}), false).unwrap();
@@ -2532,6 +2615,44 @@ mod tests {
         assert_eq!(
             connector_auth_plan(&json!({ "mode": "none" }), true).unwrap().mode,
             ConnectorAuthMode::None
+        );
+    }
+
+    #[test]
+    fn credential_refs_cannot_reach_outside_the_connector_secret_namespace() {
+        // A connector endpoint is attacker controlled, so an unconstrained env reference would let
+        // whoever can create a connector have the worker post the process environment to that
+        // endpoint. Reading JWT_SECRET this way is a full authentication bypass.
+        for reference in [
+            "env:JWT_SECRET",
+            "env:DATABASE_URL",
+            "env:POSTGRES_PASSWORD",
+            "env:PGPASSWORD",
+            "env:AWS_SECRET_ACCESS_KEY",
+            "env:OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY",
+            "env:OPENPR_BOT_TOKEN",
+            "env:HOME",
+            "env:OPENPR_CONNECTOR_SECRET_",
+            "env:MY_HOOK_SECRET",
+        ] {
+            let policy = json!({ "mode": "bearer", "token_ref": reference });
+            assert!(
+                connector_auth_plan(&policy, false).is_err(),
+                "{reference} must not be referenceable"
+            );
+        }
+
+        let allowed = connector_auth_plan(
+            &json!({ "mode": "bearer", "token_ref": "env:OPENPR_CONNECTOR_SECRET_MYHOOK" }),
+            false,
+        )
+        .unwrap();
+        assert_eq!(allowed.mode, ConnectorAuthMode::Bearer);
+        assert_eq!(
+            allowed.source,
+            Some(ConnectorCredentialSource::Env(
+                "OPENPR_CONNECTOR_SECRET_MYHOOK".to_string()
+            ))
         );
     }
 
@@ -2582,11 +2703,27 @@ mod tests {
             "fc00::1",
             "fe80::1",
             "::ffff:127.0.0.1",
+            // Deprecated and transition formats that still reach an internal IPv4 target.
+            "::7f00:1",
+            "64:ff9b::7f00:1",
+            "2002:c0a8:0001::",
+            "fec0::1",
+            "0.1.2.3",
+            // NAT64 forms whose embedded target cannot be read are refused outright.
+            "64:ff9b:1::1",
+            "2001:db8::1",
         ] {
             let ip: IpAddr = raw.parse().unwrap();
             assert!(is_blocked_ip(ip), "{raw} must be blocked");
         }
-        for raw in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+        for raw in [
+            "1.1.1.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+            // The same transition formats pointing at a public target stay reachable.
+            "64:ff9b::0101:0101",
+            "2002:0101:0101::",
+        ] {
             let ip: IpAddr = raw.parse().unwrap();
             assert!(!is_blocked_ip(ip), "{raw} must be allowed");
         }

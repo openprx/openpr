@@ -19,6 +19,12 @@ const EVENT_OUTBOX_LEASE_SECONDS: i32 = 60;
 const CONNECTOR_DELIVERY_MAX_ATTEMPTS: i32 = 5;
 /// Lease held on a connector invocation while a worker is delivering it.
 const CONNECTOR_DELIVERY_LEASE_SECONDS: i32 = 120;
+/// Age after which a `running` connector invocation without delivery bookkeeping is reclaimed.
+///
+/// A connector bot can move an invocation to `running` (progress report, `received` receipt) before
+/// the worker ever delivered it. Such a row carries no lease and no retry schedule, so without this
+/// floor it would sit in `running` forever: never delivered, never dead lettered, never logged.
+const CONNECTOR_RUNNING_STALE_SECONDS: i32 = 900;
 /// Hard cap on the response body pulled from a connector endpoint.
 const CONNECTOR_RESPONSE_BYTE_LIMIT: usize = 64 * 1024;
 /// Characters of connector diagnostics persisted on the invocation.
@@ -58,6 +64,7 @@ struct BotWebhookRow {
 #[derive(Debug, Clone, FromQueryResult)]
 struct ConnectorInvocationDispatchRow {
     id: Uuid,
+    lease_token: Uuid,
     workspace_id: Uuid,
     project_id: Uuid,
     connector_id: Uuid,
@@ -114,6 +121,7 @@ struct ConnectorDeliveryRecord<'a> {
 #[derive(Debug, Clone, FromQueryResult)]
 struct EventOutboxDispatchRow {
     outbox_id: Uuid,
+    lease_token: Uuid,
     business_event_id: Uuid,
     workspace_id: Uuid,
     project_id: Option<Uuid>,
@@ -463,7 +471,7 @@ async fn process_pending_event_outbox(db: &sea_orm::DatabaseConnection, concurre
     for event in events {
         match create_connector_invocations_for_event(db, &event).await {
             Ok(created_count) => {
-                mark_event_outbox_dispatched(db, event.outbox_id, created_count).await?;
+                mark_event_outbox_dispatched(db, event.outbox_id, event.lease_token, created_count).await?;
             }
             Err(err) => {
                 tracing::warn!(
@@ -472,7 +480,7 @@ async fn process_pending_event_outbox(db: &sea_orm::DatabaseConnection, concurre
                     error = %err,
                     "event outbox dispatch failed"
                 );
-                mark_event_outbox_failed(db, event.outbox_id, &err.to_string()).await?;
+                mark_event_outbox_failed(db, event.outbox_id, event.lease_token, &err.to_string()).await?;
             }
         }
     }
@@ -487,6 +495,10 @@ async fn process_pending_event_outbox(db: &sea_orm::DatabaseConnection, concurre
 /// rows keep their attempt counter (it is only ever incremented), so a flapping worker cannot reset
 /// the retry budget, and rows that already burned their budget are dead lettered to `failed`
 /// instead of staying invisible in `leased`.
+///
+/// Every pickup stamps a fresh `lease_token`. The completion writes carry it back, so a worker whose
+/// lease already expired and was taken over cannot overwrite the state of the worker that owns the
+/// row now (which would re-queue an already dispatched event).
 fn event_outbox_pickup_sql() -> &'static str {
     r"
         WITH picked AS (
@@ -509,6 +521,7 @@ fn event_outbox_pickup_sql() -> &'static str {
         updated AS (
             UPDATE event_outbox eo
             SET status = CASE WHEN picked.retryable THEN 'leased' ELSE 'failed' END,
+                lease_token = CASE WHEN picked.retryable THEN gen_random_uuid() ELSE NULL END,
                 attempts = CASE WHEN picked.retryable THEN eo.attempts + 1 ELSE eo.attempts END,
                 leased_until = CASE
                     WHEN picked.retryable THEN now() + make_interval(secs => $2::int)
@@ -523,6 +536,7 @@ fn event_outbox_pickup_sql() -> &'static str {
             WHERE eo.id = picked.id
             RETURNING
                 eo.id AS outbox_id,
+                eo.lease_token,
                 eo.business_event_id,
                 eo.workspace_id,
                 eo.project_id,
@@ -534,6 +548,7 @@ fn event_outbox_pickup_sql() -> &'static str {
         )
         SELECT
             outbox_id,
+            lease_token,
             business_event_id,
             workspace_id,
             project_id,
@@ -652,6 +667,12 @@ async fn create_connector_invocations_for_event(
                     WHERE ai.audit_chain_id = $6
                       AND ai.connector_id = c.id
                   )
+                -- The NOT EXISTS probe is not atomic: two workers fanning the same event out
+                -- concurrently both see no row. The unique index makes the second insert a no-op
+                -- instead of a duplicate delivery.
+                ON CONFLICT (audit_chain_id, connector_id)
+                    WHERE audit_chain_id IS NOT NULL AND connector_id IS NOT NULL
+                    DO NOTHING
             ",
             vec![
                 event.workspace_id.into(),
@@ -674,51 +695,76 @@ async fn create_connector_invocations_for_event(
     Ok(created_count)
 }
 
+/// Completes a dispatch, but only while this worker still holds the lease it was handed.
 async fn mark_event_outbox_dispatched(
     db: &sea_orm::DatabaseConnection,
     outbox_id: Uuid,
+    lease_token: Uuid,
     created_count: u64,
 ) -> anyhow::Result<()> {
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
+    let outcome = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
             UPDATE event_outbox
             SET status = 'dispatched',
+                lease_token = NULL,
                 leased_until = NULL,
                 last_error = NULL,
                 dispatched_at = now(),
                 updated_at = now(),
                 headers = headers || jsonb_build_object('connector_invocations_created', $2::bigint)
             WHERE id = $1
+              AND status = 'leased'
+              AND lease_token = $3
         ",
-        vec![
-            outbox_id.into(),
-            i64::try_from(created_count).unwrap_or(i64::MAX).into(),
-        ],
-    ))
-    .await?;
+            vec![
+                outbox_id.into(),
+                i64::try_from(created_count).unwrap_or(i64::MAX).into(),
+                lease_token.into(),
+            ],
+        ))
+        .await?;
+    if outcome.rows_affected() == 0 {
+        tracing::warn!(
+            outbox_id = %outbox_id,
+            "event outbox lease expired before dispatch was recorded, another worker owns the row"
+        );
+    }
     Ok(())
 }
 
+/// Records a dispatch failure, but only while this worker still holds the lease it was handed.
 async fn mark_event_outbox_failed(
     db: &sea_orm::DatabaseConnection,
     outbox_id: Uuid,
+    lease_token: Uuid,
     error: &str,
 ) -> anyhow::Result<()> {
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
+    let outcome = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
             UPDATE event_outbox
             SET status = 'failed',
+                lease_token = NULL,
                 leased_until = NULL,
                 last_error = left($2, 2000),
                 available_at = now() + make_interval(secs => LEAST(attempts * 30, 300)),
                 updated_at = now()
             WHERE id = $1
+              AND status = 'leased'
+              AND lease_token = $3
         ",
-        vec![outbox_id.into(), error.to_string().into()],
-    ))
-    .await?;
+            vec![outbox_id.into(), error.to_string().into(), lease_token.into()],
+        ))
+        .await?;
+    if outcome.rows_affected() == 0 {
+        tracing::warn!(
+            outbox_id = %outbox_id,
+            "event outbox lease expired before the failure was recorded, another worker owns the row"
+        );
+    }
     Ok(())
 }
 
@@ -756,14 +802,30 @@ async fn process_pending_connector_invocations(
                         next_attempt_at: None,
                     },
                 );
-                update_connector_invocation_status(db, invocation.id, "failed", Some(error), Some(result)).await?;
+                update_connector_invocation_status(
+                    db,
+                    invocation.id,
+                    invocation.lease_token,
+                    "failed",
+                    Some(error),
+                    Some(result),
+                )
+                .await?;
                 continue;
             }
         };
 
         let outcome = dispatch_connector_invocation(client, &invocation, &auth).await;
         if outcome.success {
-            update_connector_invocation_status(db, invocation.id, "dispatched", None, Some(outcome.result)).await?;
+            update_connector_invocation_status(
+                db,
+                invocation.id,
+                invocation.lease_token,
+                "dispatched",
+                None,
+                Some(outcome.result),
+            )
+            .await?;
             continue;
         }
 
@@ -780,13 +842,27 @@ async fn process_pending_connector_invocations(
             ConnectorRetryDecision::Retry { delay_seconds } => {
                 let next_attempt_at = (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
                 let result = with_retry_schedule(outcome.result, "retrying", Some(next_attempt_at));
-                update_connector_invocation_status(db, invocation.id, "pending", outcome.error_message, Some(result))
-                    .await?;
+                update_connector_invocation_status(
+                    db,
+                    invocation.id,
+                    invocation.lease_token,
+                    "pending",
+                    outcome.error_message,
+                    Some(result),
+                )
+                .await?;
             }
             ConnectorRetryDecision::Terminal => {
                 let result = with_retry_schedule(outcome.result, "dead_lettered", None);
-                update_connector_invocation_status(db, invocation.id, "failed", outcome.error_message, Some(result))
-                    .await?;
+                update_connector_invocation_status(
+                    db,
+                    invocation.id,
+                    invocation.lease_token,
+                    "failed",
+                    outcome.error_message,
+                    Some(result),
+                )
+                .await?;
             }
         }
     }
@@ -872,7 +948,11 @@ fn resolve_connector_auth(row: &ConnectorAuthContextRow) -> Result<ResolvedConne
 ///
 /// `result` is also writable by connector bots through the receipt endpoints, so every read of it
 /// is type checked and range clamped: a malformed value must degrade a single delivery, never
-/// abort the batch query.
+/// abort the batch query. A row whose bookkeeping was wiped by such a write is picked up again
+/// once it stopped moving for [`CONNECTOR_RUNNING_STALE_SECONDS`], unless it was already delivered.
+///
+/// Each pickup stamps a `lease_token` that the completion write has to present, so a worker whose
+/// lease expired cannot overwrite the state owned by the worker that took the delivery over.
 fn connector_invocation_pickup_sql() -> &'static str {
     r"
         WITH picked AS (
@@ -906,7 +986,8 @@ fn connector_invocation_pickup_sql() -> &'static str {
                         1
                     ),
                     1000000
-                )::int AS max_attempts
+                )::int AS max_attempts,
+                gen_random_uuid() AS lease_token
             FROM agent_invocations ai
             INNER JOIN connectors c ON c.id = ai.connector_id
             WHERE ai.source_task_id IS NULL
@@ -934,6 +1015,20 @@ fn connector_invocation_pickup_sql() -> &'static str {
                             ELSE (ai.result #>> '{connector_delivery,leased_until}')::timestamptz <= now()
                           END
                     )
+                 OR (
+                      -- Bookkeeping wiped or never written: recover the row instead of losing it,
+                      -- but never re-deliver something that was already delivered.
+                      ai.status = 'running'
+                      AND (ai.result #>> '{connector_delivery,status}') IS DISTINCT FROM 'delivered'
+                      AND CASE
+                            WHEN jsonb_typeof(ai.result #> '{connector_delivery,leased_until}')
+                                IS DISTINCT FROM 'string' THEN true
+                            WHEN (ai.result #>> '{connector_delivery,leased_until}')
+                                !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]' THEN true
+                            ELSE false
+                          END
+                      AND ai.updated_at <= now() - make_interval(secs => $4::int)
+                    )
                   )
             ORDER BY ai.created_at
             LIMIT $1
@@ -957,6 +1052,7 @@ fn connector_invocation_pickup_sql() -> &'static str {
                         'attempts', picked.attempts,
                         'max_attempts', picked.max_attempts,
                         'next_attempt_at', NULL,
+                        'lease_token', to_jsonb(picked.lease_token),
                         'leased_until', to_jsonb(now() + make_interval(secs => $3::int))
                     )
                 ),
@@ -965,6 +1061,7 @@ fn connector_invocation_pickup_sql() -> &'static str {
             WHERE ai.id = picked.id
             RETURNING
                 ai.id,
+                picked.lease_token,
                 ai.workspace_id,
                 ai.project_id,
                 ai.connector_id AS connector_id,
@@ -993,6 +1090,7 @@ async fn pickup_pending_connector_invocations(
             limit.into(),
             CONNECTOR_DELIVERY_MAX_ATTEMPTS.into(),
             CONNECTOR_DELIVERY_LEASE_SECONDS.into(),
+            CONNECTOR_RUNNING_STALE_SECONDS.into(),
         ],
     ))
     .all(db)
@@ -1279,17 +1377,22 @@ fn connector_invocation_payload(invocation: &ConnectorInvocationDispatchRow) -> 
     body
 }
 
+/// Writes the delivery outcome back, but only while this worker still holds the lease it was
+/// handed by the pickup query. A worker whose lease expired must not overwrite the state of the
+/// worker that took the delivery over, and must not resurrect a terminal invocation.
 async fn update_connector_invocation_status(
     db: &sea_orm::DatabaseConnection,
     invocation_id: Uuid,
+    lease_token: Uuid,
     status: &str,
     error_message: Option<String>,
     result: Option<serde_json::Value>,
 ) -> anyhow::Result<()> {
     let previous = find_invocation_by_id(db, invocation_id).await?;
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
+    let outcome = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
             UPDATE agent_invocations
             SET status = $2,
                 error_message = $3,
@@ -1298,15 +1401,25 @@ async fn update_connector_invocation_status(
             WHERE id = $1
               AND source_task_id IS NULL
               AND status NOT IN ('completed', 'failed', 'cancelled')
+              AND (result #>> '{connector_delivery,lease_token}') = $5::text
         ",
-        vec![
-            invocation_id.into(),
-            status.to_string().into(),
-            error_message.into(),
-            result.into(),
-        ],
-    ))
-    .await?;
+            vec![
+                invocation_id.into(),
+                status.to_string().into(),
+                error_message.into(),
+                result.into(),
+                lease_token.to_string().into(),
+            ],
+        ))
+        .await?;
+    if outcome.rows_affected() == 0 {
+        tracing::warn!(
+            invocation_id = %invocation_id,
+            status = %status,
+            "connector delivery lease is no longer held, outcome not recorded"
+        );
+        return Ok(());
+    }
     if let Some(updated) = find_invocation_by_id(db, invocation_id).await?
         && previous.as_ref().map(|invocation| invocation.status.as_str()) != Some(updated.status.as_str())
     {
@@ -2007,12 +2120,14 @@ mod tests {
     use super::{
         CONNECTOR_DELIVERY_MAX_ATTEMPTS, ConnectorAuthContextRow, ConnectorAuthMode, ConnectorDeliveryRecord,
         ConnectorInvocationDispatchRow, ConnectorRetryDecision, EventInboxProcessingRow, ResolvedConnectorAuth,
-        connector_delivery_headers, connector_delivery_result, connector_invocation_pickup_sql,
-        connector_retry_backoff_seconds, connector_retry_decision, event_allows_connector_fanout,
-        event_inbox_invocation_id, event_outbox_pickup_sql, invocation_status_for_receipt, receipt_status_for_inbox,
-        redact_endpoint, resolve_connector_auth, with_retry_schedule,
+        connector_delivery_headers, connector_delivery_result, connector_retry_backoff_seconds,
+        connector_retry_decision, event_allows_connector_fanout, event_inbox_invocation_id,
+        invocation_status_for_receipt, mark_event_outbox_dispatched, mark_event_outbox_failed,
+        pickup_pending_connector_invocations, pickup_pending_event_outbox, receipt_status_for_inbox, redact_endpoint,
+        resolve_connector_auth, update_connector_invocation_status, with_retry_schedule,
     };
     use api::routes::connector::{DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, sign_delivery_body};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -2072,6 +2187,7 @@ mod tests {
     fn dispatch_row(endpoint: &str) -> ConnectorInvocationDispatchRow {
         ConnectorInvocationDispatchRow {
             id: Uuid::new_v4(),
+            lease_token: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             project_id: Uuid::new_v4(),
             connector_id: Uuid::new_v4(),
@@ -2087,36 +2203,462 @@ mod tests {
         }
     }
 
-    #[test]
-    fn event_outbox_pickup_reclaims_expired_leases() {
-        let sql = event_outbox_pickup_sql();
-        assert!(sql.contains("status = 'leased'"), "leased rows must be reclaimable");
-        assert!(sql.contains("leased_until <= now()"));
-        // The attempt counter is only ever incremented, a reclaimed lease cannot reset the budget.
-        assert!(sql.contains("attempts = CASE WHEN picked.retryable THEN eo.attempts + 1 ELSE eo.attempts END"));
-        assert!(sql.contains("attempts < max_attempts"));
-        // Concurrent workers must not pick the same row.
-        assert!(sql.contains("FOR UPDATE SKIP LOCKED"));
-        // Rows whose budget is gone are dead lettered instead of staying invisible in 'leased'.
-        assert!(sql.contains("ELSE 'failed'"));
-        assert!(sql.trim_end().ends_with("WHERE retryable"));
+    /// Minimal stand-in for the delivery tables, created in a throwaway schema per test run.
+    ///
+    /// Foreign keys to unrelated tables are dropped so the fixture stays independent of the rest of
+    /// the schema; every column the delivery SQL reads or writes is present. `event_outbox` is
+    /// deliberately created without `lease_token`: the column is added by the migration below, so
+    /// the migration file itself is covered too.
+    const TEST_SCHEMA_DDL: &str = r"
+        CREATE TABLE projects (id UUID PRIMARY KEY, type_key TEXT);
+        CREATE TABLE business_events (
+            id UUID PRIMARY KEY,
+            workspace_id UUID NOT NULL,
+            project_id UUID,
+            event_type TEXT NOT NULL,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            actor_id UUID,
+            source JSONB NOT NULL,
+            payload JSONB NOT NULL,
+            metadata JSONB NOT NULL,
+            correlation_id UUID,
+            causation_id UUID,
+            idempotency_key TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE event_outbox (
+            id UUID PRIMARY KEY,
+            business_event_id UUID NOT NULL,
+            workspace_id UUID NOT NULL,
+            project_id UUID,
+            event_type TEXT NOT NULL,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            headers JSONB NOT NULL DEFAULT '{}'::jsonb,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 10,
+            available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            leased_until TIMESTAMPTZ,
+            last_error TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            dispatched_at TIMESTAMPTZ
+        );
+        CREATE INDEX idx_event_outbox_pickup ON event_outbox(status, available_at, created_at)
+            WHERE status IN ('pending', 'failed');
+        CREATE TABLE connectors (
+            id UUID PRIMARY KEY,
+            workspace_id UUID NOT NULL,
+            project_id UUID,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            endpoint TEXT,
+            is_active BOOLEAN NOT NULL DEFAULT true,
+            capability_manifest JSONB NOT NULL DEFAULT '{}'::jsonb,
+            auth_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
+            webhook_id UUID
+        );
+        CREATE TABLE agent_invocations (
+            id UUID PRIMARY KEY,
+            workspace_id UUID NOT NULL,
+            project_id UUID,
+            actor_id UUID,
+            target_agent_id UUID,
+            source_task_id UUID,
+            trigger_kind TEXT NOT NULL,
+            trigger_ref_type TEXT,
+            trigger_ref_id UUID,
+            connector_id UUID,
+            connector_kind TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+            result JSONB,
+            error_message TEXT,
+            audit_chain_id UUID,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    ";
+
+    /// Applied verbatim on top of [`TEST_SCHEMA_DDL`], so the pickup tests also prove the migration.
+    const TEST_MIGRATION: &str = include_str!("../../../migrations/0048_delivery_lease_and_pickup_indexes.sql");
+
+    struct TestDb {
+        admin: DatabaseConnection,
+        db: DatabaseConnection,
+        schema: String,
     }
 
-    #[test]
-    fn connector_pickup_reclaims_leases_and_honours_backoff() {
-        let sql = connector_invocation_pickup_sql();
-        assert!(sql.contains("ai.status = 'pending'"));
-        assert!(sql.contains("{connector_delivery,next_attempt_at}"));
-        assert!(sql.contains("ai.status = 'running'"));
-        assert!(sql.contains("{connector_delivery,leased_until}"));
-        assert!(sql.contains("FOR UPDATE SKIP LOCKED"));
-        // The attempt counter is carried forward and incremented, never reset.
-        assert!(sql.contains(")::int + 1 AS attempts"));
-        assert!(sql.contains("'attempts', picked.attempts"));
-        // Bot writable result values are type checked before they are cast.
-        assert!(sql.contains("jsonb_typeof(ai.result #> '{connector_delivery,attempts}') = 'number'"));
-        assert!(sql.contains("jsonb_typeof(ai.result #> '{connector_delivery,next_attempt_at}')"));
-        assert!(sql.contains("IS DISTINCT FROM 'string' THEN true"));
+    impl TestDb {
+        async fn cleanup(self) {
+            let statement = format!("DROP SCHEMA \"{}\" CASCADE", self.schema);
+            if let Err(err) = self.admin.execute_unprepared(&statement).await {
+                eprintln!("test schema {} could not be dropped: {err}", self.schema);
+            }
+        }
+    }
+
+    /// Prepares an isolated schema on `OPENPR_TEST_DATABASE_URL`.
+    ///
+    /// Returns `None` when the variable is unset. The queries under test are pure SQL semantics
+    /// (three valued logic on bot writable JSONB, lease reclaim windows, partial unique indexes)
+    /// which nothing but a real PostgreSQL can decide, so without a database the tests report a
+    /// skip instead of pretending to cover them.
+    async fn test_db() -> Option<TestDb> {
+        let url = std::env::var("OPENPR_TEST_DATABASE_URL").ok()?;
+        let schema = format!("worker_delivery_test_{}", Uuid::new_v4().simple());
+        let admin = Database::connect(&url)
+            .await
+            .expect("OPENPR_TEST_DATABASE_URL must point at a reachable PostgreSQL");
+        admin
+            .execute_unprepared(&format!("CREATE SCHEMA \"{schema}\""))
+            .await
+            .expect("test schema must be creatable");
+        let mut options = ConnectOptions::new(url);
+        options.max_connections(4).set_schema_search_path(schema.clone());
+        let db = Database::connect(options).await.expect("test schema must be reachable");
+        db.execute_unprepared(TEST_SCHEMA_DDL)
+            .await
+            .expect("delivery tables must be creatable");
+        db.execute_unprepared(TEST_MIGRATION)
+            .await
+            .expect("migration 0048 must apply to the delivery tables");
+        Some(TestDb { admin, db, schema })
+    }
+
+    async fn scalar(db: &DatabaseConnection, sql: &str, id: Uuid) -> Option<String> {
+        db.query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            sql,
+            vec![id.into()],
+        ))
+        .await
+        .expect("query must succeed")
+        .map(|row| row.try_get::<String>("", "value").unwrap_or_default())
+    }
+
+    async fn outbox_status(db: &DatabaseConnection, id: Uuid) -> String {
+        scalar(db, "SELECT status AS value FROM event_outbox WHERE id = $1", id)
+            .await
+            .unwrap_or_default()
+    }
+
+    async fn outbox_attempts(db: &DatabaseConnection, id: Uuid) -> i32 {
+        scalar(db, "SELECT attempts::text AS value FROM event_outbox WHERE id = $1", id)
+            .await
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(-1)
+    }
+
+    async fn insert_outbox(
+        db: &DatabaseConnection,
+        status: &str,
+        attempts: i32,
+        available_at: &str,
+        leased_until: &str,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let statement = format!(
+            "INSERT INTO event_outbox (id, business_event_id, workspace_id, event_type, aggregate_type,
+                 aggregate_id, payload, status, attempts, max_attempts, available_at, leased_until)
+             VALUES ($1, gen_random_uuid(), gen_random_uuid(), 'form.record.created', 'form_record',
+                 'aggregate', '{{}}'::jsonb, $2, $3, 10, {available_at}, {leased_until})"
+        );
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            &statement,
+            vec![id.into(), status.to_string().into(), attempts.into()],
+        ))
+        .await
+        .expect("outbox fixture must insert");
+        id
+    }
+
+    async fn insert_connector(db: &DatabaseConnection, workspace_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO connectors (id, workspace_id, kind, name, endpoint, is_active)
+             VALUES ($1, $2, 'webhook', 'downstream', 'https://hooks.example.com/openpr', true)",
+            vec![id.into(), workspace_id.into()],
+        ))
+        .await
+        .expect("connector fixture must insert");
+        id
+    }
+
+    async fn insert_invocation(
+        db: &DatabaseConnection,
+        connector_id: Uuid,
+        workspace_id: Uuid,
+        status: &str,
+        result: &str,
+        age_minutes: i32,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let statement = format!(
+            "INSERT INTO agent_invocations (id, workspace_id, project_id, trigger_kind, connector_id,
+                 connector_kind, status, payload, result, audit_chain_id, created_at, updated_at)
+             VALUES ($1, $2, gen_random_uuid(), 'workflow', $3, 'webhook', $4, '{{}}'::jsonb, {result},
+                 gen_random_uuid(), now() - make_interval(mins => {age_minutes}),
+                 now() - make_interval(mins => {age_minutes}))"
+        );
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            &statement,
+            vec![
+                id.into(),
+                workspace_id.into(),
+                connector_id.into(),
+                status.to_string().into(),
+            ],
+        ))
+        .await
+        .expect("invocation fixture must insert");
+        id
+    }
+
+    async fn invocation_status(db: &DatabaseConnection, id: Uuid) -> String {
+        scalar(db, "SELECT status AS value FROM agent_invocations WHERE id = $1", id)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Exercises the outbox pickup against PostgreSQL: reclaim, budget, dead lettering and the
+    /// lease ownership that keeps a superseded worker from overwriting the row.
+    #[tokio::test]
+    async fn event_outbox_pickup_reclaims_expired_leases() {
+        let Some(test) = test_db().await else {
+            eprintln!("skipped: set OPENPR_TEST_DATABASE_URL to run the delivery SQL against PostgreSQL");
+            return;
+        };
+        let db = &test.db;
+
+        let fresh = insert_outbox(db, "pending", 0, "now()", "NULL").await;
+        let reclaimable = insert_outbox(db, "leased", 3, "now()", "now() - interval '1 minute'").await;
+        let exhausted = insert_outbox(db, "leased", 10, "now()", "now() - interval '1 minute'").await;
+        let held = insert_outbox(db, "leased", 1, "now()", "now() + interval '5 minutes'").await;
+        let backing_off = insert_outbox(db, "failed", 1, "now() + interval '5 minutes'", "NULL").await;
+        let done = insert_outbox(db, "dispatched", 1, "now()", "NULL").await;
+
+        let picked = pickup_pending_event_outbox(db, 50).await.expect("pickup must run");
+        let ids: Vec<Uuid> = picked.iter().map(|row| row.outbox_id).collect();
+
+        assert!(ids.contains(&fresh), "a fresh row must be dispatched");
+        assert!(ids.contains(&reclaimable), "an expired lease must be reclaimed");
+        assert!(
+            !ids.contains(&exhausted),
+            "a row out of budget must not be handed out again"
+        );
+        assert!(!ids.contains(&held), "a live lease belongs to its holder");
+        assert!(
+            !ids.contains(&backing_off),
+            "backoff that has not elapsed must be respected"
+        );
+        assert!(!ids.contains(&done), "a dispatched row is final");
+
+        assert_eq!(outbox_attempts(db, reclaimable).await, 4, "attempts only ever grow");
+        assert_eq!(
+            outbox_status(db, exhausted).await,
+            "failed",
+            "a spent budget must dead letter instead of staying invisible in 'leased'"
+        );
+        assert_eq!(outbox_status(db, held).await, "leased");
+
+        let lease = picked
+            .iter()
+            .find(|row| row.outbox_id == fresh)
+            .map(|row| row.lease_token)
+            .expect("the picked row carries its lease token");
+
+        // A worker whose lease was taken over must not be able to complete the row.
+        mark_event_outbox_dispatched(db, fresh, Uuid::new_v4(), 1)
+            .await
+            .expect("write must run");
+        assert_eq!(
+            outbox_status(db, fresh).await,
+            "leased",
+            "a stale lease cannot dispatch"
+        );
+        mark_event_outbox_failed(db, fresh, Uuid::new_v4(), "stale")
+            .await
+            .expect("write must run");
+        assert_eq!(
+            outbox_status(db, fresh).await,
+            "leased",
+            "a stale lease cannot fail the row"
+        );
+
+        mark_event_outbox_dispatched(db, fresh, lease, 2)
+            .await
+            .expect("write must run");
+        assert_eq!(outbox_status(db, fresh).await, "dispatched");
+
+        let lease = picked
+            .iter()
+            .find(|row| row.outbox_id == reclaimable)
+            .map(|row| row.lease_token)
+            .expect("the reclaimed row carries a new lease token");
+        mark_event_outbox_failed(db, reclaimable, lease, "downstream refused")
+            .await
+            .expect("write must run");
+        assert_eq!(outbox_status(db, reclaimable).await, "failed");
+
+        test.cleanup().await;
+    }
+
+    /// Exercises the connector delivery pickup against PostgreSQL: the backoff and lease windows,
+    /// the recovery of bookkeeping a connector bot wiped, and the lease guard on the outcome write.
+    #[tokio::test]
+    async fn connector_pickup_reclaims_leases_and_honours_backoff() {
+        let Some(test) = test_db().await else {
+            eprintln!("skipped: set OPENPR_TEST_DATABASE_URL to run the delivery SQL against PostgreSQL");
+            return;
+        };
+        let db = &test.db;
+        let workspace_id = Uuid::new_v4();
+        let connector_id = insert_connector(db, workspace_id).await;
+
+        let fresh = insert_invocation(db, connector_id, workspace_id, "pending", "NULL", 0).await;
+        let backing_off = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "pending",
+            "jsonb_build_object('connector_delivery', jsonb_build_object('next_attempt_at', to_jsonb(now() + interval '10 minutes')))",
+            0,
+        )
+        .await;
+        let due = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "pending",
+            "jsonb_build_object('connector_delivery', jsonb_build_object('attempts', 2, 'next_attempt_at', to_jsonb(now() - interval '1 minute')))",
+            0,
+        )
+        .await;
+        let held = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "jsonb_build_object('connector_delivery', jsonb_build_object('leased_until', to_jsonb(now() + interval '10 minutes')))",
+            0,
+        )
+        .await;
+        let expired = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "jsonb_build_object('connector_delivery', jsonb_build_object('leased_until', to_jsonb(now() - interval '1 minute')))",
+            0,
+        )
+        .await;
+        // A connector bot reported progress before the delivery ever happened: the bookkeeping is
+        // gone, the row is 'running' and nothing would ever look at it again.
+        let wiped = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "'{\"progress\": {}}'::jsonb",
+            20,
+        )
+        .await;
+        let wiped_recent = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "'{\"progress\": {}}'::jsonb",
+            1,
+        )
+        .await;
+        let already_delivered = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "'{\"connector_delivery\": {\"status\": \"delivered\"}}'::jsonb",
+            60,
+        )
+        .await;
+        let malformed = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "pending",
+            "'{\"connector_delivery\": {\"attempts\": \"not-a-number\", \"max_attempts\": [1, 2], \"next_attempt_at\": \"tomorrow please\"}}'::jsonb",
+            0,
+        )
+        .await;
+
+        let picked = pickup_pending_connector_invocations(db, 50)
+            .await
+            .expect("pickup must run");
+        let ids: Vec<Uuid> = picked.iter().map(|row| row.id).collect();
+
+        assert!(ids.contains(&fresh), "a delivery with no bookkeeping yet must be sent");
+        assert!(!ids.contains(&backing_off), "a backoff that has not elapsed must hold");
+        assert!(ids.contains(&due), "a delivery whose backoff elapsed must be retried");
+        assert!(!ids.contains(&held), "a live lease belongs to its holder");
+        assert!(ids.contains(&expired), "an expired lease must be reclaimed");
+        assert!(ids.contains(&wiped), "wiped bookkeeping must not swallow the delivery");
+        assert!(!ids.contains(&wiped_recent), "a row that just moved is not stale yet");
+        assert!(
+            !ids.contains(&already_delivered),
+            "a delivered payload must never be sent twice"
+        );
+        assert!(
+            ids.contains(&malformed),
+            "malformed bookkeeping must degrade, not abort"
+        );
+
+        let attempts = |id: Uuid| {
+            picked
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| (row.attempts, row.max_attempts))
+        };
+        assert_eq!(attempts(fresh), Some((1, CONNECTOR_DELIVERY_MAX_ATTEMPTS)));
+        assert_eq!(
+            attempts(due),
+            Some((3, CONNECTOR_DELIVERY_MAX_ATTEMPTS)),
+            "attempts carry forward"
+        );
+        assert_eq!(
+            attempts(malformed),
+            Some((1, CONNECTOR_DELIVERY_MAX_ATTEMPTS)),
+            "unusable counters fall back to the defaults"
+        );
+
+        let lease = picked
+            .iter()
+            .find(|row| row.id == fresh)
+            .map(|row| row.lease_token)
+            .expect("the picked delivery carries its lease token");
+        assert_eq!(invocation_status(db, fresh).await, "running");
+
+        update_connector_invocation_status(db, fresh, Uuid::new_v4(), "dispatched", None, None)
+            .await
+            .expect("write must run");
+        assert_eq!(
+            invocation_status(db, fresh).await,
+            "running",
+            "a worker that lost the lease must not record an outcome"
+        );
+
+        update_connector_invocation_status(db, fresh, lease, "dispatched", None, None)
+            .await
+            .expect("write must run");
+        assert_eq!(invocation_status(db, fresh).await, "dispatched");
+
+        test.cleanup().await;
     }
 
     #[test]

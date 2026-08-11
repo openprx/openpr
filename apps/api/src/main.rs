@@ -41,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState { cfg: cfg.clone(), db };
     let auth_state = state.clone();
     routes::proposal::start_governance_watcher(state.clone());
+    routes::webhook::spawn_stored_endpoint_audit(state.clone());
 
     // Uploaded object downloads are gated by `uploads_access_middleware`: it accepts either a
     // signed download URL or a normal session, and the handlers then scope the object to the
@@ -1985,6 +1986,10 @@ async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
         (
             "0047_form_attachment_media_metadata.sql",
             include_str!("../../../migrations/0047_form_attachment_media_metadata.sql"),
+        ),
+        (
+            "0048_delivery_lease_and_pickup_indexes.sql",
+            include_str!("../../../migrations/0048_delivery_lease_and_pickup_indexes.sql"),
         ),
     ];
 

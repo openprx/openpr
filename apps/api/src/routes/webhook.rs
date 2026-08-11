@@ -849,6 +849,78 @@ async fn get_bot_agent_type_by_id(state: &AppState, bot_id: Uuid) -> Result<Opti
     }
 }
 
+/// Endpoint audit for webhook rows that predate outbound validation.
+///
+/// `create_webhook` and `update_webhook` validate the endpoint, but rows stored before that check
+/// existed were never validated, and the legacy trigger path delivers to whatever URL a row holds.
+/// Rewriting or deactivating those rows automatically would silently break working integrations, so
+/// the audit only names them: one warning per offending webhook plus a summary, at startup.
+pub fn spawn_stored_endpoint_audit(state: AppState) {
+    tokio::spawn(async move {
+        match audit_stored_endpoints(&state).await {
+            Ok(0) => tracing::info!("stored webhook endpoints passed outbound validation"),
+            Ok(rejected) => tracing::warn!(
+                rejected,
+                "stored webhook endpoints would be refused by outbound validation, legacy deliveries to them are unprotected"
+            ),
+            Err(err) => tracing::warn!(error = %err, "stored webhook endpoint audit could not run"),
+        }
+    });
+}
+
+/// Returns how many active webhook endpoints fail the current outbound validation.
+async fn audit_stored_endpoints(state: &AppState) -> Result<usize, ApiError> {
+    #[derive(FromQueryResult)]
+    struct StoredEndpointRow {
+        id: Uuid,
+        workspace_id: Uuid,
+        url: String,
+    }
+
+    let rows = StoredEndpointRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id, workspace_id, url FROM webhooks WHERE active = true",
+        vec![],
+    ))
+    .all(&state.db)
+    .await?;
+
+    let mut rejected = 0;
+    for row in rows {
+        // The URL can carry a token in its path or query, so only the host reaches the log line.
+        let host = reqwest::Url::parse(row.url.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(ToString::to_string))
+            .unwrap_or_else(|| "unparseable".to_string());
+        match tokio::time::timeout(STORED_ENDPOINT_AUDIT_TIMEOUT, validate_outbound_url(&row.url)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                rejected += 1;
+                tracing::warn!(
+                    webhook_id = %row.id,
+                    workspace_id = %row.workspace_id,
+                    host = %host,
+                    error = %error,
+                    "stored webhook endpoint fails outbound validation"
+                );
+            }
+            Err(_) => {
+                rejected += 1;
+                tracing::warn!(
+                    webhook_id = %row.id,
+                    workspace_id = %row.workspace_id,
+                    host = %host,
+                    "stored webhook endpoint could not be validated within the audit timeout"
+                );
+            }
+        }
+    }
+    Ok(rejected)
+}
+
+/// Per endpoint budget for [`audit_stored_endpoints`], which resolves DNS.
+const STORED_ENDPOINT_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn generate_secret() -> String {
     use rand::Rng;
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
