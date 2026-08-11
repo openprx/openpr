@@ -4916,6 +4916,23 @@ fn child_aggregate_field_value(field: &FormField, value: Decimal) -> Result<Valu
     }
 }
 
+/// Parents to recalculate after a child record changed. The child is joined on its uuid primary key
+/// (guarded by a uuid shaped `target_id`) like the child aggregates are, so the lookup stays
+/// indexable instead of casting every `form_records.id` to text.
+const RECALCULATE_PARENT_RECORDS_SQL: &str = r"
+    SELECT links.source_record_id
+    FROM form_record_links links
+    JOIN form_records parent ON parent.id = links.source_record_id
+    JOIN form_records child
+      ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
+     AND child.id = links.target_id::uuid
+    WHERE links.target_type = 'form_record'
+      AND links.relation_type = 'parent_child'
+      AND links.target_id = $1
+      AND parent.workspace_id = child.workspace_id
+      AND parent.project_id = child.project_id
+";
+
 async fn recalculate_parent_records_for_child(
     state: &AppState,
     child_record_id: Uuid,
@@ -4923,19 +4940,7 @@ async fn recalculate_parent_records_for_child(
 ) -> Result<(), ApiError> {
     let parents = ParentRecordRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
-            SELECT links.source_record_id
-            FROM form_record_links links
-            JOIN form_records parent ON parent.id = links.source_record_id
-            JOIN form_records child
-              ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
-             AND child.id = links.target_id::uuid
-            WHERE links.target_type = 'form_record'
-              AND links.relation_type = 'parent_child'
-              AND links.target_id = $1
-              AND parent.workspace_id = child.workspace_id
-              AND parent.project_id = child.project_id
-        ",
+        RECALCULATE_PARENT_RECORDS_SQL,
         vec![child_record_id.to_string().into()],
     ))
     .all(&state.db)
@@ -6937,11 +6942,12 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
 mod tests {
     use super::{
         AttachmentPackageArtifact, BusinessEventResponse, CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL,
-        EventScope, ImportRecordsFileRequest, attachment_claimed_object_keys, default_form_key_from_template,
-        default_title_template_from_schema, ensure_can_read_job_result, ensure_link_target_scope,
-        filter_event_response_values, import_records_request_from_uploaded_file_without_mapping,
-        job_listing_owner_filter, normalize_scenario_field_schema, owned_record_event_predicate,
-        push_event_scope_filters, summarize_job_result, write_attachment_package_artifact,
+        EventScope, ImportRecordsFileRequest, RECALCULATE_PARENT_RECORDS_SQL, attachment_claimed_object_keys,
+        default_form_key_from_template, default_title_template_from_schema, ensure_can_read_job_result,
+        ensure_link_target_scope, filter_event_response_values,
+        import_records_request_from_uploaded_file_without_mapping, job_listing_owner_filter,
+        normalize_scenario_field_schema, owned_record_event_predicate, push_event_scope_filters, summarize_job_result,
+        write_attachment_package_artifact,
     };
     use crate::{
         error::ApiError,
@@ -6981,6 +6987,28 @@ mod tests {
                 "missing workspace filter: {sql}"
             );
             assert!(sql.contains("child.project_id = $"), "missing project filter: {sql}");
+        }
+    }
+
+    #[test]
+    fn record_link_joins_never_cast_a_record_id_to_text() {
+        for sql in [
+            CHILD_AGGREGATE_COUNT_SQL,
+            CHILD_AGGREGATE_DECIMAL_SQL,
+            RECALCULATE_PARENT_RECORDS_SQL,
+        ] {
+            assert!(
+                !sql.contains("child.id::text"),
+                "casting the record id to text drops the primary key index: {sql}"
+            );
+            assert!(
+                sql.contains("child.id = links.target_id::uuid"),
+                "child records must be joined on their uuid primary key: {sql}"
+            );
+            assert!(
+                sql.contains("links.target_id ~ '^[0-9a-fA-F-]{36}$'"),
+                "the uuid cast must stay guarded: {sql}"
+            );
         }
     }
 
