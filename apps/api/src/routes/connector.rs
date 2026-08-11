@@ -1,12 +1,16 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
     response::IntoResponse,
 };
+use hmac::{Hmac, Mac};
 use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::{
@@ -304,6 +308,11 @@ pub async fn create_connector(
         req.capability_manifest.unwrap_or_else(|| json!({})),
         "capability_manifest",
     )?;
+    // A connector created through this endpoint is never linked to a legacy webhook secret.
+    validate_connector_auth_policy(&auth_policy, false)?;
+    if let Some(endpoint) = req.endpoint.as_deref() {
+        validate_connector_endpoint(endpoint).await?;
+    }
     let connector_id = Uuid::new_v4();
     let created_by = if is_bot { None } else { Some(actor_id) };
     let tx = state.db.begin().await?;
@@ -378,6 +387,12 @@ pub async fn update_connector(
     let existing = find_connector(&state, workspace_id, connector_id).await?;
     if let Some(project_id) = req.project_id {
         ensure_project_in_workspace(&state, workspace_id, project_id).await?;
+    }
+    if let Some(auth_policy) = req.auth_policy.as_ref() {
+        validate_connector_auth_policy(auth_policy, existing.webhook_id.is_some())?;
+    }
+    if let Some(endpoint) = req.endpoint.as_deref() {
+        validate_connector_endpoint(endpoint).await?;
     }
 
     let mut set_parts = Vec::new();
@@ -1982,17 +1997,321 @@ fn ensure_json_object(value: Value, field: &str) -> Result<Value, ApiError> {
     }
 }
 
+/// Header carrying `sha256=<lowercase hex>` HMAC-SHA256 over the exact request body.
+pub const DELIVERY_SIGNATURE_HEADER: &str = "X-Webhook-Signature";
+/// Header carrying the business event type of the delivery.
+pub const DELIVERY_EVENT_HEADER: &str = "X-Webhook-Event";
+/// Header carrying the invocation id, stable across delivery retries.
+pub const DELIVERY_ID_HEADER: &str = "X-Webhook-Delivery";
+/// Comma separated hosts (`host` or `host:port`) exempt from the private address checks.
+pub const OUTBOUND_ALLOWED_HOSTS_ENV: &str = "OPENPR_OUTBOUND_ALLOWED_HOSTS";
+/// Set to `1`/`true` to disable outbound private address checks entirely.
+pub const OUTBOUND_ALLOW_PRIVATE_ENV: &str = "OPENPR_OUTBOUND_ALLOW_PRIVATE";
+
+/// Authentication mode a connector declares in `auth_policy.mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorAuthMode {
+    None,
+    Hmac,
+    Bearer,
+}
+
+impl ConnectorAuthMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Hmac => "hmac",
+            Self::Bearer => "bearer",
+        }
+    }
+}
+
+/// Where the delivery credential is read from. Never holds the credential itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorCredentialSource {
+    WebhookSecret,
+    Env(String),
+}
+
+/// Declared authentication behaviour resolved from `connectors.auth_policy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectorAuthPlan {
+    pub mode: ConnectorAuthMode,
+    pub source: Option<ConnectorCredentialSource>,
+}
+
+/// Resolves the effective delivery authentication from a connector `auth_policy`.
+///
+/// The declared mode and the runtime behaviour are kept in sync: a policy that declares
+/// `hmac`/`bearer` without a usable credential source is rejected instead of silently
+/// downgrading to an unsigned delivery.
+pub fn connector_auth_plan(auth_policy: &Value, webhook_linked: bool) -> Result<ConnectorAuthPlan, String> {
+    if ["secret", "token", "password"]
+        .iter()
+        .any(|key| auth_policy.get(*key).is_some())
+    {
+        return Err("auth_policy must not store raw secrets, use secret_ref = \"env:NAME\"".to_string());
+    }
+
+    let mode = auth_policy
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let reference = auth_policy
+        .get("secret_ref")
+        .or_else(|| auth_policy.get("token_ref"))
+        .and_then(Value::as_str);
+    let source = match reference {
+        Some(raw) => Some(parse_credential_ref(raw)?),
+        None if webhook_linked => Some(ConnectorCredentialSource::WebhookSecret),
+        None => None,
+    };
+
+    match mode.as_str() {
+        "" => Ok(source.map_or(
+            ConnectorAuthPlan {
+                mode: ConnectorAuthMode::None,
+                source: None,
+            },
+            |source| ConnectorAuthPlan {
+                mode: ConnectorAuthMode::Hmac,
+                source: Some(source),
+            },
+        )),
+        "none" | "unsigned" => Ok(ConnectorAuthPlan {
+            mode: ConnectorAuthMode::None,
+            source: None,
+        }),
+        "hmac" | "hmac_sha256" | "hmac-sha256" => Ok(ConnectorAuthPlan {
+            mode: ConnectorAuthMode::Hmac,
+            source: Some(source.ok_or_else(|| {
+                "auth_policy mode hmac requires secret_ref = \"env:NAME\" or a linked webhook secret".to_string()
+            })?),
+        }),
+        "bearer" | "token" => match source {
+            Some(ConnectorCredentialSource::Env(name)) => Ok(ConnectorAuthPlan {
+                mode: ConnectorAuthMode::Bearer,
+                source: Some(ConnectorCredentialSource::Env(name)),
+            }),
+            _ => Err("auth_policy mode bearer requires token_ref = \"env:NAME\"".to_string()),
+        },
+        other => Err(format!("unsupported auth_policy mode {other}")),
+    }
+}
+
+fn parse_credential_ref(raw: &str) -> Result<ConnectorCredentialSource, String> {
+    let Some(name) = raw.trim().strip_prefix("env:") else {
+        return Err("credential reference must use the env:NAME form".to_string());
+    };
+    let name = name.trim();
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !name.starts_with(|c: char| c.is_ascii_digit());
+    if !valid {
+        return Err("credential reference env name must match [A-Z_][A-Z0-9_]*".to_string());
+    }
+    Ok(ConnectorCredentialSource::Env(name.to_string()))
+}
+
+/// Reads the credential for a resolved source. The returned value must never be logged.
+pub fn resolve_connector_credential(
+    source: &ConnectorCredentialSource,
+    webhook_secret: Option<&str>,
+) -> Result<String, String> {
+    match source {
+        ConnectorCredentialSource::WebhookSecret => webhook_secret
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(ToString::to_string)
+            .ok_or_else(|| "linked webhook secret is not configured".to_string()),
+        ConnectorCredentialSource::Env(name) => match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => Ok(value),
+            Ok(_) => Err(format!("credential env var {name} is empty")),
+            Err(_) => Err(format!("credential env var {name} is not set")),
+        },
+    }
+}
+
+/// HMAC-SHA256 of the raw delivery body, lowercase hex encoded.
+pub fn sign_delivery_body(secret: &str, body: &[u8]) -> Result<String, String> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|err| format!("invalid signing secret: {err}"))?;
+    mac.update(body);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Value of [`DELIVERY_SIGNATURE_HEADER`], identical in shape to the legacy webhook path.
+pub fn delivery_signature_header_value(secret: &str, body: &[u8]) -> Result<String, String> {
+    Ok(format!("sha256={}", sign_delivery_body(secret, body)?))
+}
+
+fn outbound_allowlist() -> String {
+    std::env::var(OUTBOUND_ALLOWED_HOSTS_ENV).unwrap_or_default()
+}
+
+fn outbound_private_targets_allowed() -> bool {
+    std::env::var(OUTBOUND_ALLOW_PRIVATE_ENV)
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+/// Matches a host (optionally with port) against a comma separated allowlist.
+pub fn host_is_allowlisted(host: &str, port: Option<u16>, allowlist: &str) -> bool {
+    let host = normalize_host(host);
+    allowlist
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            let entry = entry.to_ascii_lowercase();
+            match entry.rsplit_once(':') {
+                Some((entry_host, entry_port))
+                    if !entry_port.is_empty() && entry_port.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    normalize_host(entry_host) == host && port.is_some_and(|value| value.to_string() == entry_port)
+                }
+                _ => normalize_host(&entry) == host,
+            }
+        })
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// Rejects addresses that must never be reachable from a user supplied endpoint.
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || (first == 100 && (64..128).contains(&second))
+        || (first == 192 && second == 0)
+        || (first == 198 && (18..20).contains(&second))
+        || first >= 240
+}
+
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_blocked_ipv4(mapped);
+    }
+    let [first, ..] = ip.segments();
+    ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00
+        || (first & 0xffc0) == 0xfe80
+}
+
+fn literal_host_ip(host: &str) -> Option<IpAddr> {
+    normalize_host(host).parse::<IpAddr>().ok()
+}
+
+/// Scheme, credential and literal address checks. Does not perform DNS resolution.
+pub fn parse_outbound_url(raw: &str) -> Result<reqwest::Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("endpoint must not be empty".to_string());
+    }
+    let url = reqwest::Url::parse(trimmed).map_err(|err| format!("endpoint is not a valid absolute URL: {err}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "endpoint scheme {} is not allowed, use http or https",
+            url.scheme()
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("endpoint must not embed credentials".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "endpoint must contain a host".to_string())?
+        .to_string();
+
+    if outbound_private_targets_allowed()
+        || host_is_allowlisted(&host, url.port_or_known_default(), &outbound_allowlist())
+    {
+        return Ok(url);
+    }
+    if literal_host_ip(&host).is_some_and(is_blocked_ip) {
+        return Err(format!("endpoint host {host} points at a blocked address"));
+    }
+    Ok(url)
+}
+
+/// Full outbound target validation: scheme/credential checks plus DNS resolution of the host.
+///
+/// Hosts listed in [`OUTBOUND_ALLOWED_HOSTS_ENV`] (for example the in-cluster service names used
+/// by the compose deployment) skip the address checks.
+pub async fn validate_outbound_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = parse_outbound_url(raw)?;
+    if outbound_private_targets_allowed() {
+        return Ok(url);
+    }
+    let host = url.host_str().unwrap_or_default().to_string();
+    let port = url.port_or_known_default();
+    if host_is_allowlisted(&host, port, &outbound_allowlist()) || literal_host_ip(&host).is_some() {
+        return Ok(url);
+    }
+
+    let addresses = tokio::net::lookup_host((host.as_str(), port.unwrap_or(443)))
+        .await
+        .map_err(|err| format!("endpoint host {host} could not be resolved: {err}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!("endpoint host {host} could not be resolved"));
+    }
+    if addresses.iter().any(|address| is_blocked_ip(address.ip())) {
+        return Err(format!("endpoint host {host} resolves to a blocked address"));
+    }
+    Ok(url)
+}
+
+async fn validate_connector_endpoint(endpoint: &str) -> Result<(), ApiError> {
+    validate_outbound_url(endpoint)
+        .await
+        .map(|_| ())
+        .map_err(ApiError::BadRequest)
+}
+
+fn validate_connector_auth_policy(auth_policy: &Value, webhook_linked: bool) -> Result<(), ApiError> {
+    connector_auth_plan(auth_policy, webhook_linked)
+        .map(|_| ())
+        .map_err(ApiError::BadRequest)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
 
+    use std::net::IpAddr;
+
     use super::{
-        InvocationResponse, ReceiptIdempotencyRow, normalize_connector_kind, normalize_invocation_status,
-        normalize_receipt_idempotency_key, normalize_receipt_status, normalize_tool_call_status, normalize_tool_name,
-        normalize_tool_transport, normalize_trigger_kind, truncate_string, validate_connector_receipt_target,
-        validate_receipt_idempotency_replay,
+        ConnectorAuthMode, ConnectorCredentialSource, InvocationResponse, ReceiptIdempotencyRow, connector_auth_plan,
+        delivery_signature_header_value, host_is_allowlisted, is_blocked_ip, normalize_connector_kind,
+        normalize_invocation_status, normalize_receipt_idempotency_key, normalize_receipt_status,
+        normalize_tool_call_status, normalize_tool_name, normalize_tool_transport, normalize_trigger_kind,
+        parse_outbound_url, resolve_connector_credential, sign_delivery_body, truncate_string,
+        validate_connector_receipt_target, validate_receipt_idempotency_replay,
     };
 
     fn invocation_with_connector() -> InvocationResponse {
@@ -2153,6 +2472,134 @@ mod tests {
     fn tool_call_summary_truncation_is_character_safe() {
         assert_eq!(truncate_string("abcdef".to_string(), 3), "abc");
         assert_eq!(truncate_string("好好好".to_string(), 2), "好好");
+    }
+
+    #[test]
+    fn delivery_signature_matches_hmac_sha256_reference_vector() {
+        // RFC-style reference vector, also proves the `sha256=<hex>` header shape.
+        let signature = sign_delivery_body("key", b"The quick brown fox jumps over the lazy dog").unwrap();
+        assert_eq!(
+            signature,
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+        assert_eq!(
+            delivery_signature_header_value("key", b"The quick brown fox jumps over the lazy dog").unwrap(),
+            format!("sha256={signature}")
+        );
+    }
+
+    #[test]
+    fn delivery_signature_covers_the_exact_body_bytes() {
+        let body = br#"{"event":"form.record.created"}"#;
+        let tampered = br#"{"event":"form.record.updated"}"#;
+        assert_ne!(
+            sign_delivery_body("s3cret", body).unwrap(),
+            sign_delivery_body("s3cret", tampered).unwrap()
+        );
+        assert_ne!(
+            sign_delivery_body("s3cret", body).unwrap(),
+            sign_delivery_body("other", body).unwrap()
+        );
+    }
+
+    #[test]
+    fn auth_plan_declares_only_modes_it_can_perform() {
+        let webhook_linked = connector_auth_plan(&json!({ "mode": "hmac", "legacy_webhook": true }), true).unwrap();
+        assert_eq!(webhook_linked.mode, ConnectorAuthMode::Hmac);
+        assert_eq!(webhook_linked.source, Some(ConnectorCredentialSource::WebhookSecret));
+
+        // hmac without any credential source must be rejected instead of delivering unsigned.
+        assert!(connector_auth_plan(&json!({ "mode": "hmac" }), false).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "bearer" }), true).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "mtls" }), false).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret": "inline" }), false).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "vault:x" }), false).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "env:bad-name" }), false).is_err());
+
+        let env_backed =
+            connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "env:OPENPR_TEST" }), false).unwrap();
+        assert_eq!(
+            env_backed.source,
+            Some(ConnectorCredentialSource::Env("OPENPR_TEST".to_string()))
+        );
+
+        let empty = connector_auth_plan(&json!({}), false).unwrap();
+        assert_eq!(empty.mode, ConnectorAuthMode::None);
+        assert_eq!(
+            connector_auth_plan(&json!({}), true).unwrap().mode,
+            ConnectorAuthMode::Hmac
+        );
+        assert_eq!(
+            connector_auth_plan(&json!({ "mode": "none" }), true).unwrap().mode,
+            ConnectorAuthMode::None
+        );
+    }
+
+    #[test]
+    fn credential_resolution_requires_a_configured_secret() {
+        assert_eq!(
+            resolve_connector_credential(&ConnectorCredentialSource::WebhookSecret, Some(" top-secret ")).unwrap(),
+            "top-secret"
+        );
+        assert!(resolve_connector_credential(&ConnectorCredentialSource::WebhookSecret, Some("  ")).is_err());
+        assert!(resolve_connector_credential(&ConnectorCredentialSource::WebhookSecret, None).is_err());
+        assert!(
+            resolve_connector_credential(
+                &ConnectorCredentialSource::Env("OPENPR_ABSENT_TEST_SECRET".to_string()),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn outbound_urls_reject_private_and_non_http_targets() {
+        assert!(parse_outbound_url("http://127.0.0.1/hook").is_err());
+        assert!(parse_outbound_url("http://[::1]/hook").is_err());
+        assert!(parse_outbound_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(parse_outbound_url("http://10.89.0.1:8080/hook").is_err());
+        assert!(parse_outbound_url("http://192.168.1.10/hook").is_err());
+        assert!(parse_outbound_url("http://0.0.0.0/hook").is_err());
+        assert!(parse_outbound_url("file:///etc/passwd").is_err());
+        assert!(parse_outbound_url("gopher://example.com/x").is_err());
+        assert!(parse_outbound_url("http://user:pass@example.com/hook").is_err());
+        assert!(parse_outbound_url("not-a-url").is_err());
+        assert!(parse_outbound_url("   ").is_err());
+        assert!(parse_outbound_url("https://hooks.example.com/openpr").is_ok());
+    }
+
+    #[test]
+    fn blocked_ip_ranges_cover_loopback_private_and_metadata_addresses() {
+        for raw in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+        ] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(is_blocked_ip(ip), "{raw} must be blocked");
+        }
+        for raw in ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(!is_blocked_ip(ip), "{raw} must be allowed");
+        }
+    }
+
+    #[test]
+    fn allowlist_matches_deployment_internal_service_names() {
+        assert!(host_is_allowlisted("api", Some(8080), "api,webhook"));
+        assert!(host_is_allowlisted("API", Some(8080), " api , webhook "));
+        assert!(host_is_allowlisted("api", Some(8080), "api:8080"));
+        assert!(!host_is_allowlisted("api", Some(9090), "api:8080"));
+        assert!(!host_is_allowlisted("evil.example.com", Some(443), "api,webhook"));
+        assert!(!host_is_allowlisted("api", Some(8080), ""));
     }
 
     #[test]
