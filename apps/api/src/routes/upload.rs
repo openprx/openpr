@@ -14,7 +14,7 @@ use sea_orm::{DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
-use std::{convert::Infallible, io::Cursor};
+use std::{collections::BTreeSet, convert::Infallible, io::Cursor};
 use uuid::Uuid;
 
 use crate::{
@@ -134,7 +134,14 @@ impl UploadAccess {
             UploadAccessMode::SignedUrl => return Ok(()),
             UploadAccessMode::Session(claims) => claims,
         };
-        let workspace_id = resolve_upload_object_workspace(state, object_key).await?;
+        let workspace_id = match resolve_upload_object_owner(state, object_key).await? {
+            UploadObjectOwner::Unowned => None,
+            UploadObjectOwner::Owned(workspace_id) => Some(workspace_id),
+            // More than one workspace claims the object, so no membership check can be trusted.
+            UploadObjectOwner::Ambiguous => {
+                return Err(ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()));
+            }
+        };
         self.authorize_owner_workspace(state, claims, workspace_id).await
     }
 
@@ -783,15 +790,43 @@ pub(crate) fn upload_object_key_from_path(path: &str) -> Option<String> {
     Some(directory.map_or_else(|| file_name.to_string(), |directory| format!("{directory}{file_name}")))
 }
 
+/// The workspace an upload object belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadObjectOwner {
+    /// No row records ownership of the object (generic markdown uploads).
+    Unowned,
+    /// Exactly one workspace claims the object.
+    Owned(Uuid),
+    /// Several workspaces claim the object, so ownership cannot decide access.
+    Ambiguous,
+}
+
+impl UploadObjectOwner {
+    fn from_workspace_ids(workspace_ids: Vec<Uuid>) -> Self {
+        let mut distinct = workspace_ids.into_iter().collect::<BTreeSet<_>>().into_iter();
+        match (distinct.next(), distinct.next()) {
+            (None, _) => Self::Unowned,
+            (Some(workspace_id), None) => Self::Owned(workspace_id),
+            (Some(_), Some(_)) => Self::Ambiguous,
+        }
+    }
+}
+
 /// Resolve the workspace that owns `object_key`, when that ownership is recorded.
 ///
 /// Objects uploaded through the generic markdown upload endpoint have no ownership row, so
-/// `None` is returned for them and the caller falls back to "any authenticated actor".
-async fn resolve_upload_object_workspace(state: &AppState, object_key: &str) -> Result<Option<Uuid>, ApiError> {
+/// `Unowned` is returned for them and the caller falls back to "any authenticated actor". A key
+/// claimed by more than one workspace resolves to `Ambiguous`: `LIMIT 1` without `ORDER BY` used to
+/// pick an arbitrary row here, which let an attacker register an attachment pointing at somebody
+/// else's object and have the access check land on their own workspace.
+pub(crate) async fn resolve_upload_object_owner(
+    state: &AppState,
+    object_key: &str,
+) -> Result<UploadObjectOwner, ApiError> {
     if let Some(file_name) = object_key.strip_prefix("signatures/") {
-        return resolve_signature_object_workspace(state, file_name).await;
+        return resolve_signature_object_owner(state, file_name).await;
     }
-    resolve_attachment_object_workspace(state, object_key).await
+    resolve_attachment_object_owner(state, object_key).await
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -800,15 +835,15 @@ struct WorkspaceIdRow {
 }
 
 /// Look up the owning workspace of a form attachment source file or one of its derivatives.
-async fn resolve_attachment_object_workspace(state: &AppState, object_key: &str) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_attachment_object_owner(state: &AppState, object_key: &str) -> Result<UploadObjectOwner, ApiError> {
     let api_url = format!("/api/v1/uploads/{object_key}");
     let legacy_url = format!("/uploads/{object_key}");
     let thumbnail_match = json!({ "thumbnail": { "object_key": object_key } }).to_string();
     let preview_match = json!({ "preview": { "object_key": object_key } }).to_string();
     let variant_match = json!({ "variants": [{ "policy": { "object_key": object_key } }] }).to_string();
-    let row = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+    let rows = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"SELECT workspace_id
+        r"SELECT DISTINCT workspace_id
             FROM form_attachments
            WHERE storage_key = $1
               OR url IN ($2, $3)
@@ -816,7 +851,7 @@ async fn resolve_attachment_object_workspace(state: &AppState, object_key: &str)
               OR media_metadata @> $4::text::jsonb
               OR media_metadata @> $5::text::jsonb
               OR media_metadata @> $6::text::jsonb
-           LIMIT 1",
+           LIMIT 2",
         vec![
             object_key.to_string().into(),
             api_url.into(),
@@ -826,31 +861,35 @@ async fn resolve_attachment_object_workspace(state: &AppState, object_key: &str)
             variant_match.into(),
         ],
     ))
-    .one(&state.db)
+    .all(&state.db)
     .await?;
-    Ok(row.map(|row| row.workspace_id))
+    Ok(UploadObjectOwner::from_workspace_ids(
+        rows.into_iter().map(|row| row.workspace_id).collect(),
+    ))
 }
 
 /// Look up the owning workspace of a materialized signature image.
 ///
 /// Signature values are stored on the record itself, so the record that currently references the
 /// image identifies the tenant. The lookup rides the `gin(values jsonb_path_ops)` index.
-async fn resolve_signature_object_workspace(state: &AppState, file_name: &str) -> Result<Option<Uuid>, ApiError> {
+async fn resolve_signature_object_owner(state: &AppState, file_name: &str) -> Result<UploadObjectOwner, ApiError> {
     let Some(field_key) = signature_field_key_from_file_name(file_name) else {
-        return Ok(None);
+        return Ok(UploadObjectOwner::Unowned);
     };
     let value_match = json!({ field_key: format!("/api/v1/uploads/signatures/{file_name}") }).to_string();
-    let row = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+    let rows = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"SELECT workspace_id
+        r#"SELECT DISTINCT workspace_id
              FROM form_records
             WHERE form_records."values" @> $1::text::jsonb
-            LIMIT 1"#,
+            LIMIT 2"#,
         vec![value_match.into()],
     ))
-    .one(&state.db)
+    .all(&state.db)
     .await?;
-    Ok(row.map(|row| row.workspace_id))
+    Ok(UploadObjectOwner::from_workspace_ids(
+        rows.into_iter().map(|row| row.workspace_id).collect(),
+    ))
 }
 
 /// Extract the form field key from a materialized signature file name
@@ -978,6 +1017,26 @@ mod tests {
             }),
             signed: false,
         }
+    }
+
+    #[test]
+    fn object_ownership_stays_undecided_when_two_workspaces_claim_the_same_key() {
+        let victim = Uuid::new_v4();
+        let attacker = Uuid::new_v4();
+
+        assert_eq!(
+            UploadObjectOwner::from_workspace_ids(vec![victim, attacker]),
+            UploadObjectOwner::Ambiguous,
+            "a claimed object must never resolve to an arbitrary row"
+        );
+        assert_eq!(
+            UploadObjectOwner::from_workspace_ids(vec![victim, victim]),
+            UploadObjectOwner::Owned(victim)
+        );
+        assert_eq!(
+            UploadObjectOwner::from_workspace_ids(Vec::new()),
+            UploadObjectOwner::Unowned
+        );
     }
 
     #[test]

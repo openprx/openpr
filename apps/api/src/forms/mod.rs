@@ -2,6 +2,7 @@ pub mod attachment_media;
 pub mod attachment_package;
 pub mod calculation;
 pub mod decimal;
+pub mod event_redaction;
 pub mod job_context;
 pub mod permissions;
 pub mod projections;
