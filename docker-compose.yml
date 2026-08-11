@@ -45,6 +45,14 @@ services:
       OPENPR_OBJECT_STORAGE_S3_ACCESS_KEY_ID: ${OPENPR_OBJECT_STORAGE_S3_ACCESS_KEY_ID:-}
       OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY: ${OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY:-}
       OPENPR_OBJECT_STORAGE_S3_SESSION_TOKEN: ${OPENPR_OBJECT_STORAGE_S3_SESSION_TOKEN:-}
+      # Outbound delivery targets. Connector and webhook endpoints resolving to a private address
+      # are refused unless the host is listed here; the defaults keep the in-compose services
+      # (including the optional `webhook` connector receiver) reachable out of the box.
+      OPENPR_OUTBOUND_ALLOWED_HOSTS: ${OPENPR_OUTBOUND_ALLOWED_HOSTS:-webhook:9090,api:8080,mcp-server:8090,frontend:80}
+      OPENPR_OUTBOUND_ALLOW_PRIVATE: ${OPENPR_OUTBOUND_ALLOW_PRIVATE:-}
+      # Connector credentials referenced as `env:OPENPR_CONNECTOR_SECRET_*` in `auth_policy`.
+      # Add one variable per connector secret; no other environment variable can be referenced.
+      OPENPR_CONNECTOR_SECRET_DEFAULT: ${OPENPR_CONNECTOR_SECRET_DEFAULT:-}
     ports:
       - "${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_API_PORT:-8081}:8080"
     volumes:
@@ -84,6 +92,14 @@ services:
       OPENPR_OBJECT_STORAGE_S3_ACCESS_KEY_ID: ${OPENPR_OBJECT_STORAGE_S3_ACCESS_KEY_ID:-}
       OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY: ${OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY:-}
       OPENPR_OBJECT_STORAGE_S3_SESSION_TOKEN: ${OPENPR_OBJECT_STORAGE_S3_SESSION_TOKEN:-}
+      # Outbound delivery targets. Connector and webhook endpoints resolving to a private address
+      # are refused unless the host is listed here; the defaults keep the in-compose services
+      # (including the optional `webhook` connector receiver) reachable out of the box.
+      OPENPR_OUTBOUND_ALLOWED_HOSTS: ${OPENPR_OUTBOUND_ALLOWED_HOSTS:-webhook:9090,api:8080,mcp-server:8090,frontend:80}
+      OPENPR_OUTBOUND_ALLOW_PRIVATE: ${OPENPR_OUTBOUND_ALLOW_PRIVATE:-}
+      # Connector credentials referenced as `env:OPENPR_CONNECTOR_SECRET_*` in `auth_policy`.
+      # Add one variable per connector secret; no other environment variable can be referenced.
+      OPENPR_CONNECTOR_SECRET_DEFAULT: ${OPENPR_CONNECTOR_SECRET_DEFAULT:-}
     depends_on:
       postgres:
         condition: service_healthy

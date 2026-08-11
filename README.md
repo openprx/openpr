@@ -74,6 +74,17 @@ REGION, ACCESS_KEY_ID, SECRET_ACCESS_KEY, SESSION_TOKEN}`. mcp-server:
 (transport label in tool payloads, default `mcp_stdio`). All binaries read
 `RUST_LOG` as the `tracing` env filter.
 
+**Outbound deliveries (api + worker).** Connector and webhook endpoints are
+validated when they are configured and again before every delivery: an endpoint
+whose host resolves to a loopback, private, link-local, NAT64/6to4 or otherwise
+internal address is refused, and redirects are not followed.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OPENPR_OUTBOUND_ALLOWED_HOSTS` | compose sets `webhook:9090,api:8080,mcp-server:8090,frontend:80` | Comma separated `host` or `host:port` entries exempt from the private address checks. Internal receivers (compose services, in-cluster bots) must be listed here or their deliveries are rejected. |
+| `OPENPR_OUTBOUND_ALLOW_PRIVATE` | unset (checks on) | `1`/`true`/`yes` disables the private address checks entirely. Only for a fully trusted network. |
+| `OPENPR_CONNECTOR_SECRET_*` | unset | Credentials a connector `auth_policy` may reference as `{"mode":"bearer","token_ref":"env:OPENPR_CONNECTOR_SECRET_MYHOOK"}`. Only this prefix can be referenced, so a connector cannot be pointed at `JWT_SECRET`, `DATABASE_URL`, `POSTGRES_*`, `AWS_*` or `OPENPR_OBJECT_STORAGE_*`. Container deployments must add each variable to the api and worker environment in `docker-compose.yml`. |
+
 **Consumed only by docker-compose**, never by Rust code: `OPENPR_BIND_HOST`
 (default `127.0.0.1`), `OPENPR_API_PORT`, `OPENPR_FRONTEND_PORT`,
 `MCP_SERVER_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
