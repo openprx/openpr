@@ -2029,111 +2029,264 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ),
 ];
 
-async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
-    let Some((ledger_name, ledger_sql)) = MIGRATIONS.first() else {
-        return Err(anyhow::anyhow!("migration list is empty, refusing to start"));
-    };
-
-    // The ledger bootstrap is idempotent by construction, so it is the one file that may run on
-    // every start: nothing can be read from or written to the ledger before it exists.
-    apply_migration(db, ledger_name, ledger_sql)
-        .await
-        .map_err(|err| anyhow::anyhow!("migration ledger bootstrap failed: {err}"))?;
-    record_migration_if_absent(db, ledger_name, &migration_checksum(ledger_sql)).await?;
-
-    let replay = migration_replay_requested();
-    if replay {
-        tracing::warn!(
-            env = MIGRATION_REPLAY_ENV,
-            "migration replay requested: every migration is re-executed and failures are reported \
-             but not fatal, matching the pre-ledger runner"
-        );
-    }
-
-    let mut ledger = load_migration_ledger(db).await?;
-
-    // A database created by the pre-ledger runner already carries the whole schema, but the ledger
-    // is empty. Replaying 0001..cutoff there would be both slow and unsafe, so those entries are
-    // claimed without executing them. The claim is bounded by a frozen cutoff, so migrations added
-    // after the ledger shipped are never adopted by accident.
-    if !replay && ledger.len() <= 1 && database_predates_ledger(db).await? {
-        let mut adopted = 0_usize;
-        for (name, sql) in MIGRATIONS
-            .iter()
-            .skip(1)
-            .filter(|(name, _)| *name <= MIGRATION_ADOPTION_CUTOFF)
-        {
-            record_migration(db, name, &migration_checksum(sql), "adopted", None).await?;
-            adopted += 1;
-        }
-        tracing::warn!(
-            adopted,
-            cutoff = MIGRATION_ADOPTION_CUTOFF,
-            "existing database adopted into the migration ledger without replaying it; the schema \
-             assertions that follow decide whether it is actually complete"
-        );
-        ledger = load_migration_ledger(db).await?;
-    }
-
-    for (name, sql) in MIGRATIONS.iter().skip(1) {
-        let checksum = migration_checksum(sql);
-        if !replay
-            && let Some(recorded) = ledger.get(*name)
-            && recorded.status != "failed"
-        {
-            if recorded.checksum != checksum {
-                tracing::warn!(
-                    migration = %name,
-                    recorded_status = %recorded.status,
-                    "migration file changed after it was recorded; the database still holds the \
-                     previously applied version"
-                );
-            }
-            continue;
-        }
-
-        match apply_migration(db, name, sql).await {
-            Ok(()) => {
-                record_migration(db, name, &checksum, "applied", None).await?;
-                tracing::info!(migration = %name, "migration applied");
-            }
-            Err(err) => {
-                let message = err.to_string();
-                tracing::error!(
-                    migration = %name,
-                    error = %message,
-                    "migration failed; the ledger keeps it unapplied so the next start retries it"
-                );
-                if let Err(record_err) = record_migration(db, name, &checksum, "failed", Some(&message)).await {
-                    tracing::error!(
-                        migration = %name,
-                        error = %record_err,
-                        "could not record the migration failure in the ledger"
-                    );
-                }
-                if !replay {
-                    return Err(anyhow::anyhow!("migration {name} failed: {message}"));
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Newest migration an existing database may claim without executing it.
 ///
-/// Frozen on purpose. It stops at 0047 rather than at the last pre-ledger file (0048) because
-/// 0048 is fully idempotent and is the one whose failure the pre-ledger runner used to hide: a
-/// database that never got its delivery lease column re-executes it once and heals, instead of
-/// being claimed as applied and failing the schema assertions forever. Never move this forward,
-/// or a future migration would silently be skipped on every existing deployment.
+/// Frozen on purpose. Everything past it is executed on every database that has no ledger row for
+/// it, which is what keeps a future migration from being adopted by accident because its probe
+/// happens to match an object some other file created. The two files past the cutoff are
+/// idempotent and a test enforces that they stay that way.
 const MIGRATION_ADOPTION_CUTOFF: &str = "0047_form_attachment_media_metadata.sql";
 
-/// Escape hatch that restores the pre-ledger behaviour for one start: everything is re-executed
-/// and a failure is reported without aborting. Recovery tool for a database whose ledger and
-/// actual schema disagree; not meant for normal operation.
+/// Escape hatch: re-execute every migration once, reporting failures without aborting.
+///
+/// Safe to use on a live database. A failure never downgrades a ledger row that already records
+/// a success, so a replay of the non idempotent early migrations ("relation already exists") no
+/// longer turns the next ordinary start into a permanent failure.
 const MIGRATION_REPLAY_ENV: &str = "OPENPR_MIGRATIONS_REPLAY";
+
+/// Escape hatch: start even though a migration failed or the schema check found a gap.
+///
+/// The degraded path an operator needs to get the service up and inspect it. The failure is
+/// recorded and logged; nothing is skipped silently, and the next ordinary start retries.
+const MIGRATION_CONTINUE_ON_ERROR_ENV: &str = "OPENPR_MIGRATIONS_CONTINUE_ON_ERROR";
+
+/// Advisory lock namespace for the migration runner. The first key separates this lock from any
+/// other advisory lock in the system, the second one names the runner within that namespace.
+const MIGRATION_LOCK_NAMESPACE: i32 = 0x0F09_2026;
+const MIGRATION_LOCK_ID: i32 = 1;
+
+/// Evidence that one migration is already present in a database created before the ledger.
+///
+/// The previous revision took this decision once for the whole list with
+/// `to_regclass('public.users')`: every database that had a `users` table claimed all migrations
+/// up to the cutoff. A half built database - 0001 succeeded years ago, 0030 kept failing and the
+/// pre-ledger runner only warned - was therefore marked complete and its missing tables were
+/// never created again. Adoption is now decided per file, so a gap heals by executing that one
+/// file, and the same probes double as the post-run schema assertion.
+///
+/// A probe that wrongly reports "absent" only costs one execution of an idempotent file. A probe
+/// that wrongly reports "present" would skip a migration forever, so every probe names an object
+/// that its own migration creates.
+#[derive(Clone, Copy)]
+enum SchemaProbe {
+    /// Table, index or view. Resolved through `search_path`, so a deployment that does not use
+    /// the `public` schema is judged against its own schema instead of being told nothing exists.
+    Relation(&'static str),
+    /// Column on a table, by table and column name.
+    Column(&'static str, &'static str),
+    /// Label on an enum type.
+    EnumLabel(&'static str, &'static str),
+    /// Named constraint whose definition contains a marker the migration introduced.
+    ConstraintContains(&'static str, &'static str, &'static str),
+    /// No object is created that could be probed, but re-executing the file is a no-op, so it is
+    /// executed rather than adopted.
+    Rerunnable,
+}
+
+impl SchemaProbe {
+    /// Statement returning a single `present` boolean, or `None` for [`SchemaProbe::Rerunnable`].
+    ///
+    /// Every identifier travels as a bind parameter, so nothing here is concatenated into SQL.
+    fn statement(self) -> Option<Statement> {
+        match self {
+            Self::Relation(name) => Some(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT to_regclass($1) IS NOT NULL AS present",
+                vec![name.into()],
+            )),
+            Self::Column(table, column) => Some(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_attribute
+                        WHERE attrelid = to_regclass($1)
+                          AND attname = $2
+                          AND attnum > 0
+                          AND NOT attisdropped
+                    ) AS present
+                ",
+                vec![table.into(), column.into()],
+            )),
+            Self::EnumLabel(type_name, label) => Some(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_enum
+                        WHERE enumtypid = to_regtype($1)
+                          AND enumlabel = $2
+                    ) AS present
+                ",
+                vec![type_name.into(), label.into()],
+            )),
+            Self::ConstraintContains(table, constraint, marker) => Some(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conrelid = to_regclass($1)
+                          AND conname = $2
+                          AND position($3 IN pg_get_constraintdef(oid)) > 0
+                    ) AS present
+                ",
+                vec![table.into(), constraint.into(), marker.into()],
+            )),
+            Self::Rerunnable => None,
+        }
+    }
+}
+
+/// One probe per migration, in the same order as [`MIGRATIONS`], including the ledger bootstrap.
+/// A test keeps the two lists aligned so a new migration cannot be added without deciding how an
+/// existing database recognises it.
+const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
+    ("0000_schema_migrations.sql", SchemaProbe::Relation("schema_migrations")),
+    ("0001_init.sql", SchemaProbe::Relation("scheduled_jobs")),
+    ("0002_users.sql", SchemaProbe::Column("users", "name")),
+    ("0003_labels.sql", SchemaProbe::Relation("work_item_labels")),
+    ("0004_sprints.sql", SchemaProbe::Column("work_items", "sprint_id")),
+    ("0005_webhooks.sql", SchemaProbe::Relation("webhook_deliveries")),
+    (
+        "0006_notifications.sql",
+        SchemaProbe::Column("notifications", "metadata"),
+    ),
+    (
+        "0007_fulltext_search.sql",
+        SchemaProbe::Column("comments", "search_vector"),
+    ),
+    ("0008_admin_user_fields.sql", SchemaProbe::Column("users", "is_active")),
+    (
+        "0009_notifications_schema_compat.sql",
+        SchemaProbe::Relation("idx_notifications_user_unread"),
+    ),
+    (
+        "0010_issue_activity_notifications_compat.sql",
+        SchemaProbe::Column("notifications", "workspace_id"),
+    ),
+    (
+        "0011_bot_user_and_webhook_fields.sql",
+        SchemaProbe::Column("webhooks", "bot_user_id"),
+    ),
+    (
+        "0012_governance_phase1.sql",
+        SchemaProbe::Relation("proposal_issue_links"),
+    ),
+    (
+        "0013_governance_work_items_fields.sql",
+        SchemaProbe::Column("work_items", "proposal_id"),
+    ),
+    // Reshapes columns 0012 may already have created, so every object it could be probed on
+    // exists before it runs. Every branch is guarded and the unguarded statements are
+    // `SET NOT NULL` and idempotent updates, so it is executed rather than adopted.
+    ("0014_proposal_comments_schema_compat.sql", SchemaProbe::Rerunnable),
+    ("0015_governance_phase2.sql", SchemaProbe::Relation("appeals")),
+    (
+        "0016_governance_phase3.sql",
+        SchemaProbe::Relation("governance_audit_logs"),
+    ),
+    (
+        "0017_governance_phase3_hardening.sql",
+        SchemaProbe::Relation("uq_trust_score_logs_event_scope"),
+    ),
+    (
+        "0018_governance_phase3_templates.sql",
+        SchemaProbe::Column("proposals", "template_id"),
+    ),
+    (
+        "0019_governance_cycle_template_rapid.sql",
+        SchemaProbe::EnumLabel("cycle_template", "rapid"),
+    ),
+    ("0020_ai_tasks.sql", SchemaProbe::Relation("ai_task_events")),
+    // Only rewrites foreign keys that are not already cascading, and every branch is guarded, so
+    // there is nothing to probe and nothing to lose by executing it again.
+    ("0021_fix_cascade.sql", SchemaProbe::Rerunnable),
+    ("0022_bot_tokens.sql", SchemaProbe::Relation("workspace_bots")),
+    (
+        "0023_work_item_identifier.sql",
+        SchemaProbe::Column("work_items", "sequence_number"),
+    ),
+    ("0024_workflow_config.sql", SchemaProbe::Relation("workflow_states")),
+    (
+        "0025_project_types_resources.sql",
+        SchemaProbe::Relation("project_resources"),
+    ),
+    (
+        "0026_connectors_invocations.sql",
+        SchemaProbe::Relation("agent_invocations"),
+    ),
+    ("0027_check_results.sql", SchemaProbe::Relation("check_results")),
+    (
+        "0028_invocation_tool_calls.sql",
+        SchemaProbe::Relation("agent_invocation_tool_calls"),
+    ),
+    (
+        "0029_scenario_templates.sql",
+        SchemaProbe::Relation("scenario_templates"),
+    ),
+    (
+        "0030_universal_forms.sql",
+        SchemaProbe::Relation("form_record_field_index"),
+    ),
+    (
+        "0031_business_events_outbox_inbox.sql",
+        SchemaProbe::Relation("event_inbox"),
+    ),
+    (
+        "0032_print_device_connector_kinds.sql",
+        SchemaProbe::ConstraintContains("connectors", "connectors_kind_check", "device"),
+    ),
+    ("0033_plugins_wasm.sql", SchemaProbe::Relation("plugin_invocations")),
+    (
+        "0034_user_profile_preferences.sql",
+        SchemaProbe::Column("users", "notification_prefs"),
+    ),
+    // Seeds the two product lanes with ON CONFLICT DO UPDATE and retires the legacy keys; running
+    // it again on a database that already has them changes nothing.
+    ("0035_project_type_two_lanes.sql", SchemaProbe::Rerunnable),
+    (
+        "0036_universal_forms_schema_version_archive.sql",
+        SchemaProbe::Relation("idx_form_field_index_field_id"),
+    ),
+    ("0037_form_attachments.sql", SchemaProbe::Relation("form_attachments")),
+    ("0038_form_permissions.sql", SchemaProbe::Relation("form_permissions")),
+    (
+        "0039_universal_forms_pivot_view_type.sql",
+        SchemaProbe::ConstraintContains("form_views", "form_views_type_check", "pivot"),
+    ),
+    (
+        "0040_universal_forms_gantt_view_type.sql",
+        SchemaProbe::ConstraintContains("form_views", "form_views_type_check", "gantt"),
+    ),
+    (
+        "0041_form_record_comments.sql",
+        SchemaProbe::Relation("form_record_comments"),
+    ),
+    (
+        "0042_form_attachment_thumbnail_url.sql",
+        SchemaProbe::Column("form_attachments", "thumbnail_url"),
+    ),
+    (
+        "0043_form_import_mapping_templates.sql",
+        SchemaProbe::Relation("form_import_mapping_templates"),
+    ),
+    ("0044_form_import_jobs.sql", SchemaProbe::Relation("form_import_jobs")),
+    ("0045_form_export_jobs.sql", SchemaProbe::Relation("form_export_jobs")),
+    (
+        "0046_form_attachment_package_jobs.sql",
+        SchemaProbe::Relation("form_attachment_package_jobs"),
+    ),
+    (
+        "0047_form_attachment_media_metadata.sql",
+        SchemaProbe::Column("form_attachments", "media_metadata"),
+    ),
+    (
+        "0048_delivery_lease_and_pickup_indexes.sql",
+        SchemaProbe::Column("event_outbox", "lease_token"),
+    ),
+    (
+        "0049_agent_invocation_duplicate_tagging.sql",
+        SchemaProbe::Column("agent_invocations", "duplicate_of"),
+    ),
+];
 
 /// One recorded migration outcome.
 struct RecordedMigration {
@@ -2141,22 +2294,187 @@ struct RecordedMigration {
     status: String,
 }
 
-fn migration_replay_requested() -> bool {
-    std::env::var(MIGRATION_REPLAY_ENV)
-        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+/// What the runner did with one migration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MigrationOutcome {
+    /// The ledger already records a success.
+    Skipped,
+    /// Recognised in a database that predates the ledger and recorded without executing it.
+    Adopted,
+    /// Executed and recorded in the same transaction.
+    Applied,
 }
 
-/// Content fingerprint used to notice that a migration file changed after it was applied.
-fn migration_checksum(sql: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(sql.as_bytes());
-    hex::encode(hasher.finalize())
+/// Recovery switches for one migration run.
+///
+/// Kept as a value rather than read from the environment deep inside the runner, so both branches
+/// can be exercised by a test without mutating process wide state.
+#[derive(Clone, Copy, Default)]
+struct MigrationOptions {
+    /// Re-execute every migration, including those the ledger already records as successful.
+    replay: bool,
+    /// Start even though a migration failed or the post-run schema check found a gap.
+    continue_on_error: bool,
 }
 
-/// Runs one migration atomically. Partially applied files cannot survive a failure, so the ledger
-/// and the schema never drift apart within a single migration.
-async fn apply_migration(db: &DatabaseConnection, name: &str, sql: &str) -> anyhow::Result<()> {
+async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
+    run_migrations_with(
+        db,
+        MigrationOptions {
+            replay: migration_replay_requested(),
+            continue_on_error: migration_continue_on_error_requested(),
+        },
+    )
+    .await
+}
+
+async fn run_migrations_with(db: &DatabaseConnection, options: MigrationOptions) -> anyhow::Result<()> {
+    let Some((ledger_name, ledger_sql)) = MIGRATIONS.first() else {
+        return Err(anyhow::anyhow!("migration list is empty, refusing to start"));
+    };
+
+    // The ledger bootstrap is idempotent by construction, so it is the one file that may run on
+    // every start: nothing can be read from or written to the ledger before it exists. It still
+    // takes the runner lock, because two replicas issuing `CREATE TABLE IF NOT EXISTS` at the
+    // same instant can collide on the catalogue instead of one of them seeing the finished table.
+    bootstrap_migration_ledger(db, ledger_name, ledger_sql)
+        .await
+        .map_err(|err| anyhow::anyhow!("migration ledger bootstrap failed: {err}"))?;
+    record_migration_if_absent(db, ledger_name, &migration_checksum(ledger_sql)).await?;
+
+    let MigrationOptions {
+        replay,
+        continue_on_error,
+    } = options;
+    if replay {
+        tracing::warn!(
+            env = MIGRATION_REPLAY_ENV,
+            "migration replay requested: every migration is re-executed, failures are reported \
+             but not fatal, and a ledger row that already records a success is never downgraded"
+        );
+    }
+    if continue_on_error {
+        tracing::warn!(
+            env = MIGRATION_CONTINUE_ON_ERROR_ENV,
+            "starting even if a migration fails or the schema check finds a gap; the failures are \
+             recorded in schema_migrations and retried on the next start"
+        );
+    }
+    let tolerate_failure = replay || continue_on_error;
+
+    let mut adopted = 0_usize;
+    let mut applied = 0_usize;
+    let mut failed: Vec<&str> = Vec::new();
+
+    for (name, sql) in MIGRATIONS.iter().skip(1) {
+        match run_one_migration(db, name, sql, replay).await {
+            Ok(MigrationOutcome::Skipped) => {}
+            Ok(MigrationOutcome::Adopted) => {
+                adopted += 1;
+                tracing::info!(migration = %name, "migration recognised in an existing database and adopted");
+            }
+            Ok(MigrationOutcome::Applied) => {
+                applied += 1;
+                tracing::info!(migration = %name, "migration applied");
+            }
+            Err(err) => {
+                failed.push(name);
+                tracing::error!(migration = %name, error = %err, "migration failed");
+                if !tolerate_failure {
+                    return Err(anyhow::anyhow!("migration {name} failed: {err}"));
+                }
+            }
+        }
+    }
+
+    if adopted > 0 {
+        tracing::warn!(
+            adopted,
+            "migrations were adopted from an existing database without executing them; the schema \
+             check below decides whether that database is actually complete"
+        );
+    }
+    tracing::info!(applied, adopted, failed = failed.len(), "migration run finished");
+
+    verify_recorded_migrations(db, tolerate_failure).await
+}
+
+/// Runs one migration under the runner lock, deciding inside the transaction that will also write
+/// the ledger row. Decision, execution and bookkeeping are therefore one atomic step: an
+/// interrupted run leaves no half claimed ledger, and a second replica re-reads the ledger under
+/// the same lock instead of acting on a snapshot taken before it was blocked.
+async fn run_one_migration(
+    db: &DatabaseConnection,
+    name: &str,
+    sql: &str,
+    replay: bool,
+) -> anyhow::Result<MigrationOutcome> {
+    let checksum = migration_checksum(sql);
     let txn = db.begin().await?;
+    lock_migration_runner(&txn).await?;
+
+    let recorded = load_recorded_migration(&txn, name).await?;
+    let succeeded_before = recorded.as_ref().is_some_and(|row| row.status != "failed");
+
+    if !replay && let Some(row) = &recorded {
+        if succeeded_before {
+            if row.checksum != checksum {
+                tracing::warn!(
+                    migration = %name,
+                    recorded_status = %row.status,
+                    "migration file changed after it was recorded; the database still holds the \
+                     previously applied version"
+                );
+            }
+            txn.commit().await?;
+            return Ok(MigrationOutcome::Skipped);
+        }
+        tracing::warn!(
+            migration = %name,
+            "migration is recorded as failed; retrying it"
+        );
+    }
+
+    if !replay && recorded.is_none() && name <= MIGRATION_ADOPTION_CUTOFF && migration_is_present(&txn, name).await? {
+        record_migration_with_conn(&txn, name, &checksum, "adopted", None).await?;
+        txn.commit().await?;
+        return Ok(MigrationOutcome::Adopted);
+    }
+
+    if let Err(err) = txn.execute_unprepared(sql).await {
+        if let Err(rollback_err) = txn.rollback().await {
+            tracing::warn!(migration = %name, error = %rollback_err, "migration rollback failed");
+        }
+        let message = err.to_string();
+        // A replay re-executes files that already ran, so "relation already exists" is the
+        // expected answer there. Downgrading the ledger row to `failed` for those was what turned
+        // a single use of the replay switch into a database that could never start normally
+        // again, because an ordinary start retries `failed` rows and fails on the same statement.
+        if succeeded_before {
+            tracing::warn!(
+                migration = %name,
+                error = %message,
+                "re-execution failed; the ledger keeps the recorded success"
+            );
+        } else if let Err(record_err) = record_migration(db, name, &checksum, "failed", Some(&message)).await {
+            tracing::error!(
+                migration = %name,
+                error = %record_err,
+                "could not record the migration failure in the ledger"
+            );
+        }
+        return Err(anyhow::anyhow!("{message}"));
+    }
+
+    record_migration_with_conn(&txn, name, &checksum, "applied", None).await?;
+    txn.commit().await?;
+    Ok(MigrationOutcome::Applied)
+}
+
+/// Creates the ledger table itself, under the runner lock so concurrent starts serialise.
+async fn bootstrap_migration_ledger(db: &DatabaseConnection, name: &str, sql: &str) -> anyhow::Result<()> {
+    let txn = db.begin().await?;
+    lock_migration_runner(&txn).await?;
     if let Err(err) = txn.execute_unprepared(sql).await {
         if let Err(rollback_err) = txn.rollback().await {
             tracing::warn!(migration = %name, error = %rollback_err, "migration rollback failed");
@@ -2167,6 +2485,107 @@ async fn apply_migration(db: &DatabaseConnection, name: &str, sql: &str) -> anyh
     Ok(())
 }
 
+/// Takes the transaction scoped runner lock. It is released by the commit or the rollback that
+/// ends the transaction, so it can never be left behind on a pooled connection.
+async fn lock_migration_runner<C: ConnectionTrait>(conn: &C) -> anyhow::Result<()> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        vec![MIGRATION_LOCK_NAMESPACE.into(), MIGRATION_LOCK_ID.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+fn migration_replay_requested() -> bool {
+    migration_flag_enabled(MIGRATION_REPLAY_ENV)
+}
+
+fn migration_continue_on_error_requested() -> bool {
+    migration_flag_enabled(MIGRATION_CONTINUE_ON_ERROR_ENV)
+}
+
+fn migration_flag_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| migration_flag_value_enabled(&value))
+}
+
+fn migration_flag_value_enabled(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Content fingerprint used to notice that a migration file changed after it was applied.
+fn migration_checksum(sql: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(sql.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn migration_probe(name: &str) -> Option<SchemaProbe> {
+    MIGRATION_PROBES
+        .iter()
+        .find(|(probe_name, _)| *probe_name == name)
+        .map(|(_, probe)| *probe)
+}
+
+/// Whether the objects a migration creates are already in the database.
+///
+/// `Rerunnable` migrations and migrations without a probe answer "no", which costs one execution
+/// and never skips work.
+async fn migration_is_present<C: ConnectionTrait>(conn: &C, name: &str) -> anyhow::Result<bool> {
+    let Some(statement) = migration_probe(name).and_then(SchemaProbe::statement) else {
+        return Ok(false);
+    };
+    let Some(row) = conn.query_one(statement).await? else {
+        return Ok(false);
+    };
+    Ok(row.try_get::<bool>("", "present")?)
+}
+
+/// Confirms that every migration the ledger reports as successful really left its objects behind.
+///
+/// This is the assertion the previous revision did not have. `verify_governance_schema` only
+/// covers governance and `verify_delivery_schema` only covers the two delivery migrations, so a
+/// database that claimed 0001..0047 while the forms tables were missing started up healthy and
+/// answered 500 for every forms request. Every migration is checked here instead.
+async fn verify_recorded_migrations(db: &DatabaseConnection, tolerate_failure: bool) -> anyhow::Result<()> {
+    let ledger = load_migration_ledger(db).await?;
+    let mut missing: Vec<&str> = Vec::new();
+
+    for (name, _) in MIGRATIONS {
+        let Some(recorded) = ledger.get(*name) else {
+            continue;
+        };
+        if recorded.status == "failed" {
+            continue;
+        }
+        if migration_probe(name).is_some_and(|probe| matches!(probe, SchemaProbe::Rerunnable)) {
+            continue;
+        }
+        if !migration_is_present(db, name).await? {
+            missing.push(name);
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let names = missing.join(", ");
+    if tolerate_failure {
+        tracing::error!(
+            migrations = %names,
+            "the ledger reports these migrations as applied but their objects are missing; \
+             starting anyway because a migration escape hatch is set"
+        );
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "the migration ledger reports {names} as applied but their objects are missing; re-run \
+         with {MIGRATION_REPLAY_ENV}=1 to re-execute every migration, or start with \
+         {MIGRATION_CONTINUE_ON_ERROR_ENV}=1 to inspect the database"
+    ))
+}
+
 async fn record_migration(
     db: &DatabaseConnection,
     name: &str,
@@ -2174,7 +2593,17 @@ async fn record_migration(
     status: &str,
     error: Option<&str>,
 ) -> anyhow::Result<()> {
-    db.execute(Statement::from_sql_and_values(
+    record_migration_with_conn(db, name, checksum, status, error).await
+}
+
+async fn record_migration_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    name: &str,
+    checksum: &str,
+    status: &str,
+    error: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
             INSERT INTO schema_migrations (name, checksum, status, error, applied_at)
@@ -2212,6 +2641,26 @@ async fn record_migration_if_absent(db: &DatabaseConnection, name: &str, checksu
     Ok(())
 }
 
+async fn load_recorded_migration<C: ConnectionTrait>(
+    conn: &C,
+    name: &str,
+) -> anyhow::Result<Option<RecordedMigration>> {
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT checksum, status FROM schema_migrations WHERE name = $1",
+            vec![name.into()],
+        ))
+        .await?;
+    match row {
+        Some(row) => Ok(Some(RecordedMigration {
+            checksum: row.try_get::<String>("", "checksum")?,
+            status: row.try_get::<String>("", "status")?,
+        })),
+        None => Ok(None),
+    }
+}
+
 async fn load_migration_ledger(db: &DatabaseConnection) -> anyhow::Result<HashMap<String, RecordedMigration>> {
     let rows = db
         .query_all(Statement::from_string(
@@ -2228,21 +2677,6 @@ async fn load_migration_ledger(db: &DatabaseConnection) -> anyhow::Result<HashMa
         ledger.insert(name, RecordedMigration { checksum, status });
     }
     Ok(ledger)
-}
-
-/// True when the database already carries the pre-ledger schema. `users` is created by 0001 and
-/// never dropped, so its presence separates "existing deployment" from "empty database".
-async fn database_predates_ledger(db: &DatabaseConnection) -> anyhow::Result<bool> {
-    let row = db
-        .query_one(Statement::from_string(
-            DbBackend::Postgres,
-            "SELECT to_regclass('public.users') IS NOT NULL AS present".to_string(),
-        ))
-        .await?;
-    match row {
-        Some(row) => Ok(row.try_get::<bool>("", "present")?),
-        None => Ok(false),
-    }
 }
 
 async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()> {
@@ -2293,7 +2727,9 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{MIGRATION_ADOPTION_CUTOFF, MIGRATIONS, migration_checksum};
+    use super::{
+        MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, migration_checksum, migration_flag_value_enabled,
+    };
 
     /// A migration file has to be registered in two places: on disk and in [`MIGRATIONS`].
     /// Forgetting the second one makes it silently never run, so the two are compared here.
@@ -2379,5 +2815,600 @@ mod tests {
                 "{name} must not drop tables: it re-runs on every adopted database"
             );
         }
+    }
+
+    /// Every migration needs a probe, otherwise an existing database either replays it (which the
+    /// early non idempotent files do not survive) or, worse, a future migration falls back on a
+    /// probe belonging to another file. The two lists are kept in lockstep here.
+    #[test]
+    fn every_migration_has_a_schema_probe() {
+        let migrations: Vec<&str> = MIGRATIONS.iter().map(|(name, _)| *name).collect();
+        let probed: Vec<&str> = MIGRATION_PROBES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            migrations, probed,
+            "MIGRATIONS and MIGRATION_PROBES must list the same files in the same order"
+        );
+    }
+
+    /// A probe has to produce a statement, except for the two files that create nothing and are
+    /// executed rather than adopted.
+    #[test]
+    fn only_rerunnable_probes_have_no_statement() {
+        let without: Vec<&str> = MIGRATION_PROBES
+            .iter()
+            .filter(|(_, probe)| probe.statement().is_none())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            without,
+            vec![
+                "0014_proposal_comments_schema_compat.sql",
+                "0021_fix_cascade.sql",
+                "0035_project_type_two_lanes.sql"
+            ],
+            "a migration may only skip its probe when re-executing it is a no-op"
+        );
+    }
+
+    /// Probes must resolve relations through search_path. A hardcoded `public.` prefix reports
+    /// "absent" on a deployment that does not use the public schema, which sends the runner into
+    /// replaying the early non idempotent migrations.
+    #[test]
+    fn probes_do_not_hardcode_the_public_schema() {
+        for (name, probe) in MIGRATION_PROBES {
+            let Some(statement) = probe.statement() else {
+                continue;
+            };
+            let rendered = format!("{statement:?}");
+            assert!(
+                !rendered.contains("public."),
+                "{name} probe must not hardcode the public schema"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_flags_accept_only_explicit_opt_in() {
+        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(migration_flag_value_enabled(value), "{value} should enable the flag");
+        }
+        for value in ["", "0", "false", "no", "off", "maybe"] {
+            assert!(
+                !migration_flag_value_enabled(value),
+                "{value} should not enable the flag"
+            );
+        }
+    }
+
+    /// Routes are authenticated one by one with `route_layer`, so forgetting one is invisible
+    /// until somebody calls it. Four proposal reads were unauthenticated that way, two of which
+    /// finalized voting and wrote decisions. The router source is parsed here and every route
+    /// without a layer has to be on the list of endpoints that are public on purpose.
+    #[test]
+    fn only_the_intended_routes_are_reachable_without_authentication() {
+        /// Endpoints that must answer without a session, and why.
+        const PUBLIC_ROUTES: &[&str] = &[
+            // Signed, expiring download links; the handler verifies the HMAC itself.
+            "/api/v1/uploads/signatures/{file_name}/download",
+            "/api/v1/form-attachments/{attachment_id}/download",
+            // Liveness and readiness probes.
+            "/health",
+            "/ready",
+            // Credential entry points; there is no session to present yet.
+            "/api/v1/auth/register",
+            "/api/v1/auth/login",
+            "/api/v1/auth/refresh",
+        ];
+
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("the router source is readable");
+
+        let mut unauthenticated: Vec<String> = Vec::new();
+        let mut block: Option<String> = None;
+        let mut in_router = false;
+
+        let finish = |block: &str, out: &mut Vec<String>| {
+            if block.contains("route_layer") {
+                return;
+            }
+            if let Some(path) = block.split('"').nth(1) {
+                out.push(path.to_string());
+            }
+        };
+
+        for line in source.lines() {
+            if line.contains("let app = Router::new()") {
+                in_router = true;
+                continue;
+            }
+            if !in_router {
+                continue;
+            }
+            let starts_route = line.starts_with("        .route(");
+            let ends_router = line.starts_with("        .layer(");
+            if starts_route || ends_router {
+                if let Some(previous) = block.take() {
+                    finish(&previous, &mut unauthenticated);
+                }
+                if ends_router {
+                    in_router = false;
+                    continue;
+                }
+                block = Some(String::new());
+            }
+            if let Some(current) = block.as_mut() {
+                current.push_str(line);
+                current.push('\n');
+            }
+        }
+        if let Some(previous) = block.take() {
+            finish(&previous, &mut unauthenticated);
+        }
+
+        assert!(
+            !unauthenticated.is_empty(),
+            "the router parser found nothing; it no longer matches main.rs"
+        );
+        let mut expected: Vec<String> = PUBLIC_ROUTES.iter().map(|path| (*path).to_string()).collect();
+        expected.sort();
+        let mut found = unauthenticated;
+        found.sort();
+        assert_eq!(
+            found, expected,
+            "a route was registered without an authentication layer; add the layer, or add the \
+             path to PUBLIC_ROUTES with the reason it is public"
+        );
+    }
+}
+
+/// Migration runner behaviour against a real PostgreSQL server.
+///
+/// Adoption, replay and retry only differ on databases that are not empty, so a fresh compose
+/// database exercises none of them. Each test here creates its own database, shapes it into the
+/// state under test and runs the real runner against it.
+///
+/// Set `OPENPR_TEST_DATABASE_URL` to a maintenance connection string, for example
+/// `postgres://user:pw@127.0.0.1:5432/postgres`. Without it these tests report that they were
+/// skipped instead of pretending to pass.
+#[cfg(test)]
+mod migration_runner_database_tests {
+    use super::{MIGRATIONS, MigrationOptions, migration_is_present, run_migrations_with};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use std::collections::HashMap;
+
+    const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    /// A throwaway database plus the connection string needed to reach it again.
+    struct Scratch {
+        db: DatabaseConnection,
+        url: String,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        /// Second connection to the same database, for the concurrent start test.
+        async fn second_connection(&self) -> anyhow::Result<DatabaseConnection> {
+            Ok(Database::connect(&self.url).await?)
+        }
+
+        async fn drop_self(self) {
+            let Self {
+                db, name, admin_url, ..
+            } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            let statement = format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)");
+            if let Err(err) = admin.execute_unprepared(&statement).await {
+                eprintln!("could not drop scratch database {name}: {err}");
+            }
+        }
+    }
+
+    /// Creates an empty database named after the test. Returns `None` when the environment does
+    /// not offer a server, so the suite stays runnable without one.
+    async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = match Database::connect(&admin_url).await {
+            Ok(admin) => admin,
+            Err(err) => panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"),
+        };
+
+        let name = format!("openpr_mig_{label}");
+        let quoted = format!("\"{name}\"");
+        if let Err(err) = admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+        {
+            panic!("could not reset scratch database {name}: {err}");
+        }
+        if let Err(err) = admin.execute_unprepared(&format!("CREATE DATABASE {quoted}")).await {
+            panic!("could not create scratch database {name}: {err}");
+        }
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        let db = match Database::connect(&url).await {
+            Ok(db) => db,
+            Err(err) => panic!("could not connect to scratch database {name}: {err}"),
+        };
+        Some(Scratch {
+            db,
+            url,
+            name,
+            admin_url,
+        })
+    }
+
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!("skipped: {} is not set", TEST_DATABASE_URL_ENV);
+                    return;
+                }
+            }
+        };
+    }
+
+    /// Reproduces the pre-ledger runner: every file executed straight against the database with
+    /// no ledger to record it. `stop_before` leaves the database half built.
+    async fn seed_pre_ledger_schema(db: &DatabaseConnection, stop_before: Option<&str>) {
+        for (name, sql) in MIGRATIONS.iter().skip(1) {
+            if stop_before.is_some_and(|limit| *name >= limit) {
+                break;
+            }
+            if let Err(err) = db.execute_unprepared(sql).await {
+                panic!("seeding {name} failed: {err}");
+            }
+        }
+    }
+
+    async fn ledger(db: &DatabaseConnection) -> HashMap<String, String> {
+        let rows = db
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT name, status FROM schema_migrations".to_string(),
+            ))
+            .await
+            .expect("the ledger is readable");
+        let mut out = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let name: String = row.try_get("", "name").expect("name column");
+            let status: String = row.try_get("", "status").expect("status column");
+            out.insert(name, status);
+        }
+        out
+    }
+
+    fn status_of<'a>(ledger: &'a HashMap<String, String>, name: &str) -> &'a str {
+        ledger.get(name).map_or("<absent>", String::as_str)
+    }
+
+    /// Every object the ledger claims is present has to be there.
+    async fn assert_schema_complete(db: &DatabaseConnection) {
+        for (name, _) in MIGRATIONS {
+            let present = migration_is_present(db, name).await.expect("probe runs");
+            let probe_exists = super::migration_probe(name).is_some_and(|probe| probe.statement().is_some());
+            assert!(!probe_exists || present, "{name} left no trace in the database");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_database_applies_every_migration() {
+        let scratch = scratch_or_skip!("fresh");
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("a fresh database migrates cleanly");
+
+        let ledger = ledger(&scratch.db).await;
+        assert_eq!(ledger.len(), MIGRATIONS.len(), "every migration is recorded");
+        for (name, _) in MIGRATIONS {
+            assert_eq!(status_of(&ledger, name), "applied", "{name} should have been executed");
+        }
+        assert_schema_complete(&scratch.db).await;
+
+        scratch.drop_self().await;
+    }
+
+    /// A database built by the pre-ledger runner keeps its schema: the early files, which are not
+    /// idempotent, must be recognised rather than replayed.
+    #[tokio::test]
+    async fn an_existing_database_is_adopted_rather_than_replayed() {
+        let scratch = scratch_or_skip!("existing");
+        seed_pre_ledger_schema(&scratch.db, None).await;
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("an existing database migrates cleanly");
+
+        let ledger = ledger(&scratch.db).await;
+        assert_eq!(status_of(&ledger, "0001_init.sql"), "adopted");
+        assert_eq!(status_of(&ledger, "0005_webhooks.sql"), "adopted");
+        assert_eq!(status_of(&ledger, "0022_bot_tokens.sql"), "adopted");
+        assert_eq!(status_of(&ledger, "0038_form_permissions.sql"), "adopted");
+        // Past the frozen cutoff nothing is ever adopted; both files are idempotent and re-run.
+        assert_eq!(
+            status_of(&ledger, "0048_delivery_lease_and_pickup_indexes.sql"),
+            "applied"
+        );
+        assert!(
+            !ledger.values().any(|status| status == "failed"),
+            "no migration may fail on an existing database"
+        );
+        assert_schema_complete(&scratch.db).await;
+
+        scratch.drop_self().await;
+    }
+
+    /// The regression that made the previous revision dangerous: a database whose early files
+    /// succeeded and whose forms files never did. The blanket `to_regclass('public.users')`
+    /// predicate claimed all of them, so the missing tables were never created again. Per file
+    /// probes have to adopt what is there and execute what is not.
+    #[tokio::test]
+    async fn a_half_built_database_only_adopts_what_it_actually_has() {
+        let scratch = scratch_or_skip!("half_built");
+        seed_pre_ledger_schema(&scratch.db, Some("0030_universal_forms.sql")).await;
+
+        assert!(
+            !migration_is_present(&scratch.db, "0038_form_permissions.sql")
+                .await
+                .expect("probe runs"),
+            "the fixture must start without the forms tables"
+        );
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("a half built database heals");
+
+        let ledger = ledger(&scratch.db).await;
+        assert_eq!(status_of(&ledger, "0001_init.sql"), "adopted");
+        assert_eq!(status_of(&ledger, "0029_scenario_templates.sql"), "adopted");
+        assert_eq!(status_of(&ledger, "0030_universal_forms.sql"), "applied");
+        assert_eq!(status_of(&ledger, "0038_form_permissions.sql"), "applied");
+        assert!(
+            migration_is_present(&scratch.db, "0038_form_permissions.sql")
+                .await
+                .expect("probe runs"),
+            "the forms tables have to exist after the run"
+        );
+        assert_schema_complete(&scratch.db).await;
+
+        scratch.drop_self().await;
+    }
+
+    /// Adoption used to be a bare loop entered only while the ledger was empty, so an
+    /// interruption left it half claimed and the next start executed the remaining early files
+    /// against a database that already had them. Adoption is now re-derived per file.
+    #[tokio::test]
+    async fn an_interrupted_adoption_resumes_on_the_next_start() {
+        let scratch = scratch_or_skip!("interrupted");
+        seed_pre_ledger_schema(&scratch.db, None).await;
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("first run adopts the database");
+
+        // Same shape as an adoption killed after 0004: a ledger with a handful of rows in it.
+        scratch
+            .db
+            .execute_unprepared("DELETE FROM schema_migrations WHERE name > '0004'")
+            .await
+            .expect("the ledger is writable");
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("the interrupted adoption resumes instead of replaying");
+
+        let ledger = ledger(&scratch.db).await;
+        assert_eq!(
+            status_of(&ledger, "0005_webhooks.sql"),
+            "adopted",
+            "0005 creates webhooks without IF NOT EXISTS; executing it here would fail"
+        );
+        assert_eq!(status_of(&ledger, "0022_bot_tokens.sql"), "adopted");
+        assert!(!ledger.values().any(|status| status == "failed"));
+
+        scratch.drop_self().await;
+    }
+
+    /// The escape hatch used to be a trap: one replay recorded the non idempotent files as
+    /// `failed`, and an ordinary start retries `failed` rows, so the API could never start again
+    /// without the switch. A replay may now report failures but must never downgrade a recorded
+    /// success, and the ordinary start afterwards has to work.
+    #[tokio::test]
+    async fn a_replay_never_leaves_the_database_unable_to_start() {
+        let scratch = scratch_or_skip!("replay");
+        seed_pre_ledger_schema(&scratch.db, None).await;
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("first run adopts the database");
+
+        run_migrations_with(
+            &scratch.db,
+            MigrationOptions {
+                replay: true,
+                continue_on_error: false,
+            },
+        )
+        .await
+        .expect("a replay reports failures without aborting");
+
+        let after_replay = ledger(&scratch.db).await;
+        assert!(
+            !after_replay.values().any(|status| status == "failed"),
+            "a replay must not downgrade a recorded success to failed"
+        );
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("an ordinary start after a replay still works");
+        assert_schema_complete(&scratch.db).await;
+
+        scratch.drop_self().await;
+    }
+
+    /// A genuine failure aborts the start, is recorded with its error, and is retried once the
+    /// cause is gone.
+    #[tokio::test]
+    async fn a_failing_migration_aborts_the_start_and_is_retried_later() {
+        let scratch = scratch_or_skip!("failing");
+        // 0005 creates `webhooks` without IF NOT EXISTS, so an unrelated table of that name is
+        // enough to make exactly one migration fail.
+        scratch
+            .db
+            .execute_unprepared("CREATE TABLE webhooks (blocker integer)")
+            .await
+            .expect("the blocker table is created");
+
+        let err = run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect_err("a failing migration must abort the start");
+        assert!(
+            err.to_string().contains("0005_webhooks.sql"),
+            "the error has to name the migration, got: {err}"
+        );
+
+        let after_failure = ledger(&scratch.db).await;
+        assert_eq!(status_of(&after_failure, "0005_webhooks.sql"), "failed");
+        assert_eq!(status_of(&after_failure, "0004_sprints.sql"), "applied");
+
+        scratch
+            .db
+            .execute_unprepared("DROP TABLE webhooks")
+            .await
+            .expect("the blocker table is dropped");
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("the retry succeeds once the cause is gone");
+        let after_retry = ledger(&scratch.db).await;
+        assert_eq!(status_of(&after_retry, "0005_webhooks.sql"), "applied");
+        assert_schema_complete(&scratch.db).await;
+
+        scratch.drop_self().await;
+    }
+
+    /// The degradation channel an operator needs: start with the failure recorded and visible,
+    /// rather than being locked out of a database that cannot be inspected.
+    #[tokio::test]
+    async fn continue_on_error_starts_despite_a_failed_migration() {
+        let scratch = scratch_or_skip!("continue_on_error");
+        scratch
+            .db
+            .execute_unprepared("CREATE TABLE webhooks (blocker integer)")
+            .await
+            .expect("the blocker table is created");
+
+        run_migrations_with(
+            &scratch.db,
+            MigrationOptions {
+                replay: false,
+                continue_on_error: true,
+            },
+        )
+        .await
+        .expect("the degraded start comes up");
+
+        let ledger = ledger(&scratch.db).await;
+        assert_eq!(status_of(&ledger, "0005_webhooks.sql"), "failed");
+        assert_eq!(
+            status_of(&ledger, "0030_universal_forms.sql"),
+            "applied",
+            "the run continues past the failure instead of stopping"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// A ledger row is a claim, not proof. When the object it claims is gone the start has to
+    /// stop and name it, because the previous revision started up healthy with the forms tables
+    /// missing and answered 500 for every forms request instead.
+    #[tokio::test]
+    async fn a_ledger_claim_without_the_object_stops_the_start() {
+        let scratch = scratch_or_skip!("gap");
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("a fresh database migrates cleanly");
+
+        scratch
+            .db
+            .execute_unprepared("DROP TABLE form_permissions CASCADE")
+            .await
+            .expect("the forms table is dropped");
+
+        let err = run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect_err("a missing object must stop the start");
+        assert!(
+            err.to_string().contains("0038_form_permissions.sql"),
+            "the error has to name the migration, got: {err}"
+        );
+
+        run_migrations_with(
+            &scratch.db,
+            MigrationOptions {
+                replay: false,
+                continue_on_error: true,
+            },
+        )
+        .await
+        .expect("the operator can still start to inspect the database");
+
+        scratch.drop_self().await;
+    }
+
+    /// api and worker start together and both run the migrations. Without the advisory lock two
+    /// runners raced on the same DDL and one of them died on "relation already exists"; with
+    /// `restart: unless-stopped` in front of them that is a crash loop.
+    #[tokio::test]
+    async fn two_runners_starting_together_both_succeed() {
+        let scratch = scratch_or_skip!("concurrent");
+        let second = scratch.second_connection().await.expect("a second connection opens");
+
+        let (first_result, second_result) = tokio::join!(
+            run_migrations_with(&scratch.db, MigrationOptions::default()),
+            run_migrations_with(&second, MigrationOptions::default()),
+        );
+        first_result.expect("the first runner succeeds");
+        second_result.expect("the second runner succeeds");
+
+        let ledger = ledger(&scratch.db).await;
+        assert_eq!(ledger.len(), MIGRATIONS.len());
+        assert!(!ledger.values().any(|status| status == "failed"));
+        assert_schema_complete(&scratch.db).await;
+
+        drop(second);
+        scratch.drop_self().await;
+    }
+
+    /// The bootstrap used to resolve the ledger with `'public.schema_migrations'::regclass`,
+    /// which raises rather than returning NULL, so a deployment whose search_path does not
+    /// include public could not even create the ledger.
+    #[tokio::test]
+    async fn a_database_outside_the_public_schema_migrates() {
+        let scratch = scratch_or_skip!("other_schema");
+        scratch
+            .db
+            .execute_unprepared("CREATE SCHEMA app")
+            .await
+            .expect("the schema is created");
+        scratch
+            .db
+            .execute_unprepared(&format!("ALTER DATABASE \"{}\" SET search_path TO app", scratch.name))
+            .await
+            .expect("the search_path is set");
+
+        let relocated = scratch.second_connection().await.expect("a fresh connection opens");
+        run_migrations_with(&relocated, MigrationOptions::default())
+            .await
+            .expect("a non public schema migrates cleanly");
+        assert_schema_complete(&relocated).await;
+
+        drop(relocated);
+        scratch.drop_self().await;
     }
 }

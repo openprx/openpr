@@ -10,7 +10,14 @@
 -- status:
 --   applied - executed by this runner and committed
 --   adopted - already present in a database created before the ledger existed, never executed
---   failed  - execution failed; API startup aborts and the row keeps the error for the operator
+--   failed  - execution failed; API startup aborts and the row keeps the error for the operator.
+--             The next ordinary start retries it. A row that already records applied or adopted
+--             is never downgraded to failed, so re-executing a file with
+--             OPENPR_MIGRATIONS_REPLAY=1 cannot leave the database unable to start.
+--
+-- Escape hatches, both meant for recovery rather than normal operation:
+--   OPENPR_MIGRATIONS_REPLAY=1           re-execute every file once, failures are not fatal
+--   OPENPR_MIGRATIONS_CONTINUE_ON_ERROR=1 start despite a failed migration or a schema gap
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name       TEXT PRIMARY KEY,
     checksum   TEXT NOT NULL,
@@ -20,13 +27,16 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 -- Added separately so a ledger created by an earlier build of this file also gains the check.
+-- The relation is resolved with to_regclass through search_path rather than with a hardcoded
+-- 'public.schema_migrations'::regclass: the cast raises on a deployment whose search_path does
+-- not include public, which used to make the bootstrap - and therefore the whole API - fail.
 DO $$
 BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM pg_constraint
     WHERE conname = 'schema_migrations_status_check'
-      AND conrelid = 'public.schema_migrations'::regclass
+      AND conrelid = to_regclass('schema_migrations')
   ) THEN
     ALTER TABLE schema_migrations
       ADD CONSTRAINT schema_migrations_status_check
