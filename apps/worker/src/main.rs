@@ -66,7 +66,11 @@ struct ConnectorInvocationDispatchRow {
     id: Uuid,
     lease_token: Uuid,
     workspace_id: Uuid,
-    project_id: Uuid,
+    /// Nullable in the schema: an invocation can be workspace scoped, and `projects` cascades to
+    /// SET NULL on delete. Decoding it as non nullable made one such row fail the decode of the
+    /// whole pickup batch, which stopped every connector delivery in the instance behind a single
+    /// polling warning.
+    project_id: Option<Uuid>,
     connector_id: Uuid,
     connector_kind: String,
     connector_name: String,
@@ -1384,7 +1388,7 @@ fn connector_invocation_payload(invocation: &ConnectorInvocationDispatchRow) -> 
             .unwrap_or("connector.invocation"),
         "invocation_id": invocation.id.to_string(),
         "workspace_id": invocation.workspace_id.to_string(),
-        "project_id": invocation.project_id.to_string(),
+        "project_id": invocation.project_id.map(|id| id.to_string()),
         "connector_id": invocation.connector_id.to_string(),
         "connector_kind": invocation.connector_kind,
         "connector_name": invocation.connector_name,
@@ -2218,7 +2222,7 @@ mod tests {
             id: Uuid::new_v4(),
             lease_token: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
-            project_id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
             connector_id: Uuid::new_v4(),
             connector_kind: "webhook".to_string(),
             connector_name: "downstream".to_string(),
@@ -2778,6 +2782,41 @@ mod tests {
             "running",
             "a row that is not picked up must keep its bookkeeping untouched"
         );
+
+        test.cleanup().await;
+    }
+
+    /// agent_invocations.project_id is nullable and projects cascade to SET NULL, so a workspace
+    /// scoped invocation is normal. Decoding the batch as if it were mandatory made one such row
+    /// fail every delivery in the instance behind a single polling warning.
+    #[tokio::test]
+    async fn connector_pickup_handles_invocations_without_a_project() {
+        let Some(test) = test_db().await else {
+            eprintln!("skipped: set OPENPR_TEST_DATABASE_URL to run the delivery SQL against PostgreSQL");
+            return;
+        };
+        let db = &test.db;
+        let workspace_id = Uuid::new_v4();
+        let connector_id = insert_connector(db, workspace_id).await;
+
+        let scoped = insert_invocation(db, connector_id, workspace_id, "pending", "NULL", 0).await;
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE agent_invocations SET project_id = NULL WHERE id = $1",
+            vec![scoped.into()],
+        ))
+        .await
+        .expect("clearing the project must run");
+
+        let picked = pickup_pending_connector_invocations(db, 50)
+            .await
+            .expect("a null project must not fail the batch");
+
+        let row = picked
+            .iter()
+            .find(|row| row.id == scoped)
+            .expect("the workspace scoped invocation must still be delivered");
+        assert_eq!(row.project_id, None);
 
         test.cleanup().await;
     }
