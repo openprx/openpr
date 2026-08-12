@@ -8,7 +8,6 @@ use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::time::{self, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::{
@@ -488,22 +487,74 @@ fn calculate_result(yes: f64, no: f64, rule: &str) -> DecisionResult {
     }
 }
 
-async fn ensure_voting_finalized_if_needed(state: &AppState, proposal: &ProposalRow) -> Result<(), ApiError> {
+/// True once the voting window of a proposal that is still `voting` has elapsed.
+///
+/// Read-only on purpose. Request handlers used to call a helper that *finalized* the proposal
+/// here, which turned plain `GET`s into write transactions and let whoever could reach the
+/// endpoint choose the moment a decision was recorded. Settlement now belongs to the worker
+/// pipeline ([`governance_tick`]); request handlers only observe the deadline so that a vote
+/// cast between the deadline and the next tick is still rejected.
+fn voting_window_elapsed(proposal: &ProposalRow) -> bool {
     if proposal.status != "voting" {
-        return Ok(());
+        return false;
     }
 
     let Some(voting_started_at) = proposal.voting_started_at else {
-        return Ok(());
+        return false;
     };
 
     let (_, voting_hours) = cycle_hours(&proposal.cycle_template);
-    if Utc::now() < voting_started_at + Duration::hours(voting_hours) {
+    Utc::now() >= voting_started_at + Duration::hours(voting_hours)
+}
+
+/// Rejects a ballot-mutating request whose proposal has already run out of voting time.
+///
+/// Without this the removal of the read-path finalization would open a window between the
+/// deadline and the next worker tick in which votes could still be cast or withdrawn.
+fn ensure_voting_window_open(proposal: &ProposalRow) -> Result<(), ApiError> {
+    if voting_window_elapsed(proposal) {
+        return Err(ApiError::BadRequest(
+            "voting period has ended and the result is being finalized".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Advisory lock namespace used to serialize proposal settlement across processes.
+///
+/// `pg_advisory_xact_lock` takes two 32-bit keys; the first one identifies the subsystem so a
+/// proposal hash cannot collide with an unrelated lock taken elsewhere.
+const GOVERNANCE_FINALIZE_LOCK_NAMESPACE: i32 = 0x0F09_2026;
+
+async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(), ApiError> {
+    let tx = state.db.begin().await?;
+
+    // Two workers (or two replicas of one worker) can select the same expired proposal in the
+    // same second. The lock is transaction scoped, so it is released by the commit or the
+    // rollback below and cannot leak back into the pool.
+    let lock_row = tx
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_try_advisory_xact_lock($1, hashtext($2)) AS locked",
+            vec![GOVERNANCE_FINALIZE_LOCK_NAMESPACE.into(), proposal.id.clone().into()],
+        ))
+        .await?;
+    let locked = match lock_row {
+        Some(row) => row.try_get::<bool>("", "locked")?,
+        None => false,
+    };
+    if !locked {
+        let _ = tx.rollback().await;
+        tracing::debug!(
+            proposal_id = proposal.id,
+            "skip finalize: another process holds the settlement lock"
+        );
         return Ok(());
     }
 
-    let decision_exists = state
-        .db
+    // Re-read inside the lock: the holder that just committed may have written the decision
+    // between our candidate query and this transaction.
+    let decision_exists = tx
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT 1 FROM decisions WHERE proposal_id = $1",
@@ -511,16 +562,12 @@ async fn ensure_voting_finalized_if_needed(state: &AppState, proposal: &Proposal
         ))
         .await?
         .is_some();
-
     if decision_exists {
+        let _ = tx.rollback().await;
+        tracing::debug!(proposal_id = proposal.id, "skip finalize: decision already exists");
         return Ok(());
     }
 
-    finalize_voting(state, proposal).await
-}
-
-async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(), ApiError> {
-    let tx = state.db.begin().await?;
     let tally = recalculate_and_tally_votes_with_conn(&tx, proposal).await?;
     let yes = tally.yes.unwrap_or(0);
     let no = tally.no.unwrap_or(0);
@@ -617,21 +664,15 @@ struct ProposalProjectRow {
     project_id: Uuid,
 }
 
-pub fn start_governance_watcher(state: AppState) {
-    tokio::spawn(async move {
-        let mut interval = time::interval(std::time::Duration::from_secs(60));
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            if let Err(err) = governance_watcher_tick(&state).await {
-                tracing::error!(error = %err, "governance watcher tick failed");
-            }
-        }
-    });
-}
-
-async fn governance_watcher_tick(state: &AppState) -> Result<(), ApiError> {
+/// Advances every proposal whose discussion or voting deadline has passed.
+///
+/// This used to run as a background task inside the API process *and*, for whichever proposal a
+/// request happened to touch, inline on the request path. Both are gone: the API only reads, and
+/// this tick is driven by the worker polling pipeline, which is the single writer. It is
+/// idempotent and safe to run from several worker replicas at once — the `open -> voting`
+/// transition is a single conditional `UPDATE ... RETURNING`, and settlement is guarded by a
+/// per-proposal advisory lock plus the unique decision per proposal.
+pub async fn governance_tick(state: &AppState) -> Result<(), ApiError> {
     let now = Utc::now();
 
     let open_to_voting = VotingTransitionRow::find_by_statement(Statement::from_sql_and_values(
@@ -708,8 +749,27 @@ async fn governance_watcher_tick(state: &AppState) -> Result<(), ApiError> {
     .all(&state.db)
     .await?;
 
+    // One proposal that cannot be settled (a broken trust score row, a missing domain, ...) must
+    // not stop the others: the failure is logged per proposal and the tick reports how many were
+    // left behind, so a stuck settlement is visible instead of silently blocking the queue.
+    let candidates = expired_voting.len();
+    let mut failed = 0_usize;
     for proposal in expired_voting {
-        finalize_voting(state, &proposal).await?;
+        if let Err(err) = finalize_voting(state, &proposal).await {
+            failed += 1;
+            tracing::error!(
+                proposal_id = proposal.id,
+                error = %err,
+                "governance tick could not finalize an expired proposal"
+            );
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(
+            candidates,
+            failed,
+            "governance tick finished with unsettled proposals; they are retried on the next tick"
+        );
     }
 
     Ok(())
@@ -1441,8 +1501,6 @@ pub async fn get_proposal(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let proposal = find_proposal(&state, &id).await?;
-    ensure_voting_finalized_if_needed(&state, &proposal).await?;
-    let proposal = find_proposal(&state, &id).await?;
 
     let tally = proposal_tally(&state, &proposal.id).await?;
     let decision_id = DecisionIdRow::find_by_statement(Statement::from_sql_and_values(
@@ -1909,12 +1967,11 @@ pub async fn create_vote(
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
     let proposal = find_proposal(&state, &id).await?;
-    ensure_voting_finalized_if_needed(&state, &proposal).await?;
-    let proposal = find_proposal(&state, &id).await?;
 
     if proposal.status != "voting" {
         return Err(ApiError::BadRequest("proposal is not in voting status".to_string()));
     }
+    ensure_voting_window_open(&proposal)?;
 
     let choice = req.choice.trim().to_lowercase();
     if !validate_vote_choice(&choice) {
@@ -2069,8 +2126,6 @@ pub async fn create_vote(
 
 pub async fn list_votes(State(state): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
     let proposal = find_proposal(&state, &id).await?;
-    ensure_voting_finalized_if_needed(&state, &proposal).await?;
-    let proposal = find_proposal(&state, &id).await?;
 
     let tally = proposal_tally(&state, &id).await?;
 
@@ -2112,14 +2167,13 @@ pub async fn delete_my_vote(
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
     let proposal = find_proposal(&state, &id).await?;
-    ensure_voting_finalized_if_needed(&state, &proposal).await?;
-    let proposal = find_proposal(&state, &id).await?;
 
     if proposal.status != "voting" {
         return Err(ApiError::BadRequest(
             "vote can only be withdrawn during voting".to_string(),
         ));
     }
+    ensure_voting_window_open(&proposal)?;
 
     let existing_vote = VoteRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,

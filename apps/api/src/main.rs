@@ -47,7 +47,9 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("{err}"))?;
     let state = AppState { cfg: cfg.clone(), db };
     let auth_state = state.clone();
-    routes::proposal::start_governance_watcher(state.clone());
+    // Proposal settlement deliberately does not run here. It used to run both as an API
+    // background task and inline on `GET /api/v1/proposals*`, which made a read request write
+    // decisions and trust scores. The worker polling pipeline is now the only writer.
     routes::webhook::spawn_stored_endpoint_audit(state.clone());
 
     // Uploaded object downloads are gated by `uploads_access_middleware`: it accepts either a
@@ -1088,7 +1090,13 @@ async fn main() -> anyhow::Result<()> {
                 )),
         )
         // Governance proposal routes
-        .route("/api/v1/proposals", get(routes::proposal::list_proposals))
+        .route(
+            "/api/v1/proposals",
+            get(routes::proposal::list_proposals).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
         .route(
             "/api/v1/proposals",
             post(routes::proposal::create_proposal).route_layer(
@@ -1100,7 +1108,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/proposals/{id}",
-            get(routes::proposal::get_proposal),
+            get(routes::proposal::get_proposal).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/proposals/{id}",
@@ -1138,7 +1149,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/proposals/{id}/votes",
-            get(routes::proposal::list_votes),
+            get(routes::proposal::list_votes).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/proposals/{id}/votes",
@@ -1211,7 +1225,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/api/v1/proposals/{id}/comments",
-            get(routes::proposal::list_proposal_comments),
+            get(routes::proposal::list_proposal_comments).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
         )
         .route(
             "/api/v1/proposals/{id}/comments",
