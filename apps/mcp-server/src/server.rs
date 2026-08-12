@@ -47,6 +47,22 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 - attachments: array of URLs from files.upload
 - decimal/amount form fields: send decimal strings, never JSON numbers
 - list tools are paginated: read pagination_hint / total_pages before summarising
+
+## Authorization
+Every call is checked against the agent policy of the project that owns the data.
+Ids must be canonical UUIDs. Do not send a project_id that does not own the target:
+the real owner is read back from the API and a mismatch is refused.
+
+These tools currently refuse every call, because the API exposes no way to read the
+owning project of the object they address, so their policy cannot be evaluated:
+form_attachments.archive, form_attachments.restore (needs GET /api/v1/form-attachments/{attachment_id}),
+sprints.update, sprints.delete (needs GET /api/v1/sprints/{sprint_id}),
+comments.delete (needs GET /api/v1/comments/{comment_id}).
+
+Workspace wide tools carry no owning project and are therefore not filtered by a
+project policy: projects.list, projects.create, project_types.*, scenario_templates.list,
+scenario_templates.get, members.list, search.all, work_items.search, files.upload,
+proposals.get, labels.create, labels.list, labels.update, labels.delete.
 ";
 
 const AGENTS_GUIDE_MD: &str = r#"# OpenPR Agent Guide
