@@ -49,7 +49,15 @@ pub fn normalize_record_values_with_existing(
             continue;
         }
         let raw = input.get(&field.key);
-        let required_exempt = field.field_type == "autonumber" || field.field_type == "child_table";
+        // `autonumber` is filled in by the server after this runs, so it is never the caller's job.
+        // A required `child_table` is exempt on create only: child rows are written against the
+        // parent record id, which does not exist yet, so demanding rows up front makes the form
+        // impossible to submit. Once the record exists there is no such excuse, and leaving the
+        // update path exempt silently drops business invariants like "an order must have lines" —
+        // so an update that would leave a required child table empty is rejected with a message that
+        // says exactly that.
+        let creating = existing_values.is_none();
+        let required_exempt = field.field_type == "autonumber" || (field.field_type == "child_table" && creating);
         if is_missing(raw) {
             if input.contains_key(&field.key) {
                 // The caller explicitly sent an empty/null value: treat it as an explicit
@@ -58,7 +66,13 @@ pub fn normalize_record_values_with_existing(
             }
             // Otherwise the caller simply did not mention this field; whatever was seeded
             // from `existing_values` for it (if anything) is left untouched.
-            if field.required && !required_exempt && !normalized.contains_key(&field.key) {
+            // `is_missing` rather than `contains_key`: the seeding loop copies stored values
+            // verbatim, so a legacy `null` / `""` / `[]` left by a schema change would otherwise
+            // satisfy a required field just by being present.
+            if field.required && !required_exempt && is_missing(normalized.get(&field.key)) {
+                if field.field_type == "child_table" {
+                    return Err(format!("field '{}' requires at least one child row", field.key));
+                }
                 return Err(format!("field '{}' is required", field.key));
             }
             continue;
@@ -1091,18 +1105,73 @@ mod tests {
         assert!(normalize_record_values_with_existing(&schema, json!({}), None).is_err());
     }
 
-    #[test]
-    fn required_child_table_field_does_not_error_on_create() {
-        let schema = json!({
+    fn required_child_table_schema() -> serde_json::Value {
+        json!({
             "fields": [{
                 "field_id": "fld_line_items",
                 "key": "line_items",
                 "type": "child_table",
                 "required": true
             }]
-        });
+        })
+    }
+
+    #[test]
+    fn required_child_table_field_is_exempt_only_while_the_parent_is_being_created() {
+        let schema = required_child_table_schema();
+
+        // Child rows are written against the parent record id, which does not exist yet.
         let normalized = normalize_record_values(&schema, json!({}))
             .expect("required child_table should be exempt from creation-time validation");
         assert!(normalized.get("line_items").is_none());
+    }
+
+    #[test]
+    fn required_child_table_field_errors_when_an_update_would_leave_it_empty() {
+        let schema = required_child_table_schema();
+
+        for existing in [json!({}), json!({"line_items": []}), json!({"line_items": null})] {
+            let error = normalize_record_values_with_existing(&schema, json!({}), Some(&existing))
+                .expect_err("an update must not silently keep a required child table empty");
+            assert_eq!(error, "field 'line_items' requires at least one child row");
+        }
+
+        let cleared = normalize_record_values_with_existing(
+            &schema,
+            json!({"line_items": []}),
+            Some(&json!({"line_items": [{"id": "row-1"}]})),
+        )
+        .expect_err("clearing the last child row must be rejected too");
+        assert_eq!(cleared, "field 'line_items' requires at least one child row");
+    }
+
+    #[test]
+    fn required_child_table_field_passes_once_the_record_has_rows() {
+        let schema = required_child_table_schema();
+        let existing = json!({"line_items": [{"id": "row-1"}]});
+
+        let normalized = normalize_record_values_with_existing(&schema, json!({}), Some(&existing))
+            .expect("an untouched, populated child table satisfies the requirement");
+        assert_eq!(
+            normalized
+                .get("line_items")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_stored_empty_value_does_not_satisfy_a_required_field() {
+        let schema = json!({
+            "fields": [{"field_id": "fld_owner", "key": "owner", "type": "text", "required": true}]
+        });
+
+        for existing in [json!({"owner": null}), json!({"owner": "   "})] {
+            assert!(
+                normalize_record_values_with_existing(&schema, json!({}), Some(&existing)).is_err(),
+                "a stored empty value must not pass the required check just by being present"
+            );
+        }
     }
 }

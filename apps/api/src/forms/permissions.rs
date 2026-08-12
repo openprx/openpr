@@ -47,6 +47,13 @@ pub struct FormPermissionsResponse {
     pub effective: FormEffectivePermissionResponse,
 }
 
+/// Whether `role` is exempt from field-level policies and record scoping.
+///
+/// Bots used to be exempt too, on the strength of being bots: `is_bot ||` short-circuited every
+/// check in this module, so a token could read fields marked `read:false`, write fields marked
+/// `write:false`, and see every record of a form scoped to `owned`. A bot now resolves to a
+/// workspace role like anybody else — `admin` when its token carries the `admin` permission,
+/// `member` otherwise — and is judged by that role alone.
 pub fn role_is_form_admin(role: &str) -> bool {
     matches!(role.trim().to_ascii_lowercase().as_str(), "owner" | "admin")
 }
@@ -108,8 +115,8 @@ pub fn form_permissions_response(
             effective_permission_from_policies(&role, &policies, action),
         );
     }
-    let record_scope = effective_record_scope_from_policies(&role, is_bot, &policies);
-    let fields = effective_field_permissions_from_policies(&role, is_bot, &policies);
+    let record_scope = effective_record_scope_from_policies(&role, &policies);
+    let fields = effective_field_permissions_from_policies(&role, &policies);
     FormPermissionsResponse {
         form_id,
         policies,
@@ -139,10 +146,9 @@ fn effective_permission_from_policies(role: &str, policies: &[FormPermissionPoli
 
 fn effective_field_permissions_from_policies(
     role: &str,
-    is_bot: bool,
     policies: &[FormPermissionPolicyResponse],
 ) -> BTreeMap<String, BTreeMap<String, bool>> {
-    if is_bot || role_is_form_admin(role) {
+    if role_is_form_admin(role) {
         return BTreeMap::new();
     }
     let Ok(subject_id) = normalize_permission_subject_id(role) else {
@@ -222,10 +228,9 @@ pub async fn ensure_field_write_policy_allows(
     state: &AppState,
     form_id: Uuid,
     role: &str,
-    is_bot: bool,
     values: &Value,
 ) -> Result<(), ApiError> {
-    if is_bot || role_is_form_admin(role) {
+    if role_is_form_admin(role) {
         return Ok(());
     }
     let Some(value_object) = values.as_object() else {
@@ -251,10 +256,9 @@ pub async fn ensure_field_read_policy_allows(
     state: &AppState,
     form_id: Uuid,
     role: &str,
-    is_bot: bool,
     field_key: &str,
 ) -> Result<(), ApiError> {
-    if is_bot || role_is_form_admin(role) {
+    if role_is_form_admin(role) {
         return Ok(());
     }
     if let Some(row) = permission_policy_for_role(state, form_id, role).await?
@@ -267,29 +271,29 @@ pub async fn ensure_field_read_policy_allows(
     Ok(())
 }
 
-pub async fn denied_read_field_keys(
-    state: &AppState,
-    form_id: Uuid,
-    role: &str,
-    is_bot: bool,
-) -> Result<BTreeSet<String>, ApiError> {
-    if is_bot || role_is_form_admin(role) {
+pub async fn denied_read_field_keys(state: &AppState, form_id: Uuid, role: &str) -> Result<BTreeSet<String>, ApiError> {
+    if role_is_form_admin(role) {
         return Ok(BTreeSet::new());
     }
     let Some(row) = permission_policy_for_role(state, form_id, role).await? else {
         return Ok(BTreeSet::new());
     };
-    Ok(permission_policy_fields(&row.policy)
+    Ok(denied_read_fields_from_policy(&row.policy))
+}
+
+/// Field keys the policy marks `read:false`.
+pub fn denied_read_fields_from_policy(policy: &Value) -> BTreeSet<String> {
+    permission_policy_fields(policy)
         .into_iter()
         .filter_map(|(field_key, actions)| match actions.get("read") {
             Some(false) => Some(field_key),
             _ => None,
         })
-        .collect())
+        .collect()
 }
 
-pub async fn form_record_scope(state: &AppState, form_id: Uuid, role: &str, is_bot: bool) -> Result<String, ApiError> {
-    if is_bot || role_is_form_admin(role) {
+pub async fn form_record_scope(state: &AppState, form_id: Uuid, role: &str) -> Result<String, ApiError> {
+    if role_is_form_admin(role) {
         return Ok("all".to_string());
     }
     Ok(permission_policy_for_role(state, form_id, role)
@@ -303,12 +307,11 @@ pub async fn append_record_scope_sql(
     form_id: Uuid,
     role: &str,
     actor_id: Uuid,
-    is_bot: bool,
     where_parts: &mut Vec<String>,
     values: &mut Vec<sea_orm::Value>,
     next_idx: &mut usize,
 ) -> Result<(), ApiError> {
-    if form_record_scope(state, form_id, role, is_bot).await? == "owned" {
+    if form_record_scope(state, form_id, role).await? == "owned" {
         where_parts.push(format!("form_records.created_by = ${next_idx}"));
         values.push(actor_id.into());
         *next_idx += 1;
@@ -358,10 +361,9 @@ pub async fn ensure_record_scope_allows_created_by(
     form_id: Uuid,
     role: &str,
     actor_id: Uuid,
-    is_bot: bool,
     created_by: Option<Uuid>,
 ) -> Result<(), ApiError> {
-    if form_record_scope(state, form_id, role, is_bot).await? == "owned" && created_by != Some(actor_id) {
+    if form_record_scope(state, form_id, role).await? == "owned" && created_by != Some(actor_id) {
         return Err(ApiError::Forbidden(
             "form record ownership policy denied access".to_string(),
         ));
@@ -423,8 +425,8 @@ pub fn validate_permission_policy(policy: Value) -> Result<Value, ApiError> {
     Ok(policy)
 }
 
-fn effective_record_scope_from_policies(role: &str, is_bot: bool, policies: &[FormPermissionPolicyResponse]) -> String {
-    if is_bot || role_is_form_admin(role) {
+fn effective_record_scope_from_policies(role: &str, policies: &[FormPermissionPolicyResponse]) -> String {
+    if role_is_form_admin(role) {
         return "all".to_string();
     }
     let Ok(subject_id) = normalize_permission_subject_id(role) else {
@@ -502,9 +504,9 @@ pub fn normalize_permission_subject_id(value: &str) -> Result<String, ApiError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        FormPermissionPolicyResponse, filter_values_for_read_policy, form_permissions_response,
-        permission_policy_field_allows, permission_policy_fields, permission_policy_record_scope,
-        role_record_scope_predicate_sql, validate_permission_policy,
+        FormPermissionPolicyResponse, denied_read_fields_from_policy, filter_values_for_read_policy,
+        form_permissions_response, permission_policy_field_allows, permission_policy_fields,
+        permission_policy_record_scope, role_record_scope_predicate_sql, validate_permission_policy,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -636,5 +638,62 @@ mod tests {
         assert_eq!(response.effective.actions["record.update"], true);
         assert_eq!(response.effective.fields["unit_price"]["read"], false);
         assert_eq!(response.effective.fields["unit_price"]["write"], false);
+    }
+
+    fn member_policy(form_id: Uuid) -> FormPermissionPolicyResponse {
+        FormPermissionPolicyResponse {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            form_id,
+            subject_type: "role".to_string(),
+            subject_id: "member".to_string(),
+            policy: json!({
+                "record_scope": "owned",
+                "fields": {"salary": {"read": false, "write": false}}
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn bot_member_is_bound_by_the_same_field_and_record_policy_as_a_human_member() {
+        let form_id = Uuid::new_v4();
+        let policies = vec![member_policy(form_id)];
+
+        let bot = form_permissions_response(form_id, "member".to_string(), true, policies.clone());
+        let human = form_permissions_response(form_id, "member".to_string(), false, policies);
+
+        assert!(bot.effective.is_bot);
+        assert_eq!(bot.effective.record_scope, "owned");
+        assert_eq!(bot.effective.fields["salary"]["read"], false);
+        assert_eq!(bot.effective.fields["salary"]["write"], false);
+        assert_eq!(bot.effective.record_scope, human.effective.record_scope);
+        assert_eq!(bot.effective.fields, human.effective.fields);
+    }
+
+    #[test]
+    fn bot_admin_keeps_the_workspace_admin_exemption_and_nothing_more() {
+        let form_id = Uuid::new_v4();
+        let policies = vec![member_policy(form_id)];
+
+        let bot_admin = form_permissions_response(form_id, "admin".to_string(), true, policies);
+
+        assert_eq!(bot_admin.effective.record_scope, "all");
+        assert!(bot_admin.effective.fields.is_empty());
+    }
+
+    #[test]
+    fn bot_reads_are_stripped_of_fields_the_policy_denies() {
+        let policy = member_policy(Uuid::new_v4()).policy;
+        let denied = denied_read_fields_from_policy(&policy);
+
+        assert!(denied.contains("salary"));
+
+        let values = filter_values_for_read_policy(json!({"name": "Ada", "salary": "9000"}), &denied);
+
+        assert_eq!(values.get("name").and_then(serde_json::Value::as_str), Some("Ada"));
+        assert!(values.get("salary").is_none());
     }
 }

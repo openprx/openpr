@@ -40,8 +40,59 @@ pub fn extract_bot_context(extensions: &Extensions) -> Option<&BotAuthContext> {
     extensions.get::<BotAuthContext>()
 }
 
+/// What a bot token is allowed to do, as stored in `workspace_bots.permissions`.
+///
+/// The three names are the ones `POST /workspaces/{id}/bots` accepts and the ones the column
+/// comment documents. Until now none of them was ever consulted: every bot was mapped to a
+/// workspace role and the `read` / `write` distinction existed only on paper, so a token issued as
+/// read-only could create, update and delete anything its workspace contained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotPermission {
+    /// Retrieve data. Implied by `write` and `admin` — a write returns what it wrote.
+    Read,
+    /// Change data. Implied by `admin`.
+    Write,
+    /// Act as a workspace administrator: bypasses form field-level policies and record scoping
+    /// exactly like a human `admin` member, and nothing beyond that.
+    Admin,
+}
+
+impl BotPermission {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// Whether `permissions` grants `required`, honouring `admin` > `write` > `read`.
+///
+/// Unknown entries grant nothing: the issuing endpoint rejects them, so a token carrying one is
+/// either forged or predates a permission rename, and neither deserves the benefit of the doubt.
+pub fn bot_permissions_allow(permissions: &[String], required: BotPermission) -> bool {
+    let granted = |name: &str| permissions.iter().any(|permission| permission == name);
+    match required {
+        BotPermission::Read => granted("read") || granted("write") || granted("admin"),
+        BotPermission::Write => granted("write") || granted("admin"),
+        BotPermission::Admin => granted("admin"),
+    }
+}
+
+/// Reject a bot token that does not carry `required`.
+pub fn ensure_bot_permission(bot: &BotAuthContext, required: BotPermission) -> Result<(), ApiError> {
+    if bot_permissions_allow(&bot.permissions, required) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(format!(
+        "bot token lacks the '{}' permission",
+        required.as_str()
+    )))
+}
+
 fn bot_role_from_permissions(permissions: &[String]) -> String {
-    if permissions.iter().any(|p| p == "admin") {
+    if bot_permissions_allow(permissions, BotPermission::Admin) {
         "admin".to_string()
     } else {
         "member".to_string()
@@ -77,6 +128,9 @@ pub async fn require_workspace_access_from_auth(
         if bot_ctx.workspace_id != workspace_id {
             return Err(ApiError::Forbidden("bot not authorized for this workspace".to_string()));
         }
+        // A token with no usable permission at all reaches nothing, the same way a user with no
+        // workspace membership row does.
+        ensure_bot_permission(bot_ctx, BotPermission::Read)?;
         let role = bot_role_from_permissions(&bot_ctx.permissions);
         return Ok((bot_ctx.bot_id, role, true));
     }
@@ -104,6 +158,18 @@ fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// The permission an HTTP method demands of a bot token.
+///
+/// Safe methods only read, everything else can change state. Kept separate from the middleware so
+/// the mapping is testable without standing up a router.
+fn required_bot_permission(method: &axum::http::Method) -> BotPermission {
+    if method.is_safe() {
+        BotPermission::Read
+    } else {
+        BotPermission::Write
+    }
 }
 
 /// Middleware: authenticate as bot (opr_ token) or fall through to JWT.
@@ -172,11 +238,20 @@ pub async fn bot_or_user_auth_middleware(
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        req.extensions_mut().insert(BotAuthContext {
+        let context = BotAuthContext {
             bot_id: bot.id,
             workspace_id: bot.workspace_id,
             permissions,
-        });
+        };
+        // Every bot-reachable route passes through here, which makes this the one place the
+        // `read` / `write` split can be enforced without trusting each handler to remember. The
+        // HTTP method is the authority: safe methods (GET/HEAD/OPTIONS/TRACE) need `read`,
+        // everything else needs `write`. Handlers that mutate behind a POST are covered; the price
+        // is that a read-shaped POST (preview, signed-url) also needs `write`, which is the
+        // direction to fail in.
+        ensure_bot_permission(&context, required_bot_permission(req.method()))?;
+
+        req.extensions_mut().insert(context);
         req.extensions_mut().insert(JwtClaims {
             sub: bot.id.to_string(),
             email: format!("bot+{}@openpr.local", bot.id),
@@ -199,4 +274,70 @@ pub async fn bot_or_user_auth_middleware(
     }
 
     Ok(next.run(req).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BotAuthContext, BotPermission, bot_permissions_allow, bot_role_from_permissions, ensure_bot_permission,
+        required_bot_permission,
+    };
+    use axum::http::Method;
+    use uuid::Uuid;
+
+    fn bot(permissions: &[&str]) -> BotAuthContext {
+        BotAuthContext {
+            bot_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            permissions: permissions.iter().map(|value| (*value).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_read_only_bot_cannot_perform_write_operations() {
+        let read_only = bot(&["read"]);
+
+        assert!(ensure_bot_permission(&read_only, BotPermission::Read).is_ok());
+        assert!(ensure_bot_permission(&read_only, BotPermission::Write).is_err());
+        assert!(ensure_bot_permission(&read_only, BotPermission::Admin).is_err());
+    }
+
+    #[test]
+    fn write_and_admin_imply_the_weaker_permissions() {
+        assert!(bot_permissions_allow(&["write".to_string()], BotPermission::Read));
+        assert!(bot_permissions_allow(&["write".to_string()], BotPermission::Write));
+        assert!(!bot_permissions_allow(&["write".to_string()], BotPermission::Admin));
+
+        assert!(bot_permissions_allow(&["admin".to_string()], BotPermission::Read));
+        assert!(bot_permissions_allow(&["admin".to_string()], BotPermission::Write));
+        assert!(bot_permissions_allow(&["admin".to_string()], BotPermission::Admin));
+    }
+
+    #[test]
+    fn unknown_and_empty_permissions_grant_nothing() {
+        assert!(!bot_permissions_allow(&[], BotPermission::Read));
+        assert!(!bot_permissions_allow(&["readonly".to_string()], BotPermission::Read));
+        assert!(!bot_permissions_allow(&["ADMIN".to_string()], BotPermission::Admin));
+        assert!(ensure_bot_permission(&bot(&[]), BotPermission::Read).is_err());
+    }
+
+    #[test]
+    fn only_the_admin_permission_synthesizes_the_admin_workspace_role() {
+        assert_eq!(bot_role_from_permissions(&["admin".to_string()]), "admin");
+        assert_eq!(
+            bot_role_from_permissions(&["read".to_string(), "write".to_string()]),
+            "member"
+        );
+        assert_eq!(bot_role_from_permissions(&[]), "member");
+    }
+
+    #[test]
+    fn unsafe_methods_require_the_write_permission() {
+        for method in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert_eq!(required_bot_permission(&method), BotPermission::Read);
+        }
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert_eq!(required_bot_permission(&method), BotPermission::Write);
+        }
+    }
 }
