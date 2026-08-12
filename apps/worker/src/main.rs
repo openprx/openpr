@@ -230,6 +230,13 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(error = %err, "form job polling failed");
         }
 
+        // Proposal settlement lives here rather than on the API read path, where an unauthorized
+        // `GET` used to open a write transaction. The tick is idempotent and guarded by a
+        // per-proposal advisory lock, so several worker replicas may run it concurrently.
+        if let Err(err) = api::routes::proposal::governance_tick(&state).await {
+            tracing::warn!(error = %err, "governance polling failed");
+        }
+
         tokio::select! {
             () = &mut shutdown => {
                 tracing::info!("worker shutting down");

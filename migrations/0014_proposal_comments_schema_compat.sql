@@ -1,13 +1,13 @@
 DO $$
 BEGIN
-  IF to_regclass('public.proposal_comments') IS NULL THEN
+  IF to_regclass('proposal_comments') IS NULL THEN
     RETURN;
   END IF;
 
   IF NOT EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'proposal_comments' AND column_name = 'comment_type'
+    WHERE table_schema = current_schema() AND table_name = 'proposal_comments' AND column_name = 'comment_type'
   ) THEN
     ALTER TABLE proposal_comments
       ADD COLUMN comment_type varchar(20) NOT NULL DEFAULT 'general';
@@ -16,7 +16,7 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'proposal_comments' AND column_name = 'content'
+    WHERE table_schema = current_schema() AND table_name = 'proposal_comments' AND column_name = 'content'
   ) THEN
     ALTER TABLE proposal_comments
       ADD COLUMN content text;
@@ -25,7 +25,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'proposal_comments' AND column_name = 'body'
+    WHERE table_schema = current_schema() AND table_name = 'proposal_comments' AND column_name = 'body'
   ) THEN
     UPDATE proposal_comments
     SET content = COALESCE(content, body)
@@ -42,7 +42,7 @@ BEGIN
   IF NOT EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'proposal_comments' AND column_name = 'author_type'
+    WHERE table_schema = current_schema() AND table_name = 'proposal_comments' AND column_name = 'author_type'
   ) THEN
     ALTER TABLE proposal_comments
       ADD COLUMN author_type author_type;
@@ -51,7 +51,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'proposal_comments' AND column_name = 'author_type'
+    WHERE table_schema = current_schema() AND table_name = 'proposal_comments' AND column_name = 'author_type'
       AND udt_name <> 'author_type'
   ) THEN
     ALTER TABLE proposal_comments
@@ -75,7 +75,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'proposal_comments' AND column_name = 'author_id'
+    WHERE table_schema = current_schema() AND table_name = 'proposal_comments' AND column_name = 'author_id'
       AND udt_name <> 'text'
   ) THEN
     ALTER TABLE proposal_comments

@@ -12,7 +12,7 @@ BEGIN
     ON tc.constraint_name = kcu.constraint_name
    AND tc.table_schema = kcu.table_schema
   WHERE tc.constraint_type = 'FOREIGN KEY'
-    AND tc.table_schema = 'public'
+    AND tc.table_schema = current_schema()
     AND tc.table_name = 'review_participants'
     AND kcu.column_name = 'user_id'
     AND ccu.table_name = 'users'
@@ -28,7 +28,7 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM information_schema.columns
-    WHERE table_schema = 'public'
+    WHERE table_schema = current_schema()
       AND table_name = 'review_participants'
       AND column_name = 'user_id'
       AND data_type <> 'character varying'
