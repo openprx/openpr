@@ -75,7 +75,10 @@ use crate::{
             materialize_signature_values_with_audit, materialize_signature_values_with_existing_audit,
             signature_lifecycle_summary, signature_workflow_verification_summary, verify_signature_audit_source,
         },
-        validation::{validate_and_normalize_values, validate_and_normalize_values_with_existing},
+        validation::{
+            validate_and_normalize_values, validate_and_normalize_values_with_existing,
+            validate_and_normalize_values_with_existing_report,
+        },
     },
     middleware::bot_auth::{BotAuthContext, require_workspace_access_from_auth},
     plugins::hooks::{run_event_handler_hooks, run_field_validator_hooks, run_formula_hooks},
@@ -3757,10 +3760,23 @@ async fn update_record_for_form(
             )
             .await?;
             let with_autonumber = apply_autonumber_values(&tx, &form, Some(&record.values), calculated).await?;
-            let normalized = validate_and_normalize_values_with_existing(&form.schema, with_autonumber, &record.values)
-                .map_err(ApiError::BadRequest)?;
+            let normalized =
+                validate_and_normalize_values_with_existing_report(&form.schema, with_autonumber, &record.values)
+                    .map_err(ApiError::BadRequest)?;
+            if !normalized.unmet_required_fields.is_empty() {
+                // Required fields that were already empty before this write. The update is allowed
+                // through so the record stays repairable, but the gap is recorded rather than
+                // silently accepted as a satisfied constraint.
+                tracing::warn!(
+                    form_id = %form.id,
+                    record_id = %record_id,
+                    fields = %normalized.unmet_required_fields.join(","),
+                    "record updated while required fields stay unmet from before this write"
+                );
+            }
             let signature_materialization =
-                materialize_signature_values_with_existing_audit(&form.schema, normalized, &record.values).await?;
+                materialize_signature_values_with_existing_audit(&form.schema, normalized.values, &record.values)
+                    .await?;
             signature_audit_entries = annotate_signature_audit_entries(
                 signature_materialization.audit_entries,
                 if is_bot { "bot" } else { "user" },
@@ -3902,6 +3918,9 @@ async fn archive_record_for_form(
         find_idempotent_record(state, form, idempotency_key.as_deref(), "form.record.archived").await?
     {
         return Ok(record);
+    }
+    if record.archived_at.is_none() {
+        ensure_required_child_tables_keep_a_row(state, record.id).await?;
     }
     let created_by = if is_bot { None } else { Some(actor_id) };
     let tx = state.db.begin().await?;
@@ -4946,6 +4965,99 @@ fn child_aggregate_field_value(field: &FormField, value: Decimal) -> Result<Valu
         }
         _ => Ok(json!(value.normalize().to_string())),
     }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ParentRequiredChildTableRow {
+    relation_key: String,
+    parent_record_id: Uuid,
+    parent_schema: Value,
+    remaining_children: i64,
+}
+
+/// Every parent this record hangs under as a `parent_child` row, with the parent's schema and the
+/// number of *other* live child rows sharing the same `relation_key`. Sibling counting excludes the
+/// record being archived and already archived rows, so `remaining_children = 0` means archiving
+/// empties that child table.
+const PARENT_REQUIRED_CHILD_TABLES_SQL: &str = r"
+    SELECT links.relation_key,
+           links.source_record_id AS parent_record_id,
+           parent_form.schema AS parent_schema,
+           (
+               SELECT COUNT(*)::bigint
+               FROM form_record_links sibling_links
+               JOIN form_records sibling
+                 ON sibling_links.target_id ~ '^[0-9a-fA-F-]{36}$'
+                AND sibling.id = sibling_links.target_id::uuid
+               WHERE sibling_links.source_record_id = links.source_record_id
+                 AND sibling_links.relation_key = links.relation_key
+                 AND sibling_links.target_type = 'form_record'
+                 AND sibling_links.relation_type = 'parent_child'
+                 AND sibling.id <> child.id
+                 AND sibling.archived_at IS NULL
+                 AND sibling.workspace_id = parent.workspace_id
+                 AND sibling.project_id = parent.project_id
+           ) AS remaining_children
+    FROM form_record_links links
+    JOIN form_records parent ON parent.id = links.source_record_id
+    JOIN project_forms parent_form ON parent_form.id = parent.form_id
+    JOIN form_records child
+      ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
+     AND child.id = links.target_id::uuid
+    WHERE links.target_type = 'form_record'
+      AND links.relation_type = 'parent_child'
+      AND links.target_id = $1
+      AND parent.archived_at IS NULL
+      AND parent.workspace_id = child.workspace_id
+      AND parent.project_id = child.project_id
+";
+
+/// Whether `relation_key` names a required `child_table` on the parent schema that archiving would
+/// leave with no rows. Kept separate from the query so the rule itself is testable without a
+/// database.
+fn required_child_table_would_be_emptied(
+    parent_schema: &Value,
+    relation_key: &str,
+    remaining_children: i64,
+) -> Result<bool, ApiError> {
+    if remaining_children > 0 {
+        return Ok(false);
+    }
+    let fields = parse_fields(parent_schema).map_err(ApiError::BadRequest)?;
+    Ok(fields
+        .iter()
+        .any(|field| field.key == relation_key && field.required && field.field_type == "child_table"))
+}
+
+/// Enforces required `child_table` fields at the only operation that can violate them.
+///
+/// A child table's rows are separate records linked by `form_record_links`, never values on the
+/// parent, so "this child table has at least one row" cannot be checked while normalizing the
+/// parent's values — a parent has no rows the instant it is created, and normalization runs again
+/// on every later write including the recalculation triggered by adding the first row. What can be
+/// checked is the row count, and the only request that can drive it to zero is archiving the last
+/// row, so that request is where the constraint is enforced.
+async fn ensure_required_child_tables_keep_a_row(state: &AppState, child_record_id: Uuid) -> Result<(), ApiError> {
+    let parents = ParentRequiredChildTableRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        PARENT_REQUIRED_CHILD_TABLES_SQL,
+        vec![child_record_id.to_string().into()],
+    ))
+    .all(&state.db)
+    .await?;
+    for parent in parents {
+        if required_child_table_would_be_emptied(
+            &parent.parent_schema,
+            &parent.relation_key,
+            parent.remaining_children,
+        )? {
+            return Err(ApiError::BadRequest(format!(
+                "field '{}' requires at least one child row on record {}",
+                parent.relation_key, parent.parent_record_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Parents to recalculate after a child record changed. The child is joined on its uuid primary key
@@ -6972,12 +7084,13 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
 mod tests {
     use super::{
         AttachmentPackageArtifact, BusinessEventResponse, CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL,
-        EventScope, ImportRecordsFileRequest, RECALCULATE_PARENT_RECORDS_SQL, attachment_claimed_object_keys,
-        default_form_key_from_template, default_title_template_from_schema, ensure_can_read_job_result,
-        ensure_link_target_scope, filter_event_response_values,
+        EventScope, ImportRecordsFileRequest, PARENT_REQUIRED_CHILD_TABLES_SQL, RECALCULATE_PARENT_RECORDS_SQL,
+        attachment_claimed_object_keys, default_form_key_from_template, default_title_template_from_schema,
+        ensure_can_read_job_result, ensure_link_target_scope, filter_event_response_values,
         import_records_request_from_uploaded_file_without_mapping, job_listing_owner_filter,
         normalize_scenario_field_schema, owned_record_event_predicate, push_event_scope_filters,
-        record_claimed_object_keys, summarize_job_result, write_attachment_package_artifact,
+        record_claimed_object_keys, required_child_table_would_be_emptied, summarize_job_result,
+        write_attachment_package_artifact,
     };
     use crate::{
         error::ApiError,
@@ -6991,6 +7104,56 @@ mod tests {
 
     fn denied_fields(keys: &[&str]) -> BTreeSet<String> {
         keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    fn parent_schema_with_child_table(required: bool) -> Value {
+        json!({
+            "fields": [
+                {
+                    "field_id": "fld_line_items",
+                    "key": "line_items",
+                    "type": "child_table",
+                    "required": required
+                },
+                {"field_id": "fld_notes", "key": "notes", "type": "child_table"}
+            ]
+        })
+    }
+
+    #[test]
+    fn archiving_the_last_row_of_a_required_child_table_is_refused() {
+        let schema = parent_schema_with_child_table(true);
+
+        assert!(
+            required_child_table_would_be_emptied(&schema, "line_items", 0).expect("a well formed schema must parse"),
+            "the required child table would be left with no rows"
+        );
+    }
+
+    #[test]
+    fn archiving_a_child_row_is_allowed_while_siblings_or_requiredness_remain_absent() {
+        let required = parent_schema_with_child_table(true);
+        let optional = parent_schema_with_child_table(false);
+
+        // A sibling row keeps the constraint satisfied.
+        assert!(!required_child_table_would_be_emptied(&required, "line_items", 1).expect("schema must parse"));
+        // An optional child table may be emptied.
+        assert!(!required_child_table_would_be_emptied(&optional, "line_items", 0).expect("schema must parse"));
+        // A relation key that is not a required child table on this parent is none of our business.
+        assert!(!required_child_table_would_be_emptied(&required, "notes", 0).expect("schema must parse"));
+    }
+
+    #[test]
+    fn the_required_child_table_query_counts_live_siblings_only() {
+        // The guard must not count the record being archived, already archived rows, rows under a
+        // different relation key, or rows belonging to a different parent.
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling.id <> child.id"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling.archived_at IS NULL"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling_links.relation_key = links.relation_key"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling_links.source_record_id = links.source_record_id"));
+        // Tenancy: a forged link must not drag in another workspace's rows.
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("parent.workspace_id = child.workspace_id"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling.workspace_id = parent.workspace_id"));
     }
 
     #[test]
