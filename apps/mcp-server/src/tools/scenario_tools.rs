@@ -161,6 +161,16 @@ pub async fn code_directory_get(client: &OpenPrClient, args: Value) -> CallToolR
     CallToolResult::success(serde_json::to_string_pretty(&resource).unwrap_or_default())
 }
 
+/// The owning project reported by `GET /api/v1/issues/{id}`.
+fn work_item_project_id(response: &Value) -> Option<&str> {
+    response
+        .get("data")
+        .and_then(|data| data.get("project_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+}
+
 pub async fn code_task_context_get(client: &OpenPrClient, args: Value) -> CallToolResult {
     let input: CodeTaskContextInput = match serde_json::from_value(args) {
         Ok(value) => value,
@@ -173,7 +183,29 @@ pub async fn code_task_context_get(client: &OpenPrClient, args: Value) -> CallTo
     };
     let work_item = match input.work_item_id {
         Some(work_item_id) => match client.get_work_item(&work_item_id).await {
-            Ok(value) => Some(value),
+            // `code.task_context.get` is gated as a declared-project tool, so the policy
+            // that authorized this call is the policy of `project_id`. `work_item_id`
+            // addresses `GET /api/v1/issues/{id}` on its own and is never checked by that
+            // gate, so without this comparison a caller could pair a project it is allowed
+            // to read with a work item from any other project and get it back. The owning
+            // project reported by the API is the only authority; a payload that does not
+            // report one fails closed, exactly like `server::McpServer::store_owner`.
+            Ok(value) => match work_item_project_id(&value) {
+                Some(owner) if owner.eq_ignore_ascii_case(input.project_id.trim()) => Some(value),
+                Some(_) => {
+                    return CallToolResult::error(format!(
+                        "Work item {work_item_id} belongs to a different project than the requested project context; \
+                         refusing to return it under project {}",
+                        input.project_id
+                    ));
+                }
+                None => {
+                    return CallToolResult::error(format!(
+                        "Work item {work_item_id} carries no project_id, so it cannot be shown to be part of project {}",
+                        input.project_id
+                    ));
+                }
+            },
             Err(err) => return CallToolResult::error(err),
         },
         None => None,
@@ -328,8 +360,116 @@ fn resource_items(value: &Value) -> Vec<&Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_code_resources, find_directory_resource};
+    use super::{code_task_context_get, filter_code_resources, find_directory_resource};
+    use crate::client::{OpenPrClient, test_api};
+    use crate::protocol::ToolContent;
+    use axum::{Json, Router, routing::get};
     use serde_json::json;
+
+    /// Concatenated text content of a tool result.
+    fn tool_text(result: &crate::protocol::CallToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                ToolContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>()
+    }
+
+    const PROJECT: &str = "11111111-1111-4111-8111-111111111111";
+    const FOREIGN_PROJECT: &str = "99999999-9999-4999-8999-999999999999";
+    const WORK_ITEM: &str = "55555555-5555-4555-8555-555555555555";
+
+    /// `code.task_context.get` is gated as a declared-project tool, so only `project_id`
+    /// is checked against a policy. `work_item_id` addresses the issue endpoint by itself,
+    /// which let a caller read a work item from a project it was never authorized for by
+    /// pairing it with a project it was.
+    #[tokio::test]
+    async fn task_context_refuses_a_work_item_owned_by_another_project() -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new()
+            .route(
+                &format!("/api/v1/projects/{PROJECT}/context"),
+                get(|| async { Json(json!({ "code": 0, "data": { "project": { "id": PROJECT } } })) }),
+            )
+            .route(
+                &format!("/api/v1/issues/{WORK_ITEM}"),
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "id": WORK_ITEM, "project_id": FOREIGN_PROJECT, "title": "secret roadmap item" }
+                    }))
+                }),
+            );
+        let client = OpenPrClient::new(
+            test_api::spawn(router).await?,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?;
+
+        let refused = code_task_context_get(&client, json!({ "project_id": PROJECT, "work_item_id": WORK_ITEM })).await;
+        assert_eq!(refused.is_error, Some(true));
+        let text = tool_text(&refused);
+        assert!(text.contains("belongs to a different project"), "{text}");
+        assert!(!text.contains("secret roadmap item"), "{text}");
+
+        // The project context alone stays available.
+        let allowed = code_task_context_get(&client, json!({ "project_id": PROJECT })).await;
+        assert_eq!(allowed.is_error, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_context_returns_a_work_item_of_the_declared_project() -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new()
+            .route(
+                &format!("/api/v1/projects/{PROJECT}/context"),
+                get(|| async { Json(json!({ "code": 0, "data": { "project": { "id": PROJECT } } })) }),
+            )
+            .route(
+                &format!("/api/v1/issues/{WORK_ITEM}"),
+                get(|| async {
+                    Json(json!({
+                        "code": 0,
+                        "data": { "id": WORK_ITEM, "project_id": PROJECT, "title": "in scope" }
+                    }))
+                }),
+            );
+        let client = OpenPrClient::new(
+            test_api::spawn(router).await?,
+            "opr_test_token".to_string(),
+            "workspace-1".to_string(),
+        )?;
+
+        // Upper case is accepted by the policy gate's canonicalisation, so the comparison
+        // has to be case insensitive or a legitimate call would be refused.
+        let allowed = code_task_context_get(
+            &client,
+            json!({ "project_id": PROJECT.to_uppercase(), "work_item_id": WORK_ITEM }),
+        )
+        .await;
+        assert_eq!(allowed.is_error, None);
+        let text = tool_text(&allowed);
+        assert!(text.contains("in scope"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn work_item_without_a_project_id_is_not_treated_as_in_scope() {
+        assert_eq!(
+            super::work_item_project_id(&json!({ "code": 0, "data": { "id": WORK_ITEM } })),
+            None
+        );
+        assert_eq!(
+            super::work_item_project_id(&json!({ "code": 0, "data": { "project_id": "  " } })),
+            None
+        );
+        assert_eq!(
+            super::work_item_project_id(&json!({ "code": 0, "data": { "project_id": PROJECT } })),
+            Some(PROJECT)
+        );
+    }
 
     #[test]
     fn code_resource_filter_keeps_repo_and_directory_only() {

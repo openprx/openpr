@@ -1894,6 +1894,23 @@ fn claimed_project_ids(args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Whether the project agent policy lists this tool.
+///
+/// A policy that carries no `data.mcp.tool_registry.enabled_tools` array admits every
+/// tool. That is deliberate, and it is *not* the "unconfigured projects are ungoverned"
+/// hole it looks like at first read: `enabled_tools` is not a stored opt-in setting that
+/// an administrator may forget to fill in. The API derives it on every request from the
+/// project type's capabilities (`apps/api/src/routes/context.rs` `build_agent_policy` ->
+/// `build_mcp_tool_registry`), which always emits the array — at minimum the unconditional
+/// `core` group — so a live API answer always takes the `contains` branch. A project whose
+/// type does not enable the `webhook` capability really does get `connectors.list` refused.
+///
+/// The fallback therefore only fires when the field is missing altogether: an API older or
+/// newer than this binary, or a policy payload reshaped in transit. Failing closed there
+/// would take every tool down on a schema change rather than on a policy decision, so the
+/// choice is intentional. It is also not the only line of defence: the response must be a
+/// `{code: 0, ...}` envelope with a `data` object (`enforce_project_tool_policy`), the
+/// project must be a canonical UUID, and id addressed tools still resolve their real owner.
 fn is_tool_enabled_by_policy(policy_response: &Value, tool_name: &str) -> bool {
     tools::capabilities::extract_enabled_tool_names(policy_response).is_none_or(|enabled| enabled.contains(tool_name))
 }
