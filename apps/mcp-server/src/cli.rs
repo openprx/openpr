@@ -520,8 +520,10 @@ async fn run_file_upload(cmd: &FilesCmd, server: &McpServer) -> anyhow::Result<C
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to read file {file}: {e}"))?;
             let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+            // Must go through `call_tool`: `execute_tool` skips the project policy gate
+            // and the tool-call audit, so calling it here made the CLI a bypass.
             Ok(server
-                .execute_tool(
+                .call_tool(
                     "files.upload",
                     json!({ "filename": filename, "content_base64": encoded }),
                 )
