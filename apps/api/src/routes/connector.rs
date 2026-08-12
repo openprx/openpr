@@ -2034,42 +2034,44 @@ pub const OUTBOUND_ALLOW_PRIVATE_ENV: &str = "OPENPR_OUTBOUND_ALLOW_PRIVATE";
 /// cutoff, so an existing database re-executes them. The pre-ledger runner downgraded a failed
 /// migration to a warning, which left the worker silently unable to complete a delivery and
 /// nothing in the log to explain it.
+/// Every object is resolved through `to_regclass`, so the check answers for the schema the
+/// connection actually reads (`search_path`) rather than for a hardcoded `public`.
 const DELIVERY_SCHEMA_CHECKS: &[(&str, &str)] = &[
     (
         "event_outbox.lease_token column (0048)",
         "SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'event_outbox' AND column_name = 'lease_token'
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = to_regclass('event_outbox')
+              AND attname = 'lease_token'
+              AND attnum > 0
+              AND NOT attisdropped
         ) AS present",
     ),
     (
         "agent_invocations.duplicate_of column (0049)",
         "SELECT EXISTS (
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = 'agent_invocations' AND column_name = 'duplicate_of'
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = to_regclass('agent_invocations')
+              AND attname = 'duplicate_of'
+              AND attnum > 0
+              AND NOT attisdropped
         ) AS present",
     ),
     (
         "idx_event_outbox_lease_recovery index (0048)",
-        "SELECT to_regclass('public.idx_event_outbox_lease_recovery') IS NOT NULL AS present",
+        "SELECT to_regclass('idx_event_outbox_lease_recovery') IS NOT NULL AS present",
     ),
     (
         "idx_agent_invocations_connector_pickup index (0048)",
-        "SELECT to_regclass('public.idx_agent_invocations_connector_pickup') IS NOT NULL AS present",
-    ),
-    (
-        "uq_agent_invocations_audit_chain_connector unique index (0049)",
-        "SELECT to_regclass('public.uq_agent_invocations_audit_chain_connector') IS NOT NULL AS present",
+        "SELECT to_regclass('idx_agent_invocations_connector_pickup') IS NOT NULL AS present",
     ),
     (
         // The fan-out insert infers this exact predicate in its ON CONFLICT clause. An index left
         // over from an earlier build has a shorter predicate and would make every insert fail.
-        "uq_agent_invocations_audit_chain_connector predicate covers duplicate_of (0049)",
-        "SELECT EXISTS (
-            SELECT 1 FROM pg_indexes
-            WHERE schemaname = 'public'
-              AND indexname = 'uq_agent_invocations_audit_chain_connector'
-              AND indexdef LIKE '%duplicate_of IS NULL%'
+        "uq_agent_invocations_audit_chain_connector unique index with the duplicate_of predicate (0049)",
+        "SELECT COALESCE(
+            pg_get_indexdef(to_regclass('uq_agent_invocations_audit_chain_connector')) LIKE '%duplicate_of IS NULL%',
+            false
         ) AS present",
     ),
 ];

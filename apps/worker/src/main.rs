@@ -1,6 +1,6 @@
 use api::routes::connector::{
     ConnectorAuthMode, DELIVERY_EVENT_HEADER, DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, connector_auth_plan,
-    delivery_signature_header_value, resolve_connector_credential, validate_outbound_url,
+    delivery_signature_header_value, resolve_connector_credential, validate_outbound_url, verify_delivery_schema,
 };
 use clap::Parser;
 use platform::{
@@ -171,6 +171,13 @@ async fn main() -> anyhow::Result<()> {
     logging::init("worker");
 
     let db = connect_db(&cfg.database_url).await?;
+    // The pickup and completion statements below hard depend on the lease token, the duplicate
+    // tagging and the pickup indexes. Without them the worker keeps polling and silently delivers
+    // nothing, so refuse to start with the missing objects named instead.
+    if let Err(err) = verify_delivery_schema(&db).await {
+        tracing::error!(error = %err, "worker cannot start");
+        return Err(anyhow::anyhow!("{err}"));
+    }
     let state = AppState {
         cfg: cfg.clone(),
         db: db.clone(),
@@ -671,7 +678,7 @@ async fn create_connector_invocations_for_event(
                 -- concurrently both see no row. The unique index makes the second insert a no-op
                 -- instead of a duplicate delivery.
                 ON CONFLICT (audit_chain_id, connector_id)
-                    WHERE audit_chain_id IS NOT NULL AND connector_id IS NOT NULL
+                    WHERE audit_chain_id IS NOT NULL AND connector_id IS NOT NULL AND duplicate_of IS NULL
                     DO NOTHING
             ",
             vec![
@@ -949,7 +956,11 @@ fn resolve_connector_auth(row: &ConnectorAuthContextRow) -> Result<ResolvedConne
 /// `result` is also writable by connector bots through the receipt endpoints, so every read of it
 /// is type checked and range clamped: a malformed value must degrade a single delivery, never
 /// abort the batch query. A row whose bookkeeping was wiped by such a write is picked up again
-/// once it stopped moving for [`CONNECTOR_RUNNING_STALE_SECONDS`], unless it was already delivered.
+/// once it stopped moving for [`CONNECTOR_RUNNING_STALE_SECONDS`].
+///
+/// A row whose `connector_delivery.status` is `delivered` is excluded from the whole predicate,
+/// not from one branch of it: the pickup overwrites that key with `dispatching`, so a per branch
+/// guard stops working the moment any other branch matches once.
 ///
 /// Each pickup stamps a `lease_token` that the completion write has to present, so a worker whose
 /// lease expired cannot overwrite the state owned by the worker that took the delivery over.
@@ -992,9 +1003,18 @@ fn connector_invocation_pickup_sql() -> &'static str {
             INNER JOIN connectors c ON c.id = ai.connector_id
             WHERE ai.source_task_id IS NULL
               AND ai.connector_id IS NOT NULL
+              -- Accidental fan-out copies are tagged by 0049 instead of deleted. Delivering one
+              -- would send the same event twice, which is exactly what the tagging prevents.
+              AND ai.duplicate_of IS NULL
               AND c.is_active = true
               AND c.endpoint IS NOT NULL
               AND c.kind IN ('webhook', 'rest', 'mcp', 'openprx_tunnel', 'print', 'device')
+              -- Applies to every branch below, not just the stale recovery one: a delivery that
+              -- already reached the endpoint must never be picked up again, no matter which
+              -- recovery path notices the row. The pickup rewrites this key to 'dispatching', so
+              -- a guard that sits inside a single branch is also destroyed by the first pickup
+              -- that slips past it.
+              AND (ai.result #>> '{connector_delivery,status}') IS DISTINCT FROM 'delivered'
               AND (
                     (
                       ai.status = 'pending'
@@ -1016,10 +1036,9 @@ fn connector_invocation_pickup_sql() -> &'static str {
                           END
                     )
                  OR (
-                      -- Bookkeeping wiped or never written: recover the row instead of losing it,
-                      -- but never re-deliver something that was already delivered.
+                      -- Bookkeeping wiped or never written: recover the row instead of losing it.
+                      -- The already-delivered guard is hoisted above and covers this branch too.
                       ai.status = 'running'
-                      AND (ai.result #>> '{connector_delivery,status}') IS DISTINCT FROM 'delivered'
                       AND CASE
                             WHEN jsonb_typeof(ai.result #> '{connector_delivery,leased_until}')
                                 IS DISTINCT FROM 'string' THEN true
@@ -2126,7 +2145,9 @@ mod tests {
         pickup_pending_connector_invocations, pickup_pending_event_outbox, receipt_status_for_inbox, redact_endpoint,
         resolve_connector_auth, update_connector_invocation_status, with_retry_schedule,
     };
-    use api::routes::connector::{DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, sign_delivery_body};
+    use api::routes::connector::{
+        DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, sign_delivery_body, verify_delivery_schema,
+    };
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use serde_json::json;
     use uuid::Uuid;
@@ -2286,6 +2307,9 @@ mod tests {
     /// Applied verbatim on top of [`TEST_SCHEMA_DDL`], so the pickup tests also prove the migration.
     const TEST_MIGRATION: &str = include_str!("../../../migrations/0048_delivery_lease_and_pickup_indexes.sql");
 
+    /// Duplicate tagging, applied after [`TEST_MIGRATION`] exactly as the runner orders them.
+    const TEST_MIGRATION_DEDUP: &str = include_str!("../../../migrations/0049_agent_invocation_duplicate_tagging.sql");
+
     struct TestDb {
         admin: DatabaseConnection,
         db: DatabaseConnection,
@@ -2326,6 +2350,9 @@ mod tests {
         db.execute_unprepared(TEST_MIGRATION)
             .await
             .expect("migration 0048 must apply to the delivery tables");
+        db.execute_unprepared(TEST_MIGRATION_DEDUP)
+            .await
+            .expect("migration 0049 must apply to the delivery tables");
         Some(TestDb { admin, db, schema })
     }
 
@@ -2657,6 +2684,159 @@ mod tests {
             .await
             .expect("write must run");
         assert_eq!(invocation_status(db, fresh).await, "dispatched");
+
+        test.cleanup().await;
+    }
+
+    /// The delivered guard has to cover the crash recovery branch, not only the wiped bookkeeping
+    /// one. A delivery that reached the endpoint and then lost its lease (worker killed between the
+    /// HTTP response and the completion write, or a receipt endpoint stamping the outcome) is
+    /// picked up by the expired lease branch, and the pickup overwrites `status` with
+    /// `dispatching`, so a guard placed in a single branch is also erased by the first pickup that
+    /// gets past it.
+    #[tokio::test]
+    async fn connector_pickup_never_redelivers_a_delivered_payload() {
+        let Some(test) = test_db().await else {
+            eprintln!("skipped: set OPENPR_TEST_DATABASE_URL to run the delivery SQL against PostgreSQL");
+            return;
+        };
+        let db = &test.db;
+        let workspace_id = Uuid::new_v4();
+        let connector_id = insert_connector(db, workspace_id).await;
+
+        let delivered_expired_lease = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "jsonb_build_object('connector_delivery', jsonb_build_object('status', 'delivered', 'leased_until', to_jsonb(now() - interval '1 minute')))",
+            0,
+        )
+        .await;
+        let delivered_wiped_lease = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "'{\"connector_delivery\": {\"status\": \"delivered\"}}'::jsonb",
+            60,
+        )
+        .await;
+        let delivered_but_pending = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "pending",
+            "'{\"connector_delivery\": {\"status\": \"delivered\"}}'::jsonb",
+            0,
+        )
+        .await;
+        let retrying = insert_invocation(
+            db,
+            connector_id,
+            workspace_id,
+            "running",
+            "jsonb_build_object('connector_delivery', jsonb_build_object('status', 'retrying', 'leased_until', to_jsonb(now() - interval '1 minute')))",
+            0,
+        )
+        .await;
+
+        let ids: Vec<Uuid> = pickup_pending_connector_invocations(db, 50)
+            .await
+            .expect("pickup must run")
+            .iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert!(
+            !ids.contains(&delivered_expired_lease),
+            "an expired lease on a delivered payload must not cause a second delivery"
+        );
+        assert!(
+            !ids.contains(&delivered_wiped_lease),
+            "wiped bookkeeping must not resurrect a delivered payload"
+        );
+        assert!(
+            !ids.contains(&delivered_but_pending),
+            "a delivered payload stays delivered even if its row was moved back to pending"
+        );
+        assert!(
+            ids.contains(&retrying),
+            "a delivery that failed and is waiting to retry must still be reclaimable"
+        );
+
+        assert_eq!(
+            invocation_status(db, delivered_expired_lease).await,
+            "running",
+            "a row that is not picked up must keep its bookkeeping untouched"
+        );
+
+        test.cleanup().await;
+    }
+
+    /// 0049 tags accidental fan-out copies instead of deleting them, which only stops the double
+    /// delivery if the pickup actually skips a tagged row.
+    #[tokio::test]
+    async fn connector_pickup_skips_tagged_duplicate_invocations() {
+        let Some(test) = test_db().await else {
+            eprintln!("skipped: set OPENPR_TEST_DATABASE_URL to run the delivery SQL against PostgreSQL");
+            return;
+        };
+        let db = &test.db;
+        let workspace_id = Uuid::new_v4();
+        let connector_id = insert_connector(db, workspace_id).await;
+
+        let kept = insert_invocation(db, connector_id, workspace_id, "pending", "NULL", 0).await;
+        let copy = insert_invocation(db, connector_id, workspace_id, "pending", "NULL", 0).await;
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE agent_invocations SET duplicate_of = $2 WHERE id = $1",
+            vec![copy.into(), kept.into()],
+        ))
+        .await
+        .expect("tagging must run");
+
+        let ids: Vec<Uuid> = pickup_pending_connector_invocations(db, 50)
+            .await
+            .expect("pickup must run")
+            .iter()
+            .map(|row| row.id)
+            .collect();
+
+        assert!(ids.contains(&kept), "the surviving row must still be delivered");
+        assert!(!ids.contains(&copy), "a tagged duplicate must never be delivered");
+
+        test.cleanup().await;
+    }
+
+    /// The pickup and completion statements cannot run without the delivery objects, so the worker
+    /// refuses to start when one is missing. The check has to name what is missing rather than fail
+    /// on the first thing it looks at.
+    #[tokio::test]
+    async fn delivery_schema_verification_names_every_missing_object() {
+        let Some(test) = test_db().await else {
+            eprintln!("skipped: set OPENPR_TEST_DATABASE_URL to run the delivery SQL against PostgreSQL");
+            return;
+        };
+        let db = &test.db;
+
+        verify_delivery_schema(db)
+            .await
+            .expect("a fully migrated schema must pass");
+
+        db.execute_unprepared("DROP INDEX idx_event_outbox_lease_recovery")
+            .await
+            .expect("index must be droppable");
+        db.execute_unprepared("ALTER TABLE agent_invocations DROP COLUMN duplicate_of CASCADE")
+            .await
+            .expect("column must be droppable");
+
+        let error = verify_delivery_schema(db)
+            .await
+            .expect_err("a missing delivery object must be reported");
+        assert!(error.contains("idx_event_outbox_lease_recovery"), "{error}");
+        assert!(error.contains("agent_invocations.duplicate_of"), "{error}");
+        assert!(error.contains("schema_migrations"), "{error}");
 
         test.cleanup().await;
     }
