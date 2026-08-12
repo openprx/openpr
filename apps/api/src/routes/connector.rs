@@ -1989,7 +1989,7 @@ fn normalize_tool_transport(transport: &str) -> Result<String, ApiError> {
     }
 }
 
-fn truncate_string(value: String, max_chars: usize) -> String {
+pub(crate) fn truncate_string(value: String, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         value
     } else {
