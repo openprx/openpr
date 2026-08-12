@@ -83,6 +83,7 @@ struct ConnectorInvocationDispatchRow {
 /// cannot reach a log line or a persisted diagnostic.
 #[derive(FromQueryResult)]
 struct ConnectorAuthContextRow {
+    workspace_id: Uuid,
     auth_policy: serde_json::Value,
     webhook_secret: Option<String>,
 }
@@ -918,9 +919,11 @@ async fn load_connector_auth(
     let row = ConnectorAuthContextRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            SELECT c.auth_policy, w.secret AS webhook_secret
+            SELECT c.workspace_id, c.auth_policy, w.secret AS webhook_secret
             FROM connectors c
-            LEFT JOIN webhooks w ON w.id = c.webhook_id
+            -- Scoped to the connector's own workspace: a webhook_id pointing at another tenant's
+            -- webhook must not hand its secret to this delivery.
+            LEFT JOIN webhooks w ON w.id = c.webhook_id AND w.workspace_id = c.workspace_id
             WHERE c.id = $1
         ",
         vec![connector_id.into()],
@@ -935,9 +938,13 @@ async fn load_connector_auth(
 }
 
 fn resolve_connector_auth(row: &ConnectorAuthContextRow) -> Result<ResolvedConnectorAuth, String> {
-    let plan = connector_auth_plan(&row.auth_policy, row.webhook_secret.is_some())?;
+    let plan = connector_auth_plan(&row.auth_policy, row.webhook_secret.is_some(), row.workspace_id)?;
     let credential = match plan.source.as_ref() {
-        Some(source) => Some(resolve_connector_credential(source, row.webhook_secret.as_deref())?),
+        Some(source) => Some(resolve_connector_credential(
+            source,
+            row.webhook_secret.as_deref(),
+            row.workspace_id,
+        )?),
         None => None,
     };
     Ok(ResolvedConnectorAuth {
@@ -2146,7 +2153,8 @@ mod tests {
         resolve_connector_auth, update_connector_invocation_status, with_retry_schedule,
     };
     use api::routes::connector::{
-        DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, sign_delivery_body, verify_delivery_schema,
+        DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, connector_secret_env_namespace, sign_delivery_body,
+        verify_delivery_schema,
     };
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use serde_json::json;
@@ -2916,6 +2924,7 @@ mod tests {
     #[test]
     fn webhook_linked_connectors_sign_with_the_webhook_secret() {
         let row = ConnectorAuthContextRow {
+            workspace_id: Uuid::new_v4(),
             auth_policy: json!({ "mode": "hmac", "legacy_webhook": true, "secret_source": "webhook" }),
             webhook_secret: Some("legacy-secret".to_string()),
         };
@@ -2931,10 +2940,44 @@ mod tests {
 
         // A connector claiming hmac without any secret source is refused, never sent unsigned.
         let unusable = ConnectorAuthContextRow {
+            workspace_id: Uuid::new_v4(),
             auth_policy: json!({ "mode": "hmac" }),
             webhook_secret: None,
         };
         assert!(resolve_connector_auth(&unusable).is_err());
+    }
+
+    /// The delivery path builds the credential namespace from the workspace on the connector row,
+    /// so a stored policy naming another tenant's credential fails to resolve instead of signing
+    /// the attacker's delivery with the victim's secret.
+    #[test]
+    fn delivery_refuses_a_policy_pointing_at_another_workspaces_credential() {
+        let victim = Uuid::new_v4();
+        let attacker = Uuid::new_v4();
+        let victim_secret = format!("{}PAYMENTS", connector_secret_env_namespace(victim));
+
+        let stolen = ConnectorAuthContextRow {
+            workspace_id: attacker,
+            auth_policy: json!({ "mode": "bearer", "token_ref": format!("env:{victim_secret}") }),
+            webhook_secret: None,
+        };
+        // ResolvedConnectorAuth deliberately has no Debug impl, since it holds the credential.
+        let Err(error) = resolve_connector_auth(&stolen) else {
+            panic!("cross tenant credential must not resolve");
+        };
+        assert!(error.contains(&connector_secret_env_namespace(attacker)), "{error}");
+
+        // The same policy resolves inside the workspace that owns the credential, and then fails
+        // only because the variable is unset in the test process.
+        let owned = ConnectorAuthContextRow {
+            workspace_id: victim,
+            auth_policy: json!({ "mode": "bearer", "token_ref": format!("env:{victim_secret}") }),
+            webhook_secret: None,
+        };
+        let Err(owned_error) = resolve_connector_auth(&owned) else {
+            panic!("the variable is not set in the test process");
+        };
+        assert!(owned_error.contains("is not set"), "{owned_error}");
     }
 
     #[test]
