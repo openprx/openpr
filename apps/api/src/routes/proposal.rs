@@ -34,6 +34,10 @@ pub struct CreateProposalRequest {
     pub voting_rule: Option<String>,
     pub cycle_template: Option<String>,
     pub template_id: Option<String>,
+    /// Workspace the proposal belongs to. Optional: it is inferred from the template's project,
+    /// or from the author when they belong to exactly one workspace. It is only required when
+    /// neither is available, because a proposal without a tenant is readable by nobody.
+    pub workspace_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,12 +90,20 @@ pub struct ProposalRow {
     pub voting_rule: String,
     pub cycle_template: String,
     pub template_id: Option<String>,
+    pub workspace_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub submitted_at: Option<DateTime<Utc>>,
     pub voting_started_at: Option<DateTime<Utc>>,
     pub voting_ended_at: Option<DateTime<Utc>>,
     pub archived_at: Option<DateTime<Utc>>,
 }
+
+/// Columns every `ProposalRow` query has to select, in the order the struct declares them.
+const PROPOSAL_ROW_COLUMNS: &str = "id, title, proposal_type::text AS proposal_type, status::text AS status, \
+     author_id, author_type::text AS author_type, content, domains, \
+     voting_rule::text AS voting_rule, cycle_template::text AS cycle_template, \
+     template_id, workspace_id, \
+     created_at, submitted_at, voting_started_at, voting_ended_at, archived_at";
 
 #[derive(Debug, Serialize, FromQueryResult)]
 pub struct ProposalCommentRow {
@@ -139,6 +151,7 @@ pub struct ProposalListItem {
     pub voting_rule: String,
     pub cycle_template: String,
     pub template_id: Option<String>,
+    pub workspace_id: Option<Uuid>,
     pub domains: Value,
     pub created_at: String,
     pub submitted_at: Option<String>,
@@ -344,6 +357,7 @@ fn proposal_to_item(row: &ProposalRow) -> ProposalListItem {
         voting_rule: row.voting_rule.clone(),
         cycle_template: row.cycle_template.clone(),
         template_id: row.template_id.clone(),
+        workspace_id: row.workspace_id,
         domains: row.domains.clone(),
         created_at: format_dt(row.created_at),
         submitted_at: optional_dt(row.submitted_at),
@@ -402,19 +416,134 @@ async fn build_actor_context(state: &AppState, claims: &JwtClaims) -> Result<Act
     })
 }
 
+/// Which proposals a caller is allowed to see.
+///
+/// `proposals` had no tenant column at all, so every proposal lived in one instance wide
+/// namespace and any authenticated caller could read every other tenant's governance history.
+/// Migration 0050 gives the table a `workspace_id` and this decides what to compare it against.
+#[derive(Debug, Clone)]
+pub(crate) enum ProposalScope {
+    /// Instance administrator. Sees every proposal, including the ones migration 0050 could not
+    /// attribute, so an operator can still find and fix them.
+    Unrestricted,
+    /// Everything owned by these workspaces, and nothing else. An empty list sees nothing.
+    Workspaces(Vec<Uuid>),
+}
+
+impl ProposalScope {
+    fn allows(&self, workspace_id: Option<Uuid>) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            // An unattributed proposal belongs to no tenant, so no tenant may read it.
+            Self::Workspaces(allowed) => workspace_id.is_some_and(|id| allowed.contains(&id)),
+        }
+    }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct WorkspaceIdRow {
+    workspace_id: Uuid,
+}
+
+/// Resolves what the caller behind these claims may read.
+///
+/// Both identities that reach a proposal route are handled here: a human session, whose `sub` is
+/// a `users` row, and a bot token, for which the auth middleware synthesises claims carrying the
+/// `workspace_bots` row id. An identity that matches neither sees nothing rather than everything.
+pub(crate) async fn proposal_scope(state: &AppState, claims: &JwtClaims) -> Result<ProposalScope, ApiError> {
+    let subject = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid subject".to_string()))?;
+
+    let user = ActorRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT role, COALESCE(entity_type, 'human') AS entity_type FROM users WHERE id = $1",
+        vec![subject.into()],
+    ))
+    .one(&state.db)
+    .await?;
+
+    if let Some(user) = user {
+        if user.role.trim().eq_ignore_ascii_case("admin") {
+            return Ok(ProposalScope::Unrestricted);
+        }
+        let rows = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT workspace_id FROM workspace_members WHERE user_id = $1",
+            vec![subject.into()],
+        ))
+        .all(&state.db)
+        .await?;
+        return Ok(ProposalScope::Workspaces(
+            rows.into_iter().map(|row| row.workspace_id).collect(),
+        ));
+    }
+
+    let bot = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM workspace_bots WHERE id = $1 AND is_active = TRUE",
+        vec![subject.into()],
+    ))
+    .one(&state.db)
+    .await?;
+
+    Ok(ProposalScope::Workspaces(
+        bot.map(|row| row.workspace_id).into_iter().collect(),
+    ))
+}
+
+/// Decides which workspace a newly created proposal belongs to.
+///
+/// In order: an explicit request field, the workspace owning the template's project, and finally
+/// the author's workspace when they only have one. Anything else is rejected instead of guessed,
+/// because a proposal filed into the wrong tenant is a disclosure and one filed into no tenant is
+/// invisible to its author.
+async fn resolve_new_proposal_workspace(
+    state: &AppState,
+    actor: &ActorContext,
+    requested: Option<Uuid>,
+    template_project_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let memberships = WorkspaceIdRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM workspace_members WHERE user_id = $1",
+        vec![actor.user_id.into()],
+    ))
+    .all(&state.db)
+    .await?
+    .into_iter()
+    .map(|row| row.workspace_id)
+    .collect::<Vec<_>>();
+
+    if let Some(workspace_id) = requested {
+        if !actor.is_admin && !memberships.contains(&workspace_id) {
+            return Err(ApiError::Forbidden("workspace access denied".to_string()));
+        }
+        return Ok(workspace_id);
+    }
+
+    if let Some(project_id) = template_project_id
+        && let Some(workspace_id) = resolve_workspace_id_for_project(state, project_id).await?
+    {
+        return Ok(workspace_id);
+    }
+
+    match memberships.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(ApiError::BadRequest(
+            "workspace_id is required: the author belongs to no workspace".to_string(),
+        )),
+        _ => Err(ApiError::BadRequest(
+            "workspace_id is required: the author belongs to more than one workspace".to_string(),
+        )),
+    }
+}
+
+/// Loads a proposal without considering who is asking. Only for callers that are not a request:
+/// the worker settlement tick and the internal helpers it drives.
 async fn find_proposal(state: &AppState, proposal_id: &str) -> Result<ProposalRow, ApiError> {
     for lookup_id in proposal_lookup_candidates(proposal_id) {
         if let Some(proposal) = ProposalRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            r"
-                SELECT id, title, proposal_type::text AS proposal_type, status::text AS status,
-                       author_id, author_type::text AS author_type, content, domains,
-                       voting_rule::text AS voting_rule, cycle_template::text AS cycle_template,
-                       template_id,
-                       created_at, submitted_at, voting_started_at, voting_ended_at, archived_at
-                FROM proposals
-                WHERE id = $1
-            ",
+            format!("SELECT {PROPOSAL_ROW_COLUMNS} FROM proposals WHERE id = $1"),
             vec![lookup_id.into()],
         ))
         .one(&state.db)
@@ -425,6 +554,23 @@ async fn find_proposal(state: &AppState, proposal_id: &str) -> Result<ProposalRo
     }
 
     Err(ApiError::NotFound("proposal not found".to_string()))
+}
+
+/// Loads a proposal the caller is allowed to see.
+///
+/// A proposal outside the caller's workspaces answers "not found" rather than "forbidden", so the
+/// endpoint does not confirm that an id exists in someone else's tenant.
+async fn find_proposal_for_caller(
+    state: &AppState,
+    claims: &JwtClaims,
+    proposal_id: &str,
+) -> Result<ProposalRow, ApiError> {
+    let scope = proposal_scope(state, claims).await?;
+    let proposal = find_proposal(state, proposal_id).await?;
+    if !scope.allows(proposal.workspace_id) {
+        return Err(ApiError::NotFound("proposal not found".to_string()));
+    }
+    Ok(proposal)
 }
 
 async fn proposal_tally(state: &AppState, proposal_id: &str) -> Result<VoteTally, ApiError> {
@@ -723,11 +869,9 @@ pub async fn governance_tick(state: &AppState) -> Result<(), ApiError> {
 
     let expired_voting = ProposalRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"
-            SELECT id, title, proposal_type::text AS proposal_type, status::text AS status,
-                   author_id, author_type::text AS author_type, content, domains,
-                   voting_rule::text AS voting_rule, cycle_template::text AS cycle_template,
-                   created_at, submitted_at, voting_started_at, voting_ended_at, archived_at
+        format!(
+            r"
+            SELECT {PROPOSAL_ROW_COLUMNS}
             FROM proposals p
             WHERE p.status = 'voting'
               AND p.voting_started_at IS NOT NULL
@@ -743,7 +887,8 @@ pub async fn governance_tick(state: &AppState) -> Result<(), ApiError> {
               AND NOT EXISTS (
                     SELECT 1 FROM decisions d WHERE d.proposal_id = p.id
                   )
-        ",
+        "
+        ),
         vec![now.into()],
     ))
     .all(&state.db)
@@ -1271,6 +1416,10 @@ pub async fn create_proposal(
         return Err(ApiError::BadRequest("invalid cycle_template".to_string()));
     }
 
+    // Every new proposal gets a tenant. Without one it would be invisible to its own author,
+    // because a proposal with no workspace is only readable by an instance administrator.
+    let workspace_id = resolve_new_proposal_workspace(&state, &actor, req.workspace_id, template_project_id).await?;
+
     let proposal_id = gen_prefixed_id("PROP");
     let now = Utc::now();
 
@@ -1281,8 +1430,8 @@ pub async fn create_proposal(
             r"
                 INSERT INTO proposals (
                     id, title, proposal_type, status, author_id, author_type, content,
-                    domains, voting_rule, cycle_template, template_id, created_at
-                ) VALUES ($1, $2, $3::proposal_type, 'draft', $4, $5::author_type, $6, $7, $8::voting_rule, $9::cycle_template, $10, $11)
+                    domains, voting_rule, cycle_template, template_id, workspace_id, created_at
+                ) VALUES ($1, $2, $3::proposal_type, 'draft', $4, $5::author_type, $6, $7, $8::voting_rule, $9::cycle_template, $10, $11, $12)
             ",
             vec![
                 proposal_id.clone().into(),
@@ -1295,6 +1444,7 @@ pub async fn create_proposal(
                 voting_rule.clone().into(),
                 cycle_template.clone().into(),
                 req.template_id.clone().into(),
+                workspace_id.into(),
                 now.into(),
             ],
         ))
@@ -1374,8 +1524,10 @@ pub async fn create_proposal(
 
 pub async fn list_proposals(
     State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
     Query(query): Query<ListProposalsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let scope = proposal_scope(&state, &claims).await?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(20).clamp(1, 100);
     let offset = (page - 1) * per_page;
@@ -1394,6 +1546,23 @@ pub async fn list_proposals(
     let mut where_parts: Vec<String> = Vec::new();
     let mut values: Vec<sea_orm::Value> = Vec::new();
     let mut idx = 1;
+
+    // The tenant filter goes in first and is never optional. A caller that belongs to no
+    // workspace gets a predicate that matches nothing, rather than no predicate at all.
+    match &scope {
+        ProposalScope::Unrestricted => {}
+        ProposalScope::Workspaces(workspaces) if workspaces.is_empty() => {
+            where_parts.push("FALSE".to_string());
+        }
+        ProposalScope::Workspaces(workspaces) => {
+            let placeholders: Vec<String> = (idx..idx + workspaces.len()).map(|n| format!("${n}")).collect();
+            where_parts.push(format!("workspace_id IN ({})", placeholders.join(", ")));
+            for workspace_id in workspaces {
+                values.push((*workspace_id).into());
+            }
+            idx += workspaces.len();
+        }
+    }
 
     if let Some(status) = query.status {
         where_parts.push(format!("status::text = ${}", idx));
@@ -1459,11 +1628,7 @@ pub async fn list_proposals(
 
     let list_sql = format!(
         r"
-            SELECT id, title, proposal_type::text AS proposal_type, status::text AS status,
-                   author_id, author_type::text AS author_type, content, domains,
-                   voting_rule::text AS voting_rule, cycle_template::text AS cycle_template,
-                   template_id,
-                   created_at, submitted_at, voting_started_at, voting_ended_at, archived_at
+            SELECT {PROPOSAL_ROW_COLUMNS}
             FROM proposals
             {where_sql}
             ORDER BY {sort_field} {sort_order}
@@ -1498,9 +1663,10 @@ pub async fn list_proposals(
 
 pub async fn get_proposal(
     State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     let tally = proposal_tally(&state, &proposal.id).await?;
     let decision_id = DecisionIdRow::find_by_statement(Statement::from_sql_and_values(
@@ -1526,7 +1692,7 @@ pub async fn update_proposal(
     Json(req): Json<UpdateProposalRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
     let old_snapshot = serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
 
     if proposal.author_id != actor.user_id_str {
@@ -1665,7 +1831,7 @@ pub async fn delete_proposal(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
     let old_snapshot = serde_json::to_value(proposal_to_item(&proposal)).map_err(|_| ApiError::Internal)?;
 
     if proposal.author_id != actor.user_id_str {
@@ -1733,7 +1899,7 @@ pub async fn submit_proposal(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     if proposal.author_id != actor.user_id_str {
         return Err(ApiError::Forbidden("only proposal author can submit".to_string()));
@@ -1810,7 +1976,7 @@ pub async fn start_voting(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     if proposal.author_id != actor.user_id_str {
         return Err(ApiError::Forbidden("only proposal author can start voting".to_string()));
@@ -1899,7 +2065,7 @@ pub async fn archive_proposal(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
     ensure_author_or_admin(&proposal, &actor)?;
 
     let now = Utc::now();
@@ -1966,7 +2132,7 @@ pub async fn create_vote(
     Json(req): Json<VoteRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     if proposal.status != "voting" {
         return Err(ApiError::BadRequest("proposal is not in voting status".to_string()));
@@ -2124,8 +2290,12 @@ pub async fn create_vote(
     })))
 }
 
-pub async fn list_votes(State(state): State<AppState>, Path(id): Path<String>) -> Result<impl IntoResponse, ApiError> {
-    let proposal = find_proposal(&state, &id).await?;
+pub async fn list_votes(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     let tally = proposal_tally(&state, &id).await?;
 
@@ -2166,7 +2336,7 @@ pub async fn delete_my_vote(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     if proposal.status != "voting" {
         return Err(ApiError::BadRequest(
@@ -2257,7 +2427,7 @@ pub async fn create_proposal_comment(
     Json(req): Json<CreateProposalCommentRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
 
     let content = req.content.trim();
     if content.is_empty() {
@@ -2352,9 +2522,10 @@ pub async fn create_proposal_comment(
 
 pub async fn list_proposal_comments(
     State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    find_proposal(&state, &id).await?;
+    find_proposal_for_caller(&state, &claims, &id).await?;
 
     let items = ProposalCommentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -2425,7 +2596,7 @@ pub async fn delete_proposal_comment(
         ))
         .await?;
 
-    let proposal = find_proposal(&state, &comment.proposal_id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &comment.proposal_id).await?;
     if let Some(project_id) = resolve_project_id_for_proposal(&state, &comment.proposal_id, &proposal.author_id).await?
         && let Some(workspace_id) = resolve_workspace_id_for_project(&state, project_id).await?
     {
@@ -2463,7 +2634,7 @@ pub async fn delete_proposal_comment_under_proposal(
     Path((proposal_id, comment_id)): Path<(String, i64)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    find_proposal(&state, &proposal_id).await?;
+    find_proposal_for_caller(&state, &claims, &proposal_id).await?;
 
     let comment = ProposalCommentRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -2512,7 +2683,7 @@ pub async fn link_issue(
     Json(req): Json<LinkIssueRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &id).await?;
     ensure_author_or_admin(&proposal, &actor)?;
 
     if proposal.status != "approved" {
@@ -2575,9 +2746,10 @@ pub async fn link_issue(
 
 pub async fn list_linked_issues(
     State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    find_proposal(&state, &id).await?;
+    find_proposal_for_caller(&state, &claims, &id).await?;
 
     let items = ProposalIssueLinkRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -2603,7 +2775,7 @@ pub async fn unlink_issue(
     Path((proposal_id, issue_id)): Path<(String, Uuid)>,
 ) -> Result<impl IntoResponse, ApiError> {
     let actor = build_actor_context(&state, &claims).await?;
-    let proposal = find_proposal(&state, &proposal_id).await?;
+    let proposal = find_proposal_for_caller(&state, &claims, &proposal_id).await?;
     ensure_author_or_admin(&proposal, &actor)?;
 
     state
