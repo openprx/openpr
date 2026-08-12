@@ -338,11 +338,14 @@ impl OpenPrClient {
 
     // ---- Connectors / Invocations ----
 
-    pub async fn list_connectors(&self, project_id: Option<&str>, kind: Option<&str>) -> Result<Value, String> {
-        let mut params = Vec::new();
-        if let Some(project_id) = project_id {
-            params.push(format!("project_id={}", urlencoding::encode(project_id)));
-        }
+    /// Lists the connectors of one project.
+    ///
+    /// `project_id` is not optional on purpose. The endpoint is workspace addressed and
+    /// returns *every* connector in the workspace when the filter is omitted, so an
+    /// optional project would let a caller skip the project agent policy simply by not
+    /// naming a project. There is no client-side way to ask for the workspace wide list.
+    pub async fn list_connectors(&self, project_id: &str, kind: Option<&str>) -> Result<Value, String> {
+        let mut params = vec![format!("project_id={}", urlencoding::encode(project_id))];
         if let Some(kind) = kind {
             params.push(format!("kind={}", urlencoding::encode(kind)));
         }

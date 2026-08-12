@@ -7,28 +7,33 @@ use serde_json::{Value, json};
 pub fn list_connectors_tool() -> ToolDefinition {
     ToolDefinition {
         name: "connectors.list".to_string(),
-        description: "List workspace/project automation connectors such as webhook, MCP, REST, CLI, OpenPRX tunnel, print, or device"
+        description: "List the automation connectors of one project such as webhook, MCP, REST, CLI, OpenPRX tunnel, print, or device. The project UUID is mandatory: it is what the project agent policy is evaluated against, and without it the call would return every connector in the workspace"
             .to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "project_id": {
                     "type": "string",
-                    "description": "Optional project UUID to filter project-scoped connectors"
+                    "description": "Project UUID whose connectors are listed (required)"
                 },
                 "kind": {
                     "type": "string",
                     "enum": ["webhook", "mcp", "rest", "cli", "openprx_tunnel", "print", "device"],
                     "description": "Optional connector kind filter"
                 }
-            }
+            },
+            "required": ["project_id"]
         }),
     }
 }
 
+/// `project_id` is deliberately not an `Option`: a missing project turns the call into
+/// a workspace wide connector dump, which is exactly the shape the policy gate refuses.
+/// Keeping it mandatory here makes the tool fail closed even if it is ever reached
+/// through a path that does not consult [`crate::server`]'s policy scopes.
 #[derive(Debug, Deserialize)]
 struct ListConnectorsInput {
-    project_id: Option<String>,
+    project_id: String,
     kind: Option<String>,
 }
 
@@ -38,10 +43,7 @@ pub async fn list_connectors(client: &OpenPrClient, args: Value) -> CallToolResu
         Err(err) => return CallToolResult::error(format!("Invalid input: {err}")),
     };
 
-    match client
-        .list_connectors(input.project_id.as_deref(), input.kind.as_deref())
-        .await
-    {
+    match client.list_connectors(&input.project_id, input.kind.as_deref()).await {
         Ok(value) => CallToolResult::success(serde_json::to_string_pretty(&value).unwrap_or_default()),
         Err(err) => CallToolResult::error(err),
     }
