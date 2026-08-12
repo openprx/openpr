@@ -218,7 +218,7 @@ const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 105] = [
         "project_resources.delete",
         PolicyScope::DeclaredProject { required: true },
     ),
-    ("connectors.list", PolicyScope::DeclaredProject { required: false }),
+    ("connectors.list", PolicyScope::DeclaredProject { required: true }),
     ("connectors.get", PolicyScope::OwnedBy(OwnerLookup::Connector)),
     ("invocations.list", PolicyScope::DeclaredProject { required: true }),
     ("invocations.get", PolicyScope::OwnedBy(OwnerLookup::Invocation)),
@@ -1593,7 +1593,7 @@ impl McpServer {
         }
 
         if let Some(project_id) = parse_project_resource_uri(&uri, "/connectors") {
-            return match self.client.list_connectors(Some(project_id), None).await {
+            return match self.client.list_connectors(project_id, None).await {
                 Ok(connectors) => JsonRpcResponse::success(
                     id,
                     json!({
@@ -1894,6 +1894,23 @@ fn claimed_project_ids(args: &Value) -> Vec<String> {
         .collect()
 }
 
+/// Whether the project agent policy lists this tool.
+///
+/// A policy that carries no `data.mcp.tool_registry.enabled_tools` array admits every
+/// tool. That is deliberate, and it is *not* the "unconfigured projects are ungoverned"
+/// hole it looks like at first read: `enabled_tools` is not a stored opt-in setting that
+/// an administrator may forget to fill in. The API derives it on every request from the
+/// project type's capabilities (`apps/api/src/routes/context.rs` `build_agent_policy` ->
+/// `build_mcp_tool_registry`), which always emits the array — at minimum the unconditional
+/// `core` group — so a live API answer always takes the `contains` branch. A project whose
+/// type does not enable the `webhook` capability really does get `connectors.list` refused.
+///
+/// The fallback therefore only fires when the field is missing altogether: an API older or
+/// newer than this binary, or a policy payload reshaped in transit. Failing closed there
+/// would take every tool down on a schema change rather than on a policy decision, so the
+/// choice is intentional. It is also not the only line of defence: the response must be a
+/// `{code: 0, ...}` envelope with a `data` object (`enforce_project_tool_policy`), the
+/// project must be a canonical UUID, and id addressed tools still resolve their real owner.
 fn is_tool_enabled_by_policy(policy_response: &Value, tool_name: &str) -> bool {
     tools::capabilities::extract_enabled_tool_names(policy_response).is_none_or(|enabled| enabled.contains(tool_name))
 }
@@ -2166,23 +2183,16 @@ mod tests {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            let required = tool
-                .input_schema
-                .get("required")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
 
             let expected = if properties.contains_key("project_id") {
-                PolicyScope::DeclaredProject {
-                    required: required.iter().any(|value| value == "project_id"),
-                }
+                // Deliberately *not* `required: required.contains("project_id")`. Deriving
+                // the flag from the schema is what let `connectors.list` ship as
+                // `required: false`: an optional `project_id` means the caller picks
+                // whether the project agent policy applies, and omitting it degrades the
+                // call into a workspace wide read. A tool that accepts a `project_id` is
+                // always gated on one; `declared_project_id_is_mandatory_for_every_project_scoped_tool`
+                // holds the other half of the invariant on the schema itself.
+                PolicyScope::DeclaredProject { required: true }
             } else if let Some((_, lookup)) = OWNERSHIP_ARGUMENTS
                 .iter()
                 .find(|(argument, _)| properties.contains_key(*argument))
@@ -2235,6 +2245,78 @@ mod tests {
         assert_eq!(
             tool_policy_scope("acme.deploy"),
             PolicyScope::DeclaredProject { required: true }
+        );
+    }
+
+    /// `PolicyScope::DeclaredProject { required: false }` is a bypass, not a relaxation:
+    /// `resolve_policy_project_id` answers `Ok(None)` for it and `enforce_project_tool_policy`
+    /// then returns `Ok(())` without reading any policy, while the tool itself still runs
+    /// against a workspace addressed endpoint. `connectors.list` shipped that way and
+    /// returned every connector in the workspace to any caller that simply left
+    /// `project_id` out.
+    ///
+    /// The invariant is checked against the *live registry*, not against a name list, so a
+    /// tool added later with an optional `project_id` fails here instead of shipping as a
+    /// hole. Both halves matter: the scope table must say `required: true`, and the
+    /// published schema must tell the caller so.
+    #[test]
+    fn declared_project_id_is_mandatory_for_every_project_scoped_tool() {
+        let mut optional_scope = Vec::new();
+        let mut optional_schema = Vec::new();
+
+        for tool in &crate::tools::get_all_tool_definitions() {
+            if tool_policy_scope(&tool.name) == (PolicyScope::DeclaredProject { required: false }) {
+                optional_scope.push(tool.name.clone());
+            }
+
+            let declares_project_id = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| properties.contains_key("project_id"));
+            if !declares_project_id {
+                continue;
+            }
+            let schema_requires_project_id = tool
+                .input_schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|value| value.as_str() == Some("project_id")));
+            if !schema_requires_project_id {
+                optional_schema.push(tool.name.clone());
+            }
+        }
+
+        assert!(
+            optional_scope.is_empty(),
+            "these tools are gated on a project_id the caller may omit, which skips the policy entirely: {optional_scope:?}"
+        );
+        assert!(
+            optional_schema.is_empty(),
+            "these tools accept a project_id their schema does not require, so callers are invited to omit it: {optional_schema:?}"
+        );
+    }
+
+    /// The other half of the same class: a tool must not be `WorkspaceWide` while its
+    /// schema offers a `project_id`, because `WorkspaceWide` skips the policy outright and
+    /// `OWNERSHIP_ARGUMENTS` does not list `project_id`, so nothing would refuse the call.
+    #[test]
+    fn workspace_wide_tools_do_not_accept_a_project_id() {
+        let offenders = crate::tools::get_all_tool_definitions()
+            .iter()
+            .filter(|tool| tool_policy_scope(&tool.name) == PolicyScope::WorkspaceWide)
+            .filter(|tool| {
+                tool.input_schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| properties.contains_key("project_id"))
+            })
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+
+        assert!(
+            offenders.is_empty(),
+            "workspace scoped tools that take a project_id are ungoverned project tools: {offenders:?}"
         );
     }
 
@@ -2875,6 +2957,111 @@ mod tests {
             "{}",
             message(&smuggled)
         );
+        Ok(())
+    }
+
+    /// `connectors.list` shipped as `DeclaredProject { required: false }`. Omitting
+    /// `project_id` made `resolve_policy_project_id` answer `Ok(None)`, which skipped the
+    /// policy load entirely, while the tool still called the workspace addressed endpoint
+    /// and returned every connector in the workspace — endpoints and auth policy
+    /// references included. The refusal has to happen *before* the API is touched, so the
+    /// backend hit counter is part of the assertion.
+    #[tokio::test]
+    async fn connectors_list_without_a_project_id_never_reaches_the_workspace_endpoint() -> TestResult {
+        let connector_hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connector_hits);
+        let queries = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&queries);
+
+        let router = Router::new()
+            .route(
+                "/api/v1/workspaces/workspace-1/connectors",
+                get(move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
+                    let counter = Arc::clone(&counter);
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        seen.lock().await.push(query.unwrap_or_default());
+                        Json(json!({
+                            "code": 0,
+                            "data": { "items": [{
+                                "id": RESOURCE,
+                                "kind": "webhook",
+                                "endpoint": "https://internal.example/hooks/payroll",
+                                "auth_policy": { "secret_ref": "OPENPR_CONNECTOR_SECRET_W_X_DEFAULT" }
+                            }] }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                &format!("/api/v1/projects/{PROJECT}/agent-policy"),
+                policy_route(json!(["connectors.list"])),
+            );
+        let server = server(crate::client::test_api::spawn(router).await?)?;
+
+        for bypass in [json!({}), json!({ "kind": "webhook" }), json!({ "project_id": null })] {
+            let refused = server.call_tool("connectors.list", bypass.clone()).await;
+            assert_eq!(refused.is_error, Some(true), "{bypass} was not refused");
+            assert!(
+                message(&refused).contains("requires a project_id"),
+                "{}",
+                message(&refused)
+            );
+        }
+        assert_eq!(
+            connector_hits.load(Ordering::SeqCst),
+            0,
+            "a refused call must never reach the workspace connector endpoint"
+        );
+
+        // Naming the project loads that project's policy and scopes the backend query.
+        let allowed = server
+            .call_tool("connectors.list", json!({ "project_id": PROJECT }))
+            .await;
+        assert_eq!(allowed.is_error, None, "{}", message(&allowed));
+        assert_eq!(connector_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            queries.lock().await.as_slice(),
+            [format!("project_id={PROJECT}")],
+            "the declared project must reach the API as the filter it was authorized against"
+        );
+        Ok(())
+    }
+
+    /// The declared project is not just a formality: a project whose agent policy does not
+    /// enable the tool is refused, which is the whole point of making the id mandatory.
+    #[tokio::test]
+    async fn connectors_list_is_denied_by_the_declared_project_policy() -> TestResult {
+        let connector_hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connector_hits);
+        let router = Router::new()
+            .route(
+                "/api/v1/workspaces/workspace-1/connectors",
+                get(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "code": 0, "data": { "items": [] } }))
+                    }
+                }),
+            )
+            .route(
+                &format!("/api/v1/projects/{PROJECT}/agent-policy"),
+                policy_route(json!(["work_items.list"])),
+            );
+        let server = server(crate::client::test_api::spawn(router).await?)?;
+
+        let denied = server
+            .call_tool("connectors.list", json!({ "project_id": PROJECT }))
+            .await;
+        assert_eq!(denied.is_error, Some(true));
+        assert!(
+            message(&denied).contains("disabled by project agent policy"),
+            "{}",
+            message(&denied)
+        );
+        assert_eq!(connector_hits.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
