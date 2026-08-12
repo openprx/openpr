@@ -2027,6 +2027,89 @@ pub const DELIVERY_ID_HEADER: &str = "X-Webhook-Delivery";
 pub const OUTBOUND_ALLOWED_HOSTS_ENV: &str = "OPENPR_OUTBOUND_ALLOWED_HOSTS";
 /// Set to `1`/`true` to disable outbound private address checks entirely.
 pub const OUTBOUND_ALLOW_PRIVATE_ENV: &str = "OPENPR_OUTBOUND_ALLOW_PRIVATE";
+/// Schema objects the delivery pipeline cannot run without.
+///
+/// Each entry is a label and a boolean expression. The lease token and the two pickup predicates
+/// come from 0048, the duplicate tagging from 0049; both files are outside the migration adoption
+/// cutoff, so an existing database re-executes them. The pre-ledger runner downgraded a failed
+/// migration to a warning, which left the worker silently unable to complete a delivery and
+/// nothing in the log to explain it.
+const DELIVERY_SCHEMA_CHECKS: &[(&str, &str)] = &[
+    (
+        "event_outbox.lease_token column (0048)",
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'event_outbox' AND column_name = 'lease_token'
+        ) AS present",
+    ),
+    (
+        "agent_invocations.duplicate_of column (0049)",
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'agent_invocations' AND column_name = 'duplicate_of'
+        ) AS present",
+    ),
+    (
+        "idx_event_outbox_lease_recovery index (0048)",
+        "SELECT to_regclass('public.idx_event_outbox_lease_recovery') IS NOT NULL AS present",
+    ),
+    (
+        "idx_agent_invocations_connector_pickup index (0048)",
+        "SELECT to_regclass('public.idx_agent_invocations_connector_pickup') IS NOT NULL AS present",
+    ),
+    (
+        "uq_agent_invocations_audit_chain_connector unique index (0049)",
+        "SELECT to_regclass('public.uq_agent_invocations_audit_chain_connector') IS NOT NULL AS present",
+    ),
+    (
+        // The fan-out insert infers this exact predicate in its ON CONFLICT clause. An index left
+        // over from an earlier build has a shorter predicate and would make every insert fail.
+        "uq_agent_invocations_audit_chain_connector predicate covers duplicate_of (0049)",
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND indexname = 'uq_agent_invocations_audit_chain_connector'
+              AND indexdef LIKE '%duplicate_of IS NULL%'
+        ) AS present",
+    ),
+];
+
+/// Asserts the delivery schema before any polling starts.
+///
+/// Returns the labels of everything missing rather than the first failure, so one restart tells the
+/// operator the whole story.
+pub async fn verify_delivery_schema<C>(db: &C) -> Result<(), String>
+where
+    C: ConnectionTrait,
+{
+    let mut missing = Vec::new();
+    for (label, sql) in DELIVERY_SCHEMA_CHECKS {
+        let row = db
+            .query_one(Statement::from_string(DbBackend::Postgres, (*sql).to_string()))
+            .await
+            .map_err(|err| format!("delivery schema check {label} could not run: {err}"))?;
+        let present = match row {
+            Some(row) => row
+                .try_get::<bool>("", "present")
+                .map_err(|err| format!("delivery schema check {label} returned no answer: {err}"))?,
+            None => false,
+        };
+        if !present {
+            missing.push(*label);
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "delivery schema is incomplete, missing: {}. The owning migrations did not apply; \
+         inspect `SELECT name, status, error FROM schema_migrations WHERE status <> 'applied'` and \
+         restart the API to retry them",
+        missing.join(", ")
+    ))
+}
+
 /// Namespace a connector credential environment variable must live in.
 ///
 /// A connector endpoint is attacker controlled by design, so an unconstrained `env:NAME`

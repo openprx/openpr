@@ -20,8 +20,10 @@ use platform::{
     config::AppConfig,
     logging,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 
 #[derive(Serialize)]
@@ -38,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
     let db = connect_db(&cfg.database_url).await?;
     run_migrations(&db).await?;
     verify_governance_schema(&db).await?;
+    // A migration that only warned used to leave the delivery pipeline half built. Fail here
+    // instead, while the reason is still on screen.
+    routes::connector::verify_delivery_schema(&db)
+        .await
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
     let state = AppState { cfg: cfg.clone(), db };
     let auth_state = state.clone();
     routes::proposal::start_governance_watcher(state.clone());
@@ -1809,202 +1816,416 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
-    const MIGRATIONS: &[(&str, &str)] = &[
-        ("0001_init.sql", include_str!("../../../migrations/0001_init.sql")),
-        ("0002_users.sql", include_str!("../../../migrations/0002_users.sql")),
-        ("0003_labels.sql", include_str!("../../../migrations/0003_labels.sql")),
-        ("0004_sprints.sql", include_str!("../../../migrations/0004_sprints.sql")),
-        (
-            "0005_webhooks.sql",
-            include_str!("../../../migrations/0005_webhooks.sql"),
-        ),
-        (
-            "0006_notifications.sql",
-            include_str!("../../../migrations/0006_notifications.sql"),
-        ),
-        (
-            "0007_fulltext_search.sql",
-            include_str!("../../../migrations/0007_fulltext_search.sql"),
-        ),
-        (
-            "0008_admin_user_fields.sql",
-            include_str!("../../../migrations/0008_admin_user_fields.sql"),
-        ),
-        (
-            "0009_notifications_schema_compat.sql",
-            include_str!("../../../migrations/0009_notifications_schema_compat.sql"),
-        ),
-        (
-            "0010_issue_activity_notifications_compat.sql",
-            include_str!("../../../migrations/0010_issue_activity_notifications_compat.sql"),
-        ),
-        (
-            "0011_bot_user_and_webhook_fields.sql",
-            include_str!("../../../migrations/0011_bot_user_and_webhook_fields.sql"),
-        ),
-        (
-            "0012_governance_phase1.sql",
-            include_str!("../../../migrations/0012_governance_phase1.sql"),
-        ),
-        (
-            "0013_governance_work_items_fields.sql",
-            include_str!("../../../migrations/0013_governance_work_items_fields.sql"),
-        ),
-        (
-            "0014_proposal_comments_schema_compat.sql",
-            include_str!("../../../migrations/0014_proposal_comments_schema_compat.sql"),
-        ),
-        (
-            "0015_governance_phase2.sql",
-            include_str!("../../../migrations/0015_governance_phase2.sql"),
-        ),
-        (
-            "0016_governance_phase3.sql",
-            include_str!("../../../migrations/0016_governance_phase3.sql"),
-        ),
-        (
-            "0017_governance_phase3_hardening.sql",
-            include_str!("../../../migrations/0017_governance_phase3_hardening.sql"),
-        ),
-        (
-            "0018_governance_phase3_templates.sql",
-            include_str!("../../../migrations/0018_governance_phase3_templates.sql"),
-        ),
-        (
-            "0019_governance_cycle_template_rapid.sql",
-            include_str!("../../../migrations/0019_governance_cycle_template_rapid.sql"),
-        ),
-        (
-            "0020_ai_tasks.sql",
-            include_str!("../../../migrations/0020_ai_tasks.sql"),
-        ),
-        (
-            "0021_fix_cascade.sql",
-            include_str!("../../../migrations/0021_fix_cascade.sql"),
-        ),
-        (
-            "0022_bot_tokens.sql",
-            include_str!("../../../migrations/0022_bot_tokens.sql"),
-        ),
-        (
-            "0023_work_item_identifier.sql",
-            include_str!("../../../migrations/0023_work_item_identifier.sql"),
-        ),
-        (
-            "0024_workflow_config.sql",
-            include_str!("../../../migrations/0024_workflow_config.sql"),
-        ),
-        (
-            "0025_project_types_resources.sql",
-            include_str!("../../../migrations/0025_project_types_resources.sql"),
-        ),
-        (
-            "0026_connectors_invocations.sql",
-            include_str!("../../../migrations/0026_connectors_invocations.sql"),
-        ),
-        (
-            "0027_check_results.sql",
-            include_str!("../../../migrations/0027_check_results.sql"),
-        ),
-        (
-            "0028_invocation_tool_calls.sql",
-            include_str!("../../../migrations/0028_invocation_tool_calls.sql"),
-        ),
-        (
-            "0029_scenario_templates.sql",
-            include_str!("../../../migrations/0029_scenario_templates.sql"),
-        ),
-        (
-            "0030_universal_forms.sql",
-            include_str!("../../../migrations/0030_universal_forms.sql"),
-        ),
-        (
-            "0031_business_events_outbox_inbox.sql",
-            include_str!("../../../migrations/0031_business_events_outbox_inbox.sql"),
-        ),
-        (
-            "0032_print_device_connector_kinds.sql",
-            include_str!("../../../migrations/0032_print_device_connector_kinds.sql"),
-        ),
-        (
-            "0033_plugins_wasm.sql",
-            include_str!("../../../migrations/0033_plugins_wasm.sql"),
-        ),
-        (
-            "0034_user_profile_preferences.sql",
-            include_str!("../../../migrations/0034_user_profile_preferences.sql"),
-        ),
-        (
-            "0035_project_type_two_lanes.sql",
-            include_str!("../../../migrations/0035_project_type_two_lanes.sql"),
-        ),
-        (
-            "0036_universal_forms_schema_version_archive.sql",
-            include_str!("../../../migrations/0036_universal_forms_schema_version_archive.sql"),
-        ),
-        (
-            "0037_form_attachments.sql",
-            include_str!("../../../migrations/0037_form_attachments.sql"),
-        ),
-        (
-            "0038_form_permissions.sql",
-            include_str!("../../../migrations/0038_form_permissions.sql"),
-        ),
-        (
-            "0039_universal_forms_pivot_view_type.sql",
-            include_str!("../../../migrations/0039_universal_forms_pivot_view_type.sql"),
-        ),
-        (
-            "0040_universal_forms_gantt_view_type.sql",
-            include_str!("../../../migrations/0040_universal_forms_gantt_view_type.sql"),
-        ),
-        (
-            "0041_form_record_comments.sql",
-            include_str!("../../../migrations/0041_form_record_comments.sql"),
-        ),
-        (
-            "0042_form_attachment_thumbnail_url.sql",
-            include_str!("../../../migrations/0042_form_attachment_thumbnail_url.sql"),
-        ),
-        (
-            "0043_form_import_mapping_templates.sql",
-            include_str!("../../../migrations/0043_form_import_mapping_templates.sql"),
-        ),
-        (
-            "0044_form_import_jobs.sql",
-            include_str!("../../../migrations/0044_form_import_jobs.sql"),
-        ),
-        (
-            "0045_form_export_jobs.sql",
-            include_str!("../../../migrations/0045_form_export_jobs.sql"),
-        ),
-        (
-            "0046_form_attachment_package_jobs.sql",
-            include_str!("../../../migrations/0046_form_attachment_package_jobs.sql"),
-        ),
-        (
-            "0047_form_attachment_media_metadata.sql",
-            include_str!("../../../migrations/0047_form_attachment_media_metadata.sql"),
-        ),
-        (
-            "0048_delivery_lease_and_pickup_indexes.sql",
-            include_str!("../../../migrations/0048_delivery_lease_and_pickup_indexes.sql"),
-        ),
-    ];
+/// Every migration file, in application order.
+///
+/// A file that exists on disk but is missing here is silently never applied, so
+/// `every_migration_file_is_registered` asserts the two stay in sync.
+const MIGRATIONS: &[(&str, &str)] = &[
+    // Must stay first: the ledger has to exist before any outcome can be recorded.
+    (
+        "0000_schema_migrations.sql",
+        include_str!("../../../migrations/0000_schema_migrations.sql"),
+    ),
+    ("0001_init.sql", include_str!("../../../migrations/0001_init.sql")),
+    ("0002_users.sql", include_str!("../../../migrations/0002_users.sql")),
+    ("0003_labels.sql", include_str!("../../../migrations/0003_labels.sql")),
+    ("0004_sprints.sql", include_str!("../../../migrations/0004_sprints.sql")),
+    (
+        "0005_webhooks.sql",
+        include_str!("../../../migrations/0005_webhooks.sql"),
+    ),
+    (
+        "0006_notifications.sql",
+        include_str!("../../../migrations/0006_notifications.sql"),
+    ),
+    (
+        "0007_fulltext_search.sql",
+        include_str!("../../../migrations/0007_fulltext_search.sql"),
+    ),
+    (
+        "0008_admin_user_fields.sql",
+        include_str!("../../../migrations/0008_admin_user_fields.sql"),
+    ),
+    (
+        "0009_notifications_schema_compat.sql",
+        include_str!("../../../migrations/0009_notifications_schema_compat.sql"),
+    ),
+    (
+        "0010_issue_activity_notifications_compat.sql",
+        include_str!("../../../migrations/0010_issue_activity_notifications_compat.sql"),
+    ),
+    (
+        "0011_bot_user_and_webhook_fields.sql",
+        include_str!("../../../migrations/0011_bot_user_and_webhook_fields.sql"),
+    ),
+    (
+        "0012_governance_phase1.sql",
+        include_str!("../../../migrations/0012_governance_phase1.sql"),
+    ),
+    (
+        "0013_governance_work_items_fields.sql",
+        include_str!("../../../migrations/0013_governance_work_items_fields.sql"),
+    ),
+    (
+        "0014_proposal_comments_schema_compat.sql",
+        include_str!("../../../migrations/0014_proposal_comments_schema_compat.sql"),
+    ),
+    (
+        "0015_governance_phase2.sql",
+        include_str!("../../../migrations/0015_governance_phase2.sql"),
+    ),
+    (
+        "0016_governance_phase3.sql",
+        include_str!("../../../migrations/0016_governance_phase3.sql"),
+    ),
+    (
+        "0017_governance_phase3_hardening.sql",
+        include_str!("../../../migrations/0017_governance_phase3_hardening.sql"),
+    ),
+    (
+        "0018_governance_phase3_templates.sql",
+        include_str!("../../../migrations/0018_governance_phase3_templates.sql"),
+    ),
+    (
+        "0019_governance_cycle_template_rapid.sql",
+        include_str!("../../../migrations/0019_governance_cycle_template_rapid.sql"),
+    ),
+    (
+        "0020_ai_tasks.sql",
+        include_str!("../../../migrations/0020_ai_tasks.sql"),
+    ),
+    (
+        "0021_fix_cascade.sql",
+        include_str!("../../../migrations/0021_fix_cascade.sql"),
+    ),
+    (
+        "0022_bot_tokens.sql",
+        include_str!("../../../migrations/0022_bot_tokens.sql"),
+    ),
+    (
+        "0023_work_item_identifier.sql",
+        include_str!("../../../migrations/0023_work_item_identifier.sql"),
+    ),
+    (
+        "0024_workflow_config.sql",
+        include_str!("../../../migrations/0024_workflow_config.sql"),
+    ),
+    (
+        "0025_project_types_resources.sql",
+        include_str!("../../../migrations/0025_project_types_resources.sql"),
+    ),
+    (
+        "0026_connectors_invocations.sql",
+        include_str!("../../../migrations/0026_connectors_invocations.sql"),
+    ),
+    (
+        "0027_check_results.sql",
+        include_str!("../../../migrations/0027_check_results.sql"),
+    ),
+    (
+        "0028_invocation_tool_calls.sql",
+        include_str!("../../../migrations/0028_invocation_tool_calls.sql"),
+    ),
+    (
+        "0029_scenario_templates.sql",
+        include_str!("../../../migrations/0029_scenario_templates.sql"),
+    ),
+    (
+        "0030_universal_forms.sql",
+        include_str!("../../../migrations/0030_universal_forms.sql"),
+    ),
+    (
+        "0031_business_events_outbox_inbox.sql",
+        include_str!("../../../migrations/0031_business_events_outbox_inbox.sql"),
+    ),
+    (
+        "0032_print_device_connector_kinds.sql",
+        include_str!("../../../migrations/0032_print_device_connector_kinds.sql"),
+    ),
+    (
+        "0033_plugins_wasm.sql",
+        include_str!("../../../migrations/0033_plugins_wasm.sql"),
+    ),
+    (
+        "0034_user_profile_preferences.sql",
+        include_str!("../../../migrations/0034_user_profile_preferences.sql"),
+    ),
+    (
+        "0035_project_type_two_lanes.sql",
+        include_str!("../../../migrations/0035_project_type_two_lanes.sql"),
+    ),
+    (
+        "0036_universal_forms_schema_version_archive.sql",
+        include_str!("../../../migrations/0036_universal_forms_schema_version_archive.sql"),
+    ),
+    (
+        "0037_form_attachments.sql",
+        include_str!("../../../migrations/0037_form_attachments.sql"),
+    ),
+    (
+        "0038_form_permissions.sql",
+        include_str!("../../../migrations/0038_form_permissions.sql"),
+    ),
+    (
+        "0039_universal_forms_pivot_view_type.sql",
+        include_str!("../../../migrations/0039_universal_forms_pivot_view_type.sql"),
+    ),
+    (
+        "0040_universal_forms_gantt_view_type.sql",
+        include_str!("../../../migrations/0040_universal_forms_gantt_view_type.sql"),
+    ),
+    (
+        "0041_form_record_comments.sql",
+        include_str!("../../../migrations/0041_form_record_comments.sql"),
+    ),
+    (
+        "0042_form_attachment_thumbnail_url.sql",
+        include_str!("../../../migrations/0042_form_attachment_thumbnail_url.sql"),
+    ),
+    (
+        "0043_form_import_mapping_templates.sql",
+        include_str!("../../../migrations/0043_form_import_mapping_templates.sql"),
+    ),
+    (
+        "0044_form_import_jobs.sql",
+        include_str!("../../../migrations/0044_form_import_jobs.sql"),
+    ),
+    (
+        "0045_form_export_jobs.sql",
+        include_str!("../../../migrations/0045_form_export_jobs.sql"),
+    ),
+    (
+        "0046_form_attachment_package_jobs.sql",
+        include_str!("../../../migrations/0046_form_attachment_package_jobs.sql"),
+    ),
+    (
+        "0047_form_attachment_media_metadata.sql",
+        include_str!("../../../migrations/0047_form_attachment_media_metadata.sql"),
+    ),
+    (
+        "0048_delivery_lease_and_pickup_indexes.sql",
+        include_str!("../../../migrations/0048_delivery_lease_and_pickup_indexes.sql"),
+    ),
+    (
+        "0049_agent_invocation_duplicate_tagging.sql",
+        include_str!("../../../migrations/0049_agent_invocation_duplicate_tagging.sql"),
+    ),
+];
 
-    for (name, sql) in MIGRATIONS {
-        match db.execute_unprepared(sql).await {
-            Ok(_) => tracing::info!(migration = %name, "migration applied"),
-            Err(e) => tracing::warn!(
-                migration = %name,
-                error = %e,
-                "migration execution failed (likely already applied)"
-            ),
+async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
+    let Some((ledger_name, ledger_sql)) = MIGRATIONS.first() else {
+        return Err(anyhow::anyhow!("migration list is empty, refusing to start"));
+    };
+
+    // The ledger bootstrap is idempotent by construction, so it is the one file that may run on
+    // every start: nothing can be read from or written to the ledger before it exists.
+    apply_migration(db, ledger_name, ledger_sql)
+        .await
+        .map_err(|err| anyhow::anyhow!("migration ledger bootstrap failed: {err}"))?;
+    record_migration_if_absent(db, ledger_name, &migration_checksum(ledger_sql)).await?;
+
+    let replay = migration_replay_requested();
+    if replay {
+        tracing::warn!(
+            env = MIGRATION_REPLAY_ENV,
+            "migration replay requested: every migration is re-executed and failures are reported \
+             but not fatal, matching the pre-ledger runner"
+        );
+    }
+
+    let mut ledger = load_migration_ledger(db).await?;
+
+    // A database created by the pre-ledger runner already carries the whole schema, but the ledger
+    // is empty. Replaying 0001..cutoff there would be both slow and unsafe, so those entries are
+    // claimed without executing them. The claim is bounded by a frozen cutoff, so migrations added
+    // after the ledger shipped are never adopted by accident.
+    if !replay && ledger.len() <= 1 && database_predates_ledger(db).await? {
+        let mut adopted = 0_usize;
+        for (name, sql) in MIGRATIONS
+            .iter()
+            .skip(1)
+            .filter(|(name, _)| *name <= MIGRATION_ADOPTION_CUTOFF)
+        {
+            record_migration(db, name, &migration_checksum(sql), "adopted", None).await?;
+            adopted += 1;
+        }
+        tracing::warn!(
+            adopted,
+            cutoff = MIGRATION_ADOPTION_CUTOFF,
+            "existing database adopted into the migration ledger without replaying it; the schema \
+             assertions that follow decide whether it is actually complete"
+        );
+        ledger = load_migration_ledger(db).await?;
+    }
+
+    for (name, sql) in MIGRATIONS.iter().skip(1) {
+        let checksum = migration_checksum(sql);
+        if !replay
+            && let Some(recorded) = ledger.get(*name)
+            && recorded.status != "failed"
+        {
+            if recorded.checksum != checksum {
+                tracing::warn!(
+                    migration = %name,
+                    recorded_status = %recorded.status,
+                    "migration file changed after it was recorded; the database still holds the \
+                     previously applied version"
+                );
+            }
+            continue;
+        }
+
+        match apply_migration(db, name, sql).await {
+            Ok(()) => {
+                record_migration(db, name, &checksum, "applied", None).await?;
+                tracing::info!(migration = %name, "migration applied");
+            }
+            Err(err) => {
+                let message = err.to_string();
+                tracing::error!(
+                    migration = %name,
+                    error = %message,
+                    "migration failed; the ledger keeps it unapplied so the next start retries it"
+                );
+                if let Err(record_err) = record_migration(db, name, &checksum, "failed", Some(&message)).await {
+                    tracing::error!(
+                        migration = %name,
+                        error = %record_err,
+                        "could not record the migration failure in the ledger"
+                    );
+                }
+                if !replay {
+                    return Err(anyhow::anyhow!("migration {name} failed: {message}"));
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Newest migration an existing database may claim without executing it.
+///
+/// Frozen on purpose. It stops at 0047 rather than at the last pre-ledger file (0048) because
+/// 0048 is fully idempotent and is the one whose failure the pre-ledger runner used to hide: a
+/// database that never got its delivery lease column re-executes it once and heals, instead of
+/// being claimed as applied and failing the schema assertions forever. Never move this forward,
+/// or a future migration would silently be skipped on every existing deployment.
+const MIGRATION_ADOPTION_CUTOFF: &str = "0047_form_attachment_media_metadata.sql";
+
+/// Escape hatch that restores the pre-ledger behaviour for one start: everything is re-executed
+/// and a failure is reported without aborting. Recovery tool for a database whose ledger and
+/// actual schema disagree; not meant for normal operation.
+const MIGRATION_REPLAY_ENV: &str = "OPENPR_MIGRATIONS_REPLAY";
+
+/// One recorded migration outcome.
+struct RecordedMigration {
+    checksum: String,
+    status: String,
+}
+
+fn migration_replay_requested() -> bool {
+    std::env::var(MIGRATION_REPLAY_ENV)
+        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+/// Content fingerprint used to notice that a migration file changed after it was applied.
+fn migration_checksum(sql: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(sql.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Runs one migration atomically. Partially applied files cannot survive a failure, so the ledger
+/// and the schema never drift apart within a single migration.
+async fn apply_migration(db: &DatabaseConnection, name: &str, sql: &str) -> anyhow::Result<()> {
+    let txn = db.begin().await?;
+    if let Err(err) = txn.execute_unprepared(sql).await {
+        if let Err(rollback_err) = txn.rollback().await {
+            tracing::warn!(migration = %name, error = %rollback_err, "migration rollback failed");
+        }
+        return Err(err.into());
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+async fn record_migration(
+    db: &DatabaseConnection,
+    name: &str,
+    checksum: &str,
+    status: &str,
+    error: Option<&str>,
+) -> anyhow::Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO schema_migrations (name, checksum, status, error, applied_at)
+            VALUES ($1, $2, $3, $4, now())
+            ON CONFLICT (name) DO UPDATE
+            SET checksum = EXCLUDED.checksum,
+                status = EXCLUDED.status,
+                error = EXCLUDED.error,
+                applied_at = EXCLUDED.applied_at
+        ",
+        vec![
+            name.into(),
+            checksum.into(),
+            status.into(),
+            error.map(ToString::to_string).into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Records the ledger bootstrap without touching an existing row, so `applied_at` keeps meaning
+/// "when this database first got the migration" instead of "when the API last started".
+async fn record_migration_if_absent(db: &DatabaseConnection, name: &str, checksum: &str) -> anyhow::Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO schema_migrations (name, checksum, status, error, applied_at)
+            VALUES ($1, $2, 'applied', NULL, now())
+            ON CONFLICT (name) DO NOTHING
+        ",
+        vec![name.into(), checksum.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn load_migration_ledger(db: &DatabaseConnection) -> anyhow::Result<HashMap<String, RecordedMigration>> {
+    let rows = db
+        .query_all(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT name, checksum, status FROM schema_migrations".to_string(),
+        ))
+        .await?;
+
+    let mut ledger = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let name = row.try_get::<String>("", "name")?;
+        let checksum = row.try_get::<String>("", "checksum")?;
+        let status = row.try_get::<String>("", "status")?;
+        ledger.insert(name, RecordedMigration { checksum, status });
+    }
+    Ok(ledger)
+}
+
+/// True when the database already carries the pre-ledger schema. `users` is created by 0001 and
+/// never dropped, so its presence separates "existing deployment" from "empty database".
+async fn database_predates_ledger(db: &DatabaseConnection) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT to_regclass('public.users') IS NOT NULL AS present".to_string(),
+        ))
+        .await?;
+    match row {
+        Some(row) => Ok(row.try_get::<bool>("", "present")?),
+        None => Ok(false),
+    }
 }
 
 async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()> {
@@ -2051,4 +2272,95 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIGRATION_ADOPTION_CUTOFF, MIGRATIONS, migration_checksum};
+
+    /// A migration file has to be registered in two places: on disk and in [`MIGRATIONS`].
+    /// Forgetting the second one makes it silently never run, so the two are compared here.
+    #[test]
+    fn every_migration_file_is_registered() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".sql"))
+            .collect();
+        on_disk.sort();
+
+        let registered: Vec<String> = MIGRATIONS.iter().map(|(name, _)| (*name).to_string()).collect();
+        assert_eq!(
+            registered, on_disk,
+            "migrations/ and MIGRATIONS must list the same files"
+        );
+    }
+
+    #[test]
+    fn migrations_are_registered_in_file_name_order() {
+        let mut sorted: Vec<&str> = MIGRATIONS.iter().map(|(name, _)| *name).collect();
+        let registered = sorted.clone();
+        sorted.sort_unstable();
+        assert_eq!(registered, sorted, "MIGRATIONS must stay in file name order");
+    }
+
+    /// The ledger bootstrap has to be applicable before anything can be recorded, so it must be
+    /// the first entry and it must be safe to execute on every start.
+    #[test]
+    fn the_ledger_bootstrap_is_first_and_idempotent() {
+        let (name, sql) = MIGRATIONS.first().expect("at least one migration is registered");
+        assert_eq!(*name, "0000_schema_migrations.sql");
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS schema_migrations"));
+    }
+
+    /// The cutoff decides which files an existing database claims without executing them.
+    /// It must name a real migration, and everything after it must actually run.
+    #[test]
+    fn the_adoption_cutoff_names_a_registered_migration() {
+        assert!(
+            MIGRATIONS.iter().any(|(name, _)| *name == MIGRATION_ADOPTION_CUTOFF),
+            "adoption cutoff must be a registered migration"
+        );
+        let replayed: Vec<&str> = MIGRATIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name > MIGRATION_ADOPTION_CUTOFF)
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![
+                "0048_delivery_lease_and_pickup_indexes.sql",
+                "0049_agent_invocation_duplicate_tagging.sql"
+            ],
+            "only the idempotent delivery migrations may re-run on an adopted database"
+        );
+    }
+
+    /// Adoption records a checksum without executing the file, so the checksum has to be a pure
+    /// function of the content and has to separate two different files.
+    #[test]
+    fn migration_checksums_are_content_addressed() {
+        assert_eq!(migration_checksum("select 1;"), migration_checksum("select 1;"));
+        assert_ne!(migration_checksum("select 1;"), migration_checksum("select 2;"));
+        assert_eq!(migration_checksum("").len(), 64);
+    }
+
+    /// 0048 used to delete rows on every API start. Whatever else it grows, it must never remove
+    /// data again, and it must stay re-runnable because adopted databases execute it.
+    #[test]
+    fn the_delivery_migrations_never_delete_rows() {
+        for (name, sql) in MIGRATIONS.iter().filter(|(name, _)| *name > MIGRATION_ADOPTION_CUTOFF) {
+            let upper = sql.to_uppercase();
+            assert!(
+                !upper.contains("DELETE FROM"),
+                "{name} must not delete rows: it re-runs on every adopted database"
+            );
+            assert!(
+                !upper.contains("DROP TABLE"),
+                "{name} must not drop tables: it re-runs on every adopted database"
+            );
+        }
+    }
 }
