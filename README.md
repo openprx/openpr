@@ -34,11 +34,15 @@ cd openpr
 bash scripts/start.sh
 ```
 
-`scripts/start.sh` creates a local `.env` on first run with random non-production
-`POSTGRES_PASSWORD` / `JWT_SECRET` / `OPENPR_MCP_AUTH_TOKEN`, builds release binaries for
-`Dockerfile.prebuilt`, then runs `docker compose up -d --build`. Replace the
-generated secrets before production use. Services publish on
-`${OPENPR_BIND_HOST:-127.0.0.1}`: frontend `:3000`, API `:8081`, MCP `:8090`.
+`scripts/start.sh` generates the deployment's configuration on first run —
+`config/openpr.compose.toml` for the API and the worker,
+`config/openpr.compose.mcp.toml` for the MCP server, plus a compose-only `.env`
+— filling in random non-production bootstrap secrets without echoing any of them
+to the terminal. It then builds release binaries for `Dockerfile.prebuilt` and
+runs `docker compose up -d --build`. The generated files are `chmod 600` and
+hold real secrets: replace them before production use, and never commit them.
+Services publish on `${OPENPR_BIND_HOST:-127.0.0.1}`: frontend `:3000`, API
+`:8081`, MCP `:8090`.
 For demo data once healthy, `scripts/bootstrap-restaurant-demo.sh` creates a
 demo account, workspace, `restaurant_ordering_default` project with sample
 records, and a workspace-scoped bot token; it refuses non-local API URLs unless
@@ -48,59 +52,148 @@ records, and a workspace-scoped bot token; it refuses non-local API URLs unless
 
 ```bash
 # Prerequisites: stable Rust with edition 2024 support, Bun, PostgreSQL 16
-scripts/dev-up.sh          # start only PostgreSQL from compose
-cp .env.example .env
-cargo run --bin api        # listens on BIND_ADDR, default 0.0.0.0:8080
-cargo run --bin worker
+scripts/dev-up.sh                                  # start only PostgreSQL from compose
+cp config/openpr.example.toml config/openpr.toml
+$EDITOR config/openpr.toml                         # database.url, auth.jwt_secret, [mcp]
+
+cargo run --bin api -- --config config/openpr.toml     # listens on server.bind_addr, default 0.0.0.0:8081
+cargo run --bin worker -- --config config/openpr.toml
 
 cd frontend && bun install && bun run dev
 
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-cargo run --bin mcp-server -- serve --transport http
+cargo run --bin mcp-server -- serve --config config/openpr.toml --transport http
 ```
+
+> A host-side run reaches PostgreSQL through the published port, so
+> `database.url` must name `localhost`, not the compose hostname `postgres`.
+> `mcp.api_url` follows the same rule: `http://localhost:8081` from the host,
+> the `api` service address from inside the compose network.
+>
+> `--config` is optional; every binary falls back to `config/openpr.toml`
+> relative to its working directory, which is what these commands would use
+> anyway when run from the repository root.
 
 ## Configuration
 
-**Read by the programs.** api and worker: `DATABASE_URL`, `JWT_SECRET`
-(required), `JWT_ACCESS_TTL_SECONDS`, `JWT_REFRESH_TTL_SECONDS`, `APP_NAME`,
-`BIND_ADDR` (api), `DEFAULT_AUTHOR_ID`, `UPLOAD_DIR`,
-`OPENPR_OBJECT_STORAGE_BACKEND` (`local` | `s3-compatible`),
-`OPENPR_OBJECT_STORAGE_DIR`, and `OPENPR_OBJECT_STORAGE_S3_{ENDPOINT, BUCKET,
-REGION, ACCESS_KEY_ID, SECRET_ACCESS_KEY, SESSION_TOKEN}`. mcp-server:
-`OPENPR_API_URL`, `OPENPR_BOT_TOKEN`, `OPENPR_WORKSPACE_ID`,
-`OPENPR_MCP_AUTH_TOKEN` (inbound auth, see below), `OPENPR_INVOCATION_ID`
-(optional ledger correlation), `OPENPR_MCP_TRANSPORT` (transport label in tool
-payloads, default `mcp_stdio`). All binaries read `RUST_LOG` as the `tracing`
-env filter.
+**One TOML file, no environment variables.** `api`, `worker` and `mcp-server`
+read every setting from a single configuration file and **no environment
+variable at all**. The path comes from `--config <PATH>`, defaulting to
+`config/openpr.toml` relative to the process working directory. A missing file
+is a startup error, never a silent fallback: the binaries never invent a
+database URL or a signing key. `config/openpr.example.toml` is the annotated
+reference — copy it to `config/openpr.toml` and edit it.
 
-**Inbound MCP authentication (mcp-server).**
+Unknown keys are rejected, so a misspelled setting fails startup instead of
+being silently ignored.
 
-| Variable | Default | Meaning |
+| Section | Read by | Keys (defaults in parentheses) |
 | --- | --- | --- |
-| `OPENPR_MCP_AUTH_TOKEN` | unset | Bearer token required on the MCP HTTP surfaces. When set, `/mcp/rpc`, `/sse` and `/messages` reject any request without `Authorization: Bearer <token>`; `/health` stays open so container healthchecks keep working. Minimum 16 characters — generate one with `openssl rand -hex 32`. The server **refuses to start** when `--bind-addr` is not a loopback address and this variable is unset, so `docker-compose.yml` requires it: the container binds `0.0.0.0:8090` because the other compose services reach the MCP server over the bridge network. `scripts/start.sh` writes a random value into `.env` on first run; `scripts/test-mcp.sh`, `scripts/bootstrap-restaurant-demo.sh` and `skills/openpr-mcp/scripts/validate-mcp.sh` read it from the environment or from `.env`. |
+| `[server]` | api, worker | `app_name`, `bind_addr`. Both optional; each binary keeps its own default when they are omitted (api listens on `0.0.0.0:8081`). |
+| `[database]` | api, worker | `url` (**required**; full URL, password included, never logged), `max_connections` (`20`), `min_connections` (`2`), `connect_timeout_seconds` (`5`), `idle_timeout_seconds` (`30`), `acquire_timeout_seconds` (`5`) |
+| `[auth]` | api, worker | `jwt_secret` (**required**; minimum 16 characters, 64 hex recommended — `openssl rand -hex 32`), `access_ttl_seconds` (`1296000`), `refresh_ttl_seconds` (`1728000`), `default_author_id` (optional, must be a real non-nil UUID) |
+| `[logging]` | all | `filter` — `tracing` directives, validated at startup (`<service>=info,tower_http=info`), `format` — `json` \| `text` (`json`), `output` — `stderr` \| `stdout` (`stderr`) |
+| `[storage]` | api | `backend` — `local` \| `s3` (`local`), `dir` (`./uploads`); `[storage.s3]` with `endpoint`, `bucket`, `region` (`us-east-1`), `access_key_id`, `secret_access_key`, `session_token`, required only when `backend = "s3"` and left unread otherwise |
+| `[migrations]` | api | `replay` (`false`), `continue_on_error` (`false`) — both are escape hatches; turn one on deliberately, then turn it back off |
+| `[outbound]` | api, worker | `allowed_hosts` — a TOML **array of strings** (`[]`), `allow_private` (`false`) |
+| `[mcp]` | mcp-server | `api_url` (`http://localhost:8081`), `bot_token` (**required**, `opr_` prefix), `workspace_id` (**required**, real non-nil UUID), `auth_token` (inbound bearer token, minimum 16 characters), `transport` — `stdio` \| `http` \| `sse` (`stdio`), `bind_addr` (`127.0.0.1:8090`), `invocation_id` (optional ledger correlation id) |
+| `[connectors.secrets."<workspace-uuid>"]` | api, worker | One table per workspace, `NAME = "value"` |
+
+> **Eager shape, lazy presence.** Every value the file *does* contain is
+> shape-checked at startup by whichever binary reads it, but whether a mandatory
+> value is *present* is decided by the binary that needs it. A deployment that
+> runs only the MCP server therefore needs no `[database]` and no `[auth]`
+> section at all, and is never asked to invent two credentials it never uses.
+> When api or worker is missing them, validation reports every missing or
+> unusable value in **one** error instead of one restart per mistake.
+
+A complete MCP-only configuration is three lines:
+
+```toml
+[mcp]
+bot_token = "opr_..."
+workspace_id = "..."
+```
+
+**Logging** replaces `RUST_LOG`: the level is part of the deployment's
+configuration, not of whatever the surrounding shell happened to export. The MCP
+server's stdio transport frames JSON-RPC on stdout, where one log line ends the
+session, so it always logs to stderr and reports `output = "stdout"` as
+overridden rather than honouring it.
 
 **Outbound deliveries (api + worker).** Connector and webhook endpoints are
 validated when they are configured and again before every delivery: an endpoint
 whose host resolves to a loopback, private, link-local, NAT64/6to4 or otherwise
 internal address is refused, and redirects are not followed.
+`outbound.allowed_hosts` lists the exemptions as `"host"` or `"host:port"`,
+matched literally and case-insensitively — no wildcards, no URLs, no paths, all
+three are rejected at startup because they would silently never match. Internal
+receivers (compose services, in-cluster bots) must be listed there or their
+deliveries are refused. `outbound.allow_private = true` disables the checks
+entirely and is only for a closed network you control end to end.
 
-| Variable | Default | Meaning |
+```toml
+[outbound]
+allowed_hosts = ["webhook:9090", "api:8080", "mcp-server:8090", "frontend:80"]
+allow_private = false
+```
+
+**Connector credentials.** Anything a connector `auth_policy` presents to a
+third party is filed under the UUID of the workspace that owns the connector:
+
+```toml
+[connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
+SHIPPING = "..."
+```
+
+and referenced by its short name — `"auth_policy": {"mode":"hmac","secret_ref":"SHIPPING"}`.
+The lookup selects the workspace table first and searches only inside it, so no
+reference, however it is spelled, can reach another tenant's credentials: any
+user can create a workspace and is its admin there, so a process-wide namespace
+would be readable by every tenant. Names must match `[A-Z_][A-Z0-9_]*`, must not
+start with `OPENPR_`, `POSTGRES_`, `PG` or `AWS_`, and must not be `JWT_SECRET`,
+`DATABASE_URL` or `RUST_LOG`.
+
+> The retired `OPENPR_CONNECTOR_SECRET_W_<UUID>_<NAME>` environment variables map
+> onto this table: drop the whole prefix and file the remaining name under the
+> workspace UUID. `secret_ref` / `token_ref` now carry the bare name, **not** the
+> old `env:...` form.
+
+### Compose deployment
+
+`scripts/start.sh` generates two configuration files and `docker-compose.yml`
+mounts each **read-only** at `/app/config/openpr.toml` inside its containers,
+with every service passing `--config /app/config/openpr.toml`:
+
+| File | Used by | Sections |
 | --- | --- | --- |
-| `OPENPR_OUTBOUND_ALLOWED_HOSTS` | compose sets `webhook:9090,api:8080,mcp-server:8090,frontend:80` | Comma separated `host` or `host:port` entries exempt from the private address checks. Internal receivers (compose services, in-cluster bots) must be listed here or their deliveries are rejected. |
-| `OPENPR_OUTBOUND_ALLOW_PRIVATE` | unset (checks on) | `1`/`true`/`yes` disables the private address checks entirely. Only for a fully trusted network. |
-| `OPENPR_CONNECTOR_SECRET_W_<WORKSPACE>_*` | unset | Credentials a connector `auth_policy` may reference as `{"mode":"bearer","token_ref":"env:OPENPR_CONNECTOR_SECRET_W_<WORKSPACE>_MYHOOK"}`. `<WORKSPACE>` is the owning workspace UUID with dashes removed and uppercased, and a connector may only reference names inside the namespace of the workspace that owns it: any user can create a workspace and is its admin there, so a process wide namespace would be readable by every tenant. Only this prefix can be referenced, so a connector cannot be pointed at `JWT_SECRET`, `DATABASE_URL`, `POSTGRES_*`, `AWS_*` or `OPENPR_OBJECT_STORAGE_*`. Container deployments must add each variable to the api and worker environment in `docker-compose.yml`. |
+| `config/openpr.compose.toml` | api, worker | `[database]`, `[auth]`, `[logging]`, `[storage]`, `[migrations]`, `[outbound]`, `[connectors]` |
+| `config/openpr.compose.mcp.toml` | mcp-server | `[logging]`, `[mcp]` |
 
-**Consumed only by docker-compose**, never by Rust code: `OPENPR_BIND_HOST`
-(default `127.0.0.1`), `OPENPR_API_PORT`, `OPENPR_FRONTEND_PORT`,
-`MCP_SERVER_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`,
-`PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `VITE_API_BASE_URL`,
-`OPENPR_WEBHOOK_IMAGE`, `OPENPR_WEBHOOK_CONFIG`, `OPENPR_WEBHOOK_PORT`.
+The split follows the trust boundary. api and worker are one trust domain — same
+database, same signing key, and they must not drift apart. The MCP server is the
+network-exposed, agent-facing surface, and it needs neither the database URL nor
+the JWT signing key; handing it the signing key would turn a compromise of the
+MCP server into the ability to forge any user's token. The lazy
+`[database]`/`[auth]` presence check above is what makes an MCP config file
+without those sections a valid one.
 
-> `.env.example` sets `OPENPR_API_URL=http://api:8080`, the address **inside**
-> the compose network. Running the MCP server on the host requires
-> `http://localhost:8081`.
+Both generated files are `chmod 600` and hold real secrets. **Do not commit
+them.**
+
+Host-side helper scripts — `scripts/test-mcp.sh`,
+`scripts/bootstrap-restaurant-demo.sh` and
+`skills/openpr-mcp/scripts/validate-mcp.sh` — read `mcp.auth_token` out of
+`config/openpr.compose.mcp.toml`; point them at another file with
+`OPENPR_CONFIG_FILE`, or override the token for the script itself by exporting
+`OPENPR_MCP_AUTH_TOKEN`.
+
+**Consumed only by docker-compose**, never read by the Rust binaries:
+`POSTGRES_PASSWORD` (the `postgres:16` image initialises itself from it, so it
+must match the password inside `database.url`), `OPENPR_BIND_HOST` (default
+`127.0.0.1`), `OPENPR_API_PORT`, `MCP_SERVER_PORT`, `OPENPR_FRONTEND_PORT`,
+`OPENPR_WEBHOOK_PORT`, `OPENPR_RUNTIME_BASE`, `OPENPR_WEBHOOK_IMAGE`,
+`OPENPR_WEBHOOK_CONFIG`, and `VITE_API_BASE_URL` (frontend build). These live in
+`.env`, which exists purely for compose's `${...}` interpolation.
 
 ## Universal Forms
 
@@ -207,14 +300,14 @@ Only `--transport http` serves all three surfaces on one port.
 | **stdio** | `serve --transport stdio` | stdin/stdout JSON-RPC                                    |
 | **SSE**   | `serve --transport sse`   | `GET /sse`, `POST /messages`, `/health` — **no** `/mcp/rpc` |
 
-> **Security — the MCP HTTP/SSE endpoints are guarded by `OPENPR_MCP_AUTH_TOKEN`.**
+> **Security — the MCP HTTP/SSE endpoints are guarded by `mcp.auth_token`.**
 >
-> When `OPENPR_MCP_AUTH_TOKEN` is set (minimum 16 characters), `/mcp/rpc`,
-> `/sse` and `/messages` require `Authorization: Bearer <token>` and reject
-> everything else; `/health` is exempt so healthchecks keep working. The check
-> is fail-closed: if `--bind-addr` is not a loopback address and the variable is
-> unset, the server **refuses to start** rather than serving an open port. A
-> loopback bind without a token stays open to anything local, which is why
+> When `mcp.auth_token` is set (minimum 16 characters), `/mcp/rpc`, `/sse` and
+> `/messages` require `Authorization: Bearer <token>` and reject everything
+> else; `/health` is exempt so healthchecks keep working. The check is
+> fail-closed: if the bind address is not a loopback address and no token is
+> configured, the server **refuses to start** rather than serving an open port.
+> A loopback bind without a token stays open to anything local, which is why
 > `docker-compose.yml` still publishes the port on
 > `${OPENPR_BIND_HOST:-127.0.0.1}` and requires the token for the container's
 > `0.0.0.0:8090` bind.
@@ -238,16 +331,22 @@ audit-trail integrity, and can perform any read/write a workspace member can.
   "mcpServers": {
     "openpr": {
       "command": "/path/to/mcp-server",
-      "args": ["serve", "--transport", "stdio"],
-      "env": {
-        "OPENPR_API_URL": "http://localhost:8081",
-        "OPENPR_BOT_TOKEN": "opr_your_token_here",
-        "OPENPR_WORKSPACE_ID": "your-workspace-uuid"
-      }
+      "args": ["serve", "--config", "/absolute/path/to/config/openpr.toml"]
     }
   }
 }
 ```
+
+No `env` block: the binary reads no environment variables, so `mcp.api_url`,
+`mcp.bot_token` and `mcp.workspace_id` come from the file the `--config` path
+names. An absolute path is what makes this work — the default
+`config/openpr.toml` is relative to whatever working directory the MCP client
+happens to launch the process in.
+
+> `--api-url`, `--bot-token`, `--workspace-id`, `--transport` and `--bind-addr`
+> exist as command-line overrides and win over the file. Prefer the file for
+> anything secret: a token in `argv` is readable by any local process through
+> `/proc`.
 
 HTTP — plain JSON-RPC; passing `params.project_id` returns the
 project-capability-filtered tool set. SSE — open the stream, POST to the session
@@ -256,6 +355,9 @@ endpoint it returns, and the response arrives back on the stream as
 
 ```bash
 # The Authorization header is required whenever the server was started with a token.
+# This shell variable is a convenience for curl, not application configuration: the
+# value is whatever `mcp.auth_token` says in the server's configuration file (under
+# compose, config/openpr.compose.mcp.toml).
 export OPENPR_MCP_AUTH_TOKEN=your_mcp_auth_token
 
 curl -X POST http://localhost:8090/mcp/rpc -H "Content-Type: application/json" \
@@ -364,7 +466,7 @@ All under `scripts/`.
 
 | Group       | Scripts                                                                   |
 | ----------- | ------------------------------------------------------------------------- |
-| Lifecycle   | `start.sh` (first-run `.env` + random secrets, build release binaries, `compose up -d`), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
+| Lifecycle   | `start.sh` (first-run `config/openpr.compose.toml` + `config/openpr.compose.mcp.toml` + compose `.env`, random bootstrap secrets, build release binaries, `compose up -d`), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
 | Database    | `init-db.sh` (apply migrations in order), `backup-db.sh` (gzipped dump into `backups/`), `restore-db.sh`                                                                                                                              |
 | Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (asserts the 105 tool count), `verify.sh` (component health check)                                                                           |
 | Development | `dev-check.sh` (`cargo fmt --check`, `check`, `clippy -D warnings`, `test`), `ci-universal-forms-gates.sh` (reproduce the CI-only `Universal Forms Gates` bundle locally)                                                              |

@@ -7,36 +7,49 @@ set -e
 MCP_URL="${MCP_URL:-http://localhost:8090}"
 EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-105}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="${OPENPR_ENV_FILE:-$PROJECT_ROOT/.env}"
+CONFIG_FILE="${OPENPR_CONFIG_FILE:-$PROJECT_ROOT/config/openpr.compose.mcp.toml}"
 
-# Reads one KEY=value from an env file, without sourcing it.
-read_env_value() {
+# Reads one dotted key out of the TOML configuration file, using the tomllib parser in python3
+# (3.11+) rather than a grep that would mis-handle quoting and section scoping. Prints nothing
+# when the file or the key is absent, so the caller decides whether that is fatal. The value goes
+# to stdout only, never to the log.
+read_config_value() {
   local key="$1"
   local file="$2"
-  local line=""
   [ -f "$file" ] || return 0
-  line="$(grep -E "^${key}=.+" "$file" | tail -n 1 || true)"
-  [ -n "$line" ] || return 0
-  line="${line#*=}"
-  # Strip one layer of surrounding quotes, the way compose reads .env.
-  case "$line" in
-    \"*\") line="${line#\"}"; line="${line%\"}" ;;
-    \'*\') line="${line#\'}"; line="${line%\'}" ;;
-  esac
-  printf '%s' "$line"
+  OPENPR_CONFIG_KEY="$key" OPENPR_CONFIG_PATH="$file" python3 -c '
+import os
+import sys
+import tomllib
+
+try:
+    with open(os.environ["OPENPR_CONFIG_PATH"], "rb") as handle:
+        data = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(0)
+
+node = data
+for part in os.environ["OPENPR_CONFIG_KEY"].split("."):
+    if not isinstance(node, dict) or part not in node:
+        raise SystemExit(0)
+    node = node[part]
+if isinstance(node, str):
+    sys.stdout.write(node)
+'
 }
 
-# /mcp/rpc, /sse and /messages require a bearer token when the server was started with
-# OPENPR_MCP_AUTH_TOKEN; /health is exempt.
+# /mcp/rpc, /sse and /messages require a bearer token when the server was configured with
+# mcp.auth_token; /health is exempt. OPENPR_MCP_AUTH_TOKEN is an operator override for whoever
+# runs this script by hand; it is not application config, the binaries only read the TOML file.
 MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
 if [ -z "$MCP_AUTH_TOKEN" ]; then
-  MCP_AUTH_TOKEN="$(read_env_value OPENPR_MCP_AUTH_TOKEN "$ENV_FILE")"
+  MCP_AUTH_TOKEN="$(read_config_value mcp.auth_token "$CONFIG_FILE")"
 fi
 if [ -z "$MCP_AUTH_TOKEN" ]; then
-  echo "❌ OPENPR_MCP_AUTH_TOKEN is not set"
+  echo "❌ No MCP bearer token available"
   echo "   The MCP server rejects /mcp/rpc without 'Authorization: Bearer <token>'."
-  echo "   Export OPENPR_MCP_AUTH_TOKEN, or set it in $ENV_FILE"
-  echo "   (bash scripts/start.sh generates one on first run)."
+  echo "   Set mcp.auth_token in $CONFIG_FILE, or export OPENPR_MCP_AUTH_TOKEN"
+  echo "   (bash scripts/start.sh generates the configuration on first run)."
   exit 1
 fi
 
