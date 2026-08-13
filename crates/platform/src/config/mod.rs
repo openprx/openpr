@@ -15,7 +15,7 @@
 //! // `explicit` is whatever `--config` carried, or `None`.
 //! let explicit: Option<std::path::PathBuf> = None;
 //! let config = OpenPrConfig::load(explicit.as_deref())?;
-//! let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081");
+//! let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081")?;
 //! # let _ = cfg;
 //! # Ok(())
 //! # }
@@ -27,6 +27,21 @@
 //! invented configuration is a service that starts with the wrong database and the wrong signing
 //! key. Validation collects *every* unusable value before returning, so one round of edits fixes
 //! the whole file.
+//!
+//! # Eager shape, lazy presence
+//!
+//! Loading validates the *shape* of every value the file does contain, and refuses the file if
+//! any of them is unusable. Whether a *mandatory* value is present is decided by the binary that
+//! needs it, through [`OpenPrConfig::database_runtime`], [`OpenPrConfig::auth_runtime`] and
+//! [`OpenPrConfig::mcp_runtime`]: one file serves three binaries, and the MCP server reaches the
+//! API over HTTP without ever opening a database connection or signing a token. Requiring
+//! `database.url` and `auth.jwt_secret` at load time forced an MCP-only deployment to invent two
+//! credentials it never uses, which is worse than useless — an invented database URL is a real
+//! connection string pointing somewhere unintended.
+//!
+//! A binary that does need a section still fails to start without it: the accessors report every
+//! missing value of the section at once, and [`AppConfig::from_config`] — the API's and the
+//! worker's single entry point — reports the missing database *and* auth values together.
 
 mod connectors;
 mod error;
@@ -121,12 +136,37 @@ impl OpenPrConfig {
         raw.validate(origin)
     }
 
+    /// The database connection settings, or every reason they are not usable.
+    ///
+    /// `[database]` is optional for the MCP server, which reaches the API over HTTP and opens no
+    /// connection of its own, so presence is checked here rather than at load time; a value that
+    /// *is* present is already known to be well formed.
+    pub fn database_runtime(&self) -> Result<DatabaseRuntime, ConfigError> {
+        self.database.runtime(&self.origin)
+    }
+
+    /// The token signing settings, or every reason they are not usable.
+    ///
+    /// `[auth]` is optional for the MCP server, which presents a bot token issued elsewhere and
+    /// signs nothing itself; see [`Self::database_runtime`] for why presence is checked here.
+    pub fn auth_runtime(&self) -> Result<AuthRuntime, ConfigError> {
+        self.auth.runtime(&self.origin)
+    }
+
     /// The MCP server's runtime settings, or every reason they are not usable.
     ///
     /// `[mcp]` is optional for the API and the worker, so presence is checked here rather than at
     /// load time; a value that *is* present is already known to be well formed.
     pub fn mcp_runtime(&self) -> Result<McpRuntime, ConfigError> {
         self.mcp.runtime(&self.origin)
+    }
+}
+
+/// Builds the validation error a runtime accessor returns when values are missing.
+fn missing_values(origin: &Path, issues: Vec<String>) -> ConfigError {
+    ConfigError::Invalid {
+        path: origin.to_path_buf(),
+        issues,
     }
 }
 
@@ -148,10 +188,57 @@ pub struct ServerConfig {
     pub bind_addr: Option<String>,
 }
 
+/// What a binary that opens a database connection is told when `database.url` is absent.
+const DATABASE_URL_REQUIRED: &str =
+    "database.url is required to open a database connection; add it to the [database] section";
+
+/// What a binary that issues or verifies tokens is told when `auth.jwt_secret` is absent.
+const JWT_SECRET_REQUIRED: &str = "auth.jwt_secret is required to sign and verify tokens; add it to the [auth] section (generate one with \
+     `openssl rand -hex 32`)";
+
 /// `[database]` — connection string and pool shape.
-#[derive(Clone, Debug)]
+///
+/// `url` is an `Option` because the MCP server shares this file and never connects to the
+/// database; [`DatabaseRuntime`] is the shape a binary that does connect asks for.
+#[derive(Clone, Debug, Default)]
 pub struct DatabaseConfig {
     /// Connection URL. A [`Secret`] because it carries the password.
+    pub url: Option<Secret>,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub connect_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub acquire_timeout_seconds: u64,
+}
+
+impl DatabaseConfig {
+    /// Why this section cannot open a connection, or `None` when it can.
+    const fn missing(&self) -> Option<&'static str> {
+        if self.url.is_none() {
+            Some(DATABASE_URL_REQUIRED)
+        } else {
+            None
+        }
+    }
+
+    fn runtime(&self, origin: &Path) -> Result<DatabaseRuntime, ConfigError> {
+        let Some(url) = self.url.as_ref() else {
+            return Err(missing_values(origin, vec![DATABASE_URL_REQUIRED.to_owned()]));
+        };
+        Ok(DatabaseRuntime {
+            url: url.clone(),
+            max_connections: self.max_connections,
+            min_connections: self.min_connections,
+            connect_timeout_seconds: self.connect_timeout_seconds,
+            idle_timeout_seconds: self.idle_timeout_seconds,
+            acquire_timeout_seconds: self.acquire_timeout_seconds,
+        })
+    }
+}
+
+/// `[database]` with the mandatory fields resolved, as a binary that opens the pool needs them.
+#[derive(Clone, Debug)]
+pub struct DatabaseRuntime {
     pub url: Secret,
     pub max_connections: u32,
     pub min_connections: u32,
@@ -161,8 +248,43 @@ pub struct DatabaseConfig {
 }
 
 /// `[auth]` — token signing and issuance.
-#[derive(Clone, Debug)]
+///
+/// `jwt_secret` is an `Option` for the same reason as [`DatabaseConfig::url`]: the MCP server
+/// presents a bot token issued by the API and signs nothing itself.
+#[derive(Clone, Debug, Default)]
 pub struct AuthConfig {
+    pub jwt_secret: Option<Secret>,
+    pub access_ttl_seconds: i64,
+    pub refresh_ttl_seconds: i64,
+    pub default_author_id: Option<Uuid>,
+}
+
+impl AuthConfig {
+    /// Why this section cannot sign a token, or `None` when it can.
+    const fn missing(&self) -> Option<&'static str> {
+        if self.jwt_secret.is_none() {
+            Some(JWT_SECRET_REQUIRED)
+        } else {
+            None
+        }
+    }
+
+    fn runtime(&self, origin: &Path) -> Result<AuthRuntime, ConfigError> {
+        let Some(jwt_secret) = self.jwt_secret.as_ref() else {
+            return Err(missing_values(origin, vec![JWT_SECRET_REQUIRED.to_owned()]));
+        };
+        Ok(AuthRuntime {
+            jwt_secret: jwt_secret.clone(),
+            access_ttl_seconds: self.access_ttl_seconds,
+            refresh_ttl_seconds: self.refresh_ttl_seconds,
+            default_author_id: self.default_author_id,
+        })
+    }
+}
+
+/// `[auth]` with the mandatory fields resolved, as a binary that issues tokens needs them.
+#[derive(Clone, Debug)]
+pub struct AuthRuntime {
     pub jwt_secret: Secret,
     pub access_ttl_seconds: i64,
     pub refresh_ttl_seconds: i64,
@@ -179,12 +301,48 @@ pub enum LogFormat {
     Text,
 }
 
+/// Stream the tracing subscriber writes to.
+///
+/// Defaults to stderr. Stderr is never a data channel, so a log line written there can never
+/// corrupt whatever a binary writes to stdout, while every container runtime and init system
+/// this project deploys under captures the two streams identically — stderr costs nothing and
+/// removes a whole class of failure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogOutput {
+    #[default]
+    Stderr,
+    Stdout,
+}
+
+impl LogOutput {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stderr => "stderr",
+            Self::Stdout => "stdout",
+        }
+    }
+}
+
+/// What the calling binary's stdout carries, which decides whether it may also carry logs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StdoutRole {
+    /// Nothing else is written to stdout, so `logging.output` decides freely.
+    #[default]
+    Free,
+    /// Stdout is a protocol channel — the MCP server's stdio JSON-RPC framing. A single log line
+    /// on it corrupts a frame and breaks the session, so logs go to stderr whatever the file says.
+    Protocol,
+}
+
 /// `[logging]` — replaces `RUST_LOG`.
 #[derive(Clone, Debug, Default)]
 pub struct LoggingConfig {
     /// `tracing_subscriber` filter directives. `None` means "this binary's own default".
     pub filter: Option<String>,
     pub format: LogFormat,
+    /// Requested stream. Honoured only where stdout is not already spoken for; see
+    /// [`Self::effective_output`].
+    pub output: LogOutput,
 }
 
 impl LoggingConfig {
@@ -193,6 +351,18 @@ impl LoggingConfig {
         self.filter
             .clone()
             .unwrap_or_else(|| format!("{service_name}=info,tower_http=info"))
+    }
+
+    /// The stream to actually write to, given what the caller's stdout carries.
+    ///
+    /// The configured value is a preference, not a promise: a process whose stdout carries a
+    /// protocol has no stdout to log to, and an operator who writes `output = "stdout"` into a
+    /// file shared by three binaries must not be able to break the MCP server's framing with it.
+    pub const fn effective_output(&self, stdout: StdoutRole) -> LogOutput {
+        match stdout {
+            StdoutRole::Free => self.output,
+            StdoutRole::Protocol => LogOutput::Stderr,
+        }
     }
 }
 
@@ -364,8 +534,21 @@ impl AppConfig {
     /// `default_name` and `default_bind` are the calling binary's own fallbacks, used when
     /// `[server]` does not name them — one file serves three binaries, so the file cannot carry a
     /// single correct answer for either.
-    pub fn from_config(config: &OpenPrConfig, default_name: &str, default_bind: &str) -> Self {
-        Self {
+    ///
+    /// Fails when the file carries no database URL or no signing key. This is the API's and the
+    /// worker's declaration that they need both, so it reports both at once rather than sending
+    /// the operator round the loop twice.
+    pub fn from_config(config: &OpenPrConfig, default_name: &str, default_bind: &str) -> Result<Self, ConfigError> {
+        let (Some(database_url), Some(jwt_secret)) = (config.database.url.as_ref(), config.auth.jwt_secret.as_ref())
+        else {
+            let issues = [config.database.missing(), config.auth.missing()]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+            return Err(missing_values(&config.origin, issues));
+        };
+        Ok(Self {
             app_name: config
                 .server
                 .app_name
@@ -376,12 +559,12 @@ impl AppConfig {
                 .bind_addr
                 .clone()
                 .unwrap_or_else(|| default_bind.to_string()),
-            database_url: config.database.url.clone(),
-            jwt_secret: config.auth.jwt_secret.clone(),
+            database_url: database_url.clone(),
+            jwt_secret: jwt_secret.clone(),
             jwt_access_ttl_seconds: config.auth.access_ttl_seconds,
             jwt_refresh_ttl_seconds: config.auth.refresh_ttl_seconds,
             default_author_id: config.auth.default_author_id,
-        }
+        })
     }
 }
 

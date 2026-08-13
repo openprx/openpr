@@ -2185,6 +2185,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "toml",
+ "tracing",
  "tracing-subscriber",
  "uuid",
 ]

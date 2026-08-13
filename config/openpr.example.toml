@@ -15,8 +15,12 @@
 # unexpanded ${...} templates. Validation reports all unusable values at once, so one round of
 # edits fixes the whole file.
 #
-# Keys marked REQUIRED must be present. Everything else is optional and falls back to the default
-# recorded in its comment.
+# Keys marked REQUIRED must be present for the binaries named next to them, and are checked when
+# one of those binaries starts — a deployment that runs only the MCP server needs no [database]
+# and no [auth] at all, and is never asked to invent a database URL or a signing key it does not
+# use. A value that IS written down is checked for shape at startup either way, whichever binary
+# reads the file. Everything else is optional and falls back to the default recorded in its
+# comment.
 
 
 # ---------------------------------------------------------------------------------------------
@@ -36,10 +40,13 @@
 
 # ---------------------------------------------------------------------------------------------
 # [database] — PostgreSQL connection and pool shape.
+#
+# Read by the api and the worker. The MCP server reaches the API over HTTP and opens no
+# connection of its own, so an MCP-only deployment can delete this whole section.
 # ---------------------------------------------------------------------------------------------
 [database]
-# REQUIRED. Full connection URL, password included. Never logged: it is redacted in every
-# Debug and error output.
+# REQUIRED by the api and the worker; both refuse to start without it. Full connection URL,
+# password included. Never logged: it is redacted in every Debug and error output.
 url = "postgres://openpr:replace_with_postgres_password@localhost:5432/openpr"
 
 # Pool bounds. min_connections must not exceed max_connections.
@@ -54,10 +61,14 @@ acquire_timeout_seconds = 5   # default: 5
 
 # ---------------------------------------------------------------------------------------------
 # [auth] — token signing and issuance.
+#
+# Read by the api and the worker. The MCP server presents a bot token the API issued and signs
+# nothing itself, so an MCP-only deployment can delete this whole section.
 # ---------------------------------------------------------------------------------------------
 [auth]
-# REQUIRED. Signs every access and refresh token in the deployment. Minimum 16 characters;
-# 64 hex characters is the recommendation. Generate one with:
+# REQUIRED by the api and the worker; both refuse to start without it. Signs every access and
+# refresh token in the deployment. Minimum 16 characters; 64 hex characters is the
+# recommendation. Generate one with:
 #
 #     openssl rand -hex 32
 #
@@ -83,6 +94,18 @@ refresh_ttl_seconds = 1728000  # default: 1728000 (20 days)
 
 # "json" for log shippers, "text" for a terminal. Default: json.
 format = "json"
+
+# Stream the log goes to: "stderr" or "stdout". Default: stderr.
+#
+# Stderr is the default because it is never a data channel: a log line written there cannot
+# corrupt whatever a binary writes to stdout, and container runtimes and init systems capture the
+# two streams identically, so nothing is lost by preferring it.
+#
+# The MCP server's stdio transport frames JSON-RPC on stdout, where one log line breaks the
+# session. It therefore always logs to stderr and reports this setting as overridden if it says
+# "stdout" — one file configures three binaries, and the choice the api makes here must not be
+# able to break the MCP server.
+output = "stderr"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -139,7 +162,8 @@ allow_private = false
 
 # ---------------------------------------------------------------------------------------------
 # [mcp] — MCP server. Optional for the API and the worker; the MCP server needs bot_token and
-# workspace_id and reports both at once if they are missing.
+# workspace_id and reports both at once if they are missing. A file that carries only this
+# section is a complete configuration for an MCP-only deployment.
 # ---------------------------------------------------------------------------------------------
 [mcp]
 # Base URL of the OpenPR API the MCP server talks to. Default: http://localhost:8081.
