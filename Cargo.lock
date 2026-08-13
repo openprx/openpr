@@ -1829,6 +1829,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "platform",
  "reqwest",
  "serde",
  "serde_json",

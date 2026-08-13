@@ -15,12 +15,15 @@
 //! counter is therefore the real assertion: a refusal that still reaches the API is not a
 //! refusal.
 
+mod support;
+
 use axum::{Json, Router, extract::RawQuery, routing::get};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use support::{ConfigFile, McpSettings, write_config};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
@@ -110,16 +113,26 @@ struct StdioServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Kept alive for as long as the child runs: dropping it deletes the file.
+    _config: ConfigFile,
 }
 
 impl StdioServer {
+    /// The child is configured exactly the way a deployment configures it — a TOML file
+    /// passed with `--config`, no environment variables involved.
     fn spawn(api_url: &str) -> Result<Self, Box<dyn Error>> {
+        let config = write_config(&McpSettings {
+            api_url,
+            bot_token: BOT_TOKEN,
+            workspace_id: WORKSPACE,
+            auth_token: None,
+            transport: Some("stdio"),
+            bind_addr: None,
+        })?;
+
         let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-server"))
-            .args(["serve", "--transport", "stdio"])
-            .env("OPENPR_API_URL", api_url)
-            .env("OPENPR_BOT_TOKEN", BOT_TOKEN)
-            .env("OPENPR_WORKSPACE_ID", WORKSPACE)
-            .env("RUST_LOG", "error")
+            .args(["serve", "--config"])
+            .arg(config.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -132,6 +145,7 @@ impl StdioServer {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            _config: config,
         })
     }
 

@@ -361,7 +361,7 @@ fn resource_items(value: &Value) -> Vec<&Value> {
 #[cfg(test)]
 mod tests {
     use super::{code_task_context_get, filter_code_resources, find_directory_resource};
-    use crate::client::{OpenPrClient, test_api};
+    use crate::client::test_api;
     use crate::protocol::ToolContent;
     use axum::{Json, Router, routing::get};
     use serde_json::json;
@@ -402,11 +402,7 @@ mod tests {
                     }))
                 }),
             );
-        let client = OpenPrClient::new(
-            test_api::spawn(router).await?,
-            "opr_test_token".to_string(),
-            "workspace-1".to_string(),
-        )?;
+        let client = test_api::client(test_api::spawn(router).await?)?;
 
         let refused = code_task_context_get(&client, json!({ "project_id": PROJECT, "work_item_id": WORK_ITEM })).await;
         assert_eq!(refused.is_error, Some(true));
@@ -436,11 +432,7 @@ mod tests {
                     }))
                 }),
             );
-        let client = OpenPrClient::new(
-            test_api::spawn(router).await?,
-            "opr_test_token".to_string(),
-            "workspace-1".to_string(),
-        )?;
+        let client = test_api::client(test_api::spawn(router).await?)?;
 
         // Upper case is accepted by the policy gate's canonicalisation, so the comparison
         // has to be case insensitive or a legitimate call would be refused.

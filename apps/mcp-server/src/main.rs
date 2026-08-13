@@ -16,8 +16,11 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use cli::{Cli, Commands};
-use client::OpenPrClient;
+use cli::{Cli, Commands, ServeArgs};
+use client::{ClientConfig, OpenPrClient, transport_label};
+use platform::config::{
+    LogFormat, LoggingConfig, MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpRuntime, McpTransport, OpenPrConfig, Secret,
+};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde::Deserialize;
 use serde_json::json;
@@ -28,108 +31,204 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::{StreamExt, wrappers::UnboundedReceiverStream};
 use uuid::Uuid;
 
-const DEFAULT_OPENPR_API_URL: &str = "http://localhost:8081";
-
-/// Environment variable carrying the bearer token inbound HTTP/SSE callers must present.
+/// Tracing target of this binary, and the scope of the default `[logging]` filter.
 ///
-/// Read from the environment only, never from a CLI flag: a flag would put the secret in
-/// `argv`, which any local process can read out of `/proc`.
-const INBOUND_AUTH_TOKEN_ENV: &str = "OPENPR_MCP_AUTH_TOKEN";
+/// The module path `tracing` stamps on every event is `mcp_server`, so a filter written
+/// against the binary's hyphenated name would silence the whole process.
+const SERVICE_NAME: &str = "mcp_server";
 
-/// Shortest accepted inbound token. A two character token is worse than none: it invites
-/// the operator to believe the port is protected while it is trivially guessable.
-const MIN_INBOUND_AUTH_TOKEN_LEN: usize = 16;
+/// Configuration key carrying the bearer token inbound HTTP/SSE callers must present.
+///
+/// Named in every diagnostic so a refusal says exactly what to edit. Deliberately not
+/// exposed as a CLI flag: a flag would put the secret in `argv`, which any local process
+/// can read out of `/proc`.
+const INBOUND_AUTH_TOKEN_KEY: &str = "mcp.auth_token";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing — always write to stderr to keep stdout clean for JSON-RPC
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive(
-                "mcp_server=info"
-                    .parse()
-                    .unwrap_or_else(|_| tracing_subscriber::filter::Directive::default()),
-            ),
-        )
-        .init();
+    // The file is the only source of configuration; nothing below reads the environment.
+    let mut config = OpenPrConfig::load(cli.config.as_deref())?;
+    init_logging(&config.logging)?;
 
-    // Resolve config: CLI flags override environment variables
-    let base_url = cli
-        .api_url
-        .clone()
-        .or_else(|| std::env::var("OPENPR_API_URL").ok())
-        .unwrap_or_else(|| DEFAULT_OPENPR_API_URL.to_string());
+    let serve_args = match &cli.command {
+        Commands::Serve(args) => Some(args),
+        _ => None,
+    };
+    apply_cli_overrides(&mut config.mcp, &cli, serve_args)?;
 
-    let bot_token_opt = cli.bot_token.clone().or_else(|| std::env::var("OPENPR_BOT_TOKEN").ok());
+    // Lazy validation: `[mcp]` is optional for the other binaries, so the fields this one
+    // cannot run without are reported here, all of them in one pass.
+    let mcp = config.mcp_runtime()?;
 
-    let workspace_id_opt = cli
-        .workspace_id
-        .clone()
-        .or_else(|| std::env::var("OPENPR_WORKSPACE_ID").ok());
+    let client = OpenPrClient::new(ClientConfig {
+        base_url: mcp.api_url.clone(),
+        bot_token: mcp.bot_token.clone(),
+        workspace_id: mcp.workspace_id.to_string(),
+        invocation_id: mcp.invocation_id.clone(),
+        transport_label: transport_label(mcp.transport),
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
 
-    let inbound_auth_token = std::env::var(INBOUND_AUTH_TOKEN_ENV).ok();
-
-    if let Commands::Serve(serve_args) = &cli.command {
-        let bot_token =
-            bot_token_opt.ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN environment variable is required"))?;
-        let workspace_id =
-            workspace_id_opt.ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID environment variable is required"))?;
-
-        validate_runtime_config(&base_url, &bot_token, &workspace_id)?;
-        let client = OpenPrClient::new(base_url, bot_token, workspace_id).map_err(|e| anyhow::anyhow!(e))?;
-
-        // stdio is a pipe pair owned by the parent process, so it carries no inbound
-        // authentication question: whoever spawned the process is already the caller.
-        match serve_args.transport {
-            cli::Transport::Http => {
-                let auth = resolve_inbound_auth(&serve_args.bind_addr, inbound_auth_token.as_deref())?;
-                run_http(&serve_args.bind_addr, client, auth).await
-            }
-            cli::Transport::Sse => {
-                let auth = resolve_inbound_auth(&serve_args.bind_addr, inbound_auth_token.as_deref())?;
-                run_sse(&serve_args.bind_addr, client, auth).await
-            }
-            cli::Transport::Stdio => run_stdio(client).await,
-        }
+    if serve_args.is_some() {
+        serve(&mcp, client).await
     } else {
-        let bot_token = bot_token_opt
-            .ok_or_else(|| anyhow::anyhow!("OPENPR_BOT_TOKEN is required (set env var or --bot-token)"))?;
-        let workspace_id = workspace_id_opt
-            .ok_or_else(|| anyhow::anyhow!("OPENPR_WORKSPACE_ID is required (set env var or --workspace-id)"))?;
-
-        validate_runtime_config(&base_url, &bot_token, &workspace_id)?;
-        let client = OpenPrClient::new(base_url, bot_token, workspace_id).map_err(|e| anyhow::anyhow!(e))?;
         cli::run_cli_command(&cli.command, &cli.format, client).await
     }
 }
 
-fn validate_runtime_config(base_url: &str, bot_token: &str, workspace_id: &str) -> anyhow::Result<()> {
-    if base_url.trim().is_empty() || base_url.contains("${") {
-        anyhow::bail!("OPENPR_API_URL must be a concrete API URL");
-    }
-    let parsed_url =
-        reqwest::Url::parse(base_url).map_err(|e| anyhow::anyhow!("OPENPR_API_URL is not a valid URL: {e}"))?;
-    if !matches!(parsed_url.scheme(), "http" | "https") {
-        anyhow::bail!("OPENPR_API_URL must use http or https");
-    }
+/// Installs the tracing subscriber described by `[logging]`, writing to stderr.
+///
+/// Deliberately not `platform::logging::init`: that writes to stdout, and on the stdio
+/// transport stdout *is* the JSON-RPC channel — one log line there corrupts the frame the
+/// MCP client is parsing. The filter and the format still come from the file, so `[logging]`
+/// remains the only thing deciding what this process logs.
+fn init_logging(logging: &LoggingConfig) -> anyhow::Result<()> {
+    let directives = logging.filter_or_default(SERVICE_NAME);
+    let filter = tracing_subscriber::EnvFilter::try_new(&directives)
+        .map_err(|error| anyhow::anyhow!("logging.filter {directives} is not a valid tracing filter: {error}"))?;
 
-    if bot_token.trim().is_empty() || bot_token.contains("${") || bot_token.contains("replace_with") {
-        anyhow::bail!("OPENPR_BOT_TOKEN must be a concrete production bot token");
+    match logging.format {
+        LogFormat::Json => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .json()
+            .with_current_span(true)
+            .with_span_list(true)
+            .init(),
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .init(),
     }
-    if !bot_token.starts_with("opr_") {
-        anyhow::bail!("OPENPR_BOT_TOKEN must use the opr_ token prefix");
-    }
-
-    let workspace_uuid =
-        Uuid::parse_str(workspace_id).map_err(|e| anyhow::anyhow!("OPENPR_WORKSPACE_ID must be a valid UUID: {e}"))?;
-    if workspace_uuid.is_nil() {
-        anyhow::bail!("OPENPR_WORKSPACE_ID must not be the nil UUID placeholder");
-    }
-
     Ok(())
+}
+
+/// Layers the CLI overrides onto the file's `[mcp]` section.
+///
+/// A flag wins over the file: the file is the deployment's configuration, a flag is a
+/// deliberate one-off. A value that arrives through a flag has not passed the file's
+/// validation, so it is checked here — against the same rules, reported against the flag
+/// that carried it. Values that came from the file are left alone: they are already
+/// validated, and checking them twice is how one bad value grows two different messages.
+fn apply_cli_overrides(mcp: &mut McpConfig, cli: &Cli, serve: Option<&ServeArgs>) -> anyhow::Result<()> {
+    if let Some(api_url) = cli.api_url.as_deref() {
+        mcp.api_url = Some(checked_api_url(api_url)?);
+    }
+    if let Some(bot_token) = cli.bot_token.as_deref() {
+        mcp.bot_token = Some(checked_bot_token(bot_token)?);
+    }
+    if let Some(workspace_id) = cli.workspace_id.as_deref() {
+        mcp.workspace_id = Some(checked_workspace_id(workspace_id)?);
+    }
+    if let Some(serve) = serve {
+        if let Some(transport) = serve.transport {
+            mcp.transport = transport.into();
+        }
+        if let Some(bind_addr) = serve.bind_addr.as_deref() {
+            mcp.bind_addr = Some(checked_bind_addr(bind_addr)?);
+        }
+    }
+    Ok(())
+}
+
+/// Validates an `--api-url`, mirroring the rules `mcp.api_url` is held to.
+fn checked_api_url(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("${") {
+        anyhow::bail!("--api-url must be a concrete URL, not a placeholder");
+    }
+    let parsed =
+        reqwest::Url::parse(trimmed).map_err(|error| anyhow::anyhow!("--api-url is not a valid URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("--api-url must start with http:// or https://");
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        anyhow::bail!("--api-url names no host");
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validates a `--bot-token`, mirroring the rules `mcp.bot_token` is held to.
+///
+/// The token itself is never echoed, not even its prefix.
+fn checked_bot_token(value: &str) -> anyhow::Result<Secret> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("${") || trimmed.contains("replace_with") {
+        anyhow::bail!("--bot-token must be a concrete bot token");
+    }
+    if !trimmed.starts_with("opr_") {
+        anyhow::bail!("--bot-token must use the opr_ token prefix");
+    }
+    Ok(Secret::new(trimmed))
+}
+
+/// Validates a `--workspace-id`, mirroring the rules `mcp.workspace_id` is held to.
+fn checked_workspace_id(value: &str) -> anyhow::Result<Uuid> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("${") || trimmed.contains("replace_with") {
+        anyhow::bail!("--workspace-id must be a concrete UUID, not a placeholder");
+    }
+    let parsed =
+        Uuid::parse_str(trimmed).map_err(|error| anyhow::anyhow!("--workspace-id is not a valid UUID: {error}"))?;
+    if parsed.is_nil() {
+        anyhow::bail!("--workspace-id must not be the nil UUID placeholder");
+    }
+    Ok(parsed)
+}
+
+/// Validates a `--bind-addr`, mirroring the rules `mcp.bind_addr` is held to.
+///
+/// A host without a port is refused rather than completed with one: the bind address is
+/// what `resolve_inbound_auth` decides against, and a silently invented port would move
+/// the listener away from the address that decision was made for.
+fn checked_bind_addr(value: &str) -> anyhow::Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("${") {
+        anyhow::bail!("--bind-addr must be a concrete host:port, not a placeholder");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        anyhow::bail!("--bind-addr must not contain whitespace");
+    }
+    let (host, port) = split_host_port(trimmed)
+        .ok_or_else(|| anyhow::anyhow!("--bind-addr must be host:port, e.g. 127.0.0.1:8090"))?;
+    if host.is_empty() {
+        anyhow::bail!("--bind-addr names no host");
+    }
+    match port.parse::<u16>() {
+        Ok(0) | Err(_) => anyhow::bail!("--bind-addr has an invalid port {port}, expected 1-65535"),
+        Ok(_) => Ok(trimmed.to_string()),
+    }
+}
+
+/// Splits an authority into host and port, tolerating a bracketed IPv6 literal.
+fn split_host_port(authority: &str) -> Option<(&str, &str)> {
+    if let Some(end) = authority.rfind(']') {
+        let port = authority.get(end + 1..)?.strip_prefix(':')?;
+        return Some((authority.get(..=end)?, port));
+    }
+    authority.rsplit_once(':')
+}
+
+/// Starts the transport `[mcp]` selected.
+///
+/// `stdio` is a pipe pair owned by the parent process, so it carries no inbound
+/// authentication question: whoever spawned the process is already the caller. The two
+/// networked transports share the same routes and therefore take the same decision, and
+/// neither reaches its listener before that decision has been made.
+async fn serve(mcp: &McpRuntime, client: OpenPrClient) -> anyhow::Result<()> {
+    match mcp.transport {
+        McpTransport::Stdio => run_stdio(client).await,
+        McpTransport::Http => {
+            let auth = resolve_inbound_auth(&mcp.bind_addr, mcp.auth_token.as_ref())?;
+            run_http(&mcp.bind_addr, client, auth).await
+        }
+        McpTransport::Sse => {
+            let auth = resolve_inbound_auth(&mcp.bind_addr, mcp.auth_token.as_ref())?;
+            run_sse(&mcp.bind_addr, client, auth).await
+        }
+    }
 }
 
 /// How inbound HTTP/SSE requests are authenticated.
@@ -161,12 +260,20 @@ impl InboundAuth {
 ///
 /// Loopback binds may stay unauthenticated so local development keeps working, but they
 /// say so in the log rather than passing silently.
-fn resolve_inbound_auth(bind_addr: &str, configured_token: Option<&str>) -> anyhow::Result<InboundAuth> {
-    if let Some(token) = configured_token.map(str::trim).filter(|token| !token.is_empty()) {
-        if token.len() < MIN_INBOUND_AUTH_TOKEN_LEN {
+/// The length rule is a second line of defence, not the first: the configuration layer
+/// already refuses a short `mcp.auth_token` at load time. It is kept, and worded from the
+/// same constant, so the function stays fail-closed for any caller — a decision this
+/// consequential must not depend on where its input came from.
+fn resolve_inbound_auth(bind_addr: &str, configured_token: Option<&Secret>) -> anyhow::Result<InboundAuth> {
+    if let Some(token) = configured_token
+        .map(Secret::expose)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        if token.len() < MIN_MCP_AUTH_TOKEN_LEN {
             // The token is never echoed, not even its prefix.
             anyhow::bail!(
-                "{INBOUND_AUTH_TOKEN_ENV} must be at least {MIN_INBOUND_AUTH_TOKEN_LEN} characters long to be worth \
+                "{INBOUND_AUTH_TOKEN_KEY} must be at least {MIN_MCP_AUTH_TOKEN_LEN} characters long to be worth \
                  checking"
             );
         }
@@ -176,17 +283,17 @@ fn resolve_inbound_auth(bind_addr: &str, configured_token: Option<&str>) -> anyh
     if is_loopback_bind_addr(bind_addr) {
         tracing::warn!(
             bind_addr = %bind_addr,
-            "{INBOUND_AUTH_TOKEN_ENV} is not set, so inbound MCP requests are NOT authenticated. This is allowed only \
+            "{INBOUND_AUTH_TOKEN_KEY} is not set, so inbound MCP requests are NOT authenticated. This is allowed only \
              because the listener is bound to a loopback address and callers are limited to this host. Set \
-             {INBOUND_AUTH_TOKEN_ENV} before publishing this port."
+             {INBOUND_AUTH_TOKEN_KEY} before publishing this port."
         );
         return Ok(InboundAuth::LoopbackOnly);
     }
 
     anyhow::bail!(
         "Refusing to serve MCP on non-loopback bind address '{bind_addr}' without inbound authentication: set \
-         {INBOUND_AUTH_TOKEN_ENV}, or bind to 127.0.0.1 for local development. This process holds a workspace bot \
-         token, so anyone able to reach the port would hold every permission that bot has."
+         {INBOUND_AUTH_TOKEN_KEY} in the configuration file, or bind to 127.0.0.1 for local development. This process \
+         holds a workspace bot token, so anyone able to reach the port would hold every permission that bot has."
     )
 }
 
@@ -429,49 +536,77 @@ async fn health_check() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OPENPR_API_URL, InboundAuth, MIN_INBOUND_AUTH_TOKEN_LEN, bearer_token, constant_time_eq,
-        is_loopback_bind_addr, resolve_inbound_auth, validate_runtime_config,
+        InboundAuth, MIN_MCP_AUTH_TOKEN_LEN, bearer_token, checked_api_url, checked_bind_addr, checked_bot_token,
+        checked_workspace_id, constant_time_eq, is_loopback_bind_addr, resolve_inbound_auth,
     };
+    use platform::config::{DEFAULT_MCP_API_URL, Secret};
 
     const TOKEN: &str = "an-inbound-token-long-enough";
 
     #[test]
-    fn accepts_concrete_runtime_config() {
-        validate_runtime_config(
-            "http://api:8080",
-            "opr_forms_mcp_test_token",
-            "550e8400-e29b-41d4-a716-446655440000",
-        )
-        .expect("valid runtime config should pass");
-    }
-
-    #[test]
-    fn default_api_url_targets_compose_api_host_port() {
-        assert_eq!(DEFAULT_OPENPR_API_URL, "http://localhost:8081");
-    }
-
-    #[test]
-    fn rejects_compose_placeholder_literals() {
-        assert!(
-            validate_runtime_config(
-                "${OPENPR_API_URL:-http://api:8080}",
-                "${OPENPR_BOT_TOKEN:?set OPENPR_BOT_TOKEN}",
-                "${OPENPR_WORKSPACE_ID:?set OPENPR_WORKSPACE_ID}",
-            )
-            .is_err()
+    fn accepts_concrete_cli_overrides() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(checked_api_url(" http://api:8080 ")?, "http://api:8080");
+        assert_eq!(
+            checked_bot_token("opr_forms_mcp_test_token")?.expose(),
+            "opr_forms_mcp_test_token"
         );
+        assert_eq!(
+            checked_workspace_id("550e8400-e29b-41d4-a716-446655440000")?.to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(checked_bind_addr("0.0.0.0:8090")?, "0.0.0.0:8090");
+        assert_eq!(checked_bind_addr("[::1]:8090")?, "[::1]:8090");
+        Ok(())
     }
 
     #[test]
-    fn rejects_demo_token_and_nil_workspace() {
-        assert!(
-            validate_runtime_config(
-                "http://api:8080",
-                "opr_replace_with_workspace_bot_token",
-                "00000000-0000-0000-0000-000000000000",
-            )
-            .is_err()
-        );
+    fn the_api_url_default_still_targets_the_compose_api_port() {
+        assert_eq!(DEFAULT_MCP_API_URL, "http://localhost:8081");
+    }
+
+    /// The shell templates a compose file used to interpolate are values, not configuration:
+    /// reaching the process unexpanded means the deployment is broken, so they are refused
+    /// rather than used as a hostname or a token.
+    #[test]
+    fn rejects_unexpanded_shell_templates_on_the_command_line() {
+        assert!(checked_api_url("${OPENPR_API_URL:-http://api:8080}").is_err());
+        assert!(checked_bot_token("${OPENPR_BOT_TOKEN:?set OPENPR_BOT_TOKEN}").is_err());
+        assert!(checked_workspace_id("${OPENPR_WORKSPACE_ID:?set OPENPR_WORKSPACE_ID}").is_err());
+        assert!(checked_bind_addr("${OPENPR_MCP_BIND_ADDR}").is_err());
+    }
+
+    #[test]
+    fn rejects_placeholder_token_and_nil_workspace_on_the_command_line() {
+        assert!(checked_bot_token("opr_replace_with_workspace_bot_token").is_err());
+        assert!(checked_bot_token("some_other_prefix_token").is_err());
+        assert!(checked_bot_token("").is_err());
+        assert!(checked_workspace_id("00000000-0000-0000-0000-000000000000").is_err());
+        assert!(checked_workspace_id("not-a-uuid").is_err());
+    }
+
+    /// A `--bot-token` failure must not print the token it rejected.
+    #[test]
+    fn a_rejected_bot_token_is_never_echoed() {
+        let Err(error) = checked_bot_token("nope_secret_material_here") else {
+            panic!("a token without the opr_ prefix must be refused");
+        };
+        assert!(!error.to_string().contains("secret_material"), "{error}");
+    }
+
+    #[test]
+    fn rejects_api_urls_that_are_not_absolute_http_urls() {
+        assert!(checked_api_url("ftp://api:8080").is_err());
+        assert!(checked_api_url("api:8080").is_err());
+        assert!(checked_api_url("").is_err());
+    }
+
+    #[test]
+    fn rejects_bind_addresses_without_a_usable_port() {
+        assert!(checked_bind_addr("0.0.0.0").is_err());
+        assert!(checked_bind_addr("0.0.0.0:0").is_err());
+        assert!(checked_bind_addr("0.0.0.0:not-a-port").is_err());
+        assert!(checked_bind_addr(":8090").is_err());
+        assert!(checked_bind_addr("0.0.0.0 :8090").is_err());
     }
 
     /// The combination this gate exists to make impossible: reachable from the network
@@ -479,6 +614,7 @@ mod tests {
     /// compose port mapping as the only thing between a workspace bot and the internet.
     #[test]
     fn a_non_loopback_bind_without_a_token_refuses_to_start() {
+        let blank = Secret::new("   ");
         for bind_addr in [
             "0.0.0.0:8090",
             "[::]:8090",
@@ -492,7 +628,7 @@ mod tests {
                 "{bind_addr} was allowed to serve unauthenticated"
             );
             assert!(
-                resolve_inbound_auth(bind_addr, Some("   ")).is_err(),
+                resolve_inbound_auth(bind_addr, Some(&blank)).is_err(),
                 "{bind_addr} treated a blank token as configured auth"
             );
         }
@@ -500,7 +636,7 @@ mod tests {
 
     #[test]
     fn a_non_loopback_bind_serves_once_a_token_is_configured() -> Result<(), Box<dyn std::error::Error>> {
-        let auth = resolve_inbound_auth("0.0.0.0:8090", Some(TOKEN))?;
+        let auth = resolve_inbound_auth("0.0.0.0:8090", Some(&Secret::new(TOKEN)))?;
         assert!(matches!(auth, InboundAuth::BearerToken(_)));
         assert_eq!(auth.describe(), "bearer-token");
         Ok(())
@@ -510,6 +646,7 @@ mod tests {
     /// mode is reported rather than assumed.
     #[test]
     fn a_loopback_bind_may_stay_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
+        // A `None` token is what an absent `mcp.auth_token` resolves to.
         for bind_addr in ["127.0.0.1:8090", "[::1]:8090", "localhost:8090", "127.7.7.7:8090"] {
             let auth = resolve_inbound_auth(bind_addr, None)?;
             assert!(
@@ -525,23 +662,24 @@ mod tests {
     /// weak protection, on loopback as well as off it.
     #[test]
     fn a_too_short_token_is_refused_everywhere() {
-        let short = "x".repeat(MIN_INBOUND_AUTH_TOKEN_LEN - 1);
+        let short = Secret::new("x".repeat(MIN_MCP_AUTH_TOKEN_LEN - 1));
+        let long = Secret::new("x".repeat(MIN_MCP_AUTH_TOKEN_LEN));
         assert!(resolve_inbound_auth("0.0.0.0:8090", Some(&short)).is_err());
         assert!(resolve_inbound_auth("127.0.0.1:8090", Some(&short)).is_err());
-        assert!(resolve_inbound_auth("0.0.0.0:8090", Some(&"x".repeat(MIN_INBOUND_AUTH_TOKEN_LEN))).is_ok());
+        assert!(resolve_inbound_auth("0.0.0.0:8090", Some(&long)).is_ok());
     }
 
     /// The failure message has to name the fix without ever printing the secret.
     #[test]
-    fn the_fail_closed_message_names_the_variable_and_never_a_token() {
+    fn the_fail_closed_message_names_the_config_key_and_never_a_token() {
         let Err(error) = resolve_inbound_auth("0.0.0.0:8090", None) else {
             panic!("a wide open bind without a token must not be accepted");
         };
         let message = error.to_string();
-        assert!(message.contains("OPENPR_MCP_AUTH_TOKEN"), "{message}");
+        assert!(message.contains("mcp.auth_token"), "{message}");
         assert!(message.contains("127.0.0.1"), "{message}");
 
-        let Err(error) = resolve_inbound_auth("0.0.0.0:8090", Some("short")) else {
+        let Err(error) = resolve_inbound_auth("0.0.0.0:8090", Some(&Secret::new("short"))) else {
             panic!("a too short token must not be accepted");
         };
         assert!(!error.to_string().contains("short"), "the error echoed the token");

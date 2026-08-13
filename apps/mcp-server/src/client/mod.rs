@@ -1,3 +1,4 @@
+use platform::config::{McpTransport, Secret};
 use reqwest::{Client, RequestBuilder, multipart};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -47,13 +48,51 @@ const fn describe_json_kind(value: &Value) -> &'static str {
     }
 }
 
+/// Audit label of the stdio transport, as the API's `agent_invocation_tool_calls` ledger records it.
+pub const TRANSPORT_LABEL_STDIO: &str = "mcp_stdio";
+/// Audit label of the HTTP transport.
+pub const TRANSPORT_LABEL_HTTP: &str = "mcp_http";
+/// Audit label of the SSE transport.
+pub const TRANSPORT_LABEL_SSE: &str = "mcp_sse";
+
+/// The audit label a configured transport is reported under.
+///
+/// The three labels are a stable wire contract with the API, which stores them verbatim, so
+/// they are spelled out here rather than derived from the enum's own `as_str`.
+pub const fn transport_label(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => TRANSPORT_LABEL_STDIO,
+        McpTransport::Http => TRANSPORT_LABEL_HTTP,
+        McpTransport::Sse => TRANSPORT_LABEL_SSE,
+    }
+}
+
+/// Everything the client needs, already resolved from the configuration file and the CLI
+/// flags that override it.
+///
+/// Carries no `Debug` on purpose: it holds the workspace bot token, and the point of
+/// [`Secret`] is that no derived `Debug` anywhere can start printing it.
+pub struct ClientConfig {
+    /// Base URL of the `OpenPR` API, from `mcp.api_url` or `--api-url`.
+    pub base_url: String,
+    /// Workspace bot token, from `mcp.bot_token` or `--bot-token`.
+    pub bot_token: Secret,
+    /// Workspace the bot acts in, from `mcp.workspace_id` or `--workspace-id`.
+    pub workspace_id: String,
+    /// Correlation id stamped onto the tool-call audit, from `mcp.invocation_id`.
+    pub invocation_id: Option<String>,
+    /// Label the tool-call audit reports this process's transport under.
+    pub transport_label: &'static str,
+}
+
 #[derive(Clone)]
 pub struct OpenPrClient {
     client: Client,
     base_url: String,
-    bot_token: String,
+    bot_token: Secret,
     pub workspace_id: String,
     invocation_id: Option<String>,
+    transport_label: &'static str,
 }
 
 fn join_query(params: &[String]) -> String {
@@ -129,20 +168,22 @@ pub struct UploadedFile {
 }
 
 impl OpenPrClient {
-    pub fn new(base_url: String, bot_token: String, workspace_id: String) -> Result<Self, String> {
+    /// Builds a client from settings the caller has already resolved.
+    ///
+    /// Reads nothing from the process environment: every value arrives through
+    /// [`ClientConfig`], which the binary fills from the configuration file.
+    pub fn new(config: ClientConfig) -> Result<Self, String> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
         Ok(Self {
             client,
-            base_url,
-            bot_token,
-            workspace_id,
-            invocation_id: std::env::var("OPENPR_INVOCATION_ID")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            base_url: config.base_url,
+            bot_token: config.bot_token,
+            workspace_id: config.workspace_id,
+            invocation_id: config.invocation_id,
+            transport_label: config.transport_label,
         })
     }
 
@@ -150,11 +191,16 @@ impl OpenPrClient {
         self.invocation_id.as_deref()
     }
 
+    /// Label the tool-call audit reports this process's transport under.
+    pub const fn transport_label(&self) -> &'static str {
+        self.transport_label
+    }
+
     /// Sends an authenticated request and rejects both transport-level failures and
     /// API-level envelope errors before the payload reaches the caller.
     async fn send<T: DeserializeOwned>(&self, request: RequestBuilder, path: &str) -> Result<T, String> {
         let resp = request
-            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Authorization", format!("Bearer {}", self.bot_token.expose()))
             .send()
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
@@ -1156,7 +1202,7 @@ impl OpenPrClient {
         let resp = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .header("Authorization", format!("Bearer {}", self.bot_token.expose()))
             .multipart(form)
             .send()
             .await
@@ -1404,8 +1450,21 @@ fn detect_mime_type_from_filename(filename: &str) -> &'static str {
 
 #[cfg(test)]
 pub mod test_api {
+    use super::{ClientConfig, OpenPrClient, TRANSPORT_LABEL_STDIO};
     use axum::Router;
+    use platform::config::Secret;
     use std::error::Error;
+
+    /// A client pointed at a throwaway API, with the settings every in-crate test shares.
+    pub fn client(base_url: String) -> Result<OpenPrClient, String> {
+        OpenPrClient::new(ClientConfig {
+            base_url,
+            bot_token: Secret::new("opr_test_token"),
+            workspace_id: "workspace-1".to_string(),
+            invocation_id: None,
+            transport_label: TRANSPORT_LABEL_STDIO,
+        })
+    }
 
     /// Starts a throwaway API server bound to an ephemeral port and returns its base URL.
     pub async fn spawn(router: Router) -> Result<String, Box<dyn Error>> {
@@ -1430,7 +1489,7 @@ mod tests {
     use std::error::Error;
 
     fn client(base_url: String) -> Result<OpenPrClient, String> {
-        OpenPrClient::new(base_url, "opr_test_token".to_string(), "workspace-1".to_string())
+        test_api::client(base_url)
     }
 
     #[test]
