@@ -454,7 +454,7 @@ pub async fn update_preferences(
 
 fn jwt_manager(state: &AppState) -> JwtManager {
     JwtManager::new(
-        &state.cfg.jwt_secret,
+        state.cfg.jwt_secret.expose(),
         state.cfg.jwt_access_ttl_seconds,
         state.cfg.jwt_refresh_ttl_seconds,
     )

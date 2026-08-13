@@ -123,6 +123,7 @@ dependencies = [
  "base64",
  "bcrypt",
  "chrono",
+ "clap",
  "hex",
  "hmac",
  "image",

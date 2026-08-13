@@ -350,7 +350,7 @@ pub async fn ensure_attachment_media(
         });
     }
 
-    let object_storage = ObjectStorage::from_env()?;
+    let object_storage = ObjectStorage::from_runtime_config()?;
     let data = object_storage
         .get(upload_file_name)
         .await
@@ -575,11 +575,14 @@ mod tests {
         attachment_variant_kind, attachment_variant_policies, ensure_attachment_media, server_owned_upload_file_name,
         validate_attachment_create_policy,
     };
-    use crate::{routes::upload, services::object_storage::ObjectStorage};
+    use crate::{
+        routes::upload,
+        services::object_storage::{test_object_storage, test_should_create_bucket},
+    };
     use chrono::Utc;
     use image::{ImageBuffer, ImageFormat, Rgb};
     use serde_json::json;
-    use std::{env, io::Cursor};
+    use std::io::Cursor;
 
     #[test]
     fn attachment_signed_url_ttl_defaults_without_policy() {
@@ -949,15 +952,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_OBJECT_STORAGE_S3_* env vars"]
+    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_TEST_CONFIG pointing at an s3 configuration file"]
     async fn attachment_media_derivatives_round_trip_against_minio_when_configured() {
-        let storage = ObjectStorage::from_env().expect("S3 object storage env should be configured");
+        let storage = test_object_storage().expect("OPENPR_TEST_CONFIG should describe the s3 backend");
         assert_eq!(storage.reference("acceptance/probe.png").backend, "s3");
-        if env::var("OPENPR_OBJECT_STORAGE_S3_CREATE_BUCKET_FOR_TEST")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
+        if test_should_create_bucket() {
             storage
                 .create_bucket_for_test()
                 .await

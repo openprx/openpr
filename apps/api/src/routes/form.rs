@@ -1767,7 +1767,7 @@ pub async fn download_form_attachment_package_job(
         .map_err(|_| ApiError::BadRequest("attachment package job expiry is invalid".to_string()))?
         .with_timezone(&Utc);
     let artifact_key = attachment_package_artifact_key(&stored_file_name);
-    let object_storage = ObjectStorage::from_env()?;
+    let object_storage = ObjectStorage::from_runtime_config()?;
     if Utc::now() > expires_at {
         let _ = object_storage.delete(&artifact_key).await;
         return Err(ApiError::BadRequest(
@@ -2473,7 +2473,7 @@ async fn cleanup_expired_attachment_package_artifact(
         .result
         .ok_or_else(|| ApiError::BadRequest("attachment package job result is missing".to_string()))?;
     let stored_file_name = attachment_package_job_result_string(&result, "stored_file_name")?;
-    let cleanup_error = ObjectStorage::from_env()?
+    let cleanup_error = ObjectStorage::from_runtime_config()?
         .delete(&attachment_package_artifact_key(&stored_file_name))
         .await
         .err()
@@ -3135,7 +3135,7 @@ pub async fn create_form_attachment_signed_url(
     let ttl_minutes = attachment_signed_url_ttl_minutes(&form.schema, &attachment.field_key);
     let expires_at = Utc::now() + Duration::minutes(ttl_minutes);
     let expires = expires_at.timestamp();
-    let signature = sign_attachment_download(&state.cfg.jwt_secret, attachment_id, expires)?;
+    let signature = sign_attachment_download(state.cfg.jwt_secret.expose(), attachment_id, expires)?;
     Ok(ApiResponse::success(AttachmentSignedDownloadResponse {
         url: format!("/api/v1/form-attachments/{attachment_id}/download?expires={expires}&signature={signature}"),
         expires_at,
@@ -3154,7 +3154,7 @@ pub async fn download_signed_form_attachment(
     if query.expires < Utc::now().timestamp() {
         return Err(ApiError::Unauthorized("attachment download link expired".to_string()));
     }
-    let expected = sign_attachment_download(&state.cfg.jwt_secret, attachment_id, query.expires)?;
+    let expected = sign_attachment_download(state.cfg.jwt_secret.expose(), attachment_id, query.expires)?;
     if !constant_time_eq(expected.as_bytes(), query.signature.as_bytes()) {
         return Err(ApiError::Unauthorized(
             "invalid attachment download signature".to_string(),
@@ -5379,7 +5379,7 @@ async fn attachment_package_entries(
     let mut entries = Vec::new();
     let mut manifest_attachments = Vec::new();
     let mut binary_file_count = 0;
-    let object_storage = ObjectStorage::from_env()?;
+    let object_storage = ObjectStorage::from_runtime_config()?;
 
     for attachment in attachments {
         let safe_name = sanitize_zip_file_name(&attachment.file_name);
@@ -5466,7 +5466,7 @@ async fn write_attachment_package_artifact(
     job_id: Uuid,
     package: AttachmentPackageArtifact,
 ) -> Result<Value, ApiError> {
-    let object_storage = ObjectStorage::from_env()?;
+    let object_storage = ObjectStorage::from_runtime_config()?;
     let stored_file_name = format!("{}-{}", Uuid::new_v4(), package.file_name);
     let artifact_storage_key = attachment_package_artifact_key(&stored_file_name);
     let byte_size = package.zip.len();
@@ -5900,7 +5900,7 @@ async fn import_records_request_from_uploaded_file(
         .ok_or_else(|| ApiError::BadRequest("file_url is required".to_string()))?;
     let file_name = server_owned_upload_file_name(&file_url)
         .ok_or_else(|| ApiError::BadRequest("file_url must reference a server-owned upload".to_string()))?;
-    let data = ObjectStorage::from_env()?
+    let data = ObjectStorage::from_runtime_config()?
         .get(file_name)
         .await
         .map_err(|_| ApiError::NotFound("import file not found".to_string()))?;
@@ -5927,7 +5927,7 @@ async fn import_records_request_from_uploaded_file_without_mapping(
         .ok_or_else(|| ApiError::BadRequest("file_url is required".to_string()))?;
     let file_name = server_owned_upload_file_name(&file_url)
         .ok_or_else(|| ApiError::BadRequest("file_url must reference a server-owned upload".to_string()))?;
-    let data = ObjectStorage::from_env()?
+    let data = ObjectStorage::from_runtime_config()?
         .get(file_name)
         .await
         .map_err(|_| ApiError::NotFound("import file not found".to_string()))?;
@@ -7096,11 +7096,10 @@ mod tests {
     use crate::{
         error::ApiError,
         forms::attachment_package::{ZipEntry, attachment_package_artifact_key, build_stored_zip},
-        services::object_storage::ObjectStorage,
+        services::object_storage::{test_object_storage, test_should_create_bucket},
     };
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
-    use std::env;
     use uuid::Uuid;
 
     fn denied_fields(keys: &[&str]) -> BTreeSet<String> {
@@ -7468,15 +7467,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_OBJECT_STORAGE_S3_* env vars"]
+    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_TEST_CONFIG pointing at an s3 configuration file"]
     async fn attachment_package_artifact_round_trips_against_minio_when_configured() {
-        let storage = ObjectStorage::from_env().expect("S3 object storage env should be configured");
+        let storage = test_object_storage().expect("OPENPR_TEST_CONFIG should describe the s3 backend");
         assert_eq!(storage.reference("acceptance/probe.zip").backend, "s3");
-        if env::var("OPENPR_OBJECT_STORAGE_S3_CREATE_BUCKET_FOR_TEST")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
+        if test_should_create_bucket() {
             storage
                 .create_bucket_for_test()
                 .await
@@ -7537,15 +7532,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_OBJECT_STORAGE_S3_* env vars"]
+    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_TEST_CONFIG pointing at an s3 configuration file"]
     async fn import_file_artifact_round_trips_against_minio_when_configured() {
-        let storage = ObjectStorage::from_env().expect("S3 object storage env should be configured");
+        let storage = test_object_storage().expect("OPENPR_TEST_CONFIG should describe the s3 backend");
         assert_eq!(storage.reference("acceptance/probe.csv").backend, "s3");
-        if env::var("OPENPR_OBJECT_STORAGE_S3_CREATE_BUCKET_FOR_TEST")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
+        if test_should_create_bucket() {
             storage
                 .create_bucket_for_test()
                 .await
@@ -7682,7 +7673,7 @@ mod record_link_database_tests {
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
-        config::AppConfig,
+        config::{AppConfig, Secret},
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
     use serde_json::{Value, json};
@@ -7790,8 +7781,8 @@ mod record_link_database_tests {
             cfg: AppConfig {
                 app_name: "api-test".to_string(),
                 bind_addr: "127.0.0.1:0".to_string(),
-                database_url: scratch.url.clone(),
-                jwt_secret: "record-link-test-secret".to_string(),
+                database_url: Secret::new(scratch.url.clone()),
+                jwt_secret: Secret::new("record-link-test-secret"),
                 jwt_access_ttl_seconds: 900,
                 jwt_refresh_ttl_seconds: 3600,
                 default_author_id: None,

@@ -189,7 +189,7 @@ pub async fn uploads_access_middleware(
     let object_key = upload_object_key_from_path(req.uri().path())
         .ok_or_else(|| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))?;
     verify_upload_download_signature(
-        &state.cfg.jwt_secret,
+        state.cfg.jwt_secret.expose(),
         &object_key,
         expires,
         signature,
@@ -210,7 +210,7 @@ pub async fn upload_file(
 }
 
 async fn upload_file_from_multipart(headers: HeaderMap, body: Bytes) -> Result<UploadResponse, ApiError> {
-    let object_storage = ObjectStorage::from_env()?;
+    let object_storage = ObjectStorage::from_runtime_config()?;
 
     let content_type = headers
         .get("content-type")
@@ -270,7 +270,7 @@ pub async fn get_uploaded_file(
     ensure_upload_file_name(&file_name)?;
     access.authorize(&state, &file_name).await?;
 
-    let data = ObjectStorage::from_env()?
+    let data = ObjectStorage::from_runtime_config()?
         .get(&file_name)
         .await
         .map_err(|_| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))?;
@@ -383,7 +383,7 @@ pub async fn create_uploaded_signature_signed_url(
     let _ = read_signature_object(&file_name).await?;
     let expires_at = Utc::now() + Duration::minutes(SIGNATURE_SIGNED_DOWNLOAD_TTL_MINUTES);
     Ok(ApiResponse::success(signature_signed_download_response(
-        &state.cfg.jwt_secret,
+        state.cfg.jwt_secret.expose(),
         &file_name,
         expires_at,
     )?))
@@ -399,7 +399,7 @@ pub async fn download_signed_uploaded_signature(
     if query.expires < Utc::now().timestamp() {
         return Err(ApiError::Unauthorized("signature download link expired".to_string()));
     }
-    let expected = sign_signature_download(&state.cfg.jwt_secret, &file_name, query.expires)?;
+    let expected = sign_signature_download(state.cfg.jwt_secret.expose(), &file_name, query.expires)?;
     if !constant_time_eq(expected.as_bytes(), query.signature.as_bytes()) {
         return Err(ApiError::Unauthorized(
             "invalid signature download signature".to_string(),
@@ -735,7 +735,7 @@ async fn read_derivative_object(
     ensure_upload_file_name(file_name)?;
     let object_key = format!("{prefix}/{file_name}");
     access.authorize(state, &object_key).await?;
-    ObjectStorage::from_env()?
+    ObjectStorage::from_runtime_config()?
         .get(&object_key)
         .await
         .map_err(|_| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))
@@ -743,7 +743,7 @@ async fn read_derivative_object(
 
 async fn read_signature_object(file_name: &str) -> Result<Vec<u8>, ApiError> {
     ensure_signature_file_name(file_name)?;
-    ObjectStorage::from_env()?
+    ObjectStorage::from_runtime_config()?
         .get(&format!("signatures/{file_name}"))
         .await
         .map_err(|_| ApiError::NotFound(UPLOAD_NOT_FOUND_MESSAGE.to_string()))
@@ -992,12 +992,16 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::object_storage::{test_object_storage, test_should_create_bucket};
     use axum::body::to_bytes;
     use chrono::Utc;
     use image::{ImageBuffer, Rgba};
-    use platform::{app::AppState, auth::TokenType, config::AppConfig};
+    use platform::{
+        app::AppState,
+        auth::TokenType,
+        config::{AppConfig, Secret},
+    };
     use sea_orm::DatabaseConnection;
-    use std::env;
 
     const TEST_SECRET: &str = "upload-access-test-secret";
 
@@ -1006,8 +1010,8 @@ mod tests {
             cfg: AppConfig {
                 app_name: "api".to_string(),
                 bind_addr: "127.0.0.1:0".to_string(),
-                database_url: "postgres://disconnected/openpr".to_string(),
-                jwt_secret: TEST_SECRET.to_string(),
+                database_url: Secret::new("postgres://disconnected/openpr"),
+                jwt_secret: Secret::new(TEST_SECRET),
                 jwt_access_ttl_seconds: 3600,
                 jwt_refresh_ttl_seconds: 7200,
                 default_author_id: None,
@@ -1401,15 +1405,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_OBJECT_STORAGE_S3_* env vars"]
+    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_TEST_CONFIG pointing at an s3 configuration file"]
     async fn upload_route_round_trips_source_and_thumbnail_against_minio_when_configured() {
-        let storage = ObjectStorage::from_env().expect("S3 object storage env should be configured");
+        let storage = test_object_storage().expect("OPENPR_TEST_CONFIG should describe the s3 backend");
         assert_eq!(storage.reference("acceptance/probe.png").backend, "s3");
-        if env::var("OPENPR_OBJECT_STORAGE_S3_CREATE_BUCKET_FOR_TEST")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
+        if test_should_create_bucket() {
             storage
                 .create_bucket_for_test()
                 .await
