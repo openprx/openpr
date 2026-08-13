@@ -1,16 +1,21 @@
+use std::net::IpAddr;
+use std::path::PathBuf;
+
 use api::routes::connector::{
-    ConnectorAuthMode, DELIVERY_EVENT_HEADER, DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, connector_auth_plan,
-    delivery_signature_header_value, resolve_connector_credential, validate_outbound_url, verify_delivery_schema,
+    ConnectorAuthMode, DELIVERY_EVENT_HEADER, DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER,
+    delivery_signature_header_value, host_is_allowlisted, is_blocked_ip, verify_delivery_schema,
 };
 use clap::Parser;
 use platform::{
     app::{AppState, connect_db},
-    config::AppConfig,
+    config::{
+        AppConfig, ConnectorSecrets, MAX_CONNECTOR_SECRET_NAME_LEN, OpenPrConfig, validate_connector_secret_name,
+    },
     logging,
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Lease held on an outbox row while a worker fans it out to connectors.
@@ -32,8 +37,102 @@ const CONNECTOR_DIAGNOSTIC_CHARS: usize = 2_000;
 
 #[derive(Debug, Parser)]
 struct WorkerArgs {
+    /// Path of the configuration file. Defaults to `config/openpr.toml` relative to the working
+    /// directory. The worker reads no environment variables, so this file is its only input.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
     #[arg(long, default_value_t = 4)]
     concurrency: usize,
+}
+
+/// The delivery pipeline's slice of the configuration file, resolved once at startup.
+///
+/// The outbound allowlist is kept in the comma separated form the host matcher consumes so a
+/// per-delivery check allocates nothing, and the credential store is the workspace partitioned map
+/// from `[connectors.secrets]`.
+struct DeliveryPolicy {
+    outbound_allowlist: String,
+    outbound_allow_private: bool,
+    connector_secrets: ConnectorSecrets,
+}
+
+impl DeliveryPolicy {
+    fn from_config(config: &OpenPrConfig) -> Self {
+        Self {
+            outbound_allowlist: config.outbound.allowlist_csv(),
+            outbound_allow_private: config.outbound.allow_private,
+            connector_secrets: config.connectors.secrets.clone(),
+        }
+    }
+
+    /// Scheme, credential and literal address checks. Does not perform DNS resolution.
+    fn parse_outbound_url(&self, raw: &str) -> Result<reqwest::Url, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("endpoint must not be empty".to_string());
+        }
+        let url = reqwest::Url::parse(trimmed).map_err(|err| format!("endpoint is not a valid absolute URL: {err}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!(
+                "endpoint scheme {} is not allowed, use http or https",
+                url.scheme()
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err("endpoint must not embed credentials".to_string());
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| "endpoint must contain a host".to_string())?
+            .to_string();
+
+        if self.outbound_allow_private
+            || host_is_allowlisted(&host, url.port_or_known_default(), &self.outbound_allowlist)
+        {
+            return Ok(url);
+        }
+        if literal_host_ip(&host).is_some_and(is_blocked_ip) {
+            return Err(format!("endpoint host {host} points at a blocked address"));
+        }
+        Ok(url)
+    }
+
+    /// Full outbound target validation: scheme/credential checks plus DNS resolution of the host.
+    ///
+    /// Hosts listed in `outbound.allowed_hosts` (for example the in-cluster service names used by
+    /// the compose deployment) skip the address checks.
+    async fn validate_outbound_url(&self, raw: &str) -> Result<reqwest::Url, String> {
+        let url = self.parse_outbound_url(raw)?;
+        if self.outbound_allow_private {
+            return Ok(url);
+        }
+        let host = url.host_str().unwrap_or_default().to_string();
+        let port = url.port_or_known_default();
+        if host_is_allowlisted(&host, port, &self.outbound_allowlist) || literal_host_ip(&host).is_some() {
+            return Ok(url);
+        }
+
+        let addresses = tokio::net::lookup_host((host.as_str(), port.unwrap_or(443)))
+            .await
+            .map_err(|err| format!("endpoint host {host} could not be resolved: {err}"))?
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            return Err(format!("endpoint host {host} could not be resolved"));
+        }
+        if addresses.iter().any(|address| is_blocked_ip(address.ip())) {
+            return Err(format!("endpoint host {host} resolves to a blocked address"));
+        }
+        Ok(url)
+    }
+}
+
+fn literal_host_ip(host: &str) -> Option<IpAddr> {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+        .parse::<IpAddr>()
+        .ok()
 }
 
 #[derive(Debug, Clone, FromQueryResult)]
@@ -172,10 +271,14 @@ struct InvocationEventRow {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = WorkerArgs::parse();
-    let cfg = AppConfig::from_env("worker", "0.0.0.0:8081")?;
-    logging::init("worker");
+    let config = OpenPrConfig::load(args.config.as_deref())?;
+    // Installed only once the file parsed, so a configuration error is reported by the process
+    // exit rather than swallowed by a subscriber the file was supposed to describe.
+    logging::init(&config.logging, "worker")?;
+    let cfg = AppConfig::from_config(&config, "worker", "0.0.0.0:8081");
+    let policy = DeliveryPolicy::from_config(&config);
 
-    let db = connect_db(&cfg.database_url).await?;
+    let db = connect_db(&config.database).await?;
     // The pickup and completion statements below hard depend on the lease token, the duplicate
     // tagging and the pickup indexes. Without them the worker keeps polling and silently delivers
     // nothing, so refuse to start with the missing objects named instead.
@@ -205,7 +308,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("worker shutting down");
                 break;
             }
-            result = process_pending_tasks(&db, &client, args.concurrency) => {
+            result = process_pending_tasks(&db, &client, args.concurrency, &policy) => {
                 if let Err(err) = result {
                     tracing::warn!(error = %err, "task polling failed");
                 }
@@ -220,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(error = %err, "event inbox polling failed");
         }
 
-        if let Err(err) = process_pending_connector_invocations(&db, &client, args.concurrency).await {
+        if let Err(err) = process_pending_connector_invocations(&db, &client, args.concurrency, &policy).await {
             tracing::warn!(error = %err, "connector invocation polling failed");
         }
 
@@ -791,12 +894,13 @@ async fn process_pending_connector_invocations(
     db: &sea_orm::DatabaseConnection,
     client: &reqwest::Client,
     concurrency: usize,
+    policy: &DeliveryPolicy,
 ) -> anyhow::Result<()> {
     let limit = i64::try_from(concurrency.max(1)).unwrap_or(i64::MAX) * 10;
     let invocations = pickup_pending_connector_invocations(db, limit).await?;
 
     for invocation in invocations {
-        let auth = match load_connector_auth(db, invocation.connector_id).await? {
+        let auth = match load_connector_auth(db, invocation.connector_id, &policy.connector_secrets).await? {
             Ok(auth) => auth,
             Err(error) => {
                 // A policy that declares a mode it cannot perform must never fall back to an
@@ -834,7 +938,7 @@ async fn process_pending_connector_invocations(
             }
         };
 
-        let outcome = dispatch_connector_invocation(client, &invocation, &auth).await;
+        let outcome = dispatch_connector_invocation(client, &invocation, &auth, policy).await;
         if outcome.success {
             update_connector_invocation_status(
                 db,
@@ -926,6 +1030,7 @@ fn with_retry_schedule(
 async fn load_connector_auth(
     db: &sea_orm::DatabaseConnection,
     connector_id: Uuid,
+    secrets: &ConnectorSecrets,
 ) -> anyhow::Result<Result<ResolvedConnectorAuth, String>> {
     let row = ConnectorAuthContextRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -945,16 +1050,24 @@ async fn load_connector_auth(
     let Some(row) = row else {
         return Ok(Err("connector no longer exists".to_string()));
     };
-    Ok(resolve_connector_auth(&row))
+    Ok(resolve_connector_auth(&row, secrets))
 }
 
-fn resolve_connector_auth(row: &ConnectorAuthContextRow) -> Result<ResolvedConnectorAuth, String> {
-    let plan = connector_auth_plan(&row.auth_policy, row.webhook_secret.is_some(), row.workspace_id)?;
+fn resolve_connector_auth(
+    row: &ConnectorAuthContextRow,
+    secrets: &ConnectorSecrets,
+) -> Result<ResolvedConnectorAuth, String> {
+    let plan = connector_auth_plan(&row.auth_policy, row.webhook_secret.is_some())?;
     let credential = match plan.source.as_ref() {
+        // `row.workspace_id` is the `connectors.workspace_id` column selected by the statement
+        // above. It is the only workspace this delivery may read credentials for, and it must
+        // never be replaced by anything carried in the payload or in `auth_policy`: the workspace
+        // selects the credential partition, and that selection is the tenant boundary.
         Some(source) => Some(resolve_connector_credential(
             source,
             row.webhook_secret.as_deref(),
             row.workspace_id,
+            secrets,
         )?),
         None => None,
     };
@@ -962,6 +1075,133 @@ fn resolve_connector_auth(row: &ConnectorAuthContextRow) -> Result<ResolvedConne
         mode: plan.mode,
         credential,
     })
+}
+
+/// Where the delivery credential is read from. Never holds the credential itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectorCredentialSource {
+    /// The `secret` column of the webhook the connector is linked to.
+    WebhookSecret,
+    /// An entry of `[connectors.secrets."<workspace uuid>"]`, named without any prefix.
+    Named(String),
+}
+
+/// Declared authentication behaviour resolved from `connectors.auth_policy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectorAuthPlan {
+    mode: ConnectorAuthMode,
+    source: Option<ConnectorCredentialSource>,
+}
+
+/// Resolves the effective delivery authentication from a connector `auth_policy`.
+///
+/// The declared mode and the runtime behaviour are kept in sync: a policy that declares
+/// `hmac`/`bearer` without a usable credential source is rejected instead of silently downgrading
+/// to an unsigned delivery.
+///
+/// No workspace is needed here, because a credential name no longer encodes one. Under the retired
+/// environment scheme the tenant boundary was a string comparison against a name prefix; it is now
+/// the workspace partition of [`ConnectorSecrets`], enforced where the credential is actually read.
+fn connector_auth_plan(auth_policy: &Value, webhook_linked: bool) -> Result<ConnectorAuthPlan, String> {
+    if ["secret", "token", "password"]
+        .iter()
+        .any(|key| auth_policy.get(*key).is_some())
+    {
+        return Err("auth_policy must not store raw secrets, use secret_ref = \"NAME\"".to_string());
+    }
+
+    let mode = auth_policy
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let reference = auth_policy
+        .get("secret_ref")
+        .or_else(|| auth_policy.get("token_ref"))
+        .and_then(Value::as_str);
+    let source = match reference {
+        Some(raw) => Some(parse_credential_ref(raw)?),
+        None if webhook_linked => Some(ConnectorCredentialSource::WebhookSecret),
+        None => None,
+    };
+
+    match mode.as_str() {
+        "" => Ok(source.map_or(
+            ConnectorAuthPlan {
+                mode: ConnectorAuthMode::None,
+                source: None,
+            },
+            |source| ConnectorAuthPlan {
+                mode: ConnectorAuthMode::Hmac,
+                source: Some(source),
+            },
+        )),
+        "none" | "unsigned" => Ok(ConnectorAuthPlan {
+            mode: ConnectorAuthMode::None,
+            source: None,
+        }),
+        "hmac" | "hmac_sha256" | "hmac-sha256" => Ok(ConnectorAuthPlan {
+            mode: ConnectorAuthMode::Hmac,
+            source: Some(source.ok_or_else(|| {
+                "auth_policy mode hmac requires secret_ref = \"NAME\" or a linked webhook secret".to_string()
+            })?),
+        }),
+        "bearer" | "token" => match source {
+            Some(ConnectorCredentialSource::Named(name)) => Ok(ConnectorAuthPlan {
+                mode: ConnectorAuthMode::Bearer,
+                source: Some(ConnectorCredentialSource::Named(name)),
+            }),
+            _ => Err("auth_policy mode bearer requires token_ref = \"NAME\"".to_string()),
+        },
+        other => Err(format!("unsupported auth_policy mode {other}")),
+    }
+}
+
+/// Reads a `secret_ref`/`token_ref` as the name of a configured connector credential.
+///
+/// `auth_policy` is written by a workspace admin, so the reference is bounded and shape checked
+/// before it reaches any diagnostic that is persisted on the invocation.
+fn parse_credential_ref(raw: &str) -> Result<ConnectorCredentialSource, String> {
+    let name = raw.trim();
+    if name.strip_prefix("env:").is_some() {
+        return Err(
+            "credential reference still uses the retired env:NAME form; drop the env: prefix and file the \
+             credential under [connectors.secrets.\"<workspace uuid>\"] in the configuration file"
+                .to_string(),
+        );
+    }
+    if name.len() > MAX_CONNECTOR_SECRET_NAME_LEN {
+        return Err(format!(
+            "credential reference is longer than the {MAX_CONNECTOR_SECRET_NAME_LEN} character limit"
+        ));
+    }
+    validate_connector_secret_name(name).map_err(|err| err.to_string())?;
+    Ok(ConnectorCredentialSource::Named(name.to_string()))
+}
+
+/// Reads the credential for a resolved source. The returned value must never be logged.
+///
+/// `workspace_id` must be the workspace of the connector row performing the delivery. It selects
+/// the credential partition before the name is looked up, so a policy naming a credential of
+/// another tenant cannot resolve however the name is spelled.
+fn resolve_connector_credential(
+    source: &ConnectorCredentialSource,
+    webhook_secret: Option<&str>,
+    workspace_id: Uuid,
+    secrets: &ConnectorSecrets,
+) -> Result<String, String> {
+    match source {
+        ConnectorCredentialSource::WebhookSecret => webhook_secret
+            .map(str::trim)
+            .filter(|secret| !secret.is_empty())
+            .map(ToString::to_string)
+            .ok_or_else(|| "linked webhook secret is not configured".to_string()),
+        ConnectorCredentialSource::Named(name) => secrets
+            .get(workspace_id, name)
+            .map(|secret| secret.expose().to_string())
+            .map_err(|err| err.to_string()),
+    }
 }
 
 /// Pickup statement for connector deliveries.
@@ -1153,6 +1393,7 @@ async fn dispatch_connector_invocation(
     client: &reqwest::Client,
     invocation: &ConnectorInvocationDispatchRow,
     auth: &ResolvedConnectorAuth,
+    policy: &DeliveryPolicy,
 ) -> ConnectorDispatchOutcome {
     let dispatched_at = chrono::Utc::now().to_rfc3339();
     let permanent_failure = |error_message: String| ConnectorDispatchOutcome {
@@ -1177,7 +1418,7 @@ async fn dispatch_connector_invocation(
 
     // The endpoint is re-validated at delivery time: rows can predate the create/update checks and
     // DNS answers change between configuration and delivery.
-    let target = match validate_outbound_url(&invocation.endpoint).await {
+    let target = match policy.validate_outbound_url(&invocation.endpoint).await {
         Ok(url) => url,
         Err(err) => {
             return permanent_failure(format!(
@@ -1476,6 +1717,7 @@ async fn process_pending_tasks(
     db: &sea_orm::DatabaseConnection,
     client: &reqwest::Client,
     concurrency: usize,
+    policy: &DeliveryPolicy,
 ) -> anyhow::Result<()> {
     let limit = i64::try_from(concurrency.max(1)).unwrap_or(i64::MAX) * 10;
     let tasks = pickup_pending_tasks(db, limit).await?;
@@ -1485,7 +1727,7 @@ async fn process_pending_tasks(
     }
 
     for task in tasks {
-        if let Err(err) = dispatch_task(db, client, &task).await {
+        if let Err(err) = dispatch_task(db, client, &task, policy).await {
             tracing::warn!(task_id = %task.id, error = %err, "dispatch failed");
             record_dispatch_failure(db, &task, err.to_string()).await?;
         }
@@ -1581,6 +1823,7 @@ async fn dispatch_task(
     db: &sea_orm::DatabaseConnection,
     client: &reqwest::Client,
     task: &AiTaskDispatchRow,
+    policy: &DeliveryPolicy,
 ) -> anyhow::Result<()> {
     let webhook = BotWebhookRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1630,7 +1873,8 @@ async fn dispatch_task(
         "trigger_kind": trigger_kind_for_task(&task.task_type),
     });
 
-    let target = validate_outbound_url(&webhook.url)
+    let target = policy
+        .validate_outbound_url(&webhook.url)
         .await
         .map_err(|err| anyhow::anyhow!("webhook {} url rejected: {err}", webhook.webhook_id))?;
 
@@ -2156,20 +2400,37 @@ fn trigger_kind_for_task(task_type: &str) -> &'static str {
 mod tests {
     use super::{
         CONNECTOR_DELIVERY_MAX_ATTEMPTS, ConnectorAuthContextRow, ConnectorAuthMode, ConnectorDeliveryRecord,
-        ConnectorInvocationDispatchRow, ConnectorRetryDecision, EventInboxProcessingRow, ResolvedConnectorAuth,
-        connector_delivery_headers, connector_delivery_result, connector_retry_backoff_seconds,
+        ConnectorInvocationDispatchRow, ConnectorRetryDecision, DeliveryPolicy, EventInboxProcessingRow,
+        ResolvedConnectorAuth, connector_delivery_headers, connector_delivery_result, connector_retry_backoff_seconds,
         connector_retry_decision, event_allows_connector_fanout, event_inbox_invocation_id,
         invocation_status_for_receipt, mark_event_outbox_dispatched, mark_event_outbox_failed,
         pickup_pending_connector_invocations, pickup_pending_event_outbox, receipt_status_for_inbox, redact_endpoint,
         resolve_connector_auth, update_connector_invocation_status, with_retry_schedule,
     };
     use api::routes::connector::{
-        DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, connector_secret_env_namespace, sign_delivery_body,
-        verify_delivery_schema,
+        DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, sign_delivery_body, verify_delivery_schema,
     };
+    use platform::config::{ConnectorSecrets, Secret};
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use serde_json::json;
+    use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    /// Builds a credential store shaped like `[connectors.secrets."<workspace>"]`.
+    fn secret_store(entries: &[(Uuid, &str, &str)]) -> ConnectorSecrets {
+        let mut by_workspace: BTreeMap<Uuid, BTreeMap<String, Secret>> = BTreeMap::new();
+        for (workspace_id, name, value) in entries {
+            by_workspace
+                .entry(*workspace_id)
+                .or_default()
+                .insert((*name).to_string(), Secret::new(*value));
+        }
+        ConnectorSecrets::new(by_workspace)
+    }
+
+    fn no_secrets() -> ConnectorSecrets {
+        ConnectorSecrets::default()
+    }
 
     fn inbox_row(event_type: &str, payload: serde_json::Value) -> EventInboxProcessingRow {
         EventInboxProcessingRow {
@@ -2974,7 +3235,7 @@ mod tests {
             auth_policy: json!({ "mode": "hmac", "legacy_webhook": true, "secret_source": "webhook" }),
             webhook_secret: Some("legacy-secret".to_string()),
         };
-        let auth = resolve_connector_auth(&row).unwrap();
+        let auth = resolve_connector_auth(&row, &no_secrets()).unwrap();
         assert_eq!(auth.mode, ConnectorAuthMode::Hmac);
 
         let invocation = dispatch_row("https://hooks.example.com/openpr");
@@ -2990,40 +3251,133 @@ mod tests {
             auth_policy: json!({ "mode": "hmac" }),
             webhook_secret: None,
         };
-        assert!(resolve_connector_auth(&unusable).is_err());
+        assert!(resolve_connector_auth(&unusable, &no_secrets()).is_err());
     }
 
-    /// The delivery path builds the credential namespace from the workspace on the connector row,
-    /// so a stored policy naming another tenant's credential fails to resolve instead of signing
+    /// A configured credential is readable by the workspace that owns it, and by that workspace
+    /// only. The lookup key is `connectors.workspace_id` from the row the delivery was loaded
+    /// from, so a policy naming another tenant's credential fails to resolve instead of signing
     /// the attacker's delivery with the victim's secret.
     #[test]
-    fn delivery_refuses_a_policy_pointing_at_another_workspaces_credential() {
+    fn delivery_reads_credentials_of_the_connector_row_workspace_only() {
         let victim = Uuid::new_v4();
         let attacker = Uuid::new_v4();
-        let victim_secret = format!("{}PAYMENTS", connector_secret_env_namespace(victim));
+        let secrets = secret_store(&[
+            (victim, "PAYMENTS", "victim-token"),
+            (attacker, "PAYMENTS", "attacker-token"),
+        ]);
+        // The policy is written by whoever owns the connector, so it also carries the victim's
+        // workspace id as bait: nothing inside `auth_policy` may ever select the partition.
+        let policy = json!({ "mode": "bearer", "token_ref": "PAYMENTS", "workspace_id": victim.to_string() });
 
-        let stolen = ConnectorAuthContextRow {
+        // Same credential name in both workspaces, so a lookup that used the baited id instead of
+        // the connector row would return a different value rather than merely erroring.
+        let attacker_row = ConnectorAuthContextRow {
             workspace_id: attacker,
-            auth_policy: json!({ "mode": "bearer", "token_ref": format!("env:{victim_secret}") }),
+            auth_policy: policy.clone(),
             webhook_secret: None,
         };
         // ResolvedConnectorAuth deliberately has no Debug impl, since it holds the credential.
-        let Err(error) = resolve_connector_auth(&stolen) else {
-            panic!("cross tenant credential must not resolve");
+        let Ok(resolved) = resolve_connector_auth(&attacker_row, &secrets) else {
+            panic!("a workspace must read its own credential");
         };
-        assert!(error.contains(&connector_secret_env_namespace(attacker)), "{error}");
+        assert_eq!(resolved.credential.as_deref(), Some("attacker-token"));
 
-        // The same policy resolves inside the workspace that owns the credential, and then fails
-        // only because the variable is unset in the test process.
-        let owned = ConnectorAuthContextRow {
+        let victim_row = ConnectorAuthContextRow {
             workspace_id: victim,
-            auth_policy: json!({ "mode": "bearer", "token_ref": format!("env:{victim_secret}") }),
+            auth_policy: json!({ "mode": "bearer", "token_ref": "PAYMENTS" }),
             webhook_secret: None,
         };
-        let Err(owned_error) = resolve_connector_auth(&owned) else {
-            panic!("the variable is not set in the test process");
+        let Ok(resolved) = resolve_connector_auth(&victim_row, &secrets) else {
+            panic!("a workspace must read its own credential");
         };
-        assert!(owned_error.contains("is not set"), "{owned_error}");
+        assert_eq!(resolved.credential.as_deref(), Some("victim-token"));
+
+        // A workspace with no credentials at all cannot borrow one by naming it, not even while
+        // pointing the policy at a workspace that has it.
+        let outsider = Uuid::new_v4();
+        let outsider_row = ConnectorAuthContextRow {
+            workspace_id: outsider,
+            auth_policy: policy,
+            webhook_secret: None,
+        };
+        let Err(error) = resolve_connector_auth(&outsider_row, &secrets) else {
+            panic!("cross tenant credential must not resolve");
+        };
+        assert!(error.contains(&outsider.to_string()), "{error}");
+        assert!(!error.contains("victim-token"), "{error}");
+    }
+
+    /// A policy carried over from the retired environment scheme must fail loudly rather than
+    /// resolve to something. Both spellings are refused: the `env:` form outright, and the bare
+    /// namespaced name by the platform's reserved `OPENPR_` prefix.
+    #[test]
+    fn delivery_refuses_the_retired_environment_credential_reference() {
+        let victim = Uuid::new_v4();
+        let attacker = Uuid::new_v4();
+        let legacy = format!(
+            "OPENPR_CONNECTOR_SECRET_W_{}_PAYMENTS",
+            victim.simple().to_string().to_ascii_uppercase()
+        );
+        let secrets = secret_store(&[(victim, "PAYMENTS", "victim-token")]);
+
+        let prefixed = ConnectorAuthContextRow {
+            workspace_id: attacker,
+            auth_policy: json!({ "mode": "bearer", "token_ref": format!("env:{legacy}") }),
+            webhook_secret: None,
+        };
+        let Err(error) = resolve_connector_auth(&prefixed, &secrets) else {
+            panic!("the retired env: form must not resolve");
+        };
+        assert!(error.contains("connectors.secrets"), "{error}");
+
+        let bare = ConnectorAuthContextRow {
+            workspace_id: attacker,
+            auth_policy: json!({ "mode": "bearer", "token_ref": legacy }),
+            webhook_secret: None,
+        };
+        let Err(error) = resolve_connector_auth(&bare, &secrets) else {
+            panic!("a namespaced name must not resolve");
+        };
+        assert!(error.contains("reserved"), "{error}");
+    }
+
+    /// The endpoint checks read `[outbound]`, not the process environment.
+    #[tokio::test]
+    async fn outbound_checks_follow_the_configured_policy() {
+        let blocked = DeliveryPolicy {
+            outbound_allowlist: String::new(),
+            outbound_allow_private: false,
+            connector_secrets: no_secrets(),
+        };
+        assert!(blocked.parse_outbound_url("http://127.0.0.1:9000/hook").is_err());
+        assert!(blocked.parse_outbound_url("ftp://example.com/hook").is_err());
+        assert!(
+            blocked
+                .parse_outbound_url("https://user:pass@hooks.example.com/hook")
+                .is_err()
+        );
+
+        let allowlisted = DeliveryPolicy {
+            outbound_allowlist: "worker.internal,127.0.0.1:9000".to_string(),
+            outbound_allow_private: false,
+            connector_secrets: no_secrets(),
+        };
+        assert!(
+            allowlisted
+                .validate_outbound_url("http://127.0.0.1:9000/hook")
+                .await
+                .is_ok()
+        );
+        // The allowlist is matched with its port, so another port on the same host stays blocked.
+        assert!(allowlisted.parse_outbound_url("http://127.0.0.1:9100/hook").is_err());
+
+        let open = DeliveryPolicy {
+            outbound_allowlist: String::new(),
+            outbound_allow_private: true,
+            connector_secrets: no_secrets(),
+        };
+        assert!(open.validate_outbound_url("http://127.0.0.1:9100/hook").await.is_ok());
     }
 
     #[test]
