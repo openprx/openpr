@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, DatabaseConfig};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -8,13 +10,17 @@ pub struct AppState {
     pub db: DatabaseConnection,
 }
 
-pub async fn connect_db(database_url: &str) -> Result<DatabaseConnection, sea_orm::DbErr> {
-    let mut opts = ConnectOptions::new(database_url.to_string());
-    opts.max_connections(20)
-        .min_connections(2)
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .idle_timeout(std::time::Duration::from_secs(30))
-        .acquire_timeout(std::time::Duration::from_secs(5));
+/// Opens the connection pool described by the `[database]` section.
+///
+/// The pool shape used to be hardcoded here; it now comes from the configuration file so a
+/// deployment can size it without a rebuild.
+pub async fn connect_db(database: &DatabaseConfig) -> Result<DatabaseConnection, sea_orm::DbErr> {
+    let mut opts = ConnectOptions::new(database.url.expose().to_string());
+    opts.max_connections(database.max_connections)
+        .min_connections(database.min_connections)
+        .connect_timeout(Duration::from_secs(database.connect_timeout_seconds))
+        .idle_timeout(Duration::from_secs(database.idle_timeout_seconds))
+        .acquire_timeout(Duration::from_secs(database.acquire_timeout_seconds));
 
     Database::connect(opts).await
 }

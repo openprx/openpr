@@ -36,6 +36,7 @@ rust_decimal = { version = "1", features = ["serde-with-str"] }
 base64 = "0.22"
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
+toml = "0.9"
 tower = "0.5.2"
 tower-http = { version = "0.6.4", features = ["trace", "cors", "compression-gzip", "util"] }
 tracing = "0.1"
