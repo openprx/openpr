@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 
-use crate::config::{AppConfig, DatabaseConfig};
+use crate::config::{AppConfig, DatabaseRuntime};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -13,8 +13,10 @@ pub struct AppState {
 /// Opens the connection pool described by the `[database]` section.
 ///
 /// The pool shape used to be hardcoded here; it now comes from the configuration file so a
-/// deployment can size it without a rebuild.
-pub async fn connect_db(database: &DatabaseConfig) -> Result<DatabaseConnection, sea_orm::DbErr> {
+/// deployment can size it without a rebuild. Takes a [`DatabaseRuntime`] rather than the raw
+/// section so that "the file names a database" is settled by
+/// [`crate::config::OpenPrConfig::database_runtime`] before anything tries to connect.
+pub async fn connect_db(database: &DatabaseRuntime) -> Result<DatabaseConnection, sea_orm::DbErr> {
     let mut opts = ConnectOptions::new(database.url.expose().to_string());
     opts.max_connections(database.max_connections)
         .min_connections(database.min_connections)

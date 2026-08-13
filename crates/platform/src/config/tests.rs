@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::{
-    AppConfig, ConfigError, DEFAULT_CONFIG_PATH, LogFormat, McpTransport, OpenPrConfig, REDACTED, StorageBackend,
+    AppConfig, ConfigError, DEFAULT_CONFIG_PATH, LogFormat, LogOutput, McpTransport, OpenPrConfig, REDACTED,
+    StdoutRole, StorageBackend,
 };
 
 const WORKSPACE: &str = "0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8";
@@ -52,6 +53,7 @@ default_author_id = "a1b2c3d4-e5f6-4890-abcd-ef1234567890"
 [logging]
 filter = "api=debug,tower_http=info"
 format = "text"
+output = "stdout"
 
 [storage]
 backend = "s3"
@@ -101,26 +103,26 @@ fn a_complete_file_parses_into_every_section() {
     assert_eq!(config.server.app_name.as_deref(), Some("api"));
     assert_eq!(config.server.bind_addr.as_deref(), Some("0.0.0.0:8081"));
 
-    assert_eq!(
-        config.database.url.expose(),
-        "postgres://openpr:s3cret@localhost:5432/openpr"
-    );
-    assert_eq!(config.database.max_connections, 40);
-    assert_eq!(config.database.min_connections, 4);
-    assert_eq!(config.database.connect_timeout_seconds, 7);
-    assert_eq!(config.database.idle_timeout_seconds, 45);
-    assert_eq!(config.database.acquire_timeout_seconds, 6);
+    let database = config.database_runtime().expect("the database section is complete");
+    assert_eq!(database.url.expose(), "postgres://openpr:s3cret@localhost:5432/openpr");
+    assert_eq!(database.max_connections, 40);
+    assert_eq!(database.min_connections, 4);
+    assert_eq!(database.connect_timeout_seconds, 7);
+    assert_eq!(database.idle_timeout_seconds, 45);
+    assert_eq!(database.acquire_timeout_seconds, 6);
 
-    assert_eq!(config.auth.jwt_secret.expose(), "0123456789abcdef0123456789abcdef");
-    assert_eq!(config.auth.access_ttl_seconds, 3600);
-    assert_eq!(config.auth.refresh_ttl_seconds, 604_800);
+    let auth = config.auth_runtime().expect("the auth section is complete");
+    assert_eq!(auth.jwt_secret.expose(), "0123456789abcdef0123456789abcdef");
+    assert_eq!(auth.access_ttl_seconds, 3600);
+    assert_eq!(auth.refresh_ttl_seconds, 604_800);
     assert_eq!(
-        config.auth.default_author_id.map(|id| id.to_string()),
+        auth.default_author_id.map(|id| id.to_string()),
         Some("a1b2c3d4-e5f6-4890-abcd-ef1234567890".to_string())
     );
 
     assert_eq!(config.logging.filter.as_deref(), Some("api=debug,tower_http=info"));
     assert_eq!(config.logging.format, LogFormat::Text);
+    assert_eq!(config.logging.output, LogOutput::Stdout);
 
     assert_eq!(config.storage.backend, StorageBackend::S3);
     let s3 = config.storage.s3.as_ref().expect("s3 section should be present");
@@ -178,15 +180,18 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
 
     assert!(config.server.app_name.is_none());
     assert!(config.server.bind_addr.is_none());
-    assert_eq!(config.database.max_connections, 20);
-    assert_eq!(config.database.min_connections, 2);
-    assert_eq!(config.database.connect_timeout_seconds, 5);
-    assert_eq!(config.database.idle_timeout_seconds, 30);
-    assert_eq!(config.database.acquire_timeout_seconds, 5);
-    assert_eq!(config.auth.access_ttl_seconds, 1_296_000);
-    assert_eq!(config.auth.refresh_ttl_seconds, 1_728_000);
-    assert!(config.auth.default_author_id.is_none());
+    let database = config.database_runtime().expect("the url alone is enough");
+    assert_eq!(database.max_connections, 20);
+    assert_eq!(database.min_connections, 2);
+    assert_eq!(database.connect_timeout_seconds, 5);
+    assert_eq!(database.idle_timeout_seconds, 30);
+    assert_eq!(database.acquire_timeout_seconds, 5);
+    let auth = config.auth_runtime().expect("the secret alone is enough");
+    assert_eq!(auth.access_ttl_seconds, 1_296_000);
+    assert_eq!(auth.refresh_ttl_seconds, 1_728_000);
+    assert!(auth.default_author_id.is_none());
     assert_eq!(config.logging.format, LogFormat::Json);
+    assert_eq!(config.logging.output, LogOutput::Stderr);
     assert_eq!(
         config.logging.filter_or_default("worker"),
         "worker=info,tower_http=info"
@@ -204,8 +209,12 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
 // ---- one error report for every problem ----
 
 #[test]
-fn every_missing_mandatory_value_is_reported_in_one_pass() {
-    let reported = issues("[server]\napp_name = \"api\"\n");
+fn every_value_the_api_is_missing_is_reported_in_one_pass() {
+    let config = parse("[server]\napp_name = \"api\"\n").expect("presence is not a load time question");
+    let Err(ConfigError::Invalid { issues: reported, .. }) = AppConfig::from_config(&config, "api", "0.0.0.0:8081")
+    else {
+        panic!("the api must refuse to start without a database and a signing key");
+    };
     assert!(
         reported.iter().any(|issue| issue.contains("database.url is required")),
         "{reported:?}"
@@ -258,7 +267,6 @@ lowercase = "value"
     ));
 
     for expected in [
-        "database.url is required",
         "server.bind_addr",
         "database.min_connections",
         "database.connect_timeout_seconds",
@@ -281,18 +289,138 @@ lowercase = "value"
             "missing {expected:?} in {reported:?}"
         );
     }
-    assert!(reported.len() >= 17, "expected every problem at once, got {reported:?}");
+    assert!(reported.len() >= 16, "expected every problem at once, got {reported:?}");
 }
 
 #[test]
 fn the_rendered_error_lists_all_issues_and_points_at_the_example() {
-    let rendered = parse("[server]\napp_name = \"api\"\n")
+    let config = parse("[server]\napp_name = \"api\"\n").expect("presence is not a load time question");
+    let rendered = AppConfig::from_config(&config, "api", "0.0.0.0:8081")
         .expect_err("should fail")
         .to_string();
     assert!(rendered.contains("2 unusable values"), "{rendered}");
     assert!(rendered.contains("database.url is required"), "{rendered}");
     assert!(rendered.contains("auth.jwt_secret is required"), "{rendered}");
     assert!(rendered.contains("config/openpr.example.toml"), "{rendered}");
+    assert!(rendered.contains(&origin().display().to_string()), "{rendered}");
+}
+
+// ---- one file, three binaries: presence is the caller's question ----
+
+#[test]
+fn an_mcp_only_file_needs_neither_a_database_nor_a_signing_key() {
+    let config = parse(&format!(
+        r#"
+[mcp]
+bot_token = "opr_live_token"
+workspace_id = "{WORKSPACE}"
+"#
+    ))
+    .expect("an MCP-only deployment must not have to invent a database URL and a signing key");
+
+    let mcp = config.mcp_runtime().expect("the mcp section is complete");
+    assert_eq!(mcp.workspace_id.to_string(), WORKSPACE);
+    assert_eq!(mcp.api_url, super::DEFAULT_MCP_API_URL);
+    assert!(config.database.url.is_none());
+    assert!(config.auth.jwt_secret.is_none());
+}
+
+#[test]
+fn a_binary_that_opens_the_pool_still_refuses_a_file_without_a_database() {
+    let config = parse(&format!(
+        r#"
+[mcp]
+bot_token = "opr_live_token"
+workspace_id = "{WORKSPACE}"
+"#
+    ))
+    .expect("the file itself is valid");
+
+    let Err(ConfigError::Invalid { issues, .. }) = config.database_runtime() else {
+        panic!("database_runtime must refuse an absent [database] section");
+    };
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(
+        issues.iter().any(|issue| issue.contains("database.url is required")),
+        "{issues:?}"
+    );
+
+    let Err(ConfigError::Invalid { issues, .. }) = config.auth_runtime() else {
+        panic!("auth_runtime must refuse an absent [auth] section");
+    };
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert!(
+        issues.iter().any(|issue| issue.contains("auth.jwt_secret is required")),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn a_present_but_unusable_database_url_is_still_refused_at_load_time() {
+    // Laziness applies to presence only: a value that *is* written down is checked as before, so
+    // a typo never survives until the first connection attempt.
+    let reported = issues("[database]\nurl = \"postgres://openpr:${PGPASSWORD}@db/openpr\"\n");
+    assert!(
+        reported
+            .iter()
+            .any(|issue| issue.contains("database.url must be a concrete database URL")),
+        "{reported:?}"
+    );
+
+    let reported = issues("[auth]\njwt_secret = \"short\"\n");
+    assert!(
+        reported
+            .iter()
+            .any(|issue| issue.contains("auth.jwt_secret must be at least")),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn a_database_section_without_a_url_still_validates_its_pool_shape() {
+    let reported = issues("[database]\nmin_connections = 90\nmax_connections = 10\n");
+    assert!(
+        reported.iter().any(|issue| issue.contains("database.min_connections")),
+        "{reported:?}"
+    );
+    assert!(
+        !reported.iter().any(|issue| issue.contains("database.url")),
+        "an absent url is the caller's question, not the file's: {reported:?}"
+    );
+}
+
+// ---- logging ----
+
+#[test]
+fn logging_writes_to_stderr_unless_the_file_asks_for_stdout() {
+    let config = parse("[logging]\nformat = \"text\"\n").expect("logging alone is a valid file");
+    assert_eq!(config.logging.output, LogOutput::Stderr);
+    assert_eq!(config.logging.effective_output(StdoutRole::Free), LogOutput::Stderr);
+
+    let config = parse("[logging]\noutput = \"stdout\"\n").expect("stdout is a valid choice");
+    assert_eq!(config.logging.output, LogOutput::Stdout);
+    assert_eq!(config.logging.effective_output(StdoutRole::Free), LogOutput::Stdout);
+}
+
+#[test]
+fn a_stdio_transport_keeps_its_stdout_even_when_the_file_asks_for_stdout_logs() {
+    let config = parse("[logging]\noutput = \"stdout\"\n").expect("stdout is a valid choice");
+    assert_eq!(
+        config.logging.effective_output(StdoutRole::Protocol),
+        LogOutput::Stderr,
+        "a log line on a JSON-RPC channel corrupts the frame, so the file cannot ask for it"
+    );
+}
+
+#[test]
+fn an_unknown_logging_output_is_refused_rather_than_guessed() {
+    let reported = issues("[logging]\noutput = \"syslog\"\n");
+    assert!(
+        reported
+            .iter()
+            .any(|issue| issue.contains("logging.output must be stderr or stdout")),
+        "{reported:?}"
+    );
 }
 
 // ---- placeholders ----
@@ -359,10 +487,11 @@ fn the_shipped_example_is_structurally_valid_toml_for_this_schema() {
         .replace("replace_with_mcp_inbound_token", "mcp-inbound-token-value")
         .replace("replace_with_connector_credential", "connector-credential");
     let config = parse(&filled).expect("the example should validate once the placeholders are replaced");
-    assert_eq!(
-        config.database.url.expose(),
-        "postgres://openpr:s3cret@localhost:5432/openpr"
-    );
+    let database = config
+        .database_runtime()
+        .expect("the filled in example names a database");
+    assert_eq!(database.url.expose(), "postgres://openpr:s3cret@localhost:5432/openpr");
+    AppConfig::from_config(&config, "api", "0.0.0.0:8081").expect("the filled in example is enough to start the api");
 }
 
 // ---- uuids ----
@@ -761,7 +890,7 @@ fn a_directory_in_place_of_the_file_is_reported_as_unreadable() {
 #[test]
 fn app_config_takes_the_file_over_the_binary_defaults() {
     let config = parse(&full_config()).expect("the complete example should validate");
-    let cfg = AppConfig::from_config(&config, "worker", "127.0.0.1:9999");
+    let cfg = AppConfig::from_config(&config, "worker", "127.0.0.1:9999").expect("the file names both values");
     assert_eq!(cfg.app_name, "api");
     assert_eq!(cfg.bind_addr, "0.0.0.0:8081");
     assert_eq!(cfg.jwt_secret.expose(), "0123456789abcdef0123456789abcdef");
@@ -782,7 +911,7 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
 "#,
     )
     .expect("minimal file");
-    let cfg = AppConfig::from_config(&config, "worker", "0.0.0.0:8081");
+    let cfg = AppConfig::from_config(&config, "worker", "0.0.0.0:8081").expect("the file names both values");
     assert_eq!(cfg.app_name, "worker");
     assert_eq!(cfg.bind_addr, "0.0.0.0:8081");
 }
@@ -792,7 +921,7 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
 #[test]
 fn debug_output_of_app_config_never_contains_a_secret() {
     let config = parse(&full_config()).expect("the complete example should validate");
-    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081");
+    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081").expect("the file names both values");
     let rendered = format!("{cfg:?}");
     assert!(!rendered.contains("0123456789abcdef0123456789abcdef"), "{rendered}");
     assert!(!rendered.contains("s3cret"), "{rendered}");
@@ -818,6 +947,19 @@ fn debug_output_of_the_whole_config_never_contains_a_secret() {
         ] {
             assert!(!rendered.contains(plaintext), "{plaintext} leaked into {rendered}");
         }
+        assert!(rendered.contains(REDACTED), "{rendered}");
+    }
+}
+
+#[test]
+fn debug_output_of_the_database_and_auth_runtimes_never_contains_a_secret() {
+    let config = parse(&full_config()).expect("the complete example should validate");
+    let database = config.database_runtime().expect("the database section is complete");
+    let auth = config.auth_runtime().expect("the auth section is complete");
+    for rendered in [format!("{database:?}"), format!("{auth:?}")] {
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(!rendered.contains("postgres://openpr"), "{rendered}");
+        assert!(!rendered.contains("0123456789abcdef0123456789abcdef"), "{rendered}");
         assert!(rendered.contains(REDACTED), "{rendered}");
     }
 }

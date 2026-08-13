@@ -5,6 +5,11 @@
 //! service once per missing value; validation instead walks the whole file and reports every
 //! unusable value in one error.
 //!
+//! Validation checks the *shape* of every value that is present and refuses the file if any of
+//! them is unusable. It does not check that `database.url` or `auth.jwt_secret` are present at
+//! all: one file serves three binaries and the MCP server needs neither, so presence is checked
+//! by the binary that needs the value, through the runtime accessors on [`OpenPrConfig`].
+//!
 //! None of these types derive `Debug`: they hold credential material as plain `String`, and only
 //! the validated types wrap it in [`Secret`].
 
@@ -18,8 +23,8 @@ use super::connectors::{ConnectorSecrets, validate_connector_secret_name};
 use super::secret::Secret;
 use super::{
     AuthConfig, ConfigError, ConnectorsConfig, DEFAULT_S3_REGION, DEFAULT_STORAGE_DIR, DatabaseConfig, LogFormat,
-    LoggingConfig, MIN_JWT_SECRET_LEN, MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpTransport, MigrationsConfig, OpenPrConfig,
-    OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
+    LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpTransport, MigrationsConfig,
+    OpenPrConfig, OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
 };
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
@@ -97,6 +102,7 @@ struct RawAuth {
 struct RawLogging {
     filter: Option<String>,
     format: Option<String>,
+    output: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -204,9 +210,9 @@ impl RawConfig {
 
         issues.into_result(origin)?;
 
-        // Every `None` below was already recorded as an issue, so this point is only reached when
-        // all of them are `Some`.
-        let (Some(database), Some(auth), Some(storage)) = (database, auth, storage) else {
+        // `storage` is `None` only in cases that already recorded an issue, so this point is only
+        // reached when it is `Some`.
+        let Some(storage) = storage else {
             return Err(ConfigError::Invalid {
                 path: origin.to_path_buf(),
                 issues: vec!["configuration could not be assembled from the validated sections".to_string()],
@@ -245,12 +251,13 @@ impl RawServer {
 }
 
 impl RawDatabase {
-    fn validate(self, issues: &mut Issues) -> Option<DatabaseConfig> {
+    /// Checks the shape of whatever is present.
+    ///
+    /// A missing `url` is not an issue here: only a binary that opens a connection can say
+    /// whether it is missing, and it says so through `OpenPrConfig::database_runtime`.
+    fn validate(self, issues: &mut Issues) -> DatabaseConfig {
         let url = match self.url {
-            None => {
-                issues.push("database.url is required");
-                None
-            }
+            None => None,
             Some(url) if is_placeholder(&url) => {
                 issues.push(
                     "database.url must be a concrete database URL, not a placeholder or an unexpanded ${...} \
@@ -291,14 +298,14 @@ impl RawDatabase {
             DEFAULT_ACQUIRE_TIMEOUT_SECONDS,
         );
 
-        Some(DatabaseConfig {
-            url: url?,
+        DatabaseConfig {
+            url,
             max_connections,
             min_connections,
             connect_timeout_seconds,
             idle_timeout_seconds,
             acquire_timeout_seconds,
-        })
+        }
     }
 }
 
@@ -314,12 +321,13 @@ fn positive_seconds(issues: &mut Issues, field: &str, value: Option<u64>, defaul
 }
 
 impl RawAuth {
-    fn validate(self, issues: &mut Issues) -> Option<AuthConfig> {
+    /// Checks the shape of whatever is present.
+    ///
+    /// A missing `jwt_secret` is not an issue here, for the reason given on
+    /// [`RawDatabase::validate`]; `OpenPrConfig::auth_runtime` reports it instead.
+    fn validate(self, issues: &mut Issues) -> AuthConfig {
         let jwt_secret = match self.jwt_secret {
-            None => {
-                issues.push("auth.jwt_secret is required");
-                None
-            }
+            None => None,
             Some(secret) if is_placeholder(&secret) => {
                 issues.push(
                     "auth.jwt_secret must be a concrete deployment secret, not a placeholder or an unexpanded \
@@ -354,12 +362,12 @@ impl RawAuth {
             .default_author_id
             .and_then(|raw| issues.record(parse_workspace_scale_uuid("auth.default_author_id", &raw)));
 
-        Some(AuthConfig {
-            jwt_secret: jwt_secret?,
+        AuthConfig {
+            jwt_secret,
             access_ttl_seconds,
             refresh_ttl_seconds,
             default_author_id,
-        })
+        }
     }
 }
 
@@ -393,9 +401,20 @@ impl RawLogging {
                 })
             },
         );
+        let output = self.output.map_or_else(
+            || Some(LogOutput::default()),
+            |raw| {
+                issues.record(match raw.trim().to_ascii_lowercase().as_str() {
+                    "stderr" => Ok(LogOutput::Stderr),
+                    "stdout" => Ok(LogOutput::Stdout),
+                    other => Err(format!("logging.output must be stderr or stdout, got {other}")),
+                })
+            },
+        );
         LoggingConfig {
             filter,
             format: format.unwrap_or_default(),
+            output: output.unwrap_or_default(),
         }
     }
 }
