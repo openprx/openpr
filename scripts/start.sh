@@ -168,6 +168,10 @@ if [ -z "${OPENPR_RUNTIME_BASE:-}" ] && [ -r /etc/os-release ]; then
     OPENPR_RUNTIME_BASE="debian:${host_codename}-slim"
     export OPENPR_RUNTIME_BASE
     echo "   runtime base image: $OPENPR_RUNTIME_BASE (matched to host)"
+    # Persist it so a plain `docker compose up --build` keeps the same base.
+    if ! grep -q '^OPENPR_RUNTIME_BASE=' .env 2>/dev/null; then
+      printf '\n# Runtime base image for Dockerfile.prebuilt; must ship a glibc at least as new as the host.\nOPENPR_RUNTIME_BASE=%s\n' "$OPENPR_RUNTIME_BASE" >> .env
+    fi
   fi
 fi
 
