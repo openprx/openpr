@@ -27,7 +27,7 @@ use crate::{
             ZipEntry, attachment_package_artifact_key, attachment_package_job_result_string, build_stored_zip,
             sanitize_file_stem, sanitize_zip_file_name,
         },
-        calculation::evaluate_calculated_values,
+        calculation::{evaluate_calculated_values, merge_values_for_calculation, overlay_calculated_values},
         event_redaction::{redact_event_metadata, redact_event_payload, redact_event_source},
         job_context::{add_form_job_worker_context, form_job_worker_context},
         permissions::{
@@ -75,12 +75,18 @@ use crate::{
             materialize_signature_values_with_audit, materialize_signature_values_with_existing_audit,
             signature_lifecycle_summary, signature_workflow_verification_summary, verify_signature_audit_source,
         },
-        validation::{validate_and_normalize_values, validate_and_normalize_values_with_existing},
+        validation::{
+            validate_and_normalize_values, validate_and_normalize_values_with_existing,
+            validate_and_normalize_values_with_existing_report,
+        },
     },
     middleware::bot_auth::{BotAuthContext, require_workspace_access_from_auth},
     plugins::hooks::{run_event_handler_hooks, run_field_validator_hooks, run_formula_hooks},
     response::{ApiResponse, PaginatedData},
-    routes::upload::{UploadObjectOwner, resolve_upload_object_owner, upload_object_key_from_path},
+    routes::upload::{
+        UploadObjectOwner, resolve_upload_object_owner, signature_object_key_claimed_by_record_value,
+        upload_object_key_from_path,
+    },
     services::object_storage::ObjectStorage,
 };
 use rust_decimal::Decimal;
@@ -1281,7 +1287,7 @@ pub async fn list_form_records(
     Query(query): Query<ListRecordsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(1, 200);
@@ -1299,7 +1305,6 @@ pub async fn list_form_records(
         form.id,
         &role,
         actor_id,
-        is_bot,
         &mut where_parts,
         &mut values,
         &mut next_idx,
@@ -1366,7 +1371,7 @@ pub async fn list_form_records(
     ))
     .all(&state.db)
     .await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     let items = items
         .into_iter()
         .map(|record| filter_record_response_values(record, &denied_read_fields))
@@ -1516,7 +1521,7 @@ async fn export_records_for_form(
     query: &ExportRecordsQuery,
 ) -> Result<ExportRecordsResponse, ApiError> {
     let fields = parse_fields(&form.schema).map_err(ApiError::BadRequest)?;
-    let denied_read_fields = denied_read_field_keys(state, form.id, role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(state, form.id, role).await?;
     let export_scope = export_records_scope(query.scope.as_deref())?;
     let include_archived = export_records_include_archived(
         query.include_archived.unwrap_or(false),
@@ -1560,7 +1565,6 @@ async fn export_records_for_form(
         form.id,
         role,
         actor_id,
-        is_bot,
         &mut where_parts,
         &mut values,
         &mut next_idx,
@@ -1660,9 +1664,9 @@ pub async fn export_form_attachment_package(
     Query(query): Query<ExportAttachmentPackageQuery>,
 ) -> Result<Response, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.export").await?;
-    let package = build_attachment_package_for_form(&state, &form, actor_id, &role, is_bot, query.view_id).await?;
+    let package = build_attachment_package_for_form(&state, &form, actor_id, &role, query.view_id).await?;
     let content_disposition = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", package.file_name))
         .map_err(|_| ApiError::Internal)?;
 
@@ -1824,7 +1828,7 @@ pub async fn create_form_attachment_package_job(
     let query = ExportAttachmentPackageQuery { view_id: req.view_id };
     let job_id = insert_attachment_package_job(&state, &form, actor_id, is_bot, input).await?;
     let job = find_attachment_package_job(&state, job_id).await?;
-    spawn_form_attachment_package_job(state.clone(), form, actor_id, role, is_bot, job_id, query);
+    spawn_form_attachment_package_job(state.clone(), form, actor_id, role, job_id, query);
     Ok(ApiResponse::success(job))
 }
 
@@ -1833,12 +1837,11 @@ fn spawn_form_attachment_package_job(
     form: FormResponse,
     actor_id: Uuid,
     role: String,
-    is_bot: bool,
     job_id: Uuid,
     query: ExportAttachmentPackageQuery,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = run_form_attachment_package_job(state, form, actor_id, role, is_bot, job_id, query).await {
+        if let Err(error) = run_form_attachment_package_job(state, form, actor_id, role, job_id, query).await {
             tracing::warn!(job_id = %job_id, error = %error, "form attachment package job failed before status update");
         }
     });
@@ -1849,18 +1852,16 @@ async fn run_form_attachment_package_job(
     form: FormResponse,
     actor_id: Uuid,
     role: String,
-    is_bot: bool,
     job_id: Uuid,
     query: ExportAttachmentPackageQuery,
 ) -> Result<(), ApiError> {
     if !claim_attachment_package_job_running(&state, job_id).await? {
         return Ok(());
     }
-    let package_result =
-        match build_attachment_package_for_form(&state, &form, actor_id, &role, is_bot, query.view_id).await {
-            Ok(package) => write_attachment_package_artifact(job_id, package).await,
-            Err(error) => Err(error),
-        };
+    let package_result = match build_attachment_package_for_form(&state, &form, actor_id, &role, query.view_id).await {
+        Ok(package) => write_attachment_package_artifact(job_id, package).await,
+        Err(error) => Err(error),
+    };
     match package_result {
         Ok(result) => {
             update_attachment_package_job_completed(&state, job_id, result).await?;
@@ -1877,12 +1878,11 @@ async fn build_attachment_package_for_form(
     form: &FormResponse,
     actor_id: Uuid,
     role: &str,
-    is_bot: bool,
     view_id: Option<Uuid>,
 ) -> Result<AttachmentPackageArtifact, ApiError> {
     let fields = parse_fields(&form.schema).map_err(ApiError::BadRequest)?;
-    let denied_read_fields = denied_read_field_keys(state, form.id, role, is_bot).await?;
-    let record_ids = visible_form_record_ids_for_export(state, form, &fields, actor_id, role, is_bot, view_id).await?;
+    let denied_read_fields = denied_read_field_keys(state, form.id, role).await?;
+    let record_ids = visible_form_record_ids_for_export(state, form, &fields, actor_id, role, view_id).await?;
     let attachments = form_attachments_for_package(state, form.id, Some(&record_ids), &denied_read_fields).await?;
     let (entries, binary_file_count) = attachment_package_entries(form, view_id, &attachments).await?;
     let zip = build_stored_zip(&entries)?;
@@ -2385,7 +2385,7 @@ async fn process_form_attachment_package_job_from_worker(
             .await;
         }
     };
-    let (actor_id, role, is_bot) = match form_job_worker_context(&job.input, job.created_by) {
+    let (actor_id, role, _) = match form_job_worker_context(&job.input, job.created_by) {
         Ok(context) => context,
         Err(error) => return fail_attachment_package_job_if_claimed(state, job.id, error.to_string()).await,
     };
@@ -2398,7 +2398,6 @@ async fn process_form_attachment_package_job_from_worker(
         form,
         actor_id,
         role,
-        is_bot,
         job.id,
         ExportAttachmentPackageQuery { view_id: req.view_id },
     )
@@ -2678,7 +2677,7 @@ async fn import_form_record_rows(
             },
         )
         .await?;
-        let denied_read_fields = denied_read_field_keys(state, form.id, role, is_bot).await?;
+        let denied_read_fields = denied_read_field_keys(state, form.id, role).await?;
         created.push(filter_record_response_values(record, &denied_read_fields));
     }
 
@@ -2889,6 +2888,62 @@ async fn ensure_attachment_objects_claimable(
             UploadObjectOwner::Owned(_) | UploadObjectOwner::Ambiguous => {
                 return Err(ApiError::Forbidden(
                     "attachment references an upload object owned by another workspace".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Upload objects a record write would newly bind to the form's workspace.
+///
+/// Attachment registration is not the only way to claim an upload object: a materialized signature
+/// is owned by whichever record stores its URL, so writing somebody else's signature URL into a
+/// record of your own makes the ownership lookup see two workspaces. That resolves to `Ambiguous`,
+/// which fails closed for everyone — the real owner is permanently locked out of what is, in a
+/// compliance form, the evidence itself. Screening record writes the same way attachment
+/// registrations are screened removes the only way to reach that state.
+///
+/// Only values that differ from what is already stored are collected. Re-saving a record keeps
+/// working, the same object may be referenced by as many rows of one workspace as it likes, and a
+/// record whose object already went ambiguous is still editable by its owner.
+fn record_claimed_object_keys(values: &Value, existing_values: Option<&Value>) -> BTreeSet<String> {
+    let mut claimed = BTreeSet::new();
+    let Some(object) = values.as_object() else {
+        return claimed;
+    };
+    for (field_key, value) in object {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        if existing_values
+            .and_then(|existing| existing.get(field_key))
+            .and_then(Value::as_str)
+            == Some(value)
+        {
+            continue;
+        }
+        if let Some(object_key) = signature_object_key_claimed_by_record_value(field_key, value) {
+            claimed.insert(object_key);
+        }
+    }
+    claimed
+}
+
+/// Reject a record write that points at an upload object another workspace already owns.
+async fn ensure_record_objects_claimable(
+    state: &AppState,
+    workspace_id: Uuid,
+    values: &Value,
+    existing_values: Option<&Value>,
+) -> Result<(), ApiError> {
+    for object_key in record_claimed_object_keys(values, existing_values) {
+        match resolve_upload_object_owner(state, &object_key).await? {
+            UploadObjectOwner::Unowned => {}
+            UploadObjectOwner::Owned(owner_workspace_id) if owner_workspace_id == workspace_id => {}
+            UploadObjectOwner::Owned(_) | UploadObjectOwner::Ambiguous => {
+                return Err(ApiError::Forbidden(
+                    "record references an upload object owned by another workspace".to_string(),
                 ));
             }
         }
@@ -3182,10 +3237,10 @@ pub async fn aggregate_form_records(
     Query(query): Query<AggregateQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
     let field_key = normalize_key(&query.field_key).map_err(ApiError::BadRequest)?;
-    ensure_field_read_policy_allows(&state, form.id, &role, is_bot, &field_key).await?;
+    ensure_field_read_policy_allows(&state, form.id, &role, &field_key).await?;
     let aggregate = normalize_aggregate(query.aggregate.as_deref().unwrap_or("sum"))?;
     let field = parse_fields(&form.schema)
         .map_err(ApiError::BadRequest)?
@@ -3219,7 +3274,7 @@ pub async fn aggregate_form_records(
     ];
     // Aggregates must honour the same row-level scope as the record list, otherwise `owned` scope
     // leaks other members' values through sums and counts.
-    let scope_sql = if form_record_scope(&state, form.id, &role, is_bot).await? == "owned" {
+    let scope_sql = if form_record_scope(&state, form.id, &role).await? == "owned" {
         values.push(actor_id.into());
         format!("\n              AND form_records.created_by = ${}", values.len())
     } else {
@@ -3264,7 +3319,7 @@ pub async fn create_form_record(
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
     let record = create_record_for_form(&state, &form, actor_id, &role, is_bot, req).await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     Ok(ApiResponse::success(filter_record_response_values(
         record,
         &denied_read_fields,
@@ -3284,7 +3339,7 @@ async fn create_record_for_form(
     {
         return Ok(record);
     }
-    ensure_field_write_policy_allows(state, form.id, role, is_bot, &req.values).await?;
+    ensure_field_write_policy_allows(state, form.id, role, &req.values).await?;
     let values_with_formula = run_formula_hooks(
         state,
         form.workspace_id,
@@ -3307,6 +3362,7 @@ async fn create_record_for_form(
     let normalized = validate_and_normalize_values(&form.schema, with_autonumber).map_err(ApiError::BadRequest)?;
     let signature_materialization = materialize_signature_values_with_audit(&form.schema, normalized).await?;
     let normalized = signature_materialization.values;
+    ensure_record_objects_claimable(state, form.workspace_id, &normalized, None).await?;
     let signature_audit_entries = annotate_signature_audit_entries(
         signature_materialization.audit_entries,
         if is_bot { "bot" } else { "user" },
@@ -3393,12 +3449,11 @@ pub async fn preview_form_record_recalculation(
     Json(req): Json<RecalculatePreviewRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (_, role, is_bot) =
-        require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
-    ensure_field_write_policy_allows(&state, form.id, &role, is_bot, &req.values).await?;
+    let (_, role, _) = require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.create").await?;
+    ensure_field_write_policy_allows(&state, form.id, &role, &req.values).await?;
     let calculated = calculate_values(&state, &form, None, req.values).await?;
     let normalized = validate_and_normalize_values(&form.schema, calculated.clone()).map_err(ApiError::BadRequest)?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     Ok(ApiResponse::success(RecalculatePreviewResponse {
         form_id,
         schema_version: form.schema_version,
@@ -3415,10 +3470,10 @@ pub async fn get_form_record(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     Ok(ApiResponse::success(filter_record_response_values(
         record,
         &denied_read_fields,
@@ -3433,9 +3488,9 @@ pub async fn verify_form_record_signature_audit(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let verification = verify_signature_audit_source(&record.source).await?;
     let lifecycle = signature_lifecycle_summary(&form.schema, &record.values, &record.source)?;
     let workflow = signature_workflow_verification_summary(&verification, &lifecycle);
@@ -3458,7 +3513,7 @@ pub async fn recalculate_form_record(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.update").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let updated_by = if is_bot { None } else { Some(actor_id) };
     let source =
         json!({ "type": if is_bot { "bot" } else { "user" }, "actor_id": actor_id, "operation": "recalculate" });
@@ -3513,7 +3568,7 @@ pub async fn recalculate_form_record(
     recalculate_parent_records_for_child(&state, record_id, updated_by).await?;
 
     let record = find_record(&state, record_id).await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     Ok(ApiResponse::success(filter_record_response_values(
         record,
         &denied_read_fields,
@@ -3528,14 +3583,14 @@ pub async fn list_form_events(
     Query(query): Query<ListEventsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let form = find_form(&state, form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    let owned_by = if form_record_scope(&state, form.id, &role, is_bot).await? == "owned" {
+    let owned_by = if form_record_scope(&state, form.id, &role).await? == "owned" {
         Some(actor_id)
     } else {
         None
     };
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     list_business_events(
         &state,
         EventScope::Form {
@@ -3558,10 +3613,10 @@ pub async fn list_form_record_events(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     list_business_events(
         &state,
         EventScope::Record {
@@ -3583,9 +3638,9 @@ pub async fn list_form_record_comments(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let page = record_comment_page(&query);
     let total = count_record_comments(&state, record_id).await?;
     let items = list_record_comments(&state, record_id, &page).await?;
@@ -3610,7 +3665,7 @@ pub async fn create_form_record_comment(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.update").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let body = required_record_comment_body(&req)?;
     let metadata = ensure_json_object(req.metadata.unwrap_or_else(|| json!({})), "metadata")?;
     let comment_id = Uuid::new_v4();
@@ -3658,9 +3713,9 @@ pub async fn update_form_record(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.update").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let record = update_record_for_form(&state, &form, record, actor_id, &role, is_bot, req).await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     Ok(ApiResponse::success(filter_record_response_values(
         record,
         &denied_read_fields,
@@ -3693,15 +3748,35 @@ async fn update_record_for_form(
     let mut signature_audit_entries = Vec::new();
     let values = match req.values {
         Some(values) => {
-            ensure_field_write_policy_allows(state, form.id, role, is_bot, &values).await?;
+            ensure_field_write_policy_allows(state, form.id, role, &values).await?;
             let values_with_formula =
                 run_formula_hooks(&state, form.workspace_id, form.project_id, form.id, &form.key, values).await?;
-            let calculated = calculate_values(&state, &form, Some(record_id), values_with_formula).await?;
+            let calculated = calculate_values_with_existing(
+                &state,
+                &form,
+                Some(record_id),
+                Some(&record.values),
+                values_with_formula,
+            )
+            .await?;
             let with_autonumber = apply_autonumber_values(&tx, &form, Some(&record.values), calculated).await?;
-            let normalized = validate_and_normalize_values_with_existing(&form.schema, with_autonumber, &record.values)
-                .map_err(ApiError::BadRequest)?;
+            let normalized =
+                validate_and_normalize_values_with_existing_report(&form.schema, with_autonumber, &record.values)
+                    .map_err(ApiError::BadRequest)?;
+            if !normalized.unmet_required_fields.is_empty() {
+                // Required fields that were already empty before this write. The update is allowed
+                // through so the record stays repairable, but the gap is recorded rather than
+                // silently accepted as a satisfied constraint.
+                tracing::warn!(
+                    form_id = %form.id,
+                    record_id = %record_id,
+                    fields = %normalized.unmet_required_fields.join(","),
+                    "record updated while required fields stay unmet from before this write"
+                );
+            }
             let signature_materialization =
-                materialize_signature_values_with_existing_audit(&form.schema, normalized, &record.values).await?;
+                materialize_signature_values_with_existing_audit(&form.schema, normalized.values, &record.values)
+                    .await?;
             signature_audit_entries = annotate_signature_audit_entries(
                 signature_materialization.audit_entries,
                 if is_bot { "bot" } else { "user" },
@@ -3715,6 +3790,7 @@ async fn update_record_for_form(
         }
         None => record.values,
     };
+    ensure_record_objects_claimable(state, form.workspace_id, &values, Some(&previous_values)).await?;
     let source = append_signature_audit_source(source, signature_audit_entries)?;
     run_field_validator_hooks(
         &state,
@@ -3824,7 +3900,7 @@ pub async fn delete_form_record(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.delete").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     archive_record_for_form(&state, &form, record, actor_id, is_bot, query.idempotency_key).await?;
     Ok(ApiResponse::ok())
 }
@@ -3842,6 +3918,9 @@ async fn archive_record_for_form(
         find_idempotent_record(state, form, idempotency_key.as_deref(), "form.record.archived").await?
     {
         return Ok(record);
+    }
+    if record.archived_at.is_none() {
+        ensure_required_child_tables_keep_a_row(state, record.id).await?;
     }
     let created_by = if is_bot { None } else { Some(actor_id) };
     let tx = state.db.begin().await?;
@@ -3878,9 +3957,9 @@ pub async fn restore_form_record(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.delete").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let restored = restore_record_for_form(&state, &form, record, actor_id, is_bot, query.idempotency_key).await?;
-    let denied_read_fields = denied_read_field_keys(&state, form.id, &role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, form.id, &role).await?;
     Ok(ApiResponse::success(filter_record_response_values(
         restored,
         &denied_read_fields,
@@ -3936,7 +4015,7 @@ pub async fn create_record_link(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "record.update").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let target_type = normalize_target_type(&req.target_type)?;
     let relation_type = normalize_relation_type(&req.relation_type)?;
     let relation_key = normalize_key(&req.relation_key).map_err(ApiError::BadRequest)?;
@@ -3952,17 +4031,10 @@ pub async fn create_record_link(
             target_record.project_id,
         )?;
         let target_form = find_form(&state, target_record.form_id).await?;
-        let (_, target_role, target_is_bot) =
+        let (_, target_role, _) =
             require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &target_form, "form.view").await?;
-        ensure_record_scope_allows_created_by(
-            &state,
-            target_form.id,
-            &target_role,
-            actor_id,
-            target_is_bot,
-            target_record.created_by,
-        )
-        .await?;
+        ensure_record_scope_allows_created_by(&state, target_form.id, &target_role, actor_id, target_record.created_by)
+            .await?;
         if relation_type == "parent_child" {
             validate_parent_child_relation(&form.schema, &target_form.key, &relation_key)?;
         }
@@ -4024,9 +4096,9 @@ pub async fn list_record_links(
 ) -> Result<impl IntoResponse, ApiError> {
     let record = find_record(&state, record_id).await?;
     let form = find_form(&state, record.form_id).await?;
-    let (actor_id, role, is_bot) =
+    let (actor_id, role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let links = LinkResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
@@ -4073,13 +4145,13 @@ pub async fn list_relation_targets(
     .one(&state.db)
     .await?
     .ok_or_else(|| ApiError::NotFound("relation target form not found".to_string()))?;
-    let (target_actor_id, target_role, target_is_bot) =
+    let (target_actor_id, target_role, _) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &target_form, "form.view").await?;
-    let denied_read_fields = denied_read_field_keys(&state, target_form.id, &target_role, target_is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, target_form.id, &target_role).await?;
 
     let mut where_parts = vec!["form_id = $1".to_string(), "archived_at IS NULL".to_string()];
     let mut values: Vec<sea_orm::Value> = vec![target_form.id.into()];
-    if form_record_scope(&state, target_form.id, &target_role, target_is_bot).await? == "owned" {
+    if form_record_scope(&state, target_form.id, &target_role).await? == "owned" {
         values.push(target_actor_id.into());
         where_parts.push(format!("created_by = ${}", values.len()));
     }
@@ -4162,7 +4234,7 @@ pub async fn list_record_children(
     let form = find_form(&state, record.form_id).await?;
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.view").await?;
-    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, is_bot, record.created_by).await?;
+    ensure_record_scope_allows_created_by(&state, form.id, &role, actor_id, record.created_by).await?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(1, 200);
     let offset = (page - 1) * per_page;
@@ -4231,9 +4303,9 @@ pub async fn list_record_children(
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
         let child_form = find_form(&state, row.form_id).await?;
-        let (_, child_role, child_is_bot) =
+        let (_, child_role, _) =
             require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &child_form, "form.view").await?;
-        let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role, child_is_bot).await?;
+        let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role).await?;
         let record = RecordResponse {
             id: row.record_id,
             workspace_id: row.workspace_id,
@@ -4283,15 +4355,8 @@ pub async fn create_child_record(
         "record.update",
     )
     .await?;
-    ensure_record_scope_allows_created_by(
-        &state,
-        parent_form.id,
-        &parent_role,
-        actor_id,
-        is_bot,
-        parent_record.created_by,
-    )
-    .await?;
+    ensure_record_scope_allows_created_by(&state, parent_form.id, &parent_role, actor_id, parent_record.created_by)
+        .await?;
     let child_form = resolve_child_form(
         &state,
         parent_form.workspace_id,
@@ -4300,7 +4365,7 @@ pub async fn create_child_record(
         req.child_form_key.as_deref(),
     )
     .await?;
-    let (_, child_role, child_is_bot) = require_form_action(
+    let (_, child_role, _) = require_form_action(
         &state,
         &claims,
         bot.as_ref().map(|b| &b.0),
@@ -4335,7 +4400,7 @@ pub async fn create_child_record(
         is_bot,
     )
     .await?;
-    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role, child_is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role).await?;
 
     Ok(ApiResponse::success(ChildRecordMutationResponse {
         link,
@@ -4362,7 +4427,7 @@ pub async fn update_child_record(
     .await?;
     let child_record = find_record(&state, child_record_id).await?;
     let child_form = find_form(&state, child_record.form_id).await?;
-    let (_, child_role, child_is_bot) = require_form_action(
+    let (_, child_role, _) = require_form_action(
         &state,
         &claims,
         bot.as_ref().map(|b| &b.0),
@@ -4370,15 +4435,8 @@ pub async fn update_child_record(
         "record.update",
     )
     .await?;
-    ensure_record_scope_allows_created_by(
-        &state,
-        child_form.id,
-        &child_role,
-        actor_id,
-        child_is_bot,
-        child_record.created_by,
-    )
-    .await?;
+    ensure_record_scope_allows_created_by(&state, child_form.id, &child_role, actor_id, child_record.created_by)
+        .await?;
     let relation_key = match req.relation_key.as_deref() {
         Some(relation_key) => Some(validate_parent_child_relation(
             &parent_form.schema,
@@ -4403,7 +4461,7 @@ pub async fn update_child_record(
         },
     )
     .await?;
-    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role, child_is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role).await?;
 
     Ok(ApiResponse::success(ChildRecordMutationResponse {
         link,
@@ -4428,18 +4486,11 @@ pub async fn archive_child_record(
         "record.update",
     )
     .await?;
-    ensure_record_scope_allows_created_by(
-        &state,
-        parent_form.id,
-        &parent_role,
-        actor_id,
-        is_bot,
-        parent_record.created_by,
-    )
-    .await?;
+    ensure_record_scope_allows_created_by(&state, parent_form.id, &parent_role, actor_id, parent_record.created_by)
+        .await?;
     let child_record = find_record(&state, child_record_id).await?;
     let child_form = find_form(&state, child_record.form_id).await?;
-    let (_, child_role, child_is_bot) = require_form_action(
+    let (_, child_role, _) = require_form_action(
         &state,
         &claims,
         bot.as_ref().map(|b| &b.0),
@@ -4447,15 +4498,8 @@ pub async fn archive_child_record(
         "record.delete",
     )
     .await?;
-    ensure_record_scope_allows_created_by(
-        &state,
-        child_form.id,
-        &child_role,
-        actor_id,
-        child_is_bot,
-        child_record.created_by,
-    )
-    .await?;
+    ensure_record_scope_allows_created_by(&state, child_form.id, &child_role, actor_id, child_record.created_by)
+        .await?;
     let relation_key = match query.relation_key.as_deref() {
         Some(relation_key) => Some(validate_parent_child_relation(
             &parent_form.schema,
@@ -4466,7 +4510,7 @@ pub async fn archive_child_record(
     };
     let link = find_parent_child_link(&state, record_id, child_record_id, relation_key.as_deref()).await?;
     let archived = archive_record_for_form(&state, &child_form, child_record, actor_id, is_bot, None).await?;
-    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role, child_is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role).await?;
 
     Ok(ApiResponse::success(ChildRecordMutationResponse {
         link,
@@ -4491,18 +4535,11 @@ pub async fn restore_child_record(
         "record.update",
     )
     .await?;
-    ensure_record_scope_allows_created_by(
-        &state,
-        parent_form.id,
-        &parent_role,
-        actor_id,
-        is_bot,
-        parent_record.created_by,
-    )
-    .await?;
+    ensure_record_scope_allows_created_by(&state, parent_form.id, &parent_role, actor_id, parent_record.created_by)
+        .await?;
     let child_record = find_record(&state, child_record_id).await?;
     let child_form = find_form(&state, child_record.form_id).await?;
-    let (_, child_role, child_is_bot) = require_form_action(
+    let (_, child_role, _) = require_form_action(
         &state,
         &claims,
         bot.as_ref().map(|b| &b.0),
@@ -4510,15 +4547,8 @@ pub async fn restore_child_record(
         "record.delete",
     )
     .await?;
-    ensure_record_scope_allows_created_by(
-        &state,
-        child_form.id,
-        &child_role,
-        actor_id,
-        child_is_bot,
-        child_record.created_by,
-    )
-    .await?;
+    ensure_record_scope_allows_created_by(&state, child_form.id, &child_role, actor_id, child_record.created_by)
+        .await?;
     let relation_key = match query.relation_key.as_deref() {
         Some(relation_key) => Some(validate_parent_child_relation(
             &parent_form.schema,
@@ -4529,7 +4559,7 @@ pub async fn restore_child_record(
     };
     let link = find_parent_child_link(&state, record_id, child_record_id, relation_key.as_deref()).await?;
     let restored = restore_record_for_form(&state, &child_form, child_record, actor_id, is_bot, None).await?;
-    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role, child_is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(&state, child_form.id, &child_role).await?;
 
     Ok(ApiResponse::success(ChildRecordMutationResponse {
         link,
@@ -4647,8 +4677,29 @@ async fn calculate_values(
     record_id: Option<Uuid>,
     values: Value,
 ) -> Result<Value, ApiError> {
-    let calculated = evaluate_calculated_values(&form.schema, values).map_err(ApiError::BadRequest)?;
-    apply_child_aggregates(state, form, record_id, calculated).await
+    calculate_values_with_existing(state, form, record_id, None, values).await
+}
+
+/// Runs the calculation pipeline against the record as it will look after the write.
+///
+/// Formula arguments are resolved from the stored record merged with the caller's payload, so a
+/// partial update — the only kind a caller with `read:false` on a formula input can send — no longer
+/// fails with `formula field 'x' is missing`. Only the values the calculation changed are folded
+/// back onto the caller's payload, so nothing downstream mistakes a stored value for a submitted
+/// one: the field-level write policy is checked before this against the raw payload, autonumber
+/// still resolves its own carry-over from `existing_values`, and normalization still sees exactly
+/// the keys the caller mentioned plus the calculated fields.
+async fn calculate_values_with_existing(
+    state: &AppState,
+    form: &FormResponse,
+    record_id: Option<Uuid>,
+    existing_values: Option<&Value>,
+    values: Value,
+) -> Result<Value, ApiError> {
+    let seeded = merge_values_for_calculation(&form.schema, &values, existing_values).map_err(ApiError::BadRequest)?;
+    let calculated = evaluate_calculated_values(&form.schema, seeded.clone()).map_err(ApiError::BadRequest)?;
+    let calculated = apply_child_aggregates(state, form, record_id, calculated).await?;
+    overlay_calculated_values(values, &seeded, &calculated).map_err(ApiError::BadRequest)
 }
 
 async fn apply_autonumber_values(
@@ -4916,6 +4967,99 @@ fn child_aggregate_field_value(field: &FormField, value: Decimal) -> Result<Valu
     }
 }
 
+#[derive(Debug, FromQueryResult)]
+struct ParentRequiredChildTableRow {
+    relation_key: String,
+    parent_record_id: Uuid,
+    parent_schema: Value,
+    remaining_children: i64,
+}
+
+/// Every parent this record hangs under as a `parent_child` row, with the parent's schema and the
+/// number of *other* live child rows sharing the same `relation_key`. Sibling counting excludes the
+/// record being archived and already archived rows, so `remaining_children = 0` means archiving
+/// empties that child table.
+const PARENT_REQUIRED_CHILD_TABLES_SQL: &str = r"
+    SELECT links.relation_key,
+           links.source_record_id AS parent_record_id,
+           parent_form.schema AS parent_schema,
+           (
+               SELECT COUNT(*)::bigint
+               FROM form_record_links sibling_links
+               JOIN form_records sibling
+                 ON sibling_links.target_id ~ '^[0-9a-fA-F-]{36}$'
+                AND sibling.id = sibling_links.target_id::uuid
+               WHERE sibling_links.source_record_id = links.source_record_id
+                 AND sibling_links.relation_key = links.relation_key
+                 AND sibling_links.target_type = 'form_record'
+                 AND sibling_links.relation_type = 'parent_child'
+                 AND sibling.id <> child.id
+                 AND sibling.archived_at IS NULL
+                 AND sibling.workspace_id = parent.workspace_id
+                 AND sibling.project_id = parent.project_id
+           ) AS remaining_children
+    FROM form_record_links links
+    JOIN form_records parent ON parent.id = links.source_record_id
+    JOIN project_forms parent_form ON parent_form.id = parent.form_id
+    JOIN form_records child
+      ON links.target_id ~ '^[0-9a-fA-F-]{36}$'
+     AND child.id = links.target_id::uuid
+    WHERE links.target_type = 'form_record'
+      AND links.relation_type = 'parent_child'
+      AND links.target_id = $1
+      AND parent.archived_at IS NULL
+      AND parent.workspace_id = child.workspace_id
+      AND parent.project_id = child.project_id
+";
+
+/// Whether `relation_key` names a required `child_table` on the parent schema that archiving would
+/// leave with no rows. Kept separate from the query so the rule itself is testable without a
+/// database.
+fn required_child_table_would_be_emptied(
+    parent_schema: &Value,
+    relation_key: &str,
+    remaining_children: i64,
+) -> Result<bool, ApiError> {
+    if remaining_children > 0 {
+        return Ok(false);
+    }
+    let fields = parse_fields(parent_schema).map_err(ApiError::BadRequest)?;
+    Ok(fields
+        .iter()
+        .any(|field| field.key == relation_key && field.required && field.field_type == "child_table"))
+}
+
+/// Enforces required `child_table` fields at the only operation that can violate them.
+///
+/// A child table's rows are separate records linked by `form_record_links`, never values on the
+/// parent, so "this child table has at least one row" cannot be checked while normalizing the
+/// parent's values — a parent has no rows the instant it is created, and normalization runs again
+/// on every later write including the recalculation triggered by adding the first row. What can be
+/// checked is the row count, and the only request that can drive it to zero is archiving the last
+/// row, so that request is where the constraint is enforced.
+async fn ensure_required_child_tables_keep_a_row(state: &AppState, child_record_id: Uuid) -> Result<(), ApiError> {
+    let parents = ParentRequiredChildTableRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        PARENT_REQUIRED_CHILD_TABLES_SQL,
+        vec![child_record_id.to_string().into()],
+    ))
+    .all(&state.db)
+    .await?;
+    for parent in parents {
+        if required_child_table_would_be_emptied(
+            &parent.parent_schema,
+            &parent.relation_key,
+            parent.remaining_children,
+        )? {
+            return Err(ApiError::BadRequest(format!(
+                "field '{}' requires at least one child row on record {}",
+                parent.relation_key, parent.parent_record_id
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Parents to recalculate after a child record changed. The child is joined on its uuid primary key
 /// (guarded by a uuid shaped `target_id`) like the child aggregates are, so the lookup stays
 /// indexable instead of casting every `form_records.id` to text.
@@ -5101,7 +5245,6 @@ async fn visible_form_record_ids_for_export(
     fields: &[FormField],
     actor_id: Uuid,
     role: &str,
-    is_bot: bool,
     view_id: Option<Uuid>,
 ) -> Result<Vec<Uuid>, ApiError> {
     let view_query = record_query_config_from_view(state, form.id, view_id).await?;
@@ -5117,7 +5260,6 @@ async fn visible_form_record_ids_for_export(
         form.id,
         role,
         actor_id,
-        is_bot,
         &mut where_parts,
         &mut values,
         &mut next_idx,
@@ -5855,7 +5997,7 @@ async fn preview_import_rows(
         ));
     }
 
-    let denied_read_fields = denied_read_field_keys(state, form.id, role, is_bot).await?;
+    let denied_read_fields = denied_read_field_keys(state, form.id, role).await?;
     let mut previews = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
         let row_number = row.row_number.unwrap_or(index + 1);
@@ -5888,7 +6030,7 @@ async fn preview_import_row(
     is_bot: bool,
     row: &ImportRecordInput,
 ) -> Result<(String, Value), String> {
-    ensure_field_write_policy_allows(state, form.id, role, is_bot, &row.values)
+    ensure_field_write_policy_allows(state, form.id, role, &row.values)
         .await
         .map_err(|error| error.to_string())?;
     let source = ensure_json_object(
@@ -6942,11 +7084,12 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
 mod tests {
     use super::{
         AttachmentPackageArtifact, BusinessEventResponse, CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL,
-        EventScope, ImportRecordsFileRequest, RECALCULATE_PARENT_RECORDS_SQL, attachment_claimed_object_keys,
-        default_form_key_from_template, default_title_template_from_schema, ensure_can_read_job_result,
-        ensure_link_target_scope, filter_event_response_values,
+        EventScope, ImportRecordsFileRequest, PARENT_REQUIRED_CHILD_TABLES_SQL, RECALCULATE_PARENT_RECORDS_SQL,
+        attachment_claimed_object_keys, default_form_key_from_template, default_title_template_from_schema,
+        ensure_can_read_job_result, ensure_link_target_scope, filter_event_response_values,
         import_records_request_from_uploaded_file_without_mapping, job_listing_owner_filter,
-        normalize_scenario_field_schema, owned_record_event_predicate, push_event_scope_filters, summarize_job_result,
+        normalize_scenario_field_schema, owned_record_event_predicate, push_event_scope_filters,
+        record_claimed_object_keys, required_child_table_would_be_emptied, summarize_job_result,
         write_attachment_package_artifact,
     };
     use crate::{
@@ -6961,6 +7104,56 @@ mod tests {
 
     fn denied_fields(keys: &[&str]) -> BTreeSet<String> {
         keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    fn parent_schema_with_child_table(required: bool) -> Value {
+        json!({
+            "fields": [
+                {
+                    "field_id": "fld_line_items",
+                    "key": "line_items",
+                    "type": "child_table",
+                    "required": required
+                },
+                {"field_id": "fld_notes", "key": "notes", "type": "child_table"}
+            ]
+        })
+    }
+
+    #[test]
+    fn archiving_the_last_row_of_a_required_child_table_is_refused() {
+        let schema = parent_schema_with_child_table(true);
+
+        assert!(
+            required_child_table_would_be_emptied(&schema, "line_items", 0).expect("a well formed schema must parse"),
+            "the required child table would be left with no rows"
+        );
+    }
+
+    #[test]
+    fn archiving_a_child_row_is_allowed_while_siblings_or_requiredness_remain_absent() {
+        let required = parent_schema_with_child_table(true);
+        let optional = parent_schema_with_child_table(false);
+
+        // A sibling row keeps the constraint satisfied.
+        assert!(!required_child_table_would_be_emptied(&required, "line_items", 1).expect("schema must parse"));
+        // An optional child table may be emptied.
+        assert!(!required_child_table_would_be_emptied(&optional, "line_items", 0).expect("schema must parse"));
+        // A relation key that is not a required child table on this parent is none of our business.
+        assert!(!required_child_table_would_be_emptied(&required, "notes", 0).expect("schema must parse"));
+    }
+
+    #[test]
+    fn the_required_child_table_query_counts_live_siblings_only() {
+        // The guard must not count the record being archived, already archived rows, rows under a
+        // different relation key, or rows belonging to a different parent.
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling.id <> child.id"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling.archived_at IS NULL"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling_links.relation_key = links.relation_key"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling_links.source_record_id = links.source_record_id"));
+        // Tenancy: a forged link must not drag in another workspace's rows.
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("parent.workspace_id = child.workspace_id"));
+        assert!(PARENT_REQUIRED_CHILD_TABLES_SQL.contains("sibling.workspace_id = parent.workspace_id"));
     }
 
     #[test]
@@ -7400,6 +7593,49 @@ mod tests {
             .delete(&file_name)
             .await
             .expect("import artifact cleanup should succeed");
+    }
+
+    #[test]
+    fn a_record_write_claiming_a_signature_object_is_screened() {
+        let file_name = format!("signature-approval-{}.png", Uuid::new_v4());
+        let url = format!("/api/v1/uploads/signatures/{file_name}");
+
+        let claimed = record_claimed_object_keys(&json!({"approval": url, "notes": "signed"}), None);
+
+        assert_eq!(claimed, denied_fields(&[&format!("signatures/{file_name}")]));
+    }
+
+    #[test]
+    fn re_saving_an_unchanged_signature_value_claims_nothing() {
+        let file_name = format!("signature-approval-{}.png", Uuid::new_v4());
+        let url = format!("/api/v1/uploads/signatures/{file_name}");
+        let stored = json!({"approval": url.clone()});
+
+        assert!(record_claimed_object_keys(&json!({"approval": url}), Some(&stored)).is_empty());
+    }
+
+    #[test]
+    fn replacing_a_signature_value_screens_only_the_new_object() {
+        let previous = format!("signature-approval-{}.png", Uuid::new_v4());
+        let replacement = format!("signature-approval-{}.png", Uuid::new_v4());
+        let stored = json!({"approval": format!("/api/v1/uploads/signatures/{previous}")});
+
+        let claimed = record_claimed_object_keys(
+            &json!({"approval": format!("/api/v1/uploads/signatures/{replacement}")}),
+            Some(&stored),
+        );
+
+        assert_eq!(claimed, denied_fields(&[&format!("signatures/{replacement}")]));
+    }
+
+    #[test]
+    fn ordinary_record_values_are_not_treated_as_object_claims() {
+        let claimed = record_claimed_object_keys(
+            &json!({"notes": "/api/v1/uploads/signatures/signature-approval-not-a-uuid.png", "amount": 12}),
+            None,
+        );
+
+        assert!(claimed.is_empty());
     }
 
     fn test_form_response(schema: serde_json::Value) -> super::FormResponse {

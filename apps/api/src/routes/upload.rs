@@ -914,6 +914,25 @@ fn signature_field_key_from_file_name(file_name: &str) -> Option<&str> {
     Some(field_key)
 }
 
+/// The signature object a record value would claim ownership of, if any.
+///
+/// `resolve_signature_object_owner` decides who owns a materialized signature by looking for records
+/// whose `values` contain `{field_key: "/api/v1/uploads/signatures/{file}"}`, with `field_key`
+/// derived from the file name. Storing that exact pair therefore rewrites the object's ownership,
+/// which is why record writes have to be screened the same way attachment registrations are. The
+/// match is deliberately as narrow as the lookup: a different field key, the legacy `/uploads/`
+/// spelling or any surrounding text cannot influence ownership and must not be rejected.
+pub(crate) fn signature_object_key_claimed_by_record_value(field_key: &str, value: &str) -> Option<String> {
+    let file_name = value.strip_prefix("/api/v1/uploads/signatures/")?;
+    if !is_safe_upload_file_name(file_name) {
+        return None;
+    }
+    if signature_field_key_from_file_name(file_name)? != field_key {
+        return None;
+    }
+    Some(format!("signatures/{file_name}"))
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 fn sign_signature_download(secret: &str, file_name: &str, expires: i64) -> Result<String, ApiError> {
@@ -1503,5 +1522,42 @@ mod tests {
         body.extend_from_slice(data);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         body
+    }
+
+    #[test]
+    fn a_record_value_holding_a_signature_url_claims_that_object() {
+        let file_name = format!("signature-approval-{}.png", Uuid::new_v4());
+
+        assert_eq!(
+            signature_object_key_claimed_by_record_value(
+                "approval",
+                &format!("/api/v1/uploads/signatures/{file_name}")
+            ),
+            Some(format!("signatures/{file_name}"))
+        );
+    }
+
+    #[test]
+    fn only_values_the_ownership_lookup_matches_count_as_a_claim() {
+        let file_name = format!("signature-approval-{}.png", Uuid::new_v4());
+        let url = format!("/api/v1/uploads/signatures/{file_name}");
+
+        // A different field key cannot influence the lookup, which keys off the file name.
+        assert_eq!(signature_object_key_claimed_by_record_value("notes", &url), None);
+        // The legacy spelling is not what the lookup matches on.
+        assert_eq!(
+            signature_object_key_claimed_by_record_value("approval", &format!("/uploads/signatures/{file_name}")),
+            None
+        );
+        // Free text that merely mentions the URL is not an exact value match either.
+        assert_eq!(
+            signature_object_key_claimed_by_record_value("approval", &format!("see {url}")),
+            None
+        );
+        assert_eq!(
+            signature_object_key_claimed_by_record_value("approval", "/api/v1/uploads/signatures/../../etc/passwd"),
+            None
+        );
+        assert_eq!(signature_object_key_claimed_by_record_value("approval", "Ada"), None);
     }
 }

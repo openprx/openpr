@@ -4,19 +4,46 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 /// The `OpenPR` API always answers with HTTP 200 and carries the real status in the
-/// response envelope (`{ "code": 0, "message": "...", "data": ... }`), see
-/// `apps/api/src/error.rs`. Any non-zero `code` is an API error and must never be
-/// handed to callers as a successful payload.
+/// response envelope (`{ "code": 0, "message": "...", "data": ... }`): every handler
+/// returns `ApiResponse<T>` (`apps/api/src/response.rs`) and every failure returns
+/// `ApiError` (`apps/api/src/error.rs`). Any non-zero `code` is an API error and must
+/// never be handed to callers as a successful payload.
+///
+/// A payload that is not such an envelope is rejected instead of being accepted as
+/// success. Treating "no `code` field" as success was a fail-open default: an empty
+/// body, a `204`, a proxy/error page or any response reached through a smuggled URL
+/// looked exactly like a successful call, which is precisely how a policy lookup that
+/// never hit `/agent-policy` could still authorize a tool.
 fn check_response_envelope(payload: &Value, path: &str) -> Result<(), String> {
-    match payload.get("code").and_then(Value::as_i64) {
-        None | Some(0) => Ok(()),
+    let Some(envelope) = payload.as_object() else {
+        return Err(format!(
+            "Malformed response from {path}: expected a {{code, message, data}} envelope, got {}",
+            describe_json_kind(payload)
+        ));
+    };
+    match envelope.get("code").and_then(Value::as_i64) {
+        Some(0) => Ok(()),
         Some(code) => {
-            let message = payload
+            let message = envelope
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown API error");
             Err(format!("API error {code} from {path}: {message}"))
         }
+        None => Err(format!(
+            "Malformed response from {path}: the {{code, message, data}} envelope carries no integer `code`"
+        )),
+    }
+}
+
+const fn describe_json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "an empty body",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
     }
 }
 
@@ -182,32 +209,47 @@ impl OpenPrClient {
     // ---- Projects ----
 
     pub async fn list_projects(&self) -> Result<Value, String> {
-        self.get(&format!("/api/v1/workspaces/{}/projects", self.workspace_id))
-            .await
+        self.get(&format!(
+            "/api/v1/workspaces/{}/projects",
+            urlencoding::encode(&self.workspace_id)
+        ))
+        .await
     }
 
     pub async fn get_project(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}")).await
-    }
-
-    pub async fn create_project(&self, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/workspaces/{}/projects", self.workspace_id), &body)
+        self.get(&format!("/api/v1/projects/{}", urlencoding::encode(project_id)))
             .await
     }
 
+    pub async fn create_project(&self, body: Value) -> Result<Value, String> {
+        self.post(
+            &format!(
+                "/api/v1/workspaces/{}/projects",
+                urlencoding::encode(&self.workspace_id)
+            ),
+            &body,
+        )
+        .await
+    }
+
     pub async fn update_project(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.patch(&format!("/api/v1/projects/{project_id}"), &body).await
+        self.patch(&format!("/api/v1/projects/{}", urlencoding::encode(project_id)), &body)
+            .await
     }
 
     pub async fn delete_project(&self, project_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/projects/{project_id}")).await
+        self.delete(&format!("/api/v1/projects/{}", urlencoding::encode(project_id)))
+            .await
     }
 
     // ---- Project Types / Resources ----
 
     pub async fn list_project_types(&self) -> Result<Value, String> {
-        self.get(&format!("/api/v1/workspaces/{}/project-types", self.workspace_id))
-            .await
+        self.get(&format!(
+            "/api/v1/workspaces/{}/project-types",
+            urlencoding::encode(&self.workspace_id)
+        ))
+        .await
     }
 
     pub async fn get_project_type(&self, key: &str) -> Result<Value, String> {
@@ -243,7 +285,8 @@ impl OpenPrClient {
     pub async fn install_scenario_template(&self, project_id: &str, template_key: &str) -> Result<Value, String> {
         self.post(
             &format!(
-                "/api/v1/projects/{project_id}/scenario-templates/{}/install",
+                "/api/v1/projects/{}/scenario-templates/{}/install",
+                urlencoding::encode(project_id),
                 urlencoding::encode(template_key)
             ),
             &serde_json::json!({}),
@@ -252,12 +295,19 @@ impl OpenPrClient {
     }
 
     pub async fn list_project_resources(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/resources")).await
+        self.get(&format!(
+            "/api/v1/projects/{}/resources",
+            urlencoding::encode(project_id)
+        ))
+        .await
     }
 
     pub async fn create_project_resource(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/resources"), &body)
-            .await
+        self.post(
+            &format!("/api/v1/projects/{}/resources", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn update_project_resource(
@@ -266,28 +316,42 @@ impl OpenPrClient {
         resource_id: &str,
         body: Value,
     ) -> Result<Value, String> {
-        self.patch(&format!("/api/v1/projects/{project_id}/resources/{resource_id}"), &body)
-            .await
+        self.patch(
+            &format!(
+                "/api/v1/projects/{}/resources/{}",
+                urlencoding::encode(project_id),
+                urlencoding::encode(resource_id)
+            ),
+            &body,
+        )
+        .await
     }
 
     pub async fn delete_project_resource(&self, project_id: &str, resource_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/projects/{project_id}/resources/{resource_id}"))
-            .await
+        self.delete(&format!(
+            "/api/v1/projects/{}/resources/{}",
+            urlencoding::encode(project_id),
+            urlencoding::encode(resource_id)
+        ))
+        .await
     }
 
     // ---- Connectors / Invocations ----
 
-    pub async fn list_connectors(&self, project_id: Option<&str>, kind: Option<&str>) -> Result<Value, String> {
-        let mut params = Vec::new();
-        if let Some(project_id) = project_id {
-            params.push(format!("project_id={}", urlencoding::encode(project_id)));
-        }
+    /// Lists the connectors of one project.
+    ///
+    /// `project_id` is not optional on purpose. The endpoint is workspace addressed and
+    /// returns *every* connector in the workspace when the filter is omitted, so an
+    /// optional project would let a caller skip the project agent policy simply by not
+    /// naming a project. There is no client-side way to ask for the workspace wide list.
+    pub async fn list_connectors(&self, project_id: &str, kind: Option<&str>) -> Result<Value, String> {
+        let mut params = vec![format!("project_id={}", urlencoding::encode(project_id))];
         if let Some(kind) = kind {
             params.push(format!("kind={}", urlencoding::encode(kind)));
         }
         self.get(&format!(
             "/api/v1/workspaces/{}/connectors{}",
-            self.workspace_id,
+            urlencoding::encode(&self.workspace_id),
             join_query(&params)
         ))
         .await
@@ -296,7 +360,7 @@ impl OpenPrClient {
     pub async fn get_connector(&self, connector_id: &str) -> Result<Value, String> {
         self.get(&format!(
             "/api/v1/workspaces/{}/connectors/{}",
-            self.workspace_id,
+            urlencoding::encode(&self.workspace_id),
             urlencoding::encode(connector_id)
         ))
         .await
@@ -320,7 +384,8 @@ impl OpenPrClient {
             params.push(format!("per_page={per_page}"));
         }
         self.get(&format!(
-            "/api/v1/projects/{project_id}/invocations{}",
+            "/api/v1/projects/{}/invocations{}",
+            urlencoding::encode(project_id),
             join_query(&params)
         ))
         .await
@@ -332,8 +397,11 @@ impl OpenPrClient {
     }
 
     pub async fn create_invocation(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/invocations"), &body)
-            .await
+        self.post(
+            &format!("/api/v1/projects/{}/invocations", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn report_invocation_progress(&self, invocation_id: &str, body: Value) -> Result<Value, String> {
@@ -383,8 +451,12 @@ impl OpenPrClient {
         if let Some(per_page) = per_page {
             query.push(format!("per_page={per_page}"));
         }
-        self.get(&format!("/api/v1/projects/{project_id}/forms{}", join_query(&query)))
-            .await
+        self.get(&format!(
+            "/api/v1/projects/{}/forms{}",
+            urlencoding::encode(project_id),
+            join_query(&query)
+        ))
+        .await
     }
 
     pub async fn get_form(&self, form_id: &str) -> Result<Value, String> {
@@ -393,12 +465,22 @@ impl OpenPrClient {
     }
 
     pub async fn create_form(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/forms"), &body).await
+        self.post(
+            &format!("/api/v1/projects/{}/forms", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn create_form_from_template(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/forms/from-template"), &body)
-            .await
+        self.post(
+            &format!(
+                "/api/v1/projects/{}/forms/from-template",
+                urlencoding::encode(project_id)
+            ),
+            &body,
+        )
+        .await
     }
 
     pub async fn update_form_schema(&self, form_id: &str, body: Value) -> Result<Value, String> {
@@ -859,8 +941,12 @@ impl OpenPrClient {
         if let Some(per_page) = per_page {
             params.push(format!("per_page={per_page}"));
         }
-        self.get(&format!("/api/v1/projects/{project_id}/plugins{}", join_query(&params)))
-            .await
+        self.get(&format!(
+            "/api/v1/projects/{}/plugins{}",
+            urlencoding::encode(project_id),
+            join_query(&params)
+        ))
+        .await
     }
 
     pub async fn get_plugin(&self, plugin_id: &str) -> Result<Value, String> {
@@ -869,8 +955,11 @@ impl OpenPrClient {
     }
 
     pub async fn install_plugin(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/plugins"), &body)
-            .await
+        self.post(
+            &format!("/api/v1/projects/{}/plugins", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn invoke_plugin(&self, plugin_id: &str, body: Value) -> Result<Value, String> {
@@ -905,21 +994,32 @@ impl OpenPrClient {
     // ---- Project Context ----
 
     pub async fn get_project_context(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/context")).await
+        self.get(&format!("/api/v1/projects/{}/context", urlencoding::encode(project_id)))
+            .await
     }
 
     pub async fn get_project_governance_context(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/governance-context"))
-            .await
+        self.get(&format!(
+            "/api/v1/projects/{}/governance-context",
+            urlencoding::encode(project_id)
+        ))
+        .await
     }
 
     pub async fn get_project_agent_policy(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/agent-policy")).await
+        self.get(&format!(
+            "/api/v1/projects/{}/agent-policy",
+            urlencoding::encode(project_id)
+        ))
+        .await
     }
 
     pub async fn get_project_release_readiness(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/release-readiness"))
-            .await
+        self.get(&format!(
+            "/api/v1/projects/{}/release-readiness",
+            urlencoding::encode(project_id)
+        ))
+        .await
     }
 
     // ---- Work Items / Issues ----
@@ -953,24 +1053,35 @@ impl OpenPrClient {
         if let Some(sort_order) = query.sort_order {
             params.push(format!("sort_order={}", urlencoding::encode(sort_order)));
         }
-        self.get(&format!("/api/v1/projects/{project_id}/issues{}", join_query(&params)))
-            .await
+        self.get(&format!(
+            "/api/v1/projects/{}/issues{}",
+            urlencoding::encode(project_id),
+            join_query(&params)
+        ))
+        .await
     }
 
     pub async fn get_work_item(&self, work_item_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/issues/{work_item_id}")).await
+        self.get(&format!("/api/v1/issues/{}", urlencoding::encode(work_item_id)))
+            .await
     }
 
     pub async fn create_work_item(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/issues"), &body).await
+        self.post(
+            &format!("/api/v1/projects/{}/issues", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn update_work_item(&self, work_item_id: &str, body: Value) -> Result<Value, String> {
-        self.put(&format!("/api/v1/issues/{work_item_id}"), &body).await
+        self.put(&format!("/api/v1/issues/{}", urlencoding::encode(work_item_id)), &body)
+            .await
     }
 
     pub async fn delete_work_item(&self, work_item_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/issues/{work_item_id}")).await
+        self.delete(&format!("/api/v1/issues/{}", urlencoding::encode(work_item_id)))
+            .await
     }
 
     /// Searches the workspace. `search_type` maps to the backend `type` filter
@@ -988,33 +1099,48 @@ impl OpenPrClient {
 
     pub async fn add_label_to_issue(&self, issue_id: &str, label_id: &str) -> Result<Value, String> {
         self.post(
-            &format!("/api/v1/issues/{issue_id}/labels/{label_id}"),
+            &format!(
+                "/api/v1/issues/{}/labels/{}",
+                urlencoding::encode(issue_id),
+                urlencoding::encode(label_id)
+            ),
             &serde_json::json!({}),
         )
         .await
     }
 
     pub async fn remove_label_from_issue(&self, issue_id: &str, label_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/issues/{issue_id}/labels/{label_id}"))
-            .await
+        self.delete(&format!(
+            "/api/v1/issues/{}/labels/{}",
+            urlencoding::encode(issue_id),
+            urlencoding::encode(label_id)
+        ))
+        .await
     }
 
     pub async fn get_issue_labels(&self, issue_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/issues/{issue_id}/labels")).await
+        self.get(&format!("/api/v1/issues/{}/labels", urlencoding::encode(issue_id)))
+            .await
     }
 
     // ---- Comments ----
 
     pub async fn list_comments(&self, issue_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/issues/{issue_id}/comments")).await
+        self.get(&format!("/api/v1/issues/{}/comments", urlencoding::encode(issue_id)))
+            .await
     }
 
     pub async fn create_comment(&self, issue_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/issues/{issue_id}/comments"), &body).await
+        self.post(
+            &format!("/api/v1/issues/{}/comments", urlencoding::encode(issue_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn delete_comment(&self, comment_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/comments/{comment_id}")).await
+        self.delete(&format!("/api/v1/comments/{}", urlencoding::encode(comment_id)))
+            .await
     }
 
     // ---- Uploads ----
@@ -1109,16 +1235,30 @@ impl OpenPrClient {
     }
 
     pub async fn get_proposal(&self, proposal_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/proposals/{proposal_id}")).await
+        self.get(&format!("/api/v1/proposals/{}", urlencoding::encode(proposal_id)))
+            .await
     }
 
     pub async fn create_proposal(&self, body: Value) -> Result<Value, String> {
         self.post("/api/v1/proposals", &body).await
     }
 
+    /// Reads one check result. Used to resolve the project that owns a check result
+    /// before `proposals.create_from_result` is authorized against a project policy.
+    pub async fn get_check_result(&self, check_result_id: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/check-results/{}",
+            urlencoding::encode(check_result_id)
+        ))
+        .await
+    }
+
     pub async fn create_check_result(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/check-results"), &body)
-            .await
+        self.post(
+            &format!("/api/v1/projects/{}/check-results", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn create_proposal_from_result(&self, check_result_id: &str, body: Value) -> Result<Value, String> {
@@ -1135,43 +1275,59 @@ impl OpenPrClient {
     // ---- Members ----
 
     pub async fn list_members(&self) -> Result<Value, String> {
-        self.get(&format!("/api/v1/workspaces/{}/members", self.workspace_id))
-            .await
+        self.get(&format!(
+            "/api/v1/workspaces/{}/members",
+            urlencoding::encode(&self.workspace_id)
+        ))
+        .await
     }
 
     // ---- Sprints ----
 
     pub async fn create_sprint(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/projects/{project_id}/sprints"), &body)
-            .await
+        self.post(
+            &format!("/api/v1/projects/{}/sprints", urlencoding::encode(project_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn list_sprints(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/sprints")).await
+        self.get(&format!("/api/v1/projects/{}/sprints", urlencoding::encode(project_id)))
+            .await
     }
 
     pub async fn update_sprint(&self, sprint_id: &str, body: Value) -> Result<Value, String> {
-        self.put(&format!("/api/v1/sprints/{sprint_id}"), &body).await
+        self.put(&format!("/api/v1/sprints/{}", urlencoding::encode(sprint_id)), &body)
+            .await
     }
 
     pub async fn delete_sprint(&self, sprint_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/sprints/{sprint_id}")).await
+        self.delete(&format!("/api/v1/sprints/{}", urlencoding::encode(sprint_id)))
+            .await
     }
 
     // ---- Labels ----
 
     pub async fn create_label(&self, body: Value) -> Result<Value, String> {
-        self.post(&format!("/api/v1/workspaces/{}/labels", self.workspace_id), &body)
-            .await
+        self.post(
+            &format!("/api/v1/workspaces/{}/labels", urlencoding::encode(&self.workspace_id)),
+            &body,
+        )
+        .await
     }
 
     pub async fn list_labels(&self) -> Result<Value, String> {
-        self.get(&format!("/api/v1/workspaces/{}/labels", self.workspace_id))
-            .await
+        self.get(&format!(
+            "/api/v1/workspaces/{}/labels",
+            urlencoding::encode(&self.workspace_id)
+        ))
+        .await
     }
 
     pub async fn list_project_labels(&self, project_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/projects/{project_id}/labels")).await
+        self.get(&format!("/api/v1/projects/{}/labels", urlencoding::encode(project_id)))
+            .await
     }
 
     pub async fn get_work_item_by_identifier(&self, identifier: &str) -> Result<Value, String> {
@@ -1184,18 +1340,20 @@ impl OpenPrClient {
 
     pub async fn add_labels_to_issue(&self, issue_id: &str, label_ids: &[String]) -> Result<Value, String> {
         self.post(
-            &format!("/api/v1/issues/{issue_id}/labels/batch"),
+            &format!("/api/v1/issues/{}/labels/batch", urlencoding::encode(issue_id)),
             &serde_json::json!({ "label_ids": label_ids }),
         )
         .await
     }
 
     pub async fn update_label(&self, label_id: &str, body: Value) -> Result<Value, String> {
-        self.put(&format!("/api/v1/labels/{label_id}"), &body).await
+        self.put(&format!("/api/v1/labels/{}", urlencoding::encode(label_id)), &body)
+            .await
     }
 
     pub async fn delete_label(&self, label_id: &str) -> Result<Value, String> {
-        self.delete(&format!("/api/v1/labels/{label_id}")).await
+        self.delete(&format!("/api/v1/labels/{}", urlencoding::encode(label_id)))
+            .await
     }
 }
 
@@ -1276,9 +1434,25 @@ mod tests {
     }
 
     #[test]
-    fn envelope_without_error_code_is_accepted() {
+    fn envelope_with_success_code_is_accepted() {
         assert!(check_response_envelope(&json!({ "code": 0, "data": {} }), "/p").is_ok());
-        assert!(check_response_envelope(&json!({ "items": [] }), "/p").is_ok());
+    }
+
+    /// The previous default accepted every 200 that simply had no `code` field, which
+    /// made an empty body, a `204`, an HTML error page or a response fetched through a
+    /// smuggled path look like a successful API call.
+    #[test]
+    fn payloads_that_are_not_api_envelopes_are_rejected() {
+        for payload in [
+            json!({ "items": [] }),
+            json!({ "code": "0" }),
+            json!(null),
+            json!([]),
+            json!("ok"),
+        ] {
+            let error = check_response_envelope(&payload, "/p").err().unwrap_or_default();
+            assert!(error.contains("Malformed response from /p"), "{payload} -> {error}");
+        }
     }
 
     #[test]

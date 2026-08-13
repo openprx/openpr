@@ -7,6 +7,18 @@ use super::{
     schema::{FormField, parse_fields},
 };
 
+/// The outcome of normalizing a record write.
+///
+/// `unmet_required_fields` lists required fields that were **already** empty on the stored record
+/// and that this write did not address. They are carried over rather than rejected (see the
+/// required-field rule in [`normalize_record_values_report`]), and reported here so the caller is
+/// not left believing the record satisfies its schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedValues {
+    pub values: Value,
+    pub unmet_required_fields: Vec<String>,
+}
+
 pub fn normalize_record_values(schema: &Value, values: Value) -> Result<Value, String> {
     normalize_record_values_with_existing(schema, values, None)
 }
@@ -16,6 +28,43 @@ pub fn normalize_record_values_with_existing(
     values: Value,
     existing_values: Option<&Value>,
 ) -> Result<Value, String> {
+    normalize_record_values_report(schema, values, existing_values).map(|report| report.values)
+}
+
+/// Normalizes a record write and reports required fields it had to carry over.
+///
+/// ## The required-field rule
+///
+/// `required` constrains what a write leaves behind **for the fields that write is responsible
+/// for**. Concretely it is enforced:
+///
+/// - on create, for every field — a record must be born valid;
+/// - on update, for every field the caller actually mentioned — sending `null` / `""` / `[]` for a
+///   required field is an explicit clear and is rejected.
+///
+/// It is deliberately **not** enforced against a field the caller never mentioned that was already
+/// empty (or absent) on the stored record. That state predates the request — a field that turned
+/// required after the record was written, an import, a field this caller cannot even read — and
+/// rejecting the write would make the record permanently unopenable: every update, including the
+/// one that would repair the field, dies on an unrelated field. Such a field is not treated as
+/// filled either: it is listed in [`NormalizedValues::unmet_required_fields`] and the caller
+/// repairs it by sending a valid value in any later write.
+///
+/// ## Why `child_table` is never checked here
+///
+/// Child rows are not part of the parent's `values`. They are separate `form_records` joined
+/// through `form_record_links` (`relation_type = 'parent_child'`, `relation_key` = the field key),
+/// so the field key is always absent from the parent's value map and a values-level check can only
+/// ever answer "empty" — on create (rows cannot reference a parent id that does not exist yet), on
+/// every later update, and even on the system recalculation that runs when the *first* child row is
+/// added. Requiredness for a child table is a statement about the row count, so it is enforced
+/// where the row count can change: `routes::form` refuses to archive the last remaining child row
+/// of a required child table.
+pub fn normalize_record_values_report(
+    schema: &Value,
+    values: Value,
+    existing_values: Option<&Value>,
+) -> Result<NormalizedValues, String> {
     if !values.is_object() {
         return Err("values must be a JSON object".to_string());
     }
@@ -40,6 +89,8 @@ pub fn normalize_record_values_with_existing(
             }
         }
     }
+    let creating = existing_values.is_none();
+    let mut unmet_required_fields = Vec::new();
 
     for field in &fields {
         // A field hidden by its `hidden_when` condition is not visible to the caller, so
@@ -49,17 +100,30 @@ pub fn normalize_record_values_with_existing(
             continue;
         }
         let raw = input.get(&field.key);
-        let required_exempt = field.field_type == "autonumber" || field.field_type == "child_table";
+        // `autonumber` is assigned by the server after this runs, so it is never the caller's job.
+        // `child_table` rows do not live in `values` at all, so nothing here can answer whether one
+        // exists — see the `child_table` section of this function's doc comment.
+        let required_checked_here =
+            field.required && field.field_type != "autonumber" && field.field_type != "child_table";
         if is_missing(raw) {
-            if input.contains_key(&field.key) {
+            let caller_addressed_field = input.contains_key(&field.key);
+            if caller_addressed_field {
                 // The caller explicitly sent an empty/null value: treat it as an explicit
                 // clear and drop any seeded existing value for this field.
                 normalized.remove(&field.key);
             }
             // Otherwise the caller simply did not mention this field; whatever was seeded
             // from `existing_values` for it (if anything) is left untouched.
-            if field.required && !required_exempt && !normalized.contains_key(&field.key) {
-                return Err(format!("field '{}' is required", field.key));
+            // `is_missing` rather than `contains_key`: the seeding loop copies stored values
+            // verbatim, so a legacy `null` / `""` / `[]` left by a schema change must not
+            // satisfy a required field just by being present.
+            if required_checked_here && is_missing(normalized.get(&field.key)) {
+                if creating || caller_addressed_field {
+                    return Err(format!("field '{}' is required", field.key));
+                }
+                // Pre-existing gap this write did not touch: carried over so the record stays
+                // repairable, reported so it is not mistaken for a satisfied constraint.
+                unmet_required_fields.push(field.key.clone());
             }
             continue;
         }
@@ -77,7 +141,10 @@ pub fn normalize_record_values_with_existing(
         normalized.insert(field.key.clone(), value);
     }
 
-    Ok(Value::Object(normalized))
+    Ok(NormalizedValues {
+        values: Value::Object(normalized),
+        unmet_required_fields,
+    })
 }
 
 fn normalize_field_value(field: &FormField, raw: &Value, existing: Option<&Value>) -> Result<Value, String> {
@@ -467,7 +534,9 @@ fn condition_value_string(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_record_values, normalize_record_values_with_existing};
+    use super::{
+        is_missing, normalize_record_values, normalize_record_values_report, normalize_record_values_with_existing,
+    };
     use serde_json::json;
 
     #[test]
@@ -1072,37 +1141,121 @@ mod tests {
         assert!(normalized.get("legacy_field").is_none());
     }
 
-    #[test]
-    fn required_field_omitted_by_caller_uses_existing_value_or_errors_without_one() {
-        let schema = json!({
-            "fields": [{
-                "field_id": "fld_owner",
-                "key": "owner",
-                "type": "text",
-                "required": true
-            }]
-        });
-        let existing = json!({"owner": "Ada"});
-        let normalized = normalize_record_values_with_existing(&schema, json!({}), Some(&existing))
-            .expect("required field preserved from existing should not error");
-        assert_eq!(normalized.get("owner").and_then(serde_json::Value::as_str), Some("Ada"));
-
-        assert!(normalize_record_values_with_existing(&schema, json!({}), Some(&json!({}))).is_err());
-        assert!(normalize_record_values_with_existing(&schema, json!({}), None).is_err());
+    fn required_text_schema() -> serde_json::Value {
+        json!({
+            "fields": [
+                {"field_id": "fld_owner", "key": "owner", "type": "text", "required": true},
+                {"field_id": "fld_note", "key": "note", "type": "text"}
+            ]
+        })
     }
 
     #[test]
-    fn required_child_table_field_does_not_error_on_create() {
-        let schema = json!({
-            "fields": [{
-                "field_id": "fld_line_items",
-                "key": "line_items",
-                "type": "child_table",
-                "required": true
-            }]
-        });
-        let normalized = normalize_record_values(&schema, json!({}))
-            .expect("required child_table should be exempt from creation-time validation");
-        assert!(normalized.get("line_items").is_none());
+    fn required_field_omitted_by_caller_uses_existing_value() {
+        let schema = required_text_schema();
+        let existing = json!({"owner": "Ada"});
+        let report = normalize_record_values_report(&schema, json!({}), Some(&existing))
+            .expect("required field preserved from existing should not error");
+        assert_eq!(
+            report.values.get("owner").and_then(serde_json::Value::as_str),
+            Some("Ada")
+        );
+        assert!(report.unmet_required_fields.is_empty());
+    }
+
+    #[test]
+    fn create_still_rejects_a_missing_required_field() {
+        let schema = required_text_schema();
+        assert_eq!(
+            normalize_record_values(&schema, json!({"note": "n"})).expect_err("create must be born valid"),
+            "field 'owner' is required"
+        );
+    }
+
+    #[test]
+    fn explicitly_clearing_a_required_field_is_still_rejected() {
+        let schema = required_text_schema();
+        let existing = json!({"owner": "Ada"});
+
+        for cleared in [json!({"owner": null}), json!({"owner": "  "})] {
+            assert_eq!(
+                normalize_record_values_with_existing(&schema, cleared, Some(&existing))
+                    .expect_err("a caller may not empty a required field"),
+                "field 'owner' is required"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_empty_required_value_is_reported_but_never_locks_the_record() {
+        let schema = required_text_schema();
+
+        // A field that turned required after these records were written, or an import that left it
+        // empty. Rejecting the update would leave no way to reach the record at all.
+        for existing in [json!({"owner": null}), json!({"owner": "   "}), json!({})] {
+            let report = normalize_record_values_report(&schema, json!({"note": "still editable"}), Some(&existing))
+                .expect("a pre-existing gap must not block an unrelated update");
+            assert_eq!(
+                report.values.get("note").and_then(serde_json::Value::as_str),
+                Some("still editable")
+            );
+            // The gap is carried over, not blessed: the stored empty value is not kept as if it
+            // satisfied the constraint, and it is reported to the caller.
+            assert!(is_missing(report.values.get("owner")));
+            assert_eq!(report.unmet_required_fields, vec!["owner".to_string()]);
+        }
+    }
+
+    #[test]
+    fn a_stored_empty_required_value_can_be_repaired_by_the_next_update() {
+        let schema = required_text_schema();
+        let existing = json!({"owner": "", "note": "n"});
+
+        let report = normalize_record_values_report(&schema, json!({"owner": "Ada"}), Some(&existing))
+            .expect("supplying the missing value must be accepted");
+        assert_eq!(
+            report.values.get("owner").and_then(serde_json::Value::as_str),
+            Some("Ada")
+        );
+        assert!(report.unmet_required_fields.is_empty());
+    }
+
+    fn required_child_table_schema() -> serde_json::Value {
+        json!({
+            "fields": [
+                {
+                    "field_id": "fld_line_items",
+                    "key": "line_items",
+                    "type": "child_table",
+                    "required": true
+                },
+                {"field_id": "fld_note", "key": "note", "type": "text"}
+            ]
+        })
+    }
+
+    #[test]
+    fn required_child_table_never_blocks_a_parent_write() {
+        let schema = required_child_table_schema();
+
+        // Child rows are separate records linked by `form_record_links`; the parent's value map
+        // never carries them, so no answer given here could be right. Creating the parent, updating
+        // it afterwards, and the system recalculation that runs when the first child row is added
+        // all pass through untouched.
+        let created = normalize_record_values(&schema, json!({"note": "new order"}))
+            .expect("a parent must be creatable before its rows exist");
+        assert!(created.get("line_items").is_none());
+
+        for existing in [json!({}), json!({"line_items": []}), json!({"line_items": null})] {
+            let report = normalize_record_values_report(&schema, json!({"note": "edited"}), Some(&existing))
+                .expect("a child table must never make the parent record unwritable");
+            assert_eq!(
+                report.values.get("note").and_then(serde_json::Value::as_str),
+                Some("edited")
+            );
+            // Not reported as a value-level gap either: requiredness here is about the row count,
+            // which `routes::form` enforces when the last row is archived.
+            assert!(report.unmet_required_fields.is_empty());
+        }
     }
 }

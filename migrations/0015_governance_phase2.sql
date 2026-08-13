@@ -148,7 +148,7 @@ DO $$
 BEGIN
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'decision_domains'
+    WHERE table_schema = current_schema() AND table_name = 'decision_domains'
       AND column_name = 'project_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE decision_domains ALTER COLUMN project_id TYPE uuid USING project_id::uuid';
@@ -156,7 +156,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'trust_scores'
+    WHERE table_schema = current_schema() AND table_name = 'trust_scores'
       AND column_name = 'user_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE trust_scores ALTER COLUMN user_id TYPE uuid USING user_id::uuid';
@@ -164,7 +164,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'trust_scores'
+    WHERE table_schema = current_schema() AND table_name = 'trust_scores'
       AND column_name = 'project_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE trust_scores ALTER COLUMN project_id TYPE uuid USING project_id::uuid';
@@ -172,7 +172,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'trust_score_logs'
+    WHERE table_schema = current_schema() AND table_name = 'trust_score_logs'
       AND column_name = 'user_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE trust_score_logs ALTER COLUMN user_id TYPE uuid USING user_id::uuid';
@@ -180,7 +180,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'trust_score_logs'
+    WHERE table_schema = current_schema() AND table_name = 'trust_score_logs'
       AND column_name = 'project_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE trust_score_logs ALTER COLUMN project_id TYPE uuid USING project_id::uuid';
@@ -188,7 +188,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'ai_participants'
+    WHERE table_schema = current_schema() AND table_name = 'ai_participants'
       AND column_name = 'project_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE ai_participants ALTER COLUMN project_id TYPE uuid USING project_id::uuid';
@@ -196,7 +196,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'ai_participants'
+    WHERE table_schema = current_schema() AND table_name = 'ai_participants'
       AND column_name = 'registered_by' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE ai_participants ALTER COLUMN registered_by TYPE uuid USING registered_by::uuid';
@@ -204,7 +204,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'vetoers'
+    WHERE table_schema = current_schema() AND table_name = 'vetoers'
       AND column_name = 'user_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE vetoers ALTER COLUMN user_id TYPE uuid USING user_id::uuid';
@@ -212,7 +212,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'vetoers'
+    WHERE table_schema = current_schema() AND table_name = 'vetoers'
       AND column_name = 'project_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE vetoers ALTER COLUMN project_id TYPE uuid USING project_id::uuid';
@@ -220,7 +220,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'veto_events'
+    WHERE table_schema = current_schema() AND table_name = 'veto_events'
       AND column_name = 'proposal_id' AND data_type = 'character varying'
   ) THEN
     EXECUTE 'ALTER TABLE veto_events ALTER COLUMN proposal_id TYPE text';
@@ -228,7 +228,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'veto_events'
+    WHERE table_schema = current_schema() AND table_name = 'veto_events'
       AND column_name = 'vetoer_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE veto_events ALTER COLUMN vetoer_id TYPE uuid USING vetoer_id::uuid';
@@ -236,7 +236,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'appeals'
+    WHERE table_schema = current_schema() AND table_name = 'appeals'
       AND column_name = 'appellant_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE appeals ALTER COLUMN appellant_id TYPE uuid USING appellant_id::uuid';
@@ -244,7 +244,7 @@ BEGIN
 
   IF EXISTS (
     SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'appeals'
+    WHERE table_schema = current_schema() AND table_name = 'appeals'
       AND column_name = 'reviewer_id' AND data_type <> 'uuid'
   ) THEN
     EXECUTE 'ALTER TABLE appeals ALTER COLUMN reviewer_id TYPE uuid USING reviewer_id::uuid';

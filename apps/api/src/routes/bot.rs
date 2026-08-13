@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
+use crate::middleware::bot_auth::{BotAuthContext, BotPermission, bot_permissions_allow, require_workspace_access};
 use crate::{error::ApiError, response::ApiResponse};
 
 // ============================================================================
@@ -21,7 +21,12 @@ use crate::{error::ApiError, response::ApiResponse};
 #[derive(Debug, Deserialize)]
 pub struct CreateBotRequest {
     pub name: String,
-    /// Permissions array, defaults to ["read"]
+    /// Permissions array, defaults to `["read"]`.
+    ///
+    /// `read` reaches every safe HTTP method, `write` adds the unsafe ones, `admin` additionally
+    /// makes the token count as a workspace administrator. Each implies the ones before it, so
+    /// `["write"]` and `["read","write"]` are the same token. An empty array is rejected rather
+    /// than issued as a token that can do nothing.
     pub permissions: Option<Vec<String>>,
     /// RFC3339 expiry, None = never
     pub expires_at: Option<String>,
@@ -80,11 +85,38 @@ fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext
 }
 
 fn workspace_role_from_permissions(perms: &[String]) -> &'static str {
-    if perms.iter().any(|p| p == "admin") {
+    if bot_permissions_allow(perms, BotPermission::Admin) {
         "admin"
     } else {
         "member"
     }
+}
+
+/// Validate and canonicalize the permission list a bot token will carry.
+///
+/// The stored array is what every request is judged against, so it has to be exactly the vocabulary
+/// the enforcement side understands: unknown names grant nothing there and would silently produce an
+/// inert token here. Duplicates are collapsed so the stored value reads the same as it behaves.
+fn normalize_bot_permissions(permissions: Vec<String>) -> Result<Vec<String>, ApiError> {
+    const VALID_PERMISSIONS: [&str; 3] = ["read", "write", "admin"];
+    let mut normalized: Vec<String> = Vec::with_capacity(permissions.len());
+    for permission in permissions {
+        let permission = permission.trim();
+        if !VALID_PERMISSIONS.contains(&permission) {
+            return Err(ApiError::BadRequest(format!(
+                "invalid permission '{permission}', must be one of: read, write, admin"
+            )));
+        }
+        if !normalized.iter().any(|kept| kept == permission) {
+            normalized.push(permission.to_string());
+        }
+    }
+    if normalized.is_empty() {
+        return Err(ApiError::BadRequest(
+            "permissions must contain at least one of: read, write, admin".to_string(),
+        ));
+    }
+    Ok(normalized)
 }
 
 // ============================================================================
@@ -114,16 +146,7 @@ pub async fn create_bot(
         ));
     }
 
-    let perms = req.permissions.unwrap_or_else(|| vec!["read".to_string()]);
-    let valid_perms = ["read", "write", "admin"];
-    for p in &perms {
-        if !valid_perms.contains(&p.as_str()) {
-            return Err(ApiError::BadRequest(format!(
-                "invalid permission '{}', must be one of: read, write, admin",
-                p
-            )));
-        }
-    }
+    let perms = normalize_bot_permissions(req.permissions.unwrap_or_else(|| vec!["read".to_string()]))?;
 
     let expires_at: Option<chrono::DateTime<Utc>> = match req.expires_at {
         Some(ref s) => Some(
@@ -316,4 +339,33 @@ pub async fn revoke_bot(
         .await?;
 
     Ok(ApiResponse::ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_bot_permissions, workspace_role_from_permissions};
+
+    #[test]
+    fn permissions_are_canonicalized_and_deduplicated() {
+        let normalized = normalize_bot_permissions(vec![" read ".to_string(), "write".to_string(), "read".to_string()])
+            .expect("known permissions are accepted");
+
+        assert_eq!(normalized, vec!["read".to_string(), "write".to_string()]);
+    }
+
+    #[test]
+    fn a_token_that_could_do_nothing_is_not_issued() {
+        assert!(normalize_bot_permissions(Vec::new()).is_err());
+        assert!(normalize_bot_permissions(vec!["Read".to_string()]).is_err());
+        assert!(normalize_bot_permissions(vec!["owner".to_string()]).is_err());
+    }
+
+    #[test]
+    fn only_the_admin_permission_seats_the_bot_as_a_workspace_admin() {
+        assert_eq!(workspace_role_from_permissions(&["admin".to_string()]), "admin");
+        assert_eq!(
+            workspace_role_from_permissions(&["read".to_string(), "write".to_string()]),
+            "member"
+        );
+    }
 }

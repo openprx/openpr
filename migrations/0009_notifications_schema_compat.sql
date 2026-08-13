@@ -19,7 +19,7 @@ BEGIN
     IF EXISTS (
         SELECT 1
         FROM information_schema.columns
-        WHERE table_schema = 'public'
+        WHERE table_schema = current_schema()
           AND table_name = 'notifications'
           AND column_name = 'kind'
     ) THEN
@@ -43,7 +43,7 @@ BEGIN
     IF EXISTS (
         SELECT 1
         FROM information_schema.columns
-        WHERE table_schema = 'public'
+        WHERE table_schema = current_schema()
           AND table_name = 'notifications'
           AND column_name = 'payload'
     ) THEN

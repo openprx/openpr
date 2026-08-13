@@ -11,6 +11,15 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use uuid::Uuid;
 
+use crate::routes::connector::{truncate_string, validate_outbound_url};
+
+/// Hard cap on the response body pulled from a webhook receiver.
+///
+/// Matches the connector delivery path so both outbound pipelines behave the same way.
+const WEBHOOK_RESPONSE_BYTE_LIMIT: usize = 64 * 1024;
+/// Characters of receiver diagnostics persisted on `webhook_deliveries`.
+const WEBHOOK_DIAGNOSTIC_CHARS: usize = 2_000;
+
 #[derive(Debug, Clone, Copy)]
 pub enum WebhookEvent {
     IssueCreated,
@@ -828,55 +837,132 @@ async fn deliver_webhook(
         "X-Webhook-Delivery": delivery_id,
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| sea_orm::DbErr::Custom(format!("build reqwest client failed: {e}")))?;
+    let payload_json = serde_json::to_value(&payload)
+        .map_err(|e| sea_orm::DbErr::Custom(format!("serialize payload json failed: {e}")))?;
+
+    // The stored URL is re-validated on every delivery, not only when the webhook was saved: the
+    // row may predate the checks, may have been edited by another path, and DNS for a host that
+    // passed yesterday can point at an internal address today.
+    let target = match validate_outbound_url(&webhook.url).await {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::warn!(webhook_id = %webhook.id, error = %err, "webhook target refused, delivery not attempted");
+            let record = DeliveryRecord {
+                webhook_id: webhook.id,
+                event: payload.event.clone(),
+                payload: payload_json,
+                request_headers,
+                response_status: None,
+                response_body: None,
+                error: Some(truncate_string(
+                    format!("outbound target refused: {err}"),
+                    WEBHOOK_DIAGNOSTIC_CHARS,
+                )),
+                duration_ms: Some(0),
+                success: false,
+                delivered_at: Utc::now(),
+            };
+            if let Err(record_err) = record_delivery(state, record).await {
+                tracing::warn!(webhook_id = %webhook.id, error = %record_err, "webhook delivery record not stored");
+            }
+            return Ok(());
+        }
+    };
+
+    let client =
+        build_delivery_client().map_err(|e| sea_orm::DbErr::Custom(format!("build reqwest client failed: {e}")))?;
 
     let started = Instant::now();
-    let sent = client.post(&webhook.url).headers(headers).body(body).send().await;
+    let sent = client.post(target).headers(headers).body(body).send().await;
 
     let (response_status, response_body, error, success) = match sent {
         Ok(resp) => {
             let status = resp.status().as_u16() as i32;
             let success = resp.status().is_success();
-            let text = resp.text().await.ok();
-            (Some(status), text, None, success)
+            let text = truncate_string(
+                read_capped_body(resp, WEBHOOK_RESPONSE_BYTE_LIMIT).await,
+                WEBHOOK_DIAGNOSTIC_CHARS,
+            );
+            (Some(status), Some(text), None, success)
         }
-        Err(err) => (None, None, Some(err.to_string()), false),
+        Err(err) => (
+            None,
+            None,
+            Some(truncate_string(err.to_string(), WEBHOOK_DIAGNOSTIC_CHARS)),
+            false,
+        ),
     };
 
     let duration_ms = started.elapsed().as_millis() as i64;
-    let payload_json = serde_json::to_value(&payload)
-        .map_err(|e| sea_orm::DbErr::Custom(format!("serialize payload json failed: {e}")))?;
 
-    let _ = record_delivery(
-        state,
-        DeliveryRecord {
-            webhook_id: webhook.id,
-            event: payload.event.clone(),
-            payload: payload_json,
-            request_headers,
-            response_status,
-            response_body,
-            error,
-            duration_ms: Some(duration_ms),
-            success,
-            delivered_at: Utc::now(),
-        },
-    )
-    .await;
+    let record = DeliveryRecord {
+        webhook_id: webhook.id,
+        event: payload.event.clone(),
+        payload: payload_json,
+        request_headers,
+        response_status,
+        response_body,
+        error,
+        duration_ms: Some(duration_ms),
+        success,
+        delivered_at: Utc::now(),
+    };
+    if let Err(record_err) = record_delivery(state, record).await {
+        tracing::warn!(webhook_id = %webhook.id, error = %record_err, "webhook delivery record not stored");
+    }
 
-    let _ = state
+    if let Err(err) = state
         .db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "UPDATE webhooks SET last_triggered_at = $1 WHERE id = $2",
             vec![Utc::now().into(), webhook.id.into()],
         ))
-        .await;
+        .await
+    {
+        tracing::warn!(webhook_id = %webhook.id, error = %err, "webhook last_triggered_at not updated");
+    }
 
     Ok(())
+}
+
+/// Client used for legacy webhook deliveries.
+///
+/// Redirects are disabled so a target that passed [`validate_outbound_url`] cannot bounce the
+/// signed request into the internal network afterwards: the checks run against the host that was
+/// validated, and a 302 would move the request to a host that never was.
+fn build_delivery_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Reads at most `limit` bytes of the response.
+///
+/// `Response::text` pulls the whole body into memory, so a hostile or broken receiver could answer
+/// a webhook delivery with an unbounded stream and exhaust the API process, and whatever it sent
+/// was then stored verbatim in `webhook_deliveries`.
+async fn read_capped_body(mut response: reqwest::Response, limit: usize) -> String {
+    let mut collected: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = limit.saturating_sub(collected.len());
+                if remaining == 0 {
+                    break;
+                }
+                collected.extend(chunk.iter().take(remaining).copied());
+            }
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(error = %err, "webhook response body read failed");
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&collected).into_owned()
 }
 
 async fn record_delivery(state: &AppState, rec: DeliveryRecord) -> Result<(), sea_orm::DbErr> {
@@ -1009,5 +1095,98 @@ fn default_trigger_reason(event: WebhookEvent) -> &'static str {
         WebhookEvent::AiTaskCompleted => "completed",
         WebhookEvent::AiTaskFailed => "failed",
         _ => "assigned",
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    use super::{
+        WEBHOOK_DIAGNOSTIC_CHARS, WEBHOOK_RESPONSE_BYTE_LIMIT, build_delivery_client, read_capped_body,
+        validate_outbound_url,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Serves one request with a fixed raw HTTP response and returns the URL to hit.
+    async fn serve_once(response: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port must be bindable");
+        let addr = listener.local_addr().expect("the bound port must be readable");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut discard = [0_u8; 2048];
+                let _read = socket.read(&mut discard).await;
+                let _written = socket.write_all(&response).await;
+                let _flushed = socket.flush().await;
+            }
+        });
+        format!("http://{addr}/hook")
+    }
+
+    /// A receiver that answers a delivery with an unbounded body must not be able to pull the API
+    /// process down with it, and whatever it did send must not land verbatim in webhook_deliveries.
+    #[tokio::test]
+    async fn a_response_body_is_capped_before_it_is_stored() {
+        let oversized = "A".repeat(WEBHOOK_RESPONSE_BYTE_LIMIT * 2);
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\n\r\n{oversized}",
+            oversized.len()
+        );
+        let url = serve_once(raw.into_bytes()).await;
+
+        let client = build_delivery_client().expect("client must build");
+        let response = client.post(&url).send().await.expect("request must complete");
+        let body = read_capped_body(response, WEBHOOK_RESPONSE_BYTE_LIMIT).await;
+
+        assert_eq!(
+            body.len(),
+            WEBHOOK_RESPONSE_BYTE_LIMIT,
+            "the body must stop at the cap instead of following the receiver"
+        );
+        assert!(
+            WEBHOOK_DIAGNOSTIC_CHARS < WEBHOOK_RESPONSE_BYTE_LIMIT,
+            "what is stored must be smaller than what is read"
+        );
+    }
+
+    /// The outbound checks are done once, against one host. Following a redirect would move the
+    /// signed delivery to a host that was never checked, which is the whole SSRF bypass.
+    #[tokio::test]
+    async fn deliveries_do_not_follow_redirects() {
+        let raw =
+            b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\n\r\n";
+        let url = serve_once(raw.to_vec()).await;
+
+        let client = build_delivery_client().expect("client must build");
+        let response = client.post(&url).send().await.expect("request must complete");
+
+        assert_eq!(
+            response.status().as_u16(),
+            302,
+            "the redirect must be reported, never followed"
+        );
+        assert_eq!(
+            response.url().as_str(),
+            url,
+            "the request must not have moved to the redirect target"
+        );
+    }
+
+    /// Delivery re-validates the stored URL, so a webhook row that predates the checks, or that was
+    /// edited elsewhere, cannot reach an internal address.
+    #[tokio::test]
+    async fn internal_targets_are_refused_before_the_request_is_built() {
+        for url in [
+            "http://127.0.0.1/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://user:pass@example.com/hook",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_outbound_url(url).await.is_err(),
+                "{url} must not be deliverable"
+            );
+        }
     }
 }
