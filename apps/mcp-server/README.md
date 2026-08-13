@@ -32,6 +32,50 @@ export OPENPR_API_URL="http://localhost:8081"
 export OPENPR_BOT_TOKEN="opr_your_token_here"
 export OPENPR_WORKSPACE_ID="your-workspace-uuid"
 export RUST_LOG="info"
+
+# Required for HTTP/SSE transports on any non-loopback bind address
+export OPENPR_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+```
+
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `OPENPR_API_URL` | yes | Base URL of the OpenPR API. |
+| `OPENPR_BOT_TOKEN` | yes | Workspace bot token. Authenticates this process **to** the API. |
+| `OPENPR_WORKSPACE_ID` | yes | Workspace UUID. |
+| `OPENPR_MCP_AUTH_TOKEN` | conditional | Bearer token inbound HTTP/SSE callers must present. Minimum 16 characters. See below. |
+
+### Inbound authentication (HTTP/SSE)
+
+`OPENPR_BOT_TOKEN` authenticates this process **to** the API. It says nothing about who is
+calling **in**. Anyone who can reach the MCP port holds every permission the workspace bot
+has, so the HTTP and SSE transports authenticate their own callers:
+
+- **`OPENPR_MCP_AUTH_TOKEN` set** — every request to `/mcp/rpc`, `/sse` and `/messages`
+  must carry `Authorization: Bearer <token>`. Anything else gets `401` with
+  `WWW-Authenticate: Bearer`. The comparison is constant time.
+- **Not set, bound to loopback** (`127.0.0.1`, `[::1]`, `localhost`) — served without
+  authentication so local development is unaffected. A warning names the variable to set
+  before publishing the port.
+- **Not set, bound to anything else** (`0.0.0.0`, `[::]`, a LAN address, a hostname) —
+  **the process refuses to start.** This is the one combination that cannot be made safe,
+  so it is removed rather than warned about.
+
+`/health` is exempt: it answers a constant `OK`, reads nothing, and discloses nothing a
+caller who completed the TCP handshake does not already know, so orchestrator probes do
+not need the shared secret.
+
+The token is read from the environment only — never a CLI flag, which would put it in
+`argv` where any local process can read it out of `/proc`. It is never logged.
+
+**stdio is unaffected**: it is a pipe pair owned by the process that spawned the server,
+so the caller is already established.
+
+```bash
+# Authenticated HTTP call
+curl -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+     http://localhost:8090/mcp/rpc
 ```
 
 ### Build
@@ -52,10 +96,18 @@ OPENPR_WORKSPACE_ID=your-workspace-uuid \
 
 #### HTTP Mode (for testing/debugging)
 ```bash
+# Loopback default (127.0.0.1:8090): no inbound token needed for local work.
 OPENPR_API_URL=http://localhost:8081 \
 OPENPR_BOT_TOKEN=opr_your_token_here \
 OPENPR_WORKSPACE_ID=your-workspace-uuid \
 ./target/release/mcp-server serve --transport http
+
+# Reachable from other hosts: OPENPR_MCP_AUTH_TOKEN is mandatory, or startup fails.
+OPENPR_API_URL=http://localhost:8081 \
+OPENPR_BOT_TOKEN=opr_your_token_here \
+OPENPR_WORKSPACE_ID=your-workspace-uuid \
+OPENPR_MCP_AUTH_TOKEN=your_inbound_token \
+./target/release/mcp-server serve --transport http --bind-addr 0.0.0.0:8090
 ```
 
 #### SSE Mode (for streaming clients)
