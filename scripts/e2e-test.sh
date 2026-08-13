@@ -2,29 +2,85 @@
 set -euo pipefail
 
 # End-to-End Test Script
-# Starts Docker environment, runs all tests, and cleans up
+# Rebuilds the compose environment from scratch, runs all tests, and tears it
+# down again.
+#
+# THIS SCRIPT DESTROYS AND RECREATES THE LOCAL TEST ENVIRONMENT.
+# It runs `docker compose down -v` both before and after the test run, which
+# deletes the `pgdata` volume of THIS compose project (the openpr stack defined
+# by ./docker-compose.yml). Volumes belonging to any other project are never
+# touched. The up-front reset is what makes the script repeatable: test-api.sh
+# registers the very first account of an empty database, and registration is
+# admin-only once a user exists, so a leftover database from a previous run
+# would fail the second run.
+#
+# Environment variables:
+#   OPENPR_E2E_ASSUME_YES=1  skip the interactive confirmation of the reset
+#   OPENPR_E2E_KEEP_STACK=1  leave the stack running afterwards (for debugging);
+#                            the next run still starts from a clean database
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
+
+ASSUME_YES="${OPENPR_E2E_ASSUME_YES:-0}"
+KEEP_STACK="${OPENPR_E2E_KEEP_STACK:-0}"
 
 echo "🚀 Starting End-to-End Tests"
 echo "Project Root: $PROJECT_ROOT"
 echo ""
 
-# Cleanup function
-cleanup() {
-  echo ""
-  echo "🧹 Cleaning up..."
-  docker compose down -v
-  echo "✅ Cleanup complete"
-}
-
-# Set trap to cleanup on exit
-trap cleanup EXIT
-
 health_response_ok() {
   grep -Eiq "ok|healthy"
 }
+
+# Number of compose services currently reporting a healthy healthcheck.
+# A bare `grep -c healthy` also matches "unhealthy", so match the parenthesised
+# marker compose prints in the status column: "(unhealthy)" does not contain
+# the literal "(healthy)".
+# `|| echo 0` would be wrong here: on zero matches grep already prints "0" and
+# then exits 1, so the fallback would append a second line and the comparison
+# below would be handed "0\n0".
+healthy_service_count() {
+  local count
+  count="$(docker compose ps | grep -cF '(healthy)' || true)"
+  printf '%s' "${count:-0}"
+}
+
+unhealthy_service_present() {
+  docker compose ps | grep -qF '(unhealthy)'
+}
+
+# Step 0: Reset the environment before starting, so the run does not depend on
+# the previous run having reached its cleanup.
+echo "🧨 Step 0: Resetting the test environment"
+echo "   This removes the containers and the database volume of the openpr compose project."
+if [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
+  read -r -p "   Type 'yes' to erase the local openpr compose data and continue: " reply
+  if [ "$reply" != "yes" ]; then
+    echo "❌ Aborted; nothing was changed."
+    exit 1
+  fi
+fi
+docker compose down -v --remove-orphans
+echo "✅ Environment reset"
+echo ""
+
+# Cleanup function. Registered only after the reset was confirmed, so aborting
+# at the prompt above cannot delete anything.
+cleanup() {
+  if [ "$KEEP_STACK" = "1" ]; then
+    echo ""
+    echo "ℹ️  OPENPR_E2E_KEEP_STACK=1; leaving the stack running."
+    echo "   Tear it down with: docker compose down -v"
+    return
+  fi
+  echo ""
+  echo "🧹 Cleaning up..."
+  docker compose down -v --remove-orphans
+  echo "✅ Cleanup complete"
+}
+
+trap cleanup EXIT
 
 # Step 1: Start Docker environment
 echo "📦 Step 1: Starting Docker Compose"
@@ -34,23 +90,20 @@ bash "$PROJECT_ROOT/scripts/start.sh"
 echo "⏳ Waiting for services to be ready..."
 max_wait=120
 elapsed=0
+services_ready=0
 while [ $elapsed -lt $max_wait ]; do
-  if docker compose ps | grep -q "unhealthy"; then
+  if unhealthy_service_present; then
     echo "⚠️  Some services are unhealthy, waiting..."
-    sleep 5
-    elapsed=$((elapsed + 5))
-  else
-    healthy_count=$(docker compose ps | grep -c "healthy" || echo "0")
-    if [ "$healthy_count" -ge 4 ]; then
-      echo "✅ All services are healthy"
-      break
-    fi
-    sleep 5
-    elapsed=$((elapsed + 5))
+  elif [ "$(healthy_service_count)" -ge 4 ]; then
+    echo "✅ All services are healthy"
+    services_ready=1
+    break
   fi
+  sleep 5
+  elapsed=$((elapsed + 5))
 done
 
-if [ $elapsed -ge $max_wait ]; then
+if [ "$services_ready" -ne 1 ]; then
   echo "❌ Timeout waiting for services to be healthy"
   docker compose ps
   docker compose logs
@@ -61,8 +114,7 @@ echo ""
 
 # Step 2: Verify database migrations
 echo "📋 Step 2: Verify Database Migrations"
-docker compose exec -T postgres psql -U openpr -d openpr -c "\dt" | grep -q "users\|workspaces\|projects"
-if [ $? -eq 0 ]; then
+if docker compose exec -T postgres psql -U openpr -d openpr -c "\dt" | grep -Eq "users|workspaces|projects"; then
   echo "✅ Database migrations applied successfully"
 else
   echo "❌ Database migrations failed"
