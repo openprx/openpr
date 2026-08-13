@@ -23,7 +23,7 @@ pub async fn jwt_auth_middleware(
         .ok_or_else(|| ApiError::Unauthorized("missing access token".to_string()))?;
 
     let jwt = JwtManager::new(
-        &state.cfg.jwt_secret,
+        state.cfg.jwt_secret.expose(),
         state.cfg.jwt_access_ttl_seconds,
         state.cfg.jwt_refresh_ttl_seconds,
     );

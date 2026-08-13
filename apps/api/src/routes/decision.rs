@@ -236,7 +236,7 @@ mod decision_scope_database_tests {
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
-        config::AppConfig,
+        config::{AppConfig, Secret},
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use uuid::Uuid;
@@ -343,8 +343,8 @@ mod decision_scope_database_tests {
             cfg: AppConfig {
                 app_name: "api-test".to_string(),
                 bind_addr: "127.0.0.1:0".to_string(),
-                database_url: scratch.url.clone(),
-                jwt_secret: "decision-scope-test-secret".to_string(),
+                database_url: Secret::new(scratch.url.clone()),
+                jwt_secret: Secret::new("decision-scope-test-secret"),
                 jwt_access_ttl_seconds: 900,
                 jwt_refresh_ttl_seconds: 3600,
                 default_author_id: None,

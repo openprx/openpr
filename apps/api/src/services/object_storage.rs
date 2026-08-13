@@ -1,19 +1,14 @@
-use std::{
-    env,
-    path::{Component, Path, PathBuf},
-};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
+use platform::config::{S3Config, Secret, StorageBackend, StorageConfig};
 use reqwest::{Client, Method, StatusCode, Url, header::HeaderMap};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::error::ApiError;
-
-const DEFAULT_OBJECT_STORAGE_DIR: &str = "./uploads";
-const DEFAULT_S3_REGION: &str = "us-east-1";
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ObjectReference {
@@ -43,26 +38,36 @@ struct S3ObjectStorage {
     endpoint: String,
     bucket: String,
     region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
+    /// Held as [`Secret`] so the derived `Debug` on this struct, and on every struct that carries
+    /// an [`ObjectStorage`], cannot print the signing credentials.
+    access_key_id: Secret,
+    secret_access_key: Secret,
+    session_token: Option<Secret>,
     client: Client,
 }
 
 impl ObjectStorage {
-    pub fn from_env() -> Result<Self, ApiError> {
-        let backend = env::var("OPENPR_OBJECT_STORAGE_BACKEND")
-            .or_else(|_| env::var("OBJECT_STORAGE_BACKEND"))
-            .unwrap_or_else(|_| "local".to_string());
-        match normalize_backend(&backend)? {
-            ObjectStorageBackendKind::Local => Self::local(
-                env::var("OPENPR_OBJECT_STORAGE_DIR")
-                    .or_else(|_| env::var("UPLOAD_DIR"))
-                    .unwrap_or_else(|_| DEFAULT_OBJECT_STORAGE_DIR.to_string()),
-                "local",
-            ),
-            ObjectStorageBackendKind::S3 => Self::s3_from_env(),
+    /// Builds the backend the `[storage]` section selects.
+    ///
+    /// The backend used to be assembled from a dozen environment variables, several of them
+    /// generic names (`AWS_*`, `UPLOAD_DIR`) that anything in the surrounding environment could
+    /// set. It now comes from the configuration file, which has already normalised the backend
+    /// name and validated the S3 section.
+    pub fn from_config(storage: &StorageConfig) -> Result<Self, ApiError> {
+        match storage.backend {
+            StorageBackend::Local => Self::local(storage.dir.clone(), "local"),
+            StorageBackend::S3 => {
+                let s3 = storage.s3.as_ref().ok_or_else(|| {
+                    ApiError::BadRequest("storage.backend is s3 but the [storage.s3] section is missing".to_string())
+                })?;
+                Self::s3(s3)
+            }
         }
+    }
+
+    /// Builds the backend from the configuration this process installed at startup.
+    pub fn from_runtime_config() -> Result<Self, ApiError> {
+        Self::from_config(&crate::config::runtime().storage)
     }
 
     pub fn local(root: impl Into<PathBuf>, backend: impl Into<String>) -> Result<Self, ApiError> {
@@ -79,50 +84,21 @@ impl ObjectStorage {
         })
     }
 
-    fn s3_from_env() -> Result<Self, ApiError> {
-        let endpoint = required_env_any(&[
-            "OPENPR_OBJECT_STORAGE_S3_ENDPOINT",
-            "OBJECT_STORAGE_S3_ENDPOINT",
-            "AWS_ENDPOINT_URL_S3",
-            "AWS_ENDPOINT_URL",
-        ])?;
-        let bucket = required_env_any(&[
-            "OPENPR_OBJECT_STORAGE_S3_BUCKET",
-            "OBJECT_STORAGE_S3_BUCKET",
-            "AWS_S3_BUCKET",
-        ])?;
-        validate_s3_bucket(&bucket)?;
-        let region = env_any(&[
-            "OPENPR_OBJECT_STORAGE_S3_REGION",
-            "OBJECT_STORAGE_S3_REGION",
-            "AWS_REGION",
-            "AWS_DEFAULT_REGION",
-        ])
-        .unwrap_or_else(|| DEFAULT_S3_REGION.to_string());
-        let access_key_id = required_env_any(&[
-            "OPENPR_OBJECT_STORAGE_S3_ACCESS_KEY_ID",
-            "OBJECT_STORAGE_S3_ACCESS_KEY_ID",
-            "AWS_ACCESS_KEY_ID",
-        ])?;
-        let secret_access_key = required_env_any(&[
-            "OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY",
-            "OBJECT_STORAGE_S3_SECRET_ACCESS_KEY",
-            "AWS_SECRET_ACCESS_KEY",
-        ])?;
-        let session_token = env_any(&[
-            "OPENPR_OBJECT_STORAGE_S3_SESSION_TOKEN",
-            "OBJECT_STORAGE_S3_SESSION_TOKEN",
-            "AWS_SESSION_TOKEN",
-        ]);
-
+    /// Builds the S3 backend from an already validated `[storage.s3]` section.
+    ///
+    /// The bucket is re-checked here rather than trusted: it is interpolated into every request
+    /// path, so the one rule that keeps a key from escaping its bucket is enforced at the point
+    /// of use as well as at load time.
+    fn s3(s3: &S3Config) -> Result<Self, ApiError> {
+        validate_s3_bucket(&s3.bucket)?;
         Ok(Self {
             backend: ObjectStorageBackend::S3(S3ObjectStorage {
-                endpoint: endpoint.trim().trim_end_matches('/').to_string(),
-                bucket,
-                region,
-                access_key_id,
-                secret_access_key,
-                session_token,
+                endpoint: s3.endpoint.trim().trim_end_matches('/').to_string(),
+                bucket: s3.bucket.clone(),
+                region: s3.region.clone(),
+                access_key_id: s3.access_key_id.clone(),
+                secret_access_key: s3.secret_access_key.clone(),
+                session_token: s3.session_token.clone(),
                 client: Client::new(),
             }),
         })
@@ -266,12 +242,12 @@ impl S3ObjectStorage {
             canonical_uri: &canonical_uri,
             host: &host,
             payload_hash: &payload_hash,
-            access_key_id: &self.access_key_id,
-            secret_access_key: &self.secret_access_key,
+            access_key_id: self.access_key_id.expose(),
+            secret_access_key: self.secret_access_key.expose(),
             region: &self.region,
             amz_date: &amz_date,
             date: &date,
-            session_token: self.session_token.as_deref(),
+            session_token: self.session_token.as_ref().map(Secret::expose),
         })?;
         let mut headers = HeaderMap::new();
         headers.insert("host", host.parse().map_err(|_| ApiError::Internal)?);
@@ -283,7 +259,7 @@ impl S3ObjectStorage {
         if let Some(session_token) = &self.session_token {
             headers.insert(
                 "x-amz-security-token",
-                session_token.parse().map_err(|_| ApiError::Internal)?,
+                session_token.expose().parse().map_err(|_| ApiError::Internal)?,
             );
         }
         headers.insert("authorization", authorization.parse().map_err(|_| ApiError::Internal)?);
@@ -328,23 +304,9 @@ fn normalize_backend(raw: &str) -> Result<ObjectStorageBackendKind, ApiError> {
         Ok(ObjectStorageBackendKind::S3)
     } else {
         Err(ApiError::BadRequest(
-            "OPENPR_OBJECT_STORAGE_BACKEND supports local/filesystem or s3-compatible".to_string(),
+            "storage.backend supports local/filesystem or s3-compatible".to_string(),
         ))
     }
-}
-
-fn env_any(keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| env::var(key).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn required_env_any(keys: &[&str]) -> Result<String, ApiError> {
-    env_any(keys).ok_or_else(|| {
-        let key = keys.first().copied().unwrap_or("object storage configuration");
-        ApiError::BadRequest(format!("{key} is required"))
-    })
 }
 
 pub fn validate_object_key(key: &str) -> Result<(), ApiError> {
@@ -471,6 +433,37 @@ fn hex_sha256(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Environment variable naming the configuration file the S3 acceptance tests read.
+///
+/// Test scaffolding in the same spirit as `OPENPR_TEST_DATABASE_URL`, and compiled only into the
+/// test binary: those tests need a reachable S3 compatible service, which no committed
+/// configuration file can describe. The service itself reads nothing from the environment.
+#[cfg(test)]
+pub const TEST_CONFIG_PATH_ENV: &str = "OPENPR_TEST_CONFIG";
+
+/// Set to `1` to have the S3 acceptance tests create their bucket before using it.
+#[cfg(test)]
+pub const TEST_S3_CREATE_BUCKET_ENV: &str = "OPENPR_TEST_S3_CREATE_BUCKET";
+
+/// The object storage described by the configuration file [`TEST_CONFIG_PATH_ENV`] names.
+#[cfg(test)]
+pub fn test_object_storage() -> Result<ObjectStorage, ApiError> {
+    let path = std::env::var(TEST_CONFIG_PATH_ENV).map_err(|_| {
+        ApiError::BadRequest(format!(
+            "{TEST_CONFIG_PATH_ENV} must name a configuration file whose [storage] section selects the s3 backend"
+        ))
+    })?;
+    let config = platform::config::OpenPrConfig::load(Some(Path::new(&path)))
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    ObjectStorage::from_config(&config.storage)
+}
+
+/// Whether the S3 acceptance tests should create their bucket first.
+#[cfg(test)]
+pub fn test_should_create_bucket() -> bool {
+    std::env::var(TEST_S3_CREATE_BUCKET_ENV).is_ok_and(|value| value.trim() == "1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +488,52 @@ mod tests {
             normalize_backend("s3-compatible").unwrap(),
             ObjectStorageBackendKind::S3
         ));
+    }
+
+    fn s3_config() -> S3Config {
+        S3Config {
+            endpoint: "https://s3.example.test/".to_string(),
+            bucket: "openpr-uploads".to_string(),
+            region: "eu-central-1".to_string(),
+            access_key_id: Secret::new("AKIDEXAMPLE"),
+            secret_access_key: Secret::new("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"),
+            session_token: Some(Secret::new("session-token-value")),
+        }
+    }
+
+    fn storage_config(backend: StorageBackend, s3: Option<S3Config>) -> StorageConfig {
+        StorageConfig {
+            backend,
+            dir: PathBuf::from("/tmp/openpr-test"),
+            s3,
+        }
+    }
+
+    #[test]
+    fn builds_the_backend_the_storage_section_names() {
+        let local = ObjectStorage::from_config(&storage_config(StorageBackend::Local, None))
+            .expect("local backend should build");
+        assert_eq!(local.reference("file.csv").backend, "local");
+
+        let s3 = ObjectStorage::from_config(&storage_config(StorageBackend::S3, Some(s3_config())))
+            .expect("s3 backend should build");
+        assert_eq!(s3.reference("file.csv").backend, "s3");
+    }
+
+    #[test]
+    fn refuses_the_s3_backend_without_its_section() {
+        // Falling back to local storage here would silently write uploads to the container's
+        // filesystem on a deployment that asked for S3.
+        assert!(ObjectStorage::from_config(&storage_config(StorageBackend::S3, None)).is_err());
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_s3_credentials() {
+        let storage = ObjectStorage::from_config(&storage_config(StorageBackend::S3, Some(s3_config())))
+            .expect("s3 backend should build");
+        let rendered = format!("{storage:?}");
+        assert!(!rendered.contains("wJalrXUtnFEMI"), "{rendered}");
+        assert!(!rendered.contains("session-token-value"), "{rendered}");
     }
 
     #[test]
@@ -533,15 +572,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_OBJECT_STORAGE_S3_* env vars"]
+    #[ignore = "requires a reachable S3-compatible service such as MinIO and OPENPR_TEST_CONFIG pointing at an s3 configuration file"]
     async fn s3_backend_round_trips_against_minio_when_configured() {
-        let storage = ObjectStorage::from_env().expect("S3 object storage env should be configured");
+        let storage = test_object_storage().expect("OPENPR_TEST_CONFIG should describe the s3 backend");
         assert_eq!(storage.reference("acceptance/probe.txt").backend, "s3");
-        if env::var("OPENPR_OBJECT_STORAGE_S3_CREATE_BUCKET_FOR_TEST")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
+        if test_should_create_bucket() {
             storage
                 .create_bucket_for_test()
                 .await

@@ -100,7 +100,7 @@ async fn materialize_signature_values_with_existing_storage(
         };
         let object_storage = match &storage {
             Some(object_storage) => object_storage,
-            None => storage.insert(ObjectStorage::from_env()?),
+            None => storage.insert(ObjectStorage::from_runtime_config()?),
         };
         let file_name = format!("signature-{}-{}.png", field.key, Uuid::new_v4());
         let object_key = format!("signatures/{file_name}");
@@ -538,12 +538,12 @@ pub async fn verify_signature_audit_entry_with_storage(
         .get("byte_size")
         .and_then(Value::as_u64)
         .ok_or_else(|| ApiError::BadRequest("signature audit entry byte_size is missing".to_string()))?;
-    let env_storage;
+    let configured_storage;
     let object_storage = match &storage_override {
         Some(object_storage) => object_storage,
         None => {
-            env_storage = ObjectStorage::from_env()?;
-            &env_storage
+            configured_storage = ObjectStorage::from_runtime_config()?;
+            &configured_storage
         }
     };
     let bytes = object_storage.get(object_key).await?;
@@ -723,7 +723,7 @@ pub async fn cleanup_expired_signature_values_with_storage(
         }
         let object_storage = match &storage {
             Some(object_storage) => object_storage,
-            None => storage.insert(ObjectStorage::from_env()?),
+            None => storage.insert(ObjectStorage::from_runtime_config()?),
         };
         object_storage.delete(&object_key).await?;
         let storage_ref = object_storage.reference(object_key.clone());
@@ -825,7 +825,7 @@ pub async fn cleanup_expired_replaced_signature_audit_entries_with_storage(
         }
         let object_storage = match &storage {
             Some(object_storage) => object_storage,
-            None => storage.insert(ObjectStorage::from_env()?),
+            None => storage.insert(ObjectStorage::from_runtime_config()?),
         };
         object_storage.delete(&previous_object_key).await?;
         let storage_ref = object_storage.reference(previous_object_key);

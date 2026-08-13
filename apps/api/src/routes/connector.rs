@@ -6,7 +6,11 @@ use axum::{
     response::IntoResponse,
 };
 use hmac::{Hmac, Mac};
-use platform::{app::AppState, auth::JwtClaims};
+use platform::{
+    app::AppState,
+    auth::JwtClaims,
+    config::{ConnectorSecrets, validate_connector_secret_name},
+};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait, Value as SeaValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2023,10 +2027,10 @@ pub const DELIVERY_SIGNATURE_HEADER: &str = "X-Webhook-Signature";
 pub const DELIVERY_EVENT_HEADER: &str = "X-Webhook-Event";
 /// Header carrying the invocation id, stable across delivery retries.
 pub const DELIVERY_ID_HEADER: &str = "X-Webhook-Delivery";
-/// Comma separated hosts (`host` or `host:port`) exempt from the private address checks.
-pub const OUTBOUND_ALLOWED_HOSTS_ENV: &str = "OPENPR_OUTBOUND_ALLOWED_HOSTS";
-/// Set to `1`/`true` to disable outbound private address checks entirely.
-pub const OUTBOUND_ALLOW_PRIVATE_ENV: &str = "OPENPR_OUTBOUND_ALLOW_PRIVATE";
+/// Configuration key of the hosts exempt from the private address checks.
+pub const OUTBOUND_ALLOWED_HOSTS_KEY: &str = "outbound.allowed_hosts";
+/// Configuration key that disables the outbound private address checks entirely.
+pub const OUTBOUND_ALLOW_PRIVATE_KEY: &str = "outbound.allow_private";
 /// Schema objects the delivery pipeline cannot run without.
 ///
 /// Each entry is a label and a boolean expression. The lease token and the two pickup predicates
@@ -2112,51 +2116,13 @@ where
     ))
 }
 
-/// Namespace a connector credential environment variable must live in.
+/// The retired form of a credential reference, kept only to explain itself.
 ///
-/// A connector endpoint is attacker controlled by design, so an unconstrained `env:NAME`
-/// reference would turn every connector into a read primitive for the whole process
-/// environment (`JWT_SECRET`, `DATABASE_URL`, object storage keys). Credentials meant for
-/// connectors must be provisioned under this prefix and nowhere else.
-pub const CONNECTOR_SECRET_ENV_PREFIX: &str = "OPENPR_CONNECTOR_SECRET_";
-
-/// Segment that follows [`CONNECTOR_SECRET_ENV_PREFIX`] and carries the owning workspace.
-const CONNECTOR_SECRET_WORKSPACE_MARKER: &str = "W_";
-
-/// Environment namespace that holds the delivery credentials of exactly one workspace.
-///
-/// The prefix alone is a process wide namespace, and a process wide namespace is shared by every
-/// tenant. Anyone can create a workspace and is its admin, so under the prefix-only rule an
-/// attacker could create a workspace, create a connector pointing at their own server, reference
-/// another tenant's `OPENPR_CONNECTOR_SECRET_*` name and have the worker sign a delivery to them
-/// with the victim's secret, or send it as a bearer token. That is a credential read primitive on
-/// the default compose deployment.
-///
-/// The namespace is therefore derived from the workspace id of the connector that holds the
-/// reference. The id is a server generated v4 UUID read from the connector row (or from the
-/// authenticated route path), never from the request body, and it is not a mutable field, so a
-/// workspace an attacker owns can only ever name credentials inside its own namespace. Knowing the
-/// victim's workspace id does not help: the reference is validated against the workspace of the
-/// connector doing the reading, not against the name being read.
-///
-/// The v4 UUID is rendered without dashes and uppercased so the result is a legal environment
-/// variable name:
-/// `OPENPR_CONNECTOR_SECRET_W_0F8A1B2C3D4E5F60718293A4B5C6D7E8_SHIPPING`.
-pub fn connector_secret_env_namespace(workspace_id: Uuid) -> String {
-    format!(
-        "{CONNECTOR_SECRET_ENV_PREFIX}{CONNECTOR_SECRET_WORKSPACE_MARKER}{}_",
-        workspace_id.simple().to_string().to_ascii_uppercase()
-    )
-}
-
-/// Environment variables that must never be reachable through a credential reference.
-///
-/// [`CONNECTOR_SECRET_ENV_PREFIX`] already excludes all of them; this list is a second,
-/// independent gate that keeps holding if the namespace rule is ever widened.
-const DENIED_CREDENTIAL_ENV_NAMES: &[&str] = &["JWT_SECRET", "DATABASE_URL", "OPENPR_BOT_TOKEN", "RUST_LOG"];
-
-/// Environment variable prefixes that must never be reachable through a credential reference.
-const DENIED_CREDENTIAL_ENV_PREFIXES: &[&str] = &["POSTGRES_", "PG", "AWS_", "OPENPR_OBJECT_STORAGE_"];
+/// Credentials used to be provisioned as process environment variables named
+/// `OPENPR_CONNECTOR_SECRET_W_<workspace uuid>_<NAME>`, and `auth_policy.secret_ref` named them as
+/// `env:<that whole variable>`. A stored policy in that shape must fail with an explanation rather
+/// than with a name-shape complaint, because the fix is an edit to two files and not a typo.
+const RETIRED_ENV_REFERENCE_PREFIX: &str = "env:";
 
 /// Authentication mode a connector declares in `auth_policy.mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2180,7 +2146,12 @@ impl ConnectorAuthMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorCredentialSource {
     WebhookSecret,
-    Env(String),
+    /// A credential filed under the owning workspace in `[connectors.secrets]`.
+    ///
+    /// Holds the bare name only. The workspace that may read it is never carried here: it is
+    /// supplied separately at every lookup, from the connector row or the authenticated route
+    /// path, so a stored policy cannot smuggle a tenant along with the name.
+    Named(String),
 }
 
 /// Declared authentication behaviour resolved from `connectors.auth_policy`.
@@ -2195,16 +2166,23 @@ pub struct ConnectorAuthPlan {
 /// The declared mode and the runtime behaviour are kept in sync: a policy that declares
 /// `hmac`/`bearer` without a usable credential source is rejected instead of silently
 /// downgrading to an unsigned delivery.
+///
+/// `workspace_id` must be the workspace of the connector the policy belongs to — the
+/// authenticated route path when the policy is being written, the connector row when a delivery
+/// is being prepared — and `secrets` is the whole `[connectors.secrets]` table. The pair is what
+/// confines the reference to one tenant: the name is looked up inside that workspace's partition
+/// and nowhere else.
 pub fn connector_auth_plan(
     auth_policy: &Value,
     webhook_linked: bool,
     workspace_id: Uuid,
+    secrets: &ConnectorSecrets,
 ) -> Result<ConnectorAuthPlan, String> {
     if ["secret", "token", "password"]
         .iter()
         .any(|key| auth_policy.get(*key).is_some())
     {
-        return Err("auth_policy must not store raw secrets, use secret_ref = \"env:NAME\"".to_string());
+        return Err("auth_policy must not store raw secrets, use secret_ref = \"NAME\"".to_string());
     }
 
     let mode = auth_policy
@@ -2218,7 +2196,7 @@ pub fn connector_auth_plan(
         .or_else(|| auth_policy.get("token_ref"))
         .and_then(Value::as_str);
     let source = match reference {
-        Some(raw) => Some(parse_credential_ref(raw, workspace_id)?),
+        Some(raw) => Some(parse_credential_ref(raw, workspace_id, secrets)?),
         None if webhook_linked => Some(ConnectorCredentialSource::WebhookSecret),
         None => None,
     };
@@ -2241,71 +2219,60 @@ pub fn connector_auth_plan(
         "hmac" | "hmac_sha256" | "hmac-sha256" => Ok(ConnectorAuthPlan {
             mode: ConnectorAuthMode::Hmac,
             source: Some(source.ok_or_else(|| {
-                "auth_policy mode hmac requires secret_ref = \"env:NAME\" or a linked webhook secret".to_string()
+                "auth_policy mode hmac requires secret_ref = \"NAME\" or a linked webhook secret".to_string()
             })?),
         }),
         "bearer" | "token" => match source {
-            Some(ConnectorCredentialSource::Env(name)) => Ok(ConnectorAuthPlan {
+            Some(ConnectorCredentialSource::Named(name)) => Ok(ConnectorAuthPlan {
                 mode: ConnectorAuthMode::Bearer,
-                source: Some(ConnectorCredentialSource::Env(name)),
+                source: Some(ConnectorCredentialSource::Named(name)),
             }),
-            _ => Err("auth_policy mode bearer requires token_ref = \"env:NAME\"".to_string()),
+            _ => Err("auth_policy mode bearer requires token_ref = \"NAME\"".to_string()),
         },
         other => Err(format!("unsupported auth_policy mode {other}")),
     }
 }
 
-fn parse_credential_ref(raw: &str, workspace_id: Uuid) -> Result<ConnectorCredentialSource, String> {
-    let Some(name) = raw.trim().strip_prefix("env:") else {
-        return Err("credential reference must use the env:NAME form".to_string());
-    };
-    let name = name.trim();
-    let valid = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        && !name.starts_with(|c: char| c.is_ascii_digit());
-    if !valid {
-        return Err("credential reference env name must match [A-Z_][A-Z0-9_]*".to_string());
-    }
-    if DENIED_CREDENTIAL_ENV_NAMES.contains(&name)
-        || DENIED_CREDENTIAL_ENV_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-    {
+/// Turns an `auth_policy.secret_ref`/`token_ref` into a source, checked against the reading
+/// workspace's own credentials.
+///
+/// This is the write-time half of the tenant check. A connector endpoint and its `auth_policy`
+/// are attacker controlled by design — anyone can create a workspace and is its admin — so the
+/// name in the reference is never trusted to identify who may read it. `workspace_id` selects the
+/// partition and [`ConnectorSecrets::get`] searches the name only inside it, which means a
+/// reference to a name this workspace does not own is refused here, at the moment it is written,
+/// instead of turning into a delivery-time surprise.
+fn parse_credential_ref(
+    raw: &str,
+    workspace_id: Uuid,
+    secrets: &ConnectorSecrets,
+) -> Result<ConnectorCredentialSource, String> {
+    let name = raw.trim();
+    if let Some(retired) = name.strip_prefix(RETIRED_ENV_REFERENCE_PREFIX) {
         return Err(format!(
-            "credential reference env name {name} is reserved by the platform"
+            "credential reference {raw} uses the retired environment variable form; provision the \
+             credential under [connectors.secrets.\"{workspace_id}\"] in the configuration file and \
+             reference it by its bare name instead of {RETIRED_ENV_REFERENCE_PREFIX}{retired}"
         ));
     }
-    credential_env_name_in_workspace(name, workspace_id)?;
-    Ok(ConnectorCredentialSource::Env(name.to_string()))
-}
-
-/// Rejects any credential name outside the workspace's own namespace.
-///
-/// Kept separate from [`parse_credential_ref`] so the delivery path can repeat the check against
-/// the stored row: a policy written before this rule existed, or by a future code path that forgets
-/// the namespace, must still not read another tenant's credential at send time.
-fn credential_env_name_in_workspace(name: &str, workspace_id: Uuid) -> Result<(), String> {
-    let namespace = connector_secret_env_namespace(workspace_id);
-    if name.len() > namespace.len() && name.starts_with(&namespace) {
-        return Ok(());
-    }
-    Err(format!(
-        "credential reference env name must start with {namespace}, which is the credential \
-         namespace of this workspace; a connector can only read credentials provisioned for the \
-         workspace that owns it"
-    ))
+    validate_connector_secret_name(name).map_err(|err| err.to_string())?;
+    // Existence is checked inside this workspace's partition, and the value is deliberately
+    // dropped: the reference records a name, never a credential.
+    secrets.get(workspace_id, name).map_err(|err| err.to_string())?;
+    Ok(ConnectorCredentialSource::Named(name.to_string()))
 }
 
 /// Reads the credential for a resolved source. The returned value must never be logged.
 ///
-/// `workspace_id` is the workspace of the connector performing the delivery, so the namespace rule
-/// is enforced again here and not only where the policy was written.
+/// This is the delivery-time half of the tenant check, and it does not trust the write-time half:
+/// a policy stored before this rule existed, or written by a future code path that forgets it,
+/// still cannot read another tenant's credential here. `workspace_id` must be the workspace read
+/// from the connector row, so the lookup is confined to the partition that connector belongs to.
 pub fn resolve_connector_credential(
     source: &ConnectorCredentialSource,
     webhook_secret: Option<&str>,
     workspace_id: Uuid,
+    secrets: &ConnectorSecrets,
 ) -> Result<String, String> {
     match source {
         ConnectorCredentialSource::WebhookSecret => webhook_secret
@@ -2313,13 +2280,12 @@ pub fn resolve_connector_credential(
             .filter(|secret| !secret.is_empty())
             .map(ToString::to_string)
             .ok_or_else(|| "linked webhook secret is not configured".to_string()),
-        ConnectorCredentialSource::Env(name) => {
-            credential_env_name_in_workspace(name, workspace_id)?;
-            match std::env::var(name) {
-                Ok(value) if !value.trim().is_empty() => Ok(value),
-                Ok(_) => Err(format!("credential env var {name} is empty")),
-                Err(_) => Err(format!("credential env var {name} is not set")),
+        ConnectorCredentialSource::Named(name) => {
+            let secret = secrets.get(workspace_id, name).map_err(|err| err.to_string())?;
+            if secret.expose().trim().is_empty() {
+                return Err(format!("connector credential {name} is empty"));
             }
+            Ok(secret.expose().to_string())
         }
     }
 }
@@ -2337,13 +2303,14 @@ pub fn delivery_signature_header_value(secret: &str, body: &[u8]) -> Result<Stri
     Ok(format!("sha256={}", sign_delivery_body(secret, body)?))
 }
 
+/// The `outbound.allowed_hosts` entries, in the comma separated form [`host_is_allowlisted`] reads.
 fn outbound_allowlist() -> String {
-    std::env::var(OUTBOUND_ALLOWED_HOSTS_ENV).unwrap_or_default()
+    crate::config::runtime().outbound.allowlist_csv()
 }
 
+/// Whether `outbound.allow_private` has switched the private address checks off.
 fn outbound_private_targets_allowed() -> bool {
-    std::env::var(OUTBOUND_ALLOW_PRIVATE_ENV)
-        .is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    crate::config::runtime().outbound.allow_private
 }
 
 /// Matches a host (optionally with port) against a comma separated allowlist.
@@ -2507,14 +2474,38 @@ async fn validate_connector_endpoint(endpoint: &str) -> Result<(), ApiError> {
         .map_err(ApiError::BadRequest)
 }
 
+/// Checks an `auth_policy` on the way into the database.
+///
+/// `workspace_id` comes from the authenticated route path, which `ensure_workspace_access` has
+/// already confirmed the caller is an admin of. It is never taken from the request body: the body
+/// is what an attacker controls, and a workspace id read from it would let one tenant file a
+/// reference that resolves against another tenant's credentials.
 fn validate_connector_auth_policy(
     auth_policy: &Value,
     webhook_linked: bool,
     workspace_id: Uuid,
 ) -> Result<(), ApiError> {
-    connector_auth_plan(auth_policy, webhook_linked, workspace_id)
-        .map(|_| ())
-        .map_err(ApiError::BadRequest)
+    validate_connector_auth_policy_with(
+        auth_policy,
+        webhook_linked,
+        workspace_id,
+        &crate::config::runtime().connectors.secrets,
+    )
+    .map_err(ApiError::BadRequest)
+}
+
+/// The credential store is an argument here so the tenant rule can be exercised against a known
+/// store instead of against whatever the process happens to have installed.
+///
+/// `workspace_id` is the caller's, and the policy is only ever *data* to it: nothing read out of
+/// `auth_policy` may influence which workspace the credential names are resolved in.
+fn validate_connector_auth_policy_with(
+    auth_policy: &Value,
+    webhook_linked: bool,
+    workspace_id: Uuid,
+    secrets: &ConnectorSecrets,
+) -> Result<(), String> {
+    connector_auth_plan(auth_policy, webhook_linked, workspace_id, secrets).map(|_| ())
 }
 
 #[cfg(test)]
@@ -2526,13 +2517,15 @@ mod tests {
     use std::net::IpAddr;
 
     use super::{
-        CONNECTOR_SECRET_ENV_PREFIX, ConnectorAuthMode, ConnectorCredentialSource, InvocationResponse,
-        ReceiptIdempotencyRow, connector_auth_plan, connector_secret_env_namespace, delivery_signature_header_value,
-        host_is_allowlisted, is_blocked_ip, normalize_connector_kind, normalize_invocation_status,
-        normalize_receipt_idempotency_key, normalize_receipt_status, normalize_tool_call_status, normalize_tool_name,
-        normalize_tool_transport, normalize_trigger_kind, parse_outbound_url, resolve_connector_credential,
-        sign_delivery_body, truncate_string, validate_connector_receipt_target, validate_receipt_idempotency_replay,
+        ConnectorAuthMode, ConnectorCredentialSource, InvocationResponse, ReceiptIdempotencyRow, connector_auth_plan,
+        delivery_signature_header_value, host_is_allowlisted, is_blocked_ip, normalize_connector_kind,
+        normalize_invocation_status, normalize_receipt_idempotency_key, normalize_receipt_status,
+        normalize_tool_call_status, normalize_tool_name, normalize_tool_transport, normalize_trigger_kind,
+        parse_outbound_url, resolve_connector_credential, sign_delivery_body, truncate_string,
+        validate_connector_auth_policy_with, validate_connector_receipt_target, validate_receipt_idempotency_replay,
     };
+    use platform::config::{ConnectorSecrets, Secret};
+    use std::collections::BTreeMap;
 
     fn invocation_with_connector() -> InvocationResponse {
         let now = Utc::now();
@@ -2722,187 +2715,318 @@ mod tests {
         );
     }
 
+    /// A credential store holding `(workspace, name, value)` triples.
+    fn secrets_store(entries: &[(Uuid, &str, &str)]) -> ConnectorSecrets {
+        let mut by_workspace: BTreeMap<Uuid, BTreeMap<String, Secret>> = BTreeMap::new();
+        for (workspace, name, value) in entries {
+            by_workspace
+                .entry(*workspace)
+                .or_default()
+                .insert((*name).to_string(), Secret::new(*value));
+        }
+        ConnectorSecrets::new(by_workspace)
+    }
+
     #[test]
     fn auth_plan_declares_only_modes_it_can_perform() {
         let workspace = Uuid::new_v4();
-        let namespace = connector_secret_env_namespace(workspace);
+        let secrets = secrets_store(&[(workspace, "TEST", "test-value"), (workspace, "MYHOOK", "hook-value")]);
 
-        let webhook_linked =
-            connector_auth_plan(&json!({ "mode": "hmac", "legacy_webhook": true }), true, workspace).unwrap();
+        let webhook_linked = connector_auth_plan(
+            &json!({ "mode": "hmac", "legacy_webhook": true }),
+            true,
+            workspace,
+            &secrets,
+        )
+        .unwrap();
         assert_eq!(webhook_linked.mode, ConnectorAuthMode::Hmac);
         assert_eq!(webhook_linked.source, Some(ConnectorCredentialSource::WebhookSecret));
 
         // hmac without any credential source must be rejected instead of delivering unsigned.
-        assert!(connector_auth_plan(&json!({ "mode": "hmac" }), false, workspace).is_err());
-        assert!(connector_auth_plan(&json!({ "mode": "bearer" }), true, workspace).is_err());
-        assert!(connector_auth_plan(&json!({ "mode": "mtls" }), false, workspace).is_err());
-        assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret": "inline" }), false, workspace).is_err());
-        assert!(connector_auth_plan(&json!({ "mode": "hmac", "secret_ref": "vault:x" }), false, workspace).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "hmac" }), false, workspace, &secrets).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "bearer" }), true, workspace, &secrets).is_err());
+        assert!(connector_auth_plan(&json!({ "mode": "mtls" }), false, workspace, &secrets).is_err());
         assert!(
             connector_auth_plan(
-                &json!({ "mode": "hmac", "secret_ref": "env:bad-name" }),
+                &json!({ "mode": "hmac", "secret": "inline" }),
                 false,
-                workspace
+                workspace,
+                &secrets
+            )
+            .is_err()
+        );
+        assert!(
+            connector_auth_plan(
+                &json!({ "mode": "hmac", "secret_ref": "vault:x" }),
+                false,
+                workspace,
+                &secrets
+            )
+            .is_err()
+        );
+        assert!(
+            connector_auth_plan(
+                &json!({ "mode": "hmac", "secret_ref": "bad-name" }),
+                false,
+                workspace,
+                &secrets
+            )
+            .is_err()
+        );
+        // A name that is well formed but was never provisioned is refused when the policy is
+        // written, not hours later when a delivery is attempted.
+        assert!(
+            connector_auth_plan(
+                &json!({ "mode": "hmac", "secret_ref": "NEVER_PROVISIONED" }),
+                false,
+                workspace,
+                &secrets
             )
             .is_err()
         );
 
-        let env_backed = connector_auth_plan(
-            &json!({ "mode": "hmac", "secret_ref": format!("env:{namespace}TEST") }),
+        let file_backed = connector_auth_plan(
+            &json!({ "mode": "hmac", "secret_ref": "TEST" }),
             false,
             workspace,
+            &secrets,
         )
         .unwrap();
         assert_eq!(
-            env_backed.source,
-            Some(ConnectorCredentialSource::Env(format!("{namespace}TEST")))
+            file_backed.source,
+            Some(ConnectorCredentialSource::Named("TEST".to_string()))
         );
 
-        let empty = connector_auth_plan(&json!({}), false, workspace).unwrap();
+        let empty = connector_auth_plan(&json!({}), false, workspace, &secrets).unwrap();
         assert_eq!(empty.mode, ConnectorAuthMode::None);
         assert_eq!(
-            connector_auth_plan(&json!({}), true, workspace).unwrap().mode,
+            connector_auth_plan(&json!({}), true, workspace, &secrets).unwrap().mode,
             ConnectorAuthMode::Hmac
         );
         assert_eq!(
-            connector_auth_plan(&json!({ "mode": "none" }), true, workspace)
+            connector_auth_plan(&json!({ "mode": "none" }), true, workspace, &secrets)
                 .unwrap()
                 .mode,
             ConnectorAuthMode::None
         );
-    }
 
-    #[test]
-    fn credential_refs_cannot_reach_outside_the_connector_secret_namespace() {
-        // A connector endpoint is attacker controlled, so an unconstrained env reference would let
-        // whoever can create a connector have the worker post the process environment to that
-        // endpoint. Reading JWT_SECRET this way is a full authentication bypass.
-        let workspace = Uuid::new_v4();
-        let namespace = connector_secret_env_namespace(workspace);
-        for reference in [
-            "env:JWT_SECRET".to_string(),
-            "env:DATABASE_URL".to_string(),
-            "env:POSTGRES_PASSWORD".to_string(),
-            "env:PGPASSWORD".to_string(),
-            "env:AWS_SECRET_ACCESS_KEY".to_string(),
-            "env:OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY".to_string(),
-            "env:OPENPR_BOT_TOKEN".to_string(),
-            "env:HOME".to_string(),
-            "env:OPENPR_CONNECTOR_SECRET_".to_string(),
-            "env:MY_HOOK_SECRET".to_string(),
-            // The workspace namespace is a prefix, never a complete name.
-            format!("env:{namespace}"),
-        ] {
-            let policy = json!({ "mode": "bearer", "token_ref": reference.clone() });
-            assert!(
-                connector_auth_plan(&policy, false, workspace).is_err(),
-                "{reference} must not be referenceable"
-            );
-        }
-
-        let allowed = connector_auth_plan(
-            &json!({ "mode": "bearer", "token_ref": format!("env:{namespace}MYHOOK") }),
+        let bearer = connector_auth_plan(
+            &json!({ "mode": "bearer", "token_ref": "MYHOOK" }),
             false,
             workspace,
+            &secrets,
         )
         .unwrap();
-        assert_eq!(allowed.mode, ConnectorAuthMode::Bearer);
+        assert_eq!(bearer.mode, ConnectorAuthMode::Bearer);
         assert_eq!(
-            allowed.source,
-            Some(ConnectorCredentialSource::Env(format!("{namespace}MYHOOK")))
+            bearer.source,
+            Some(ConnectorCredentialSource::Named("MYHOOK".to_string()))
         );
     }
 
-    /// Every user can create a workspace and is its admin there, so a namespace shared by the whole
-    /// process is a namespace shared with every attacker: create a workspace, create a connector
-    /// pointing at your own server, reference someone else's credential name and the worker signs
-    /// the delivery to you with their secret. The namespace is therefore derived from the workspace
-    /// of the connector doing the reading, which is a server generated id the attacker neither
-    /// chooses nor can change.
+    #[test]
+    fn credential_refs_cannot_name_platform_secrets() {
+        // A connector endpoint is attacker controlled, so a reference that could name anything the
+        // process holds would let whoever can create a connector have the worker post that value to
+        // their own server. Reading the signing key this way is a full authentication bypass.
+        let workspace = Uuid::new_v4();
+        let secrets = secrets_store(&[(workspace, "MYHOOK", "hook-value")]);
+        for reference in [
+            "JWT_SECRET",
+            "DATABASE_URL",
+            "POSTGRES_PASSWORD",
+            "PGPASSWORD",
+            "AWS_SECRET_ACCESS_KEY",
+            "OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY",
+            "OPENPR_BOT_TOKEN",
+            "RUST_LOG",
+            "HOME",
+            "bad-name",
+            "",
+        ] {
+            let policy = json!({ "mode": "bearer", "token_ref": reference });
+            assert!(
+                connector_auth_plan(&policy, false, workspace, &secrets).is_err(),
+                "{reference} must not be referenceable"
+            );
+        }
+    }
+
+    /// The retired scheme provisioned credentials as `OPENPR_CONNECTOR_SECRET_W_<uuid>_<NAME>`
+    /// environment variables and referenced them as `env:<that variable>`. A policy left in that
+    /// shape must fail with an explanation of the new form, and must never resolve.
+    #[test]
+    fn the_retired_environment_reference_form_is_refused_with_an_explanation() {
+        let workspace = Uuid::new_v4();
+        let secrets = secrets_store(&[(workspace, "SHIPPING", "shipping-value")]);
+        let legacy = format!(
+            "env:OPENPR_CONNECTOR_SECRET_W_{}_SHIPPING",
+            workspace.simple().to_string().to_ascii_uppercase()
+        );
+
+        let error = connector_auth_plan(
+            &json!({ "mode": "hmac", "secret_ref": legacy }),
+            false,
+            workspace,
+            &secrets,
+        )
+        .expect_err("the retired form must not resolve");
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains(&workspace.to_string()), "{error}");
+
+        // Not even the bare new name behind an env: prefix, so the failure is never ambiguous.
+        assert!(
+            connector_auth_plan(
+                &json!({ "mode": "hmac", "secret_ref": "env:SHIPPING" }),
+                false,
+                workspace,
+                &secrets
+            )
+            .is_err()
+        );
+    }
+
+    /// Every user can create a workspace and is its admin there, so a credential namespace shared
+    /// by the whole process is a namespace shared with every attacker: create a workspace, create a
+    /// connector pointing at your own server, reference someone else's credential name and the
+    /// worker signs the delivery to you with their secret. The credential store is therefore
+    /// partitioned by workspace, and every lookup is made inside the partition of the connector
+    /// doing the reading — a server generated id the attacker neither chooses nor can change.
     #[test]
     fn a_connector_cannot_reference_another_workspaces_credential() {
         let victim = Uuid::new_v4();
         let attacker = Uuid::new_v4();
-        let victim_secret = format!("{}PAYMENTS", connector_secret_env_namespace(victim));
+        let secrets = secrets_store(&[
+            (victim, "PAYMENTS", "victim-payments-key"),
+            (attacker, "OWN", "attacker-own-key"),
+        ]);
 
-        // The attacker writes the policy, but the workspace used to build the namespace comes from
-        // the authenticated route or the stored connector row, never from the request body.
-        let stolen = json!({ "mode": "bearer", "token_ref": format!("env:{victim_secret}") });
-        let error = connector_auth_plan(&stolen, false, attacker).expect_err("cross tenant read must be refused");
-        assert!(error.contains(&connector_secret_env_namespace(attacker)), "{error}");
+        // The attacker writes the policy, but the workspace the lookup runs in comes from the
+        // authenticated route or the stored connector row, never from the request body.
+        let stolen = json!({ "mode": "bearer", "token_ref": "PAYMENTS" });
+        let error =
+            connector_auth_plan(&stolen, false, attacker, &secrets).expect_err("cross tenant read must be refused");
+        assert!(!error.contains("victim-payments-key"), "{error}");
 
         // The same policy is legitimate inside the workspace that owns the credential.
-        assert!(connector_auth_plan(&stolen, false, victim).is_ok());
+        assert!(connector_auth_plan(&stolen, false, victim, &secrets).is_ok());
 
-        // Knowing the victim namespace does not help: a name that merely contains it still resolves
-        // inside the attacker's own namespace.
-        let smuggled = json!({
-            "mode": "bearer",
-            "token_ref": format!("env:{}X_{victim_secret}", connector_secret_env_namespace(attacker)),
-        });
-        let plan = connector_auth_plan(&smuggled, false, attacker).expect("own namespace is allowed");
-        match plan.source {
-            Some(ConnectorCredentialSource::Env(name)) => assert!(
-                name.starts_with(&connector_secret_env_namespace(attacker)),
-                "resolved name {name} escaped the attacker namespace"
-            ),
-            other => panic!("expected an env source, got {other:?}"),
+        // Knowing the victim's workspace id does not help: there is no spelling of a name that
+        // reaches out of the reader's own partition.
+        for smuggled in [
+            format!("{victim}/PAYMENTS"),
+            format!("{victim}:PAYMENTS"),
+            format!("{}_PAYMENTS", victim.simple().to_string().to_ascii_uppercase()),
+            format!("W_{}_PAYMENTS", victim.simple().to_string().to_ascii_uppercase()),
+            "../PAYMENTS".to_string(),
+        ] {
+            let policy = json!({ "mode": "bearer", "token_ref": smuggled.clone() });
+            assert!(
+                connector_auth_plan(&policy, false, attacker, &secrets).is_err(),
+                "{smuggled} must not reach the victim's credential"
+            );
         }
 
-        // Delivery time repeats the check, so a policy stored before this rule existed, or written
-        // by a future code path that forgets it, still cannot read across tenants. The refusal has
-        // to name the namespace: failing only because the variable happens to be unset in this
-        // process would pass just as well without any check at all.
-        let source = ConnectorCredentialSource::Env(victim_secret.clone());
-        let error = resolve_connector_credential(&source, None, attacker)
+        // Delivery time repeats the lookup against the connector row's workspace, so a policy
+        // stored before this rule existed, or written by a future code path that forgets it, still
+        // cannot read across tenants.
+        let source = ConnectorCredentialSource::Named("PAYMENTS".to_string());
+        let error = resolve_connector_credential(&source, None, attacker, &secrets)
             .expect_err("delivery must refuse a cross tenant credential");
-        assert!(
-            error.contains(&connector_secret_env_namespace(attacker)),
-            "delivery must refuse on the namespace rule, not because the variable is unset: {error}"
-        );
+        assert!(!error.contains("victim-payments-key"), "{error}");
+        assert!(error.contains(&attacker.to_string()), "{error}");
 
-        // Inside the owning workspace the same name gets as far as reading the environment.
-        let owned = resolve_connector_credential(&ConnectorCredentialSource::Env(victim_secret), None, victim)
-            .expect_err("the variable is not set in the test process");
-        assert!(owned.contains("is not set"), "{owned}");
-    }
+        // Every embedded-workspace spelling is refused at delivery too, not only where the policy
+        // was written: this is what fails if the delivery lookup ever stops taking its workspace
+        // from the connector row.
+        for smuggled in [
+            format!("{victim}/PAYMENTS"),
+            format!("{victim}:PAYMENTS"),
+            format!("W_{}_PAYMENTS", victim.simple().to_string().to_ascii_uppercase()),
+        ] {
+            let source = ConnectorCredentialSource::Named(smuggled.clone());
+            let error = resolve_connector_credential(&source, None, attacker, &secrets)
+                .expect_err("an embedded workspace must not select a partition");
+            assert!(!error.contains("victim-payments-key"), "{smuggled}: {error}");
+        }
 
-    #[test]
-    fn credential_namespaces_are_distinct_and_env_safe() {
-        let first = connector_secret_env_namespace(Uuid::new_v4());
-        let second = connector_secret_env_namespace(Uuid::new_v4());
-        assert_ne!(first, second);
-        assert!(first.starts_with(CONNECTOR_SECRET_ENV_PREFIX));
-        assert!(first.ends_with('_'));
-        assert!(
-            first
-                .chars()
-                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
-            "{first} must be a legal environment variable prefix"
+        // Inside the owning workspace the same name resolves to the real value.
+        assert_eq!(
+            resolve_connector_credential(&source, None, victim, &secrets).unwrap(),
+            "victim-payments-key"
         );
     }
 
+    /// The workspace a policy is checked against comes from the authenticated route path. Reading
+    /// it from the policy body instead would hand the choice of tenant back to the attacker, which
+    /// is exactly the cross-tenant credential read this partitioning exists to prevent.
     #[test]
-    fn credential_resolution_requires_a_configured_secret() {
+    fn the_policy_body_cannot_choose_the_workspace_it_is_checked_against() {
+        let victim = Uuid::new_v4();
+        let attacker = Uuid::new_v4();
+        let secrets = secrets_store(&[(victim, "PAYMENTS", "victim-payments-key")]);
+
+        for key in ["workspace_id", "workspace", "tenant_id", "owner_workspace_id"] {
+            let policy = json!({ "mode": "bearer", "token_ref": "PAYMENTS", key: victim.to_string() });
+            let error = validate_connector_auth_policy_with(&policy, false, attacker, &secrets)
+                .expect_err("the body must not select the victim's workspace");
+            assert!(!error.contains("victim-payments-key"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn credential_resolution_requires_a_provisioned_secret() {
         let workspace = Uuid::new_v4();
+        let secrets = secrets_store(&[(workspace, "PRESENT", "present-value"), (workspace, "BLANK", "   ")]);
+
         assert_eq!(
             resolve_connector_credential(
                 &ConnectorCredentialSource::WebhookSecret,
                 Some(" top-secret "),
-                workspace
+                workspace,
+                &secrets
             )
             .unwrap(),
             "top-secret"
         );
         assert!(
-            resolve_connector_credential(&ConnectorCredentialSource::WebhookSecret, Some("  "), workspace).is_err()
+            resolve_connector_credential(
+                &ConnectorCredentialSource::WebhookSecret,
+                Some("  "),
+                workspace,
+                &secrets
+            )
+            .is_err()
         );
-        assert!(resolve_connector_credential(&ConnectorCredentialSource::WebhookSecret, None, workspace).is_err());
+        assert!(
+            resolve_connector_credential(&ConnectorCredentialSource::WebhookSecret, None, workspace, &secrets).is_err()
+        );
+        assert_eq!(
+            resolve_connector_credential(
+                &ConnectorCredentialSource::Named("PRESENT".to_string()),
+                None,
+                workspace,
+                &secrets
+            )
+            .unwrap(),
+            "present-value"
+        );
+        // A provisioned but blank credential is refused rather than signing with an empty key.
         assert!(
             resolve_connector_credential(
-                &ConnectorCredentialSource::Env(format!("{}ABSENT", connector_secret_env_namespace(workspace))),
+                &ConnectorCredentialSource::Named("BLANK".to_string()),
                 None,
-                workspace
+                workspace,
+                &secrets
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_connector_credential(
+                &ConnectorCredentialSource::Named("ABSENT".to_string()),
+                None,
+                workspace,
+                &secrets
             )
             .is_err()
         );
