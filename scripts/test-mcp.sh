@@ -6,6 +6,39 @@ set -e
 
 MCP_URL="${MCP_URL:-http://localhost:8090}"
 EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-105}"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="${OPENPR_ENV_FILE:-$PROJECT_ROOT/.env}"
+
+# Reads one KEY=value from an env file, without sourcing it.
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  local line=""
+  [ -f "$file" ] || return 0
+  line="$(grep -E "^${key}=.+" "$file" | tail -n 1 || true)"
+  [ -n "$line" ] || return 0
+  line="${line#*=}"
+  # Strip one layer of surrounding quotes, the way compose reads .env.
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+  printf '%s' "$line"
+}
+
+# /mcp/rpc, /sse and /messages require a bearer token when the server was started with
+# OPENPR_MCP_AUTH_TOKEN; /health is exempt.
+MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
+if [ -z "$MCP_AUTH_TOKEN" ]; then
+  MCP_AUTH_TOKEN="$(read_env_value OPENPR_MCP_AUTH_TOKEN "$ENV_FILE")"
+fi
+if [ -z "$MCP_AUTH_TOKEN" ]; then
+  echo "❌ OPENPR_MCP_AUTH_TOKEN is not set"
+  echo "   The MCP server rejects /mcp/rpc without 'Authorization: Bearer <token>'."
+  echo "   Export OPENPR_MCP_AUTH_TOKEN, or set it in $ENV_FILE"
+  echo "   (bash scripts/start.sh generates one on first run)."
+  exit 1
+fi
 
 echo "🧪 Starting MCP Server Tests"
 echo "MCP URL: $MCP_URL"
@@ -27,6 +60,7 @@ echo ""
 echo "📋 Test 2: List Available Tools"
 tools_response=$(curl -sS -X POST "$MCP_URL/mcp/rpc" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
 
 tool_names=$(python3 -c '
@@ -109,6 +143,7 @@ echo ""
 echo "📋 Test 3: Invoke Tool (projects.list)"
 call_response=$(curl -sS -X POST "$MCP_URL/mcp/rpc" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}')
 
 python3 -c '

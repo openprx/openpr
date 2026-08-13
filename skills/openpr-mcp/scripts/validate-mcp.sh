@@ -1,15 +1,52 @@
 #!/bin/bash
 # Quick smoke test for OpenPR MCP server connectivity
 # Usage: ./validate-mcp.sh [http://localhost:8090] [project-uuid]
+# Requires OPENPR_MCP_AUTH_TOKEN in the environment or in the repository .env
+# (override the file with OPENPR_ENV_FILE).
 
 MCP_URL="${1:-http://localhost:8090}"
 PROJECT_ID="${2:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${OPENPR_ENV_FILE:-$SCRIPT_DIR/../../../.env}"
+
+# Reads one KEY=value from an env file, without sourcing it.
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  local line=""
+  [ -f "$file" ] || return 0
+  line="$(grep -E "^${key}=.+" "$file" | tail -n 1 || true)"
+  [ -n "$line" ] || return 0
+  line="${line#*=}"
+  # Strip one layer of surrounding quotes, the way compose reads .env.
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+  printf '%s' "$line"
+}
+
+# /mcp/rpc, /sse and /messages require a bearer token when the server was started with
+# OPENPR_MCP_AUTH_TOKEN; /health is exempt. The token is never passed as an argument so it
+# does not end up in the process list.
+MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
+if [ -z "$MCP_AUTH_TOKEN" ]; then
+  MCP_AUTH_TOKEN="$(read_env_value OPENPR_MCP_AUTH_TOKEN "$ENV_FILE")"
+fi
+if [ -z "$MCP_AUTH_TOKEN" ]; then
+  echo "❌ OPENPR_MCP_AUTH_TOKEN is not set"
+  echo "   The MCP server rejects /mcp/rpc without 'Authorization: Bearer <token>'."
+  echo "   Export OPENPR_MCP_AUTH_TOKEN, or set it in $ENV_FILE"
+  echo "   (bash scripts/start.sh generates one on first run)."
+  exit 1
+fi
 
 echo "Testing MCP at $MCP_URL ..."
 
 # tools/list
 TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
 
 TOOLS=$(printf '%s' "$TOOLS_RESPONSE" | \
@@ -110,6 +147,7 @@ fi
 if [ -n "$PROJECT_ID" ]; then
   PROJECT_TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"project_id\":\"$PROJECT_ID\"}}")
 
   PROJECT_TOOLS=$(printf '%s' "$PROJECT_TOOLS_RESPONSE" | \
@@ -141,6 +179,7 @@ fi
 # projects.list
 RESULT=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}')
 
 if echo "$RESULT" | grep -q '"code": 0'; then

@@ -128,6 +128,12 @@ services:
       OPENPR_API_URL: http://api:8080
       OPENPR_BOT_TOKEN: ${OPENPR_BOT_TOKEN:?set OPENPR_BOT_TOKEN for the MCP server}
       OPENPR_WORKSPACE_ID: ${OPENPR_WORKSPACE_ID:?set OPENPR_WORKSPACE_ID for the MCP server}
+      # Inbound bearer token for /mcp/rpc, /sse and /messages; /health stays open for the
+      # healthcheck below. Required, not defaulted: the container has to bind 0.0.0.0 so the
+      # other services can reach it, and the server refuses to start on a non-loopback bind
+      # without a token. A default would either be an empty value that turns a readable compose
+      # error into a container crash loop, or a shared secret published in this repository.
+      OPENPR_MCP_AUTH_TOKEN: ${OPENPR_MCP_AUTH_TOKEN:?set OPENPR_MCP_AUTH_TOKEN (16+ chars) for the MCP server, scripts/start.sh generates one}
     command: ["/app/mcp-server", "serve", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
     ports:
       - "${OPENPR_BIND_HOST:-127.0.0.1}:${MCP_SERVER_PORT:-8090}:8090"

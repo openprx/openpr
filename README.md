@@ -35,7 +35,7 @@ bash scripts/start.sh
 ```
 
 `scripts/start.sh` creates a local `.env` on first run with random non-production
-`POSTGRES_PASSWORD` / `JWT_SECRET`, builds release binaries for
+`POSTGRES_PASSWORD` / `JWT_SECRET` / `OPENPR_MCP_AUTH_TOKEN`, builds release binaries for
 `Dockerfile.prebuilt`, then runs `docker compose up -d --build`. Replace the
 generated secrets before production use. Services publish on
 `${OPENPR_BIND_HOST:-127.0.0.1}`: frontend `:3000`, API `:8081`, MCP `:8090`.
@@ -70,9 +70,16 @@ cargo run --bin mcp-server -- serve --transport http
 `OPENPR_OBJECT_STORAGE_DIR`, and `OPENPR_OBJECT_STORAGE_S3_{ENDPOINT, BUCKET,
 REGION, ACCESS_KEY_ID, SECRET_ACCESS_KEY, SESSION_TOKEN}`. mcp-server:
 `OPENPR_API_URL`, `OPENPR_BOT_TOKEN`, `OPENPR_WORKSPACE_ID`,
-`OPENPR_INVOCATION_ID` (optional ledger correlation), `OPENPR_MCP_TRANSPORT`
-(transport label in tool payloads, default `mcp_stdio`). All binaries read
-`RUST_LOG` as the `tracing` env filter.
+`OPENPR_MCP_AUTH_TOKEN` (inbound auth, see below), `OPENPR_INVOCATION_ID`
+(optional ledger correlation), `OPENPR_MCP_TRANSPORT` (transport label in tool
+payloads, default `mcp_stdio`). All binaries read `RUST_LOG` as the `tracing`
+env filter.
+
+**Inbound MCP authentication (mcp-server).**
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `OPENPR_MCP_AUTH_TOKEN` | unset | Bearer token required on the MCP HTTP surfaces. When set, `/mcp/rpc`, `/sse` and `/messages` reject any request without `Authorization: Bearer <token>`; `/health` stays open so container healthchecks keep working. Minimum 16 characters — generate one with `openssl rand -hex 32`. The server **refuses to start** when `--bind-addr` is not a loopback address and this variable is unset, so `docker-compose.yml` requires it: the container binds `0.0.0.0:8090` because the other compose services reach the MCP server over the bridge network. `scripts/start.sh` writes a random value into `.env` on first run; `scripts/test-mcp.sh`, `scripts/bootstrap-restaurant-demo.sh` and `skills/openpr-mcp/scripts/validate-mcp.sh` read it from the environment or from `.env`. |
 
 **Outbound deliveries (api + worker).** Connector and webhook endpoints are
 validated when they are configured and again before every delivery: an endpoint
@@ -200,13 +207,22 @@ Only `--transport http` serves all three surfaces on one port.
 | **stdio** | `serve --transport stdio` | stdin/stdout JSON-RPC                                    |
 | **SSE**   | `serve --transport sse`   | `GET /sse`, `POST /messages`, `/health` — **no** `/mcp/rpc` |
 
-> **Security — the MCP HTTP/SSE endpoints are unauthenticated.**
+> **Security — the MCP HTTP/SSE endpoints are guarded by `OPENPR_MCP_AUTH_TOKEN`.**
 >
-> `/mcp/rpc`, `/sse`, and `/messages` have **no auth middleware**. The bot token
-> is used only on the mcp-server → API hop, so anyone who can reach the MCP port
-> gets full workspace access under the server's bot identity. This is why
-> `docker-compose.yml` binds the port to `${OPENPR_BIND_HOST:-127.0.0.1}`. Never
-> expose the MCP port to a network without your own authenticating proxy.
+> When `OPENPR_MCP_AUTH_TOKEN` is set (minimum 16 characters), `/mcp/rpc`,
+> `/sse` and `/messages` require `Authorization: Bearer <token>` and reject
+> everything else; `/health` is exempt so healthchecks keep working. The check
+> is fail-closed: if `--bind-addr` is not a loopback address and the variable is
+> unset, the server **refuses to start** rather than serving an open port. A
+> loopback bind without a token stays open to anything local, which is why
+> `docker-compose.yml` still publishes the port on
+> `${OPENPR_BIND_HOST:-127.0.0.1}` and requires the token for the container's
+> `0.0.0.0:8090` bind.
+>
+> The token is a single shared secret, not a per-caller identity: everyone
+> holding it acts under the server's bot token, with full access to its
+> workspace. Treat it as one trust boundary and put your own authenticating
+> proxy in front when different callers need different rights.
 
 ### Bot tokens
 
@@ -239,15 +255,22 @@ endpoint it returns, and the response arrives back on the stream as
 `event: message`.
 
 ```bash
+# The Authorization header is required whenever the server was started with a token.
+export OPENPR_MCP_AUTH_TOKEN=your_mcp_auth_token
+
 curl -X POST http://localhost:8090/mcp/rpc -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 curl -X POST http://localhost:8090/mcp/rpc -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"project_id":"<project-uuid>"}}'
 
-curl -N -H "Accept: text/event-stream" http://localhost:8090/sse
+curl -N -H "Accept: text/event-stream" \
+  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" http://localhost:8090/sse
 # → event: endpoint / data: /messages?session_id=<uuid>
 curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 

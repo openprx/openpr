@@ -83,7 +83,17 @@ if [ ! -f .env ]; then
   upsert_env "OPENPR_BOT_TOKEN" "opr_local_$(random_hex 24)"
   upsert_env "OPENPR_WORKSPACE_ID" "$(random_uuid)"
   upsert_env "DEFAULT_AUTHOR_ID" "$(random_uuid)"
+  upsert_env "OPENPR_MCP_AUTH_TOKEN" "$(random_hex 32)"
   echo "⚠️  Local bootstrap secrets were generated in .env. Replace them before production use."
+  echo ""
+fi
+
+# An .env written before the MCP server gained inbound authentication has no token, and compose
+# now refuses to start mcp-server without one. Only mcp-server reads this value, so generating it
+# here cannot invalidate an already provisioned database or bot token.
+if ! grep -qE "^OPENPR_MCP_AUTH_TOKEN=.+" .env; then
+  upsert_env "OPENPR_MCP_AUTH_TOKEN" "$(random_hex 32)"
+  echo "🔐 Generated OPENPR_MCP_AUTH_TOKEN in .env (value not printed)."
   echo ""
 fi
 
@@ -92,6 +102,7 @@ required_vars=(
   JWT_SECRET
   OPENPR_BOT_TOKEN
   OPENPR_WORKSPACE_ID
+  OPENPR_MCP_AUTH_TOKEN
 )
 
 missing_vars=()
@@ -119,6 +130,14 @@ if ! validate_concrete_value "OPENPR_BOT_TOKEN" "$bot_token"; then
   config_errors=$((config_errors + 1))
 elif [[ "$bot_token" != opr_* ]]; then
   echo "❌ .env value for OPENPR_BOT_TOKEN must start with opr_"
+  config_errors=$((config_errors + 1))
+fi
+
+mcp_auth_token="$(env_value "OPENPR_MCP_AUTH_TOKEN")"
+if ! validate_concrete_value "OPENPR_MCP_AUTH_TOKEN" "$mcp_auth_token"; then
+  config_errors=$((config_errors + 1))
+elif [ "${#mcp_auth_token}" -lt 16 ]; then
+  echo "❌ .env value for OPENPR_MCP_AUTH_TOKEN must be at least 16 characters"
   config_errors=$((config_errors + 1))
 fi
 

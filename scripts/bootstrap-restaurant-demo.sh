@@ -32,6 +32,8 @@ Environment:
                                 Values: auto, 1, 0. Default: auto.
   OPENPR_DEMO_MCP_URL           MCP JSON-RPC URL.
                                 Default: http://localhost:8090/mcp/rpc
+  OPENPR_MCP_AUTH_TOKEN         Bearer token for the MCP JSON-RPC endpoint.
+                                Read from OPENPR_DEMO_ENV_PATH when unset.
 
 This is a local onboarding helper, not a production seeding tool.
 EOF
@@ -50,6 +52,32 @@ require_cmd() {
 }
 
 require_cmd node
+
+DEMO_ENV_PATH="${OPENPR_DEMO_ENV_PATH:-$ROOT_DIR/.env}"
+
+# Reads one KEY=value from an env file, without sourcing it.
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  local line=""
+  [ -f "$file" ] || return 0
+  line="$(grep -E "^${key}=.+" "$file" | tail -n 1 || true)"
+  [ -n "$line" ] || return 0
+  line="${line#*=}"
+  # Strip one layer of surrounding quotes, the way compose reads .env.
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+  printf '%s' "$line"
+}
+
+# The MCP verification below posts to /mcp/rpc, which requires a bearer token when the server
+# was started with OPENPR_MCP_AUTH_TOKEN. /health is exempt and stays unauthenticated.
+MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
+if [ -z "$MCP_AUTH_TOKEN" ]; then
+  MCP_AUTH_TOKEN="$(read_env_value OPENPR_MCP_AUTH_TOKEN "$DEMO_ENV_PATH")"
+fi
 
 DEMO_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/openpr-restaurant-demo.XXXXXX.json")"
 trap 'rm -f "$DEMO_STATE_FILE"' EXIT
@@ -76,7 +104,7 @@ OPENPR_DEMO_WORKSPACE_NAME="${OPENPR_DEMO_WORKSPACE_NAME:-Restaurant Demo}" \
 OPENPR_DEMO_PROJECT_KEY="${OPENPR_DEMO_PROJECT_KEY:-RESTDEMO}" \
 OPENPR_DEMO_PROJECT_NAME="${OPENPR_DEMO_PROJECT_NAME:-Restaurant Ordering Demo}" \
 OPENPR_DEMO_WRITE_ENV="${OPENPR_DEMO_WRITE_ENV:-auto}" \
-OPENPR_DEMO_ENV_PATH="${OPENPR_DEMO_ENV_PATH:-$ROOT_DIR/.env}" \
+OPENPR_DEMO_ENV_PATH="$DEMO_ENV_PATH" \
 OPENPR_DEMO_STATE_FILE="$DEMO_STATE_FILE" \
 node --input-type=commonjs <<'NODE'
 const fs = require('fs');
@@ -375,12 +403,16 @@ fi
 OPENPR_DEMO_STATE_FILE="$DEMO_STATE_FILE" \
 OPENPR_DEMO_VERIFY_MCP_HTTP="${OPENPR_DEMO_VERIFY_MCP_HTTP:-auto}" \
 OPENPR_DEMO_MCP_URL="${OPENPR_DEMO_MCP_URL:-http://localhost:8090/mcp/rpc}" \
+OPENPR_DEMO_ENV_PATH="$DEMO_ENV_PATH" \
+OPENPR_MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" \
 node --input-type=commonjs <<'NODE'
 const fs = require('fs');
 
 const verifyMode = process.env.OPENPR_DEMO_VERIFY_MCP_HTTP ?? 'auto';
 const mcpUrl = process.env.OPENPR_DEMO_MCP_URL ?? 'http://localhost:8090/mcp/rpc';
 const stateFile = process.env.OPENPR_DEMO_STATE_FILE;
+const envPath = process.env.OPENPR_DEMO_ENV_PATH ?? '.env';
+const mcpAuthToken = process.env.OPENPR_MCP_AUTH_TOKEN ?? '';
 
 if (verifyMode === '0' || verifyMode === 'false') {
   console.log('MCP HTTP verification skipped: OPENPR_DEMO_VERIFY_MCP_HTTP=0');
@@ -442,6 +474,13 @@ function extractTextContent(payload) {
 }
 
 async function verify() {
+  if (!mcpAuthToken) {
+    const message = 'MCP HTTP verification needs OPENPR_MCP_AUTH_TOKEN: /mcp/rpc rejects requests without an Authorization: Bearer header';
+    if (verifyMode === '1') throw new Error(message);
+    console.log(`${message}. Export OPENPR_MCP_AUTH_TOKEN or set it in ${envPath} (bash scripts/start.sh generates one).`);
+    return;
+  }
+
   const healthUrl = healthUrlFromRpcUrl(mcpUrl);
   const reachable = await waitForHealth(healthUrl);
   if (!reachable) {
@@ -453,7 +492,10 @@ async function verify() {
 
   const response = await fetchWithTimeout(mcpUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${mcpAuthToken}`,
+    },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -461,6 +503,9 @@ async function verify() {
       params: { name: 'projects.list', arguments: {} },
     }),
   }, 5000);
+  if (response.status === 401 || response.status === 403) {
+    throw new Error(`MCP HTTP verification was rejected with ${response.status}: OPENPR_MCP_AUTH_TOKEN does not match the token the MCP server runs with. Recreate mcp-server after changing .env.`);
+  }
   const payload = await response.json();
   if (!response.ok || payload.error || payload?.result?.is_error === true) {
     throw new Error(`MCP HTTP projects.list failed: ${JSON.stringify(payload)}`);
