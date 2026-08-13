@@ -1,0 +1,218 @@
+# OpenPR configuration — annotated example.
+#
+# Copy this file to config/openpr.toml, replace every replace_with_* placeholder, and start the
+# services from the directory that holds it, or pass --config <path>.
+#
+#     cp config/openpr.example.toml config/openpr.toml
+#     $EDITOR config/openpr.toml
+#
+# OpenPR reads NO environment variables. This file is the only source of configuration for the
+# API, the worker and the MCP server; each binary reads the sections it needs and ignores the
+# rest. A missing file is a startup error — the services never invent defaults for a database URL
+# or a signing key.
+#
+# Every replace_with_* value below is rejected by validation on purpose, as are empty strings and
+# unexpanded ${...} templates. Validation reports all unusable values at once, so one round of
+# edits fixes the whole file.
+#
+# Keys marked REQUIRED must be present for the binaries named next to them, and are checked when
+# one of those binaries starts — a deployment that runs only the MCP server needs no [database]
+# and no [auth] at all, and is never asked to invent a database URL or a signing key it does not
+# use. A value that IS written down is checked for shape at startup either way, whichever binary
+# reads the file. Everything else is optional and falls back to the default recorded in its
+# comment.
+
+
+# ---------------------------------------------------------------------------------------------
+# [server] — identity and listen address of the HTTP binaries.
+#
+# Optional as a whole. One file serves three binaries that listen on different ports, so leaving
+# these out lets each binary keep its own built-in default (api and worker: 0.0.0.0:8081). Set
+# them only when you run a single binary from this file, or when you override the port.
+# ---------------------------------------------------------------------------------------------
+[server]
+# Service name used in logs and in the health payload. Default: the binary's own name.
+# app_name = "api"
+
+# Listen address as host:port. Default: the binary's own default.
+# bind_addr = "0.0.0.0:8081"
+
+
+# ---------------------------------------------------------------------------------------------
+# [database] — PostgreSQL connection and pool shape.
+#
+# Read by the api and the worker. The MCP server reaches the API over HTTP and opens no
+# connection of its own, so an MCP-only deployment can delete this whole section.
+# ---------------------------------------------------------------------------------------------
+[database]
+# REQUIRED by the api and the worker; both refuse to start without it. Full connection URL,
+# password included. Never logged: it is redacted in every Debug and error output.
+url = "postgres://openpr:replace_with_postgres_password@localhost:5432/openpr"
+
+# Pool bounds. min_connections must not exceed max_connections.
+max_connections = 20          # default: 20
+min_connections = 2           # default: 2
+
+# Pool timeouts, in whole seconds. Each must be at least 1.
+connect_timeout_seconds = 5   # default: 5
+idle_timeout_seconds = 30     # default: 30
+acquire_timeout_seconds = 5   # default: 5
+
+
+# ---------------------------------------------------------------------------------------------
+# [auth] — token signing and issuance.
+#
+# Read by the api and the worker. The MCP server presents a bot token the API issued and signs
+# nothing itself, so an MCP-only deployment can delete this whole section.
+# ---------------------------------------------------------------------------------------------
+[auth]
+# REQUIRED by the api and the worker; both refuse to start without it. Signs every access and
+# refresh token in the deployment. Minimum 16 characters; 64 hex characters is the
+# recommendation. Generate one with:
+#
+#     openssl rand -hex 32
+#
+# Rotating this value invalidates every issued token. Never logged.
+jwt_secret = "replace_with_a_64_character_hex_secret"
+
+# Token lifetimes in seconds. Both must be greater than 0.
+access_ttl_seconds = 1296000   # default: 1296000 (15 days)
+refresh_ttl_seconds = 1728000  # default: 1728000 (20 days)
+
+# Author attributed to records created by an unauthenticated import path. Optional; when set it
+# must be a real, non-nil UUID of an existing user.
+# default_author_id = "00000000-0000-0000-0000-000000000000"  # the nil UUID is rejected
+
+
+# ---------------------------------------------------------------------------------------------
+# [logging] — replaces RUST_LOG.
+# ---------------------------------------------------------------------------------------------
+[logging]
+# tracing-subscriber filter directives. Validated at startup, so a typo fails fast instead of
+# silently producing a silent service. Default: "<service>=info,tower_http=info".
+# filter = "api=info,tower_http=info,sea_orm=warn"
+
+# "json" for log shippers, "text" for a terminal. Default: json.
+format = "json"
+
+# Stream the log goes to: "stderr" or "stdout". Default: stderr.
+#
+# Stderr is the default because it is never a data channel: a log line written there cannot
+# corrupt whatever a binary writes to stdout, and container runtimes and init systems capture the
+# two streams identically, so nothing is lost by preferring it.
+#
+# The MCP server's stdio transport frames JSON-RPC on stdout, where one log line breaks the
+# session. It therefore always logs to stderr and reports this setting as overridden if it says
+# "stdout" — one file configures three binaries, and the choice the api makes here must not be
+# able to break the MCP server.
+output = "stderr"
+
+
+# ---------------------------------------------------------------------------------------------
+# [storage] — where uploaded objects live.
+# ---------------------------------------------------------------------------------------------
+[storage]
+# "local" or "s3". Default: local.
+backend = "local"
+
+# Root directory of the local backend. Ignored when backend = "s3". Default: "./uploads".
+dir = "./uploads"
+
+# [storage.s3] is REQUIRED when backend = "s3", and left unread otherwise — you can keep it
+# filled in while running on local storage and switch by editing one line above.
+# [storage.s3]
+# endpoint = "https://s3.eu-central-1.amazonaws.com"  # REQUIRED, http:// or https://
+# bucket = "openpr-uploads"                           # REQUIRED, 3-63 chars, lowercase
+# region = "us-east-1"                                # default: us-east-1
+# access_key_id = "replace_with_s3_access_key_id"          # REQUIRED, never logged
+# secret_access_key = "replace_with_s3_secret_access_key"  # REQUIRED, never logged
+# session_token = "replace_with_s3_session_token"          # optional, for temporary credentials
+
+
+# ---------------------------------------------------------------------------------------------
+# [migrations] — escape hatches of the migration runner. Both default to false, which is the
+# setting a healthy deployment runs with. Turn one on deliberately, then turn it back off.
+# ---------------------------------------------------------------------------------------------
+[migrations]
+# Re-execute every migration once, reporting failures without aborting. Safe on a live database:
+# a failure never downgrades a ledger row that already records a success.
+replay = false
+
+# Start even though a migration failed or the schema check found a gap. The degraded path for
+# getting a service up to inspect it. The failure is still recorded and logged.
+continue_on_error = false
+
+
+# ---------------------------------------------------------------------------------------------
+# [outbound] — what the connector delivery pipeline is allowed to call.
+#
+# Outbound requests to private and loopback addresses are blocked by default, so a connector
+# cannot be pointed at the cluster's own metadata service or at an internal admin port.
+# ---------------------------------------------------------------------------------------------
+[outbound]
+# Hosts exempt from the private address check, as "host" or "host:port". Matched literally and
+# case-insensitively — no wildcards, no URLs, no paths. Default: empty.
+allowed_hosts = []
+# allowed_hosts = ["worker.internal", "hooks.example.com:8443"]
+
+# Disables the private address check entirely. Only for a closed network you control end to end.
+# Default: false.
+allow_private = false
+
+
+# ---------------------------------------------------------------------------------------------
+# [mcp] — MCP server. Optional for the API and the worker; the MCP server needs bot_token and
+# workspace_id and reports both at once if they are missing. A file that carries only this
+# section is a complete configuration for an MCP-only deployment.
+# ---------------------------------------------------------------------------------------------
+[mcp]
+# Base URL of the OpenPR API the MCP server talks to. Default: http://localhost:8081.
+# api_url = "http://localhost:8081"
+
+# REQUIRED to run the MCP server. Workspace bot token; must carry the opr_ prefix. Create one in
+# the workspace's bot settings. Never logged.
+# bot_token = "replace_with_opr_bot_token"
+
+# REQUIRED to run the MCP server. Workspace the bot acts in. Must be a real, non-nil UUID.
+# workspace_id = "replace_with_workspace_uuid"
+
+# Bearer token inbound HTTP/SSE callers must present. Minimum 16 characters. The MCP server
+# holds a workspace bot token, so anyone who can reach a networked transport holds every
+# permission that bot has — set this whenever transport is http or sse on a non-loopback bind.
+# Generate one with: openssl rand -hex 24. Never logged.
+# auth_token = "replace_with_mcp_inbound_token"
+
+# "stdio", "http" or "sse". Default: stdio, which is a pipe pair owned by the parent process and
+# therefore carries no inbound authentication question.
+transport = "stdio"
+
+# Listen address for the http and sse transports. Default: 127.0.0.1:8090.
+# bind_addr = "127.0.0.1:8090"
+
+# Correlation id stamped onto API calls made on behalf of one agent invocation. Usually left
+# unset and supplied per invocation.
+# invocation_id = "inv-0001"
+
+
+# ---------------------------------------------------------------------------------------------
+# [connectors.secrets] — credentials the delivery pipeline may present to third parties.
+#
+# One table per workspace, keyed by the workspace's UUID. A connector can only read credentials
+# filed under the UUID of the workspace that owns it: the lookup selects the workspace table
+# first and searches for the name only inside it, so no reference — however it is spelled — can
+# reach another tenant's credentials. Two workspaces may use the same credential name without
+# colliding.
+#
+# Names must match [A-Z_][A-Z0-9_]* and must not start with OPENPR_, POSTGRES_, PG or AWS_, and
+# must not be JWT_SECRET, DATABASE_URL or RUST_LOG. Values are never logged.
+#
+# Reference one from a connector's auth_policy by its short name, for example:
+#
+#     "auth_policy": { "mode": "hmac", "secret_ref": "SHIPPING" }
+#
+# The retired OPENPR_CONNECTOR_SECRET_W_<uuid>_<NAME> environment variables map to this table:
+# drop the whole prefix and file the remaining name under the workspace UUID.
+# ---------------------------------------------------------------------------------------------
+# [connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
+# SHIPPING = "replace_with_connector_credential"
+# PAYMENTS = "replace_with_connector_credential"

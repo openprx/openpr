@@ -7,12 +7,17 @@
 //! compose file binding the port to `127.0.0.1` was the only thing in the way, and a port
 //! mapping is a deployment convenience, not a security boundary.
 //!
-//! Everything here drives the *shipped binary* over real TCP.
+//! Everything here drives the *shipped binary* over real TCP, configured the way a
+//! deployment configures it: a TOML file handed over with `--config`, and no environment
+//! variables at all.
+
+mod support;
 
 use serde_json::{Value, json};
 use std::error::Error;
 use std::process::Stdio;
 use std::time::Duration;
+use support::{ConfigFile, McpSettings, write_config};
 use tokio::process::{Child, Command};
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -29,34 +34,56 @@ async fn free_port() -> Result<u16, Box<dyn Error>> {
     Ok(port)
 }
 
-/// A live `mcp-server serve --transport http` child process.
+/// A live `mcp-server serve` child process on a networked transport.
+///
+/// The transport, the bind address and the inbound token all come out of the
+/// configuration file, so the listener under test is the one a deployment would get.
 struct HttpServer {
     child: Child,
     base_url: String,
+    /// Kept alive for as long as the child runs: dropping it deletes the file.
+    _config: ConfigFile,
 }
 
 impl HttpServer {
     fn spawn(bind_addr: &str, inbound_token: Option<&str>) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_with(bind_addr, bind_addr, inbound_token, "http", &[])
+    }
+
+    /// `configured_bind` is what the file says, `reachable_at` is where the listener is
+    /// expected to end up, and `extra_args` are appended after `--config` — so a test can
+    /// hand the two different values and prove a flag overrides the file.
+    fn spawn_with(
+        configured_bind: &str,
+        reachable_at: &str,
+        inbound_token: Option<&str>,
+        transport: &str,
+        extra_args: &[&str],
+    ) -> Result<Self, Box<dyn Error>> {
+        let config = write_config(&McpSettings {
+            // No API call is made by `initialize`, so the URL only has to be well formed.
+            api_url: "http://127.0.0.1:1",
+            bot_token: BOT_TOKEN,
+            workspace_id: WORKSPACE,
+            auth_token: inbound_token,
+            transport: Some(transport),
+            bind_addr: Some(configured_bind),
+        })?;
+
         let mut command = Command::new(env!("CARGO_BIN_EXE_mcp-server"));
         command
-            .args(["serve", "--transport", "http", "--bind-addr", bind_addr])
-            // No API call is made by `initialize`, so the URL only has to be well formed.
-            .env("OPENPR_API_URL", "http://127.0.0.1:1")
-            .env("OPENPR_BOT_TOKEN", BOT_TOKEN)
-            .env("OPENPR_WORKSPACE_ID", WORKSPACE)
-            .env("RUST_LOG", "error")
-            .env_remove("OPENPR_MCP_AUTH_TOKEN")
+            .args(["serve", "--config"])
+            .arg(config.path())
+            .args(extra_args)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if let Some(token) = inbound_token {
-            command.env("OPENPR_MCP_AUTH_TOKEN", token);
-        }
 
         let child = command.spawn()?;
         Ok(Self {
             child,
-            base_url: format!("http://{bind_addr}"),
+            base_url: format!("http://{reachable_at}"),
+            _config: config,
         })
     }
 
@@ -238,8 +265,8 @@ async fn a_non_loopback_bind_without_a_token_refuses_to_start() -> TestResult {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("OPENPR_MCP_AUTH_TOKEN"),
-        "the refusal must name the variable that fixes it: {stderr}"
+        stderr.contains("mcp.auth_token"),
+        "the refusal must name the configuration key that fixes it: {stderr}"
     );
     assert!(
         stderr.contains(&bind_addr),
@@ -265,29 +292,68 @@ async fn a_non_loopback_bind_without_a_token_refuses_to_start() -> TestResult {
 #[tokio::test]
 async fn a_non_loopback_sse_bind_without_a_token_refuses_to_start() -> TestResult {
     let bind_addr = format!("0.0.0.0:{}", free_port().await?);
-    let child = Command::new(env!("CARGO_BIN_EXE_mcp-server"))
-        .args(["serve", "--transport", "sse", "--bind-addr", &bind_addr])
-        .env("OPENPR_API_URL", "http://127.0.0.1:1")
-        .env("OPENPR_BOT_TOKEN", BOT_TOKEN)
-        .env("OPENPR_WORKSPACE_ID", WORKSPACE)
-        .env("RUST_LOG", "error")
-        .env_remove("OPENPR_MCP_AUTH_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+    let server = HttpServer::spawn_with(&bind_addr, &bind_addr, None, "sse", &[])?;
 
-    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await??;
+    let output = tokio::time::timeout(Duration::from_secs(20), server.child.wait_with_output()).await??;
     assert!(
         !output.status.success(),
         "SSE on 0.0.0.0 without inbound auth must not start"
     );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("OPENPR_MCP_AUTH_TOKEN"),
+        String::from_utf8_lossy(&output.stderr).contains("mcp.auth_token"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
+}
+
+/// `--bind-addr` beats `[mcp] bind_addr`, and the fail-closed gate is decided on the
+/// address the listener actually gets. A flag that were checked against the file's address
+/// would let `--bind-addr 0.0.0.0:...` walk straight past a loopback entry in the file.
+#[tokio::test]
+async fn a_bind_address_flag_overrides_the_file_and_still_faces_the_gate() -> TestResult {
+    // The file says loopback, the flag says everywhere, and no inbound token is configured.
+    let wide_open = format!("0.0.0.0:{}", free_port().await?);
+    let server = HttpServer::spawn_with("127.0.0.1:8090", &wide_open, None, "http", &["--bind-addr", &wide_open])?;
+
+    let output = tokio::time::timeout(Duration::from_secs(20), server.child.wait_with_output()).await??;
+    assert!(
+        !output.status.success(),
+        "a flag that widens the bind address must face the same refusal"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&wide_open),
+        "the refusal named the wrong address: {stderr}"
+    );
+    assert!(stderr.contains("mcp.auth_token"), "{stderr}");
+
+    // And with the token supplied, the same flag serves — on the flag's address, not the
+    // file's, which is what proves the override reached the listener.
+    let bind_addr = format!("127.0.0.1:{}", free_port().await?);
+    let serving = HttpServer::spawn_with(
+        "127.0.0.1:8090",
+        &bind_addr,
+        Some(INBOUND_TOKEN),
+        "http",
+        &["--bind-addr", &bind_addr],
+    )?;
+    let client = reqwest::Client::new();
+    serving.wait_until_ready(&client).await?;
+
+    let authorized = client
+        .post(format!("{}/mcp/rpc", serving.base_url))
+        .bearer_auth(INBOUND_TOKEN)
+        .json(&initialize_request())
+        .send()
+        .await?;
+    assert_eq!(
+        authorized.status(),
+        reqwest::StatusCode::OK,
+        "the overridden bind address did not serve"
+    );
+
+    serving.shutdown().await
 }
 
 /// stdio is a pipe pair owned by the parent process, so the inbound auth rule must not
@@ -296,13 +362,21 @@ async fn a_non_loopback_sse_bind_without_a_token_refuses_to_start() -> TestResul
 async fn stdio_is_unaffected_by_the_inbound_auth_rule() -> TestResult {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    // Bound wide open in the file, and with no inbound token: on a networked transport
+    // this exact configuration is refused, so serving it proves the rule stops at stdio
+    // rather than leaking into a transport that has no port to protect.
+    let config = write_config(&McpSettings {
+        api_url: "http://127.0.0.1:1",
+        bot_token: BOT_TOKEN,
+        workspace_id: WORKSPACE,
+        auth_token: None,
+        transport: Some("stdio"),
+        bind_addr: Some("0.0.0.0:8090"),
+    })?;
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-server"))
-        .args(["serve", "--transport", "stdio"])
-        .env("OPENPR_API_URL", "http://127.0.0.1:1")
-        .env("OPENPR_BOT_TOKEN", BOT_TOKEN)
-        .env("OPENPR_WORKSPACE_ID", WORKSPACE)
-        .env("RUST_LOG", "error")
-        .env_remove("OPENPR_MCP_AUTH_TOKEN")
+        .args(["serve", "--config"])
+        .arg(config.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -328,5 +402,55 @@ async fn stdio_is_unaffected_by_the_inbound_auth_rule() -> TestResult {
 
     drop(stdin);
     tokio::time::timeout(Duration::from_secs(10), child.wait()).await??;
+    Ok(())
+}
+
+/// The environment is not a configuration source any more. Handed every variable the
+/// server used to read and no file, it must refuse to start instead of quietly running on
+/// values that are no longer part of the deployment's configuration.
+#[tokio::test]
+async fn the_retired_environment_variables_no_longer_configure_the_server() -> TestResult {
+    let empty = support::write_config(&McpSettings {
+        api_url: "http://127.0.0.1:1",
+        bot_token: BOT_TOKEN,
+        workspace_id: WORKSPACE,
+        auth_token: None,
+        transport: Some("stdio"),
+        bind_addr: None,
+    })?;
+    // A directory that holds no `config/openpr.toml`, so the default path misses too.
+    let empty_dir = empty.path().parent().ok_or("config file has no parent directory")?;
+
+    let child = Command::new(env!("CARGO_BIN_EXE_mcp-server"))
+        .args(["serve", "--transport", "stdio"])
+        .current_dir(empty_dir)
+        .env("OPENPR_API_URL", "http://127.0.0.1:1")
+        .env("OPENPR_BOT_TOKEN", BOT_TOKEN)
+        .env("OPENPR_WORKSPACE_ID", WORKSPACE)
+        .env("OPENPR_MCP_AUTH_TOKEN", INBOUND_TOKEN)
+        .env("OPENPR_MCP_TRANSPORT", "mcp_stdio")
+        .env("OPENPR_INVOCATION_ID", "inv-0001")
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await??;
+    assert!(
+        !output.status.success(),
+        "the environment alone started the server (exit status {:?})",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("configuration file not found"),
+        "the failure must be the missing file, not something else: {stderr}"
+    );
+    assert!(
+        !stderr.contains(INBOUND_TOKEN),
+        "the failure echoed a token from the environment: {stderr}"
+    );
     Ok(())
 }

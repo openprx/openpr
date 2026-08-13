@@ -15,15 +15,17 @@ use axum::{
     response::IntoResponse,
     routing::{delete, get, patch, post, put},
 };
+use clap::Parser;
 use platform::{
     app::{AppState, connect_db},
-    config::AppConfig,
+    config::{AppConfig, MigrationsConfig, OpenPrConfig},
     logging,
 };
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 
 #[derive(Serialize)]
@@ -32,13 +34,31 @@ struct HealthResponse {
     service: String,
 }
 
+/// Command line surface of the API binary.
+///
+/// The only thing the process accepts from outside the configuration file is where that file is.
+#[derive(Parser)]
+#[command(name = "api", about = "OpenPR API server")]
+struct Args {
+    /// Path to the configuration file. Defaults to config/openpr.toml
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cfg = AppConfig::from_env("api", "0.0.0.0:8081")?;
-    logging::init("api");
+    let args = Args::parse();
+    let config = OpenPrConfig::load(args.config.as_deref())?;
+    // Installed before the logger so that a configuration this process cannot publish aborts
+    // startup rather than leaving half the service reading the fallback settings.
+    api::config::install(&config).map_err(|err| anyhow::anyhow!("{err}"))?;
+    logging::init(&config.logging, "api")?;
 
-    let db = connect_db(&cfg.database_url).await?;
-    run_migrations(&db).await?;
+    // from_config first: it reports a missing database url and signing key together, so the
+    // operator fixes both in one pass instead of being walked through them one at a time.
+    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081")?;
+    let db = connect_db(&config.database_runtime()?).await?;
+    run_migrations(&db, config.migrations).await?;
     verify_governance_schema(&db).await?;
     // A migration that only warned used to leave the delivery pipeline half built. Fail here
     // instead, while the reason is still on screen.
@@ -2041,18 +2061,21 @@ const MIGRATIONS: &[(&str, &str)] = &[
 /// idempotent and a test enforces that they stay that way.
 const MIGRATION_ADOPTION_CUTOFF: &str = "0047_form_attachment_media_metadata.sql";
 
-/// Escape hatch: re-execute every migration once, reporting failures without aborting.
+/// Configuration key of the escape hatch that re-executes every migration once, reporting
+/// failures without aborting.
 ///
 /// Safe to use on a live database. A failure never downgrades a ledger row that already records
 /// a success, so a replay of the non idempotent early migrations ("relation already exists") no
-/// longer turns the next ordinary start into a permanent failure.
-const MIGRATION_REPLAY_ENV: &str = "OPENPR_MIGRATIONS_REPLAY";
+/// longer turns the next ordinary start into a permanent failure. Named here only so the warning
+/// it prints tells the operator which line of the file to turn back off.
+const MIGRATION_REPLAY_KEY: &str = "migrations.replay";
 
-/// Escape hatch: start even though a migration failed or the schema check found a gap.
+/// Configuration key of the escape hatch that starts the service even though a migration failed
+/// or the schema check found a gap.
 ///
 /// The degraded path an operator needs to get the service up and inspect it. The failure is
 /// recorded and logged; nothing is skipped silently, and the next ordinary start retries.
-const MIGRATION_CONTINUE_ON_ERROR_ENV: &str = "OPENPR_MIGRATIONS_CONTINUE_ON_ERROR";
+const MIGRATION_CONTINUE_ON_ERROR_KEY: &str = "migrations.continue_on_error";
 
 /// Advisory lock namespace for the migration runner. The first key separates this lock from any
 /// other advisory lock in the system, the second one names the runner within that namespace.
@@ -2325,15 +2348,22 @@ struct MigrationOptions {
     continue_on_error: bool,
 }
 
-async fn run_migrations(db: &DatabaseConnection) -> anyhow::Result<()> {
-    run_migrations_with(
-        db,
-        MigrationOptions {
-            replay: migration_replay_requested(),
-            continue_on_error: migration_continue_on_error_requested(),
-        },
-    )
-    .await
+impl MigrationOptions {
+    /// Maps the `[migrations]` section onto the runner's switches.
+    ///
+    /// A separate function so the mapping is testable without a database: the two switches have
+    /// the same type and opposite consequences, and swapping them would otherwise only show up
+    /// on a deployment that had asked for one of them.
+    const fn from_config(migrations: MigrationsConfig) -> Self {
+        Self {
+            replay: migrations.replay,
+            continue_on_error: migrations.continue_on_error,
+        }
+    }
+}
+
+async fn run_migrations(db: &DatabaseConnection, migrations: MigrationsConfig) -> anyhow::Result<()> {
+    run_migrations_with(db, MigrationOptions::from_config(migrations)).await
 }
 
 async fn run_migrations_with(db: &DatabaseConnection, options: MigrationOptions) -> anyhow::Result<()> {
@@ -2356,14 +2386,14 @@ async fn run_migrations_with(db: &DatabaseConnection, options: MigrationOptions)
     } = options;
     if replay {
         tracing::warn!(
-            env = MIGRATION_REPLAY_ENV,
+            setting = MIGRATION_REPLAY_KEY,
             "migration replay requested: every migration is re-executed, failures are reported \
              but not fatal, and a ledger row that already records a success is never downgraded"
         );
     }
     if continue_on_error {
         tracing::warn!(
-            env = MIGRATION_CONTINUE_ON_ERROR_ENV,
+            setting = MIGRATION_CONTINUE_ON_ERROR_KEY,
             "starting even if a migration fails or the schema check finds a gap; the failures are \
              recorded in schema_migrations and retried on the next start"
         );
@@ -2505,22 +2535,6 @@ async fn lock_migration_runner<C: ConnectionTrait>(conn: &C) -> anyhow::Result<(
     Ok(())
 }
 
-fn migration_replay_requested() -> bool {
-    migration_flag_enabled(MIGRATION_REPLAY_ENV)
-}
-
-fn migration_continue_on_error_requested() -> bool {
-    migration_flag_enabled(MIGRATION_CONTINUE_ON_ERROR_ENV)
-}
-
-fn migration_flag_enabled(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| migration_flag_value_enabled(&value))
-}
-
-fn migration_flag_value_enabled(value: &str) -> bool {
-    matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-}
-
 /// Content fingerprint used to notice that a migration file changed after it was applied.
 fn migration_checksum(sql: &str) -> String {
     let mut hasher = Sha256::new();
@@ -2589,8 +2603,8 @@ async fn verify_recorded_migrations(db: &DatabaseConnection, tolerate_failure: b
     }
     Err(anyhow::anyhow!(
         "the migration ledger reports {names} as applied but their objects are missing; re-run \
-         with {MIGRATION_REPLAY_ENV}=1 to re-execute every migration, or start with \
-         {MIGRATION_CONTINUE_ON_ERROR_ENV}=1 to inspect the database"
+         with {MIGRATION_REPLAY_KEY} = true in the configuration file to re-execute every \
+         migration, or start with {MIGRATION_CONTINUE_ON_ERROR_KEY} = true to inspect the database"
     ))
 }
 
@@ -2735,9 +2749,8 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, migration_checksum, migration_flag_value_enabled,
-    };
+    use super::{MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, MigrationOptions, migration_checksum};
+    use platform::config::MigrationsConfig;
 
     /// A migration file has to be registered in two places: on disk and in [`MIGRATIONS`].
     /// Forgetting the second one makes it silently never run, so the two are compared here.
@@ -2877,16 +2890,26 @@ mod tests {
     }
 
     #[test]
-    fn migration_flags_accept_only_explicit_opt_in() {
-        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
-            assert!(migration_flag_value_enabled(value), "{value} should enable the flag");
-        }
-        for value in ["", "0", "false", "no", "off", "maybe"] {
-            assert!(
-                !migration_flag_value_enabled(value),
-                "{value} should not enable the flag"
-            );
-        }
+    fn migration_escape_hatches_are_off_until_the_file_asks_for_them() {
+        let quiet = MigrationOptions::from_config(MigrationsConfig::default());
+        assert!(!quiet.replay);
+        assert!(!quiet.continue_on_error);
+
+        // Each switch is read from its own key. Asserted one at a time so a swapped mapping
+        // cannot pass by setting both.
+        let replaying = MigrationOptions::from_config(MigrationsConfig {
+            replay: true,
+            continue_on_error: false,
+        });
+        assert!(replaying.replay);
+        assert!(!replaying.continue_on_error);
+
+        let tolerant = MigrationOptions::from_config(MigrationsConfig {
+            replay: false,
+            continue_on_error: true,
+        });
+        assert!(!tolerant.replay);
+        assert!(tolerant.continue_on_error);
     }
 
     /// Routes are authenticated one by one with `route_layer`, so forgetting one is invisible
@@ -3450,7 +3473,7 @@ mod proposal_scope_database_tests {
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
-        config::AppConfig,
+        config::{AppConfig, Secret},
     };
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use uuid::Uuid;
@@ -3472,8 +3495,8 @@ mod proposal_scope_database_tests {
             cfg: AppConfig {
                 app_name: "api-test".to_string(),
                 bind_addr: "127.0.0.1:0".to_string(),
-                database_url: scratch.url().to_string(),
-                jwt_secret: "proposal-scope-test-secret".to_string(),
+                database_url: Secret::new(scratch.url()),
+                jwt_secret: Secret::new("proposal-scope-test-secret"),
                 jwt_access_ttl_seconds: 900,
                 jwt_refresh_ttl_seconds: 3600,
                 default_author_id: None,

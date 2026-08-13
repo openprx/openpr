@@ -22,10 +22,11 @@ Environment:
   OPENPR_DEMO_PROJECT_KEY       Project key. Default: RESTDEMO
   OPENPR_DEMO_PROJECT_NAME      Project name. Default: Restaurant Ordering Demo
   OPENPR_DEMO_ALLOW_REMOTE=1    Allow non-localhost API URLs.
-  OPENPR_DEMO_WRITE_ENV=0       Do not update local .env with MCP credentials.
-                                Default: auto, write only when .env exists.
-  OPENPR_DEMO_ENV_PATH          Env file path for MCP credentials.
-                                Default: repo .env.
+  OPENPR_DEMO_WRITE_CONFIG=0    Do not write the demo bot credentials into the MCP
+                                configuration file. Default: auto, write only when
+                                that file already exists.
+  OPENPR_DEMO_CONFIG_PATH       MCP configuration file carrying [mcp].
+                                Default: repo config/openpr.compose.mcp.toml.
   OPENPR_DEMO_RESTART_MCP=0     Do not recreate running compose mcp-server.
                                 Default: 1.
   OPENPR_DEMO_VERIFY_MCP_HTTP   Verify local MCP JSON-RPC after bootstrap.
@@ -33,7 +34,8 @@ Environment:
   OPENPR_DEMO_MCP_URL           MCP JSON-RPC URL.
                                 Default: http://localhost:8090/mcp/rpc
   OPENPR_MCP_AUTH_TOKEN         Bearer token for the MCP JSON-RPC endpoint.
-                                Read from OPENPR_DEMO_ENV_PATH when unset.
+                                Read from mcp.auth_token in the configuration file
+                                when unset.
 
 This is a local onboarding helper, not a production seeding tool.
 EOF
@@ -53,31 +55,53 @@ require_cmd() {
 
 require_cmd node
 
-DEMO_ENV_PATH="${OPENPR_DEMO_ENV_PATH:-$ROOT_DIR/.env}"
+# The MCP server reads no environment variables; its settings live in a TOML file. Under compose
+# that is the file docker-compose.yml mounts into the mcp-server container.
+DEMO_CONFIG_PATH="${OPENPR_DEMO_CONFIG_PATH:-$ROOT_DIR/config/openpr.compose.mcp.toml}"
 
-# Reads one KEY=value from an env file, without sourcing it.
-read_env_value() {
+require_cmd python3
+
+# Reads one dotted key out of the TOML configuration file, using the tomllib parser in python3
+# (3.11+) rather than a grep that would mis-handle quoting and section scoping. Prints nothing
+# when the file or the key is absent, so the caller decides whether that is fatal. The value goes
+# to stdout only, never to the log.
+read_config_value() {
   local key="$1"
   local file="$2"
-  local line=""
   [ -f "$file" ] || return 0
-  line="$(grep -E "^${key}=.+" "$file" | tail -n 1 || true)"
-  [ -n "$line" ] || return 0
-  line="${line#*=}"
-  # Strip one layer of surrounding quotes, the way compose reads .env.
-  case "$line" in
-    \"*\") line="${line#\"}"; line="${line%\"}" ;;
-    \'*\') line="${line#\'}"; line="${line%\'}" ;;
-  esac
-  printf '%s' "$line"
+  OPENPR_CONFIG_KEY="$key" OPENPR_CONFIG_PATH="$file" python3 -c '
+import os
+import sys
+import tomllib
+
+try:
+    with open(os.environ["OPENPR_CONFIG_PATH"], "rb") as handle:
+        data = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(0)
+
+node = data
+for part in os.environ["OPENPR_CONFIG_KEY"].split("."):
+    if not isinstance(node, dict) or part not in node:
+        raise SystemExit(0)
+    node = node[part]
+if isinstance(node, str):
+    sys.stdout.write(node)
+'
 }
 
-# The MCP verification below posts to /mcp/rpc, which requires a bearer token when the server
-# was started with OPENPR_MCP_AUTH_TOKEN. /health is exempt and stays unauthenticated.
+# The MCP verification below posts to /mcp/rpc, which requires a bearer token when the server was
+# configured with mcp.auth_token. /health is exempt and stays unauthenticated.
+# OPENPR_MCP_AUTH_TOKEN is an operator override for this script, not application configuration.
 MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
 if [ -z "$MCP_AUTH_TOKEN" ]; then
-  MCP_AUTH_TOKEN="$(read_env_value OPENPR_MCP_AUTH_TOKEN "$DEMO_ENV_PATH")"
+  MCP_AUTH_TOKEN="$(read_config_value mcp.auth_token "$DEMO_CONFIG_PATH")"
 fi
+
+# Credentials already in the file. When they still address the demo workspace the bootstrap keeps
+# them instead of minting a second bot on every run.
+EXISTING_BOT_TOKEN="$(read_config_value mcp.bot_token "$DEMO_CONFIG_PATH")"
+EXISTING_WORKSPACE_ID="$(read_config_value mcp.workspace_id "$DEMO_CONFIG_PATH")"
 
 DEMO_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/openpr-restaurant-demo.XXXXXX.json")"
 trap 'rm -f "$DEMO_STATE_FILE"' EXIT
@@ -103,8 +127,8 @@ OPENPR_DEMO_WORKSPACE_SLUG="${OPENPR_DEMO_WORKSPACE_SLUG:-restaurant-demo}" \
 OPENPR_DEMO_WORKSPACE_NAME="${OPENPR_DEMO_WORKSPACE_NAME:-Restaurant Demo}" \
 OPENPR_DEMO_PROJECT_KEY="${OPENPR_DEMO_PROJECT_KEY:-RESTDEMO}" \
 OPENPR_DEMO_PROJECT_NAME="${OPENPR_DEMO_PROJECT_NAME:-Restaurant Ordering Demo}" \
-OPENPR_DEMO_WRITE_ENV="${OPENPR_DEMO_WRITE_ENV:-auto}" \
-OPENPR_DEMO_ENV_PATH="$DEMO_ENV_PATH" \
+OPENPR_DEMO_EXISTING_BOT_TOKEN="$EXISTING_BOT_TOKEN" \
+OPENPR_DEMO_EXISTING_WORKSPACE_ID="$EXISTING_WORKSPACE_ID" \
 OPENPR_DEMO_STATE_FILE="$DEMO_STATE_FILE" \
 node --input-type=commonjs <<'NODE'
 const fs = require('fs');
@@ -116,8 +140,11 @@ const workspaceSlug = process.env.OPENPR_DEMO_WORKSPACE_SLUG;
 const workspaceName = process.env.OPENPR_DEMO_WORKSPACE_NAME;
 const projectKey = process.env.OPENPR_DEMO_PROJECT_KEY;
 const projectName = process.env.OPENPR_DEMO_PROJECT_NAME;
-const envPath = process.env.OPENPR_DEMO_ENV_PATH;
-const writeEnvMode = process.env.OPENPR_DEMO_WRITE_ENV ?? 'auto';
+// Handed in by the wrapper, which reads them out of the TOML configuration file. This block never
+// touches that file: node has no TOML parser, and the wrapper writes any new credentials back
+// through python3's tomllib so a hand-edited file keeps its comments and its structure.
+const existingBotToken = process.env.OPENPR_DEMO_EXISTING_BOT_TOKEN ?? '';
+const existingWorkspaceId = process.env.OPENPR_DEMO_EXISTING_WORKSPACE_ID ?? '';
 const stateFile = process.env.OPENPR_DEMO_STATE_FILE;
 
 async function rawRequest(method, path, body, token) {
@@ -155,41 +182,6 @@ function formByKey(forms, key) {
   const form = forms.find((item) => item.key === key);
   assert(form, `restaurant demo missing form ${key}`);
   return form;
-}
-
-function readEnvFile() {
-  if (!envPath || !fs.existsSync(envPath)) return {};
-  const values = {};
-  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (match) values[match[1]] = match[2];
-  }
-  return values;
-}
-
-function upsertEnvFile(updates) {
-  if (!envPath) return false;
-  const shouldWrite = writeEnvMode === '1' || (writeEnvMode === 'auto' && fs.existsSync(envPath));
-  if (!shouldWrite) return false;
-
-  const original = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
-  const seen = new Set();
-  const lines = original.split(/\r?\n/).map((line) => {
-    for (const [key, value] of Object.entries(updates)) {
-      if (line.startsWith(`${key}=`) || line.startsWith(`#${key}=`)) {
-        seen.add(key);
-        return `${key}=${value}`;
-      }
-    }
-    return line;
-  });
-
-  for (const [key, value] of Object.entries(updates)) {
-    if (!seen.has(key)) lines.push(`${key}=${value}`);
-  }
-
-  fs.writeFileSync(envPath, lines.join('\n').replace(/\n*$/, '\n'));
-  return true;
 }
 
 async function authenticate() {
@@ -249,15 +241,11 @@ async function tokenCanAccessWorkspace(botToken, workspaceId) {
 }
 
 async function ensureMcpBot(token, workspaceId) {
-  const envValues = readEnvFile();
-  const envToken = envValues.OPENPR_BOT_TOKEN;
-  const envWorkspaceId = envValues.OPENPR_WORKSPACE_ID;
-
-  if (envWorkspaceId === workspaceId && await tokenCanAccessWorkspace(envToken, workspaceId)) {
+  if (existingWorkspaceId === workspaceId && await tokenCanAccessWorkspace(existingBotToken, workspaceId)) {
     return {
-      token: envToken,
-      token_source: 'existing_env',
-      env_written: false,
+      token: existingBotToken,
+      token_source: 'existing_config',
+      credentials_changed: false,
       mcp_ready: true,
     };
   }
@@ -268,16 +256,12 @@ async function ensureMcpBot(token, workspaceId) {
   }, token);
 
   assert(await tokenCanAccessWorkspace(bot.token, workspaceId), 'created MCP bot token cannot access demo workspace');
-  const envWritten = upsertEnvFile({
-    OPENPR_BOT_TOKEN: bot.token,
-    OPENPR_WORKSPACE_ID: workspaceId,
-  });
 
   return {
     token: bot.token,
     token_source: 'created',
     token_prefix: bot.token_prefix,
-    env_written: envWritten,
+    credentials_changed: true,
     mcp_ready: true,
   };
 }
@@ -372,17 +356,21 @@ async function main() {
     mcp_workspace_id: workspace.id,
     mcp_token_source: mcp.token_source,
     mcp_token_prefix: mcp.token.slice(0, 8),
-    mcp_env_written: mcp.env_written,
+    mcp_credentials_changed: mcp.credentials_changed,
     mcp_ready: mcp.mcp_ready,
   };
   if (stateFile) {
-    fs.writeFileSync(stateFile, JSON.stringify(result, null, 2), { mode: 0o600 });
+    // The bot token goes to the state file only, so the wrapper can write it into the MCP
+    // configuration file. That file is created with mode 0600 and removed when this script exits;
+    // `result`, which is printed below, carries only the token's first 8 characters.
+    fs.writeFileSync(
+      stateFile,
+      JSON.stringify({ ...result, mcp_bot_token: mcp.token }, null, 2),
+      { mode: 0o600 },
+    );
   }
   console.log(JSON.stringify(result, null, 2));
   console.log(`restaurant demo ready: http://localhost:3000${formsUrl}`);
-  if (mcp.env_written) {
-    console.log('MCP demo credentials written to .env. Recreate mcp-server to load them if it is already running.');
-  }
 }
 
 main().catch((error) => {
@@ -391,10 +379,108 @@ main().catch((error) => {
 });
 NODE
 
-if [[ "${OPENPR_DEMO_RESTART_MCP:-1}" == "1" ]] && [[ "${OPENPR_DEMO_WRITE_ENV:-auto}" != "0" ]]; then
+# Write the bot credentials the run just created into [mcp] of the configuration file. Done here
+# rather than in node: this rewrites only the two values and leaves every comment and every other
+# key in place, and it verifies the result by parsing it back.
+WRITE_CONFIG_MODE="${OPENPR_DEMO_WRITE_CONFIG:-auto}"
+CONFIG_WRITTEN=0
+if [[ "$WRITE_CONFIG_MODE" != "0" ]]; then
+  if OPENPR_DEMO_CONFIG_PATH="$DEMO_CONFIG_PATH" \
+     OPENPR_DEMO_STATE_FILE="$DEMO_STATE_FILE" \
+     OPENPR_DEMO_WRITE_CONFIG="$WRITE_CONFIG_MODE" \
+     python3 -c '
+import json
+import os
+import re
+import sys
+import tomllib
+
+config_path = os.environ["OPENPR_DEMO_CONFIG_PATH"]
+mode = os.environ["OPENPR_DEMO_WRITE_CONFIG"]
+
+# "auto" only touches a file that is already there; "1" also creates a missing one.
+if not os.path.exists(config_path) and mode != "1":
+    raise SystemExit(2)
+
+with open(os.environ["OPENPR_DEMO_STATE_FILE"], "r", encoding="utf-8") as handle:
+    state = json.load(handle)
+if not state.get("mcp_credentials_changed"):
+    raise SystemExit(2)
+
+updates = {"bot_token": state["mcp_bot_token"], "workspace_id": state["mcp_workspace_id"]}
+
+
+def toml_string(value):
+    escaped = value.replace("\\", "\\\\").replace(chr(34), "\\" + chr(34))
+    return chr(34) + escaped + chr(34)
+
+
+try:
+    with open(config_path, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+except FileNotFoundError:
+    lines = ["[mcp]"]
+
+# Locate [mcp] and the line after its last entry, so a key that is absent is appended inside the
+# section rather than under whatever table happens to come next.
+start = None
+end = len(lines)
+for index, line in enumerate(lines):
+    stripped = line.strip()
+    if start is None:
+        if stripped == "[mcp]":
+            start = index
+    elif stripped.startswith("[") and not stripped.startswith("[["):
+        end = index
+        break
+if start is None:
+    lines.append("[mcp]")
+    start, end = len(lines) - 1, len(lines)
+
+for key, value in updates.items():
+    pattern = re.compile(r"^\s*#?\s*" + re.escape(key) + r"\s*=")
+    for index in range(start + 1, end):
+        if pattern.match(lines[index]):
+            lines[index] = f"{key} = {toml_string(value)}"
+            break
+    else:
+        insert_at = end
+        while insert_at > start + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        lines.insert(insert_at, f"{key} = {toml_string(value)}")
+        end += 1
+
+rendered = "\n".join(lines) + "\n"
+
+# Parse before replacing the file: a write that produced something the MCP server cannot read
+# would take the stack down at the next restart.
+parsed = tomllib.loads(rendered).get("mcp", {})
+for key, value in updates.items():
+    if parsed.get(key) != value:
+        print(f"rewriting {key} in {config_path} did not round-trip", file=sys.stderr)
+        raise SystemExit(1)
+
+temp_path = f"{config_path}.tmp"
+with open(os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as handle:
+    handle.write(rendered)
+os.replace(temp_path, config_path)
+'; then
+    CONFIG_WRITTEN=1
+    echo "Demo MCP bot credentials written to $DEMO_CONFIG_PATH (values not printed)."
+  else
+    status=$?
+    # 2 means "nothing to do": credentials unchanged, or the file is absent and mode is auto.
+    if [[ "$status" != "2" ]]; then
+      echo "Failed to write demo MCP credentials to $DEMO_CONFIG_PATH" >&2
+      exit "$status"
+    fi
+  fi
+fi
+
+if [[ "${OPENPR_DEMO_RESTART_MCP:-1}" == "1" ]] && [[ "$CONFIG_WRITTEN" == "1" ]]; then
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if docker compose ps --services --filter status=running 2>/dev/null | grep -qx 'mcp-server'; then
-      echo "Recreating mcp-server so it can load demo MCP credentials from .env..."
+      echo "Recreating mcp-server so it reloads the demo MCP credentials from its configuration file..."
       docker compose up -d --no-deps --force-recreate mcp-server
     fi
   fi
@@ -403,7 +489,7 @@ fi
 OPENPR_DEMO_STATE_FILE="$DEMO_STATE_FILE" \
 OPENPR_DEMO_VERIFY_MCP_HTTP="${OPENPR_DEMO_VERIFY_MCP_HTTP:-auto}" \
 OPENPR_DEMO_MCP_URL="${OPENPR_DEMO_MCP_URL:-http://localhost:8090/mcp/rpc}" \
-OPENPR_DEMO_ENV_PATH="$DEMO_ENV_PATH" \
+OPENPR_DEMO_CONFIG_PATH="$DEMO_CONFIG_PATH" \
 OPENPR_MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" \
 node --input-type=commonjs <<'NODE'
 const fs = require('fs');
@@ -411,7 +497,7 @@ const fs = require('fs');
 const verifyMode = process.env.OPENPR_DEMO_VERIFY_MCP_HTTP ?? 'auto';
 const mcpUrl = process.env.OPENPR_DEMO_MCP_URL ?? 'http://localhost:8090/mcp/rpc';
 const stateFile = process.env.OPENPR_DEMO_STATE_FILE;
-const envPath = process.env.OPENPR_DEMO_ENV_PATH ?? '.env';
+const configPath = process.env.OPENPR_DEMO_CONFIG_PATH ?? 'config/openpr.compose.mcp.toml';
 const mcpAuthToken = process.env.OPENPR_MCP_AUTH_TOKEN ?? '';
 
 if (verifyMode === '0' || verifyMode === 'false') {
@@ -477,7 +563,7 @@ async function verify() {
   if (!mcpAuthToken) {
     const message = 'MCP HTTP verification needs OPENPR_MCP_AUTH_TOKEN: /mcp/rpc rejects requests without an Authorization: Bearer header';
     if (verifyMode === '1') throw new Error(message);
-    console.log(`${message}. Export OPENPR_MCP_AUTH_TOKEN or set it in ${envPath} (bash scripts/start.sh generates one).`);
+    console.log(`${message}. Set mcp.auth_token in ${configPath}, or export OPENPR_MCP_AUTH_TOKEN (bash scripts/start.sh generates one).`);
     return;
   }
 
@@ -504,7 +590,7 @@ async function verify() {
     }),
   }, 5000);
   if (response.status === 401 || response.status === 403) {
-    throw new Error(`MCP HTTP verification was rejected with ${response.status}: OPENPR_MCP_AUTH_TOKEN does not match the token the MCP server runs with. Recreate mcp-server after changing .env.`);
+    throw new Error(`MCP HTTP verification was rejected with ${response.status}: the bearer token does not match the one the MCP server runs with. Recreate mcp-server after changing mcp.auth_token in ${configPath}.`);
   }
   const payload = await response.json();
   if (!response.ok || payload.error || payload?.result?.is_error === true) {

@@ -375,7 +375,7 @@ mod tests {
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
-        config::AppConfig,
+        config::{AppConfig, Secret},
     };
     use serde_json::Value as JsonValue;
 
@@ -408,8 +408,8 @@ mod tests {
         let cfg = AppConfig {
             app_name: "api-test".to_string(),
             bind_addr: "127.0.0.1:0".to_string(),
-            database_url: url,
-            jwt_secret: "test-secret".to_string(),
+            database_url: Secret::new(url),
+            jwt_secret: Secret::new("test-secret"),
             jwt_access_ttl_seconds: 60,
             jwt_refresh_ttl_seconds: 60,
             default_author_id: None,

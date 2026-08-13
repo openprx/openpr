@@ -1501,7 +1501,7 @@ mod tests {
     }
 
     fn client(base_url: String) -> Result<OpenPrClient, String> {
-        OpenPrClient::new(base_url, "opr_test_token".to_string(), "workspace-1".to_string())
+        crate::client::test_api::client(base_url)
     }
 
     fn result_text(result: &crate::protocol::CallToolResult) -> String {

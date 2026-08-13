@@ -262,7 +262,7 @@ pub async fn bot_or_user_auth_middleware(
     } else {
         // ── JWT path (unchanged behaviour) ──
         let jwt = JwtManager::new(
-            &state.cfg.jwt_secret,
+            state.cfg.jwt_secret.expose(),
             state.cfg.jwt_access_ttl_seconds,
             state.cfg.jwt_refresh_ttl_seconds,
         );

@@ -9,6 +9,15 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 MODE="${1:-}"
 
+# The api, worker and mcp-server binaries read no environment variables; these two files are the
+# only source of their configuration. `.env` survives for docker-compose's own interpolation and
+# for the postgres image, which initialises itself from POSTGRES_PASSWORD.
+ENV_FILE=".env"
+APP_CONFIG="config/openpr.compose.toml"
+MCP_CONFIG="config/openpr.compose.mcp.toml"
+
+# Values generated below are never printed. A secret that reaches the terminal reaches the scroll
+# buffer, the CI log and the screenshot; the files are written with mode 600 instead.
 random_hex() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex "$1"
@@ -33,131 +42,391 @@ random_uuid() {
 upsert_env() {
   local key="$1"
   local value="$2"
-  if grep -qE "^#?${key}=" .env; then
-    sed -i.bak -E "s|^#?${key}=.*|${key}=${value}|" .env
-    rm -f .env.bak
+  if grep -qE "^#?${key}=" "$ENV_FILE"; then
+    sed -i.bak -E "s|^#?${key}=.*|${key}=${value}|" "$ENV_FILE"
+    rm -f "$ENV_FILE.bak"
   else
-    printf '%s=%s\n' "$key" "$value" >> .env
+    printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
   fi
 }
 
 env_value() {
   local key="$1"
-  grep -E "^${key}=" .env | tail -n 1 | cut -d= -f2-
+  [ -f "$ENV_FILE" ] || return 0
+  grep -E "^${key}=" "$ENV_FILE" | tail -n 1 | cut -d= -f2- || true
 }
 
-is_placeholder_value() {
-  local value="$1"
-  [[ -z "$value" || "$value" == *'${'* || "$value" == *replace_with* || "$value" == "change-me-in-production" ]]
-}
-
-validate_concrete_value() {
-  local key="$1"
-  local value="$2"
-  if is_placeholder_value "$value"; then
-    echo "❌ .env contains a placeholder or empty value for $key"
-    return 1
+# docker-compose creates a directory when a bind mount source does not exist, and the container
+# then dies on a configuration file it cannot read. Catch that here, where the message can say so.
+guard_not_directory() {
+  local path="$1"
+  if [ -d "$path" ]; then
+    echo "❌ $path is a directory."
+    echo "   docker-compose creates one when it mounts a configuration file that does not exist yet."
+    echo "   Remove it and rerun this script: rmdir '$path'"
+    exit 1
   fi
 }
 
-validate_uuid_value() {
-  local key="$1"
-  local value="$2"
-  validate_concrete_value "$key" "$value" || return 1
-  if [[ ! "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-    echo "❌ .env value for $key must be a UUID"
-    return 1
-  fi
-  if [[ "$value" == "00000000-0000-0000-0000-000000000000" ]]; then
-    echo "❌ .env value for $key must not be the nil UUID placeholder"
-    return 1
-  fi
-}
+guard_not_directory "$APP_CONFIG"
+guard_not_directory "$MCP_CONFIG"
 
-# Check if .env exists
-if [ ! -f .env ]; then
-  echo "📝 Creating .env from .env.example"
-  cp .env.example .env
-  upsert_env "POSTGRES_PASSWORD" "local_$(random_hex 16)"
-  upsert_env "JWT_SECRET" "local_$(random_hex 32)"
-  upsert_env "OPENPR_BOT_TOKEN" "opr_local_$(random_hex 24)"
-  upsert_env "OPENPR_WORKSPACE_ID" "$(random_uuid)"
-  upsert_env "DEFAULT_AUTHOR_ID" "$(random_uuid)"
-  upsert_env "OPENPR_MCP_AUTH_TOKEN" "$(random_hex 32)"
-  echo "⚠️  Local bootstrap secrets were generated in .env. Replace them before production use."
-  echo ""
+# ---------------------------------------------------------------------------------------------
+# .env — docker-compose interpolation only.
+# ---------------------------------------------------------------------------------------------
+if [ ! -f "$ENV_FILE" ]; then
+  echo "📝 Creating $ENV_FILE from .env.example (docker-compose values only)"
+  cp .env.example "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
 fi
 
-# An .env written before the MCP server gained inbound authentication has no token, and compose
-# now refuses to start mcp-server without one. Only mcp-server reads this value, so generating it
-# here cannot invalidate an already provisioned database or bot token.
-if ! grep -qE "^OPENPR_MCP_AUTH_TOKEN=.+" .env; then
-  upsert_env "OPENPR_MCP_AUTH_TOKEN" "$(random_hex 32)"
-  echo "🔐 Generated OPENPR_MCP_AUTH_TOKEN in .env (value not printed)."
-  echo ""
+postgres_password="$(env_value POSTGRES_PASSWORD)"
+if [ -z "$postgres_password" ] || [[ "$postgres_password" == *replace_with* ]]; then
+  # An existing configuration file wins: postgres only runs initdb once, so regenerating the
+  # password against an existing pgdata volume would lock the stack out of its own database.
+  if [ -f "$APP_CONFIG" ]; then
+    postgres_password="$(OPENPR_APP_CONFIG="$APP_CONFIG" python3 -c '
+import os
+import sys
+import tomllib
+from urllib.parse import urlsplit, unquote
+
+try:
+    with open(os.environ["OPENPR_APP_CONFIG"], "rb") as handle:
+        url = tomllib.load(handle).get("database", {}).get("url", "")
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(0)
+password = urlsplit(url).password
+if password:
+    sys.stdout.write(unquote(password))
+')"
+  fi
+  if [ -z "$postgres_password" ]; then
+    postgres_password="local_$(random_hex 16)"
+  fi
+  upsert_env "POSTGRES_PASSWORD" "$postgres_password"
+  echo "🔐 Set POSTGRES_PASSWORD in $ENV_FILE (value not printed)."
 fi
 
-required_vars=(
-  POSTGRES_PASSWORD
-  JWT_SECRET
-  OPENPR_BOT_TOKEN
-  OPENPR_WORKSPACE_ID
-  OPENPR_MCP_AUTH_TOKEN
-)
+# ---------------------------------------------------------------------------------------------
+# config/openpr.compose.toml — read by the api and the worker.
+# ---------------------------------------------------------------------------------------------
+if [ ! -f "$APP_CONFIG" ]; then
+  echo "📝 Generating $APP_CONFIG (api + worker)"
+  umask 077
+  cat > "$APP_CONFIG" <<EOF
+# OpenPR configuration for the api and the worker containers, generated by scripts/start.sh.
+#
+# Mounted read-only at /app/config/openpr.toml in both services; see docker-compose.yml. The
+# annotated reference for every key is config/openpr.example.toml.
+#
+# THIS FILE HOLDS DEPLOYMENT SECRETS. It is not committed, and the bootstrap values below are for
+# local use only -- replace them before running this anywhere real.
 
-missing_vars=()
-for key in "${required_vars[@]}"; do
-  if ! grep -qE "^${key}=.+" .env; then
-    missing_vars+=("$key")
-  fi
-done
+[server]
+# The api's own default is 0.0.0.0:8081, but docker-compose.yml publishes the container's 8080 and
+# frontend/nginx.conf proxies to api:8080, so the api is pinned to 8080 here.
+# app_name is deliberately unset: this file also serves the worker, and a shared name would make
+# the worker log itself as the api. Each binary keeps its own.
+# The worker never opens a listener, so bind_addr is simply unread there.
+bind_addr = "0.0.0.0:8080"
 
-if [ "${#missing_vars[@]}" -ne 0 ]; then
-  echo "❌ .env is missing required compose values: ${missing_vars[*]}"
-  echo "Set them in .env or remove .env and rerun this script to generate local bootstrap values."
+[database]
+# The host is the compose service name, so this URL only resolves inside the compose network. A
+# host-side \`cargo run\` needs its own file pointing at localhost.
+# The password must stay in step with POSTGRES_PASSWORD in .env: the postgres image initialises
+# itself from that variable and only ever runs initdb once.
+url = "postgres://openpr:${postgres_password}@postgres:5432/openpr"
+max_connections = 20
+min_connections = 2
+
+[auth]
+# Signs every access and refresh token in this deployment. Rotating it invalidates all of them.
+jwt_secret = "$(random_hex 32)"
+access_ttl_seconds = 1296000
+refresh_ttl_seconds = 1728000
+# default_author_id is deliberately unset: it must name a user that actually exists, and a
+# generated UUID would only point at a row that never gets created.
+
+[logging]
+# filter is left out so each binary keeps its own default scope ("<service>=info,tower_http=info").
+format = "json"
+output = "stderr"
+
+[storage]
+backend = "local"
+# Must match the ./uploads bind mount of the api and worker services in docker-compose.yml.
+dir = "/app/uploads"
+
+[migrations]
+replay = false
+continue_on_error = false
+
+[outbound]
+# Connector and webhook endpoints resolving to a private address are refused unless the host is
+# listed here. These are the in-compose services, including the optional webhook receiver.
+# Entries are matched literally: "host" or "host:port", no wildcards and no URLs.
+allowed_hosts = ["webhook:9090", "api:8080", "mcp-server:8090", "frontend:80"]
+allow_private = false
+
+# Credentials the connector delivery pipeline may present, one table per workspace, keyed by the
+# workspace UUID. A connector auth_policy references one by its short name, for example
+# {"mode": "hmac", "secret_ref": "SHIPPING"}. A connector can only read names filed under the
+# workspace that owns it.
+# [connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
+# SHIPPING = "..."
+EOF
+  # 0644, not 0600: the containers run as their own uid and a rootless runtime maps the
+  # host owner to a different one inside, so an owner-only file is unreadable there.
+  # Protect the deployment directory instead (e.g. chmod 750 on the parent).
+  chmod 644 "$APP_CONFIG"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# config/openpr.compose.mcp.toml — read by the mcp-server.
+#
+# Separate from the file above on purpose: the MCP server is the published, agent facing surface
+# and it needs neither the database URL nor the signing key. It reaches the API over HTTP with a
+# workspace bot token, so this file carries [logging] and [mcp] and nothing else.
+# ---------------------------------------------------------------------------------------------
+if [ ! -f "$MCP_CONFIG" ]; then
+  echo "📝 Generating $MCP_CONFIG (mcp-server)"
+  umask 077
+  cat > "$MCP_CONFIG" <<EOF
+# OpenPR configuration for the mcp-server container, generated by scripts/start.sh.
+#
+# Mounted read-only at /app/config/openpr.toml; see docker-compose.yml. No [database] and no
+# [auth] section: this service opens no database connection and signs no token, and the lazy
+# validation of those sections is what lets the file leave them out entirely.
+#
+# THIS FILE HOLDS DEPLOYMENT SECRETS. It is not committed.
+
+[logging]
+format = "json"
+output = "stderr"
+
+[mcp]
+# The api service inside the compose network, not the published host port.
+api_url = "http://api:8080"
+
+# Bootstrap placeholders that satisfy validation so the container starts. They are NOT credentials
+# of a real workspace yet -- scripts/bootstrap-restaurant-demo.sh replaces both with a bot token
+# it creates through the API, then recreates this service.
+bot_token = "opr_local_$(random_hex 24)"
+workspace_id = "$(random_uuid)"
+
+# Bearer token inbound HTTP/SSE callers must present. Required here because the compose container
+# binds 0.0.0.0:8090 so the other services can reach it, and the server refuses a non-loopback
+# bind without one. /health stays open so the healthcheck keeps working.
+auth_token = "$(random_hex 32)"
+
+# transport and bind_addr are supplied as flags by docker-compose.yml, which wins over this file.
+transport = "stdio"
+EOF
+  # 0644, not 0600: the containers run as their own uid and a rootless runtime maps the
+  # host owner to a different one inside, so an owner-only file is unreadable there.
+  # Protect the deployment directory instead (e.g. chmod 750 on the parent).
+  chmod 644 "$MCP_CONFIG"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Validation. Mirrors crates/platform/src/config/raw.rs so a bad file is reported here rather than
+# as a container that exits during `compose up`. Nothing below prints a value.
+# ---------------------------------------------------------------------------------------------
+if ! OPENPR_APP_CONFIG="$APP_CONFIG" OPENPR_MCP_CONFIG="$MCP_CONFIG" OPENPR_ENV_FILE="$ENV_FILE" python3 -c '
+import os
+import re
+import sys
+import tomllib
+from urllib.parse import urlsplit, unquote
+
+# The key sets accepted by crates/platform/src/config/raw.rs. Every Raw* struct carries
+# deny_unknown_fields, so a misspelled key is a hard startup failure rather than a default.
+SCHEMA = {
+    "server": {"app_name", "bind_addr"},
+    "database": {
+        "url",
+        "max_connections",
+        "min_connections",
+        "connect_timeout_seconds",
+        "idle_timeout_seconds",
+        "acquire_timeout_seconds",
+    },
+    "auth": {"jwt_secret", "access_ttl_seconds", "refresh_ttl_seconds", "default_author_id"},
+    "logging": {"filter", "format", "output"},
+    "storage": {"backend", "dir", "s3"},
+    "migrations": {"replay", "continue_on_error"},
+    "outbound": {"allowed_hosts", "allow_private"},
+    "mcp": {
+        "api_url",
+        "bot_token",
+        "workspace_id",
+        "auth_token",
+        "transport",
+        "bind_addr",
+        "invocation_id",
+    },
+    "connectors": {"secrets"},
+}
+S3_KEYS = {"endpoint", "bucket", "region", "access_key_id", "secret_access_key", "session_token"}
+PLACEHOLDERS = ("${", "replace_with", "change-me-in-production")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+NIL_UUID = "00000000-0000-0000-0000-000000000000"
+
+issues = []
+
+
+def load(path, label):
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except FileNotFoundError:
+        issues.append(f"{label}: {path} does not exist; rerun scripts/start.sh to generate it")
+    except IsADirectoryError:
+        issues.append(f"{label}: {path} is a directory, not a file")
+    except OSError as err:
+        issues.append(f"{label}: {path} is unreadable ({err.strerror})")
+    except tomllib.TOMLDecodeError as err:
+        issues.append(f"{label}: {path} is not valid TOML ({err})")
+    return None
+
+
+def check_keys(data, label):
+    for section, value in data.items():
+        if section not in SCHEMA:
+            issues.append(f"{label}: unknown section [{section}]; the binaries reject unknown keys")
+            continue
+        if not isinstance(value, dict):
+            continue
+        # Credential names under [connectors.secrets] are data, not schema.
+        if section == "connectors":
+            continue
+        for key in value:
+            if key not in SCHEMA[section]:
+                issues.append(f"{label}: unknown key {section}.{key}; the binaries reject unknown keys")
+    for key in data.get("storage", {}).get("s3", {}):
+        if key not in S3_KEYS:
+            issues.append(f"{label}: unknown key storage.s3.{key}")
+
+
+def concrete(value):
+    return isinstance(value, str) and value.strip() and not any(m in value for m in PLACEHOLDERS)
+
+
+def get(data, section, key):
+    value = data.get(section, {})
+    return value.get(key) if isinstance(value, dict) else None
+
+
+app = load(os.environ["OPENPR_APP_CONFIG"], "api/worker config")
+mcp = load(os.environ["OPENPR_MCP_CONFIG"], "mcp config")
+
+if app is not None:
+    label = "api/worker config"
+    check_keys(app, label)
+    url = get(app, "database", "url")
+    if url is None:
+        issues.append(f"{label}: database.url is required by the api and the worker")
+    elif not concrete(url):
+        issues.append(f"{label}: database.url is empty or still a placeholder")
+    secret = get(app, "auth", "jwt_secret")
+    if secret is None:
+        issues.append(f"{label}: auth.jwt_secret is required by the api and the worker")
+    elif not concrete(secret):
+        issues.append(f"{label}: auth.jwt_secret is empty or still a placeholder")
+    elif len(secret.strip()) < 16:
+        issues.append(f"{label}: auth.jwt_secret must be at least 16 characters")
+    hosts = get(app, "outbound", "allowed_hosts")
+    if hosts is not None and not isinstance(hosts, list):
+        issues.append(f"{label}: outbound.allowed_hosts must be an array of strings")
+    elif isinstance(hosts, list):
+        for entry in hosts:
+            if not isinstance(entry, str) or "://" in entry or "/" in entry or "*" in entry:
+                issues.append(
+                    f"{label}: outbound.allowed_hosts entry {entry!r} must be a host or host:port"
+                )
+
+if mcp is not None:
+    label = "mcp config"
+    check_keys(mcp, label)
+    if "database" in mcp or "auth" in mcp:
+        issues.append(
+            f"{label}: carries [database] or [auth]; the MCP server needs neither and must not "
+            "hold the database URL or the signing key"
+        )
+    api_url = get(mcp, "mcp", "api_url")
+    if api_url is not None and not (concrete(api_url) and api_url.startswith(("http://", "https://"))):
+        issues.append(f"{label}: mcp.api_url must be an http:// or https:// URL")
+    token = get(mcp, "mcp", "bot_token")
+    if token is None:
+        issues.append(f"{label}: mcp.bot_token is required to run the MCP server")
+    elif not concrete(token):
+        issues.append(f"{label}: mcp.bot_token is empty or still a placeholder")
+    elif not token.strip().startswith("opr_"):
+        issues.append(f"{label}: mcp.bot_token must use the opr_ token prefix")
+    workspace = get(mcp, "mcp", "workspace_id")
+    if workspace is None:
+        issues.append(f"{label}: mcp.workspace_id is required to run the MCP server")
+    elif not concrete(workspace) or not UUID_RE.match(workspace.strip()):
+        issues.append(f"{label}: mcp.workspace_id must be a UUID")
+    elif workspace.strip() == NIL_UUID:
+        issues.append(f"{label}: mcp.workspace_id must not be the nil UUID placeholder")
+    auth_token = get(mcp, "mcp", "auth_token")
+    if auth_token is None:
+        issues.append(
+            f"{label}: mcp.auth_token is required; the compose container binds 0.0.0.0:8090 and "
+            "the server refuses a non-loopback bind without an inbound token"
+        )
+    elif not concrete(auth_token):
+        issues.append(f"{label}: mcp.auth_token is empty or still a placeholder")
+    elif len(auth_token.strip()) < 16:
+        issues.append(f"{label}: mcp.auth_token must be at least 16 characters")
+
+# The postgres image runs initdb once, from POSTGRES_PASSWORD. If database.url disagrees with it
+# the stack builds, starts, and then fails every query with an authentication error.
+env_password = None
+try:
+    with open(os.environ["OPENPR_ENV_FILE"], "r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("POSTGRES_PASSWORD="):
+                env_password = line.split("=", 1)[1].strip()
+except OSError:
+    issues.append(".env: cannot be read; docker-compose needs POSTGRES_PASSWORD from it")
+
+if not env_password:
+    issues.append(".env: POSTGRES_PASSWORD is not set; the postgres service will not start")
+elif app is not None:
+    url = get(app, "database", "url")
+    if isinstance(url, str):
+        url_password = urlsplit(url).password
+        if url_password is not None and unquote(url_password) != env_password:
+            issues.append(
+                "the password in database.url does not match POSTGRES_PASSWORD in .env; "
+                "postgres would reject every connection"
+            )
+
+if issues:
+    for issue in issues:
+        print(f"❌ {issue}", file=sys.stderr)
+    raise SystemExit(1)
+'; then
+  echo ""
+  echo "Fix the values above, or delete $APP_CONFIG / $MCP_CONFIG and rerun this script to"
+  echo "regenerate local bootstrap values."
   exit 1
 fi
 
-config_errors=0
-for key in POSTGRES_PASSWORD JWT_SECRET; do
-  if ! validate_concrete_value "$key" "$(env_value "$key")"; then
-    config_errors=$((config_errors + 1))
-  fi
-done
-
-bot_token="$(env_value "OPENPR_BOT_TOKEN")"
-if ! validate_concrete_value "OPENPR_BOT_TOKEN" "$bot_token"; then
-  config_errors=$((config_errors + 1))
-elif [[ "$bot_token" != opr_* ]]; then
-  echo "❌ .env value for OPENPR_BOT_TOKEN must start with opr_"
-  config_errors=$((config_errors + 1))
-fi
-
-mcp_auth_token="$(env_value "OPENPR_MCP_AUTH_TOKEN")"
-if ! validate_concrete_value "OPENPR_MCP_AUTH_TOKEN" "$mcp_auth_token"; then
-  config_errors=$((config_errors + 1))
-elif [ "${#mcp_auth_token}" -lt 16 ]; then
-  echo "❌ .env value for OPENPR_MCP_AUTH_TOKEN must be at least 16 characters"
-  config_errors=$((config_errors + 1))
-fi
-
-if ! validate_uuid_value "OPENPR_WORKSPACE_ID" "$(env_value "OPENPR_WORKSPACE_ID")"; then
-  config_errors=$((config_errors + 1))
-fi
-
-if grep -qE "^DEFAULT_AUTHOR_ID=" .env; then
-  if ! validate_uuid_value "DEFAULT_AUTHOR_ID" "$(env_value "DEFAULT_AUTHOR_ID")"; then
-    config_errors=$((config_errors + 1))
-  fi
-fi
-
-if [ "$config_errors" -ne 0 ]; then
-  echo "Remove .env and rerun this script to regenerate local bootstrap values, or replace the invalid values manually."
-  exit 1
+# The compose containers run as uid 1000, and the configuration files are mode 600. When the
+# repository belongs to another user the mount is unreadable inside the container.
+file_owner="$(stat -c '%u' "$APP_CONFIG" 2>/dev/null || echo 1000)"
+if [ "$file_owner" != "1000" ]; then
+  echo "⚠️  $APP_CONFIG is owned by uid $file_owner but the containers run as uid 1000."
+  echo "   The mount will be unreadable inside the container; chown the files to uid 1000."
+  echo ""
 fi
 
 if [ "$MODE" = "--check-config" ]; then
-  echo "✅ .env bootstrap configuration is valid."
+  echo "✅ $APP_CONFIG, $MCP_CONFIG and $ENV_FILE are valid."
   exit 0
 fi
 
@@ -188,8 +457,8 @@ if [ -z "${OPENPR_RUNTIME_BASE:-}" ] && [ -r /etc/os-release ]; then
     export OPENPR_RUNTIME_BASE
     echo "   runtime base image: $OPENPR_RUNTIME_BASE (matched to host)"
     # Persist it so a plain `docker compose up --build` keeps the same base.
-    if ! grep -q '^OPENPR_RUNTIME_BASE=' .env 2>/dev/null; then
-      printf '\n# Runtime base image for Dockerfile.prebuilt; must ship a glibc at least as new as the host.\nOPENPR_RUNTIME_BASE=%s\n' "$OPENPR_RUNTIME_BASE" >> .env
+    if ! grep -q '^OPENPR_RUNTIME_BASE=' "$ENV_FILE" 2>/dev/null; then
+      printf '\n# Runtime base image for Dockerfile.prebuilt; must ship a glibc at least as new as the host.\nOPENPR_RUNTIME_BASE=%s\n' "$OPENPR_RUNTIME_BASE" >> "$ENV_FILE"
     fi
   fi
 fi
@@ -204,12 +473,12 @@ max_wait=120
 elapsed=0
 while [ $elapsed -lt $max_wait ]; do
   healthy_count=$(docker compose ps | grep -c "healthy" || echo "0")
-  
+
   if [ "$healthy_count" -ge 4 ]; then
     echo "✅ All services are healthy!"
     break
   fi
-  
+
   printf "."
   sleep 2
   elapsed=$((elapsed + 2))
@@ -235,6 +504,12 @@ echo "  - API:        http://localhost:8081"
 echo "  - MCP Server: http://localhost:8090"
 echo "  - PostgreSQL: compose network only"
 echo ""
+echo "📄 Configuration:"
+echo "  - api + worker: $APP_CONFIG"
+echo "  - mcp-server:   $MCP_CONFIG"
+echo "  - compose:      $ENV_FILE"
+echo "  Both configuration files contain generated secrets. Do not commit them."
+echo ""
 echo "📊 Service Status:"
 docker compose ps
 echo ""
@@ -242,5 +517,6 @@ echo "📝 Useful Commands:"
 echo "  - View logs:       docker compose logs -f"
 echo "  - Stop services:   docker compose down"
 echo "  - Restart:         docker compose restart"
+echo "  - Check config:    bash scripts/start.sh --check-config"
 echo "  - Run tests:       bash scripts/e2e-test.sh"
 echo ""
