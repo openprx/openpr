@@ -180,20 +180,20 @@ pub fn relation_target_config(
     })
 }
 
-pub fn validate_parent_child_relation(
-    parent_schema: &Value,
-    child_form_key: &str,
-    relation_key: &str,
-) -> Result<String, ApiError> {
-    let relation_key = normalize_key(relation_key).map_err(ApiError::BadRequest)?;
-    let fields = parent_schema
+/// Returns the parent schema field declared under `relation_key`, if the schema declares one.
+fn parent_schema_field<'a>(parent_schema: &'a Value, relation_key: &str) -> Option<&'a Value> {
+    parent_schema
         .get("fields")
         .and_then(Value::as_array)
-        .ok_or_else(|| ApiError::BadRequest("parent form schema fields are required".to_string()))?;
-    let field = fields
-        .iter()
-        .find(|field| field.get("key").and_then(Value::as_str) == Some(relation_key.as_str()))
-        .ok_or_else(|| ApiError::BadRequest("parent_child relation field not found".to_string()))?;
+        .and_then(|fields| {
+            fields
+                .iter()
+                .find(|field| field.get("key").and_then(Value::as_str) == Some(relation_key))
+        })
+}
+
+/// Checks that a declared relation field really is a `parent_child` field pointing at `child_form_key`.
+fn ensure_field_declares_parent_child(field: &Value, child_form_key: &str) -> Result<(), ApiError> {
     let relation = field
         .get("relation")
         .and_then(Value::as_object)
@@ -216,6 +216,44 @@ pub fn validate_parent_child_relation(
         return Err(ApiError::BadRequest(
             "child form does not match parent_child relation target".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Resolves the child table field a parent form declares for `relation_key`.
+///
+/// Used by the endpoints that create or address a child record *through* a parent form field, where
+/// the declaration is what names the child form, so a missing declaration is a client error.
+pub fn validate_parent_child_relation(
+    parent_schema: &Value,
+    child_form_key: &str,
+    relation_key: &str,
+) -> Result<String, ApiError> {
+    let relation_key = normalize_key(relation_key).map_err(ApiError::BadRequest)?;
+    parent_schema
+        .get("fields")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::BadRequest("parent form schema fields are required".to_string()))?;
+    let field = parent_schema_field(parent_schema, &relation_key)
+        .ok_or_else(|| ApiError::BadRequest("parent_child relation field not found".to_string()))?;
+    ensure_field_declares_parent_child(field, child_form_key)?;
+    Ok(relation_key)
+}
+
+/// Validates a `parent_child` link key only when the parent schema declares a field for it.
+///
+/// The generic link endpoint also serves the modelling where the child form holds the parent id and
+/// the parent form declares no child table field at all, so an undeclared key is a legitimate link
+/// rather than an error. A declared key is still validated so a link can never contradict the field
+/// that the parent form publishes under the same name.
+pub fn validate_optional_parent_child_relation(
+    parent_schema: &Value,
+    child_form_key: &str,
+    relation_key: &str,
+) -> Result<String, ApiError> {
+    let relation_key = normalize_key(relation_key).map_err(ApiError::BadRequest)?;
+    if let Some(field) = parent_schema_field(parent_schema, &relation_key) {
+        ensure_field_declares_parent_child(field, child_form_key)?;
     }
     Ok(relation_key)
 }
@@ -272,7 +310,8 @@ pub async fn find_parent_child_link(
 mod tests {
     use super::{
         normalize_optional_child_form_key, normalize_optional_relation_key, normalize_relation_type,
-        normalize_target_type, relation_target_config, validate_parent_child_relation,
+        normalize_target_type, relation_target_config, validate_optional_parent_child_relation,
+        validate_parent_child_relation,
     };
     use serde_json::json;
 
@@ -318,6 +357,67 @@ mod tests {
             "lines"
         );
         assert!(validate_parent_child_relation(&schema, "contacts", "lines").is_err());
+    }
+
+    /// The generic link endpoint must serve the modelling where the child form holds the parent id,
+    /// which leaves the parent form without a child table field to declare the relation key.
+    #[test]
+    fn accepts_a_parent_child_link_key_the_parent_schema_does_not_declare() {
+        let schema = json!({
+            "fields": [
+                {"key": "order_no", "type": "text"},
+                {"key": "total_amount", "type": "amount"}
+            ]
+        });
+
+        assert_eq!(
+            validate_optional_parent_child_relation(&schema, "order_line", "order_lines").unwrap(),
+            "order_lines"
+        );
+        assert!(validate_parent_child_relation(&schema, "order_line", "order_lines").is_err());
+    }
+
+    /// A schema without a usable `fields` array declares nothing, so it cannot contradict the link.
+    #[test]
+    fn accepts_a_parent_child_link_key_when_the_schema_declares_no_fields() {
+        assert_eq!(
+            validate_optional_parent_child_relation(&json!({}), "order_line", "order_lines").unwrap(),
+            "order_lines"
+        );
+    }
+
+    /// A declared key still has to agree with the link, otherwise a link could contradict the field
+    /// the parent form publishes under the same name.
+    #[test]
+    fn rejects_a_parent_child_link_key_that_contradicts_the_declared_field() {
+        let schema = json!({
+            "fields": [{
+                "key": "lines",
+                "type": "child_table",
+                "relation": {"relation_type": "parent_child", "form_key": "order_lines"}
+            }, {
+                "key": "customer",
+                "type": "relation",
+                "relation": {"relation_type": "reference", "form_key": "crm_accounts"}
+            }]
+        });
+
+        assert_eq!(
+            validate_optional_parent_child_relation(&schema, "order_lines", "lines").unwrap(),
+            "lines"
+        );
+        assert!(validate_optional_parent_child_relation(&schema, "contacts", "lines").is_err());
+        assert!(validate_optional_parent_child_relation(&schema, "crm_accounts", "customer").is_err());
+    }
+
+    /// An invalid key is a client error on both paths; relaxing the declaration check must not turn
+    /// the relaxed path into one that accepts arbitrary keys.
+    #[test]
+    fn rejects_malformed_parent_child_link_keys() {
+        let schema = json!({"fields": []});
+
+        assert!(validate_optional_parent_child_relation(&schema, "order_line", "Order Lines").is_err());
+        assert!(validate_optional_parent_child_relation(&schema, "order_line", "").is_err());
     }
 
     #[test]
