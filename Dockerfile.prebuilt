@@ -1,6 +1,11 @@
 # syntax=docker/dockerfile:1.7
-# Prebuilt binary Dockerfile - uses locally compiled binaries
-FROM debian:bookworm-slim
+# Prebuilt binary Dockerfile - uses locally compiled binaries.
+#
+# The binaries are compiled on the host, so this runtime image must ship a glibc
+# at least as new as the host's. scripts/start.sh derives RUNTIME_BASE from the
+# host release; override OPENPR_RUNTIME_BASE to pin it manually.
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM ${RUNTIME_BASE}
 ARG APP_BIN
 WORKDIR /app
 

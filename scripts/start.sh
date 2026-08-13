@@ -159,6 +159,18 @@ fi
 echo "🔨 Building release binaries for Dockerfile.prebuilt..."
 cargo build --workspace --release
 
+# The binaries are linked against the host glibc, so the runtime image has to be
+# at least as new. Derive it from the host release unless the caller pinned one.
+if [ -z "${OPENPR_RUNTIME_BASE:-}" ] && [ -r /etc/os-release ]; then
+  host_id=$(. /etc/os-release && echo "${ID:-}")
+  host_codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+  if [ "$host_id" = "debian" ] && [ -n "$host_codename" ]; then
+    OPENPR_RUNTIME_BASE="debian:${host_codename}-slim"
+    export OPENPR_RUNTIME_BASE
+    echo "   runtime base image: $OPENPR_RUNTIME_BASE (matched to host)"
+  fi
+fi
+
 echo "🔨 Building and starting services..."
 docker compose up -d --build
 

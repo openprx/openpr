@@ -26,6 +26,7 @@ services:
       context: .
       dockerfile: Dockerfile.prebuilt
       args:
+        RUNTIME_BASE: ${OPENPR_RUNTIME_BASE:-debian:bookworm-slim}
         APP_BIN: api
     command: ["/app/api"]
     environment:
@@ -75,6 +76,7 @@ services:
       context: .
       dockerfile: Dockerfile.prebuilt
       args:
+        RUNTIME_BASE: ${OPENPR_RUNTIME_BASE:-debian:bookworm-slim}
         APP_BIN: worker
     command: ["/app/worker"]
     environment:
@@ -112,6 +114,7 @@ services:
       context: .
       dockerfile: Dockerfile.prebuilt
       args:
+        RUNTIME_BASE: ${OPENPR_RUNTIME_BASE:-debian:bookworm-slim}
         APP_BIN: mcp-server
     environment:
       APP_NAME: mcp-server
