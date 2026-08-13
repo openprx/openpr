@@ -51,3 +51,7 @@ Thumbs.db
 *.sqlite
 /CHANGELOG.md
 .brv/
+
+# Generated runtime configuration; contains the signing key and database password.
+/config/openpr.compose*.toml
+/config/openpr.toml
