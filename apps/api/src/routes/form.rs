@@ -63,7 +63,8 @@ use crate::{
             ChildRecordRelationQuery, ChildRecordRow, CreateChildRecordRequest, CreateLinkRequest, LinkResponse,
             ListChildrenQuery, RelationTargetResponse, RelationTargetsQuery, UpdateChildRecordRequest, find_link,
             find_parent_child_link, normalize_optional_child_form_key, normalize_optional_relation_key,
-            normalize_relation_type, normalize_target_type, relation_target_config, validate_parent_child_relation,
+            normalize_relation_type, normalize_target_type, relation_target_config,
+            validate_optional_parent_child_relation, validate_parent_child_relation,
         },
         schema::{FormField, ensure_schema_field_ids, normalize_key, parse_fields, validate_schema},
         schema_insights::{
@@ -4036,7 +4037,7 @@ pub async fn create_record_link(
         ensure_record_scope_allows_created_by(&state, target_form.id, &target_role, actor_id, target_record.created_by)
             .await?;
         if relation_type == "parent_child" {
-            validate_parent_child_relation(&form.schema, &target_form.key, &relation_key)?;
+            validate_optional_parent_child_relation(&form.schema, &target_form.key, &relation_key)?;
         }
         target_record_id.to_string()
     } else {
@@ -7658,5 +7659,588 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+}
+
+/// The generic record link endpoint against a real `PostgreSQL` server.
+///
+/// The endpoint used to require the parent form to declare a field named after the link's
+/// `relation_key`, which rejected the shipped restaurant scenario: its `order` form keeps no child
+/// table field because the `order_line` form holds the parent id. Only a real database shows that
+/// the link is now written, that a declared field is still honoured, and that the tenant, target and
+/// permission checks the same code path carries were not relaxed with it.
+///
+/// Set `OPENPR_TEST_DATABASE_URL` to a maintenance connection string, for example
+/// `postgres://user:pw@127.0.0.1:5432/postgres`. Without it these tests report that they were
+/// skipped instead of pretending to pass.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
+mod record_link_database_tests {
+    use super::create_record_link;
+    use crate::{error::ApiError, forms::relations::CreateLinkRequest};
+    use axum::extract::{Extension, Json, Path, State};
+    use platform::{
+        app::AppState,
+        auth::{JwtClaims, TokenType},
+        config::AppConfig,
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
+    const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    /// A throwaway database that drops itself when the test is done.
+    struct Scratch {
+        db: DatabaseConnection,
+        url: String,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        async fn drop_self(self) {
+            let Self {
+                db, name, admin_url, ..
+            } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            if let Err(err) = admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await
+            {
+                eprintln!("could not drop scratch database {name}: {err}");
+            }
+        }
+    }
+
+    /// Creates an empty database named after the test and applies every migration file on disk in
+    /// name order, which is the order the runner uses. Returns `None` when the environment does not
+    /// offer a server, so the suite stays runnable without one.
+    async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = Database::connect(&admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+        let name = format!("openpr_link_{label}");
+        let quoted = format!("\"{name}\"");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+            .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+            .await
+            .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        let db = Database::connect(&url)
+            .await
+            .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+        migrate(&db).await;
+
+        Some(Scratch {
+            db,
+            url,
+            name,
+            admin_url,
+        })
+    }
+
+    /// Applies `migrations/*.sql` in name order. The files are read from disk rather than copied
+    /// here so a new migration cannot leave this schema behind.
+    async fn migrate(db: &DatabaseConnection) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migration file was found in {dir}");
+
+        for path in files {
+            let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+            db.execute_unprepared(&sql)
+                .await
+                .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+        }
+    }
+
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!("skipped: {} is not set", TEST_DATABASE_URL_ENV);
+                    return;
+                }
+            }
+        };
+    }
+
+    fn state_for(scratch: &Scratch) -> AppState {
+        AppState {
+            cfg: AppConfig {
+                app_name: "api-test".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                database_url: scratch.url.clone(),
+                jwt_secret: "record-link-test-secret".to_string(),
+                jwt_access_ttl_seconds: 900,
+                jwt_refresh_ttl_seconds: 3600,
+                default_author_id: None,
+            },
+            db: scratch.db.clone(),
+        }
+    }
+
+    fn claims_for(user_id: Uuid) -> JwtClaims {
+        JwtClaims {
+            sub: user_id.to_string(),
+            email: format!("{user_id}@example.test"),
+            token_type: TokenType::Access,
+            iat: 0,
+            exp: 0,
+        }
+    }
+
+    /// The restaurant `order` form: no child table field, so nothing declares `order_lines`.
+    fn order_schema() -> Value {
+        json!({
+            "fields": [
+                {"field_id": "fld_order_no", "key": "order_no", "type": "text"},
+                {"field_id": "fld_order_status", "key": "status", "type": "text"}
+            ]
+        })
+    }
+
+    /// The same form once it does declare a child table, which the link then has to agree with.
+    fn order_schema_with_child_table() -> Value {
+        json!({
+            "fields": [
+                {"field_id": "fld_order_no", "key": "order_no", "type": "text"},
+                {
+                    "field_id": "fld_order_lines",
+                    "key": "order_lines",
+                    "type": "child_table",
+                    "relation": {"relation_type": "parent_child", "form_key": "order_line"}
+                }
+            ]
+        })
+    }
+
+    async fn create_user(state: &AppState, label: &str) -> Uuid {
+        let user_id = Uuid::new_v4();
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO users (id, email, name, password_hash, role) VALUES ($1, $2, $3, 'x', 'user')",
+                vec![
+                    user_id.into(),
+                    format!("{label}-{user_id}@example.test").into(),
+                    label.into(),
+                ],
+            ))
+            .await
+            .expect("the user is created");
+        user_id
+    }
+
+    /// One workspace with one project, and the caller joined at `role`.
+    async fn create_tenant(state: &AppState, label: &str, user_id: Uuid, role: &str) -> (Uuid, Uuid) {
+        let workspace_id = Uuid::new_v4();
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO workspaces (id, name, slug, created_by) VALUES ($1, $2, $3, $4)",
+                vec![
+                    workspace_id.into(),
+                    label.into(),
+                    format!("{label}-{workspace_id}").into(),
+                    user_id.into(),
+                ],
+            ))
+            .await
+            .expect("the workspace is created");
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+                vec![workspace_id.into(), user_id.into(), role.into()],
+            ))
+            .await
+            .expect("the membership is created");
+        let project_id = create_project(state, workspace_id, user_id, label).await;
+        (workspace_id, project_id)
+    }
+
+    async fn create_project(state: &AppState, workspace_id: Uuid, user_id: Uuid, label: &str) -> Uuid {
+        let project_id = Uuid::new_v4();
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO projects (id, workspace_id, key, name, created_by) VALUES ($1, $2, $3, $4, $5)",
+                vec![
+                    project_id.into(),
+                    workspace_id.into(),
+                    format!("P{}", &project_id.simple().to_string()[..6]).into(),
+                    label.into(),
+                    user_id.into(),
+                ],
+            ))
+            .await
+            .expect("the project is created");
+        project_id
+    }
+
+    async fn create_form(state: &AppState, tenant: (Uuid, Uuid), key: &str, schema: Value) -> Uuid {
+        let form_id = Uuid::new_v4();
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    INSERT INTO project_forms (id, workspace_id, project_id, key, name, title_template, schema)
+                    VALUES ($1, $2, $3, $4, $5, '{title}', $6)
+                ",
+                vec![
+                    form_id.into(),
+                    tenant.0.into(),
+                    tenant.1.into(),
+                    key.into(),
+                    key.into(),
+                    schema.into(),
+                ],
+            ))
+            .await
+            .expect("the form is created");
+        form_id
+    }
+
+    async fn create_record(state: &AppState, tenant: (Uuid, Uuid), form_id: Uuid, created_by: Uuid) -> Uuid {
+        let record_id = Uuid::new_v4();
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    INSERT INTO form_records (id, workspace_id, project_id, form_id, title, values, created_by)
+                    VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6)
+                ",
+                vec![
+                    record_id.into(),
+                    tenant.0.into(),
+                    tenant.1.into(),
+                    form_id.into(),
+                    format!("record {record_id}").into(),
+                    created_by.into(),
+                ],
+            ))
+            .await
+            .expect("the record is created");
+        record_id
+    }
+
+    async fn set_member_policy(state: &AppState, tenant: (Uuid, Uuid), form_id: Uuid, policy: Value) {
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    INSERT INTO form_permissions (workspace_id, project_id, form_id, subject_type, subject_id, policy)
+                    VALUES ($1, $2, $3, 'role', 'member', $4)
+                ",
+                vec![tenant.0.into(), tenant.1.into(), form_id.into(), policy.into()],
+            ))
+            .await
+            .expect("the permission policy is stored");
+    }
+
+    #[derive(Debug, FromQueryResult)]
+    struct LinkCountRow {
+        count: i64,
+    }
+
+    #[derive(Debug, FromQueryResult)]
+    struct RecordValuesRow {
+        values: Value,
+    }
+
+    async fn link_count(state: &AppState, source_record_id: Uuid) -> i64 {
+        LinkCountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT COUNT(*)::bigint AS count FROM form_record_links WHERE source_record_id = $1",
+            vec![source_record_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("the link count is readable")
+        .map_or(-1, |row| row.count)
+    }
+
+    fn link_request(target_id: &Uuid, relation_key: &str) -> CreateLinkRequest {
+        CreateLinkRequest {
+            target_type: "form_record".to_string(),
+            target_id: target_id.to_string(),
+            relation_key: relation_key.to_string(),
+            relation_type: "parent_child".to_string(),
+            metadata: None,
+        }
+    }
+
+    async fn link(state: &AppState, user_id: Uuid, record_id: Uuid, req: CreateLinkRequest) -> Result<(), ApiError> {
+        create_record_link(
+            State(state.clone()),
+            Extension(claims_for(user_id)),
+            None,
+            Path(record_id),
+            Json(req),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// The shipped restaurant scenario models order lines on the child form, so the `order` schema
+    /// declares no `order_lines` field and the link used to be rejected with a 400.
+    #[tokio::test]
+    async fn a_parent_child_link_is_written_when_the_parent_schema_declares_no_relation_field() {
+        let scratch = scratch_or_skip!("undeclared");
+        let state = state_for(&scratch);
+
+        let user_id = create_user(&state, "owner").await;
+        let tenant = create_tenant(&state, "restaurant", user_id, "owner").await;
+        let order_form = create_form(&state, tenant, "order", order_schema()).await;
+        let line_form = create_form(&state, tenant, "order_line", json!({"fields": []})).await;
+        let order = create_record(&state, tenant, order_form, user_id).await;
+        let line = create_record(&state, tenant, line_form, user_id).await;
+
+        let result = link(&state, user_id, order, link_request(&line, "order_lines")).await;
+
+        assert!(result.is_ok(), "the link must be accepted: {:?}", result.err());
+        assert_eq!(link_count(&state, order).await, 1, "the link row must be stored");
+
+        scratch.drop_self().await;
+    }
+
+    /// A declared field still binds: the link may not claim a key the parent form publishes for a
+    /// different child form.
+    #[tokio::test]
+    async fn a_parent_child_link_that_contradicts_a_declared_relation_field_is_rejected() {
+        let scratch = scratch_or_skip!("declared");
+        let state = state_for(&scratch);
+
+        let user_id = create_user(&state, "owner").await;
+        let tenant = create_tenant(&state, "restaurant", user_id, "owner").await;
+        let order_form = create_form(&state, tenant, "order", order_schema_with_child_table()).await;
+        let line_form = create_form(&state, tenant, "order_line", json!({"fields": []})).await;
+        let print_form = create_form(&state, tenant, "print_job", json!({"fields": []})).await;
+        let order = create_record(&state, tenant, order_form, user_id).await;
+        let line = create_record(&state, tenant, line_form, user_id).await;
+        let print_job = create_record(&state, tenant, print_form, user_id).await;
+
+        let mismatched = link(&state, user_id, order, link_request(&print_job, "order_lines")).await;
+        assert!(
+            matches!(mismatched, Err(ApiError::BadRequest(_))),
+            "a link must not contradict the declared child table: {mismatched:?}"
+        );
+        assert_eq!(
+            link_count(&state, order).await,
+            0,
+            "the rejected link must not be stored"
+        );
+
+        let matching = link(&state, user_id, order, link_request(&line, "order_lines")).await;
+        assert!(
+            matching.is_ok(),
+            "the declared child form must still link: {:?}",
+            matching.err()
+        );
+        assert_eq!(link_count(&state, order).await, 1, "the accepted link must be stored");
+
+        scratch.drop_self().await;
+    }
+
+    /// Relaxing the schema check must not let a link reach out of its tenant, even for a caller who
+    /// belongs to both workspaces.
+    #[tokio::test]
+    async fn a_parent_child_link_cannot_reach_another_tenant() {
+        let scratch = scratch_or_skip!("tenant");
+        let state = state_for(&scratch);
+
+        let user_id = create_user(&state, "owner").await;
+        let alpha = create_tenant(&state, "alpha", user_id, "owner").await;
+        let beta = create_tenant(&state, "beta", user_id, "owner").await;
+        let sibling_project = (alpha.0, create_project(&state, alpha.0, user_id, "second").await);
+
+        let order_form = create_form(&state, alpha, "order", order_schema()).await;
+        let order = create_record(&state, alpha, order_form, user_id).await;
+        let beta_form = create_form(&state, beta, "order_line", json!({"fields": []})).await;
+        let beta_line = create_record(&state, beta, beta_form, user_id).await;
+        let sibling_form = create_form(&state, sibling_project, "order_line", json!({"fields": []})).await;
+        let sibling_line = create_record(&state, sibling_project, sibling_form, user_id).await;
+
+        let across_workspaces = link(&state, user_id, order, link_request(&beta_line, "order_lines")).await;
+        assert!(
+            matches!(across_workspaces, Err(ApiError::NotFound(_))),
+            "another workspace's record must stay unreachable: {across_workspaces:?}"
+        );
+
+        let across_projects = link(&state, user_id, order, link_request(&sibling_line, "order_lines")).await;
+        assert!(
+            matches!(across_projects, Err(ApiError::NotFound(_))),
+            "another project's record must stay unreachable: {across_projects:?}"
+        );
+        assert_eq!(link_count(&state, order).await, 0, "no cross tenant link may be stored");
+
+        scratch.drop_self().await;
+    }
+
+    /// A target that does not exist, or that is not a record id at all, is still refused.
+    #[tokio::test]
+    async fn a_parent_child_link_to_a_missing_target_is_rejected() {
+        let scratch = scratch_or_skip!("missing");
+        let state = state_for(&scratch);
+
+        let user_id = create_user(&state, "owner").await;
+        let tenant = create_tenant(&state, "restaurant", user_id, "owner").await;
+        let order_form = create_form(&state, tenant, "order", order_schema()).await;
+        let order = create_record(&state, tenant, order_form, user_id).await;
+
+        let unknown = link(&state, user_id, order, link_request(&Uuid::new_v4(), "order_lines")).await;
+        assert!(
+            matches!(unknown, Err(ApiError::NotFound(_))),
+            "an unknown record id must be refused: {unknown:?}"
+        );
+
+        let malformed = CreateLinkRequest {
+            target_type: "form_record".to_string(),
+            target_id: "not-a-record-id".to_string(),
+            relation_key: "order_lines".to_string(),
+            relation_type: "parent_child".to_string(),
+            metadata: None,
+        };
+        let malformed = link(&state, user_id, order, malformed).await;
+        assert!(
+            matches!(malformed, Err(ApiError::BadRequest(_))),
+            "a target that is not a record id must be refused: {malformed:?}"
+        );
+        assert_eq!(
+            link_count(&state, order).await,
+            0,
+            "no link may be stored for a missing target"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The caller still needs `form.view` on the target form, and still has to pass the target
+    /// form's `record_scope` policy.
+    #[tokio::test]
+    async fn a_parent_child_link_still_needs_permission_on_the_target_form() {
+        let scratch = scratch_or_skip!("permission");
+        let state = state_for(&scratch);
+
+        let member = create_user(&state, "member").await;
+        let other = create_user(&state, "other").await;
+        let tenant = create_tenant(&state, "restaurant", member, "member").await;
+        let order_form = create_form(&state, tenant, "order", order_schema()).await;
+        let hidden_form = create_form(&state, tenant, "order_line", json!({"fields": []})).await;
+        let scoped_form = create_form(&state, tenant, "print_job", json!({"fields": []})).await;
+        let order = create_record(&state, tenant, order_form, member).await;
+        let hidden_line = create_record(&state, tenant, hidden_form, member).await;
+        let foreign_record = create_record(&state, tenant, scoped_form, other).await;
+
+        set_member_policy(&state, tenant, hidden_form, json!({"actions": {"form.view": false}})).await;
+        set_member_policy(&state, tenant, scoped_form, json!({"record_scope": "owned"})).await;
+
+        let without_view = link(&state, member, order, link_request(&hidden_line, "order_lines")).await;
+        assert!(
+            matches!(without_view, Err(ApiError::Forbidden(_))),
+            "form.view on the target form must still be required: {without_view:?}"
+        );
+
+        let outside_scope = link(&state, member, order, link_request(&foreign_record, "order_lines")).await;
+        assert!(
+            matches!(outside_scope, Err(ApiError::Forbidden(_))),
+            "the target record scope must still be enforced: {outside_scope:?}"
+        );
+        assert_eq!(link_count(&state, order).await, 0, "no unauthorized link may be stored");
+
+        scratch.drop_self().await;
+    }
+
+    /// A link whose key no formula mentions must leave the parent's child aggregates alone rather
+    /// than failing the write or feeding the wrong rows into a total.
+    #[tokio::test]
+    async fn an_undeclared_link_key_leaves_child_aggregates_untouched() {
+        let scratch = scratch_or_skip!("aggregate");
+        let state = state_for(&scratch);
+
+        let user_id = create_user(&state, "owner").await;
+        let tenant = create_tenant(&state, "restaurant", user_id, "owner").await;
+        let order_form = create_form(
+            &state,
+            tenant,
+            "order",
+            json!({
+                "fields": [
+                    {"field_id": "fld_order_no", "key": "order_no", "type": "text"},
+                    {
+                        "field_id": "fld_lines_total",
+                        "key": "lines_total",
+                        "type": "number",
+                        "formula": {"op": "child_sum", "relation_key": "lines", "field": "line_total"}
+                    }
+                ]
+            }),
+        )
+        .await;
+        let line_form = create_form(
+            &state,
+            tenant,
+            "order_line",
+            json!({"fields": [{"field_id": "fld_line_total", "key": "line_total", "type": "number"}]}),
+        )
+        .await;
+        let order = create_record(&state, tenant, order_form, user_id).await;
+        let line = create_record(&state, tenant, line_form, user_id).await;
+
+        let result = link(&state, user_id, order, link_request(&line, "order_lines")).await;
+        assert!(
+            result.is_ok(),
+            "an undeclared link key must not break the recalculation: {:?}",
+            result.err()
+        );
+
+        let values = RecordValuesRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT values FROM form_records WHERE id = $1",
+            vec![order.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("the parent record is readable")
+        .expect("the parent record exists")
+        .values;
+        assert_eq!(
+            values
+                .get("lines_total")
+                .and_then(|total| total.get("decimal"))
+                .and_then(Value::as_str),
+            Some("0"),
+            "a formula on another relation key must not pick the link up: {values}"
+        );
+
+        scratch.drop_self().await;
     }
 }
