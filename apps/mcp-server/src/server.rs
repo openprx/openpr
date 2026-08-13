@@ -1058,7 +1058,7 @@ impl McpServer {
         let is_error = result.is_error.unwrap_or(false);
         let payload = json!({
             "tool_name": tool_name,
-            "transport": std::env::var("OPENPR_MCP_TRANSPORT").unwrap_or_else(|_| "mcp_stdio".to_string()),
+            "transport": self.client.transport_label(),
             "status": if is_error { "failed" } else { "succeeded" },
             "arguments": arguments,
             "result_summary": summarize_tool_result(result),
@@ -2159,11 +2159,7 @@ mod tests {
     const PLUGIN: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
     fn server(base_url: String) -> Result<super::McpServer, String> {
-        Ok(super::McpServer::new(crate::client::OpenPrClient::new(
-            base_url,
-            "opr_test_token".to_string(),
-            "workspace-1".to_string(),
-        )?))
+        Ok(super::McpServer::new(crate::client::test_api::client(base_url)?))
     }
 
     fn policy_route(enabled_tools: Value) -> axum::routing::MethodRouter {

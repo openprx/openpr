@@ -1,13 +1,11 @@
 // CLI output functions necessarily use print macros and indexing — allow these for this module.
-#![allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    clippy::unreachable,
-    clippy::indexing_slicing
-)]
+#![allow(clippy::print_stdout, clippy::print_stderr, clippy::indexing_slicing)]
+
+use std::path::PathBuf;
 
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use platform::config::McpTransport;
 use serde_json::{Value, json};
 
 use crate::client::OpenPrClient;
@@ -29,19 +27,27 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
+    /// Path to the configuration file \[default: config/openpr.toml\]
+    ///
+    /// Global because every subcommand needs it: the settings it carries are read before
+    /// the subcommand is dispatched, so `mcp-server projects list --config <path>` has to
+    /// parse exactly like `mcp-server serve --config <path>`.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
     /// Output format
     #[arg(long, value_enum, global = true, default_value_t = OutputFormat::Json)]
     pub format: OutputFormat,
 
-    /// API URL (overrides `OPENPR_API_URL`)
+    /// API URL (overrides `mcp.api_url`)
     #[arg(long, global = true)]
     pub api_url: Option<String>,
 
-    /// Bot authentication token (overrides `OPENPR_BOT_TOKEN`)
+    /// Bot authentication token (overrides `mcp.bot_token`)
     #[arg(long, global = true)]
     pub bot_token: Option<String>,
 
-    /// Workspace ID (overrides `OPENPR_WORKSPACE_ID`)
+    /// Workspace ID (overrides `mcp.workspace_id`)
     #[arg(long, global = true)]
     pub workspace_id: Option<String>,
 }
@@ -71,21 +77,35 @@ pub enum Commands {
 
 // ---- Serve ----
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Transport {
     Http,
     Sse,
     Stdio,
 }
 
+impl From<Transport> for McpTransport {
+    fn from(transport: Transport) -> Self {
+        match transport {
+            Transport::Http => Self::Http,
+            Transport::Sse => Self::Sse,
+            Transport::Stdio => Self::Stdio,
+        }
+    }
+}
+
+/// Both fields are optional rather than defaulted by `clap`: a clap default is
+/// indistinguishable from a value the operator typed, so defaulting here would silently
+/// override whatever `[mcp]` says. `None` means "the configuration file decides", and the
+/// file's own fallbacks are `mcp.transport = stdio` and `DEFAULT_MCP_BIND_ADDR`.
 #[derive(Debug, Args)]
 pub struct ServeArgs {
-    /// Transport protocol
-    #[arg(long, value_enum, default_value_t = Transport::Stdio)]
-    pub transport: Transport,
-    /// Bind address for HTTP/SSE transports
-    #[arg(long, default_value = "127.0.0.1:8090")]
-    pub bind_addr: String,
+    /// Transport protocol (overrides `mcp.transport`) \[default: stdio\]
+    #[arg(long, value_enum)]
+    pub transport: Option<Transport>,
+    /// Bind address for HTTP/SSE transports (overrides `mcp.bind_addr`) \[default: 127.0.0.1:8090\]
+    #[arg(long)]
+    pub bind_addr: Option<String>,
 }
 
 // ---- Projects ----
@@ -393,7 +413,9 @@ pub async fn run_cli_command(command: &Commands, format: &OutputFormat, client: 
     }
 
     let (tool_name, args): (&str, Value) = match command {
-        Commands::Serve(_) => unreachable!("serve is handled before run_cli_command"),
+        // `serve` is dispatched by `main` before this function is reached; reporting the
+        // mistake is an error return, never a panic.
+        Commands::Serve(_) => anyhow::bail!("serve is not a tool call and is handled before run_cli_command"),
 
         Commands::Projects(cmd) => match &cmd.action {
             ProjectsAction::List => ("projects.list", json!({})),
@@ -483,8 +505,8 @@ pub async fn run_cli_command(command: &Commands, format: &OutputFormat, client: 
 
         Commands::Search(search_args) => ("search.all", json!({ "query": search_args.query })),
 
-        // Files handled above via run_file_upload
-        Commands::Files(_) => unreachable!("Files handled before this match"),
+        // Files is handled above via `run_file_upload`, which returns before this match.
+        Commands::Files(_) => anyhow::bail!("files is handled by run_file_upload before this match"),
 
         Commands::Tools(cmd) => match &cmd.action {
             ToolsAction::Call { name, args_json } => (name.as_str(), parse_tool_args_json(args_json)?),
@@ -534,7 +556,7 @@ async fn run_file_upload(cmd: &FilesCmd, server: &McpServer) -> anyhow::Result<C
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, ToolsAction, Transport, parse_tool_args_json};
+    use super::{Cli, Commands, McpTransport, ToolsAction, Transport, parse_tool_args_json};
     use clap::Parser;
     use serde_json::json;
 
@@ -572,17 +594,73 @@ mod tests {
         assert!(parse_tool_args_json("{not-json}").is_err());
     }
 
+    /// An unspecified `--bind-addr` must stay `None` so `[mcp] bind_addr` still decides.
+    /// A clap default here would look exactly like an operator supplied value and would
+    /// override the file on every single run.
     #[test]
-    fn http_transport_defaults_to_localhost_bind() {
+    fn an_unspecified_transport_and_bind_address_defer_to_the_configuration_file() {
         let cli = Cli::try_parse_from(["mcp-server", "serve", "--transport", "http"])
             .expect("serve http command should parse");
 
         match cli.command {
             Commands::Serve(args) => {
-                assert!(matches!(args.transport, Transport::Http));
-                assert_eq!(args.bind_addr, "127.0.0.1:8090");
+                assert!(matches!(args.transport, Some(Transport::Http)));
+                assert_eq!(args.bind_addr, None);
             }
             _ => panic!("expected serve command"),
         }
+
+        let bare = Cli::try_parse_from(["mcp-server", "serve"]).expect("bare serve should parse");
+        match bare.command {
+            Commands::Serve(args) => {
+                assert!(args.transport.is_none());
+                assert!(args.bind_addr.is_none());
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    /// `--config` is global, so it has to parse after any subcommand, not just after
+    /// `serve`. It used to be possible to declare it on `serve` alone, which made
+    /// `mcp-server projects list --config <path>` fail to parse.
+    #[test]
+    fn the_config_flag_parses_on_every_subcommand() {
+        for args in [
+            vec!["mcp-server", "serve", "--config", "/etc/openpr.toml"],
+            vec!["mcp-server", "projects", "list", "--config", "/etc/openpr.toml"],
+            vec![
+                "mcp-server",
+                "work-items",
+                "get",
+                "PRX-1",
+                "--config",
+                "/etc/openpr.toml",
+            ],
+            vec!["mcp-server", "search", "anything", "--config", "/etc/openpr.toml"],
+            vec![
+                "mcp-server",
+                "tools",
+                "call",
+                "--name",
+                "forms.list",
+                "--config",
+                "/etc/openpr.toml",
+            ],
+            vec!["mcp-server", "--config", "/etc/openpr.toml", "projects", "list"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap_or_else(|error| panic!("{args:?} should parse: {error}"));
+            assert_eq!(
+                cli.config.as_deref(),
+                Some(std::path::Path::new("/etc/openpr.toml")),
+                "{args:?} did not carry the config path"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_flags_map_onto_the_configuration_enum() {
+        assert_eq!(McpTransport::from(Transport::Stdio), McpTransport::Stdio);
+        assert_eq!(McpTransport::from(Transport::Http), McpTransport::Http);
+        assert_eq!(McpTransport::from(Transport::Sse), McpTransport::Sse);
     }
 }
