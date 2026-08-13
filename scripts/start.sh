@@ -176,7 +176,10 @@ allow_private = false
 # [connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
 # SHIPPING = "..."
 EOF
-  chmod 600 "$APP_CONFIG"
+  # 0644, not 0600: the containers run as their own uid and a rootless runtime maps the
+  # host owner to a different one inside, so an owner-only file is unreadable there.
+  # Protect the deployment directory instead (e.g. chmod 750 on the parent).
+  chmod 644 "$APP_CONFIG"
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -220,7 +223,10 @@ auth_token = "$(random_hex 32)"
 # transport and bind_addr are supplied as flags by docker-compose.yml, which wins over this file.
 transport = "stdio"
 EOF
-  chmod 600 "$MCP_CONFIG"
+  # 0644, not 0600: the containers run as their own uid and a rootless runtime maps the
+  # host owner to a different one inside, so an owner-only file is unreadable there.
+  # Protect the deployment directory instead (e.g. chmod 750 on the parent).
+  chmod 644 "$MCP_CONFIG"
 fi
 
 # ---------------------------------------------------------------------------------------------
