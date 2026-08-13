@@ -275,10 +275,12 @@ async fn main() -> anyhow::Result<()> {
     // Installed only once the file parsed, so a configuration error is reported by the process
     // exit rather than swallowed by a subscriber the file was supposed to describe.
     logging::init(&config.logging, "worker")?;
-    let cfg = AppConfig::from_config(&config, "worker", "0.0.0.0:8081");
+    // from_config first: it reports a missing database url and signing key together, so the
+    // operator fixes both in one pass instead of being walked through them one at a time.
+    let cfg = AppConfig::from_config(&config, "worker", "0.0.0.0:8081")?;
     let policy = DeliveryPolicy::from_config(&config);
 
-    let db = connect_db(&config.database).await?;
+    let db = connect_db(&config.database_runtime()?).await?;
     // The pickup and completion statements below hard depend on the lease token, the duplicate
     // tagging and the pickup indexes. Without them the worker keeps polling and silently delivers
     // nothing, so refuse to start with the missing objects named instead.

@@ -18,9 +18,7 @@ use axum::{
 use clap::Parser;
 use cli::{Cli, Commands, ServeArgs};
 use client::{ClientConfig, OpenPrClient, transport_label};
-use platform::config::{
-    LogFormat, LoggingConfig, MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpRuntime, McpTransport, OpenPrConfig, Secret,
-};
+use platform::config::{MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpRuntime, McpTransport, OpenPrConfig, Secret};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde::Deserialize;
 use serde_json::json;
@@ -50,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
 
     // The file is the only source of configuration; nothing below reads the environment.
     let mut config = OpenPrConfig::load(cli.config.as_deref())?;
-    init_logging(&config.logging)?;
+    // stdio frames JSON-RPC on stdout, so the log stream is reserved to stderr no
+    // matter what the file asks for.
+    platform::logging::init_reserving_stdout(&config.logging, SERVICE_NAME)?;
 
     let serve_args = match &cli.command {
         Commands::Serve(args) => Some(args),
@@ -76,33 +76,6 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli::run_cli_command(&cli.command, &cli.format, client).await
     }
-}
-
-/// Installs the tracing subscriber described by `[logging]`, writing to stderr.
-///
-/// Deliberately not `platform::logging::init`: that writes to stdout, and on the stdio
-/// transport stdout *is* the JSON-RPC channel — one log line there corrupts the frame the
-/// MCP client is parsing. The filter and the format still come from the file, so `[logging]`
-/// remains the only thing deciding what this process logs.
-fn init_logging(logging: &LoggingConfig) -> anyhow::Result<()> {
-    let directives = logging.filter_or_default(SERVICE_NAME);
-    let filter = tracing_subscriber::EnvFilter::try_new(&directives)
-        .map_err(|error| anyhow::anyhow!("logging.filter {directives} is not a valid tracing filter: {error}"))?;
-
-    match logging.format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .json()
-            .with_current_span(true)
-            .with_span_list(true)
-            .init(),
-        LogFormat::Text => tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(filter)
-            .init(),
-    }
-    Ok(())
 }
 
 /// Layers the CLI overrides onto the file's `[mcp]` section.

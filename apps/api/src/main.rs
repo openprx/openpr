@@ -54,8 +54,10 @@ async fn main() -> anyhow::Result<()> {
     api::config::install(&config).map_err(|err| anyhow::anyhow!("{err}"))?;
     logging::init(&config.logging, "api")?;
 
-    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081");
-    let db = connect_db(&config.database).await?;
+    // from_config first: it reports a missing database url and signing key together, so the
+    // operator fixes both in one pass instead of being walked through them one at a time.
+    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081")?;
+    let db = connect_db(&config.database_runtime()?).await?;
     run_migrations(&db, config.migrations).await?;
     verify_governance_schema(&db).await?;
     // A migration that only warned used to leave the delivery pipeline half built. Fail here
