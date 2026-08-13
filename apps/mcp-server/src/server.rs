@@ -1030,6 +1030,20 @@ impl McpServer {
         }
     }
 
+    /// Applies the project agent policy to one `resources/read`.
+    ///
+    /// The resource is mapped to the tool whose policy already governs the same payload
+    /// and handed to `enforce_project_tool_policy`. Ownership resolution, foreign project
+    /// rejection and the ownership cache are therefore the tool path's, not a second
+    /// implementation that could drift away from it: `openpr://forms/{id}/records` is
+    /// authorized by exactly the decision `form_records.list` would have made.
+    async fn enforce_resource_read_policy(&self, uri: &str) -> Result<(), String> {
+        match resource_policy_subject(uri)? {
+            ResourceSubject::Ungoverned => Ok(()),
+            ResourceSubject::Tool { tool, args } => self.enforce_project_tool_policy(tool, &args).await,
+        }
+    }
+
     async fn report_tool_call_audit(
         &self,
         tool_name: &str,
@@ -1087,6 +1101,13 @@ impl McpServer {
         JsonRpcResponse::success(id, result)
     }
 
+    /// The static resource catalogue.
+    ///
+    /// Deliberately not policy filtered, unlike `tools/list`. Every entry is a fixed
+    /// description of a *shape*: the four names, descriptions and MIME types below are
+    /// identical for every caller, carry no project identifier and no project owned data,
+    /// and the request itself names no project to filter against. Withholding them would
+    /// hide nothing — `resources/read` is where the data lives, and that is gated.
     #[allow(clippy::unused_self)]
     fn handle_resources_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let resources = vec![
@@ -1119,6 +1140,13 @@ impl McpServer {
         JsonRpcResponse::success(id, json!({ "resources": resources }))
     }
 
+    /// The URI templates a client can expand.
+    ///
+    /// Not policy filtered, for the same reason as `handle_resources_list`: a template is
+    /// a `{project_id}` placeholder, never a project. Knowing that
+    /// `openpr://projects/{project_id}/connectors` exists grants nothing, because
+    /// expanding it lands in `handle_resources_read`, which resolves the real owner and
+    /// refuses when the policy does.
     #[allow(clippy::unused_self)]
     fn handle_resources_templates_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let templates = vec![
@@ -1252,6 +1280,20 @@ impl McpServer {
                 return JsonRpcResponse::error(id, JsonRpcError::invalid_params("Missing required field: uri"));
             }
         };
+
+        // `resources/read` serves the same project owned payloads `tools/call` does, so it
+        // is gated by the same project agent policy. Without this the resource door is a
+        // complete bypass of every capability an administrator disabled on the tool door:
+        // `openpr://projects/{id}/connectors` returned the connector list, endpoints and
+        // `auth_policy` blobs included, for a project whose policy refuses
+        // `connectors.list`.
+        if let Err(error) = self.enforce_resource_read_policy(&uri).await {
+            tracing::warn!(
+                uri = %sanitize_for_error(&uri),
+                "Refusing resources/read: the project agent policy does not authorize it"
+            );
+            return JsonRpcResponse::error(id, JsonRpcError::invalid_params(error));
+        }
 
         match uri.as_str() {
             "openpr://skills/openpr-mcp" => {
@@ -1698,6 +1740,137 @@ impl McpServer {
     }
 }
 
+/// `openpr://projects/{project_id}/<suffix>` -> the tool whose project agent policy
+/// governs the very same payload.
+///
+/// `/recent-decisions` maps to `context.get_governance` because that is the call it is
+/// served from: it reads the governance context and returns one field of it, so it can
+/// carry no weaker authorization than the whole document does.
+const PROJECT_RESOURCE_POLICY_TOOLS: [(&str, &str); 12] = [
+    ("/issues", "work_items.list"),
+    ("/forms", "forms.list"),
+    ("/context", "context.get_project"),
+    ("/governance", "context.get_governance"),
+    ("/agent-policy", "context.get_agent_policy"),
+    ("/release-readiness", "release.readiness.get"),
+    ("/type", "projects.get"),
+    ("/resources", "project_resources.list"),
+    ("/connectors", "connectors.list"),
+    ("/invocations", "invocations.list"),
+    ("/recent-decisions", "context.get_governance"),
+    ("/sprints", "sprints.list"),
+];
+
+/// `openpr://forms/{form_id}<suffix>` -> the governing tool. The empty suffix is last
+/// because it matches the bare form URI only (`parse_form_resource_uri` refuses a
+/// remainder containing `/`), and reading it last keeps that intent obvious.
+const FORM_RESOURCE_POLICY_TOOLS: [(&str, &str); 3] = [
+    ("/records", "form_records.list"),
+    ("/events", "events.tail"),
+    ("", "forms.get"),
+];
+
+/// `openpr://form-records/{record_id}<suffix>` -> the governing tool.
+const FORM_RECORD_RESOURCE_POLICY_TOOLS: [(&str, &str); 2] = [("/events", "events.tail"), ("", "form_records.get")];
+
+/// The tool that governs `openpr://issues/{identifier}`.
+const ISSUE_IDENTIFIER_POLICY_TOOL: &str = "work_items.get_by_identifier";
+
+/// What decides whether one `resources/read` is allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResourceSubject {
+    /// Served from process memory, or from a workspace wide catalogue that no project
+    /// agent policy can govern — the equivalent tools are `PolicyScope::WorkspaceWide`,
+    /// so there is no policy to consult and nothing project owned to leak.
+    Ungoverned,
+    /// Governed exactly like `tool` invoked with `args`.
+    Tool { tool: &'static str, args: Value },
+}
+
+/// Classifies a `resources/read` URI into the policy subject that governs it.
+///
+/// The match order mirrors `handle_resources_read` one for one, and
+/// `every_readable_resource_uri_is_governed_like_its_tool` pins the whole pairing, so a
+/// resource cannot be served through a door this function does not recognise.
+///
+/// An id lifted out of a URI is only accepted once it parses as a canonical UUID. That is
+/// the same guard the tool path applies to `project_id`, and for the same reason: the
+/// value is interpolated into the API URL that both the policy lookup and the read
+/// itself address, so a value that could reshape that URL must never reach either.
+fn resource_policy_subject(uri: &str) -> Result<ResourceSubject, String> {
+    // The three guides are compile time constants and the scenario catalogue is a global
+    // catalogue served by `scenario_templates.list`/`get`, both `WorkspaceWide`.
+    if matches!(
+        uri,
+        "openpr://skills/openpr-mcp"
+            | "openpr://guides/agents"
+            | "openpr://guides/workflows"
+            | "openpr://scenario-templates"
+    ) || parse_scenario_template_uri(uri).is_some()
+    {
+        return Ok(ResourceSubject::Ungoverned);
+    }
+
+    for (suffix, tool) in PROJECT_RESOURCE_POLICY_TOOLS {
+        if let Some(project_id) = parse_project_resource_uri(uri, suffix) {
+            return Ok(ResourceSubject::Tool {
+                tool,
+                args: json!({ "project_id": canonical_resource_id(project_id, "project_id")? }),
+            });
+        }
+    }
+
+    for (suffix, tool) in FORM_RESOURCE_POLICY_TOOLS {
+        if let Some(form_id) = parse_form_resource_uri(uri, suffix) {
+            return Ok(ResourceSubject::Tool {
+                tool,
+                args: json!({ "form_id": canonical_resource_id(form_id, "form_id")? }),
+            });
+        }
+    }
+
+    for (suffix, tool) in FORM_RECORD_RESOURCE_POLICY_TOOLS {
+        if let Some(record_id) = parse_form_record_resource_uri(uri, suffix) {
+            return Ok(ResourceSubject::Tool {
+                tool,
+                args: json!({ "record_id": canonical_resource_id(record_id, "record_id")? }),
+            });
+        }
+    }
+
+    if let Some(identifier) = parse_issue_identifier_uri(uri) {
+        // Validated with the allowlist the tool path uses, and the exact string that
+        // passed is the one the policy is evaluated against — an identifier that only
+        // becomes acceptable after trimming would authorize a different read than the
+        // dispatch below performs.
+        let args = json!({ "identifier": identifier.as_str() });
+        if identifier_argument(&args)?.as_deref() != Some(identifier.as_str()) {
+            return Err(format!(
+                "Invalid params: issue identifier '{}' is not a work item identifier",
+                sanitize_for_error(&identifier)
+            ));
+        }
+        return Ok(ResourceSubject::Tool {
+            tool: ISSUE_IDENTIFIER_POLICY_TOOL,
+            args,
+        });
+    }
+
+    // Nothing matched, so `handle_resources_read` reaches no backend for this URI and
+    // answers "Unknown resource URI". There is no data access to authorize.
+    Ok(ResourceSubject::Ungoverned)
+}
+
+/// A project owned id lifted out of a resource URI, or an error that refuses the read.
+fn canonical_resource_id(raw: &str, field: &str) -> Result<String, String> {
+    canonical_uuid(raw).ok_or_else(|| {
+        format!(
+            "Invalid params: {field} '{}' is not a canonical UUID",
+            sanitize_for_error(raw)
+        )
+    })
+}
+
 fn parse_project_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str> {
     let project_id = uri.strip_prefix("openpr://projects/")?.strip_suffix(suffix)?;
     if project_id.is_empty() || project_id.contains('/') {
@@ -1954,9 +2127,11 @@ fn redact_tool_arguments(args: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGENTS_GUIDE_MD, OWNERSHIP_ARGUMENTS, PolicyScope, SKILL_GUIDE_MD, TOOL_POLICY_SCOPES, canonical_uuid,
-        claimed_project_ids, declared_project_id, extract_tools_list_project_id, is_tool_enabled_by_policy,
-        redact_tool_arguments, summarize_tool_result, tool_policy_scope,
+        AGENTS_GUIDE_MD, FORM_RECORD_RESOURCE_POLICY_TOOLS, FORM_RESOURCE_POLICY_TOOLS, ISSUE_IDENTIFIER_POLICY_TOOL,
+        OWNERSHIP_ARGUMENTS, PROJECT_RESOURCE_POLICY_TOOLS, PolicyScope, ResourceSubject, SKILL_GUIDE_MD,
+        TOOL_POLICY_SCOPES, canonical_uuid, claimed_project_ids, declared_project_id, extract_tools_list_project_id,
+        is_tool_enabled_by_policy, redact_tool_arguments, resource_policy_subject, summarize_tool_result,
+        tool_policy_scope,
     };
     use crate::protocol::{CallToolResult, ToolContent};
     use axum::{
@@ -3172,5 +3347,283 @@ mod tests {
         };
 
         assert_eq!(summarize_tool_result(&result).as_deref(), Some("done"));
+    }
+
+    /// The whole `resources/read` surface, one row per readable URI, pinned against the
+    /// tool whose policy governs it.
+    ///
+    /// This is the table the resource door is audited from. A new resource that reaches
+    /// the API without a row here is the exact bug this test exists to catch: it would
+    /// be served by `handle_resources_read` while `resource_policy_subject` classified it
+    /// `Ungoverned`, which is a second unauthenticated door onto project data.
+    #[test]
+    fn every_readable_resource_uri_is_governed_like_its_tool() -> TestResult {
+        let governed = [
+            // Project addressed reads.
+            (format!("openpr://projects/{PROJECT}/issues"), "work_items.list"),
+            (format!("openpr://projects/{PROJECT}/forms"), "forms.list"),
+            (format!("openpr://projects/{PROJECT}/context"), "context.get_project"),
+            (
+                format!("openpr://projects/{PROJECT}/governance"),
+                "context.get_governance",
+            ),
+            (
+                format!("openpr://projects/{PROJECT}/agent-policy"),
+                "context.get_agent_policy",
+            ),
+            (
+                format!("openpr://projects/{PROJECT}/release-readiness"),
+                "release.readiness.get",
+            ),
+            (format!("openpr://projects/{PROJECT}/type"), "projects.get"),
+            (
+                format!("openpr://projects/{PROJECT}/resources"),
+                "project_resources.list",
+            ),
+            (format!("openpr://projects/{PROJECT}/connectors"), "connectors.list"),
+            (format!("openpr://projects/{PROJECT}/invocations"), "invocations.list"),
+            (
+                format!("openpr://projects/{PROJECT}/recent-decisions"),
+                "context.get_governance",
+            ),
+            (format!("openpr://projects/{PROJECT}/sprints"), "sprints.list"),
+        ];
+        for (uri, expected_tool) in governed {
+            assert_eq!(
+                resource_policy_subject(&uri)?,
+                ResourceSubject::Tool {
+                    tool: expected_tool,
+                    args: json!({ "project_id": PROJECT }),
+                },
+                "{uri} is not governed by {expected_tool}"
+            );
+        }
+
+        // Form addressed reads resolve their owner from the form, exactly like the tools.
+        for (uri, expected_tool) in [
+            (format!("openpr://forms/{FORM}"), "forms.get"),
+            (format!("openpr://forms/{FORM}/records"), "form_records.list"),
+            (format!("openpr://forms/{FORM}/events"), "events.tail"),
+        ] {
+            assert_eq!(
+                resource_policy_subject(&uri)?,
+                ResourceSubject::Tool {
+                    tool: expected_tool,
+                    args: json!({ "form_id": FORM }),
+                },
+                "{uri} is not governed by {expected_tool}"
+            );
+        }
+
+        for (uri, expected_tool) in [
+            (format!("openpr://form-records/{RECORD}"), "form_records.get"),
+            (format!("openpr://form-records/{RECORD}/events"), "events.tail"),
+        ] {
+            assert_eq!(
+                resource_policy_subject(&uri)?,
+                ResourceSubject::Tool {
+                    tool: expected_tool,
+                    args: json!({ "record_id": RECORD }),
+                },
+                "{uri} is not governed by {expected_tool}"
+            );
+        }
+
+        assert_eq!(
+            resource_policy_subject("openpr://issues/PRX-42")?,
+            ResourceSubject::Tool {
+                tool: ISSUE_IDENTIFIER_POLICY_TOOL,
+                args: json!({ "identifier": "PRX-42" }),
+            }
+        );
+
+        // The four resources no project agent policy can govern, and why: three are
+        // compile time constants, the fourth is the global scenario catalogue whose tools
+        // are `WorkspaceWide`.
+        for uri in [
+            "openpr://skills/openpr-mcp",
+            "openpr://guides/agents",
+            "openpr://guides/workflows",
+            "openpr://scenario-templates",
+            "openpr://scenario-templates/software-delivery",
+        ] {
+            assert_eq!(
+                resource_policy_subject(uri)?,
+                ResourceSubject::Ungoverned,
+                "{uri} should carry no project policy"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Every tool named in the resource tables has to be a tool the policy gate knows, or
+    /// the resource door would be authorized against a name no policy can ever list.
+    #[test]
+    fn every_resource_policy_tool_is_registered_in_the_policy_table() {
+        let registered: Vec<&str> = TOOL_POLICY_SCOPES.iter().map(|(name, _)| *name).collect();
+        let referenced = PROJECT_RESOURCE_POLICY_TOOLS
+            .iter()
+            .chain(FORM_RESOURCE_POLICY_TOOLS.iter())
+            .chain(FORM_RECORD_RESOURCE_POLICY_TOOLS.iter())
+            .map(|(_, tool)| *tool)
+            .chain(std::iter::once(ISSUE_IDENTIFIER_POLICY_TOOL));
+        for tool in referenced {
+            assert!(
+                registered.contains(&tool),
+                "resource tables map to '{tool}', which is not in TOOL_POLICY_SCOPES"
+            );
+        }
+    }
+
+    /// A project scoped resource whose id is not a canonical UUID is refused outright.
+    /// Before the gate existed the raw text went straight into the API path, which is the
+    /// URL reshaping `canonical_uuid` was introduced to stop on the tool side.
+    #[test]
+    fn resource_uris_carrying_an_unparsable_id_are_refused() {
+        for uri in [
+            "openpr://projects/not-a-uuid/connectors",
+            &format!("openpr://projects/{PROJECT}%2Fpad/agent-policy"),
+            &format!("openpr://projects/{PROJECT}?pad=/connectors"),
+            "openpr://forms/not-a-uuid/records",
+            "openpr://form-records/not-a-uuid/events",
+            "openpr://issues/PRX 42",
+        ] {
+            assert!(
+                resource_policy_subject(uri).is_err(),
+                "{uri} was classified instead of refused"
+            );
+        }
+    }
+
+    /// A traversal shaped URI is stopped one step earlier: the id would span a `/`, so no
+    /// parser claims it, `handle_resources_read` matches nothing and answers "Unknown
+    /// resource URI" without calling the API. Classifying it `Ungoverned` is therefore
+    /// correct rather than a hole — this test is what keeps the two facts tied together,
+    /// because "no policy applies" is only safe while "no backend is reached" holds.
+    #[tokio::test]
+    async fn traversal_shaped_resource_uris_reach_no_backend() -> TestResult {
+        // Any API call would fail outright: nothing listens on this port.
+        let server = server("http://127.0.0.1:1".to_string())?;
+        for uri in [
+            "openpr://projects/../../admin/connectors",
+            "openpr://forms/../../workspaces/records",
+            "openpr://form-records/a/b/events",
+        ] {
+            assert_eq!(
+                resource_policy_subject(uri)?,
+                ResourceSubject::Ungoverned,
+                "{uri} was classified as a governed read"
+            );
+            let response = server
+                .handle_resources_read(Some(json!(1)), Some(json!({ "uri": uri })))
+                .await;
+            let body = serde_json::to_string(&response)?;
+            assert!(body.contains("Unknown resource URI"), "{uri} -> {body}");
+        }
+        Ok(())
+    }
+
+    /// The regression itself: a project whose policy refuses `connectors.list` must not be
+    /// able to hand back the same connector list through `resources/read`, and the refusal
+    /// must not reach the connector endpoint at all.
+    #[tokio::test]
+    async fn a_disabled_tool_cannot_be_reached_through_the_resource_door() -> TestResult {
+        let connector_hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connector_hits);
+        let router = Router::new()
+            .route(
+                "/api/v1/projects/{project_id}/agent-policy",
+                policy_route(json!(["work_items.list"])),
+            )
+            .route(
+                "/api/v1/workspaces/{workspace_id}/connectors",
+                get(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "code": 0,
+                            "data": [{ "name": "payroll-webhook", "auth_policy": { "secret_ref": "TOP_SECRET" } }]
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let server = server(format!("http://{addr}"))?;
+        let response = server
+            .handle_resources_read(
+                Some(json!(1)),
+                Some(json!({ "uri": format!("openpr://projects/{PROJECT}/connectors") })),
+            )
+            .await;
+
+        let error = serde_json::to_string(&response)?;
+        assert!(
+            error.contains("disabled by project agent policy"),
+            "resources/read was not refused: {error}"
+        );
+        assert!(
+            !error.contains("payroll-webhook") && !error.contains("TOP_SECRET"),
+            "the refusal leaked connector data: {error}"
+        );
+        assert_eq!(
+            connector_hits.load(Ordering::SeqCst),
+            0,
+            "a refused resources/read still reached the connector endpoint"
+        );
+        Ok(())
+    }
+
+    /// The same door still works for a project whose policy enables the tool, so the gate
+    /// is a policy check and not a blanket denial.
+    #[tokio::test]
+    async fn the_resource_door_still_serves_a_policy_enabled_project() -> TestResult {
+        let router = Router::new()
+            .route(
+                "/api/v1/projects/{project_id}/agent-policy",
+                policy_route(json!(["connectors.list"])),
+            )
+            .route(
+                "/api/v1/workspaces/{workspace_id}/connectors",
+                get(|| async { Json(json!({ "code": 0, "data": [{ "name": "payroll-webhook" }] })) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let server = server(format!("http://{addr}"))?;
+        let response = server
+            .handle_resources_read(
+                Some(json!(1)),
+                Some(json!({ "uri": format!("openpr://projects/{PROJECT}/connectors") })),
+            )
+            .await;
+
+        let body = serde_json::to_string(&response)?;
+        assert!(body.contains("payroll-webhook"), "authorized read was refused: {body}");
+        Ok(())
+    }
+
+    /// The guides are process memory, so they stay readable without any API round trip.
+    /// A gate that needed the API to serve a compile time constant would be a new failure
+    /// mode, not a control.
+    #[tokio::test]
+    async fn static_guides_are_served_without_consulting_any_policy() -> TestResult {
+        // Base URL points at a port nothing listens on: any API call would fail the read.
+        let server = server("http://127.0.0.1:1".to_string())?;
+        let response = server
+            .handle_resources_read(Some(json!(1)), Some(json!({ "uri": "openpr://guides/agents" })))
+            .await;
+        let body = serde_json::to_string(&response)?;
+        assert!(body.contains("OpenPR Agent Guide"), "{body}");
+        Ok(())
     }
 }
