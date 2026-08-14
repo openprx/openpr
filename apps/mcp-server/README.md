@@ -32,11 +32,9 @@ section — `config/openpr.example.toml` is the full annotated reference:
 ```toml
 [mcp]
 api_url = "http://localhost:8081"
+# Required for transport = "stdio" and for the CLI subcommands. Not used by http/sse.
 bot_token = "opr_your_token_here"
 workspace_id = "your-workspace-uuid"
-
-# Required for HTTP/SSE transports on any non-loopback bind address
-auth_token = "generate with: openssl rand -hex 24"
 ```
 
 Save it as `config/openpr.toml` (the default path the binary looks for) or anywhere else and
@@ -49,41 +47,44 @@ mcp-server serve --config config/openpr.toml
 | Config key | Required | Purpose |
 | --- | --- | --- |
 | `mcp.api_url` | no, default `http://localhost:8081` | Base URL of the OpenPR API. |
-| `mcp.bot_token` | yes | Workspace bot token. Authenticates this process **to** the API. |
-| `mcp.workspace_id` | yes | Workspace UUID. |
-| `mcp.auth_token` | conditional | Bearer token inbound HTTP/SSE callers must present. Minimum 16 characters. See below. |
+| `mcp.bot_token` | conditional | Workspace bot token, used only by `stdio` and the CLI subcommands, which have no per-request caller to act on. Ignored by `http`/`sse`. |
+| `mcp.workspace_id` | yes | Workspace UUID the calls are scoped to. |
+
+There is no `mcp.auth_token` key any more. If your configuration file still has one, delete
+it — the server refuses to start rather than run with a key that no longer does anything.
 
 ### Inbound authentication (HTTP/SSE)
 
-`mcp.bot_token` authenticates this process **to** the API. It says nothing about who is
-calling **in**. Anyone who can reach the MCP port holds every permission the workspace bot
-has, so the HTTP and SSE transports authenticate their own callers:
+There is no shared secret and no server-side identity for the networked transports to fall
+back to. Every request to `/mcp/rpc`, `/sse` and `/messages` must carry the *caller's own*
+MCP-type account token:
 
-- **`mcp.auth_token` set** — every request to `/mcp/rpc`, `/sse` and `/messages`
-  must carry `Authorization: Bearer <token>`. Anything else gets `401` with
-  `WWW-Authenticate: Bearer`. The comparison is constant time.
-- **Not set, bound to loopback** (`127.0.0.1`, `[::1]`, `localhost`) — served without
-  authentication so local development is unaffected. A warning names the config key to set
-  before publishing the port.
-- **Not set, bound to anything else** (`0.0.0.0`, `[::]`, a LAN address, a hostname) —
-  **the process refuses to start.** This is the one combination that cannot be made safe,
-  so it is removed rather than warned about.
+```
+Authorization: Bearer opr_...
+```
+
+The MCP server does not itself validate this token beyond reading it out of the header — it
+forwards it to the OpenPR API unchanged, and the API authenticates it and enforces
+authorization. A request with no `Authorization` header, or a malformed one, is rejected
+with `401` and `WWW-Authenticate: Bearer` before it reaches any tool. Because every caller
+supplies their own credential, `mcp.bind_addr` can be `0.0.0.0` or any other reachable
+address without extra configuration — there is no "anonymous acting as the server" case to
+guard against.
+
+The caller's token must belong to the same workspace named by `mcp.workspace_id` in this
+server's configuration; the API returns `403` if it belongs to a different workspace.
 
 `/health` is exempt: it answers a constant `OK`, reads nothing, and discloses nothing a
-caller who completed the TCP handshake does not already know, so orchestrator probes do
-not need the shared secret.
+caller who completed the TCP handshake does not already know, so orchestrator probes need
+no credential.
 
-The token is read from the configuration file only — never a CLI flag, which would put it
-in `argv` where any local process can read it out of `/proc`, and never the environment,
-since the binary reads no environment variables at all. It is never logged.
-
-**stdio is unaffected**: it is a pipe pair owned by the process that spawned the server,
-so the caller is already established.
+**stdio is unaffected**: it is a pipe pair owned by the process that spawned the server, so
+the caller is already established, and the process authenticates to the API with
+`mcp.bot_token` from the configuration file.
 
 ```bash
-# Authenticated HTTP call. Set MCP_AUTH_TOKEN to the mcp.auth_token value from your config file.
-MCP_AUTH_TOKEN="your_configured_mcp_auth_token"
-curl -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+# Authenticated HTTP call. Use the caller's own MCP-type account token, not a shared secret.
+curl -H "Authorization: Bearer opr_your_own_account_token" \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
      http://localhost:8090/mcp/rpc
@@ -104,10 +105,11 @@ cargo build -p mcp-server --release
 
 #### HTTP Mode (for testing/debugging)
 ```bash
-# Loopback default (127.0.0.1:8090): no inbound token needed for local work.
+# Loopback default (127.0.0.1:8090). Every request still needs its own caller bot token.
 ./target/release/mcp-server serve --transport http --config config/openpr.toml
 
-# Reachable from other hosts: mcp.auth_token is mandatory in the config file, or startup fails.
+# Reachable from other hosts: no extra config needed, since there is no server-side
+# credential to expose. Each request still authenticates with its own caller bot token.
 ./target/release/mcp-server serve --transport http --bind-addr 0.0.0.0:8090 --config config/openpr.toml
 ```
 
@@ -204,8 +206,9 @@ echo '{
 # Start server
 ./target/release/mcp-server serve --transport http --config config/openpr.toml
 
-# Call tool via HTTP
+# Call tool via HTTP -- Authorization carries the caller's own MCP-type account token.
 curl -X POST http://localhost:8090/mcp/rpc \
+  -H "Authorization: Bearer opr_your_own_account_token" \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
@@ -365,15 +368,24 @@ the client config points `--config` at a file carrying `[mcp]` (see Prerequisite
 
 ## Troubleshooting
 
-### "mcp.bot_token is required to run the MCP server"
-Create a workspace bot token and set it, along with the API URL and workspace ID, in the
-`[mcp]` section of the configuration file:
+### "mcp.auth_token has been removed"
+The server refuses to start if the configuration file still has an `mcp.auth_token` key —
+that key was a shared inbound secret in an earlier version and no longer does anything.
+Delete the line. Every HTTP/SSE caller now presents its own workspace bot token instead;
+see [Inbound authentication (HTTP/SSE)](#inbound-authentication-httpsse) above.
+
+### "mcp.bot_token is required by the stdio transport and by the CLI subcommands..."
+`stdio` and the CLI subcommands have no per-request caller to act on, so they need an
+identity of their own. Create a workspace bot token and set it, along with the API URL and
+workspace ID, in the `[mcp]` section of the configuration file:
 ```toml
 [mcp]
 api_url = "http://localhost:8081"
 bot_token = "opr_your_token_here"
 workspace_id = "your-workspace-uuid"
 ```
+`http` and `sse` never need `mcp.bot_token`: every request already carries its own caller's
+bot token.
 
 ### API Connection Refused
 MCP talks to the OpenPR API, not directly to PostgreSQL. Confirm the API is running, then
@@ -402,14 +414,22 @@ Use `cargo run --bin list-tools` to see all available tools and their exact name
 ## Security
 
 MCP is an API client. It does not accept arbitrary database credentials and it
-does not bypass OpenPR authorization.
+does not bypass OpenPR authorization. It never verifies a bot token itself — it has no
+signing key and no bot registry, so it forwards the token it holds and lets the API decide.
 
-- Configure MCP with `mcp.api_url`, `mcp.bot_token`, and `mcp.workspace_id` in the
-  configuration file.
+- `stdio` and the CLI subcommands act as the identity in `mcp.bot_token`, configured in the
+  file.
+- `http` and `sse` act as whoever called them: every request must carry its own caller's
+  bot token in `Authorization: Bearer opr_...`, which this server forwards to the API
+  unchanged. There is no shared secret and no server-side fallback identity for these
+  transports — a request without a usable caller token gets `401` before it reaches any
+  tool (`/health` is exempt).
 - The API authenticates `opr_` bot tokens by SHA-256 token hash in
   `workspace_bots`.
 - Disabled or expired bot tokens are rejected.
-- Workspace access is enforced by the API; a bot token can only act inside its workspace.
+- Workspace access is enforced by the API; a bot token can only act inside its workspace,
+  and must belong to the workspace named by this server's `mcp.workspace_id` — a token from
+  another workspace gets `403`.
 - JWT user tokens still use the normal API JWT validation path.
 - For public HTTP exposure, place MCP behind your reverse proxy or tunnel and
   apply deployment-level rate limits.

@@ -40,7 +40,10 @@
   - `code.resources.list`, `code.directory.get`, `code.task_context.get`, `code.change_proposal.create`
   - `documents.extract_summary`, `documents.review_risk`, `approval.request`, `inspection.report`, `corrective_action.propose`
   - `members.list`, `search.all`
-- Authentication: Bot token via `mcp.bot_token` in the configuration file (prefix `opr_`).
+- Authentication:
+  - `stdio` and the CLI subcommands: `mcp.bot_token` in the configuration file (prefix `opr_`). Not used by `http`/`sse`.
+  - `http`/`sse`: no `mcp.bot_token`, no shared secret. Every request must carry its own caller account token as `Authorization: Bearer opr_...`; the server forwards it to the API as-is. Missing/malformed header = `401` (except `/health`). The token's workspace must match this server's `mcp.workspace_id`, or the API returns `403`.
+  - `mcp.auth_token` does not exist any more. If a configuration file still has it, the server refuses to start — remove the key, do not try to set a value for it.
 - Skill package: `skills/openpr-mcp/SKILL.md`
 
 ## Project Structure & Module Organization
@@ -74,12 +77,15 @@ cargo clippy --all-targets -- -D warnings
 # Deploy (local)
 docker compose down && docker compose up -d --build
 
-# Test MCP
+# Test MCP -- Authorization carries the caller's own MCP-type account token (opr_ prefix),
+# scoped to the workspace configured in mcp.workspace_id. Omitting it gets 401.
 curl -X POST http://localhost:8090/mcp/rpc \
+  -H "Authorization: Bearer opr_your_own_account_token" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 curl -X POST http://localhost:8090/mcp/rpc \
+  -H "Authorization: Bearer opr_your_own_account_token" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"project_id":"<project-uuid>"}}'
 ```
@@ -119,4 +125,6 @@ curl -X POST http://localhost:8090/mcp/rpc \
 - Never commit bot tokens or API keys.
 - The configuration file is the source of all secrets (`mcp.bot_token`, `mcp.workspace_id`); OpenPR reads no environment variables. Never commit the file itself.
 - Bot tokens are workspace-scoped; each creates a `bot_mcp` user for audit integrity.
+- `mcp.bot_token` is only required for `stdio` transport and CLI subcommands (no per-request caller to act on). `http`/`sse` transports ignore it: every request supplies its own caller bot token via `Authorization: Bearer opr_...`, forwarded to the API unchanged. There is no server-side fallback identity and no shared inbound secret for these transports, so `mcp.bind_addr` can be bound to any reachable address without extra configuration.
+- `mcp.auth_token` was removed. A configuration file that still sets it fails to start; when asked to fix a broken MCP config, delete the key rather than filling in a value.
 - File uploads: server-side type validation and size limits.

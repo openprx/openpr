@@ -221,9 +221,10 @@ jwt_secret = "replace_with_long_random_secret"
 ```toml
 [mcp]
 api_url = "http://api:8080"
-bot_token = "opr_replace_with_workspace_bot_token"
 workspace_id = "replace_with_workspace_uuid"
-auth_token = "replace_with_mcp_inbound_token"
+# bot_token is only needed if this deployment also runs stdio or CLI subcommands against
+# this workspace; http/sse ignore it entirely. Leave it unset for an http/sse-only deployment.
+# bot_token = "opr_replace_with_workspace_bot_token"
 ```
 
 `.env` is left to docker-compose's own `${...}` interpolation and to the
@@ -242,11 +243,15 @@ concrete value, not the example one: the postgres image runs initdb from
 `POSTGRES_PASSWORD` exactly once, and a later disagreement fails every query
 with an authentication error. `auth.jwt_secret` must be a concrete deployment
 secret, not the example value.
-`mcp.api_url` should point to the API service on the compose network. Bot token
-and workspace ID must be issued for the production workspace that AI assistants,
-CLI calls, and MCP clients are allowed to operate on. `mcp.auth_token` is the
-bearer token inbound HTTP/SSE callers must present; the server refuses a
-non-loopback bind without one.
+`mcp.api_url` should point to the API service on the compose network. `mcp.workspace_id`
+must be the production workspace that AI assistants, CLI calls, and MCP clients are allowed
+to operate on. `mcp.bot_token` is only needed for `stdio` and CLI subcommands run against
+this workspace; the compose deployment serves `http`, where `mcp.bot_token` is unused and
+can be left unset — every inbound request instead carries its own caller's MCP-type account
+token as `Authorization: Bearer opr_...`, which the server forwards to the API unchanged and
+the API authenticates against the same `mcp.workspace_id`. There is no `mcp.auth_token` key
+any more; if a configuration file still sets one, the server refuses to start rather than
+run with a key that no longer has any effect.
 For Docker Compose frontend delivery, keep `VITE_API_BASE_URL` empty so browser
 requests use the nginx same-origin API proxy. For local frontend development
 outside compose, set `VITE_API_BASE_URL=http://localhost:8081`.
@@ -334,7 +339,7 @@ In production, verify:
 
 - MCP server health endpoint responds.
 - `tools/list` includes `forms.*`, `form_records.*`, `events.tail`, `plugins.*`, `connectors.*`, project type, and scenario template tools.
-- Bot token and workspace binding belong to the production workspace.
+- The bot token in use — the caller's own `Authorization: Bearer opr_...` token for `http`/`sse`, or `mcp.bot_token` for `stdio`/CLI — belongs to the production workspace named by `mcp.workspace_id`; a token from another workspace gets `403`.
 - Project-aware capability filtering still exposes forms tools for the restaurant project.
 - Generic CLI tool calls work for `forms.list` and `form_records.aggregate`.
 
