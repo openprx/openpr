@@ -22,6 +22,7 @@ RUN rm /etc/nginx/conf.d/default.conf
 
 # Copy custom nginx config
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker-entrypoint.d/10-resolver.sh /docker-entrypoint.d/10-resolver.sh
 
 # Copy built files
 COPY --from=builder /app/build .
