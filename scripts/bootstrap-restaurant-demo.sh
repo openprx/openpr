@@ -484,7 +484,11 @@ fi
 
 if [[ "${OPENPR_DEMO_RESTART_MCP:-1}" == "1" ]] && [[ "$CONFIG_WRITTEN" == "1" ]]; then
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    if docker compose ps --services --filter status=running 2>/dev/null | grep -qx 'mcp-server'; then
+    # `compose ps --services` is a docker-compose extension that podman-compose rejects
+    # outright, which used to make this guard silently false: the credentials were rewritten
+    # and the container was never recreated, so the verification below talked to a server
+    # still holding the previous ones. Ask the container runtime directly instead.
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'mcp-server'; then
       echo "Recreating mcp-server so it reloads the demo MCP credentials from its configuration file..."
       # Remove before recreating instead of --force-recreate: under podman-compose that flag
       # fails with "container name is already in use", and the failure used to go unchecked,
