@@ -136,7 +136,9 @@ services:
   frontend:
     build:
       context: ./frontend
-      dockerfile: Dockerfile
+      # Dockerfile builds from source; Dockerfile.prebuilt serves an existing
+      # ./frontend/build, for hosts that have no bun toolchain.
+      dockerfile: ${OPENPR_FRONTEND_DOCKERFILE:-Dockerfile}
     ports:
       - "${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_FRONTEND_PORT:-3000}:80"
     depends_on:
