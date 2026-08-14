@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use std::path::PathBuf;
 
+use api::config::RuntimeConfig;
 use api::routes::connector::{
     ConnectorAuthMode, DELIVERY_EVENT_HEADER, DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER,
     delivery_signature_header_value, host_is_allowlisted, is_blocked_ip, verify_delivery_schema,
@@ -57,11 +58,17 @@ struct DeliveryPolicy {
 }
 
 impl DeliveryPolicy {
-    fn from_config(config: &OpenPrConfig) -> Self {
+    /// Projects the configuration this process installed onto the delivery pipeline's slice of it.
+    ///
+    /// The projection deliberately starts from [`RuntimeConfig`] rather than reading
+    /// [`OpenPrConfig`] a second time. The worker links the API library, whose outbound checks read
+    /// `api::config::runtime().outbound`; deriving both from the same installed value is what keeps
+    /// the two checks from disagreeing about the allowlist inside one process.
+    fn from_runtime(runtime: &RuntimeConfig) -> Self {
         Self {
-            outbound_allowlist: config.outbound.allowlist_csv(),
-            outbound_allow_private: config.outbound.allow_private,
-            connector_secrets: config.connectors.secrets.clone(),
+            outbound_allowlist: runtime.outbound.allowlist_csv(),
+            outbound_allow_private: runtime.outbound.allow_private,
+            connector_secrets: runtime.connectors.secrets.clone(),
         }
     }
 
@@ -268,17 +275,41 @@ struct InvocationEventRow {
     audit_chain_id: Option<Uuid>,
 }
 
+/// Publishes the configuration file to the API library this binary links, and hands back the
+/// installed value.
+///
+/// The worker is a second process, so it owns its own copy of the API library's process global and
+/// has to install into it exactly like `api::main` does. It used to skip this, which left every
+/// code path the worker reaches through that library running on `RuntimeConfig::fallback`: local
+/// object storage under `./uploads`, an empty outbound allowlist and no connector credentials. The
+/// form export, form import and attachment packaging jobs the polling loop runs are API library
+/// code that reads object storage that way, so an operator who pointed `[storage] dir` somewhere
+/// else — or switched the backend to S3 — got a worker writing to a different place than the API
+/// read from, with nothing on either side reporting a problem.
+///
+/// The installed value is returned rather than left for the caller to fetch so that startup cannot
+/// build its delivery policy from a configuration it forgot to publish.
+fn install_runtime_config(config: &OpenPrConfig) -> anyhow::Result<&'static RuntimeConfig> {
+    // A second call is an error, not a no-op, and a worker that cannot publish its configuration
+    // must fail here rather than poll with the fallback settings.
+    api::config::install(config).map_err(|err| anyhow::anyhow!("{err}"))?;
+    Ok(api::config::runtime())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = WorkerArgs::parse();
     let config = OpenPrConfig::load(args.config.as_deref())?;
-    // Installed only once the file parsed, so a configuration error is reported by the process
+    // Installed before the logger, as in `api::main`: a configuration this process cannot publish
+    // aborts startup instead of leaving the jobs it runs on the fallback settings.
+    let runtime = install_runtime_config(&config)?;
+    // Initialised only once the file parsed, so a configuration error is reported by the process
     // exit rather than swallowed by a subscriber the file was supposed to describe.
     logging::init(&config.logging, "worker")?;
     // from_config first: it reports a missing database url and signing key together, so the
     // operator fixes both in one pass instead of being walked through them one at a time.
     let cfg = AppConfig::from_config(&config, "worker", "0.0.0.0:8081")?;
-    let policy = DeliveryPolicy::from_config(&config);
+    let policy = DeliveryPolicy::from_runtime(runtime);
 
     let db = connect_db(&config.database_runtime()?).await?;
     // The pickup and completion statements below hard depend on the lease token, the duplicate
@@ -299,7 +330,16 @@ async fn main() -> anyhow::Result<()> {
         .connect_timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    tracing::info!(concurrency = args.concurrency, app = %cfg.app_name, "worker started");
+    // The storage settings are logged because the form jobs below write through them and there is
+    // otherwise no way to tell from outside which of the two processes reads which directory.
+    // Only the backend name and the local root are logged; the S3 section carries credentials.
+    tracing::info!(
+        concurrency = args.concurrency,
+        app = %cfg.app_name,
+        storage_backend = ?runtime.storage.backend,
+        storage_dir = %runtime.storage.dir.display(),
+        "worker started"
+    );
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -2409,13 +2449,15 @@ mod tests {
         pickup_pending_connector_invocations, pickup_pending_event_outbox, receipt_status_for_inbox, redact_endpoint,
         resolve_connector_auth, update_connector_invocation_status, with_retry_schedule,
     };
+    use super::{OpenPrConfig, install_runtime_config};
     use api::routes::connector::{
         DELIVERY_ID_HEADER, DELIVERY_SIGNATURE_HEADER, sign_delivery_body, verify_delivery_schema,
     };
-    use platform::config::{ConnectorSecrets, Secret};
+    use platform::config::{ConnectorSecrets, DEFAULT_STORAGE_DIR, Secret};
     use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     /// Builds a credential store shaped like `[connectors.secrets."<workspace>"]`.
@@ -2432,6 +2474,74 @@ mod tests {
 
     fn no_secrets() -> ConnectorSecrets {
         ConnectorSecrets::default()
+    }
+
+    /// A startup file whose three published sections all differ from `RuntimeConfig::fallback`.
+    const STARTUP_CONFIG: &str = r#"
+[server]
+app_name = "worker"
+bind_addr = "0.0.0.0:8081"
+
+[database]
+url = "postgres://openpr:s3cret@localhost:5432/openpr"
+
+[auth]
+jwt_secret = "0123456789abcdef0123456789abcdef"
+
+[storage]
+backend = "local"
+dir = "/srv/openpr/objects"
+
+[outbound]
+allowed_hosts = ["connectors.internal:8443"]
+
+[connectors.secrets."a1b2c3d4-e5f6-4890-abcd-ef1234567890"]
+PAYMENTS = "payments-token"
+"#;
+
+    /// The worker must publish its configuration file to the API library it links.
+    ///
+    /// The form import, export, attachment packaging and retention jobs the polling loop runs are
+    /// API library code that builds its object storage from `api::config::runtime()`. Before the
+    /// worker installed anything, that call returned `RuntimeConfig::fallback` — local storage
+    /// under `DEFAULT_STORAGE_DIR` — no matter what `[storage]` said, so those jobs read and wrote
+    /// a different place than the API process while both reported success.
+    ///
+    /// This is the only test in this binary that touches the process global: `runtime()` seals the
+    /// `OnceLock` on first read, so a second installing test could not be ordered against it.
+    #[test]
+    fn worker_startup_publishes_the_configuration_file_to_the_api_library() {
+        let config = OpenPrConfig::parse(STARTUP_CONFIG, Path::new("/etc/openpr/worker.toml"))
+            .expect("the startup fixture must be a valid configuration file");
+        let runtime = install_runtime_config(&config).expect("the worker must publish its configuration");
+
+        // The distinguishing assertion: the fallback would report DEFAULT_STORAGE_DIR here.
+        assert_eq!(runtime.storage.dir, PathBuf::from("/srv/openpr/objects"));
+        assert_ne!(runtime.storage.dir, PathBuf::from(DEFAULT_STORAGE_DIR));
+        // Read back through the public accessor the API library's job code actually calls.
+        assert_eq!(
+            api::config::runtime().storage.dir,
+            PathBuf::from("/srv/openpr/objects"),
+            "the form jobs read storage through this accessor, not through the returned borrow"
+        );
+
+        // The other two published sections come from the same file rather than from the fallback's
+        // empty allowlist and empty credential store.
+        assert_eq!(runtime.outbound.allowlist_csv(), "connectors.internal:8443");
+        assert_eq!(runtime.connectors.secrets.entry_count(), 1);
+
+        // The delivery policy is a projection of that same installed value, so the worker's own
+        // outbound checks and the API library's `runtime().outbound` checks cannot disagree.
+        let policy = DeliveryPolicy::from_runtime(runtime);
+        assert_eq!(
+            policy.outbound_allowlist,
+            api::config::runtime().outbound.allowlist_csv()
+        );
+        assert!(!policy.outbound_allow_private);
+
+        // Installing twice is refused rather than silently ignored: two configurations in one
+        // process would mean half the worker runs on settings the operator cannot see.
+        assert!(install_runtime_config(&config).is_err());
     }
 
     fn inbox_row(event_type: &str, payload: serde_json::Value) -> EventInboxProcessingRow {

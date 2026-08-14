@@ -10,6 +10,11 @@
 //! environment: `main` installs the sections once, before the listener is bound, and
 //! [`runtime`] hands out a shared borrow of them afterwards.
 //!
+//! "`main`" means every binary that links this library, not just the API server. The worker links
+//! it too and runs the form import, export, attachment packaging and retention jobs, which build
+//! their object storage from [`runtime`]; it installs its own configuration file at startup for
+//! the same reason.
+//!
 //! Connector credentials are deliberately *not* read through [`runtime`] by the delivery code.
 //! They are passed as an explicit `&ConnectorSecrets` argument together with the workspace id that
 //! selects the tenant partition, so the tenant boundary is visible in every signature that crosses
@@ -41,10 +46,15 @@ impl RuntimeConfig {
 
     /// The settings a process that never called [`install`] runs with.
     ///
-    /// Only unit tests reach this: `main` installs the file before it binds a socket, and a
-    /// failure to do so aborts startup. The values are the safe end of each setting — local
-    /// storage under [`DEFAULT_STORAGE_DIR`], an empty outbound allowlist with the private
-    /// address checks on, and no connector credentials at all.
+    /// Only unit tests reach this: every binary linking this library installs the file before it
+    /// does any work, and a failure to do so aborts startup. The values are the safe end of each
+    /// setting — local storage under [`DEFAULT_STORAGE_DIR`], an empty outbound allowlist with the
+    /// private address checks on, and no connector credentials at all.
+    ///
+    /// Being the safe end is not the same as being correct: a binary that reaches these settings
+    /// silently disagrees with the file the rest of the deployment reads. [`runtime`] seals the
+    /// `OnceLock` on the first read, so the first such read is permanent and a later [`install`]
+    /// reports an error rather than repairing it.
     fn fallback() -> Self {
         Self {
             storage: StorageConfig {
