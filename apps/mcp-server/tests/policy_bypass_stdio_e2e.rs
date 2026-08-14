@@ -123,9 +123,8 @@ impl StdioServer {
     fn spawn(api_url: &str) -> Result<Self, Box<dyn Error>> {
         let config = write_config(&McpSettings {
             api_url,
-            bot_token: BOT_TOKEN,
+            bot_token: Some(BOT_TOKEN),
             workspace_id: WORKSPACE,
-            auth_token: None,
             transport: Some("stdio"),
             bind_addr: None,
         })?;

@@ -429,6 +429,15 @@ pub struct McpServer {
     /// but an agent policy can be edited at any time and is therefore re-read on every
     /// call. A cache hit costs zero extra requests, a miss costs exactly one lookup
     /// (two only for an attachment whose payload reports just its form).
+    ///
+    /// The cache is per-`McpServer`, and an `McpServer` is built per request on the
+    /// networked transports — it never spans two callers. That matters beyond tidiness:
+    /// ownership is resolved by *calling the API as the caller*, so an entry another
+    /// caller's credential paid for would let this one skip that call and learn that a form
+    /// id exists, and which project owns it, without ever proving it may look. Sharing the
+    /// map across callers would turn a performance cache into an existence oracle, so the
+    /// two lifetimes must not be decoupled. On stdio there is one caller for the life of the
+    /// process, so the same map is simply that caller's own.
     project_id_cache: Mutex<HashMap<String, ResolvedOwner>>,
 }
 

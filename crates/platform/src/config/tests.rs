@@ -79,7 +79,6 @@ allow_private = true
 api_url = "http://api:8080"
 bot_token = "opr_live_botexampletoken"
 workspace_id = "{WORKSPACE}"
-auth_token = "mcp-inbound-token-value"
 transport = "http"
 bind_addr = "0.0.0.0:8090"
 invocation_id = "inv-42"
@@ -152,12 +151,11 @@ fn a_complete_file_parses_into_every_section() {
     assert!(config.mcp.transport.is_networked());
     let mcp = config.mcp_runtime().expect("mcp section is complete");
     assert_eq!(mcp.api_url, "http://api:8080");
-    assert_eq!(mcp.bot_token.expose(), "opr_live_botexampletoken");
-    assert_eq!(mcp.workspace_id.to_string(), WORKSPACE);
     assert_eq!(
-        mcp.auth_token.as_ref().map(super::Secret::expose),
-        Some("mcp-inbound-token-value")
+        mcp.bot_token.as_ref().map(super::Secret::expose),
+        Some("opr_live_botexampletoken")
     );
+    assert_eq!(mcp.workspace_id.to_string(), WORKSPACE);
     assert_eq!(mcp.bind_addr, "0.0.0.0:8090");
     assert_eq!(mcp.invocation_id.as_deref(), Some("inv-42"));
 
@@ -258,7 +256,6 @@ allowed_hosts = ["https://hooks.example.com/path", "*.example.com"]
 api_url = "ftp://api"
 bot_token = "not-prefixed"
 workspace_id = "not-a-uuid"
-auth_token = "short"
 transport = "grpc"
 
 [connectors.secrets."{WORKSPACE}"]
@@ -280,7 +277,6 @@ lowercase = "value"
         "mcp.api_url",
         "mcp.bot_token",
         "mcp.workspace_id",
-        "mcp.auth_token must be at least",
         "mcp.transport",
         "connectors.secrets",
     ] {
@@ -289,7 +285,7 @@ lowercase = "value"
             "missing {expected:?} in {reported:?}"
         );
     }
-    assert!(reported.len() >= 16, "expected every problem at once, got {reported:?}");
+    assert!(reported.len() >= 15, "expected every problem at once, got {reported:?}");
 }
 
 #[test]
@@ -576,8 +572,12 @@ SHIPPING = "second"
 
 // ---- tokens ----
 
+/// The shared inbound secret is gone, and a file that still carries it is stopped with an
+/// explanation rather than serving on an assumption the operator no longer holds. Silently
+/// ignoring the key would leave a deployment believing its port was gated by a secret that
+/// nothing reads any more.
 #[test]
-fn an_mcp_auth_token_shorter_than_the_minimum_is_refused_without_echoing_it() {
+fn a_retired_mcp_auth_token_is_refused_with_an_explanation_and_never_echoed() {
     let reported = issues(&format!(
         r#"
 [database]
@@ -589,42 +589,57 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
 [mcp]
 workspace_id = "{WORKSPACE}"
 bot_token = "opr_live_token"
-auth_token = "fifteen-chars-x"
+auth_token = "an-inbound-secret-value"
 "#
     ));
     assert!(
         reported
             .iter()
-            .any(|issue| issue.contains("mcp.auth_token must be at least 16 characters")),
+            .any(|issue| issue.contains("mcp.auth_token has been removed")),
         "{reported:?}"
     );
     assert!(
-        !reported.iter().any(|issue| issue.contains("fifteen-chars-x")),
-        "the token must never be echoed: {reported:?}"
+        reported.iter().any(|issue| issue.contains("Authorization: Bearer")),
+        "the refusal has to say what replaced it: {reported:?}"
+    );
+    assert!(
+        !reported.iter().any(|issue| issue.contains("an-inbound-secret-value")),
+        "the retired secret must never be echoed: {reported:?}"
     );
 }
 
+/// `mcp.bot_token` is the identity stdio acts as, so stdio cannot run without it — and the
+/// networked transports never use it, so they must not be made to configure one. A file
+/// carrying nothing but a transport and a workspace is a complete http deployment.
 #[test]
-fn an_mcp_auth_token_at_the_minimum_is_accepted() {
-    let config = parse(&format!(
+fn a_networked_transport_needs_no_bot_token_but_stdio_does() {
+    let networked = parse(&format!(
         r#"
-[database]
-url = "postgres://localhost/openpr"
-
-[auth]
-jwt_secret = "0123456789abcdef0123456789abcdef"
-
 [mcp]
 workspace_id = "{WORKSPACE}"
-bot_token = "opr_live_token"
-auth_token = "sixteen-chars-ab"
+transport = "http"
+bind_addr = "0.0.0.0:8090"
 "#
     ))
-    .expect("a 16 character token should be accepted");
-    assert_eq!(
-        config.mcp.auth_token.as_ref().map(super::Secret::expose),
-        Some("sixteen-chars-ab")
-    );
+    .expect("an http deployment needs neither a database nor a bot token");
+    let runtime = networked
+        .mcp_runtime()
+        .expect("a networked transport should resolve without a bot token");
+    assert!(runtime.bot_token.is_none());
+    assert_eq!(runtime.bind_addr, "0.0.0.0:8090");
+
+    let stdio = parse(&format!(
+        r#"
+[mcp]
+workspace_id = "{WORKSPACE}"
+transport = "stdio"
+"#
+    ))
+    .expect("the shape of the file is fine; the missing value is reported by mcp_runtime");
+    let Err(ConfigError::Invalid { issues, .. }) = stdio.mcp_runtime() else {
+        panic!("stdio without a bot token has no identity to act as and must be refused");
+    };
+    assert!(issues.iter().any(|issue| issue.contains("mcp.bot_token")), "{issues:?}");
 }
 
 #[test]
@@ -670,7 +685,6 @@ bot_token = "opr_live_token"
     assert_eq!(mcp.api_url, super::DEFAULT_MCP_API_URL);
     assert_eq!(mcp.bind_addr, super::DEFAULT_MCP_BIND_ADDR);
     assert_eq!(mcp.transport, McpTransport::Stdio);
-    assert!(mcp.auth_token.is_none());
 }
 
 // ---- connector credential isolation ----

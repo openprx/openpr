@@ -44,6 +44,9 @@ pub struct Cli {
     pub api_url: Option<String>,
 
     /// Bot authentication token (overrides `mcp.bot_token`)
+    ///
+    /// Used by the CLI subcommands and by `serve --transport stdio`. The `http` and `sse`
+    /// transports ignore it: they act as whoever calls them, never as a configured bot.
     #[arg(long, global = true)]
     pub bot_token: Option<String>,
 
