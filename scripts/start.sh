@@ -443,9 +443,23 @@ if [ "$MODE" = "--pull" ]; then
   echo ""
 fi
 
-# Build and start services
-echo "🔨 Building release binaries for Dockerfile.prebuilt..."
-cargo build --workspace --release
+# Build and start services. A host that received prebuilt binaries (no Rust toolchain
+# installed) passes --no-build; the binaries must then already sit in target/release.
+if [ "$MODE" = "--no-build" ]; then
+  missing_binaries=()
+  for binary in api worker mcp-server; do
+    [ -x "target/release/$binary" ] || missing_binaries+=("target/release/$binary")
+  done
+  if [ "${#missing_binaries[@]}" -ne 0 ]; then
+    echo "❌ --no-build was requested but these binaries are missing: ${missing_binaries[*]}"
+    echo "Build them on a host with the same or older glibc and copy them over."
+    exit 1
+  fi
+  echo "⏭️  Using the prebuilt binaries in target/release (--no-build)."
+else
+  echo "🔨 Building release binaries for Dockerfile.prebuilt..."
+  cargo build --workspace --release
+fi
 
 # The binaries are linked against the host glibc, so the runtime image has to be
 # at least as new. Derive it from the host release unless the caller pinned one.
