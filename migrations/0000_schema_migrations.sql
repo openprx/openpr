@@ -13,11 +13,12 @@
 --   failed  - execution failed; API startup aborts and the row keeps the error for the operator.
 --             The next ordinary start retries it. A row that already records applied or adopted
 --             is never downgraded to failed, so re-executing a file with
---             OPENPR_MIGRATIONS_REPLAY=1 cannot leave the database unable to start.
+--             [migrations] replay cannot leave the database unable to start.
 --
--- Escape hatches, both meant for recovery rather than normal operation:
---   OPENPR_MIGRATIONS_REPLAY=1           re-execute every file once, failures are not fatal
---   OPENPR_MIGRATIONS_CONTINUE_ON_ERROR=1 start despite a failed migration or a schema gap
+-- Escape hatches, both meant for recovery rather than normal operation. They live in the
+-- configuration file; the binaries read no environment variables.
+--   [migrations] replay = true             re-execute every file once, failures are not fatal
+--   [migrations] continue_on_error = true  start despite a failed migration or a schema gap
 CREATE TABLE IF NOT EXISTS schema_migrations (
     name       TEXT PRIMARY KEY,
     checksum   TEXT NOT NULL,

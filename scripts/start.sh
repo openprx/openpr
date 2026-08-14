@@ -424,8 +424,9 @@ if issues:
   exit 1
 fi
 
-# The compose containers run as uid 1000, and the configuration files are mode 600. When the
-# repository belongs to another user the mount is unreadable inside the container.
+# The compose containers run as uid 1000. The configuration files are mode 644 so that the
+# container user can read them at all, but when the repository belongs to another user the
+# mount can still be unreadable inside the container.
 file_owner="$(stat -c '%u' "$APP_CONFIG" 2>/dev/null || echo 1000)"
 if [ "$file_owner" != "1000" ]; then
   echo "⚠️  $APP_CONFIG is owned by uid $file_owner but the containers run as uid 1000."

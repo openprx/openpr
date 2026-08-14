@@ -1,6 +1,6 @@
-# Upgrading OpenPR 0.2.0 → 0.3.0
+# Upgrading OpenPR 0.2.0 → 0.2.1
 
-0.3.0 is a breaking release. A 0.2.0 deployment will **not** start on 0.3.0 without changes, and a
+0.2.1 is a breaking release. A 0.2.0 deployment will **not** start on 0.2.1 without changes, and a
 few things that used to work will start returning `403` after it does start.
 
 Read this page end to end before you upgrade. Every step is written as **symptom → cause → fix**,
@@ -42,7 +42,7 @@ Two items **cannot be migrated automatically** and need a human decision:
    and `0000_schema_migrations.sql` creates the migration ledger.
 
    ```bash
-   pg_dump -Fc -U openpr -d openpr -f openpr-pre-0.3.0.dump
+   pg_dump -Fc -U openpr -d openpr -f openpr-pre-0.2.1.dump
    ```
 
 2. **Record what you have**, so you can rebuild it as TOML and verify it afterwards:
@@ -84,7 +84,7 @@ Error: configuration file config/openpr.toml not found
 
 ### Cause
 
-`api`, `worker` and `mcp-server` read **no environment variables at all** in 0.3.0. The file named by
+`api`, `worker` and `mcp-server` read **no environment variables at all** in 0.2.1. The file named by
 `--config <PATH>` is the only source of configuration; without the flag the path is
 `config/openpr.toml`, resolved relative to the process working directory. There are no built-in
 fallbacks for a database URL or a signing key — an unconfigured service fails rather than inventing
@@ -527,7 +527,7 @@ migration <name> failed: <error>
 
 ### Cause
 
-Before 0.3.0 the runner replayed every migration file on every start and downgraded any failure to a
+Before 0.2.1 the runner replayed every migration file on every start and downgraded any failure to a
 warning ("likely already applied"). A partially applied schema was indistinguishable from a healthy
 one, and every non-idempotent statement ran again on each restart.
 
@@ -538,7 +538,7 @@ A row that already records `applied` or `adopted` is never downgraded to `failed
 
 ### Fix
 
-**Nothing to do for an existing database.** On the first 0.3.0 start the runner marks the historical
+**Nothing to do for an existing database.** On the first 0.2.1 start the runner marks the historical
 migrations as `adopted` and moves on. Confirm afterwards:
 
 ```sql
@@ -722,7 +722,7 @@ once.
 
 ## Step 10 — new deployment options
 
-Not breaking, but they solve the problems that make a 0.3.0 rollout awkward on a host that is not a
+Not breaking, but they solve the problems that make a 0.2.1 rollout awkward on a host that is not a
 full build machine.
 
 ### Deploying to a host without a Rust toolchain
@@ -804,7 +804,7 @@ those are the three paths where the new refusals show up in production rather th
 
 ## Rolling back
 
-0.3.0 adds `schema_migrations` and `proposals.workspace_id`; neither is read by 0.2.0, so the schema
+0.2.1 adds `schema_migrations` and `proposals.workspace_id`; neither is read by 0.2.0, so the schema
 itself is backward compatible and a rollback of the binaries alone will run. What does **not** roll
 back is your configuration: 0.2.0 reads only environment variables and will ignore the TOML file
 entirely. Keep the environment you recorded in [step 0](#step-0--before-you-begin) until you are
