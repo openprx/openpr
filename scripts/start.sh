@@ -480,16 +480,26 @@ fi
 echo "🔨 Building and starting services..."
 docker compose up -d --build
 
-# Wait for services to be healthy
+# Wait for the services to answer. Probing the published endpoints beats parsing
+# `docker compose ps`: that output differs between podman-compose and the docker
+# compose plugin, and a zero match used to read back as the string "0\n0".
 echo ""
 echo "⏳ Waiting for services to be ready..."
+probe_host="${OPENPR_BIND_HOST:-127.0.0.1}"
+[ "$probe_host" = "0.0.0.0" ] && probe_host=127.0.0.1
+api_probe="http://${probe_host}:${OPENPR_API_PORT:-8081}/health"
+mcp_probe="http://${probe_host}:${MCP_SERVER_PORT:-8090}/health"
+frontend_probe="http://${probe_host}:${OPENPR_FRONTEND_PORT:-3000}/"
+
 max_wait=120
 elapsed=0
+services_ready=0
 while [ $elapsed -lt $max_wait ]; do
-  healthy_count=$(docker compose ps | grep -c "healthy" || echo "0")
-
-  if [ "$healthy_count" -ge 4 ]; then
-    echo "✅ All services are healthy!"
+  if curl -fsS -m 5 "$api_probe" >/dev/null 2>&1 &&
+    curl -fsS -m 5 "$mcp_probe" >/dev/null 2>&1 &&
+    curl -fsS -m 5 -o /dev/null "$frontend_probe" 2>/dev/null; then
+    echo "✅ All services are answering!"
+    services_ready=1
     break
   fi
 
@@ -501,7 +511,7 @@ done
 echo ""
 echo ""
 
-if [ $elapsed -ge $max_wait ]; then
+if [ "$services_ready" -ne 1 ]; then
   echo "⚠️  Timeout waiting for services. Checking status..."
   docker compose ps
   echo ""
