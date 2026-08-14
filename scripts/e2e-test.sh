@@ -62,6 +62,11 @@ if [ "$ASSUME_YES" != "1" ] && [ -t 0 ]; then
   fi
 fi
 docker compose down -v --remove-orphans
+# The generated configuration files outlive the database volume, and the workspace id and bot
+# token they carry name rows that the wipe just deleted. Leaving them in place makes the MCP
+# server authenticate as a bot that no longer exists, so drop them and let start.sh regenerate
+# a matching set. Only the generated files go; config/openpr.example.toml is untouched.
+rm -f config/openpr.compose.toml config/openpr.compose.mcp.toml
 echo "✅ Environment reset"
 echo ""
 
