@@ -389,6 +389,7 @@ if [[ "$WRITE_CONFIG_MODE" != "0" ]]; then
      OPENPR_DEMO_WRITE_CONFIG="$WRITE_CONFIG_MODE" \
      python3 -c '
 import json
+import stat
 import os
 import re
 import sys
@@ -459,9 +460,18 @@ for key, value in updates.items():
         print(f"rewriting {key} in {config_path} did not round-trip", file=sys.stderr)
         raise SystemExit(1)
 
+# Keep whatever mode the file already had. A rootless container runtime maps the host
+# owner to a different uid inside, so an owner-only file leaves the mcp-server unable to
+# read its own configuration; replacing the file must not silently tighten it.
+try:
+    existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
+except OSError:
+    existing_mode = 0o600
+
 temp_path = f"{config_path}.tmp"
 with open(os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as handle:
     handle.write(rendered)
+os.chmod(temp_path, existing_mode)
 os.replace(temp_path, config_path)
 '; then
     CONFIG_WRITTEN=1
