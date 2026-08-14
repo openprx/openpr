@@ -460,19 +460,15 @@ for key, value in updates.items():
         print(f"rewriting {key} in {config_path} did not round-trip", file=sys.stderr)
         raise SystemExit(1)
 
-# Keep whatever mode the file already had. A rootless container runtime maps the host
-# owner to a different uid inside, so an owner-only file leaves the mcp-server unable to
-# read its own configuration; replacing the file must not silently tighten it.
-try:
-    existing_mode = stat.S_IMODE(os.stat(config_path).st_mode)
-except OSError:
-    existing_mode = 0o600
-
-temp_path = f"{config_path}.tmp"
-with open(os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as handle:
+# Write in place rather than rename over the path. compose bind-mounts this file into the
+# mcp-server container, and a bind mount follows the inode it was created with: an atomic
+# rename swaps in a new inode, so the container would keep serving the old contents through
+# restarts while the host shows the new ones. Overwriting keeps the inode, and with it the
+# mode the container needs to read the file at all. The rendered text was already parsed and
+# round-tripped above, so the window where a crash could leave a truncated file is small and
+# recoverable by rerunning this script.
+with open(config_path, "w", encoding="utf-8") as handle:
     handle.write(rendered)
-os.chmod(temp_path, existing_mode)
-os.replace(temp_path, config_path)
 '; then
     CONFIG_WRITTEN=1
     echo "Demo MCP bot credentials written to $DEMO_CONFIG_PATH (values not printed)."
