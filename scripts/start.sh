@@ -214,7 +214,7 @@ api_url = "http://api:8080"
 # it creates through the API, then recreates this service.
 # bot_token is what the stdio transport and the CLI subcommands act as. docker-compose.yml serves
 # http, where it is unused: every inbound request carries its own caller's bot token in
-# `Authorization: Bearer opr_...` and the server forwards that one to the API.
+# \`Authorization: Bearer opr_...\` and the server forwards that one to the API.
 bot_token = "opr_local_$(random_hex 24)"
 workspace_id = "$(random_uuid)"
 
@@ -232,7 +232,7 @@ fi
 
 # ---------------------------------------------------------------------------------------------
 # Validation. Mirrors crates/platform/src/config/raw.rs so a bad file is reported here rather than
-# as a container that exits during `compose up`. Nothing below prints a value.
+# as a container that exits during \`compose up\`. Nothing below prints a value.
 # ---------------------------------------------------------------------------------------------
 if ! OPENPR_APP_CONFIG="$APP_CONFIG" OPENPR_MCP_CONFIG="$MCP_CONFIG" OPENPR_ENV_FILE="$ENV_FILE" python3 -c '
 import os
