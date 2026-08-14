@@ -15,6 +15,20 @@ ignore = [
     # Lockfile-only through SQLx's inactive MySQL backend. OpenPR enables only
     # sqlx-postgres at build/runtime; cargo tree -i rsa/sqlx-mysql prints no active tree.
     "RUSTSEC-2023-0071",
+
+    # rkyv 0.7 out-of-bounds read when validating an untrusted archive containing Rc/Arc.
+    # Reached only as rust_decimal's optional rkyv serialization backend, by way of sea-orm.
+    # OpenPR never produces or parses a rkyv archive: decimals cross every boundary as
+    # strings (the API rejects JSON numbers for amount fields outright), and no rkyv type
+    # appears in the workspace. The fix needs rust_decimal to move to rkyv 0.8, so this
+    # cannot be resolved here; revisit when sea-orm ships a rust_decimal with rkyv >=0.8.17.
+    "RUSTSEC-2026-0235",
+
+    # proc-macro-error2 is unmaintained. It is a build-time proc-macro dependency only, so
+    # nothing from it is linked into the shipped binaries and it cannot be reached at
+    # runtime. Pulled in transitively; no supported replacement is available to us until the
+    # crates that depend on it migrate.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
