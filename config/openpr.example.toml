@@ -161,32 +161,45 @@ allow_private = false
 
 
 # ---------------------------------------------------------------------------------------------
-# [mcp] — MCP server. Optional for the API and the worker; the MCP server needs bot_token and
-# workspace_id and reports both at once if they are missing. A file that carries only this
-# section is a complete configuration for an MCP-only deployment.
+# [mcp] — MCP server. Optional for the API and the worker.
+#
+# Every call this server makes to the OpenPR API is made with a workspace bot token, and which
+# bot that is depends on the transport:
+#
+#   stdio          One person runs one process from their own MCP client, so the identity is
+#                  mcp.bot_token below. That is already one account per process.
+#   http / sse     A shared listener, where one configured bot would make every caller
+#                  indistinguishable. Each request instead presents its *own* caller's bot token
+#                  in `Authorization: Bearer opr_...`, which this server forwards to the API
+#                  unchanged; the API authenticates it and the audit trail records that bot.
+#                  A request without one is answered 401 (only /health is exempt), so these
+#                  deployments need no mcp.bot_token at all.
+#
+# This server never verifies a token itself. It has no signing key and no bot registry; holding
+# either would mean a compromised MCP server could mint identities. It forwards and the API
+# decides.
 # ---------------------------------------------------------------------------------------------
 [mcp]
 # Base URL of the OpenPR API the MCP server talks to. Default: http://localhost:8081.
 # api_url = "http://localhost:8081"
 
-# REQUIRED to run the MCP server. Workspace bot token; must carry the opr_ prefix. Create one in
-# the workspace's bot settings. Never logged.
+# REQUIRED for transport = "stdio" and for the CLI subcommands, which have no per-request
+# credential to act on. NOT used, and not needed, by transport = "http" or "sse".
+# Workspace bot token; must carry the opr_ prefix. Create one in the workspace's bot settings.
+# Never logged.
 # bot_token = "replace_with_opr_bot_token"
 
-# REQUIRED to run the MCP server. Workspace the bot acts in. Must be a real, non-nil UUID.
+# REQUIRED to run the MCP server. Workspace the calls are scoped to. Must be a real, non-nil UUID.
 # workspace_id = "replace_with_workspace_uuid"
-
-# Bearer token inbound HTTP/SSE callers must present. Minimum 16 characters. The MCP server
-# holds a workspace bot token, so anyone who can reach a networked transport holds every
-# permission that bot has — set this whenever transport is http or sse on a non-loopback bind.
-# Generate one with: openssl rand -hex 24. Never logged.
-# auth_token = "replace_with_mcp_inbound_token"
 
 # "stdio", "http" or "sse". Default: stdio, which is a pipe pair owned by the parent process and
 # therefore carries no inbound authentication question.
 transport = "stdio"
 
-# Listen address for the http and sse transports. Default: 127.0.0.1:8090.
+# Listen address for the http and sse transports. Default: 127.0.0.1:8090. Binding this to a
+# reachable address does not publish an anonymous port: every request on these transports has to
+# present its caller's own bot token, and the process holds no identity of its own to fall back
+# to, so an unauthenticated caller can reach nothing but /health.
 # bind_addr = "127.0.0.1:8090"
 
 # Correlation id stamped onto API calls made on behalf of one agent invocation. Usually left

@@ -5,7 +5,7 @@ mod server;
 mod tools;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Query, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
@@ -18,7 +18,7 @@ use axum::{
 use clap::Parser;
 use cli::{Cli, Commands, ServeArgs};
 use client::{ClientConfig, OpenPrClient, transport_label};
-use platform::config::{MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpRuntime, McpTransport, OpenPrConfig, Secret};
+use platform::config::{MCP_BOT_TOKEN_REQUIRED, McpConfig, McpRuntime, McpTransport, OpenPrConfig, Secret};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde::Deserialize;
 use serde_json::json;
@@ -35,12 +35,14 @@ use uuid::Uuid;
 /// against the binary's hyphenated name would silence the whole process.
 const SERVICE_NAME: &str = "mcp_server";
 
-/// Configuration key carrying the bearer token inbound HTTP/SSE callers must present.
+/// Configuration key carrying the identity `stdio` and the CLI subcommands act as.
+const BOT_TOKEN_KEY: &str = "mcp.bot_token";
+
+/// Longest inbound caller bot token accepted, in bytes.
 ///
-/// Named in every diagnostic so a refusal says exactly what to edit. Deliberately not
-/// exposed as a CLI flag: a flag would put the secret in `argv`, which any local process
-/// can read out of `/proc`.
-const INBOUND_AUTH_TOKEN_KEY: &str = "mcp.auth_token";
+/// A bound on a value that is copied into an outbound header and held for the life of one
+/// request. Comfortably above any real `OpenPR` bot token, which is tens of bytes.
+const MAX_CALLER_TOKEN_LEN: usize = 8 * 1024;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,20 +64,41 @@ async fn main() -> anyhow::Result<()> {
     // cannot run without are reported here, all of them in one pass.
     let mcp = config.mcp_runtime()?;
 
-    let client = OpenPrClient::new(ClientConfig {
+    if serve_args.is_some() {
+        serve(&mcp).await
+    } else {
+        // A CLI subcommand is a local process with no caller to act on behalf of, so it
+        // speaks to the API as the configured identity and cannot run without one.
+        let client = build_client(&mcp, Some(configured_bot_token(&mcp)?))?;
+        cli::run_cli_command(&cli.command, &cli.format, client).await
+    }
+}
+
+/// The configured identity, or the refusal that names the key which supplies it.
+///
+/// Reported here rather than at load time because an `http`/`sse` deployment is *expected*
+/// to have no `mcp.bot_token`: it never speaks to the API as itself.
+fn configured_bot_token(mcp: &McpRuntime) -> anyhow::Result<Secret> {
+    mcp.bot_token
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("{MCP_BOT_TOKEN_REQUIRED} (missing {BOT_TOKEN_KEY})"))
+}
+
+/// Builds the API client every request of one transport starts from.
+///
+/// `credential` is `None` for the networked transports. That is the structural half of the
+/// invariant this server rests on: there is no server-side identity in the process for a
+/// networked request to fall back to, so a request that somehow reached a tool without a
+/// caller credential fails closed instead of quietly acting as a workspace bot.
+fn build_client(mcp: &McpRuntime, credential: Option<Secret>) -> anyhow::Result<OpenPrClient> {
+    OpenPrClient::new(ClientConfig {
         base_url: mcp.api_url.clone(),
-        bot_token: mcp.bot_token.clone(),
+        credential,
         workspace_id: mcp.workspace_id.to_string(),
         invocation_id: mcp.invocation_id.clone(),
         transport_label: transport_label(mcp.transport),
     })
-    .map_err(|e| anyhow::anyhow!(e))?;
-
-    if serve_args.is_some() {
-        serve(&mcp, client).await
-    } else {
-        cli::run_cli_command(&cli.command, &cli.format, client).await
-    }
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Layers the CLI overrides onto the file's `[mcp]` section.
@@ -153,9 +176,8 @@ fn checked_workspace_id(value: &str) -> anyhow::Result<Uuid> {
 
 /// Validates a `--bind-addr`, mirroring the rules `mcp.bind_addr` is held to.
 ///
-/// A host without a port is refused rather than completed with one: the bind address is
-/// what `resolve_inbound_auth` decides against, and a silently invented port would move
-/// the listener away from the address that decision was made for.
+/// A host without a port is refused rather than completed with one: an invented port would
+/// put the listener somewhere the operator did not ask for and did not publish.
 fn checked_bind_addr(value: &str) -> anyhow::Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.contains("${") {
@@ -186,107 +208,35 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
 
 /// Starts the transport `[mcp]` selected.
 ///
-/// `stdio` is a pipe pair owned by the parent process, so it carries no inbound
-/// authentication question: whoever spawned the process is already the caller. The two
-/// networked transports share the same routes and therefore take the same decision, and
-/// neither reaches its listener before that decision has been made.
-async fn serve(mcp: &McpRuntime, client: OpenPrClient) -> anyhow::Result<()> {
+/// The two shapes of deployment differ in exactly one thing — where the bot token each API
+/// call is made with comes from — and in nothing else:
+///
+/// * `stdio` is a pipe pair owned by the parent process. It has no per-request headers, so
+///   the identity is `mcp.bot_token`: one person runs one process from their own MCP client,
+///   configured with their own bot. That is already per-account.
+/// * `http` and `sse` are shared listeners, where a single configured bot would make every
+///   caller indistinguishable. Every request carries its own caller's bot token in
+///   `Authorization: Bearer` and is served as that bot; the process itself holds no
+///   identity, which is why [`build_client`] is handed `None` here.
+///
+/// Both paths then do the same thing with the token they hold: forward it to the API
+/// verbatim and let the API authenticate it. Neither one parses or validates its contents.
+async fn serve(mcp: &McpRuntime) -> anyhow::Result<()> {
     match mcp.transport {
-        McpTransport::Stdio => run_stdio(client).await,
-        McpTransport::Http => {
-            let auth = resolve_inbound_auth(&mcp.bind_addr, mcp.auth_token.as_ref())?;
-            run_http(&mcp.bind_addr, client, auth).await
-        }
-        McpTransport::Sse => {
-            let auth = resolve_inbound_auth(&mcp.bind_addr, mcp.auth_token.as_ref())?;
-            run_sse(&mcp.bind_addr, client, auth).await
-        }
+        McpTransport::Stdio => run_stdio(build_client(mcp, Some(configured_bot_token(mcp)?))?).await,
+        McpTransport::Http => run_http(&mcp.bind_addr, build_client(mcp, None)?).await,
+        McpTransport::Sse => run_sse(&mcp.bind_addr, build_client(mcp, None)?).await,
     }
 }
 
-/// How inbound HTTP/SSE requests are authenticated.
+/// The bot token one inbound HTTP/SSE request presented, on its way to the API.
 ///
-/// The MCP server holds a workspace bot token and speaks to the API with it, so anyone
-/// who can reach this port holds every permission that bot has. The bot token
-/// authenticates this process *to* the API; it says nothing about who is calling *in*.
+/// Placed in the request extensions by [`require_caller_token`] and taken back out by the
+/// handler. It exists as its own type so that the handler cannot be written without it: the
+/// extractor for a missing extension rejects the request, so the failure mode of forgetting
+/// the middleware is a refusal, not an anonymous call.
 #[derive(Clone)]
-enum InboundAuth {
-    /// Every data carrying route requires this bearer token.
-    BearerToken(Arc<str>),
-    /// No inbound authentication, permitted only because the listener is bound to a
-    /// loopback address where the kernel already restricts callers to this host.
-    LoopbackOnly,
-}
-
-impl InboundAuth {
-    /// A label safe to log. Never derives from the token itself.
-    const fn describe(&self) -> &'static str {
-        match self {
-            Self::BearerToken(_) => "bearer-token",
-            Self::LoopbackOnly => "none (loopback bind)",
-        }
-    }
-}
-
-/// Decides how a listener authenticates its callers, refusing the one combination that
-/// cannot be made safe: reachable from the network *and* unauthenticated.
-///
-/// Loopback binds may stay unauthenticated so local development keeps working, but they
-/// say so in the log rather than passing silently.
-/// The length rule is a second line of defence, not the first: the configuration layer
-/// already refuses a short `mcp.auth_token` at load time. It is kept, and worded from the
-/// same constant, so the function stays fail-closed for any caller — a decision this
-/// consequential must not depend on where its input came from.
-fn resolve_inbound_auth(bind_addr: &str, configured_token: Option<&Secret>) -> anyhow::Result<InboundAuth> {
-    if let Some(token) = configured_token
-        .map(Secret::expose)
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        if token.len() < MIN_MCP_AUTH_TOKEN_LEN {
-            // The token is never echoed, not even its prefix.
-            anyhow::bail!(
-                "{INBOUND_AUTH_TOKEN_KEY} must be at least {MIN_MCP_AUTH_TOKEN_LEN} characters long to be worth \
-                 checking"
-            );
-        }
-        return Ok(InboundAuth::BearerToken(Arc::from(token)));
-    }
-
-    if is_loopback_bind_addr(bind_addr) {
-        tracing::warn!(
-            bind_addr = %bind_addr,
-            "{INBOUND_AUTH_TOKEN_KEY} is not set, so inbound MCP requests are NOT authenticated. This is allowed only \
-             because the listener is bound to a loopback address and callers are limited to this host. Set \
-             {INBOUND_AUTH_TOKEN_KEY} before publishing this port."
-        );
-        return Ok(InboundAuth::LoopbackOnly);
-    }
-
-    anyhow::bail!(
-        "Refusing to serve MCP on non-loopback bind address '{bind_addr}' without inbound authentication: set \
-         {INBOUND_AUTH_TOKEN_KEY} in the configuration file, or bind to 127.0.0.1 for local development. This process \
-         holds a workspace bot token, so anyone able to reach the port would hold every permission that bot has."
-    )
-}
-
-/// Whether a bind address restricts callers to this host.
-///
-/// Anything that is not a literal loopback address is treated as remotely reachable. A
-/// hostname other than `localhost` is not resolved: this decides whether authentication
-/// may be skipped, and guessing wrong in that direction publishes an open port.
-fn is_loopback_bind_addr(bind_addr: &str) -> bool {
-    let bind_addr = bind_addr.trim();
-    if let Ok(socket_addr) = bind_addr.parse::<std::net::SocketAddr>() {
-        return socket_addr.ip().is_loopback();
-    }
-    let host = bind_addr.rsplit_once(':').map_or(bind_addr, |(host, _port)| host);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
+struct CallerToken(Secret);
 
 /// The token out of an `Authorization: Bearer <token>` header, if it is well formed.
 fn bearer_token(header_value: &str) -> Option<&str> {
@@ -298,64 +248,63 @@ fn bearer_token(header_value: &str) -> Option<&str> {
     if token.is_empty() { None } else { Some(token) }
 }
 
-/// Compares two secrets without an early exit on the first differing byte, so the time
-/// taken does not reveal how much of a guess was correct.
+/// The caller's bot token, if the request carries a usable one.
 ///
-/// The length comparison is deliberately not constant time — that is standard for bearer
-/// token checks and leaks only the token's length, never its bytes.
-fn constant_time_eq(presented: &[u8], expected: &[u8]) -> bool {
-    if presented.len() != expected.len() {
-        return false;
-    }
-    let mut difference = 0u8;
-    for (presented_byte, expected_byte) in presented.iter().zip(expected.iter()) {
-        difference |= presented_byte ^ expected_byte;
-    }
-    std::hint::black_box(difference) == 0
-}
-
-/// Rejects inbound requests that do not present the configured bearer token.
-async fn require_inbound_auth(State(auth): State<InboundAuth>, request: Request, next: Next) -> Response {
-    let InboundAuth::BearerToken(expected) = &auth else {
-        return next.run(request).await;
-    };
-
-    let presented = request
-        .headers()
+/// `to_str` limits the value to visible ASCII, which is also what makes it safe to copy into
+/// an outbound header. The length bound is the only judgement passed on the contents:
+/// whether this token names a real, enabled bot with rights to anything is the API's
+/// question, and a verdict reached here would be a second, weaker authenticator sitting in
+/// front of the real one.
+fn caller_token(headers: &header::HeaderMap) -> Option<Secret> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(bearer_token);
-
-    if presented.is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes())) {
-        return next.run(request).await;
-    }
-
-    // Neither the presented nor the expected token is logged, on either branch.
-    tracing::warn!(
-        path = %request.uri().path(),
-        "Rejected an inbound MCP request with a missing or invalid bearer token"
-    );
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        Json(json!({ "error": "Missing or invalid Authorization: Bearer token" })),
-    )
-        .into_response()
+        .and_then(bearer_token)
+        .filter(|token| token.len() <= MAX_CALLER_TOKEN_LEN)
+        .map(Secret::new)
 }
 
-/// Wraps the data carrying routes in the inbound auth layer.
+/// Rejects any inbound request that does not carry a caller bot token, and hands the one it
+/// does carry to the handler.
+///
+/// This is the whole inbound authentication story. There is no shared secret, no
+/// configuration that relaxes it and no anonymous path: a networked MCP request is made as
+/// somebody, or it is not made.
+async fn require_caller_token(mut request: Request, next: Next) -> Response {
+    let Some(token) = caller_token(request.headers()) else {
+        // The rejection names no header value, on either the too-long or the absent branch.
+        tracing::warn!(
+            path = %request.uri().path(),
+            "Rejected an inbound MCP request that carried no usable caller bot token"
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+            Json(json!({
+                "error": "Missing Authorization: Bearer <opr_ bot token>. This MCP server acts as its caller, so \
+                          every request must present the caller's own workspace bot token."
+            })),
+        )
+            .into_response();
+    };
+
+    request.extensions_mut().insert(CallerToken(token));
+    next.run(request).await
+}
+
+/// Wraps the data carrying routes in the caller token layer.
 ///
 /// `/health` stays outside it on purpose: it answers a constant `OK`, reads nothing and
 /// discloses nothing a caller who already completed the TCP handshake does not know, and
-/// orchestrator probes must not need the shared secret to run.
-fn serve_router(state: SseState, auth: InboundAuth, protected: Router<SseState>) -> Router {
+/// orchestrator probes have no bot account to authenticate as.
+fn serve_router(state: SseState, protected: Router<SseState>) -> Router {
     Router::new()
-        .merge(protected.route_layer(middleware::from_fn_with_state(auth, require_inbound_auth)))
+        .merge(protected.route_layer(middleware::from_fn(require_caller_token)))
         .route("/health", get(health_check))
         .with_state(state)
 }
 
-async fn run_http(bind_addr: &str, client: OpenPrClient, auth: InboundAuth) -> anyhow::Result<()> {
+async fn run_http(bind_addr: &str, client: OpenPrClient) -> anyhow::Result<()> {
     let state = SseState {
         client,
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -365,21 +314,30 @@ async fn run_http(bind_addr: &str, client: OpenPrClient, auth: InboundAuth) -> a
         .route("/mcp/rpc", post(handle_jsonrpc))
         .route("/sse", get(handle_sse_connect))
         .route("/messages", post(handle_sse_message));
-    let auth_mode = auth.describe();
-    let app = serve_router(state, auth, protected);
+    let app = serve_router(state, protected);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(
         bind_addr = %bind_addr,
-        inbound_auth = %auth_mode,
+        inbound_auth = INBOUND_AUTH_DESCRIPTION,
         "MCP HTTP transport started (JSON-RPC + SSE)"
     );
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn handle_jsonrpc(State(state): State<SseState>, Json(req): Json<JsonRpcRequest>) -> impl IntoResponse {
-    let server = McpServer::new(state.client.clone());
+/// How the networked transports report their inbound authentication in the startup log.
+///
+/// A constant rather than a computed label because there is now only one answer; a log line
+/// that could say something else would imply a setting that no longer exists.
+const INBOUND_AUTH_DESCRIPTION: &str = "per-request caller bot token (Authorization: Bearer), required";
+
+async fn handle_jsonrpc(
+    State(state): State<SseState>,
+    Extension(caller): Extension<CallerToken>,
+    Json(req): Json<JsonRpcRequest>,
+) -> impl IntoResponse {
+    let server = McpServer::new(state.client.acting_as(caller.0));
     server.handle_request(req).await.map_or_else(
         || (StatusCode::ACCEPTED, Json(json!({"status": "accepted"}))),
         |response| (StatusCode::OK, Json(json!(response))),
@@ -418,7 +376,7 @@ struct MessagesQuery {
     session_id: String,
 }
 
-async fn run_sse(bind_addr: &str, client: OpenPrClient, auth: InboundAuth) -> anyhow::Result<()> {
+async fn run_sse(bind_addr: &str, client: OpenPrClient) -> anyhow::Result<()> {
     let state = SseState {
         client,
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -427,13 +385,12 @@ async fn run_sse(bind_addr: &str, client: OpenPrClient, auth: InboundAuth) -> an
     let protected = Router::new()
         .route("/sse", get(handle_sse_connect))
         .route("/messages", post(handle_sse_message));
-    let auth_mode = auth.describe();
-    let app = serve_router(state, auth, protected);
+    let app = serve_router(state, protected);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     tracing::info!(
         bind_addr = %bind_addr,
-        inbound_auth = %auth_mode,
+        inbound_auth = INBOUND_AUTH_DESCRIPTION,
         "MCP SSE transport started"
     );
     axum::serve(listener, app).await?;
@@ -468,8 +425,13 @@ async fn handle_sse_connect(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+/// The SSE session is only a delivery channel: the identity a request is served as comes
+/// from the `POST /messages` that carried it, never from the `GET /sse` that opened the
+/// stream. Binding identity to the session would let one caller's messages ride another
+/// caller's stream, and would make the identity outlive the request that proved it.
 async fn handle_sse_message(
     State(state): State<SseState>,
+    Extension(caller): Extension<CallerToken>,
     Query(query): Query<MessagesQuery>,
     Json(req): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
@@ -478,7 +440,7 @@ async fn handle_sse_message(
         return (StatusCode::NOT_FOUND, Json(json!({"error": "Unknown SSE session_id"})));
     };
 
-    let server = McpServer::new(state.client.clone());
+    let server = McpServer::new(state.client.acting_as(caller.0));
     let response = server.handle_request(req).await;
     let Some(response) = response else {
         return (StatusCode::ACCEPTED, Json(json!({"status": "accepted"})));
@@ -509,12 +471,12 @@ async fn health_check() -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        InboundAuth, MIN_MCP_AUTH_TOKEN_LEN, bearer_token, checked_api_url, checked_bind_addr, checked_bot_token,
-        checked_workspace_id, constant_time_eq, is_loopback_bind_addr, resolve_inbound_auth,
+        MAX_CALLER_TOKEN_LEN, bearer_token, caller_token, checked_api_url, checked_bind_addr, checked_bot_token,
+        checked_workspace_id, header,
     };
     use platform::config::{DEFAULT_MCP_API_URL, Secret};
 
-    const TOKEN: &str = "an-inbound-token-long-enough";
+    const TOKEN: &str = "opr_caller_bot_token_example";
 
     #[test]
     fn accepts_concrete_cli_overrides() -> Result<(), Box<dyn std::error::Error>> {
@@ -582,93 +544,6 @@ mod tests {
         assert!(checked_bind_addr("0.0.0.0 :8090").is_err());
     }
 
-    /// The combination this gate exists to make impossible: reachable from the network
-    /// and unauthenticated. Binding wide open used to be a plain config choice, with the
-    /// compose port mapping as the only thing between a workspace bot and the internet.
-    #[test]
-    fn a_non_loopback_bind_without_a_token_refuses_to_start() {
-        let blank = Secret::new("   ");
-        for bind_addr in [
-            "0.0.0.0:8090",
-            "[::]:8090",
-            "192.168.31.136:8090",
-            "10.0.0.5:8090",
-            // A hostname that is not `localhost` is not resolved, so it counts as remote.
-            "mcp.internal:8090",
-        ] {
-            assert!(
-                resolve_inbound_auth(bind_addr, None).is_err(),
-                "{bind_addr} was allowed to serve unauthenticated"
-            );
-            assert!(
-                resolve_inbound_auth(bind_addr, Some(&blank)).is_err(),
-                "{bind_addr} treated a blank token as configured auth"
-            );
-        }
-    }
-
-    #[test]
-    fn a_non_loopback_bind_serves_once_a_token_is_configured() -> Result<(), Box<dyn std::error::Error>> {
-        let auth = resolve_inbound_auth("0.0.0.0:8090", Some(&Secret::new(TOKEN)))?;
-        assert!(matches!(auth, InboundAuth::BearerToken(_)));
-        assert_eq!(auth.describe(), "bearer-token");
-        Ok(())
-    }
-
-    /// Loopback stays usable without a token so local development is unaffected, and the
-    /// mode is reported rather than assumed.
-    #[test]
-    fn a_loopback_bind_may_stay_unauthenticated() -> Result<(), Box<dyn std::error::Error>> {
-        // A `None` token is what an absent `mcp.auth_token` resolves to.
-        for bind_addr in ["127.0.0.1:8090", "[::1]:8090", "localhost:8090", "127.7.7.7:8090"] {
-            let auth = resolve_inbound_auth(bind_addr, None)?;
-            assert!(
-                matches!(auth, InboundAuth::LoopbackOnly),
-                "{bind_addr} should be recognised as loopback"
-            );
-            assert_eq!(auth.describe(), "none (loopback bind)");
-        }
-        Ok(())
-    }
-
-    /// A token too short to resist guessing is rejected outright rather than accepted as
-    /// weak protection, on loopback as well as off it.
-    #[test]
-    fn a_too_short_token_is_refused_everywhere() {
-        let short = Secret::new("x".repeat(MIN_MCP_AUTH_TOKEN_LEN - 1));
-        let long = Secret::new("x".repeat(MIN_MCP_AUTH_TOKEN_LEN));
-        assert!(resolve_inbound_auth("0.0.0.0:8090", Some(&short)).is_err());
-        assert!(resolve_inbound_auth("127.0.0.1:8090", Some(&short)).is_err());
-        assert!(resolve_inbound_auth("0.0.0.0:8090", Some(&long)).is_ok());
-    }
-
-    /// The failure message has to name the fix without ever printing the secret.
-    #[test]
-    fn the_fail_closed_message_names_the_config_key_and_never_a_token() {
-        let Err(error) = resolve_inbound_auth("0.0.0.0:8090", None) else {
-            panic!("a wide open bind without a token must not be accepted");
-        };
-        let message = error.to_string();
-        assert!(message.contains("mcp.auth_token"), "{message}");
-        assert!(message.contains("127.0.0.1"), "{message}");
-
-        let Err(error) = resolve_inbound_auth("0.0.0.0:8090", Some(&Secret::new("short"))) else {
-            panic!("a too short token must not be accepted");
-        };
-        assert!(!error.to_string().contains("short"), "the error echoed the token");
-    }
-
-    #[test]
-    fn loopback_detection_does_not_guess_in_the_permissive_direction() {
-        assert!(is_loopback_bind_addr("127.0.0.1:8090"));
-        assert!(is_loopback_bind_addr(" localhost:8090 "));
-        assert!(!is_loopback_bind_addr("0.0.0.0:8090"));
-        assert!(!is_loopback_bind_addr("[::]:8090"));
-        // Not a bindable address at all, so it must not be read as loopback.
-        assert!(!is_loopback_bind_addr(""));
-        assert!(!is_loopback_bind_addr("localhost.evil.example:8090"));
-    }
-
     #[test]
     fn bearer_parsing_accepts_only_a_well_formed_bearer_header() {
         assert_eq!(bearer_token("Bearer abc"), Some("abc"));
@@ -679,19 +554,61 @@ mod tests {
         assert_eq!(bearer_token("abc"), None);
     }
 
+    /// Builds the header map an inbound request would arrive with.
+    fn headers(pairs: &[(header::HeaderName, &str)]) -> header::HeaderMap {
+        let mut map = header::HeaderMap::new();
+        for (name, value) in pairs {
+            match header::HeaderValue::from_str(value) {
+                Ok(value) => {
+                    map.insert(name.clone(), value);
+                }
+                Err(error) => panic!("test header value is not a valid header: {error}"),
+            }
+        }
+        map
+    }
+
+    /// The token the caller presented is the token that is carried onward, byte for byte.
+    /// Trimming, re-casing or otherwise "cleaning" it would hand the API a credential the
+    /// caller never sent.
     #[test]
-    fn token_comparison_matches_only_the_exact_secret() {
-        assert!(constant_time_eq(TOKEN.as_bytes(), TOKEN.as_bytes()));
-        assert!(!constant_time_eq(b"", TOKEN.as_bytes()));
-        // A correct prefix must not be accepted, which is what a `starts_with` check or a
-        // truncated comparison would do.
-        let prefix = TOKEN.as_bytes().get(..8).unwrap_or_default();
-        assert!(!constant_time_eq(prefix, TOKEN.as_bytes()));
-        assert!(!constant_time_eq(format!("{TOKEN}x").as_bytes(), TOKEN.as_bytes()));
-        let mut wrong_last_byte = TOKEN.to_string();
-        wrong_last_byte.pop();
-        wrong_last_byte.push('!');
-        assert!(!constant_time_eq(wrong_last_byte.as_bytes(), TOKEN.as_bytes()));
+    fn the_callers_token_is_taken_verbatim_from_the_authorization_header() {
+        let extracted = caller_token(&headers(&[(header::AUTHORIZATION, &format!("Bearer {TOKEN}"))]));
+        assert_eq!(extracted.as_ref().map(Secret::expose), Some(TOKEN));
+    }
+
+    /// Every way of not presenting a bot token has to come out the same: no identity, which
+    /// the middleware turns into a 401. A `None` here that became "act as the server" is
+    /// exactly the bug this change exists to remove.
+    #[test]
+    fn a_request_without_a_usable_bearer_token_yields_no_identity() {
+        let too_long = "opr_".to_string() + &"x".repeat(MAX_CALLER_TOKEN_LEN);
+        for map in [
+            headers(&[]),
+            headers(&[(header::AUTHORIZATION, "")]),
+            headers(&[(header::AUTHORIZATION, "Bearer")]),
+            headers(&[(header::AUTHORIZATION, "Bearer   ")]),
+            headers(&[(header::AUTHORIZATION, &format!("Basic {TOKEN}"))]),
+            headers(&[(header::AUTHORIZATION, TOKEN)]),
+            // A different header is not the Authorization header, however suggestive.
+            headers(&[(header::PROXY_AUTHORIZATION, &format!("Bearer {TOKEN}"))]),
+            headers(&[(header::AUTHORIZATION, &format!("Bearer {too_long}"))]),
+        ] {
+            assert!(
+                caller_token(&map).is_none(),
+                "a request with {map:?} was given an identity"
+            );
+        }
+    }
+
+    /// The bound is on the token, not on the whole header, and a token at the limit is
+    /// still served: a cap that rejected legitimate credentials would be an availability
+    /// bug wearing a security hat.
+    #[test]
+    fn a_token_at_the_length_limit_is_still_accepted() {
+        let at_limit = "x".repeat(MAX_CALLER_TOKEN_LEN);
+        let extracted = caller_token(&headers(&[(header::AUTHORIZATION, &format!("Bearer {at_limit}"))]));
+        assert_eq!(extracted.as_ref().map(Secret::expose), Some(at_limit.as_str()));
     }
 }
 

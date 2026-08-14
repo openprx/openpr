@@ -24,17 +24,59 @@ fn check_response_envelope(payload: &Value, path: &str) -> Result<(), String> {
     };
     match envelope.get("code").and_then(Value::as_i64) {
         Some(0) => Ok(()),
-        Some(code) => {
-            let message = envelope
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown API error");
-            Err(format!("API error {code} from {path}: {message}"))
-        }
+        Some(code) => Err(refusal_reason(code).map_or_else(
+            || {
+                let message = envelope
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown API error");
+                format!("API error {code} from {path}: {message}")
+            },
+            |reason| format!("API error {code} from {path}: {reason}"),
+        )),
         None => Err(format!(
             "Malformed response from {path}: the {{code, message, data}} envelope carries no integer `code`"
         )),
     }
+}
+
+/// The fixed wording an *authentication* failure is reported with, or `None` for every other
+/// status, whose own message is relayed.
+///
+/// `401` is the one status where the caller has not been identified at all. The MCP server
+/// forwards a credential it never verified, so a caller can put an arbitrary token on the
+/// wire and read back whatever the backend says about it — and what the backend says is prose
+/// written for an operator, which is where an internal hostname or a middleware name leaks.
+/// That makes an unauthenticated stranger the one party who must be told the least, so they
+/// are told only the verdict and how to act on it.
+///
+/// `403` is deliberately not on this list. A `403` means the credential *was* accepted and
+/// the bot is known; the message then explains which rule refused a legitimate caller's
+/// request ("policy denied", "not a member of this workspace"), and withholding it would cost
+/// every real user their only explanation to buy nothing an authenticated caller could not
+/// already learn by making the call.
+const fn refusal_reason(code: i64) -> Option<&'static str> {
+    match code {
+        401 => Some(
+            "the OpenPR API rejected the credential this call was made with; check that the bot token presented is \
+             correct, enabled and not expired",
+        ),
+        _ => None,
+    }
+}
+
+/// What a caller is told about a non-2xx answer.
+///
+/// The `OpenPR` API itself answers `200` and carries its status in the envelope, so a real
+/// HTTP status here comes from something in front of it — a proxy, a gateway, a load
+/// balancer — whose error page is not written for this caller at all. The same reasoning as
+/// [`refusal_reason`] therefore applies to the same status, and to a body rather than to an
+/// envelope message.
+fn rejected_request_error(status: reqwest::StatusCode, path: &str, body: &str) -> String {
+    refusal_reason(i64::from(status.as_u16())).map_or_else(
+        || format!("HTTP {status} from {path}: {body}"),
+        |reason| format!("HTTP {status} from {path}: {reason}"),
+    )
 }
 
 const fn describe_json_kind(value: &Value) -> &'static str {
@@ -67,17 +109,30 @@ pub const fn transport_label(transport: McpTransport) -> &'static str {
     }
 }
 
+/// What a client with no credential answers when something asks it to call the API.
+///
+/// Reaching this is a bug, not a deployment mistake: the networked transports install the
+/// caller's credential before any handler runs, and the transports that have no caller
+/// (stdio, the CLI subcommands) are configured with `mcp.bot_token`. It is an error rather
+/// than a fallback so that the failure is a refusal, never an unattributed call made with
+/// somebody else's authority.
+const NO_OUTBOUND_CREDENTIAL: &str = "Refusing to call the OpenPR API with no credential: this request carried no caller identity \
+     and this process holds none of its own";
+
 /// Everything the client needs, already resolved from the configuration file and the CLI
 /// flags that override it.
 ///
-/// Carries no `Debug` on purpose: it holds the workspace bot token, and the point of
-/// [`Secret`] is that no derived `Debug` anywhere can start printing it.
+/// Carries no `Debug` on purpose: it may hold a credential, and the point of [`Secret`] is
+/// that no derived `Debug` anywhere can start printing it.
 pub struct ClientConfig {
     /// Base URL of the `OpenPR` API, from `mcp.api_url` or `--api-url`.
     pub base_url: String,
-    /// Workspace bot token, from `mcp.bot_token` or `--bot-token`.
-    pub bot_token: Secret,
-    /// Workspace the bot acts in, from `mcp.workspace_id` or `--workspace-id`.
+    /// The identity this client presents to the API.
+    ///
+    /// `None` for the networked transports, which hold no identity of their own and are
+    /// handed the caller's through [`OpenPrClient::acting_as`] once per request.
+    pub credential: Option<Secret>,
+    /// Workspace the caller acts in, from `mcp.workspace_id` or `--workspace-id`.
     pub workspace_id: String,
     /// Correlation id stamped onto the tool-call audit, from `mcp.invocation_id`.
     pub invocation_id: Option<String>,
@@ -89,7 +144,8 @@ pub struct ClientConfig {
 pub struct OpenPrClient {
     client: Client,
     base_url: String,
-    bot_token: Secret,
+    /// The bearer credential every outbound request carries. See [`ClientConfig::credential`].
+    credential: Option<Secret>,
     pub workspace_id: String,
     invocation_id: Option<String>,
     transport_label: &'static str,
@@ -180,11 +236,30 @@ impl OpenPrClient {
         Ok(Self {
             client,
             base_url: config.base_url,
-            bot_token: config.bot_token,
+            credential: config.credential,
             workspace_id: config.workspace_id,
             invocation_id: config.invocation_id,
             transport_label: config.transport_label,
         })
+    }
+
+    /// The same client, speaking to the API as `credential` instead of as itself.
+    ///
+    /// This is how a per-request caller identity reaches all 105 tools without threading a
+    /// credential through every one of them: the request scoped client *is* the identity, so
+    /// a tool cannot pick a different one, and neither can the policy gate or the audit
+    /// report that run around it. The HTTP connection pool is shared because [`Client`] is
+    /// an `Arc` inside; nothing else is.
+    #[must_use]
+    pub fn acting_as(&self, credential: Secret) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            credential: Some(credential),
+            workspace_id: self.workspace_id.clone(),
+            invocation_id: self.invocation_id.clone(),
+            transport_label: self.transport_label,
+        }
     }
 
     pub fn invocation_id(&self) -> Option<&str> {
@@ -196,11 +271,20 @@ impl OpenPrClient {
         self.transport_label
     }
 
+    /// The `Authorization` header value for one outbound request, or the refusal that stands
+    /// in for a credential this client does not have.
+    fn authorization(&self) -> Result<String, String> {
+        self.credential
+            .as_ref()
+            .map(|credential| format!("Bearer {}", credential.expose()))
+            .ok_or_else(|| NO_OUTBOUND_CREDENTIAL.to_string())
+    }
+
     /// Sends an authenticated request and rejects both transport-level failures and
     /// API-level envelope errors before the payload reaches the caller.
     async fn send<T: DeserializeOwned>(&self, request: RequestBuilder, path: &str) -> Result<T, String> {
         let resp = request
-            .header("Authorization", format!("Bearer {}", self.bot_token.expose()))
+            .header("Authorization", self.authorization()?)
             .send()
             .await
             .map_err(|e| format!("Request failed: {e}"))?;
@@ -212,7 +296,7 @@ impl OpenPrClient {
             .map_err(|e| format!("Failed to read response body from {path}: {e}"))?;
 
         if !status.is_success() {
-            return Err(format!("HTTP {status} from {path}: {body}"));
+            return Err(rejected_request_error(status, path, &body));
         }
 
         let payload: Value = if body.trim().is_empty() {
@@ -1202,7 +1286,7 @@ impl OpenPrClient {
         let resp = self
             .client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.bot_token.expose()))
+            .header("Authorization", self.authorization()?)
             .multipart(form)
             .send()
             .await
@@ -1211,7 +1295,7 @@ impl OpenPrClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status} from /api/v1/upload: {body}"));
+            return Err(rejected_request_error(status, "/api/v1/upload", &body));
         }
 
         let payload: Value = resp
@@ -1459,7 +1543,7 @@ pub mod test_api {
     pub fn client(base_url: String) -> Result<OpenPrClient, String> {
         OpenPrClient::new(ClientConfig {
             base_url,
-            bot_token: Secret::new("opr_test_token"),
+            credential: Some(Secret::new("opr_test_token")),
             workspace_id: "workspace-1".to_string(),
             invocation_id: None,
             transport_label: TRANSPORT_LABEL_STDIO,
@@ -1479,7 +1563,7 @@ pub mod test_api {
 
 #[cfg(test)]
 mod tests {
-    use super::{ListRecordsQuery, OpenPrClient, check_response_envelope, test_api};
+    use super::{ListRecordsQuery, OpenPrClient, check_response_envelope, rejected_request_error, test_api};
     use axum::{
         Json, Router,
         extract::RawQuery,
@@ -1516,12 +1600,59 @@ mod tests {
 
     #[test]
     fn envelope_with_error_code_is_rejected_with_api_message() {
-        let error = check_response_envelope(&json!({ "code": 403, "message": "forbidden" }), "/p")
+        let error = check_response_envelope(&json!({ "code": 404, "message": "form not found" }), "/p")
             .err()
             .unwrap_or_default();
 
-        assert!(error.contains("403"), "{error}");
-        assert!(error.contains("forbidden"), "{error}");
+        assert!(error.contains("404"), "{error}");
+        assert!(error.contains("form not found"), "{error}");
+    }
+
+    /// The one status whose message is not relayed. A caller that failed to authenticate has
+    /// not been identified at all, so it is told the verdict and how to act on it, and nothing
+    /// the backend said.
+    #[test]
+    fn a_rejected_credential_is_reported_without_the_backends_own_words() {
+        let error = check_response_envelope(
+            &json!({ "code": 401, "message": "looked it up in pg-primary-7.internal:5432" }),
+            "/p",
+        )
+        .err()
+        .unwrap_or_default();
+
+        assert!(error.contains("401"), "{error}");
+        assert!(error.contains("not expired"), "the refusal is not actionable: {error}");
+        assert!(
+            !error.contains("pg-primary-7.internal"),
+            "the refusal relayed the backend's message: {error}"
+        );
+    }
+
+    /// A `403` is an authenticated caller being refused a specific action, so its message is
+    /// the only explanation that caller will ever get and is relayed in full.
+    #[test]
+    fn an_authenticated_caller_still_learns_why_it_was_refused() {
+        let error = check_response_envelope(&json!({ "code": 403, "message": "policy denied" }), "/p")
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("403") && error.contains("policy denied"), "{error}");
+    }
+
+    /// The same rule, applied to a real HTTP status — which, since the API answers 200 with an
+    /// envelope, means something in front of it answered, with a body written for nobody here.
+    #[test]
+    fn a_refusal_from_in_front_of_the_api_is_reported_without_its_body() {
+        let error = rejected_request_error(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "/p",
+            "<html>nginx/1.27 upstream api-7.internal</html>",
+        );
+        assert!(error.contains("401"), "{error}");
+        assert!(!error.contains("api-7.internal"), "{error}");
+
+        // Every other status keeps its body: it is about the caller's own request.
+        let relayed = rejected_request_error(reqwest::StatusCode::BAD_GATEWAY, "/p", "upstream timed out");
+        assert!(relayed.contains("upstream timed out"), "{relayed}");
     }
 
     #[tokio::test]

@@ -35,11 +35,11 @@ format = \"text\"
 /// depends on, say, the absence of an inbound token says so where it is read.
 pub struct McpSettings<'a> {
     pub api_url: &'a str,
-    pub bot_token: &'a str,
+    /// The identity `stdio` and the CLI subcommands act as. `None` writes no key at all,
+    /// which is what an `http`/`sse` deployment looks like: it holds no identity of its own
+    /// and serves every request as the caller that presented one.
+    pub bot_token: Option<&'a str>,
     pub workspace_id: &'a str,
-    /// `None` writes no key at all, which is the deployment mistake the fail-closed gate
-    /// exists to catch — not the same thing as an empty value.
-    pub auth_token: Option<&'a str>,
     /// `None` leaves the file's own default, `stdio`.
     pub transport: Option<&'a str>,
     /// `None` leaves the file's own default, `127.0.0.1:8090`.
@@ -68,6 +68,18 @@ impl Drop for ConfigFile {
 
 /// Writes a complete configuration file carrying `settings`.
 pub fn write_config(settings: &McpSettings<'_>) -> Result<ConfigFile, Box<dyn Error>> {
+    write_config_with_extra_mcp_keys(settings, "")
+}
+
+/// As [`write_config`], plus raw lines appended to the `[mcp]` table.
+///
+/// The escape hatch exists for keys [`McpSettings`] deliberately does not model — a retired
+/// one, for instance, which a test needs to write precisely because the loader should refuse
+/// it. Modelling those as fields would suggest they are still part of the schema.
+pub fn write_config_with_extra_mcp_keys(
+    settings: &McpSettings<'_>,
+    extra_mcp_keys: &str,
+) -> Result<ConfigFile, Box<dyn Error>> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let unique = format!(
         "openpr-mcp-e2e-{}-{}",
@@ -80,17 +92,17 @@ pub fn write_config(settings: &McpSettings<'_>) -> Result<ConfigFile, Box<dyn Er
     let mut source = String::from(SHARED_SECTIONS);
     writeln!(source, "[mcp]")?;
     writeln!(source, "api_url = \"{}\"", settings.api_url)?;
-    writeln!(source, "bot_token = \"{}\"", settings.bot_token)?;
-    writeln!(source, "workspace_id = \"{}\"", settings.workspace_id)?;
-    if let Some(auth_token) = settings.auth_token {
-        writeln!(source, "auth_token = \"{auth_token}\"")?;
+    if let Some(bot_token) = settings.bot_token {
+        writeln!(source, "bot_token = \"{bot_token}\"")?;
     }
+    writeln!(source, "workspace_id = \"{}\"", settings.workspace_id)?;
     if let Some(transport) = settings.transport {
         writeln!(source, "transport = \"{transport}\"")?;
     }
     if let Some(bind_addr) = settings.bind_addr {
         writeln!(source, "bind_addr = \"{bind_addr}\"")?;
     }
+    source.push_str(extra_mcp_keys);
 
     let path = dir.join("openpr.toml");
     fs::write(&path, source)?;

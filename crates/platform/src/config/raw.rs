@@ -23,8 +23,8 @@ use super::connectors::{ConnectorSecrets, validate_connector_secret_name};
 use super::secret::Secret;
 use super::{
     AuthConfig, ConfigError, ConnectorsConfig, DEFAULT_S3_REGION, DEFAULT_STORAGE_DIR, DatabaseConfig, LogFormat,
-    LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, MIN_MCP_AUTH_TOKEN_LEN, McpConfig, McpTransport, MigrationsConfig,
-    OpenPrConfig, OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
+    LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, McpConfig, McpTransport, MigrationsConfig, OpenPrConfig,
+    OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
 };
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
@@ -145,6 +145,9 @@ struct RawMcp {
     api_url: Option<String>,
     bot_token: Option<String>,
     workspace_id: Option<String>,
+    /// Retired. Kept only so that a file still carrying it gets an explanation instead of
+    /// `deny_unknown_fields`' bare "unknown field" — the key used to be load bearing, and an
+    /// operator who wrote it deserves to be told what replaced it.
     auth_token: Option<String>,
     transport: Option<String>,
     bind_addr: Option<String>,
@@ -599,18 +602,15 @@ impl RawMcp {
         let workspace_id = self
             .workspace_id
             .and_then(|raw| issues.record(parse_workspace_scale_uuid("mcp.workspace_id", &raw)));
-        let auth_token = self.auth_token.and_then(|token| {
-            issues.record(if is_placeholder(&token) {
-                Err("mcp.auth_token must be a concrete token when it is set".to_string())
-            } else if token.trim().len() < MIN_MCP_AUTH_TOKEN_LEN {
-                // The token is never echoed, not even its prefix.
-                Err(format!(
-                    "mcp.auth_token must be at least {MIN_MCP_AUTH_TOKEN_LEN} characters long to be worth checking"
-                ))
-            } else {
-                Ok(Secret::new(token.trim()))
-            })
-        });
+        if self.auth_token.is_some() {
+            // The value is never echoed, not even its length.
+            issues.push(
+                "mcp.auth_token has been removed: an inbound http/sse caller now presents its own workspace bot token \
+                 in `Authorization: Bearer opr_...`, which the MCP server forwards to the API unchanged and the API \
+                 authenticates. Delete the key; there is no shared inbound secret any more, and a request without a \
+                 caller bot token is refused",
+            );
+        }
         let transport = self.transport.map_or_else(
             || Some(McpTransport::default()),
             |raw| {
@@ -637,7 +637,6 @@ impl RawMcp {
             api_url,
             bot_token,
             workspace_id,
-            auth_token,
             transport: transport.unwrap_or_default(),
             bind_addr,
             invocation_id,

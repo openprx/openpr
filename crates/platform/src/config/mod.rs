@@ -71,12 +71,6 @@ pub const DEFAULT_CONFIG_PATH: &str = "config/openpr.toml";
 /// forceable offline from a single captured token.
 pub const MIN_JWT_SECRET_LEN: usize = 16;
 
-/// Shortest accepted `mcp.auth_token`.
-///
-/// A two character token is worse than none: it invites the operator to believe the port is
-/// protected while it is trivially guessable.
-pub const MIN_MCP_AUTH_TOKEN_LEN: usize = 16;
-
 /// Region assumed when `[storage.s3]` does not name one.
 pub const DEFAULT_S3_REGION: &str = "us-east-1";
 
@@ -455,26 +449,40 @@ impl McpTransport {
 #[derive(Clone, Debug, Default)]
 pub struct McpConfig {
     pub api_url: Option<String>,
+    /// The workspace bot token `stdio` and the CLI subcommands present to the API.
+    ///
+    /// A `stdio` process is launched by one person's MCP client and speaks for one bot account,
+    /// so the configuration file is where its identity belongs. The networked transports do not
+    /// use this at all: they act as whoever called them.
     pub bot_token: Option<Secret>,
     pub workspace_id: Option<Uuid>,
-    /// Bearer token inbound HTTP/SSE callers must present.
-    pub auth_token: Option<Secret>,
     pub transport: McpTransport,
     pub bind_addr: Option<String>,
     /// Correlation id stamped onto API calls made on behalf of one agent invocation.
     pub invocation_id: Option<String>,
 }
 
+/// What a deployment whose transport has no per-request credential is told.
+///
+/// `stdio` is a pipe pair and the CLI subcommands are a local process: neither carries a caller
+/// credential, so both act as the configured bot and both need it to be there.
+pub const MCP_BOT_TOKEN_REQUIRED: &str = "mcp.bot_token is required by the stdio transport and by the CLI subcommands, which have no \
+     per-request credential to act on; it is not used, nor needed, when mcp.transport is http or \
+     sse, because every networked call is made with the bot token its caller presented";
+
 impl McpConfig {
     fn runtime(&self, origin: &Path) -> Result<McpRuntime, ConfigError> {
         let mut issues = Vec::new();
-        if self.bot_token.is_none() {
-            issues.push("mcp.bot_token is required to run the MCP server".to_string());
+        // The networked transports authenticate every request against the caller's own
+        // `Authorization: Bearer` bot token and forward it to the API, so they hold no
+        // server-side identity at all and must not be forced to configure one.
+        if !self.transport.is_networked() && self.bot_token.is_none() {
+            issues.push(MCP_BOT_TOKEN_REQUIRED.to_string());
         }
         if self.workspace_id.is_none() {
             issues.push("mcp.workspace_id is required to run the MCP server".to_string());
         }
-        let (Some(bot_token), Some(workspace_id)) = (self.bot_token.as_ref(), self.workspace_id) else {
+        let Some(workspace_id) = self.workspace_id.filter(|_| issues.is_empty()) else {
             return Err(ConfigError::Invalid {
                 path: origin.to_path_buf(),
                 issues,
@@ -482,9 +490,8 @@ impl McpConfig {
         };
         Ok(McpRuntime {
             api_url: self.api_url.clone().unwrap_or_else(|| DEFAULT_MCP_API_URL.to_string()),
-            bot_token: bot_token.clone(),
+            bot_token: self.bot_token.clone(),
             workspace_id,
-            auth_token: self.auth_token.clone(),
             transport: self.transport,
             bind_addr: self
                 .bind_addr
@@ -499,9 +506,10 @@ impl McpConfig {
 #[derive(Clone, Debug)]
 pub struct McpRuntime {
     pub api_url: String,
-    pub bot_token: Secret,
+    /// The configured identity. `None` is normal for an `http`/`sse` deployment, which never
+    /// speaks to the API as itself; a command that does need one says so by name.
+    pub bot_token: Option<Secret>,
     pub workspace_id: Uuid,
-    pub auth_token: Option<Secret>,
     pub transport: McpTransport,
     pub bind_addr: String,
     pub invocation_id: Option<String>,
