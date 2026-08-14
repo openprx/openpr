@@ -95,7 +95,7 @@ being silently ignored.
 | `[storage]` | api | `backend` — `local` \| `s3` (`local`), `dir` (`./uploads`); `[storage.s3]` with `endpoint`, `bucket`, `region` (`us-east-1`), `access_key_id`, `secret_access_key`, `session_token`, required only when `backend = "s3"` and left unread otherwise |
 | `[migrations]` | api | `replay` (`false`), `continue_on_error` (`false`) — both are escape hatches; turn one on deliberately, then turn it back off |
 | `[outbound]` | api, worker | `allowed_hosts` — a TOML **array of strings** (`[]`), `allow_private` (`false`) |
-| `[mcp]` | mcp-server | `api_url` (`http://localhost:8081`), `bot_token` (**required**, `opr_` prefix), `workspace_id` (**required**, real non-nil UUID), `auth_token` (inbound bearer token, minimum 16 characters), `transport` — `stdio` \| `http` \| `sse` (`stdio`), `bind_addr` (`127.0.0.1:8090`), `invocation_id` (optional ledger correlation id) |
+| `[mcp]` | mcp-server | `api_url` (`http://localhost:8081`), `bot_token` (`opr_` prefix; **required** for `stdio` and the CLI subcommands, unused by `http`/`sse`), `workspace_id` (**required**, real non-nil UUID), `transport` — `stdio` \| `http` \| `sse` (`stdio`), `bind_addr` (`127.0.0.1:8090`), `invocation_id` (optional ledger correlation id) |
 | `[connectors.secrets."<workspace-uuid>"]` | api, worker | One table per workspace, `NAME = "value"` |
 
 > **Eager shape, lazy presence.** Every value the file *does* contain is
@@ -180,12 +180,22 @@ without those sections a valid one.
 Both generated files are `chmod 600` and hold real secrets. **Do not commit
 them.**
 
-Host-side helper scripts — `scripts/test-mcp.sh`,
-`scripts/bootstrap-restaurant-demo.sh` and
-`skills/openpr-mcp/scripts/validate-mcp.sh` — read `mcp.auth_token` out of
-`config/openpr.compose.mcp.toml`; point them at another file with
-`OPENPR_CONFIG_FILE`, or override the token for the script itself by exporting
-`OPENPR_MCP_AUTH_TOKEN`.
+Host-side helper scripts call the MCP HTTP endpoints as a workspace bot,
+because that is the only way in — there is no shared inbound secret. The bot has
+to be one of `mcp.workspace_id`, the workspace the server scopes its API calls
+to; a bot from anywhere else is answered *bot not authorized for this
+workspace*. `mcp.bot_token` in the same file is by construction that bot, so
+that is what they read, and `OPENPR_MCP_BOT_TOKEN` overrides it everywhere:
+
+- `scripts/test-mcp.sh` and `skills/openpr-mcp/scripts/validate-mcp.sh` read
+  `mcp.bot_token` out of `config/openpr.compose.mcp.toml`; point them at another
+  file with `OPENPR_CONFIG_FILE`. Both refuse the `opr_local_…` placeholder
+  `scripts/start.sh` generates rather than sending it and reporting a 401.
+- `scripts/bootstrap-restaurant-demo.sh` is what replaces that placeholder: it
+  creates the workspace and the bot through the API, writes both into the file,
+  recreates the `mcp-server` container, then verifies `/mcp/rpc` as the bot it
+  just created. `scripts/e2e-test.sh` runs it between the API and MCP test
+  steps for exactly that reason.
 
 **Consumed only by docker-compose**, never read by the Rust binaries:
 `POSTGRES_PASSWORD` (the `postgres:16` image initialises itself from it, so it
@@ -300,22 +310,26 @@ Only `--transport http` serves all three surfaces on one port.
 | **stdio** | `serve --transport stdio` | stdin/stdout JSON-RPC                                    |
 | **SSE**   | `serve --transport sse`   | `GET /sse`, `POST /messages`, `/health` — **no** `/mcp/rpc` |
 
-> **Security — the MCP HTTP/SSE endpoints are guarded by `mcp.auth_token`.**
+> **Security — an MCP HTTP/SSE request is made as its own caller.**
 >
-> When `mcp.auth_token` is set (minimum 16 characters), `/mcp/rpc`, `/sse` and
-> `/messages` require `Authorization: Bearer <token>` and reject everything
-> else; `/health` is exempt so healthchecks keep working. The check is
-> fail-closed: if the bind address is not a loopback address and no token is
-> configured, the server **refuses to start** rather than serving an open port.
-> A loopback bind without a token stays open to anything local, which is why
-> `docker-compose.yml` still publishes the port on
-> `${OPENPR_BIND_HOST:-127.0.0.1}` and requires the token for the container's
-> `0.0.0.0:8090` bind.
+> `/mcp/rpc`, `/sse` and `/messages` require `Authorization: Bearer <opr_ bot
+> token>` and reject everything else with 401; `/health` is exempt so
+> healthchecks keep working. There is no shared inbound secret and no
+> configuration that relaxes this: the server holds no identity of its own on
+> these transports, forwards the token the request presented to the API
+> unchanged, and lets the API authenticate it. Every call is therefore made by a
+> named bot, and the audit trail records that bot rather than the server.
 >
-> The token is a single shared secret, not a per-caller identity: everyone
-> holding it acts under the server's bot token, with full access to its
-> workspace. Treat it as one trust boundary and put your own authenticating
-> proxy in front when different callers need different rights.
+> Because an unauthenticated caller can reach nothing but `/health`, binding a
+> reachable address publishes no anonymous surface — which is what lets the
+> compose container bind `0.0.0.0:8090` with no secret in its configuration file
+> at all. `mcp.auth_token` was the old shared secret and **has been removed**: a
+> configuration file that still carries the key is refused at startup, so delete
+> the line rather than leaving it for later.
+>
+> `mcp.bot_token` still names the identity for `stdio` and for the CLI
+> subcommands, which have no per-request header to read one from. It is unused
+> by `http` and `sse`.
 
 ### Bot tokens
 
@@ -348,31 +362,48 @@ happens to launch the process in.
 > anything secret: a token in `argv` is readable by any local process through
 > `/proc`.
 
+### Client configuration — HTTP/SSE
+
+One shared server, many callers: the token belongs to the client, not to the
+server, so each client puts **its own** bot token in the header.
+
+```json
+{
+  "mcpServers": {
+    "openpr": {
+      "type": "http",
+      "url": "http://localhost:8090/mcp/rpc",
+      "headers": { "Authorization": "Bearer opr_your_own_workspace_bot_token" }
+    }
+  }
+}
+```
+
 HTTP — plain JSON-RPC; passing `params.project_id` returns the
 project-capability-filtered tool set. SSE — open the stream, POST to the session
 endpoint it returns, and the response arrives back on the stream as
 `event: message`.
 
 ```bash
-# The Authorization header is required whenever the server was started with a token.
-# This shell variable is a convenience for curl, not application configuration: the
-# value is whatever `mcp.auth_token` says in the server's configuration file (under
-# compose, config/openpr.compose.mcp.toml).
-export OPENPR_MCP_AUTH_TOKEN=your_mcp_auth_token
+# The Authorization header is mandatory on every one of these; only /health is exempt.
+# This shell variable is a convenience for curl, not application configuration: the value
+# is your own workspace bot token, created under Workspace → Members → Bot Tokens. The
+# server forwards it to the API unchanged and the call is made as that bot.
+export OPENPR_MCP_BOT_TOKEN=opr_your_own_workspace_bot_token
 
 curl -X POST http://localhost:8090/mcp/rpc -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
+  -H "Authorization: Bearer $OPENPR_MCP_BOT_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 curl -X POST http://localhost:8090/mcp/rpc -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
+  -H "Authorization: Bearer $OPENPR_MCP_BOT_TOKEN" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"project_id":"<project-uuid>"}}'
 
 curl -N -H "Accept: text/event-stream" \
-  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" http://localhost:8090/sse
+  -H "Authorization: Bearer $OPENPR_MCP_BOT_TOKEN" http://localhost:8090/sse
 # → event: endpoint / data: /messages?session_id=<uuid>
 curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
+  -H "Authorization: Bearer $OPENPR_MCP_BOT_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 

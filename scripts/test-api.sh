@@ -22,10 +22,13 @@ API_URL="${API_URL:-http://localhost:8081}"
 ADMIN_EMAIL="${OPENPR_ADMIN_EMAIL:-}"
 ADMIN_PASSWORD="${OPENPR_ADMIN_PASSWORD:-}"
 
-# Unique per run so the script can be re-run against the same database.
+# Unique per run so the script can be re-run against the same database. A caller that has to name
+# the account afterwards pins it instead: on a freshly reset database this is the first account,
+# which makes it the admin, and scripts/e2e-test.sh hands it to
+# scripts/bootstrap-restaurant-demo.sh, which has to log in as somebody to create the MCP bot.
 RUN_ID="$(date +%s)-$$"
-TEST_EMAIL="test-${RUN_ID}@example.com"
-TEST_PASSWORD="TestPassword123!"
+TEST_EMAIL="${OPENPR_TEST_EMAIL:-test-${RUN_ID}@example.com}"
+TEST_PASSWORD="${OPENPR_TEST_PASSWORD:-TestPassword123!}"
 
 echo "🧪 Starting API Integration Tests"
 echo "API URL: $API_URL"

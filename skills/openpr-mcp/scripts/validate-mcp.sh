@@ -1,9 +1,9 @@
 #!/bin/bash
 # Quick smoke test for OpenPR MCP server connectivity
 # Usage: ./validate-mcp.sh [http://localhost:8090] [project-uuid]
-# Reads the MCP bearer token from the TOML configuration file (mcp.auth_token), by default
-# config/openpr.compose.mcp.toml in the repository root; override the file with
-# OPENPR_CONFIG_FILE, or the token itself with OPENPR_MCP_AUTH_TOKEN.
+# Calls the server as a workspace bot. The token is read from mcp.bot_token in the TOML
+# configuration file, by default config/openpr.compose.mcp.toml in the repository root; override
+# the file with OPENPR_CONFIG_FILE, or the token itself with OPENPR_MCP_BOT_TOKEN.
 
 MCP_URL="${1:-http://localhost:8090}"
 PROJECT_ID="${2:-}"
@@ -39,28 +39,45 @@ if isinstance(node, str):
 '
 }
 
-# /mcp/rpc, /sse and /messages require a bearer token when the server was configured with
-# mcp.auth_token; /health is exempt. The token is never passed as an argument so it does not end
-# up in the process list. OPENPR_MCP_AUTH_TOKEN is an operator override for whoever runs this
-# script by hand; it is not application config, the binaries only read the TOML file.
-MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
-if [ -z "$MCP_AUTH_TOKEN" ]; then
-  MCP_AUTH_TOKEN="$(read_config_value mcp.auth_token "$CONFIG_FILE")"
+# /mcp/rpc, /sse and /messages are served as the caller that made the request: there is no shared
+# inbound secret, every request presents its own workspace bot token in `Authorization: Bearer
+# opr_...`, and the MCP server forwards that token to the API, which authenticates it. /health is
+# exempt and stays unauthenticated.
+#
+# mcp.bot_token is the natural source here: it is already a workspace bot token of this
+# deployment — the identity the stdio transport runs as — so this smoke test can call the HTTP
+# transport as somebody without credentials of its own, an API round trip, or a second account.
+# OPENPR_MCP_BOT_TOKEN overrides it for whoever wants to validate as a different bot.
+MCP_BOT_TOKEN="${OPENPR_MCP_BOT_TOKEN:-}"
+if [ -z "$MCP_BOT_TOKEN" ]; then
+  MCP_BOT_TOKEN="$(read_config_value mcp.bot_token "$CONFIG_FILE")"
 fi
-if [ -z "$MCP_AUTH_TOKEN" ]; then
-  echo "❌ No MCP bearer token available"
-  echo "   The MCP server rejects /mcp/rpc without 'Authorization: Bearer <token>'."
-  echo "   Set mcp.auth_token in $CONFIG_FILE, or export OPENPR_MCP_AUTH_TOKEN"
-  echo "   (bash scripts/start.sh generates the configuration on first run)."
+if [ -z "$MCP_BOT_TOKEN" ]; then
+  echo "❌ No MCP caller bot token available"
+  echo "   The MCP server rejects /mcp/rpc without 'Authorization: Bearer <opr_ bot token>'."
+  echo "   Set mcp.bot_token in $CONFIG_FILE, or export OPENPR_MCP_BOT_TOKEN."
+  echo "   Create one under Workspace → Members → Bot Tokens, or run"
+  echo "   scripts/bootstrap-restaurant-demo.sh, which mints one and writes it into that file."
   exit 1
 fi
+case "$MCP_BOT_TOKEN" in
+  # What scripts/start.sh generates so the container passes validation and starts. It names no
+  # account, so every authenticated call below would come back 401 without an explanation.
+  opr_local_*)
+    echo "❌ mcp.bot_token in $CONFIG_FILE is still the bootstrap placeholder scripts/start.sh wrote"
+    echo "   It belongs to no workspace, so the API rejects it. Run"
+    echo "   scripts/bootstrap-restaurant-demo.sh to replace it with a real bot token, or export"
+    echo "   OPENPR_MCP_BOT_TOKEN."
+    exit 1
+    ;;
+esac
 
 echo "Testing MCP at $MCP_URL ..."
 
 # tools/list
 TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Authorization: Bearer $MCP_BOT_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
 
 TOOLS=$(printf '%s' "$TOOLS_RESPONSE" | \
@@ -161,7 +178,7 @@ fi
 if [ -n "$PROJECT_ID" ]; then
   PROJECT_TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+    -H "Authorization: Bearer $MCP_BOT_TOKEN" \
     -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"project_id\":\"$PROJECT_ID\"}}")
 
   PROJECT_TOOLS=$(printf '%s' "$PROJECT_TOOLS_RESPONSE" | \
@@ -193,13 +210,33 @@ fi
 # projects.list
 RESULT=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+  -H "Authorization: Bearer $MCP_BOT_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}')
 
-if echo "$RESULT" | grep -q '"code": 0'; then
+# The JSON-RPC envelope is what says whether the call worked; the API payload it wraps is rendered
+# as text and its shape is not this script's business. A failed tool call comes back as a normal
+# result with isError set, which is also how a rejected caller bot token arrives here, so that flag
+# is the check. Grepping the body for a pretty-printed '"code": 0' matched neither.
+if RESULT_ERROR=$(printf '%s' "$RESULT" | python3 -c '
+import json
+import sys
+
+payload = json.load(sys.stdin)
+if payload.get("error"):
+    print(json.dumps(payload["error"], ensure_ascii=False), file=sys.stderr)
+    raise SystemExit(1)
+result = payload.get("result")
+if not isinstance(result, dict):
+    print("tools/call response is missing result", file=sys.stderr)
+    raise SystemExit(1)
+if result.get("isError") is True or result.get("is_error") is True:
+    print(json.dumps(result.get("content", []), ensure_ascii=False), file=sys.stderr)
+    raise SystemExit(1)
+' 2>&1); then
   echo "✅ projects.list: success"
 else
   echo "❌ projects.list failed"
+  echo "$RESULT_ERROR"
   exit 1
 fi
 

@@ -103,9 +103,12 @@ services:
     # deployment, not to the file. A flag wins over the file, so the compose stack serves HTTP on
     # 8090 whatever [mcp] transport says.
     #
-    # The inbound bearer token is NOT a flag: argv is readable by any local process through /proc.
-    # It lives in mcp.auth_token in the mounted file, and the server refuses to start on a
-    # non-loopback bind without it.
+    # Nothing here holds an inbound secret, because there is none: the http transport serves every
+    # request as the caller that made it, and a caller identifies itself with its own workspace bot
+    # token in `Authorization: Bearer opr_...`, which this server forwards to the api service for
+    # authentication. A request without one is refused with 401, so binding 0.0.0.0 inside the
+    # compose network publishes no anonymous surface; only /health answers unauthenticated, which
+    # is what the healthcheck below needs.
     command:
       - "/app/mcp-server"
       - "serve"

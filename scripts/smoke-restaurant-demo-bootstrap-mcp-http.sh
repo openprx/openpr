@@ -134,8 +134,8 @@ wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
 # What this smoke proves is that the bootstrap hands the MCP server usable credentials, so the
 # file it writes them into is the temporary one below rather than the repository's. It has to
 # exist before the first bootstrap run: OPENPR_DEMO_WRITE_CONFIG=1 rewrites [mcp] in place and
-# never creates the file. auth_token is set because the second run verifies /mcp/rpc, which
-# refuses a request that carries no bearer token. The value is written, never printed.
+# never creates the file. It carries no inbound secret: the second run verifies /mcp/rpc as the
+# demo bot it created, and a file that still stated auth_token would stop the server from starting.
 cat >"$MCP_CONFIG" <<EOF
 [logging]
 filter = "error"
@@ -143,7 +143,6 @@ format = "text"
 
 [mcp]
 api_url = "http://127.0.0.1:$API_PORT"
-auth_token = "$(openssl rand -hex 16)"
 EOF
 
 OPENPR_API_URL="http://127.0.0.1:$API_PORT" \

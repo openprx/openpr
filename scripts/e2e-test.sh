@@ -123,8 +123,30 @@ fi
 echo ""
 
 # Step 3: Run API tests
+# The account is pinned rather than left random because step 3b needs to log in as it: the
+# database was reset in step 0, so this registration is the first one and the account it creates
+# is the admin, and registration is admin-only from here on.
+E2E_ACCOUNT_EMAIL="e2e-$(date +%s)-$$@example.com"
+E2E_ACCOUNT_PASSWORD="TestPassword123!"
+
 echo "📋 Step 3: Running API Integration Tests"
+OPENPR_TEST_EMAIL="$E2E_ACCOUNT_EMAIL" \
+OPENPR_TEST_PASSWORD="$E2E_ACCOUNT_PASSWORD" \
 bash "$PROJECT_ROOT/scripts/test-api.sh"
+echo ""
+
+# Step 3b: Give the MCP server a real workspace and a real bot to be reached as.
+# There is no shared inbound secret any more: an MCP HTTP request is served as the bot whose token
+# it presents, and that bot has to belong to the workspace the server is bound to through
+# mcp.workspace_id. Step 1 wrote placeholders for both, which name nothing. This bootstrap creates
+# the workspace and the bot through the API, writes the pair into
+# config/openpr.compose.mcp.toml, and recreates the mcp-server container so it picks them up —
+# after which step 4 can authenticate as that bot.
+echo "📋 Step 3b: Seeding a workspace and the MCP bot the server is reached as"
+OPENPR_DEMO_EMAIL="$E2E_ACCOUNT_EMAIL" \
+OPENPR_DEMO_PASSWORD="$E2E_ACCOUNT_PASSWORD" \
+OPENPR_DEMO_VERIFY_MCP_HTTP=1 \
+bash "$PROJECT_ROOT/scripts/bootstrap-restaurant-demo.sh"
 echo ""
 
 # Step 4: Run MCP tests

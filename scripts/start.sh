@@ -212,13 +212,14 @@ api_url = "http://api:8080"
 # Bootstrap placeholders that satisfy validation so the container starts. They are NOT credentials
 # of a real workspace yet -- scripts/bootstrap-restaurant-demo.sh replaces both with a bot token
 # it creates through the API, then recreates this service.
+# bot_token is what the stdio transport and the CLI subcommands act as. docker-compose.yml serves
+# http, where it is unused: every inbound request carries its own caller's bot token in
+# `Authorization: Bearer opr_...` and the server forwards that one to the API.
 bot_token = "opr_local_$(random_hex 24)"
 workspace_id = "$(random_uuid)"
 
-# Bearer token inbound HTTP/SSE callers must present. Required here because the compose container
-# binds 0.0.0.0:8090 so the other services can reach it, and the server refuses a non-loopback
-# bind without one. /health stays open so the healthcheck keeps working.
-auth_token = "$(random_hex 32)"
+# There is no inbound shared secret. An http/sse request without a caller bot token is refused
+# with 401; /health stays open so the healthcheck keeps working.
 
 # transport and bind_addr are supplied as flags by docker-compose.yml, which wins over this file.
 transport = "stdio"
@@ -261,12 +262,22 @@ SCHEMA = {
         "api_url",
         "bot_token",
         "workspace_id",
-        "auth_token",
         "transport",
         "bind_addr",
         "invocation_id",
     },
     "connectors": {"secrets"},
+}
+# Keys the binaries used to accept and now reject outright. A file that still carries one is not a
+# file with a stale comment in it: the process refuses to start, so this has to be reported as the
+# removal it is, with the edit that fixes it, rather than as a generic unknown key.
+RETIRED = {
+    ("mcp", "auth_token"): (
+        "the shared inbound secret has been removed and the MCP server refuses to start while the key "
+        "is present. An http/sse caller now presents its own workspace bot token in the "
+        "Authorization: Bearer opr_... header, which the server forwards to the API unchanged. "
+        "Fix: delete the auth_token line from the [mcp] section"
+    ),
 }
 S3_KEYS = {"endpoint", "bucket", "region", "access_key_id", "secret_access_key", "session_token"}
 PLACEHOLDERS = ("${", "replace_with", "change-me-in-production")
@@ -291,7 +302,7 @@ def load(path, label):
     return None
 
 
-def check_keys(data, label):
+def check_keys(data, label, path):
     for section, value in data.items():
         if section not in SCHEMA:
             issues.append(f"{label}: unknown section [{section}]; the binaries reject unknown keys")
@@ -302,7 +313,10 @@ def check_keys(data, label):
         if section == "connectors":
             continue
         for key in value:
-            if key not in SCHEMA[section]:
+            retired = RETIRED.get((section, key))
+            if retired is not None:
+                issues.append(f"{label}: {section}.{key} is retired: {retired} of {path}")
+            elif key not in SCHEMA[section]:
                 issues.append(f"{label}: unknown key {section}.{key}; the binaries reject unknown keys")
     for key in data.get("storage", {}).get("s3", {}):
         if key not in S3_KEYS:
@@ -318,12 +332,14 @@ def get(data, section, key):
     return value.get(key) if isinstance(value, dict) else None
 
 
-app = load(os.environ["OPENPR_APP_CONFIG"], "api/worker config")
-mcp = load(os.environ["OPENPR_MCP_CONFIG"], "mcp config")
+app_path = os.environ["OPENPR_APP_CONFIG"]
+mcp_path = os.environ["OPENPR_MCP_CONFIG"]
+app = load(app_path, "api/worker config")
+mcp = load(mcp_path, "mcp config")
 
 if app is not None:
     label = "api/worker config"
-    check_keys(app, label)
+    check_keys(app, label, app_path)
     url = get(app, "database", "url")
     if url is None:
         issues.append(f"{label}: database.url is required by the api and the worker")
@@ -348,7 +364,7 @@ if app is not None:
 
 if mcp is not None:
     label = "mcp config"
-    check_keys(mcp, label)
+    check_keys(mcp, label, mcp_path)
     if "database" in mcp or "auth" in mcp:
         issues.append(
             f"{label}: carries [database] or [auth]; the MCP server needs neither and must not "
@@ -357,13 +373,15 @@ if mcp is not None:
     api_url = get(mcp, "mcp", "api_url")
     if api_url is not None and not (concrete(api_url) and api_url.startswith(("http://", "https://"))):
         issues.append(f"{label}: mcp.api_url must be an http:// or https:// URL")
+    # bot_token is the identity of the stdio transport and of the CLI subcommands. The compose
+    # stack serves http, where it is unused and may be absent: each request brings the bot token of
+    # the caller that made it. Only the shape is checked, and only when the file states one.
     token = get(mcp, "mcp", "bot_token")
-    if token is None:
-        issues.append(f"{label}: mcp.bot_token is required to run the MCP server")
-    elif not concrete(token):
-        issues.append(f"{label}: mcp.bot_token is empty or still a placeholder")
-    elif not token.strip().startswith("opr_"):
-        issues.append(f"{label}: mcp.bot_token must use the opr_ token prefix")
+    if token is not None:
+        if not concrete(token):
+            issues.append(f"{label}: mcp.bot_token is empty or still a placeholder")
+        elif not token.strip().startswith("opr_"):
+            issues.append(f"{label}: mcp.bot_token must use the opr_ token prefix")
     workspace = get(mcp, "mcp", "workspace_id")
     if workspace is None:
         issues.append(f"{label}: mcp.workspace_id is required to run the MCP server")
@@ -371,16 +389,6 @@ if mcp is not None:
         issues.append(f"{label}: mcp.workspace_id must be a UUID")
     elif workspace.strip() == NIL_UUID:
         issues.append(f"{label}: mcp.workspace_id must not be the nil UUID placeholder")
-    auth_token = get(mcp, "mcp", "auth_token")
-    if auth_token is None:
-        issues.append(
-            f"{label}: mcp.auth_token is required; the compose container binds 0.0.0.0:8090 and "
-            "the server refuses a non-loopback bind without an inbound token"
-        )
-    elif not concrete(auth_token):
-        issues.append(f"{label}: mcp.auth_token is empty or still a placeholder")
-    elif len(auth_token.strip()) < 16:
-        issues.append(f"{label}: mcp.auth_token must be at least 16 characters")
 
 # The postgres image runs initdb once, from POSTGRES_PASSWORD. If database.url disagrees with it
 # the stack builds, starts, and then fails every query with an authentication error.

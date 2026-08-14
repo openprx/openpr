@@ -33,9 +33,9 @@ Environment:
                                 Values: auto, 1, 0. Default: auto.
   OPENPR_DEMO_MCP_URL           MCP JSON-RPC URL.
                                 Default: http://localhost:8090/mcp/rpc
-  OPENPR_MCP_AUTH_TOKEN         Bearer token for the MCP JSON-RPC endpoint.
-                                Read from mcp.auth_token in the configuration file
-                                when unset.
+  OPENPR_MCP_BOT_TOKEN          Workspace bot token the MCP JSON-RPC verification calls
+                                as. Defaults to the demo bot this run created, which is
+                                what makes the verification prove the demo bot works.
 
 This is a local onboarding helper, not a production seeding tool.
 EOF
@@ -90,13 +90,12 @@ if isinstance(node, str):
 '
 }
 
-# The MCP verification below posts to /mcp/rpc, which requires a bearer token when the server was
-# configured with mcp.auth_token. /health is exempt and stays unauthenticated.
-# OPENPR_MCP_AUTH_TOKEN is an operator override for this script, not application configuration.
-MCP_AUTH_TOKEN="${OPENPR_MCP_AUTH_TOKEN:-}"
-if [ -z "$MCP_AUTH_TOKEN" ]; then
-  MCP_AUTH_TOKEN="$(read_config_value mcp.auth_token "$DEMO_CONFIG_PATH")"
-fi
+# The MCP verification below posts to /mcp/rpc, which is served as whoever called it: the request
+# carries a workspace bot token in `Authorization: Bearer opr_...` and the MCP server forwards it
+# to the API. There is no shared inbound secret. /health is exempt and stays unauthenticated.
+# The default identity is the demo bot this run creates or reuses, so the verification proves the
+# credentials it just wrote actually work; OPENPR_MCP_BOT_TOKEN overrides it for this script only.
+MCP_CALLER_BOT_TOKEN="${OPENPR_MCP_BOT_TOKEN:-}"
 
 # Credentials already in the file. When they still address the demo workspace the bootstrap keeps
 # them instead of minting a second bot on every run.
@@ -490,7 +489,7 @@ OPENPR_DEMO_STATE_FILE="$DEMO_STATE_FILE" \
 OPENPR_DEMO_VERIFY_MCP_HTTP="${OPENPR_DEMO_VERIFY_MCP_HTTP:-auto}" \
 OPENPR_DEMO_MCP_URL="${OPENPR_DEMO_MCP_URL:-http://localhost:8090/mcp/rpc}" \
 OPENPR_DEMO_CONFIG_PATH="$DEMO_CONFIG_PATH" \
-OPENPR_MCP_AUTH_TOKEN="$MCP_AUTH_TOKEN" \
+OPENPR_MCP_BOT_TOKEN="$MCP_CALLER_BOT_TOKEN" \
 node --input-type=commonjs <<'NODE'
 const fs = require('fs');
 
@@ -498,7 +497,7 @@ const verifyMode = process.env.OPENPR_DEMO_VERIFY_MCP_HTTP ?? 'auto';
 const mcpUrl = process.env.OPENPR_DEMO_MCP_URL ?? 'http://localhost:8090/mcp/rpc';
 const stateFile = process.env.OPENPR_DEMO_STATE_FILE;
 const configPath = process.env.OPENPR_DEMO_CONFIG_PATH ?? 'config/openpr.compose.mcp.toml';
-const mcpAuthToken = process.env.OPENPR_MCP_AUTH_TOKEN ?? '';
+const overrideBotToken = process.env.OPENPR_MCP_BOT_TOKEN ?? '';
 
 if (verifyMode === '0' || verifyMode === 'false') {
   console.log('MCP HTTP verification skipped: OPENPR_DEMO_VERIFY_MCP_HTTP=0');
@@ -560,10 +559,14 @@ function extractTextContent(payload) {
 }
 
 async function verify() {
-  if (!mcpAuthToken) {
-    const message = 'MCP HTTP verification needs OPENPR_MCP_AUTH_TOKEN: /mcp/rpc rejects requests without an Authorization: Bearer header';
+  // The demo bot this run created or reused. It is the caller identity the verification asserts
+  // with, so a 401 here means the credentials just written into the MCP configuration file are
+  // not usable — which is the failure this whole check exists to catch.
+  const callerBotToken = overrideBotToken || state.mcp_bot_token || '';
+  if (!callerBotToken) {
+    const message = 'MCP HTTP verification has no caller bot token: /mcp/rpc rejects a request without an Authorization: Bearer opr_... header';
     if (verifyMode === '1') throw new Error(message);
-    console.log(`${message}. Set mcp.auth_token in ${configPath}, or export OPENPR_MCP_AUTH_TOKEN (bash scripts/start.sh generates one).`);
+    console.log(`${message}. The demo bootstrap normally supplies the demo bot it created; export OPENPR_MCP_BOT_TOKEN to name another one.`);
     return;
   }
 
@@ -580,7 +583,7 @@ async function verify() {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Authorization: `Bearer ${mcpAuthToken}`,
+      Authorization: `Bearer ${callerBotToken}`,
     },
     body: JSON.stringify({
       jsonrpc: '2.0',
@@ -590,10 +593,12 @@ async function verify() {
     }),
   }, 5000);
   if (response.status === 401 || response.status === 403) {
-    throw new Error(`MCP HTTP verification was rejected with ${response.status}: the bearer token does not match the one the MCP server runs with. Recreate mcp-server after changing mcp.auth_token in ${configPath}.`);
+    throw new Error(`MCP HTTP verification was rejected with ${response.status}: the API refused the demo bot token this run presented. The MCP server forwards the caller token unchanged, so check that the bot still exists in the demo workspace named by mcp.workspace_id in ${configPath}.`);
   }
   const payload = await response.json();
-  if (!response.ok || payload.error || payload?.result?.is_error === true) {
+  // The wire field is isError; is_error is accepted too so the check survives a serialisation
+  // change rather than quietly passing every failed call.
+  if (!response.ok || payload.error || payload?.result?.isError === true || payload?.result?.is_error === true) {
     throw new Error(`MCP HTTP projects.list failed: ${JSON.stringify(payload)}`);
   }
 
