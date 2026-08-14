@@ -440,6 +440,18 @@ async fn handle_sse_message(
         return (StatusCode::NOT_FOUND, Json(json!({"error": "Unknown SSE session_id"})));
     };
 
+    // Asked before the call runs, not after it: `handle_request` performs the tool's side
+    // effect, so running one whose answer has nowhere to go leaves the caller holding a
+    // refusal for work that was in fact done — and a refusal is exactly what makes a client
+    // retry, which performs the effect a second time.
+    if sender.is_closed() {
+        state.sessions.lock().await.remove(&query.session_id);
+        return (StatusCode::GONE, Json(json!({"error": "SSE session is closed"})));
+    }
+
+    // Kept for the log below, because `handle_request` consumes the request. A method name
+    // is a protocol constant, never a credential or an argument.
+    let method = req.method.clone();
     let server = McpServer::new(state.client.acting_as(caller.0));
     let response = server.handle_request(req).await;
     let Some(response) = response else {
@@ -457,6 +469,17 @@ async fn handle_sse_message(
     };
 
     if sender.send(SseServerEvent::Message(response_json)).is_err() {
+        // The check above narrows this window but cannot close it: the client may drop its
+        // stream at any instant *while* the call is running, and nothing in this process can
+        // hold that connection open or take back a side effect the API has already applied.
+        // What is left is the honest report of it — the call ran, and its result died here.
+        // Logged rather than dropped silently, so "done but never acknowledged" is something
+        // an operator can find when a caller retries and the effect appears twice.
+        tracing::warn!(
+            session_id = %query.session_id,
+            method = %method,
+            "SSE stream closed while its message was in flight: the call ran, but its result could not be delivered"
+        );
         state.sessions.lock().await.remove(&query.session_id);
         return (StatusCode::GONE, Json(json!({"error": "SSE session is closed"})));
     }
@@ -609,6 +632,128 @@ mod tests {
         let at_limit = "x".repeat(MAX_CALLER_TOKEN_LEN);
         let extracted = caller_token(&headers(&[(header::AUTHORIZATION, &format!("Bearer {at_limit}"))]));
         assert_eq!(extracted.as_ref().map(Secret::expose), Some(at_limit.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod sse_delivery_tests {
+    use super::{CallerToken, MessagesQuery, SseServerEvent, SseState, handle_sse_message};
+    use crate::client::{ClientConfig, OpenPrClient};
+    use crate::protocol::JsonRpcRequest;
+    use axum::{
+        Extension, Json,
+        extract::{Query, State},
+        http::StatusCode,
+        response::IntoResponse,
+    };
+    use platform::config::Secret;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{Mutex, mpsc};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    const CALLER_TOKEN: &str = "opr_caller_bot_token_example";
+    const WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
+
+    /// A counting stand-in for the `OpenPR` API.
+    ///
+    /// One accepted connection is one outbound call this process made, which is what "the
+    /// tool ran" looks like from outside it. Asserting on the count rather than on the
+    /// answer is the point: a tool that ran and whose result was then thrown away leaves no
+    /// trace in this process at all, only at the API it already called.
+    async fn counting_api() -> Result<(String, Arc<AtomicUsize>), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+
+        tokio::spawn(async move {
+            const BODY: &[u8] = br#"{"code":0,"message":"ok","data":[]}"#;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut scratch = [0_u8; 2048];
+                let _ = socket.read(&mut scratch).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    BODY.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(BODY).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        Ok((format!("http://{addr}"), calls))
+    }
+
+    /// A message posted onto a session whose stream is gone is refused *before* its tool runs.
+    ///
+    /// The state is built here rather than reached through a real client, because a client
+    /// that drops its connection has its receiver dropped and its registry entry reaped
+    /// within microseconds of each other: end to end, the message lands on the "unknown
+    /// session" branch and never exercises this one. Registered sender, dead receiver is
+    /// nonetheless the state the ordering is about — it is what every in-flight message
+    /// passes through — and running the call in it performs the tool's side effect and then
+    /// answers `410`, which tells the caller nothing happened when something did, and invites
+    /// the retry that does it twice.
+    #[tokio::test]
+    async fn a_message_for_a_stream_that_is_gone_is_refused_before_its_tool_runs() -> TestResult {
+        let (api_url, calls) = counting_api().await?;
+        let client = OpenPrClient::new(ClientConfig {
+            base_url: api_url,
+            credential: None,
+            workspace_id: WORKSPACE.to_string(),
+            invocation_id: None,
+            transport_label: "sse",
+        })
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+
+        let (tx, rx) = mpsc::unbounded_channel::<SseServerEvent>();
+        drop(rx);
+        let session_id = "5f6a1a3c-0f4d-4a2e-9a1b-6d2f5c8e7b40".to_string();
+        let mut registry = HashMap::new();
+        registry.insert(session_id.clone(), tx);
+        let sessions = Arc::new(Mutex::new(registry));
+
+        let state = SseState {
+            client,
+            sessions: Arc::clone(&sessions),
+        };
+        let refusal = handle_sse_message(
+            State(state),
+            Extension(CallerToken(Secret::new(CALLER_TOKEN))),
+            Query(MessagesQuery {
+                session_id: session_id.clone(),
+            }),
+            Json(JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(json!(1)),
+                method: "tools/call".to_string(),
+                params: Some(json!({ "name": "projects.list", "arguments": {} })),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            refusal.status(),
+            StatusCode::GONE,
+            "a message for a stream that cannot receive its answer was not refused"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the tool ran for a stream that could not be told what it did"
+        );
+        assert!(
+            sessions.lock().await.is_empty(),
+            "the dead session was left in the registry to be found again"
+        );
+        Ok(())
     }
 }
 

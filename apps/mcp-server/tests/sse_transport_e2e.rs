@@ -620,16 +620,24 @@ async fn an_unknown_session_id_is_refused_and_never_reaches_the_backend() -> Tes
     server.shutdown().await
 }
 
-/// A message posted after its stream is gone is refused rather than accepted.
+/// A message posted after its stream is gone is refused, and its tool never runs.
 ///
 /// Both refusals are correct and the server can legitimately answer either: dropping the
 /// connection makes the receiver unreachable (`410`, "the stream is closed") *and* schedules
 /// the session's removal from the registry (`404`, "no such stream"), and which one a message
-/// observes depends on which lands first. What must never happen is `202` — an acknowledgement
-/// for an answer that can no longer be delivered anywhere.
+/// observes depends on which lands first. So the status code is not what is pinned down here.
+/// What is, is the backend: whichever refusal the server picks, the tool behind the message
+/// must not have run. `202` would be the loud version of the same failure — an
+/// acknowledgement for an answer that can no longer be delivered anywhere — but the quiet
+/// version is worse: a refusal handed back for work that was in fact performed, which reads
+/// to the caller as "nothing happened" and invites the retry that performs it again.
+///
+/// Everything posted before the refusal is an `initialize`, which the server answers out of
+/// its own head, so a single outbound call at the end of this test can only have come from
+/// the `tools/call` that was posted to a session already known to be gone.
 #[tokio::test]
 async fn a_message_posted_after_its_stream_closed_is_refused_not_acknowledged() -> TestResult {
-    let (api_url, _probe) = spawn_api().await?;
+    let (api_url, probe) = spawn_api().await?;
     let bind_addr = free_bind_addr().await?;
     let server = SseServer::spawn(&api_url, &bind_addr)?;
     let client = reqwest::Client::new();
@@ -681,6 +689,28 @@ async fn a_message_posted_after_its_stream_closed_is_refused_not_acknowledged() 
     assert!(
         error == "SSE session is closed" || error == "Unknown SSE session_id",
         "the refusal does not explain that the session is gone: {last_body}"
+    );
+
+    // The server has now demonstrably noticed the closure, so this call is posted to a
+    // session it already knows it cannot answer. Refusing it is only half the job: the
+    // refusal has to arrive without the tool having run, because a tool that ran changed
+    // something at the API that this caller was just told did not happen.
+    let after_refusal = client
+        .post(&url)
+        .bearer_auth(ALICE_TOKEN)
+        .json(&tools_call_request(3, "projects.list", &json!({})))
+        .send()
+        .await?;
+    assert!(
+        after_refusal.status() == reqwest::StatusCode::GONE || after_refusal.status() == reqwest::StatusCode::NOT_FOUND,
+        "a tool call for a closed stream was answered {}, not a refusal",
+        after_refusal.status()
+    );
+    assert_eq!(
+        probe.call_count().await,
+        0,
+        "a message for a closed stream still ran its tool: {:?}",
+        probe.tokens_for("/").await
     );
 
     server.shutdown().await
