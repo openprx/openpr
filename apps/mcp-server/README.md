@@ -26,35 +26,44 @@ The MCP Server provides AI models with tools to interact with OpenPR's project m
 
 ### Prerequisites
 
-```bash
-# Required environment variables
-export OPENPR_API_URL="http://localhost:8081"
-export OPENPR_BOT_TOKEN="opr_your_token_here"
-export OPENPR_WORKSPACE_ID="your-workspace-uuid"
-export RUST_LOG="info"
+OpenPR reads no environment variables. Create a configuration file carrying the `[mcp]`
+section — `config/openpr.example.toml` is the full annotated reference:
+
+```toml
+[mcp]
+api_url = "http://localhost:8081"
+bot_token = "opr_your_token_here"
+workspace_id = "your-workspace-uuid"
 
 # Required for HTTP/SSE transports on any non-loopback bind address
-export OPENPR_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+auth_token = "generate with: openssl rand -hex 24"
 ```
 
-| Variable | Required | Purpose |
+Save it as `config/openpr.toml` (the default path the binary looks for) or anywhere else and
+pass `--config <path>`:
+
+```bash
+mcp-server serve --config config/openpr.toml
+```
+
+| Config key | Required | Purpose |
 | --- | --- | --- |
-| `OPENPR_API_URL` | yes | Base URL of the OpenPR API. |
-| `OPENPR_BOT_TOKEN` | yes | Workspace bot token. Authenticates this process **to** the API. |
-| `OPENPR_WORKSPACE_ID` | yes | Workspace UUID. |
-| `OPENPR_MCP_AUTH_TOKEN` | conditional | Bearer token inbound HTTP/SSE callers must present. Minimum 16 characters. See below. |
+| `mcp.api_url` | no, default `http://localhost:8081` | Base URL of the OpenPR API. |
+| `mcp.bot_token` | yes | Workspace bot token. Authenticates this process **to** the API. |
+| `mcp.workspace_id` | yes | Workspace UUID. |
+| `mcp.auth_token` | conditional | Bearer token inbound HTTP/SSE callers must present. Minimum 16 characters. See below. |
 
 ### Inbound authentication (HTTP/SSE)
 
-`OPENPR_BOT_TOKEN` authenticates this process **to** the API. It says nothing about who is
+`mcp.bot_token` authenticates this process **to** the API. It says nothing about who is
 calling **in**. Anyone who can reach the MCP port holds every permission the workspace bot
 has, so the HTTP and SSE transports authenticate their own callers:
 
-- **`OPENPR_MCP_AUTH_TOKEN` set** — every request to `/mcp/rpc`, `/sse` and `/messages`
+- **`mcp.auth_token` set** — every request to `/mcp/rpc`, `/sse` and `/messages`
   must carry `Authorization: Bearer <token>`. Anything else gets `401` with
   `WWW-Authenticate: Bearer`. The comparison is constant time.
 - **Not set, bound to loopback** (`127.0.0.1`, `[::1]`, `localhost`) — served without
-  authentication so local development is unaffected. A warning names the variable to set
+  authentication so local development is unaffected. A warning names the config key to set
   before publishing the port.
 - **Not set, bound to anything else** (`0.0.0.0`, `[::]`, a LAN address, a hostname) —
   **the process refuses to start.** This is the one combination that cannot be made safe,
@@ -64,15 +73,17 @@ has, so the HTTP and SSE transports authenticate their own callers:
 caller who completed the TCP handshake does not already know, so orchestrator probes do
 not need the shared secret.
 
-The token is read from the environment only — never a CLI flag, which would put it in
-`argv` where any local process can read it out of `/proc`. It is never logged.
+The token is read from the configuration file only — never a CLI flag, which would put it
+in `argv` where any local process can read it out of `/proc`, and never the environment,
+since the binary reads no environment variables at all. It is never logged.
 
 **stdio is unaffected**: it is a pipe pair owned by the process that spawned the server,
 so the caller is already established.
 
 ```bash
-# Authenticated HTTP call
-curl -H "Authorization: Bearer $OPENPR_MCP_AUTH_TOKEN" \
+# Authenticated HTTP call. Set MCP_AUTH_TOKEN to the mcp.auth_token value from your config file.
+MCP_AUTH_TOKEN="your_configured_mcp_auth_token"
+curl -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
      -H 'Content-Type: application/json' \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
      http://localhost:8090/mcp/rpc
@@ -88,34 +99,21 @@ cargo build -p mcp-server --release
 
 #### stdio Mode (for MCP clients)
 ```bash
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-./target/release/mcp-server serve --transport stdio
+./target/release/mcp-server serve --transport stdio --config config/openpr.toml
 ```
 
 #### HTTP Mode (for testing/debugging)
 ```bash
 # Loopback default (127.0.0.1:8090): no inbound token needed for local work.
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-./target/release/mcp-server serve --transport http
+./target/release/mcp-server serve --transport http --config config/openpr.toml
 
-# Reachable from other hosts: OPENPR_MCP_AUTH_TOKEN is mandatory, or startup fails.
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-OPENPR_MCP_AUTH_TOKEN=your_inbound_token \
-./target/release/mcp-server serve --transport http --bind-addr 0.0.0.0:8090
+# Reachable from other hosts: mcp.auth_token is mandatory in the config file, or startup fails.
+./target/release/mcp-server serve --transport http --bind-addr 0.0.0.0:8090 --config config/openpr.toml
 ```
 
 #### SSE Mode (for streaming clients)
 ```bash
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-./target/release/mcp-server serve --transport sse
+./target/release/mcp-server serve --transport sse --config config/openpr.toml
 ```
 
 ## Available Tools
@@ -178,17 +176,11 @@ OPENPR_WORKSPACE_ID=your-workspace-uuid \
 ```bash
 # Using stdin/stdout
 echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | \
-  OPENPR_API_URL=http://localhost:8081 \
-  OPENPR_BOT_TOKEN=opr_your_token_here \
-  OPENPR_WORKSPACE_ID=your-workspace-uuid \
-  ./target/release/mcp-server serve --transport stdio
+  ./target/release/mcp-server serve --transport stdio --config config/openpr.toml
 
 # Project-aware capability filtering
 echo '{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"project_id": "<project-uuid>"}}' | \
-  OPENPR_API_URL=http://localhost:8081 \
-  OPENPR_BOT_TOKEN=opr_your_token_here \
-  OPENPR_WORKSPACE_ID=your-workspace-uuid \
-  ./target/release/mcp-server serve --transport stdio
+  ./target/release/mcp-server serve --transport stdio --config config/openpr.toml
 ```
 
 ### Call a Tool
@@ -204,19 +196,13 @@ echo '{
       "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
     }
   }
-}' | OPENPR_API_URL=http://localhost:8081 \
-  OPENPR_BOT_TOKEN=opr_your_token_here \
-  OPENPR_WORKSPACE_ID=your-workspace-uuid \
-  ./target/release/mcp-server serve --transport stdio
+}' | ./target/release/mcp-server serve --transport stdio --config config/openpr.toml
 ```
 
 ### HTTP Mode Example
 ```bash
 # Start server
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-./target/release/mcp-server serve --transport http
+./target/release/mcp-server serve --transport http --config config/openpr.toml
 
 # Call tool via HTTP
 curl -X POST http://localhost:8090/mcp/rpc \
@@ -255,13 +241,18 @@ mcp-server:
     dockerfile: Dockerfile.prebuilt
     args:
       APP_BIN: mcp-server
-  environment:
-    APP_NAME: mcp-server
-    RUST_LOG: info
-    OPENPR_API_URL: http://api:8080
-    OPENPR_BOT_TOKEN: ${OPENPR_BOT_TOKEN:?set OPENPR_BOT_TOKEN for the MCP server}
-    OPENPR_WORKSPACE_ID: ${OPENPR_WORKSPACE_ID:?set OPENPR_WORKSPACE_ID for the MCP server}
-  command: ["/app/mcp-server", "serve", "--transport", "http", "--bind-addr", "0.0.0.0:8090"]
+  command:
+    - "/app/mcp-server"
+    - "serve"
+    - "--config"
+    - "/app/config/openpr.toml"
+    - "--transport"
+    - "http"
+    - "--bind-addr"
+    - "0.0.0.0:8090"
+  volumes:
+    # Carries [logging] and [mcp] only -- no database URL and no signing key reach this service.
+    - ./config/openpr.compose.mcp.toml:/app/config/openpr.toml:ro
   ports:
     - "127.0.0.1:8090:8090"
   depends_on:
@@ -271,7 +262,8 @@ mcp-server:
 
 The default compose stack uses `Dockerfile.prebuilt`, so build the release
 binary first or use `bash scripts/start.sh`, which performs that build before
-starting compose.
+starting compose. `scripts/start.sh` also generates `config/openpr.compose.mcp.toml`
+from `config/openpr.example.toml`.
 
 ## Development
 
@@ -340,24 +332,15 @@ This outputs the currently registered MCP tools with their complete JSON Schema 
 bash scripts/start.sh
 
 # Run MCP server
-OPENPR_API_URL=http://localhost:8081 \
-OPENPR_BOT_TOKEN=opr_your_token_here \
-OPENPR_WORKSPACE_ID=your-workspace-uuid \
-cargo run -p mcp-server -- serve --transport stdio
+cargo run -p mcp-server -- serve --transport stdio --config config/openpr.toml
 
 # Test with example request
 echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | \
-  OPENPR_API_URL=http://localhost:8081 \
-  OPENPR_BOT_TOKEN=opr_your_token_here \
-  OPENPR_WORKSPACE_ID=your-workspace-uuid \
-  cargo run -q -p mcp-server -- serve --transport stdio | jq '.'
+  cargo run -q -p mcp-server -- serve --transport stdio --config config/openpr.toml | jq '.'
 
 # Test project-aware tool discovery
 echo '{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"project_id": "<project-uuid>"}}' | \
-  OPENPR_API_URL=http://localhost:8081 \
-  OPENPR_BOT_TOKEN=opr_your_token_here \
-  OPENPR_WORKSPACE_ID=your-workspace-uuid \
-  cargo run -q -p mcp-server -- serve --transport stdio | jq '.'
+  cargo run -q -p mcp-server -- serve --transport stdio --config config/openpr.toml | jq '.'
 ```
 
 ### Integration with MCP Clients
@@ -367,18 +350,14 @@ The MCP server works with any MCP-compatible client:
 - MCP Inspector
 - Custom MCP clients
 
-Configure the client to use the server:
+Configure the client to use the server. The MCP server reads no environment variables, so
+the client config points `--config` at a file carrying `[mcp]` (see Prerequisites above):
 ```json
 {
   "mcpServers": {
     "openpr": {
       "command": "/path/to/mcp-server",
-      "args": ["serve", "--transport", "stdio"],
-      "env": {
-        "OPENPR_API_URL": "http://localhost:8081",
-        "OPENPR_BOT_TOKEN": "opr_your_token_here",
-        "OPENPR_WORKSPACE_ID": "your-workspace-uuid"
-      }
+      "args": ["serve", "--transport", "stdio", "--config", "/absolute/path/to/openpr.toml"]
     }
   }
 }
@@ -386,21 +365,27 @@ Configure the client to use the server:
 
 ## Troubleshooting
 
-### "OPENPR_BOT_TOKEN is required"
-Create a workspace bot token and pass it with the API URL and workspace ID:
-```bash
-export OPENPR_API_URL="http://localhost:8081"
-export OPENPR_BOT_TOKEN="opr_your_token_here"
-export OPENPR_WORKSPACE_ID="your-workspace-uuid"
+### "mcp.bot_token is required to run the MCP server"
+Create a workspace bot token and set it, along with the API URL and workspace ID, in the
+`[mcp]` section of the configuration file:
+```toml
+[mcp]
+api_url = "http://localhost:8081"
+bot_token = "opr_your_token_here"
+workspace_id = "your-workspace-uuid"
 ```
 
 ### API Connection Refused
-MCP talks to the OpenPR API, not directly to PostgreSQL. Ensure the API is
-running and `OPENPR_API_URL` points at it:
+MCP talks to the OpenPR API, not directly to PostgreSQL. Confirm the API is running, then
+point `mcp.api_url` at it in the configuration file:
 
 ```bash
 curl http://localhost:8081/health
-export OPENPR_API_URL="http://localhost:8081"
+```
+
+```toml
+[mcp]
+api_url = "http://localhost:8081"
 ```
 
 ### Tool Not Found
@@ -419,8 +404,8 @@ Use `cargo run --bin list-tools` to see all available tools and their exact name
 MCP is an API client. It does not accept arbitrary database credentials and it
 does not bypass OpenPR authorization.
 
-- Configure MCP with `OPENPR_API_URL`, `OPENPR_BOT_TOKEN`, and
-  `OPENPR_WORKSPACE_ID`.
+- Configure MCP with `mcp.api_url`, `mcp.bot_token`, and `mcp.workspace_id` in the
+  configuration file.
 - The API authenticates `opr_` bot tokens by SHA-256 token hash in
   `workspace_bots`.
 - Disabled or expired bot tokens are rejected.

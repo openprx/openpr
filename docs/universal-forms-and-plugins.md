@@ -79,15 +79,16 @@ scripts/bootstrap-restaurant-demo.sh
 
 The demo helper creates or reuses a local user, workspace, restaurant scenario
 project, sample menu/table/order/order-line/report records, a `parent_child`
-link, and a workspace-scoped MCP bot token. When a local `.env` exists it writes
-`OPENPR_BOT_TOKEN` and `OPENPR_WORKSPACE_ID`, then recreates a running compose
+link, and a workspace-scoped MCP bot token. When the MCP configuration file
+exists it writes `mcp.bot_token` and `mcp.workspace_id` into it, then recreates
+a running compose
 `mcp-server` so MCP clients use the same demo workspace. If the MCP HTTP
 endpoint is reachable, it verifies `/mcp/rpc` with `projects.list` and confirms
 the demo project appears through MCP. It refuses non-local API URLs by default
 so the built-in demo credentials are not accidentally used against production.
 For a disposable verification of that full API -> bot token -> MCP HTTP path,
 run `scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh`; it uses a temporary
-database and temporary env file.
+database and a temporary configuration file.
 
 ## Verification
 

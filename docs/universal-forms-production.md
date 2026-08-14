@@ -168,16 +168,17 @@ scripts/bootstrap-restaurant-demo.sh
 
 The demo helper creates a local demo account/workspace/project, sample
 universal-form records, and a workspace-scoped MCP bot token through the public
-API. When a local `.env` exists it writes `OPENPR_BOT_TOKEN` and
-`OPENPR_WORKSPACE_ID`, then recreates a running compose `mcp-server` so local
-MCP clients use the demo workspace. If the MCP HTTP endpoint is reachable, it
+API. When the MCP configuration file exists it writes `mcp.bot_token` and
+`mcp.workspace_id` into it, then recreates a running compose `mcp-server` so
+local MCP clients use the demo workspace. If the MCP HTTP endpoint is reachable, it
 verifies `/mcp/rpc` with `projects.list` and confirms the demo project appears
 through MCP. It refuses non-local API URLs unless `OPENPR_DEMO_ALLOW_REMOTE=1`
 is set, and it is not a production data seeding path.
 
 For release engineering, `scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh`
 runs the same local demo bootstrap against disposable PostgreSQL/API/MCP
-processes, uses a temporary env file, and forces MCP HTTP verification. It is a
+processes, uses a temporary configuration file, and forces MCP HTTP
+verification. It is a
 pre-production proof of the onboarding path; it is still not a production data
 seeding path.
 
@@ -197,26 +198,55 @@ Do not mark final acceptance until user-side manual signoff is complete.
 The compose deployment must not ship with demo MCP credentials. Configure these
 values for the target deployment before starting OpenPR services:
 
-```bash
-POSTGRES_PASSWORD=replace_with_postgres_password
-DATABASE_URL=postgres://openpr:replace_with_postgres_password@postgres:5432/openpr
-JWT_SECRET=replace_with_long_random_secret
-OPENPR_FRONTEND_PORT=3000
-OPENPR_API_PORT=8081
-OPENPR_API_URL=http://api:8080
-VITE_API_BASE_URL=
-MCP_SERVER_PORT=8090
-OPENPR_BOT_TOKEN=opr_replace_with_workspace_bot_token
-OPENPR_WORKSPACE_ID=00000000-0000-0000-0000-000000000000
-DEFAULT_AUTHOR_ID=00000000-0000-0000-0000-000000000000
+The api, worker and mcp-server binaries read no environment variables at all.
+Their settings live in TOML configuration files that `docker-compose.yml` mounts
+read-only at `/app/config/openpr.toml`; `bash scripts/start.sh` generates a
+working pair on first run. `config/openpr.example.toml` is the annotated
+reference for every key.
+
+`config/openpr.compose.toml` — api and worker:
+
+```toml
+[database]
+url = "postgres://openpr:replace_with_postgres_password@postgres:5432/openpr"
+
+[auth]
+jwt_secret = "replace_with_long_random_secret"
+# default_author_id must name a user that exists; leave it out otherwise.
 ```
 
-`POSTGRES_PASSWORD` and `DATABASE_URL` must use a concrete database password,
-not the example value. `JWT_SECRET` must be a concrete deployment secret, not
-the example value.
-`OPENPR_API_URL` should point to the API service on the compose network. Bot
-token and workspace ID must be issued for the production workspace that AI
-assistants, CLI calls, and MCP clients are allowed to operate on.
+`config/openpr.compose.mcp.toml` — mcp-server. It carries no `[database]` and no
+`[auth]`: the service opens no database connection and signs no token.
+
+```toml
+[mcp]
+api_url = "http://api:8080"
+bot_token = "opr_replace_with_workspace_bot_token"
+workspace_id = "replace_with_workspace_uuid"
+auth_token = "replace_with_mcp_inbound_token"
+```
+
+`.env` is left to docker-compose's own `${...}` interpolation and to the
+postgres image. Nothing in it reaches OpenPR's own code:
+
+```bash
+POSTGRES_PASSWORD=replace_with_postgres_password
+OPENPR_FRONTEND_PORT=3000
+OPENPR_API_PORT=8081
+MCP_SERVER_PORT=8090
+VITE_API_BASE_URL=
+```
+
+`POSTGRES_PASSWORD` and the password inside `database.url` must be the same
+concrete value, not the example one: the postgres image runs initdb from
+`POSTGRES_PASSWORD` exactly once, and a later disagreement fails every query
+with an authentication error. `auth.jwt_secret` must be a concrete deployment
+secret, not the example value.
+`mcp.api_url` should point to the API service on the compose network. Bot token
+and workspace ID must be issued for the production workspace that AI assistants,
+CLI calls, and MCP clients are allowed to operate on. `mcp.auth_token` is the
+bearer token inbound HTTP/SSE callers must present; the server refuses a
+non-loopback bind without one.
 For Docker Compose frontend delivery, keep `VITE_API_BASE_URL` empty so browser
 requests use the nginx same-origin API proxy. For local frontend development
 outside compose, set `VITE_API_BASE_URL=http://localhost:8081`.
@@ -322,13 +352,25 @@ Before accepting an external object-storage deployment, run the deployed smoke
 against the production surface. Use `OPENPR_EXPECT_OBJECT_STORAGE_BACKEND=s3`
 when the environment is expected to use the S3-compatible backend; leave it
 unset only when the deployment intentionally uses the local backend.
-The compose API and worker services pass through `OPENPR_OBJECT_STORAGE_BACKEND`,
-`OPENPR_OBJECT_STORAGE_S3_ENDPOINT`, `OPENPR_OBJECT_STORAGE_S3_BUCKET`,
-`OPENPR_OBJECT_STORAGE_S3_REGION`,
-`OPENPR_OBJECT_STORAGE_S3_ACCESS_KEY_ID`,
-`OPENPR_OBJECT_STORAGE_S3_SECRET_ACCESS_KEY`, and optional
-`OPENPR_OBJECT_STORAGE_S3_SESSION_TOKEN`; set those in `.env` before starting
-the stack when using S3-compatible storage.
+The API and worker read the backend from `[storage]` in
+`config/openpr.compose.toml`. Set `backend = "s3"` and fill in `[storage.s3]`
+before starting the stack when using S3-compatible storage; `endpoint`,
+`bucket`, `access_key_id` and `secret_access_key` are required in that mode,
+`region` defaults to `us-east-1`, and `session_token` is optional for temporary
+credentials. `[storage.s3]` is left unread while `backend = "local"`, so it can
+stay filled in and the deployment switches by editing one line:
+
+```toml
+[storage]
+backend = "s3"
+
+[storage.s3]
+endpoint = "https://s3.eu-central-1.amazonaws.com"
+bucket = "openpr-uploads"
+region = "us-east-1"
+access_key_id = "replace_with_s3_access_key_id"
+secret_access_key = "replace_with_s3_secret_access_key"
+```
 
 The smoke command logs in to the deployed API, creates a temporary form, uploads
 an image and a CSV through `/api/v1/upload`, verifies source and thumbnail

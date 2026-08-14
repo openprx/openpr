@@ -10,7 +10,7 @@ DB_PASSWORD="$(openssl rand -hex 12)"
 API_PORT="${OPENPR_SMOKE_API_PORT:-$((22180 + ($$ % 1000)))}"
 TMP_DIR="$(mktemp -d /tmp/openpr-scenario-forms-smoke.XXXXXX)"
 API_LOG="$TMP_DIR/api.log"
-JWT_SECRET="openpr-scenario-forms-smoke-secret"
+SMOKE_JWT_SECRET="openpr-scenario-forms-smoke-secret"
 
 OWNER_ID="11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID="33333333-3333-4333-8333-333333333333"
@@ -73,13 +73,30 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The binaries read no environment variables; this file is their only configuration, and they
+# refuse to start without one. It is written inside the 0700 directory mktemp made for this run
+# and is removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+app_name = "api"
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
 
@@ -95,7 +112,7 @@ VALUES ('$WORKSPACE_ID', '$OWNER_ID', 'owner', now());
 SQL
 
 API_URL="http://127.0.0.1:$API_PORT" \
-JWT_SECRET="$JWT_SECRET" \
+SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" \
 OWNER_ID="$OWNER_ID" \
 WORKSPACE_ID="$WORKSPACE_ID" \
 node --input-type=commonjs <<'NODE'
@@ -103,7 +120,7 @@ const crypto = require('crypto');
 
 const apiUrl = process.env.API_URL;
 const workspaceId = process.env.WORKSPACE_ID;
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret = process.env.SMOKE_JWT_SECRET;
 
 function b64url(value) {
   return Buffer.from(JSON.stringify(value)).toString('base64url');

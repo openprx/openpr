@@ -625,11 +625,11 @@ contains "restaurant demo bootstrap creates restaurant template project" "script
 contains "restaurant demo bootstrap refuses remote API by default" "scripts/bootstrap-restaurant-demo.sh" "OPENPR_DEMO_ALLOW_REMOTE"
 contains "restaurant demo bootstrap verifies formula output" "scripts/bootstrap-restaurant-demo.sh" "restaurant_calc should calculate order_line.line_total"
 contains "restaurant demo bootstrap creates MCP bot token" "scripts/bootstrap-restaurant-demo.sh" "/bots"
-contains "restaurant demo bootstrap writes MCP env credentials" "scripts/bootstrap-restaurant-demo.sh" "OPENPR_WORKSPACE_ID"
+contains "restaurant demo bootstrap writes MCP config credentials" "scripts/bootstrap-restaurant-demo.sh" "mcp.workspace_id"
 contains "restaurant demo bootstrap can recreate compose MCP server" "scripts/bootstrap-restaurant-demo.sh" "--force-recreate mcp-server"
 contains "restaurant demo bootstrap verifies MCP HTTP projects.list" "scripts/bootstrap-restaurant-demo.sh" "projects.list"
 contains "restaurant demo bootstrap checks demo project through MCP HTTP" "scripts/bootstrap-restaurant-demo.sh" "MCP HTTP verification passed"
-contains "restaurant demo MCP HTTP smoke starts real MCP server" "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "mcp-server\" serve --transport http"
+contains "restaurant demo MCP HTTP smoke starts real MCP server" "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "/target/debug/mcp-server\" --config"
 contains "restaurant demo MCP HTTP smoke forces JSON-RPC verification" "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "OPENPR_DEMO_VERIFY_MCP_HTTP=1"
 contains "restaurant demo MCP HTTP smoke proves RESTDEMO over MCP" "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "projects.list includes RESTDEMO"
 contains "acceptance includes restaurant demo MCP HTTP smoke" "scripts/acceptance-universal-forms.sh" "Restaurant demo bootstrap MCP HTTP smoke"
@@ -1138,7 +1138,7 @@ contains "MCP test script requires relation tools" "scripts/test-mcp.sh" "form_r
 contains "MCP test script requires child lifecycle tools" "scripts/test-mcp.sh" "form_records.child_archive"
 contains "MCP test script checks plugin invocations" "scripts/test-mcp.sh" "plugin_invocations.list"
 contains "dev-up exposes PostgreSQL on localhost only" "scripts/dev-up.sh" "127.0.0.1:\${POSTGRES_PORT}:5432"
-contains "dev-up prints host database URL" "scripts/dev-up.sh" "DATABASE_URL=postgres://openpr:\${POSTGRES_PASSWORD}@127.0.0.1:\${POSTGRES_PORT}/openpr"
+contains "dev-up prints host database url for the config file" "scripts/dev-up.sh" "url = \\\"postgres://openpr:\${POSTGRES_PASSWORD}@127.0.0.1:\${POSTGRES_PORT}/openpr\\\""
 contains "init-db defaults to localhost development database" "scripts/init-db.sh" 'PGHOST="${PGHOST:-127.0.0.1}"'
 contains "init-db defaults to development password" "scripts/init-db.sh" 'PGPASSWORD="${PGPASSWORD:-openpr_dev_password}"'
 contains "docs audit requires README delivery acceptance state" "scripts/audit-universal-forms-docs.sh" "README documents delivery acceptance state"

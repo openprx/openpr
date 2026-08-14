@@ -110,8 +110,9 @@ openpr/
 ### Local Development
 
 ```bash
-# Backend (without Docker)
-cargo run -p api
+# Backend (without Docker). The binaries read no environment variables; --config is
+# the only thing they take from outside the file, and it defaults to config/openpr.toml.
+cargo run -p api -- --config config/openpr.toml
 
 # Frontend (hot reload)
 cd frontend && bun run dev
@@ -122,14 +123,15 @@ bash scripts/dev-up.sh
 
 `scripts/dev-up.sh` is for local host development. It starts PostgreSQL through
 the compose service with a temporary localhost-only port override and prints
-the matching `DATABASE_URL`/`PGPASSWORD` values for `cargo run` and
-`scripts/init-db.sh`.
+the matching `url` line for the `[database]` section of `config/openpr.toml`,
+plus the `PGPASSWORD` value `scripts/init-db.sh` needs.
 
 ### Debugging
 
 ```bash
-# Rust with debug logs
-RUST_LOG=debug cargo run -p api
+# Rust with debug logs: set filter under [logging] in config/openpr.toml,
+# for example filter = "api=debug,tower_http=debug".
+cargo run -p api -- --config config/openpr.toml
 
 # Check database
 docker compose exec postgres psql -U openpr -d openpr

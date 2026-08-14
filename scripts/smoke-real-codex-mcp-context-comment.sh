@@ -19,6 +19,7 @@ WEBHOOK_PORT="${OPENPR_SMOKE_WEBHOOK_PORT:-$((19091 + ($$ % 1000)))}"
 TMP_DIR="$(mktemp -d /tmp/openpr-real-codex-smoke.XXXXXX)"
 API_LOG="$TMP_DIR/api.log"
 WEBHOOK_LOG="$TMP_DIR/webhook.log"
+MCP_CONFIG="$TMP_DIR/openpr.mcp.toml"
 BOT_TOKEN="opr_real_codex_smoke_token"
 COMMENT_MARKER="REAL_CODEX_MCP_COMMENT_OK"
 
@@ -100,14 +101,31 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
-JWT_SECRET="openpr-real-codex-smoke-secret"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_JWT_SECRET="openpr-real-codex-smoke-secret"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The api reads no environment variables; this file is its only configuration, and it refuses to
+# start without one. It is written inside the 0700 directory mktemp made for this run and is
+# removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+app_name = "api"
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
 
@@ -227,14 +245,24 @@ trust_level = "trusted"
 
 [mcp_servers.openpr]
 command = "$ROOT_DIR/target/debug/mcp-server"
-args = ["serve", "--transport", "stdio"]
+args = ["serve", "--transport", "stdio", "--config", "$MCP_CONFIG"]
+EOF
 
-[mcp_servers.openpr.env]
-OPENPR_API_URL = "http://127.0.0.1:$API_PORT"
-OPENPR_BOT_TOKEN = "$BOT_TOKEN"
-OPENPR_WORKSPACE_ID = "$WORKSPACE_ID"
-OPENPR_INVOCATION_ID = "$INVOCATION_ID"
-OPENPR_MCP_TRANSPORT = "mcp_stdio"
+# The MCP server reads no environment variables, so codex cannot hand it an identity through
+# [mcp_servers.openpr.env]; it gets a configuration file instead. invocation_id is what stamps
+# every tool call codex makes onto this run's invocation ledger row, and the transport label the
+# API sees follows from mcp.transport rather than from a variable naming it.
+cat >"$MCP_CONFIG" <<EOF
+[logging]
+filter = "error"
+format = "text"
+
+[mcp]
+api_url = "http://127.0.0.1:$API_PORT"
+bot_token = "$BOT_TOKEN"
+workspace_id = "$WORKSPACE_ID"
+invocation_id = "$INVOCATION_ID"
+transport = "stdio"
 EOF
 
 cat >"$TMP_DIR/webhook-config.toml" <<EOF

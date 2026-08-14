@@ -155,13 +155,18 @@ jobs:
             # Download and extract (example: macOS Apple Silicon)
             tar xzf openpr-mcp-server-macos-arm64.tar.gz
 
-            # Configure for your OpenPR instance
-            export OPENPR_API_URL="https://your-openpr.example.com"
-            export OPENPR_BOT_TOKEN="opr_your_token"
-            export OPENPR_WORKSPACE_ID="your-workspace-uuid"
-
             # Run
-            ./mcp-server --transport stdio
+            ./mcp-server serve --transport stdio --config openpr.toml
+            ```
+
+            The server reads no environment variables; `openpr.toml` is its only
+            configuration, and it will not start without one:
+
+            ```toml
+            [mcp]
+            api_url = "https://your-openpr.example.com"
+            bot_token = "opr_your_token"
+            workspace_id = "your-workspace-uuid"
             ```
 
             ### MCP Client Config (Claude Desktop / Codex / Cursor)
@@ -171,12 +176,7 @@ jobs:
               "mcpServers": {
                 "openpr": {
                   "command": "/path/to/mcp-server",
-                  "args": ["--transport", "stdio"],
-                  "env": {
-                    "OPENPR_API_URL": "https://your-openpr.example.com",
-                    "OPENPR_BOT_TOKEN": "opr_your_token",
-                    "OPENPR_WORKSPACE_ID": "your-workspace-uuid"
-                  }
+                  "args": ["serve", "--transport", "stdio", "--config", "/absolute/path/to/openpr.toml"]
                 }
               }
             }

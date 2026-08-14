@@ -10,7 +10,7 @@ DB_PASSWORD="$(openssl rand -hex 12)"
 API_PORT="${OPENPR_SMOKE_API_PORT:-$((17480 + ($$ % 1000)))}"
 TMP_DIR="$(mktemp -d /tmp/openpr-phase5-smoke.XXXXXX)"
 API_LOG="$TMP_DIR/api.log"
-JWT_SECRET="openpr-phase5-smoke-secret"
+SMOKE_JWT_SECRET="openpr-phase5-smoke-secret"
 
 OWNER_ID="11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID="22222222-2222-4222-8222-222222222222"
@@ -79,15 +79,42 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The binaries read no environment variables; this file is their only configuration, and they
+# refuse to start without one. It is written inside the 0700 directory mktemp made for this run
+# and is removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+app_name = "api"
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
+
+# The mcp-server reads no environment variables either, and refuses to start without a
+# configuration file. Its identity still arrives per call through --api-url/--bot-token/
+# --workspace-id, so this file only has to keep the log stream out of the JSON-RPC client's way.
+MCP_CONFIG="$TMP_DIR/openpr.mcp.toml"
+cat >"$MCP_CONFIG" <<'TOML'
+[logging]
+filter = "error"
+format = "text"
+TOML
 
 BOT_HASH="$(sha256_hex "$BOT_TOKEN")"
 
@@ -111,13 +138,14 @@ SQL
 
 API_URL="http://127.0.0.1:$API_PORT" \
 ROOT_DIR="$ROOT_DIR" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
+SMOKE_DATABASE_URL="$SMOKE_DATABASE_URL" \
+SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" \
 OWNER_ID="$OWNER_ID" \
 WORKSPACE_ID="$WORKSPACE_ID" \
 BOT_ID="$BOT_ID" \
 BOT_TOKEN="$BOT_TOKEN" \
 MCP_BIN="$ROOT_DIR/target/debug/mcp-server" \
+MCP_CONFIG="$MCP_CONFIG" \
 node --input-type=commonjs <<'NODE'
 const crypto = require('crypto');
 const fs = require('fs');
@@ -126,9 +154,10 @@ const { spawnSync } = require('child_process');
 const apiUrl = process.env.API_URL;
 const rootDir = process.env.ROOT_DIR;
 const workspaceId = process.env.WORKSPACE_ID;
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret = process.env.SMOKE_JWT_SECRET;
 const botToken = process.env.BOT_TOKEN;
 const mcpBin = process.env.MCP_BIN;
+const mcpConfig = process.env.MCP_CONFIG;
 const releaseSchemaPath = 'docs/schemas/openpr-project-release-readiness.schema.json';
 const releaseSchema = JSON.parse(fs.readFileSync(`${rootDir}/${releaseSchemaPath}`, 'utf8'));
 
@@ -171,8 +200,8 @@ function mcpRequest(method, params) {
   const requestPayload = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) + '\n';
   const result = spawnSync(
     mcpBin,
-    ['--api-url', apiUrl, '--bot-token', botToken, '--workspace-id', workspaceId, 'serve', '--transport', 'stdio'],
-    { input: requestPayload, encoding: 'utf8', env: { ...process.env, RUST_LOG: 'error' }, timeout: 20000 },
+    ['--config', mcpConfig, '--api-url', apiUrl, '--bot-token', botToken, '--workspace-id', workspaceId, 'serve', '--transport', 'stdio'],
+    { input: requestPayload, encoding: 'utf8', env: process.env, timeout: 20000 },
   );
   if (result.status !== 0) {
     throw new Error(`MCP ${method} exited ${result.status}: ${result.stderr}`);
@@ -213,7 +242,7 @@ async function main() {
     result: { source: 'phase5-release-readiness' },
   });
 
-  const psql = spawnSync('psql', [process.env.DATABASE_URL, '-v', 'ON_ERROR_STOP=1', '-q'], {
+  const psql = spawnSync('psql', [process.env.SMOKE_DATABASE_URL, '-v', 'ON_ERROR_STOP=1', '-q'], {
     input: `
       INSERT INTO governance_audit_logs (project_id, actor_id, action, resource_type, resource_id, old_value, new_value, metadata, created_at)
       VALUES ('${project.id}', '${process.env.OWNER_ID}', 'release.evidence.recorded', 'project', '${project.id}', NULL, '{"status":"reviewed"}'::jsonb, '{}'::jsonb, now());
@@ -256,7 +285,7 @@ async function main() {
   assert(JSON.stringify(resource).includes('openpr.project.release_readiness.v1'), 'release readiness resource should expose schema version');
   assert(JSON.stringify(resource).includes('governance_audit_events'), 'release readiness resource should expose audit evidence counts');
 
-  const pendingTask = spawnSync('psql', [process.env.DATABASE_URL, '-v', 'ON_ERROR_STOP=1', '-q'], {
+  const pendingTask = spawnSync('psql', [process.env.SMOKE_DATABASE_URL, '-v', 'ON_ERROR_STOP=1', '-q'], {
     input: `
       INSERT INTO ai_tasks (project_id, ai_participant_id, task_type, status, payload, created_at, updated_at)
       VALUES ('${project.id}', '${process.env.BOT_ID}', 'release_gate_check', 'pending', '{}'::jsonb, now(), now());

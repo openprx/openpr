@@ -415,7 +415,7 @@ contains "README exposes WASM plugins" "$ROOT_DIR/README.md" "WASM plugins:"
 contains "README exposes restaurant scenario template" "$ROOT_DIR/README.md" "restaurant_ordering_default"
 contains "README uses start script for quick start" "$ROOT_DIR/README.md" "bash scripts/start.sh"
 contains "README documents restaurant demo bootstrap" "$ROOT_DIR/README.md" "scripts/bootstrap-restaurant-demo.sh"
-contains "README documents demo MCP credential sync" "$ROOT_DIR/README.md" '`OPENPR_BOT_TOKEN` and `OPENPR_WORKSPACE_ID`'
+contains "README documents demo MCP credential sync" "$ROOT_DIR/README.md" '`mcp.bot_token` and `mcp.workspace_id`'
 contains "README documents demo MCP HTTP verification" "$ROOT_DIR/README.md" '`projects.list` through `/mcp/rpc`'
 contains "README documents demo remote API safety" "$ROOT_DIR/README.md" "OPENPR_DEMO_ALLOW_REMOTE=1"
 contains "README documents delivery acceptance state" "$ROOT_DIR/README.md" "## Delivery Acceptance State"
@@ -779,7 +779,7 @@ equals "acceptance guide has one manual evidence map explanation" "$(rg -F -c "T
 equals "acceptance guide has one signoff status report explanation" "$(rg -F -c "The signoff status report is the fastest reviewer prompt" "$ROOT_DIR/docs/universal-forms-acceptance.md" || true)" "1"
 contains "production runbook states Postgres-only delivery" "$ROOT_DIR/docs/universal-forms-production.md" "Production is PostgreSQL-only for this delivery path"
 contains "production runbook includes MCP runtime config" "$ROOT_DIR/docs/universal-forms-production.md" "## Runtime Configuration"
-contains "production runbook includes concrete PostgreSQL password requirement" "$ROOT_DIR/docs/universal-forms-production.md" '`POSTGRES_PASSWORD` and `DATABASE_URL` must use a concrete database password'
+contains "production runbook includes concrete PostgreSQL password requirement" "$ROOT_DIR/docs/universal-forms-production.md" '`POSTGRES_PASSWORD` and the password inside `database.url` must be the same'
 contains "production runbook includes internal-only PostgreSQL exposure" "$ROOT_DIR/docs/universal-forms-production.md" "PostgreSQL is exposed only inside the compose network"
 contains "production runbook includes localhost app ports" "$ROOT_DIR/docs/universal-forms-production.md" "host ports bind"
 contains "production runbook includes reverse proxy requirement" "$ROOT_DIR/docs/universal-forms-production.md" "reverse proxy or tunnel"
@@ -787,12 +787,12 @@ contains "production runbook includes compose multi-instance guidance" "$ROOT_DI
 contains "production runbook includes webhook starter config" "$ROOT_DIR/docs/universal-forms-production.md" "config/openpr-webhook.example.toml"
 contains "production runbook includes local compose bootstrap" "$ROOT_DIR/docs/universal-forms-production.md" "bash scripts/start.sh"
 contains "production runbook includes local restaurant demo bootstrap" "$ROOT_DIR/docs/universal-forms-production.md" "scripts/bootstrap-restaurant-demo.sh"
-contains "production runbook includes local demo MCP credential sync" "$ROOT_DIR/docs/universal-forms-production.md" 'writes `OPENPR_BOT_TOKEN` and'
+contains "production runbook includes local demo MCP credential sync" "$ROOT_DIR/docs/universal-forms-production.md" 'writes `mcp.bot_token` and'
 contains "production runbook includes local demo MCP HTTP verification" "$ROOT_DIR/docs/universal-forms-production.md" 'verifies `/mcp/rpc` with `projects.list`'
 contains "production runbook includes restaurant demo MCP HTTP smoke" "$ROOT_DIR/docs/universal-forms-production.md" "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh"
 contains "production runbook includes connector receiver profile" "$ROOT_DIR/docs/universal-forms-production.md" '`connectors` profile'
-contains "production runbook includes concrete JWT secret requirement" "$ROOT_DIR/docs/universal-forms-production.md" '`JWT_SECRET` must be a concrete deployment secret'
-contains "production runbook includes MCP compose API URL" "$ROOT_DIR/docs/universal-forms-production.md" "OPENPR_API_URL=http://api:8080"
+contains "production runbook includes concrete JWT secret requirement" "$ROOT_DIR/docs/universal-forms-production.md" '`auth.jwt_secret` must be a concrete deployment'
+contains "production runbook includes MCP compose API URL" "$ROOT_DIR/docs/universal-forms-production.md" 'api_url = "http://api:8080"'
 contains "production runbook includes frontend API base URL guidance" "$ROOT_DIR/docs/universal-forms-production.md" "VITE_API_BASE_URL=http://localhost:8081"
 contains "production runbook uses Bun frontend commands" "$ROOT_DIR/docs/universal-forms-production.md" "cd frontend && bun run check && bun run build"
 contains "production runbook includes first business scenario" "$ROOT_DIR/docs/universal-forms-production.md" "restaurant_ordering_default"

@@ -14,7 +14,7 @@ TMP_DIR="$(mktemp -d /tmp/openpr-phase2-smoke.XXXXXX)"
 API_LOG="$TMP_DIR/api.log"
 WORKER_LOG="$TMP_DIR/worker.log"
 WEBHOOK_LOG="$TMP_DIR/webhook.log"
-JWT_SECRET="openpr-phase2-smoke-secret"
+SMOKE_JWT_SECRET="openpr-phase2-smoke-secret"
 
 OWNER_ID="11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID="22222222-2222-4222-8222-222222222222"
@@ -89,15 +89,43 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The binaries read no environment variables; this file is their only configuration, and they
+# refuse to start without one. It is written inside the 0700 directory mktemp made for this run
+# and is removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+# app_name is deliberately unset: this file also serves the worker, and a shared name would make
+# the worker log itself as the api. bind_addr is simply unread there.
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,worker=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
+
+# The mcp-server reads no environment variables either, and refuses to start without a
+# configuration file. Its identity still arrives per call through --api-url/--bot-token/
+# --workspace-id, so this file only has to keep the log stream out of the JSON-RPC client's way.
+MCP_CONFIG="$TMP_DIR/openpr.mcp.toml"
+cat >"$MCP_CONFIG" <<'TOML'
+[logging]
+filter = "error"
+format = "text"
+TOML
 
 BOT_HASH="$(sha256_hex "$BOT_TOKEN")"
 
@@ -163,19 +191,17 @@ EOF
 webhook_pid=$!
 wait_http "http://127.0.0.1:$WEBHOOK_PORT/health" "openpr-webhook"
 
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-worker=info,openpr=info}" \
-"$ROOT_DIR/target/debug/worker" --concurrency 1 >"$WORKER_LOG" 2>&1 &
+"$ROOT_DIR/target/debug/worker" --config "$APP_CONFIG" --concurrency 1 >"$WORKER_LOG" 2>&1 &
 worker_pid=$!
 
 API_URL="http://127.0.0.1:$API_PORT" \
-JWT_SECRET="$JWT_SECRET" \
+SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" \
 OWNER_ID="$OWNER_ID" \
 WORKSPACE_ID="$WORKSPACE_ID" \
 BOT_ID="$BOT_ID" \
 BOT_TOKEN="$BOT_TOKEN" \
 MCP_BIN="$ROOT_DIR/target/debug/mcp-server" \
+MCP_CONFIG="$MCP_CONFIG" \
 WEBHOOK_PORT="$WEBHOOK_PORT" \
 WEBHOOK_LOG="$WEBHOOK_LOG" \
 node --input-type=commonjs <<'NODE'
@@ -186,9 +212,10 @@ const { spawnSync } = require('child_process');
 const apiUrl = process.env.API_URL;
 const workspaceId = process.env.WORKSPACE_ID;
 const botId = process.env.BOT_ID;
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret = process.env.SMOKE_JWT_SECRET;
 const botToken = process.env.BOT_TOKEN;
 const mcpBin = process.env.MCP_BIN;
+const mcpConfig = process.env.MCP_CONFIG;
 const webhookPort = process.env.WEBHOOK_PORT;
 const webhookLog = process.env.WEBHOOK_LOG;
 
@@ -235,10 +262,10 @@ function extractToolText(response) {
 
 function mcpRequest(method, params) {
   const requestPayload = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) + '\n';
-  const result = spawnSync(mcpBin, ['--api-url', apiUrl, '--bot-token', botToken, '--workspace-id', workspaceId, 'serve', '--transport', 'stdio'], {
+  const result = spawnSync(mcpBin, ['--config', mcpConfig, '--api-url', apiUrl, '--bot-token', botToken, '--workspace-id', workspaceId, 'serve', '--transport', 'stdio'], {
     input: requestPayload,
     encoding: 'utf8',
-    env: { ...process.env, RUST_LOG: 'error' },
+    env: process.env,
     timeout: 20000,
   });
   if (result.status !== 0) {

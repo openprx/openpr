@@ -20,5 +20,6 @@ POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
 echo "PostgreSQL started for local development."
 echo "  Host: 127.0.0.1"
 echo "  Port: ${POSTGRES_PORT}"
-echo "  DATABASE_URL=postgres://openpr:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/openpr"
+echo "  The binaries read no environment; put this in the [database] section of config/openpr.toml:"
+echo "  url = \"postgres://openpr:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/openpr\""
 echo "  PGPASSWORD=${POSTGRES_PASSWORD} PGHOST=127.0.0.1 PGPORT=${POSTGRES_PORT} bash scripts/init-db.sh"

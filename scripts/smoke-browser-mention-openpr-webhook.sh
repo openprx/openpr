@@ -17,7 +17,7 @@ WORKER_LOG="$TMP_DIR/worker.log"
 WEBHOOK_LOG="$TMP_DIR/webhook.log"
 BROWSER_LOG="$TMP_DIR/browser.log"
 BROWSER_DOM="$TMP_DIR/browser.dom"
-JWT_SECRET="openpr-browser-mention-smoke-secret"
+SMOKE_JWT_SECRET="openpr-browser-mention-smoke-secret"
 
 OWNER_ID="11111111-1111-4111-8111-111111111111"
 BOT_ID="22222222-2222-4222-8222-222222222222"
@@ -96,13 +96,31 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The binaries read no environment variables; this file is their only configuration, and they
+# refuse to start without one. It is written inside the 0700 directory mktemp made for this run
+# and is removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+# app_name is deliberately unset: this file also serves the worker, and a shared name would make
+# the worker log itself as the api. bind_addr is simply unread there.
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,worker=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
 
@@ -164,9 +182,9 @@ VALUES (
 );
 SQL
 
-ACCESS_TOKEN="$(OWNER_ID="$OWNER_ID" JWT_SECRET="$JWT_SECRET" node <<'NODE'
+ACCESS_TOKEN="$(OWNER_ID="$OWNER_ID" SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" node <<'NODE'
 const crypto = require('crypto');
-const secret = process.env.JWT_SECRET;
+const secret = process.env.SMOKE_JWT_SECRET;
 const now = Math.floor(Date.now() / 1000);
 const payload = {
   sub: process.env.OWNER_ID,
@@ -213,10 +231,7 @@ EOF
 webhook_pid=$!
 wait_http "http://127.0.0.1:$WEBHOOK_PORT/health" "openpr-webhook"
 
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-worker=info,openpr=info}" \
-"$ROOT_DIR/target/debug/worker" --concurrency 1 >"$WORKER_LOG" 2>&1 &
+"$ROOT_DIR/target/debug/worker" --config "$APP_CONFIG" --concurrency 1 >"$WORKER_LOG" 2>&1 &
 worker_pid=$!
 
 cat >"$TMP_DIR/browser-server.mjs" <<'NODE'

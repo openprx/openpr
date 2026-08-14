@@ -275,7 +275,7 @@ contains "env example documents MCP bot token placeholder" "$ROOT_DIR/.env.examp
 contains "env example documents MCP workspace placeholder" "$ROOT_DIR/.env.example" "OPENPR_WORKSPACE_ID=00000000-0000-0000-0000-000000000000"
 contains "README stdio MCP config targets API host port" "$ROOT_DIR/README.md" '"OPENPR_API_URL": "http://localhost:8081"'
 contains "README MCP stdio config uses serve subcommand" "$ROOT_DIR/README.md" '"args": ["serve", "--transport", "stdio"]'
-contains "MCP app README local examples target API host port" "$ROOT_DIR/apps/mcp-server/README.md" "OPENPR_API_URL=http://localhost:8081"
+contains "MCP app README local examples target API host port" "$ROOT_DIR/apps/mcp-server/README.md" 'api_url = "http://localhost:8081"'
 contains "MCP app README documents current tool count" "$ROOT_DIR/apps/mcp-server/README.md" "105 MCP Tools"
 contains "MCP app README documents three transports" "$ROOT_DIR/apps/mcp-server/README.md" "Three Transport Modes"
 contains "MCP app README documents SSE transport" "$ROOT_DIR/apps/mcp-server/README.md" "serve --transport sse"
@@ -300,8 +300,8 @@ contains "MCP app README documents bot token hash auth" "$ROOT_DIR/apps/mcp-serv
 contains "MCP app README documents workspace-scoped bot access" "$ROOT_DIR/apps/mcp-server/README.md" "a bot token can only act inside its workspace"
 not_contains "MCP app README does not claim auth is unenforced" "$ROOT_DIR/apps/mcp-server/README.md" "Authentication infrastructure exists but is not enforced"
 not_contains "MCP app README does not list stale JWT TODO" "$ROOT_DIR/apps/mcp-server/README.md" "Implement JWT token validation"
-contains "MCP regression stdio path targets API host port" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" '"OPENPR_API_URL":"http://localhost:8081"'
-contains "MCP regression stdio path uses serve subcommand" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" '[MCP_BIN,"serve","--transport","stdio"]'
+contains "MCP regression stdio path targets API host port" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" 'api_url = "http://localhost:8081"'
+contains "MCP regression stdio path uses serve subcommand" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" '[MCP_BIN,"serve","--transport","stdio","--config",MCP_CONFIG]'
 contains "MCP regression checks current 105-tool registry" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" "tools/list.registry_105"
 contains "MCP validation requires exact 105 tools" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 105 tools"
 contains "MCP skill guide documents current tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "enumerate all 105 tools"
@@ -388,7 +388,7 @@ contains "start script rejects placeholder env values" "$START_SCRIPT" "is_place
 contains "start script rejects nil workspace UUID" "$START_SCRIPT" "must not be the nil UUID placeholder"
 contains "start script requires opr token prefix" "$START_SCRIPT" "must start with opr_"
 contains "dev-up uses localhost-only PostgreSQL port override" "$ROOT_DIR/scripts/dev-up.sh" "127.0.0.1:\${POSTGRES_PORT}:5432"
-contains "dev-up provides host DATABASE_URL" "$ROOT_DIR/scripts/dev-up.sh" "DATABASE_URL=postgres://openpr:\${POSTGRES_PASSWORD}@127.0.0.1:\${POSTGRES_PORT}/openpr"
+contains "dev-up provides host database url for the config file" "$ROOT_DIR/scripts/dev-up.sh" "url = \\\"postgres://openpr:\${POSTGRES_PASSWORD}@127.0.0.1:\${POSTGRES_PORT}/openpr\\\""
 contains "dev-up documents init-db command" "$ROOT_DIR/scripts/dev-up.sh" "bash scripts/init-db.sh"
 contains "init-db defaults to localhost development database" "$ROOT_DIR/scripts/init-db.sh" 'PGHOST="${PGHOST:-127.0.0.1}"'
 contains "init-db uses development password default" "$ROOT_DIR/scripts/init-db.sh" 'PGPASSWORD="${PGPASSWORD:-openpr_dev_password}"'
@@ -400,7 +400,7 @@ contains "restaurant demo bootstrap writes MCP workspace env" "$ROOT_DIR/scripts
 contains "restaurant demo bootstrap recreates running MCP compose service" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "--force-recreate mcp-server"
 contains "restaurant demo bootstrap verifies MCP HTTP projects.list" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "projects.list"
 contains "restaurant demo bootstrap supports required MCP HTTP verification" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "OPENPR_DEMO_VERIFY_MCP_HTTP=1"
-contains "restaurant demo MCP HTTP smoke uses temporary env file" "$ROOT_DIR/scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "OPENPR_DEMO_ENV_PATH"
+contains "restaurant demo MCP HTTP smoke uses temporary config file" "$ROOT_DIR/scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "OPENPR_DEMO_CONFIG_PATH"
 contains "restaurant demo MCP HTTP smoke starts local MCP HTTP" "$ROOT_DIR/scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "serve --transport http"
 contains "restaurant demo MCP HTTP smoke requires RESTDEMO through MCP" "$ROOT_DIR/scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "projects.list includes RESTDEMO"
 contains "verify script uses docker compose v2" "$VERIFY_SCRIPT" "docker compose version"
@@ -502,7 +502,7 @@ printf '\nProduction runbook coverage:\n'
 contains "runbook states minimum production services" "$PRODUCTION_DOC" "Minimum production services:"
 contains "runbook states worker is required for connector delivery" "$PRODUCTION_DOC" "If the worker is not running"
 contains "runbook states runtime configuration section" "$PRODUCTION_DOC" "## Runtime Configuration"
-contains "runbook states PostgreSQL password must be concrete" "$PRODUCTION_DOC" '`POSTGRES_PASSWORD` and `DATABASE_URL` must use a concrete database password'
+contains "runbook states PostgreSQL password must be concrete" "$PRODUCTION_DOC" '`POSTGRES_PASSWORD` and the password inside `database.url` must be the same'
 contains "runbook states PostgreSQL is internal-only" "$PRODUCTION_DOC" "PostgreSQL is exposed only inside the compose network"
 contains "runbook states app ports bind localhost by default" "$PRODUCTION_DOC" "host ports bind"
 contains "runbook states reverse proxy or tunnel requirement" "$PRODUCTION_DOC" "reverse proxy or tunnel"
@@ -511,7 +511,7 @@ contains "runbook states webhook example config" "$PRODUCTION_DOC" "config/openp
 contains "runbook states webhook production secret replacement" "$PRODUCTION_DOC" 'set a concrete `webhook_secrets` value'
 contains "runbook states local compose bootstrap script" "$PRODUCTION_DOC" "bash scripts/start.sh"
 contains "runbook states local restaurant demo bootstrap" "$PRODUCTION_DOC" "scripts/bootstrap-restaurant-demo.sh"
-contains "runbook states local demo writes MCP credentials" "$PRODUCTION_DOC" 'writes `OPENPR_BOT_TOKEN` and'
+contains "runbook states local demo writes MCP credentials" "$PRODUCTION_DOC" 'writes `mcp.bot_token` and'
 contains "runbook states local demo recreates MCP service" "$PRODUCTION_DOC" 'recreates a running compose `mcp-server`'
 contains "runbook states local demo verifies MCP HTTP" "$PRODUCTION_DOC" 'verifies `/mcp/rpc` with `projects.list`'
 contains "runbook states restaurant demo is not production seeding" "$PRODUCTION_DOC" "not a production data seeding path"
@@ -524,9 +524,9 @@ contains "runbook documents CI production readiness gate" "$PRODUCTION_DOC" "scr
 contains "runbook documents SQLx inactive MySQL boundary" "$PRODUCTION_DOC" "inactive MySQL backend scope"
 contains "runbook states prebuilt compose needs release build" "$PRODUCTION_DOC" "Dockerfile.prebuilt"
 contains "runbook states webhook receiver uses connectors profile" "$PRODUCTION_DOC" '`connectors` profile'
-contains "runbook states JWT secret must be concrete" "$PRODUCTION_DOC" '`JWT_SECRET` must be a concrete deployment secret'
-contains "runbook states MCP compose API URL" "$PRODUCTION_DOC" "OPENPR_API_URL=http://api:8080"
-contains "runbook states MCP credentials are production workspace scoped" "$PRODUCTION_DOC" "token and workspace ID must be issued for the production workspace"
+contains "runbook states JWT secret must be concrete" "$PRODUCTION_DOC" '`auth.jwt_secret` must be a concrete deployment'
+contains "runbook states MCP compose API URL" "$PRODUCTION_DOC" 'api_url = "http://api:8080"'
+contains "runbook states MCP credentials are production workspace scoped" "$PRODUCTION_DOC" "workspace ID must be issued for the production workspace"
 contains "runbook states PostgreSQL-only path" "$PRODUCTION_DOC" "Production is PostgreSQL-only for this delivery path"
 contains "runbook includes event outbox audit requirement" "$PRODUCTION_DOC" 'Verify `event_outbox` has no growing backlog'
 contains "runbook includes restaurant acceptance scenario" "$PRODUCTION_DOC" 'Use `restaurant_ordering_default`'
@@ -538,8 +538,8 @@ contains "runbook documents automation inbox diagnostics" "$PRODUCTION_DOC" "inv
 contains "runbook documents automation receiver 2xx-before-receipt ordering" "$PRODUCTION_DOC" "return a 2xx response to the worker dispatch before it"
 contains "runbook includes production object-storage smoke" "$PRODUCTION_DOC" "scripts/smoke-universal-forms-production-object-storage.mjs"
 contains "runbook documents expected object-storage backend assertion" "$PRODUCTION_DOC" "OPENPR_EXPECT_OBJECT_STORAGE_BACKEND"
-contains "runbook documents object-storage S3 endpoint env" "$PRODUCTION_DOC" "OPENPR_OBJECT_STORAGE_S3_ENDPOINT"
-contains "runbook documents object-storage S3 bucket env" "$PRODUCTION_DOC" "OPENPR_OBJECT_STORAGE_S3_BUCKET"
+contains "runbook documents object-storage S3 config section" "$PRODUCTION_DOC" "[storage.s3]"
+contains "runbook documents object-storage S3 bucket key" "$PRODUCTION_DOC" 'bucket = "openpr-uploads"'
 contains "runbook documents upload storage backend field" "$PRODUCTION_DOC" "storage_backend"
 contains "runbook documents upload object key field" "$PRODUCTION_DOC" "object_key"
 contains "runbook documents upload thumbnail field" "$PRODUCTION_DOC" "thumbnail_url"

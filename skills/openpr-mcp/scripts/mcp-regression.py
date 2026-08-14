@@ -1,12 +1,25 @@
 #!/usr/bin/env python3
 """OpenPR MCP core regression - 3 transports with 105-tool registry checks."""
-import json, subprocess, requests, time, threading, sys, queue, base64
+import json, subprocess, requests, time, threading, sys, queue, base64, os, atexit, shutil, tempfile
 
 MCP_HTTP = "http://localhost:8090"
 TOKEN = "opr_0a5bc81ea108dad8077decc880abced0d923aa873b9ff774575ec152aecf15d5"
 WS = "e5166fd1-3bb7-46d9-b907-273b1eef3f44"
 PID = "adc627bf-15fe-418b-8948-d3c343f9e4f5"
 MCP_BIN = "/opt/worker/code/openpr/target/release/mcp-server"
+
+# The MCP server reads no environment variables and refuses to start without a configuration
+# file, so the stdio transport gets one instead of an env dict. It is written 0600 into a
+# temporary directory removed at exit, because it carries the bot token.
+_CONFIG_DIR = tempfile.mkdtemp(prefix="openpr-mcp-regression-")
+atexit.register(shutil.rmtree, _CONFIG_DIR, True)
+MCP_CONFIG = os.path.join(_CONFIG_DIR, "openpr.toml")
+with open(os.open(MCP_CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as _handle:
+    _handle.write(
+        '[logging]\nfilter = "error"\nformat = "text"\n\n'
+        '[mcp]\napi_url = "http://localhost:8081"\n'
+        f'bot_token = "{TOKEN}"\nworkspace_id = "{WS}"\ntransport = "stdio"\n'
+    )
 
 PASS = FAIL = SKIP = 0
 ERRORS = []
@@ -28,8 +41,8 @@ def http_call(tool, args=None):
 def stdio_call(tool, args=None):
     payload = json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args or {}}})
     try:
-        env = {"OPENPR_API_URL":"http://localhost:8081","OPENPR_BOT_TOKEN":TOKEN,"OPENPR_WORKSPACE_ID":WS,"PATH":"/usr/bin:/bin"}
-        proc = subprocess.run([MCP_BIN,"serve","--transport","stdio"], input=payload, capture_output=True, text=True, timeout=15, env=env)
+        env = {"PATH":"/usr/bin:/bin"}
+        proc = subprocess.run([MCP_BIN,"serve","--transport","stdio","--config",MCP_CONFIG], input=payload, capture_output=True, text=True, timeout=15, env=env)
         for line in proc.stdout.strip().split("\n"):
             line = line.strip()
             if line.startswith("{"):
@@ -147,8 +160,8 @@ def http_list_tools():
 def stdio_list_tools():
     payload = json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/list"})
     try:
-        env = {"OPENPR_API_URL":"http://localhost:8081","OPENPR_BOT_TOKEN":TOKEN,"OPENPR_WORKSPACE_ID":WS,"PATH":"/usr/bin:/bin"}
-        proc = subprocess.run([MCP_BIN,"serve","--transport","stdio"], input=payload, capture_output=True, text=True, timeout=15, env=env)
+        env = {"PATH":"/usr/bin:/bin"}
+        proc = subprocess.run([MCP_BIN,"serve","--transport","stdio","--config",MCP_CONFIG], input=payload, capture_output=True, text=True, timeout=15, env=env)
         for line in proc.stdout.strip().split("\n"):
             line = line.strip()
             if line.startswith("{"):

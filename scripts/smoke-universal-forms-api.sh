@@ -12,7 +12,7 @@ TMP_DIR="$(mktemp -d /tmp/openpr-forms-smoke.XXXXXX)"
 API_LOG="$TMP_DIR/api.log"
 WORKER_LOG="$TMP_DIR/worker.log"
 RECEIVER_LOG="$TMP_DIR/receiver.ndjson"
-JWT_SECRET="openpr-forms-smoke-secret"
+SMOKE_JWT_SECRET="openpr-forms-smoke-secret"
 RECEIVER_PORT="${OPENPR_SMOKE_RECEIVER_PORT:-$((19180 + ($$ % 1000)))}"
 
 OWNER_ID="11111111-1111-4111-8111-111111111111"
@@ -105,13 +105,31 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The binaries read no environment variables; this file is their only configuration, and they
+# refuse to start without one. It is written inside the 0700 directory mktemp made for this run
+# and is removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+# app_name is deliberately unset: this file also serves the worker, and a shared name would make
+# the worker log itself as the api. bind_addr is simply unread there.
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,worker=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
 
@@ -148,10 +166,7 @@ NODE
 receiver_pid=$!
 wait_http "http://127.0.0.1:$RECEIVER_PORT/health" "connector receiver"
 
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-worker=info,openpr=info}" \
-"$ROOT_DIR/target/debug/worker" --concurrency 2 >"$WORKER_LOG" 2>&1 &
+"$ROOT_DIR/target/debug/worker" --config "$APP_CONFIG" --concurrency 2 >"$WORKER_LOG" 2>&1 &
 worker_pid=$!
 
 psql_smoke -v ON_ERROR_STOP=1 -q <<SQL
@@ -171,7 +186,7 @@ SQL
 
 API_URL="http://127.0.0.1:$API_PORT" \
 RECEIVER_URL="http://127.0.0.1:$RECEIVER_PORT/events" \
-JWT_SECRET="$JWT_SECRET" \
+SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" \
 OWNER_ID="$OWNER_ID" \
 WORKSPACE_ID="$WORKSPACE_ID" \
 node --input-type=commonjs <<'NODE'
@@ -179,7 +194,7 @@ const crypto = require('crypto');
 
 const apiUrl = process.env.API_URL;
 const workspaceId = process.env.WORKSPACE_ID;
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret = process.env.SMOKE_JWT_SECRET;
 const receiverUrl = process.env.RECEIVER_URL;
 
 function b64url(value) {
@@ -752,14 +767,14 @@ if [[ -z "$PRINT_INVOCATION_ID" ]]; then
 fi
 
 API_URL="http://127.0.0.1:$API_PORT" \
-JWT_SECRET="$JWT_SECRET" \
+SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" \
 OWNER_ID="$OWNER_ID" \
 PRINT_INVOCATION_ID="$PRINT_INVOCATION_ID" \
 node --input-type=commonjs <<'NODE'
 const crypto = require('crypto');
 
 const apiUrl = process.env.API_URL;
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret = process.env.SMOKE_JWT_SECRET;
 const invocationId = process.env.PRINT_INVOCATION_ID;
 
 function b64url(value) {

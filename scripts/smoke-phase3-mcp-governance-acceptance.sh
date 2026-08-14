@@ -10,7 +10,7 @@ DB_PASSWORD="$(openssl rand -hex 12)"
 API_PORT="${OPENPR_SMOKE_API_PORT:-$((17380 + ($$ % 1000)))}"
 TMP_DIR="$(mktemp -d /tmp/openpr-phase3-smoke.XXXXXX)"
 API_LOG="$TMP_DIR/api.log"
-JWT_SECRET="openpr-phase3-smoke-secret"
+SMOKE_JWT_SECRET="openpr-phase3-smoke-secret"
 
 OWNER_ID="11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID="22222222-2222-4222-8222-222222222222"
@@ -79,15 +79,42 @@ CREATE ROLE "$DB_USER" LOGIN PASSWORD '$DB_PASSWORD';
 CREATE DATABASE "$DB_NAME" OWNER "$DB_USER";
 SQL
 
-DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
+SMOKE_DATABASE_URL="postgres://$DB_USER:$DB_PASSWORD@127.0.0.1:$POSTGRES_PORT/$DB_NAME"
 
-BIND_ADDR="127.0.0.1:$API_PORT" \
-DATABASE_URL="$DATABASE_URL" \
-JWT_SECRET="$JWT_SECRET" \
-RUST_LOG="${RUST_LOG:-api=info,openpr=info}" \
-"$ROOT_DIR/target/debug/api" >"$API_LOG" 2>&1 &
+# The binaries read no environment variables; this file is their only configuration, and they
+# refuse to start without one. It is written inside the 0700 directory mktemp made for this run
+# and is removed with it, so the generated database password never lands in the repository.
+# text logging rather than json: the only reader of the log file is a human debugging a failure.
+APP_CONFIG="$TMP_DIR/openpr.toml"
+cat >"$APP_CONFIG" <<EOF
+[server]
+app_name = "api"
+bind_addr = "127.0.0.1:$API_PORT"
+
+[database]
+url = "$SMOKE_DATABASE_URL"
+
+[auth]
+jwt_secret = "$SMOKE_JWT_SECRET"
+
+[logging]
+filter = "${OPENPR_SMOKE_LOG_FILTER:-api=info,openpr=info}"
+format = "text"
+EOF
+
+"$ROOT_DIR/target/debug/api" --config "$APP_CONFIG" >"$API_LOG" 2>&1 &
 api_pid=$!
 wait_http "http://127.0.0.1:$API_PORT/health" "OpenPR API"
+
+# The mcp-server reads no environment variables either, and refuses to start without a
+# configuration file. Its identity still arrives per call through --api-url/--bot-token/
+# --workspace-id, so this file only has to keep the log stream out of the JSON-RPC client's way.
+MCP_CONFIG="$TMP_DIR/openpr.mcp.toml"
+cat >"$MCP_CONFIG" <<'TOML'
+[logging]
+filter = "error"
+format = "text"
+TOML
 
 BOT_HASH="$(sha256_hex "$BOT_TOKEN")"
 
@@ -122,20 +149,32 @@ SET enabled_capabilities = EXCLUDED.enabled_capabilities,
 SQL
 
 API_URL="http://127.0.0.1:$API_PORT" \
-JWT_SECRET="$JWT_SECRET" \
+SMOKE_JWT_SECRET="$SMOKE_JWT_SECRET" \
 OWNER_ID="$OWNER_ID" \
 WORKSPACE_ID="$WORKSPACE_ID" \
 BOT_TOKEN="$BOT_TOKEN" \
 MCP_BIN="$ROOT_DIR/target/debug/mcp-server" \
+MCP_CONFIG="$MCP_CONFIG" \
 node --input-type=commonjs <<'NODE'
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
+const fs = require('fs');
 
 const apiUrl = process.env.API_URL;
 const workspaceId = process.env.WORKSPACE_ID;
-const jwtSecret = process.env.JWT_SECRET;
+const jwtSecret = process.env.SMOKE_JWT_SECRET;
 const botToken = process.env.BOT_TOKEN;
 const mcpBin = process.env.MCP_BIN;
+const mcpConfig = process.env.MCP_CONFIG;
+
+// The correlation id that stamps an MCP tool call onto an invocation ledger row is a
+// configuration key (mcp.invocation_id), not an environment variable, so a call that has to be
+// audited runs against its own copy of the configuration file rather than its own environment.
+function invocationConfig(invocationId) {
+  const path = mcpConfig.replace(/\.toml$/, '.invocation.toml');
+  fs.writeFileSync(path, `[logging]\nfilter = "error"\nformat = "text"\n\n[mcp]\ninvocation_id = "${invocationId}"\n`);
+  return path;
+}
 
 function b64url(value) {
   return Buffer.from(JSON.stringify(value)).toString('base64url');
@@ -172,15 +211,15 @@ async function request(token, method, path, body) {
   return payload.data;
 }
 
-function mcpRequest(method, params, env = {}) {
+function mcpRequest(method, params, configPath = mcpConfig) {
   const requestPayload = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) + '\n';
   const result = spawnSync(
     mcpBin,
-    ['--api-url', apiUrl, '--bot-token', botToken, '--workspace-id', workspaceId, 'serve', '--transport', 'stdio'],
+    ['--config', configPath, '--api-url', apiUrl, '--bot-token', botToken, '--workspace-id', workspaceId, 'serve', '--transport', 'stdio'],
     {
       input: requestPayload,
       encoding: 'utf8',
-      env: { ...process.env, ...env, RUST_LOG: 'error' },
+      env: process.env,
       timeout: 20000,
     },
   );
@@ -192,8 +231,8 @@ function mcpRequest(method, params, env = {}) {
   return JSON.parse(line);
 }
 
-function mcpTool(name, args = {}, env = {}) {
-  const response = mcpRequest('tools/call', { name, arguments: args }, env);
+function mcpTool(name, args = {}, configPath = mcpConfig) {
+  const response = mcpRequest('tools/call', { name, arguments: args }, configPath);
   const text = response.result?.content?.[0]?.text;
   if (!text) throw new Error(`MCP ${name} response has no text content: ${JSON.stringify(response)}`);
   if (response.result?.isError) return { isError: true, text };
@@ -320,10 +359,10 @@ async function main() {
   const invocationId = invocation.data?.id;
   assert(invocationId, 'invocations.create should return an invocation id');
 
-  const auditedContext = mcpTool('context.get_project', { project_id: codeProject.id }, { OPENPR_INVOCATION_ID: invocationId });
+  const auditedContext = mcpTool('context.get_project', { project_id: codeProject.id }, invocationConfig(invocationId));
   assert(JSON.stringify(auditedContext).includes('Phase 3 Code MCP Project'), 'audited context call should still succeed');
   const toolCalls = await request(ownerToken, 'GET', `/api/v1/invocations/${invocationId}/tool-calls`);
-  assert(toolCalls.items?.some((call) => call.tool_name === 'context.get_project' && call.status === 'succeeded'), 'OPENPR_INVOCATION_ID should audit MCP tool calls');
+  assert(toolCalls.items?.some((call) => call.tool_name === 'context.get_project' && call.status === 'succeeded'), 'mcp.invocation_id should audit MCP tool calls');
 
   const dynamicInvocation = mcpTool('vendor.phase3_check', {
     project_id: codeProject.id,

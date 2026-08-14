@@ -40,7 +40,7 @@
   - `code.resources.list`, `code.directory.get`, `code.task_context.get`, `code.change_proposal.create`
   - `documents.extract_summary`, `documents.review_risk`, `approval.request`, `inspection.report`, `corrective_action.propose`
   - `members.list`, `search.all`
-- Authentication: Bot token via `OPENPR_BOT_TOKEN` env var (prefix `opr_`).
+- Authentication: Bot token via `mcp.bot_token` in the configuration file (prefix `opr_`).
 - Skill package: `skills/openpr-mcp/SKILL.md`
 
 ## Project Structure & Module Organization
@@ -117,6 +117,6 @@ curl -X POST http://localhost:8090/mcp/rpc \
 ## Security & Configuration
 
 - Never commit bot tokens or API keys.
-- Environment variables for all secrets (`OPENPR_BOT_TOKEN`, `OPENPR_WORKSPACE_ID`).
+- The configuration file is the source of all secrets (`mcp.bot_token`, `mcp.workspace_id`); OpenPR reads no environment variables. Never commit the file itself.
 - Bot tokens are workspace-scoped; each creates a `bot_mcp` user for audit integrity.
 - File uploads: server-side type validation and size limits.
