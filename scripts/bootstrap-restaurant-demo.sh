@@ -486,7 +486,17 @@ if [[ "${OPENPR_DEMO_RESTART_MCP:-1}" == "1" ]] && [[ "$CONFIG_WRITTEN" == "1" ]
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if docker compose ps --services --filter status=running 2>/dev/null | grep -qx 'mcp-server'; then
       echo "Recreating mcp-server so it reloads the demo MCP credentials from its configuration file..."
-      docker compose up -d --no-deps --force-recreate mcp-server
+      # Remove before recreating instead of --force-recreate: under podman-compose that flag
+      # fails with "container name is already in use", and the failure used to go unchecked,
+      # leaving the previous container serving the previous credentials while the health probe
+      # below reported it as ready.
+      if ! docker compose rm -sf mcp-server >/dev/null 2>&1; then
+        echo "Could not remove the running mcp-server container; it may keep serving the previous credentials." >&2
+      fi
+      if ! docker compose up -d --no-deps mcp-server; then
+        echo "Failed to start mcp-server with the new credentials." >&2
+        exit 1
+      fi
     fi
   fi
 fi
