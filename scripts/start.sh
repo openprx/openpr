@@ -434,6 +434,21 @@ if [ "$file_owner" != "1000" ]; then
   echo ""
 fi
 
+# The same uid rule applies to ./uploads, which the api and worker containers write to. The
+# config check above does not cover it, and a directory the container user cannot write turns
+# every upload into a 500 long after the stack looks healthy. Under rootless podman the host
+# directory belongs to the invoking user, which maps to uid 0 inside the container -- so the
+# owner the container sees is not the owner `ls` shows on the host.
+mkdir -p uploads
+uploads_owner="$(stat -c '%u' uploads 2>/dev/null || echo 1000)"
+if [ "$uploads_owner" != "1000" ]; then
+  echo "⚠️  ./uploads is owned by uid $uploads_owner but the containers run as uid 1000."
+  echo "   Uploads will fail with 500 once the stack is up. Fix it before serving traffic:"
+  echo "     rootless podman:  podman unshare chown -R 1000:1000 uploads"
+  echo "     docker / root:    sudo chown -R 1000:1000 uploads"
+  echo ""
+fi
+
 if [ "$MODE" = "--check-config" ]; then
   echo "✅ $APP_CONFIG, $MCP_CONFIG and $ENV_FILE are valid."
   exit 0

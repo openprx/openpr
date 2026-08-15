@@ -155,9 +155,19 @@ impl LocalObjectStorage {
     async fn put(&self, key: &str, data: &[u8]) -> Result<(), ApiError> {
         let path = self.object_path(key)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await.map_err(|_| ApiError::Internal)?;
+            // The caller only ever sees `internal server error`, so without this the most
+            // common local-backend failure -- a storage directory the container user cannot
+            // write, which is what a bind mount owned by another uid produces -- reaches the
+            // operator as a 500 with nothing in the log to act on.
+            fs::create_dir_all(parent).await.map_err(|error| {
+                tracing::error!(%error, path = %parent.display(), "local object directory create failed");
+                ApiError::Internal
+            })?;
         }
-        fs::write(path, data).await.map_err(|_| ApiError::Internal)
+        fs::write(&path, data).await.map_err(|error| {
+            tracing::error!(%error, path = %path.display(), "local object put failed");
+            ApiError::Internal
+        })
     }
 
     async fn get(&self, key: &str) -> Result<Vec<u8>, ApiError> {
@@ -169,10 +179,13 @@ impl LocalObjectStorage {
 
     async fn delete(&self, key: &str) -> Result<(), ApiError> {
         let path = self.object_path(key)?;
-        match fs::remove_file(path).await {
+        match fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(ApiError::Internal),
+            Err(error) => {
+                tracing::error!(%error, path = %path.display(), "local object delete failed");
+                Err(ApiError::Internal)
+            }
         }
     }
 
