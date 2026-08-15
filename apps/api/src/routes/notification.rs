@@ -1,10 +1,3 @@
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss
-)]
-
 use axum::{
     Extension,
     extract::{Path, Query, State},
@@ -136,7 +129,12 @@ pub async fn list_notifications(
         .map(|r| NotificationResponse::from_query_result(r, ""))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let total_pages = ((total as f64) / f64::from(per_page)).ceil() as u32;
+    let page_count = if per_page == 0 {
+        if total == 0 { 0 } else { i64::from(u32::MAX) }
+    } else {
+        total / i64::from(per_page) + i64::from(total % i64::from(per_page) != 0)
+    };
+    let total_pages = u32::try_from(page_count).map_err(|_| ApiError::Internal)?;
 
     Ok(ApiResponse::success(NotificationListData {
         page_data: PaginatedData {

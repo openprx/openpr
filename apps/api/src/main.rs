@@ -1,11 +1,4 @@
-#![allow(
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    clippy::cast_lossless
-)]
+#![allow(clippy::nursery, clippy::pedantic)]
 
 use api::{middleware, response::ApiResponse, routes};
 use axum::{

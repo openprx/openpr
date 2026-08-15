@@ -1,10 +1,5 @@
-// Quorum calculation retains the established floating-point ceiling semantics.
 // Local SQL row types stay beside the queries whose column shapes they mirror.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::items_after_statements
-)]
+#![allow(clippy::items_after_statements)]
 
 use chrono::{Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
@@ -291,7 +286,8 @@ impl VetoService {
         }
 
         let total_vetoers = self.count_domain_vetoers(&tx, project_id, &veto.domain).await?;
-        let threshold = ((total_vetoers as f64) * (2.0 / 3.0)).ceil() as i64;
+        let doubled_vetoers = total_vetoers.checked_mul(2).ok_or(ApiError::Internal)?;
+        let threshold = doubled_vetoers / 3 + i64::from(doubled_vetoers % 3 != 0);
 
         let mut status = veto.status.clone();
         let mut escalation_result: Option<String> = None;

@@ -1,12 +1,6 @@
 // Explicit branches preserve the established evaluation order and mutation points.
-// Paginator values retain the existing signed database and unsigned page-index representations.
 // Local SQL row types stay beside the queries whose column shapes they mirror.
-#![allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::items_after_statements,
-    clippy::useless_let_if_seq
-)]
+#![allow(clippy::items_after_statements, clippy::useless_let_if_seq)]
 
 use chrono::{Duration, Utc};
 use sea_orm::{
@@ -820,11 +814,15 @@ impl ImpactReviewService {
             query = query.filter(impact_review::Column::Rating.eq(rating));
         }
 
+        let page_size =
+            u64::try_from(per_page).map_err(|_| ApiError::BadRequest("per_page must be positive".to_string()))?;
+        let page_index =
+            u64::try_from(page - 1).map_err(|_| ApiError::BadRequest("page must be positive".to_string()))?;
         let paginator = query
             .order_by_desc(impact_review::Column::CreatedAt)
-            .paginate(&self.db, per_page as u64);
-        let total = paginator.num_items().await? as i64;
-        let items = paginator.fetch_page((page - 1) as u64).await?;
+            .paginate(&self.db, page_size);
+        let total = i64::try_from(paginator.num_items().await?).map_err(|_| ApiError::Internal)?;
+        let items = paginator.fetch_page(page_index).await?;
 
         Ok((items, total))
     }

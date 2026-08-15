@@ -1,11 +1,5 @@
 // Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
-    clippy::needless_pass_by_value
-)]
+#![allow(clippy::needless_pass_by_value)]
 
 use axum::{
     Extension, Json,
@@ -6747,7 +6741,7 @@ async fn duplicate_form_views(
         ))
         .await?;
     }
-    Ok(views.len() as i64)
+    i64::try_from(views.len()).map_err(|_| ApiError::Internal)
 }
 
 async fn next_duplicate_form_key(state: &AppState, project_id: Uuid, source_key: &str) -> Result<String, ApiError> {
@@ -7070,7 +7064,7 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
     if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     }
 }
 
@@ -7084,7 +7078,7 @@ mod tests {
         ensure_can_read_job_result, ensure_link_target_scope, filter_event_response_values,
         import_records_request_from_uploaded_file_without_mapping, job_listing_owner_filter,
         normalize_scenario_field_schema, owned_record_event_predicate, push_event_scope_filters,
-        record_claimed_object_keys, required_child_table_would_be_emptied, summarize_job_result,
+        record_claimed_object_keys, required_child_table_would_be_emptied, summarize_job_result, total_pages,
         write_attachment_package_artifact,
     };
     use crate::{
@@ -7098,6 +7092,12 @@ mod tests {
 
     fn denied_fields(keys: &[&str]) -> BTreeSet<String> {
         keys.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    #[test]
+    fn total_pages_keeps_full_i64_precision() {
+        assert_eq!(total_pages(i64::MAX, 100), i64::MAX / 100 + 1);
+        assert_eq!(total_pages(0, 100), 0);
     }
 
     fn parent_schema_with_child_table(required: bool) -> Value {

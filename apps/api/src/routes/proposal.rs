@@ -1,11 +1,5 @@
 // Explicit branches preserve the established evaluation order and mutation points.
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::useless_let_if_seq
-)]
+#![allow(clippy::useless_let_if_seq)]
 
 use axum::{
     Extension, Json,
@@ -730,6 +724,8 @@ async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(),
     let total = yes + no + abstain;
     let result = calculate_result(weighted_yes, weighted_no, &proposal.voting_rule);
 
+    // Vote counts are non-negative i64 values and this field is an approximate ratio constrained to 0.0..=1.0.
+    #[allow(clippy::cast_precision_loss)]
     let approval_rate = if yes + no > 0 {
         Some((yes as f64) / ((yes + no) as f64))
     } else {
@@ -741,6 +737,14 @@ async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(),
     } else {
         None
     };
+    let total_votes = i32::try_from(total)
+        .map_err(|_| ApiError::BadRequest("vote tally exceeds the supported i32 range".to_string()))?;
+    let yes_votes = i32::try_from(yes)
+        .map_err(|_| ApiError::BadRequest("yes vote tally exceeds the supported i32 range".to_string()))?;
+    let no_votes = i32::try_from(no)
+        .map_err(|_| ApiError::BadRequest("no vote tally exceeds the supported i32 range".to_string()))?;
+    let abstain_votes = i32::try_from(abstain)
+        .map_err(|_| ApiError::BadRequest("abstain vote tally exceeds the supported i32 range".to_string()))?;
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -773,10 +777,10 @@ async fn finalize_voting(state: &AppState, proposal: &ProposalRow) -> Result<(),
                 proposal.id.clone().into(),
                 result.as_db_value().into(),
                 approval_rate.into(),
-                (total as i32).into(),
-                (yes as i32).into(),
-                (no as i32).into(),
-                (abstain as i32).into(),
+                total_votes.into(),
+                yes_votes.into(),
+                no_votes.into(),
+                abstain_votes.into(),
                 Some(weighted_yes).into(),
                 Some(weighted_no).into(),
                 weighted_approval_rate.into(),
@@ -1650,7 +1654,7 @@ pub async fn list_proposals(
     let total_pages = if total == 0 {
         1
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {
@@ -2166,7 +2170,8 @@ pub async fn create_vote(
             .ai_reason_min_length(actor.user_id, project_id)
             .await?
             .unwrap_or(50)
-            .max(0) as usize;
+            .max(0);
+        let min_reason = usize::try_from(min_reason).map_err(|_| ApiError::Internal)?;
 
         let reason_len = req
             .reason

@@ -1,6 +1,3 @@
-// Dimensions are clamped to the configured u32 policy range before conversion.
-#![allow(clippy::cast_possible_truncation)]
-
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -222,6 +219,8 @@ fn attachment_thumbnail_max_dimension(value: &Value) -> Option<u32> {
     if dimension == 0 {
         return None;
     }
+    // The clamp caps this value at MAX_ATTACHMENT_THUMBNAIL_DIMENSION, which is a u32 constant.
+    #[allow(clippy::cast_possible_truncation)]
     Some(dimension.clamp(
         u64::from(MIN_ATTACHMENT_THUMBNAIL_DIMENSION),
         u64::from(MAX_ATTACHMENT_THUMBNAIL_DIMENSION),
@@ -235,6 +234,8 @@ fn attachment_preview_max_dimension(value: &Value) -> Option<u32> {
     if dimension == 0 {
         return None;
     }
+    // The clamp caps this value at MAX_ATTACHMENT_PREVIEW_DIMENSION, which is a u32 constant.
+    #[allow(clippy::cast_possible_truncation)]
     Some(dimension.clamp(
         u64::from(MIN_ATTACHMENT_PREVIEW_DIMENSION),
         u64::from(MAX_ATTACHMENT_PREVIEW_DIMENSION),

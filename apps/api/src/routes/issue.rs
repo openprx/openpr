@@ -1,12 +1,6 @@
 // Domain-specific local names remain explicit for audit readability.
-// Pagination retains the established floating-point ceiling and signed wire representation.
 // Local SQL row types stay beside the queries whose column shapes they mirror.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::items_after_statements,
-    clippy::similar_names
-)]
+#![allow(clippy::items_after_statements, clippy::similar_names)]
 
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
@@ -584,7 +578,7 @@ pub async fn list_issues(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {

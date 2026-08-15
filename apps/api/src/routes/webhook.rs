@@ -1,6 +1,3 @@
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -134,7 +131,7 @@ pub async fn list_deliveries(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / f64::from(per_page)).ceil() as i64
+        total / i64::from(per_page) + i64::from(total % i64::from(per_page) != 0)
     };
 
     let rows = state

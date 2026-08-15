@@ -1,10 +1,5 @@
 // Explicit branches preserve the established evaluation order and mutation points.
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::option_if_let_else
-)]
+#![allow(clippy::option_if_let_else)]
 
 use axum::{
     Extension, Json,
@@ -439,7 +434,7 @@ pub async fn list_project_ai_tasks(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     let (list_sql, list_values) = if let Some(status) = query.status {

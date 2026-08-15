@@ -1,12 +1,6 @@
 // Domain-specific local names remain explicit for audit readability.
-// Workflow positions come from bounded in-memory template indices.
 // Local SQL row types stay beside the queries whose column shapes they mirror.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::items_after_statements,
-    clippy::similar_names
-)]
+#![allow(clippy::items_after_statements, clippy::similar_names)]
 
 use axum::{
     Extension, Json,
@@ -1170,7 +1164,10 @@ pub async fn reorder_workflow_states(
 
     // Phase 1: assign large offset values to avoid UNIQUE(workflow_id, position) conflicts
     for (idx, sid) in req.state_ids.iter().enumerate() {
-        let offset_pos = 10000 + idx as i32;
+        let position = i32::try_from(idx).map_err(|_| ApiError::BadRequest("too many workflow states".to_string()))?;
+        let offset_pos = 10000_i32
+            .checked_add(position)
+            .ok_or_else(|| ApiError::BadRequest("too many workflow states".to_string()))?;
         state
             .db
             .execute(Statement::from_sql_and_values(
@@ -1183,7 +1180,7 @@ pub async fn reorder_workflow_states(
 
     // Phase 2: assign final positions
     for (idx, sid) in req.state_ids.iter().enumerate() {
-        let final_pos = idx as i32;
+        let final_pos = i32::try_from(idx).map_err(|_| ApiError::BadRequest("too many workflow states".to_string()))?;
         state
             .db
             .execute(Statement::from_sql_and_values(

@@ -1,10 +1,6 @@
 // Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
-// Template ordinals and WASM byte lengths retain the existing bounded encoder semantics.
 // Local SQL row types stay beside the queries whose column shapes they mirror.
 #![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
     clippy::items_after_statements,
     clippy::needless_pass_by_value,
     clippy::similar_names
@@ -267,6 +263,8 @@ async fn create_template_workflow(
             .or_else(|| state.get("is_terminal"))
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
+        let position = i32::try_from(idx + 1)
+            .map_err(|_| ApiError::BadRequest("template defines too many workflow states".to_string()))?;
 
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -283,7 +281,7 @@ async fn create_template_workflow(
                 key.to_string().into(),
                 display_name.to_string().into(),
                 category.to_string().into(),
-                ((idx + 1) as i32).into(),
+                position.into(),
                 color.into(),
                 is_initial.into(),
                 is_terminal.into(),
@@ -1563,31 +1561,31 @@ fn constant_json_wasm(output: &JsonValue) -> Result<Vec<u8>, ApiError> {
     let input_ptr = 2048_u32;
     let handle = (i64::from(output_ptr) << 32) | i64::try_from(output.len()).unwrap_or(i64::MAX);
     let type_section = wasm_vec(vec![
-        wasm_func_type(&[0x7f], &[0x7f]),
-        wasm_func_type(&[0x7f, 0x7f], &[0x7e]),
-        wasm_func_type(&[], &[0x7f]),
-    ]);
-    let function_section = wasm_vec(vec![vec![0x02], vec![0x00], vec![0x01]]);
-    let memory_section = wasm_vec(vec![vec![0x00, 0x01]]);
+        wasm_func_type(&[0x7f], &[0x7f])?,
+        wasm_func_type(&[0x7f, 0x7f], &[0x7e])?,
+        wasm_func_type(&[], &[0x7f])?,
+    ])?;
+    let function_section = wasm_vec(vec![vec![0x02], vec![0x00], vec![0x01]])?;
+    let memory_section = wasm_vec(vec![vec![0x00, 0x01]])?;
     let export_section = wasm_vec(vec![
-        wasm_export("memory", 0x02, 0),
-        wasm_export("openpr_plugin_abi_version", 0x00, 0),
-        wasm_export("openpr_alloc", 0x00, 1),
-        wasm_export("openpr_invoke", 0x00, 2),
-    ]);
+        wasm_export("memory", 0x02, 0)?,
+        wasm_export("openpr_plugin_abi_version", 0x00, 0)?,
+        wasm_export("openpr_alloc", 0x00, 1)?,
+        wasm_export("openpr_invoke", 0x00, 2)?,
+    ])?;
     let code_section = wasm_vec(vec![
-        wasm_body(vec![0x41, 0x01]),
+        wasm_body(vec![0x41, 0x01])?,
         wasm_body({
             let mut instructions = vec![0x41];
             instructions.extend(leb_u32(input_ptr));
             instructions
-        }),
+        })?,
         wasm_body({
             let mut instructions = vec![0x42];
             instructions.extend(leb_i64(handle));
             instructions
-        }),
-    ]);
+        })?,
+    ])?;
     let data_section = wasm_vec(vec![{
         let mut segment = vec![0x00, 0x41];
         segment.extend(leb_u32(output_ptr));
@@ -1597,62 +1595,66 @@ fn constant_json_wasm(output: &JsonValue) -> Result<Vec<u8>, ApiError> {
         ));
         segment.extend(output);
         segment
-    }]);
+    }])?;
 
     let mut wasm = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
-    wasm.extend(wasm_section(1, type_section));
-    wasm.extend(wasm_section(3, function_section));
-    wasm.extend(wasm_section(5, memory_section));
-    wasm.extend(wasm_section(7, export_section));
-    wasm.extend(wasm_section(10, code_section));
-    wasm.extend(wasm_section(11, data_section));
+    wasm.extend(wasm_section(1, type_section)?);
+    wasm.extend(wasm_section(3, function_section)?);
+    wasm.extend(wasm_section(5, memory_section)?);
+    wasm.extend(wasm_section(7, export_section)?);
+    wasm.extend(wasm_section(10, code_section)?);
+    wasm.extend(wasm_section(11, data_section)?);
     Ok(wasm)
 }
 
-fn wasm_func_type(params: &[u8], results: &[u8]) -> Vec<u8> {
-    let mut bytes = vec![0x60];
-    bytes.extend(leb_u32(params.len() as u32));
-    bytes.extend(params);
-    bytes.extend(leb_u32(results.len() as u32));
-    bytes.extend(results);
-    bytes
+fn wasm_len(len: usize) -> Result<u32, ApiError> {
+    u32::try_from(len).map_err(|_| ApiError::BadRequest("generated plugin module is too large".to_string()))
 }
 
-fn wasm_export(name: &str, kind: u8, index: u32) -> Vec<u8> {
-    let mut bytes = wasm_str(name);
+fn wasm_func_type(params: &[u8], results: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = vec![0x60];
+    bytes.extend(leb_u32(wasm_len(params.len())?));
+    bytes.extend(params);
+    bytes.extend(leb_u32(wasm_len(results.len())?));
+    bytes.extend(results);
+    Ok(bytes)
+}
+
+fn wasm_export(name: &str, kind: u8, index: u32) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = wasm_str(name)?;
     bytes.push(kind);
     bytes.extend(leb_u32(index));
-    bytes
+    Ok(bytes)
 }
 
-fn wasm_body(instructions: Vec<u8>) -> Vec<u8> {
+fn wasm_body(instructions: Vec<u8>) -> Result<Vec<u8>, ApiError> {
     let mut body = vec![0x00];
     body.extend(instructions);
     body.push(0x0b);
-    let mut bytes = leb_u32(body.len() as u32);
+    let mut bytes = leb_u32(wasm_len(body.len())?);
     bytes.extend(body);
-    bytes
+    Ok(bytes)
 }
 
-fn wasm_section(id: u8, content: Vec<u8>) -> Vec<u8> {
+fn wasm_section(id: u8, content: Vec<u8>) -> Result<Vec<u8>, ApiError> {
     let mut bytes = vec![id];
-    bytes.extend(leb_u32(content.len() as u32));
+    bytes.extend(leb_u32(wasm_len(content.len())?));
     bytes.extend(content);
-    bytes
+    Ok(bytes)
 }
 
-fn wasm_vec(items: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut bytes = leb_u32(items.len() as u32);
+fn wasm_vec(items: Vec<Vec<u8>>) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = leb_u32(wasm_len(items.len())?);
     for item in items {
         bytes.extend(item);
     }
-    bytes
+    Ok(bytes)
 }
 
-fn wasm_str(value: &str) -> Vec<u8> {
-    let mut bytes = leb_u32(value.len() as u32);
+fn wasm_str(value: &str) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = leb_u32(wasm_len(value.len())?);
     bytes.extend(value.as_bytes());
-    bytes
+    Ok(bytes)
 }
 
 fn leb_u32(mut value: u32) -> Vec<u8> {
@@ -1674,6 +1676,8 @@ fn leb_u32(mut value: u32) -> Vec<u8> {
 fn leb_i64(mut value: i64) -> Vec<u8> {
     let mut bytes = Vec::new();
     loop {
+        // Masking with 0x7f proves the encoded chunk is always within the u8 range 0..=127.
+        #[allow(clippy::cast_sign_loss)]
         let mut byte = (value & 0x7f) as u8;
         value >>= 7;
         let sign_bit_set = (byte & 0x40) != 0;

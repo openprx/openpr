@@ -1,6 +1,5 @@
 // Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
-// Decimal scale validation bounds the value before its established u32 representation.
-#![allow(clippy::cast_possible_truncation, clippy::needless_pass_by_value)]
+#![allow(clippy::needless_pass_by_value)]
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -276,7 +275,7 @@ fn parse_amount_config(value: Option<&Value>) -> Result<AmountFieldConfig, Strin
 
     Ok(AmountFieldConfig {
         currency,
-        scale: scale as u32,
+        scale: u32::try_from(scale).map_err(|_| "amount.scale cannot be represented as u32".to_string())?,
         allow_negative: object
             .and_then(|item| item.get("allow_negative"))
             .and_then(Value::as_bool)

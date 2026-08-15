@@ -136,9 +136,9 @@ mod tests {
     fn test_access_token_claims_fields() {
         // 验证 access token 的 sub/email/token_type/iat/exp 字段均正确写入
         let mgr = make_manager();
-        let before = chrono::Utc::now().timestamp() as usize;
+        let before = usize::try_from(chrono::Utc::now().timestamp()).expect("current timestamps fit in usize");
         let token = mgr.issue_access_token("uid-42", "check@fields.com").expect("签发失败");
-        let after = chrono::Utc::now().timestamp() as usize;
+        let after = usize::try_from(chrono::Utc::now().timestamp()).expect("current timestamps fit in usize");
 
         let claims = mgr.verify_access_token(&token).expect("验证失败");
 

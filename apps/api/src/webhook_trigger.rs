@@ -1,11 +1,6 @@
 // This data shape mirrors an established wire or persistence schema and must remain stable.
-// Elapsed milliseconds retain the established signed diagnostic representation.
 // Local SQL row types stay beside the queries whose column shapes they mirror.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::items_after_statements,
-    clippy::struct_field_names
-)]
+#![allow(clippy::items_after_statements, clippy::struct_field_names)]
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -902,7 +897,7 @@ async fn deliver_webhook(
         ),
     };
 
-    let duration_ms = started.elapsed().as_millis() as i64;
+    let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
     let record = DeliveryRecord {
         webhook_id: webhook.id,

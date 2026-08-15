@@ -1,6 +1,5 @@
 // Domain-specific local names remain explicit for audit readability.
-// Governance counts and ratios retain their established database and JSON numeric representations.
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::similar_names)]
+#![allow(clippy::similar_names)]
 
 use axum::{
     Extension, Json,
@@ -814,6 +813,8 @@ pub async fn get_decision_analytics(
     .all(&state.db)
     .await?;
 
+    // PostgreSQL counts are non-negative i64 values and this JSON field is an approximate ratio in 0.0..=1.0.
+    #[allow(clippy::cast_precision_loss)]
     let pass_rate = if overview.total_decisions > 0 {
         (overview.approved_count as f64) / (overview.total_decisions as f64)
     } else {
@@ -835,6 +836,8 @@ pub async fn get_decision_analytics(
             "avg_cycle_hours": overview.avg_cycle_hours
         },
         "by_type": by_type.into_iter().map(|row| {
+            // PostgreSQL counts are non-negative i64 values and this JSON field is an approximate ratio in 0.0..=1.0.
+            #[allow(clippy::cast_precision_loss)]
             let rate = if row.total_decisions > 0 {
                 (row.approved_count as f64) / (row.total_decisions as f64)
             } else {
@@ -851,6 +854,8 @@ pub async fn get_decision_analytics(
             })
         }).collect::<Vec<Value>>(),
         "by_domain": by_domain.into_iter().map(|row| {
+            // PostgreSQL counts are non-negative i64 values and this JSON field is an approximate ratio in 0.0..=1.0.
+            #[allow(clippy::cast_precision_loss)]
             let rate = if row.total_decisions > 0 {
                 (row.approved_count as f64) / (row.total_decisions as f64)
             } else {
@@ -1174,17 +1179,21 @@ pub async fn create_project_audit_report(
         &Uuid::new_v4().simple().to_string()[..8]
     );
 
+    // PostgreSQL counts are non-negative i64 values and this JSON field is an approximate ratio in 0.0..=1.0.
+    #[allow(clippy::cast_precision_loss)]
+    let report_pass_rate = if summary.total_decisions > 0 {
+        (summary.approved_count as f64) / (summary.total_decisions as f64)
+    } else {
+        0.0
+    };
+
     let key_insights = json!({
         "decision_stats": {
             "total_decisions": summary.total_decisions,
             "approved_count": summary.approved_count,
             "rejected_count": summary.rejected_count,
             "vetoed_count": summary.vetoed_count,
-            "pass_rate": if summary.total_decisions > 0 {
-                (summary.approved_count as f64) / (summary.total_decisions as f64)
-            } else {
-                0.0
-            },
+            "pass_rate": report_pass_rate,
             "avg_cycle_hours": summary.avg_cycle_hours
         },
         "trust_distribution": trust_distribution,
@@ -1195,6 +1204,17 @@ pub async fn create_project_audit_report(
             "rating_distribution": rating.rating_distribution
         }
     });
+
+    let total_proposals = i32::try_from(summary.total_decisions)
+        .map_err(|_| ApiError::BadRequest("report total exceeds the supported i32 range".to_string()))?;
+    let approved_proposals = i32::try_from(summary.approved_count)
+        .map_err(|_| ApiError::BadRequest("approved total exceeds the supported i32 range".to_string()))?;
+    let rejected_proposals = i32::try_from(summary.rejected_count)
+        .map_err(|_| ApiError::BadRequest("rejected total exceeds the supported i32 range".to_string()))?;
+    let vetoed_proposals = i32::try_from(summary.vetoed_count)
+        .map_err(|_| ApiError::BadRequest("vetoed total exceeds the supported i32 range".to_string()))?;
+    let reviewed_proposals = i32::try_from(rating.reviewed_proposals)
+        .map_err(|_| ApiError::BadRequest("reviewed total exceeds the supported i32 range".to_string()))?;
 
     state
         .db
@@ -1220,11 +1240,11 @@ pub async fn create_project_audit_report(
                 project_id.into(),
                 period_start.into(),
                 period_end.into(),
-                (summary.total_decisions as i32).into(),
-                (summary.approved_count as i32).into(),
-                (summary.rejected_count as i32).into(),
-                (summary.vetoed_count as i32).into(),
-                (rating.reviewed_proposals as i32).into(),
+                total_proposals.into(),
+                approved_proposals.into(),
+                rejected_proposals.into(),
+                vetoed_proposals.into(),
+                reviewed_proposals.into(),
                 rating.avg_review_rating.into(),
                 rating.rating_distribution.into(),
                 Some(top_contributors).into(),
@@ -1540,11 +1560,15 @@ pub async fn get_ai_participant_alignment_stats(
         recent_aligned: 0,
     });
 
+    // PostgreSQL counts are non-negative i64 values and this JSON field is an approximate ratio in 0.0..=1.0.
+    #[allow(clippy::cast_precision_loss)]
     let overall_alignment_rate = if stats.total > 0 {
         (stats.aligned as f64) / (stats.total as f64)
     } else {
         0.0
     };
+    // PostgreSQL counts are non-negative i64 values and this JSON field is an approximate ratio in 0.0..=1.0.
+    #[allow(clippy::cast_precision_loss)]
     let recent_alignment_rate = if stats.recent_total > 0 {
         (stats.recent_aligned as f64) / (stats.recent_total as f64)
     } else {

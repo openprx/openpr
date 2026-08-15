@@ -1,6 +1,3 @@
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-
 use std::{
     fmt::Write as _,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -699,7 +696,7 @@ pub async fn list_invocation_tool_calls(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {
@@ -778,7 +775,7 @@ pub async fn list_invocation_inbox(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {
@@ -937,7 +934,7 @@ pub async fn list_form_inbox(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {
@@ -1560,7 +1557,7 @@ async fn list_invocations_inner(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {

@@ -1,6 +1,5 @@
 // The explicit public type contract remains stable without broadening or replacing its API.
-// Collection length retains the established signed pagination representation.
-#![allow(clippy::cast_possible_wrap, clippy::trait_duplication_in_bounds)]
+#![allow(clippy::trait_duplication_in_bounds)]
 
 use axum::Json;
 use serde::Serialize;
@@ -52,6 +51,8 @@ pub struct PaginatedData<T: Serialize> {
 
 impl<T: Serialize> PaginatedData<T> {
     pub const fn from_items(items: Vec<T>) -> Self {
+        // Vec length cannot exceed isize::MAX, which fits in i64 on every supported target.
+        #[allow(clippy::cast_possible_wrap)]
         let total = items.len() as i64;
         Self {
             items,

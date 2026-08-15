@@ -1,6 +1,3 @@
-// Pagination retains the established floating-point ceiling and signed wire representation.
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-
 use axum::{
     Extension,
     extract::{Path, Query, State},
@@ -125,7 +122,7 @@ pub async fn list_decisions(
     let total_pages = if total == 0 {
         1
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        total / per_page + i64::from(total % per_page != 0)
     };
 
     Ok(ApiResponse::success(PaginatedData {
