@@ -1,5 +1,3 @@
-#![allow(clippy::nursery, clippy::pedantic)]
-
 use api::{middleware, response::ApiResponse, routes};
 use axum::{
     Json, Router,
@@ -1838,7 +1836,7 @@ async fn health(State(state): State<AppState>) -> Json<ApiResponse<HealthRespons
 
 async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     match state.db.ping().await {
-        Ok(_) => ApiResponse::success(serde_json::json!({"status":"ready"})).into_response(),
+        Ok(()) => ApiResponse::success(serde_json::json!({"status":"ready"})).into_response(),
         Err(err) => {
             tracing::warn!(error = %err, "database not ready");
             ApiResponse::error(500, "database not ready").into_response()
@@ -2733,7 +2731,7 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
             .query_one(Statement::from_string(DbBackend::Postgres, (*sql).to_string()))
             .await
         {
-            return Err(anyhow::anyhow!("governance schema check failed for {}: {}", name, e));
+            return Err(anyhow::anyhow!("governance schema check failed for {name}: {e}"));
         }
     }
 
@@ -2741,7 +2739,16 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::print_stderr)]
+// Test modules index fixtures directly, print skip reasons, and mirror wire shapes;
+// panicking there is the assertion rather than a defect.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::print_stderr,
+    clippy::doc_markdown,
+    clippy::redundant_pub_crate,
+    clippy::struct_field_names,
+    clippy::case_sensitive_file_extension_comparisons
+)]
 mod tests {
     use super::{MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, MigrationOptions, migration_checksum};
     use platform::config::MigrationsConfig;
@@ -2997,7 +3004,16 @@ mod tests {
 /// `postgres://user:pw@127.0.0.1:5432/postgres`. Without it these tests report that they were
 /// skipped instead of pretending to pass.
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::print_stderr)]
+// Test modules index fixtures directly, print skip reasons, and mirror wire shapes;
+// panicking there is the assertion rather than a defect.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::print_stderr,
+    clippy::doc_markdown,
+    clippy::redundant_pub_crate,
+    clippy::struct_field_names,
+    clippy::case_sensitive_file_extension_comparisons
+)]
 mod migration_runner_database_tests {
     use super::{MIGRATIONS, MigrationOptions, migration_is_present, run_migrations_with};
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
@@ -3458,7 +3474,16 @@ mod migration_runner_database_tests {
 ///
 /// Uses the same `OPENPR_TEST_DATABASE_URL` as the migration tests.
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::print_stderr)]
+// Test modules index fixtures directly, print skip reasons, and mirror wire shapes;
+// panicking there is the assertion rather than a defect.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::print_stderr,
+    clippy::doc_markdown,
+    clippy::redundant_pub_crate,
+    clippy::struct_field_names,
+    clippy::case_sensitive_file_extension_comparisons
+)]
 mod proposal_scope_database_tests {
     use super::migration_runner_database_tests::{Scratch, scratch};
     use super::{MigrationOptions, run_migrations_with};
