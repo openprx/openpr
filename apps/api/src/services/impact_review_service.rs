@@ -1,3 +1,13 @@
+// Explicit branches preserve the established evaluation order and mutation points.
+// Paginator values retain the existing signed database and unsigned page-index representations.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::items_after_statements,
+    clippy::useless_let_if_seq
+)]
+
 use chrono::{Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -220,16 +230,13 @@ impl ImpactReviewService {
                 .filter(governance_config::Column::ProjectId.eq(project.project_id))
                 .one(db)
                 .await?
-                .map(|cfg| cfg.auto_review_days.max(1))
-                .unwrap_or(30)
+                .map_or(30, |cfg| cfg.auto_review_days.max(1))
         } else {
             30
         };
 
-        let from_voting = voting_ended_at
-            .map(|at| at.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now)
-            + Duration::days(auto_review_days as i64);
+        let from_voting = voting_ended_at.map_or_else(Utc::now, |at| at.with_timezone(&Utc))
+            + Duration::days(i64::from(auto_review_days));
         let all_closed_at = TimestampRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
             r"
@@ -247,7 +254,7 @@ impl ImpactReviewService {
         .await?;
 
         let from_issues = all_closed_at.map(|row| row.value + Duration::days(7));
-        Ok(from_issues.map(|time| time.min(from_voting)).unwrap_or(from_voting))
+        Ok(from_issues.map_or(from_voting, |time| time.min(from_voting)))
     }
 
     async fn populate_participants<C: ConnectionTrait>(
@@ -898,14 +905,14 @@ async fn infer_participant_type<C: ConnectionTrait>(
     .one(db)
     .await?;
 
-    Ok(row
-        .map(|r| parse_participant_type(&r.voter_type))
-        .unwrap_or(crate::entities::trust_score::ParticipantType::Human))
+    Ok(row.map_or(crate::entities::trust_score::ParticipantType::Human, |r| {
+        parse_participant_type(&r.voter_type)
+    }))
 }
 
 fn compute_outcome_alignment(rating: ReviewRating, vote_choice: Option<&str>) -> &'static str {
     let outcome_positive = matches!(rating, ReviewRating::S | ReviewRating::A | ReviewRating::B);
-    match vote_choice.map(|v| v.to_ascii_lowercase()) {
+    match vote_choice.map(str::to_ascii_lowercase) {
         Some(choice) if choice == "abstain" => "neutral",
         Some(choice) if choice == "yes" && outcome_positive => "aligned",
         Some(choice) if choice == "no" && !outcome_positive => "aligned",

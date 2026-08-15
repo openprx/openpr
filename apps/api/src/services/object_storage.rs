@@ -1,4 +1,10 @@
-use std::path::{Component, Path, PathBuf};
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::needless_pass_by_value, clippy::option_if_let_else)]
+
+use std::{
+    fmt::Write as _,
+    path::{Component, Path, PathBuf},
+};
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -252,7 +258,7 @@ impl S3ObjectStorage {
         let date = now.format("%Y%m%d").to_string();
         let authorization = s3_authorization(S3AuthorizationInput {
             method: method.as_str(),
-            canonical_uri: &canonical_uri,
+            canonical_uri,
             host: &host,
             payload_hash: &payload_hash,
             access_key_id: self.access_key_id.expose(),
@@ -404,7 +410,7 @@ fn s3_authorization(input: S3AuthorizationInput<'_>) -> Result<String, ApiError>
         input.host, input.payload_hash, input.amz_date
     );
     let signed_headers = if let Some(session_token) = input.session_token {
-        canonical_headers.push_str(&format!("x-amz-security-token:{session_token}\n"));
+        let _ = writeln!(canonical_headers, "x-amz-security-token:{session_token}");
         "host;x-amz-content-sha256;x-amz-date;x-amz-security-token"
     } else {
         "host;x-amz-content-sha256;x-amz-date"

@@ -1,3 +1,15 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+// Template ordinals and WASM byte lengths retain the existing bounded encoder semantics.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::items_after_statements,
+    clippy::needless_pass_by_value,
+    clippy::similar_names
+)]
+
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -1040,7 +1052,7 @@ fn default_plugin_templates(template_key: &str) -> Result<Vec<TemplatePlugin>, A
                     "tools": [
                         {"name": "restaurant_calc.today_revenue", "description": "Read restaurant daily revenue context."}
                     ],
-                    "runtime": {"timeout_ms": 500, "fuel": 100000, "memory_bytes": 1048576}
+                    "runtime": {"timeout_ms": 500, "fuel": 100_000, "memory_bytes": 1_048_576}
                 }
             }),
             wasm_bytes: constant_json_wasm(&json!({
@@ -1677,7 +1689,7 @@ fn leb_i64(mut value: i64) -> Vec<u8> {
     bytes
 }
 
-/// POST /api/v1/workspaces/:workspace_id/projects - Create a new project
+/// POST /`api/v1/workspaces/:workspace_id/projects` - Create a new project
 pub async fn create_project(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -2051,7 +2063,7 @@ pub async fn install_project_scenario_template(
     })))
 }
 
-/// GET /api/v1/workspaces/:workspace_id/projects - List projects in workspace
+/// GET /`api/v1/workspaces/:workspace_id/projects` - List projects in workspace
 pub async fn list_projects(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -2249,32 +2261,32 @@ pub async fn update_project(
     let mut param_idx = 1;
 
     if let Some(name) = req.name {
-        updates.push(format!("name = ${}", param_idx));
+        updates.push(format!("name = ${param_idx}"));
         values.push(name.into());
         param_idx += 1;
     }
 
     if let Some(key) = req.key {
-        updates.push(format!("key = ${}", param_idx));
+        updates.push(format!("key = ${param_idx}"));
         values.push(key.into());
         param_idx += 1;
     }
 
     if let Some(description) = req.description {
-        updates.push(format!("description = ${}", param_idx));
+        updates.push(format!("description = ${param_idx}"));
         values.push(description.into());
         param_idx += 1;
     }
 
     if let Some(type_key) = req.type_key {
         ensure_project_type_exists(&state, &type_key).await?;
-        updates.push(format!("type_key = ${}", param_idx));
+        updates.push(format!("type_key = ${param_idx}"));
         values.push(type_key.into());
         param_idx += 1;
     }
 
     if let Some(type_settings) = req.type_settings {
-        updates.push(format!("type_settings = ${}", param_idx));
+        updates.push(format!("type_settings = ${param_idx}"));
         values.push(type_settings.into());
         param_idx += 1;
     }
@@ -2283,7 +2295,7 @@ pub async fn update_project(
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
 
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     values.push(chrono::Utc::now().into());
     param_idx += 1;
 
@@ -2595,8 +2607,7 @@ mod tests {
             assert!(
                 form.get("views")
                     .and_then(JsonValue::as_array)
-                    .map(|views| views.len() >= 2)
-                    .unwrap_or(false)
+                    .is_some_and(|views| views.len() >= 2)
             );
         }
     }

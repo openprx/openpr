@@ -1,3 +1,6 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::needless_pass_by_value)]
+
 use axum::{
     Extension,
     extract::{Path, Query, State},

@@ -1,3 +1,6 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::needless_pass_by_value)]
+
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value, json};
@@ -131,12 +134,11 @@ pub fn normalize_record_values_report(
             continue;
         };
         let value = normalize_field_value(field, raw_value, existing_values.and_then(|item| item.get(&field.key)))?;
-        if field_read_only_by_condition(field, input, existing_values) {
-            if let Some(existing) = existing_values.and_then(|item| item.get(&field.key)) {
-                if existing != &value {
-                    return Err(format!("field '{}' is read-only by condition", field.key));
-                }
-            }
+        if field_read_only_by_condition(field, input, existing_values)
+            && let Some(existing) = existing_values.and_then(|item| item.get(&field.key))
+            && existing != &value
+        {
+            return Err(format!("field '{}' is read-only by condition", field.key));
         }
         normalized.insert(field.key.clone(), value);
     }
@@ -234,10 +236,10 @@ fn normalize_member(field: &FormField, raw: &Value) -> Result<Value, String> {
     let mut value = Map::new();
     value.insert("user_id".to_string(), json!(user_id));
     for key in ["name", "email"] {
-        if let Some(item) = object.get(key).and_then(Value::as_str).map(str::trim) {
-            if !item.is_empty() {
-                value.insert(key.to_string(), json!(item));
-            }
+        if let Some(item) = object.get(key).and_then(Value::as_str).map(str::trim)
+            && !item.is_empty()
+        {
+            value.insert(key.to_string(), json!(item));
         }
     }
     Ok(Value::Object(value))
@@ -278,10 +280,10 @@ fn normalize_location(field: &FormField, raw: &Value) -> Result<Value, String> {
     let mut value = Map::new();
     value.insert("lat".to_string(), json!(lat));
     value.insert("lng".to_string(), json!(lng));
-    if let Some(label) = object.get("label").and_then(Value::as_str).map(str::trim) {
-        if !label.is_empty() {
-            value.insert("label".to_string(), json!(label));
-        }
+    if let Some(label) = object.get("label").and_then(Value::as_str).map(str::trim)
+        && !label.is_empty()
+    {
+        value.insert("label".to_string(), json!(label));
     }
     Ok(Value::Object(value))
 }
@@ -485,15 +487,15 @@ fn condition_matches(condition: &Value, input: &Map<String, Value>, existing_val
 
 fn normalize_condition_operator(operator: Option<&str>) -> &'static str {
     match operator.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
-        Some("not_equals") | Some("neq") | Some("!=") | Some("<>") => "not_equals",
+        Some("not_equals" | "neq" | "!=" | "<>") => "not_equals",
         Some("contains") => "contains",
-        Some("not_contains") | Some("not-contains") => "not_contains",
-        Some("is_empty") | Some("empty") => "is_empty",
-        Some("not_empty") | Some("exists") => "not_empty",
-        Some("gt") | Some(">") => "gt",
-        Some("gte") | Some(">=") => "gte",
-        Some("lt") | Some("<") => "lt",
-        Some("lte") | Some("<=") => "lte",
+        Some("not_contains" | "not-contains") => "not_contains",
+        Some("is_empty" | "empty") => "is_empty",
+        Some("not_empty" | "exists") => "not_empty",
+        Some("gt" | ">") => "gt",
+        Some("gte" | ">=") => "gte",
+        Some("lt" | "<") => "lt",
+        Some("lte" | "<=") => "lte",
         _ => "equals",
     }
 }
@@ -975,7 +977,7 @@ mod tests {
             normalized.get("scan_code").and_then(serde_json::Value::as_str),
             Some("SKU-2026-0001")
         );
-        assert!(normalize_record_values(&schema, json!({"scan_code": 20260001})).is_err());
+        assert!(normalize_record_values(&schema, json!({"scan_code": 20_260_001})).is_err());
     }
 
     #[test]

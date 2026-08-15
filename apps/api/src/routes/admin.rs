@@ -1,3 +1,6 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::ref_option)]
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -136,7 +139,7 @@ pub async fn list_users(
 
     let (where_sql, where_values) = build_search_where(&query.search, &query.entity_type)?;
 
-    let count_sql = format!("SELECT COUNT(*)::bigint as total FROM users {}", where_sql);
+    let count_sql = format!("SELECT COUNT(*)::bigint as total FROM users {where_sql}");
     let total_row = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         &count_sql,
@@ -203,7 +206,7 @@ pub async fn create_user(
     }
 
     let password_hash = if entity_type == "bot" {
-        "".to_string()
+        String::new()
     } else {
         let password = req
             .password
@@ -363,44 +366,44 @@ pub async fn update_user(
     let mut param_idx: i64 = 1;
 
     if let Some(name) = req.name {
-        set_parts.push(format!("name = ${}", param_idx));
+        set_parts.push(format!("name = ${param_idx}"));
         values.push(name.trim().to_string().into());
         param_idx += 1;
     }
 
     if let Some(email) = normalized_email {
-        set_parts.push(format!("email = ${}", param_idx));
+        set_parts.push(format!("email = ${param_idx}"));
         values.push(email.into());
         param_idx += 1;
     }
 
     if let Some(role) = req.role {
-        set_parts.push(format!("role = ${}", param_idx));
+        set_parts.push(format!("role = ${param_idx}"));
         values.push(role.into());
         param_idx += 1;
     }
 
     if let Some(entity_type) = req.entity_type {
         let normalized = normalize_entity_type(Some(&entity_type))?;
-        set_parts.push(format!("entity_type = ${}", param_idx));
+        set_parts.push(format!("entity_type = ${param_idx}"));
         values.push(normalized.into());
         param_idx += 1;
     }
 
     if req.agent_type.is_some() {
         let normalized = normalize_agent_type(req.agent_type)?;
-        set_parts.push(format!("agent_type = ${}", param_idx));
+        set_parts.push(format!("agent_type = ${param_idx}"));
         values.push(normalized.into());
         param_idx += 1;
     }
 
     if req.agent_config.is_some() {
-        set_parts.push(format!("agent_config = ${}", param_idx));
+        set_parts.push(format!("agent_config = ${param_idx}"));
         values.push(req.agent_config.into());
         param_idx += 1;
     }
 
-    set_parts.push(format!("updated_at = ${}", param_idx));
+    set_parts.push(format!("updated_at = ${param_idx}"));
     values.push(chrono::Utc::now().into());
     param_idx += 1;
     values.push(user_id.into());
@@ -557,20 +560,20 @@ fn build_search_where(
     if let Some(keyword) = search {
         let trimmed = keyword.trim();
         if !trimmed.is_empty() {
-            clauses.push(format!("(email ILIKE ${0} OR name ILIKE ${0})", idx));
-            values.push(format!("%{}%", trimmed).into());
+            clauses.push(format!("(email ILIKE ${idx} OR name ILIKE ${idx})"));
+            values.push(format!("%{trimmed}%").into());
             idx += 1;
         }
     }
 
     if let Some(raw_entity_type) = entity_type {
         let normalized = normalize_entity_type(Some(raw_entity_type.as_str()))?;
-        clauses.push(format!("entity_type = ${}", idx));
+        clauses.push(format!("entity_type = ${idx}"));
         values.push(normalized.into());
     }
 
     if clauses.is_empty() {
-        Ok(("".to_string(), values))
+        Ok((String::new(), values))
     } else {
         Ok((format!("WHERE {}", clauses.join(" AND ")), values))
     }

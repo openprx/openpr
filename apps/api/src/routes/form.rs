@@ -1,3 +1,12 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+// Pagination retains the established floating-point ceiling and signed wire representation.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::needless_pass_by_value
+)]
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -713,8 +722,7 @@ pub async fn duplicate_form(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{} Copy", source_form.name));
+        .map_or_else(|| format!("{} Copy", source_form.name), str::to_string);
     let description = req.description.unwrap_or_else(|| source_form.description.clone());
     let new_form_id = Uuid::new_v4();
     let source = json!({
@@ -803,8 +811,7 @@ pub async fn create_project_form_from_template(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| default_form_key_from_template(&template.key));
+        .map_or_else(|| default_form_key_from_template(&template.key), str::to_string);
     let form_key = normalize_key(&requested_key).map_err(ApiError::BadRequest)?;
     let name = req
         .name
@@ -822,8 +829,7 @@ pub async fn create_project_form_from_template(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| default_title_template_from_schema(&schema));
+        .map_or_else(|| default_title_template_from_schema(&schema), str::to_string);
     let detail_layout = default_detail_layout_for_schema(&schema);
     let form_id = Uuid::new_v4();
     let source = json!({
@@ -957,13 +963,13 @@ pub async fn update_form(
         return Ok(ApiResponse::success(form));
     }
     if schema_changed {
-        if let Some(expected) = req.expected_schema_version {
-            if expected != form.schema_version {
-                return Err(ApiError::Conflict(format!(
-                    "schema version conflict: expected {}, current {}",
-                    expected, form.schema_version
-                )));
-            }
+        if let Some(expected) = req.expected_schema_version
+            && expected != form.schema_version
+        {
+            return Err(ApiError::Conflict(format!(
+                "schema version conflict: expected {}, current {}",
+                expected, form.schema_version
+            )));
         }
         set_parts.push("schema_version = schema_version + 1".to_string());
     }
@@ -1173,14 +1179,14 @@ pub async fn update_form_view(
     let (actor_id, role, is_bot) =
         require_form_action(&state, &claims, bot.as_ref().map(|b| &b.0), &form, "form.design").await?;
     ensure_can_manage_view(&view, actor_id, &role, is_bot)?;
-    if let Some(expected_updated_at) = req.expected_updated_at {
-        if expected_updated_at != view.updated_at {
-            return Err(ApiError::Conflict(format!(
-                "view update conflict: expected {}, current {}",
-                expected_updated_at.to_rfc3339(),
-                view.updated_at.to_rfc3339()
-            )));
-        }
+    if let Some(expected_updated_at) = req.expected_updated_at
+        && expected_updated_at != view.updated_at
+    {
+        return Err(ApiError::Conflict(format!(
+            "view update conflict: expected {}, current {}",
+            expected_updated_at.to_rfc3339(),
+            view.updated_at.to_rfc3339()
+        )));
     }
     let mut set_parts = Vec::new();
     let mut values = Vec::new();
@@ -1354,7 +1360,7 @@ pub async fn list_form_records(
     let offset_idx = item_values.len();
     let items = RecordResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        &format!(
+        format!(
             r"
             SELECT form_records.id, form_records.workspace_id, form_records.project_id,
                    form_records.form_id, form_records.title, form_records.values,
@@ -1596,7 +1602,7 @@ async fn export_records_for_form(
 
     let records = RecordResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        &format!(
+        format!(
             r"
                 SELECT form_records.id, form_records.workspace_id, form_records.project_id,
                        form_records.form_id, form_records.title, form_records.values,
@@ -1780,7 +1786,7 @@ pub async fn download_form_attachment_package_job(
         .await
         .map_err(|_| ApiError::NotFound("attachment package job artifact not found".to_string()))?;
     let content_disposition =
-        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", file_name)).map_err(|_| ApiError::Internal)?;
+        HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\"")).map_err(|_| ApiError::Internal)?;
     let attachment_count = result
         .get("attachment_count")
         .and_then(Value::as_u64)
@@ -1985,7 +1991,7 @@ pub async fn list_form_import_mapping_templates(
     let where_sql = where_parts.join(" AND ");
     let items = FormImportMappingTemplateResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        &format!(
+        format!(
             r"
                 SELECT id, workspace_id, project_id, form_id, name, header_signature,
                        headers, selections, transforms, shared, created_by,
@@ -2981,8 +2987,8 @@ pub async fn create_form_attachment(
     }
     let file_name = required_trimmed(&req.file_name, "file_name")?;
     let storage_key = required_trimmed(&req.storage_key, "storage_key")?;
-    let content_type = req.content_type.as_deref().map(str::trim).unwrap_or("").to_string();
-    let url = req.url.as_deref().map(str::trim).unwrap_or("").to_string();
+    let content_type = req.content_type.as_deref().map_or("", str::trim).to_string();
+    let url = req.url.as_deref().map_or("", str::trim).to_string();
     let byte_size = req.byte_size.unwrap_or_default();
     if byte_size < 0 {
         return Err(ApiError::BadRequest("byte_size must be non-negative".to_string()));
@@ -3094,7 +3100,7 @@ pub async fn list_form_attachments(
     values.push(offset.into());
     let items = FormAttachmentResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        &format!(
+        format!(
             r"
                 SELECT id, workspace_id, project_id, form_id, record_id, field_id, field_key,
                        file_name, content_type, byte_size, storage_key, url, thumbnail_url,
@@ -3415,7 +3421,7 @@ async fn create_record_for_form(
     let event_payload = json!({ "record_id": record_id, "values": normalized });
     insert_form_event_with_idempotency(
         &tx,
-        &form,
+        form,
         Some(record_id),
         "form.record.created",
         created_by,
@@ -3751,16 +3757,11 @@ async fn update_record_for_form(
         Some(values) => {
             ensure_field_write_policy_allows(state, form.id, role, &values).await?;
             let values_with_formula =
-                run_formula_hooks(&state, form.workspace_id, form.project_id, form.id, &form.key, values).await?;
-            let calculated = calculate_values_with_existing(
-                &state,
-                &form,
-                Some(record_id),
-                Some(&record.values),
-                values_with_formula,
-            )
-            .await?;
-            let with_autonumber = apply_autonumber_values(&tx, &form, Some(&record.values), calculated).await?;
+                run_formula_hooks(state, form.workspace_id, form.project_id, form.id, &form.key, values).await?;
+            let calculated =
+                calculate_values_with_existing(state, form, Some(record_id), Some(&record.values), values_with_formula)
+                    .await?;
+            let with_autonumber = apply_autonumber_values(&tx, form, Some(&record.values), calculated).await?;
             let normalized =
                 validate_and_normalize_values_with_existing_report(&form.schema, with_autonumber, &record.values)
                     .map_err(ApiError::BadRequest)?;
@@ -3794,7 +3795,7 @@ async fn update_record_for_form(
     ensure_record_objects_claimable(state, form.workspace_id, &values, Some(&previous_values)).await?;
     let source = append_signature_audit_source(source, signature_audit_entries)?;
     run_field_validator_hooks(
-        &state,
+        state,
         form.workspace_id,
         form.project_id,
         form.id,
@@ -3829,7 +3830,7 @@ async fn update_record_for_form(
     let event_payload = json!({ "record_id": record_id, "values": values });
     insert_form_event_with_idempotency(
         &tx,
-        &form,
+        form,
         Some(record_id),
         "form.record.updated",
         updated_by,
@@ -3842,7 +3843,7 @@ async fn update_record_for_form(
     if let Some(payload) = table_change_payload {
         insert_form_event(
             &tx,
-            &form,
+            form,
             Some(record_id),
             "order.table_changed",
             updated_by,
@@ -3853,7 +3854,7 @@ async fn update_record_for_form(
     }
     tx.commit().await?;
     run_event_handler_hooks(
-        &state,
+        state,
         form.workspace_id,
         form.project_id,
         form.id,
@@ -3863,7 +3864,7 @@ async fn update_record_for_form(
         event_payload,
     )
     .await?;
-    recalculate_parent_records_for_child(&state, record_id, updated_by).await?;
+    recalculate_parent_records_for_child(state, record_id, updated_by).await?;
 
     find_record(state, record_id).await
 }
@@ -4203,10 +4204,10 @@ pub async fn list_relation_targets(
             .await?;
     if let Some(display_field) = display_field {
         for item in &mut items {
-            if !denied_read_fields.contains(&display_field) {
-                if let Some(display) = item.values.get(&display_field).map(display_value) {
-                    item.display = display;
-                }
+            if !denied_read_fields.contains(&display_field)
+                && let Some(display) = item.values.get(&display_field).map(display_value)
+            {
+                item.display = display;
             }
         }
     }
@@ -4726,11 +4727,11 @@ async fn apply_autonumber_values(
     .await?;
 
     for field in autonumber_fields {
-        if let Some(existing) = existing_values.and_then(|item| item.get(&field.key)) {
-            if !existing.is_null() {
-                output.insert(field.key, existing.clone());
-                continue;
-            }
+        if let Some(existing) = existing_values.and_then(|item| item.get(&field.key))
+            && !existing.is_null()
+        {
+            output.insert(field.key, existing.clone());
+            continue;
         }
         let next_number = next_autonumber_ordinal(tx, form.id, &field.key).await? + 1;
         output.insert(
@@ -4768,8 +4769,7 @@ fn autonumber_schema_fields(schema: &Value) -> Vec<AutonumberSchemaField> {
             let prefix = config
                 .and_then(|item| item.get("prefix"))
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| "AUTO-".to_string());
+                .map_or_else(|| "AUTO-".to_string(), str::to_string);
             let width = config
                 .and_then(|item| item.get("width"))
                 .and_then(Value::as_u64)
@@ -4955,8 +4955,6 @@ async fn child_aggregate_decimal(
 
 fn child_aggregate_field_value(field: &FormField, value: Decimal) -> Result<Value, ApiError> {
     match field.field_type.as_str() {
-        "amount" => Ok(json!(value.normalize().to_string())),
-        "number" | "formula" => Ok(json!(value.normalize().to_string())),
         "integer" => {
             let raw = value.normalize().to_string();
             let parsed = raw
@@ -5169,16 +5167,16 @@ async fn export_column_keys(
         }
         raw_keys.extend(export_columns_from_config(&view.config));
     }
-    if raw_keys.is_empty() {
-        if let Some(columns) = query.columns.as_deref() {
-            raw_keys.extend(
-                columns
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string),
-            );
-        }
+    if raw_keys.is_empty()
+        && let Some(columns) = query.columns.as_deref()
+    {
+        raw_keys.extend(
+            columns
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        );
     }
     if raw_keys.is_empty() {
         raw_keys.extend(fields.iter().take(8).map(|field| field.key.clone()));
@@ -5226,16 +5224,15 @@ async fn record_query_config_from_view(
         filter_expression: record_filter_expression_from_config(&view.config),
         sort: None,
     };
-    if let Some(sort) = view.config.get("sort").and_then(Value::as_object) {
-        if let Some(field) = sort.get("field").and_then(Value::as_str).map(str::trim) {
-            if !field.is_empty() {
-                let direction = match sort.get("direction").and_then(Value::as_str) {
-                    Some("desc") => "desc",
-                    _ => "asc",
-                };
-                config.sort = Some(format!("{field}:{direction}"));
-            }
-        }
+    if let Some(sort) = view.config.get("sort").and_then(Value::as_object)
+        && let Some(field) = sort.get("field").and_then(Value::as_str).map(str::trim)
+        && !field.is_empty()
+    {
+        let direction = match sort.get("direction").and_then(Value::as_str) {
+            Some("desc") => "desc",
+            _ => "asc",
+        };
+        config.sort = Some(format!("{field}:{direction}"));
     }
     Ok(config)
 }
@@ -5290,7 +5287,7 @@ async fn visible_form_record_ids_for_export(
     let where_sql = where_parts.join(" AND ");
     let rows = RecordIdRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        &format!(
+        format!(
             r"
                 SELECT form_records.id
                 FROM form_records
@@ -5352,7 +5349,7 @@ async fn form_attachments_for_package(
 
     FormAttachmentResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        &format!(
+        format!(
             r"
                 SELECT id, workspace_id, project_id, form_id, record_id, field_id, field_key,
                        file_name, content_type, byte_size, storage_key, url, thumbnail_url,
@@ -5388,24 +5385,21 @@ async fn attachment_package_entries(
         let mut package_path = None;
         let package_status;
         if let Some(upload_file_name) = server_owned_upload_file_name(&attachment.url) {
-            match object_storage.get(upload_file_name).await {
-                Ok(data) => {
-                    entries.push(ZipEntry {
-                        path: file_path.clone(),
-                        data,
-                    });
-                    package_path = Some(file_path);
-                    package_status = "included";
-                    binary_file_count += 1;
-                }
-                Err(_) => {
-                    entries.push(ZipEntry {
-                        path: link_path.clone(),
-                        data: format!("{}\n", attachment.url).into_bytes(),
-                    });
-                    package_path = Some(link_path);
-                    package_status = "missing_server_file";
-                }
+            if let Ok(data) = object_storage.get(upload_file_name).await {
+                entries.push(ZipEntry {
+                    path: file_path.clone(),
+                    data,
+                });
+                package_path = Some(file_path);
+                package_status = "included";
+                binary_file_count += 1;
+            } else {
+                entries.push(ZipEntry {
+                    path: link_path.clone(),
+                    data: format!("{}\n", attachment.url).into_bytes(),
+                });
+                package_path = Some(link_path);
+                package_status = "missing_server_file";
             }
         } else if attachment.url.trim().is_empty() {
             package_status = "metadata_only";
@@ -6816,7 +6810,7 @@ fn default_form_key_from_template(template_key: &str) -> String {
     template_key
         .trim()
         .strip_suffix("_default")
-        .unwrap_or(template_key.trim())
+        .unwrap_or_else(|| template_key.trim())
         .to_string()
 }
 
@@ -6981,8 +6975,7 @@ fn view_config_is_private(config: &Value) -> bool {
     config
         .get("visibility")
         .and_then(Value::as_str)
-        .map(|value| value.trim() == "private")
-        .unwrap_or(false)
+        .is_some_and(|value| value.trim() == "private")
 }
 
 fn ensure_can_manage_view(view: &ViewResponse, actor_id: Uuid, role: &str, is_bot: bool) -> Result<(), ApiError> {
@@ -7602,7 +7595,7 @@ mod tests {
     fn re_saving_an_unchanged_signature_value_claims_nothing() {
         let file_name = format!("signature-approval-{}.png", Uuid::new_v4());
         let url = format!("/api/v1/uploads/signatures/{file_name}");
-        let stored = json!({"approval": url.clone()});
+        let stored = json!({"approval": url});
 
         assert!(record_claimed_object_keys(&json!({"approval": url}), Some(&stored)).is_empty());
     }

@@ -1,3 +1,12 @@
+// This data shape mirrors an established wire or persistence schema and must remain stable.
+// Elapsed milliseconds retain the established signed diagnostic representation.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::items_after_statements,
+    clippy::struct_field_names
+)]
+
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -56,7 +65,7 @@ pub enum WebhookEvent {
 }
 
 impl WebhookEvent {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::IssueCreated => "issue.created",
             Self::IssueUpdated => "issue.updated",
@@ -877,7 +886,7 @@ async fn deliver_webhook(
 
     let (response_status, response_body, error, success) = match sent {
         Ok(resp) => {
-            let status = resp.status().as_u16() as i32;
+            let status = i32::from(resp.status().as_u16());
             let success = resp.status().is_success();
             let text = truncate_string(
                 read_capped_body(resp, WEBHOOK_RESPONSE_BYTE_LIMIT).await,
@@ -1070,7 +1079,7 @@ fn sign_payload(secret: &str, raw_body: &str) -> Result<String, String> {
 fn format_issue_key(project_key: &str, issue_id: Uuid) -> String {
     let id = issue_id.simple().to_string().to_uppercase();
     let short = &id[..8];
-    format!("{}-{}", project_key, short)
+    format!("{project_key}-{short}")
 }
 
 fn extract_assignee_ids(issue_payload: &Value) -> Vec<Uuid> {
@@ -1086,10 +1095,9 @@ fn extract_assignee_ids(issue_payload: &Value) -> Vec<Uuid> {
         .unwrap_or_default()
 }
 
-fn default_trigger_reason(event: WebhookEvent) -> &'static str {
+const fn default_trigger_reason(event: WebhookEvent) -> &'static str {
     match event {
         WebhookEvent::IssueCreated => "created",
-        WebhookEvent::IssueAssigned | WebhookEvent::IssueUpdated => "assigned",
         WebhookEvent::IssueStateChanged => "status_changed",
         WebhookEvent::CommentCreated => "mentioned",
         WebhookEvent::AiTaskCompleted => "completed",
@@ -1125,7 +1133,7 @@ mod delivery_tests {
     }
 
     /// A receiver that answers a delivery with an unbounded body must not be able to pull the API
-    /// process down with it, and whatever it did send must not land verbatim in webhook_deliveries.
+    /// process down with it, and whatever it did send must not land verbatim in `webhook_deliveries`.
     #[tokio::test]
     async fn a_response_body_is_capped_before_it_is_stored() {
         let oversized = "A".repeat(WEBHOOK_RESPONSE_BYTE_LIMIT * 2);
@@ -1144,10 +1152,12 @@ mod delivery_tests {
             WEBHOOK_RESPONSE_BYTE_LIMIT,
             "the body must stop at the cap instead of following the receiver"
         );
-        assert!(
-            WEBHOOK_DIAGNOSTIC_CHARS < WEBHOOK_RESPONSE_BYTE_LIMIT,
-            "what is stored must be smaller than what is read"
-        );
+        const {
+            assert!(
+                WEBHOOK_DIAGNOSTIC_CHARS < WEBHOOK_RESPONSE_BYTE_LIMIT,
+                "what is stored must be smaller than what is read"
+            );
+        }
     }
 
     /// The outbound checks are done once, against one host. Following a redirect would move the

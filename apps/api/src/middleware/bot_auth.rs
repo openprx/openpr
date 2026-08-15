@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 /// Bot Token authentication middleware.
 ///
 /// Supports two authentication modes:

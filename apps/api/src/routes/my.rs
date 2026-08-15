@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 use axum::{
     Extension,
     extract::{Query, State},
@@ -21,11 +24,11 @@ pub struct PaginationQuery {
     pub per_page: i64,
 }
 
-fn default_page() -> i64 {
+const fn default_page() -> i64 {
     1
 }
 
-fn default_per_page() -> i64 {
+const fn default_per_page() -> i64 {
     10
 }
 
@@ -114,7 +117,7 @@ pub async fn get_my_issues(
     .one(&state.db)
     .await?;
 
-    let total = total_result.map(|r| r.count).unwrap_or(0);
+    let total = total_result.map_or(0, |r| r.count);
 
     let issues = MyIssueRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -242,7 +245,7 @@ pub async fn get_my_activities(
     .one(&state.db)
     .await?;
 
-    let total = total_result.map(|r| r.count).unwrap_or(0);
+    let total = total_result.map_or(0, |r| r.count);
 
     let activities = MyActivityRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,

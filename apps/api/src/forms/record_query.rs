@@ -1,3 +1,6 @@
+// The optional helper keeps its focused internal call contract and avoids a wider API split.
+#![allow(clippy::single_option_map)]
+
 use serde_json::Value;
 
 use crate::{
@@ -29,7 +32,7 @@ pub enum RecordFilterExpressionConfig {
     Condition(RecordFilterConfig),
     Group {
         logic: RecordFilterLogic,
-        children: Vec<RecordFilterExpressionConfig>,
+        children: Vec<Self>,
     },
 }
 

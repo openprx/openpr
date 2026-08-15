@@ -1,3 +1,6 @@
+// Dimensions are clamped to the configured u32 policy range before conversion.
+#![allow(clippy::cast_possible_truncation)]
+
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -112,12 +115,12 @@ pub fn validate_attachment_create_policy(
             "attachment content_type is not allowed by field policy".to_string(),
         ));
     }
-    if let Some(max_size_bytes) = policy.max_size_bytes {
-        if byte_size > max_size_bytes {
-            return Err(ApiError::BadRequest(
-                "attachment byte_size exceeds field max_size_mb policy".to_string(),
-            ));
-        }
+    if let Some(max_size_bytes) = policy.max_size_bytes
+        && byte_size > max_size_bytes
+    {
+        return Err(ApiError::BadRequest(
+            "attachment byte_size exceeds field max_size_mb policy".to_string(),
+        ));
     }
     validate_attachment_storage_policy(&policy, url)?;
     Ok(())
@@ -144,7 +147,7 @@ fn attachment_field_policy(schema: &Value, field_key: &str) -> Option<Attachment
                 .filter_map(Value::as_str)
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
-                .map(|item| item.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .collect::<BTreeSet<_>>()
         })
         .unwrap_or_default();
@@ -311,7 +314,7 @@ pub async fn ensure_attachment_media(
             json!({
                 "enabled": true,
                 "source": "client",
-                "url": thumbnail_url.clone(),
+                "url": thumbnail_url,
             }),
             None,
             Vec::new(),

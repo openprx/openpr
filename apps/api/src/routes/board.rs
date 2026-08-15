@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 use axum::{
     Extension,
     extract::{Path, State},
@@ -37,7 +40,7 @@ pub struct BoardResponse {
     pub columns: Vec<BoardColumn>,
 }
 
-/// GET /api/v1/projects/:project_id/board - Get kanban board view
+/// GET /`api/v1/projects/:project_id/board` - Get kanban board view
 pub async fn get_project_board(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,

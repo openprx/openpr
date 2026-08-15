@@ -187,7 +187,6 @@ fn next_actions_for_gates(gates: &[ReadinessGate]) -> Vec<ReadinessNextAction> {
 fn next_action_actor(gate_key: &str) -> &'static str {
     match gate_key {
         "no_pending_ai_tasks" => "ai_operator",
-        "no_active_invocations" | "no_failed_invocations" | "no_failed_connector_deliveries" => "operator",
         "no_pending_governance_results" | "audit_trail_present" | "result_artifact_present" => "reviewer",
         "no_stale_resources" => "project_owner",
         _ => "operator",

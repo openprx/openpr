@@ -1,3 +1,7 @@
+// The explicit public type contract remains stable without broadening or replacing its API.
+// Collection length retains the established signed pagination representation.
+#![allow(clippy::cast_possible_wrap, clippy::trait_duplication_in_bounds)]
+
 use axum::Json;
 use serde::Serialize;
 
@@ -10,7 +14,7 @@ pub struct ApiResponse<T: Serialize> {
 }
 
 impl<T: Serialize> ApiResponse<T> {
-    pub fn success(data: T) -> Json<ApiResponse<T>> {
+    pub fn success(data: T) -> Json<Self> {
         Json(Self {
             code: 0,
             message: "success".into(),
@@ -20,7 +24,7 @@ impl<T: Serialize> ApiResponse<T> {
 }
 
 impl ApiResponse<()> {
-    pub fn error(code: i32, msg: impl Into<String>) -> Json<ApiResponse<()>> {
+    pub fn error(code: i32, msg: impl Into<String>) -> Json<Self> {
         Json(Self {
             code,
             message: msg.into(),
@@ -28,7 +32,7 @@ impl ApiResponse<()> {
         })
     }
 
-    pub fn ok() -> Json<ApiResponse<()>> {
+    pub fn ok() -> Json<Self> {
         Json(Self {
             code: 0,
             message: "success".into(),
@@ -47,7 +51,7 @@ pub struct PaginatedData<T: Serialize> {
 }
 
 impl<T: Serialize> PaginatedData<T> {
-    pub fn from_items(items: Vec<T>) -> Self {
+    pub const fn from_items(items: Vec<T>) -> Self {
         let total = items.len() as i64;
         Self {
             items,

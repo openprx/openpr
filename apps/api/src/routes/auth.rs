@@ -1,3 +1,6 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::unused_async)]
+
 use axum::{
     Extension, Json,
     extract::State,
@@ -499,7 +502,7 @@ async fn load_notification_preferences(state: &AppState, user_id: &str) -> Resul
     Ok(serde_json::from_value(value).unwrap_or_else(|_| default_notification_preferences()))
 }
 
-fn default_notification_preferences() -> NotificationPreferences {
+const fn default_notification_preferences() -> NotificationPreferences {
     NotificationPreferences {
         email_notification: true,
         mention_only: false,

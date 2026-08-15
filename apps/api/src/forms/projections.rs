@@ -75,12 +75,8 @@ where
                 field.key.into(),
                 field.field_id.into(),
                 value_text.into(),
-                value_decimal
-                    .map(SeaValue::from)
-                    .unwrap_or_else(|| SeaValue::from(None::<String>)),
-                value_datetime
-                    .map(SeaValue::from)
-                    .unwrap_or_else(|| SeaValue::from(None::<String>)),
+                value_decimal.map_or_else(|| SeaValue::from(None::<String>), SeaValue::from),
+                value_datetime.map_or_else(|| SeaValue::from(None::<String>), SeaValue::from),
                 value_bool.into(),
             ],
         ))

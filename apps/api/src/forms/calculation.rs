@@ -1,3 +1,6 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::needless_pass_by_value)]
+
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;

@@ -1,7 +1,7 @@
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "proposals")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
@@ -119,7 +119,7 @@ pub enum CycleTemplate {
 }
 
 impl CycleTemplate {
-    pub fn discussion_hours(self) -> i64 {
+    pub const fn discussion_hours(self) -> i64 {
         match self {
             Self::Rapid => 1,
             Self::Fast => 24,
@@ -128,7 +128,7 @@ impl CycleTemplate {
         }
     }
 
-    pub fn voting_hours(self) -> i64 {
+    pub const fn voting_hours(self) -> i64 {
         match self {
             Self::Rapid => 1,
             Self::Fast => 24,

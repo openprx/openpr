@@ -176,12 +176,12 @@ pub async fn list_appeals(
     } else {
         where_parts.push(format!(
             r#"(
-                a.appellant_id = ${0}
+                a.appellant_id = ${idx}
                 OR EXISTS (
                     SELECT 1
                     FROM trust_score_logs t
                     INNER JOIN vetoers v ON v.project_id = t.project_id AND v.domain = t.domain
-                    WHERE t.id = a.log_id AND v.user_id = ${0}
+                    WHERE t.id = a.log_id AND v.user_id = ${idx}
                 )
                 OR EXISTS (
                     SELECT 1
@@ -196,25 +196,24 @@ pub async fn list_appeals(
                                 SELECT 1
                                 FROM workspace_members wm
                                 WHERE wm.workspace_id = p.workspace_id
-                                  AND wm.user_id = ${0}
+                                  AND wm.user_id = ${idx}
                                   AND wm.role IN ('owner', 'admin')
                             )
                             OR EXISTS (
                                 SELECT 1
                                 FROM workspace_bots wb
                                 WHERE wb.workspace_id = p.workspace_id
-                                  AND wb.id = ${0}
+                                  AND wb.id = ${idx}
                                   AND wb.permissions @> '["admin"]'::jsonb
                             )
                           )
                       )
                 )
-            )"#,
-            idx
+            )"#
         ));
-        values.push(user_id.into());
-        idx += 1;
     }
+    values.push(user_id.into());
+    idx += 1;
 
     if let Some(status) = query.status {
         let normalized = status.to_lowercase();
@@ -494,8 +493,7 @@ async fn ensure_can_review_appeal<C: ConnectionTrait>(
     ))
     .one(db)
     .await?
-    .map(|row| row.count)
-    .unwrap_or(0);
+    .map_or(0, |row| row.count);
 
     if vetoer_count > 0 {
         Ok(())
@@ -522,8 +520,7 @@ async fn can_review_in_project(state: &AppState, user_id: Uuid, log: &TrustScore
     ))
     .one(&state.db)
     .await?
-    .map(|row| row.count)
-    .unwrap_or(0);
+    .map_or(0, |row| row.count);
 
     Ok(count > 0)
 }

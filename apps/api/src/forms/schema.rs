@@ -1,3 +1,7 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+// Decimal scale validation bounds the value before its established u32 representation.
+#![allow(clippy::cast_possible_truncation, clippy::needless_pass_by_value)]
+
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -80,8 +84,7 @@ pub fn ensure_schema_field_ids(schema: Value) -> Result<Value, String> {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(new_field_id);
+            .map_or_else(new_field_id, str::to_string);
         validate_field_id(&field_id)?;
         field_object.insert("field_id".to_string(), Value::String(field_id));
         next_fields.push(Value::Object(field_object));
@@ -303,7 +306,7 @@ fn parse_signature_config(value: Option<&Value>) -> Result<SignatureFieldConfig,
     let reason_required = object
         .and_then(|item| item.get("reason_required"))
         .and_then(Value::as_bool)
-        .unwrap_or(reason_field.is_some());
+        .unwrap_or_else(|| reason_field.is_some());
     if reason_required && reason_field.is_none() {
         return Err("signature.reason_field is required when signature.reason_required is true".to_string());
     }

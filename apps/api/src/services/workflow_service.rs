@@ -108,8 +108,7 @@ pub async fn default_project_state(state: &AppState, project_id: Uuid) -> Result
     Ok(workflow
         .states
         .first()
-        .map(|s| s.key.clone())
-        .unwrap_or_else(|| "todo".to_string()))
+        .map_or_else(|| "todo".to_string(), |s| s.key.clone()))
 }
 
 pub fn allowed_state_values(workflow: &EffectiveWorkflow) -> String {

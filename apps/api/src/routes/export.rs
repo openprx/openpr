@@ -6,6 +6,7 @@ use axum::{
 use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use uuid::Uuid;
 
 use crate::{error::ApiError, response::ApiResponse};
@@ -153,8 +154,9 @@ pub async fn export_project(
 
             for issue in &export.issues {
                 let description = issue.description.replace('"', "\"\"");
-                csv_output.push_str(&format!(
-                    "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"\n",
+                let _ = writeln!(
+                    csv_output,
+                    "\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"",
                     issue.key,
                     issue.title,
                     issue.status,
@@ -163,7 +165,7 @@ pub async fn export_project(
                     description,
                     issue.created_at,
                     issue.updated_at
-                ));
+                );
             }
 
             let filename = format!("project_{}_export.csv", export.project.key);

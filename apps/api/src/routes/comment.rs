@@ -1,3 +1,7 @@
+// This data shape mirrors an established wire or persistence schema and must remain stable.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements, clippy::struct_field_names)]
+
 use std::collections::HashSet;
 
 use axum::{
@@ -89,10 +93,7 @@ async fn create_mention_notifications<C: ConnectionTrait>(
         return Ok(());
     }
 
-    let link = format!(
-        "/workspace/{}/projects/{}/issues/{}",
-        workspace_id, project_id, issue_id
-    );
+    let link = format!("/workspace/{workspace_id}/projects/{project_id}/issues/{issue_id}");
     let now = chrono::Utc::now();
 
     for mention_user_id in mention_user_ids {
@@ -124,7 +125,7 @@ async fn create_mention_notifications<C: ConnectionTrait>(
                 "mentioned".into(),
                 json!({}).into(),
                 "notification.mentionedTitle".into(),
-                format!("mentioned_by:{}", actor_name).into(),
+                format!("mentioned_by:{actor_name}").into(),
                 link.clone().into(),
                 issue_id.into(),
                 now.into(),
@@ -154,7 +155,7 @@ async fn mentioned_bot_ids<C: ConnectionTrait>(db: &C, mention_user_ids: &[Uuid]
     Ok(bot_ids)
 }
 
-/// POST /api/v1/issues/:issue_id/comments - Create a new comment
+/// POST /`api/v1/issues/:issue_id/comments` - Create a new comment
 pub async fn create_comment(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -210,10 +211,7 @@ pub async fn create_comment(
     .one(&state.db)
     .await?;
 
-    let actor_name = author
-        .as_ref()
-        .map(|u| u.name.clone())
-        .unwrap_or_else(|| "User".to_string());
+    let actor_name = author.as_ref().map_or_else(|| "User".to_string(), |u| u.name.clone());
 
     let mention_user_ids = normalize_mentions(req.mentions, user_id);
 
@@ -307,7 +305,7 @@ pub async fn create_comment(
     }))
 }
 
-/// GET /api/v1/issues/:issue_id/comments - List comments for an issue
+/// GET /`api/v1/issues/:issue_id/comments` - List comments for an issue
 pub async fn list_comments(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -439,10 +437,7 @@ pub async fn update_comment(
     .one(&state.db)
     .await?;
 
-    let actor_name = author
-        .as_ref()
-        .map(|u| u.name.clone())
-        .unwrap_or_else(|| "User".to_string());
+    let actor_name = author.as_ref().map_or_else(|| "User".to_string(), |u| u.name.clone());
 
     let mention_user_ids = normalize_mentions(req.mentions, user_id);
 

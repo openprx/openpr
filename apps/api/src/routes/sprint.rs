@@ -1,3 +1,7 @@
+// Domain-specific local names remain explicit for audit readability.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements, clippy::similar_names)]
+
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
     Extension, Json,
@@ -65,7 +69,7 @@ fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext
     extensions
 }
 
-/// POST /api/v1/projects/:project_id/sprints - Create sprint
+/// POST /`api/v1/projects/:project_id/sprints` - Create sprint
 pub async fn create_sprint(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -169,7 +173,7 @@ pub async fn create_sprint(
     }))
 }
 
-/// GET /api/v1/projects/:project_id/sprints - List sprints
+/// GET /`api/v1/projects/:project_id/sprints` - List sprints
 pub async fn list_sprints(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -301,13 +305,13 @@ pub async fn update_sprint(
     let mut param_idx = 1;
 
     if let Some(name) = req.name {
-        updates.push(format!("name = ${}", param_idx));
+        updates.push(format!("name = ${param_idx}"));
         values.push(name.into());
         param_idx += 1;
     }
 
     if let Some(description) = req.description {
-        updates.push(format!("description = ${}", param_idx));
+        updates.push(format!("description = ${param_idx}"));
         values.push(description.into());
         param_idx += 1;
     }
@@ -315,7 +319,7 @@ pub async fn update_sprint(
     if let Some(start) = req.start_date {
         let date = chrono::NaiveDate::parse_from_str(&start, "%Y-%m-%d")
             .map_err(|_| ApiError::BadRequest("invalid start_date format".to_string()))?;
-        updates.push(format!("start_date = ${}", param_idx));
+        updates.push(format!("start_date = ${param_idx}"));
         values.push(date.into());
         param_idx += 1;
     }
@@ -323,13 +327,13 @@ pub async fn update_sprint(
     if let Some(end) = req.end_date {
         let date = chrono::NaiveDate::parse_from_str(&end, "%Y-%m-%d")
             .map_err(|_| ApiError::BadRequest("invalid end_date format".to_string()))?;
-        updates.push(format!("end_date = ${}", param_idx));
+        updates.push(format!("end_date = ${param_idx}"));
         values.push(date.into());
         param_idx += 1;
     }
 
     if let Some(status) = req.status {
-        updates.push(format!("status = ${}", param_idx));
+        updates.push(format!("status = ${param_idx}"));
         values.push(status.into());
         param_idx += 1;
     }
@@ -338,7 +342,7 @@ pub async fn update_sprint(
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
 
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     values.push(chrono::Utc::now().into());
     param_idx += 1;
 

@@ -1,3 +1,6 @@
+// Extension matching stays case-sensitive to preserve the established upload and media policy.
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
+
 use base64::Engine;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{Value, json};
@@ -311,7 +314,7 @@ pub fn signature_lifecycle_summary(schema: &Value, values: &Value, source: &Valu
         let deleted_objects = field_entries
             .iter()
             .filter_map(|entry| match entry.get("action").and_then(Value::as_str) {
-                Some("retention_delete") | Some("replacement_retention_delete") => Some(json!({
+                Some("retention_delete" | "replacement_retention_delete") => Some(json!({
                     "action": entry.get("action").and_then(Value::as_str),
                     "object_key": entry.get("object_key").and_then(Value::as_str),
                     "url": entry.get("url").and_then(Value::as_str),
@@ -539,12 +542,11 @@ pub async fn verify_signature_audit_entry_with_storage(
         .and_then(Value::as_u64)
         .ok_or_else(|| ApiError::BadRequest("signature audit entry byte_size is missing".to_string()))?;
     let configured_storage;
-    let object_storage = match &storage_override {
-        Some(object_storage) => object_storage,
-        None => {
-            configured_storage = ObjectStorage::from_runtime_config()?;
-            &configured_storage
-        }
+    let object_storage = if let Some(object_storage) = &storage_override {
+        object_storage
+    } else {
+        configured_storage = ObjectStorage::from_runtime_config()?;
+        &configured_storage
     };
     let bytes = object_storage.get(object_key).await?;
     let actual_sha256 = signature_sha256_hex(&bytes);

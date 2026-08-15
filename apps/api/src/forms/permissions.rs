@@ -121,10 +121,10 @@ pub fn form_permissions_response(
         form_id,
         policies,
         effective: FormEffectivePermissionResponse {
-            record_scope,
             role,
             is_bot,
             actions,
+            record_scope,
             fields,
         },
     }
@@ -140,8 +140,7 @@ fn effective_permission_from_policies(role: &str, policies: &[FormPermissionPoli
     policies
         .iter()
         .find(|policy| policy.subject_type == "role" && policy.subject_id == subject_id)
-        .map(|policy| permission_policy_allows(&policy.policy, action))
-        .unwrap_or(true)
+        .is_none_or(|policy| permission_policy_allows(&policy.policy, action))
 }
 
 fn effective_field_permissions_from_policies(
@@ -296,10 +295,10 @@ pub async fn form_record_scope(state: &AppState, form_id: Uuid, role: &str) -> R
     if role_is_form_admin(role) {
         return Ok("all".to_string());
     }
-    Ok(permission_policy_for_role(state, form_id, role)
-        .await?
-        .map(|policy| permission_policy_record_scope(&policy.policy))
-        .unwrap_or_else(|| "all".to_string()))
+    Ok(permission_policy_for_role(state, form_id, role).await?.map_or_else(
+        || "all".to_string(),
+        |policy| permission_policy_record_scope(&policy.policy),
+    ))
 }
 
 pub async fn append_record_scope_sql(
@@ -435,8 +434,10 @@ fn effective_record_scope_from_policies(role: &str, policies: &[FormPermissionPo
     policies
         .iter()
         .find(|policy| policy.subject_type == "role" && policy.subject_id == subject_id)
-        .map(|policy| permission_policy_record_scope(&policy.policy))
-        .unwrap_or_else(|| "all".to_string())
+        .map_or_else(
+            || "all".to_string(),
+            |policy| permission_policy_record_scope(&policy.policy),
+        )
 }
 
 async fn permission_policy_for_role(
@@ -528,8 +529,8 @@ mod tests {
         assert!(permission_policy_field_allows(&policy, "missing_field", "read"));
 
         let fields = permission_policy_fields(&policy);
-        assert_eq!(fields["unit_price"]["write"], false);
-        assert_eq!(fields["unit_price"]["read"], true);
+        assert!(!fields["unit_price"]["write"]);
+        assert!(fields["unit_price"]["read"]);
     }
 
     #[test]
@@ -635,10 +636,10 @@ mod tests {
 
         assert_eq!(response.form_id, form_id);
         assert_eq!(response.effective.record_scope, "owned");
-        assert_eq!(response.effective.actions["record.delete"], false);
-        assert_eq!(response.effective.actions["record.update"], true);
-        assert_eq!(response.effective.fields["unit_price"]["read"], false);
-        assert_eq!(response.effective.fields["unit_price"]["write"], false);
+        assert!(!response.effective.actions["record.delete"]);
+        assert!(response.effective.actions["record.update"]);
+        assert!(!response.effective.fields["unit_price"]["read"]);
+        assert!(!response.effective.fields["unit_price"]["write"]);
     }
 
     fn member_policy(form_id: Uuid) -> FormPermissionPolicyResponse {
@@ -668,8 +669,8 @@ mod tests {
 
         assert!(bot.effective.is_bot);
         assert_eq!(bot.effective.record_scope, "owned");
-        assert_eq!(bot.effective.fields["salary"]["read"], false);
-        assert_eq!(bot.effective.fields["salary"]["write"], false);
+        assert!(!bot.effective.fields["salary"]["read"]);
+        assert!(!bot.effective.fields["salary"]["write"]);
         assert_eq!(bot.effective.record_scope, human.effective.record_scope);
         assert_eq!(bot.effective.fields, human.effective.fields);
     }

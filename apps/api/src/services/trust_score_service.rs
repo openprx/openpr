@@ -20,7 +20,7 @@ pub enum TrustLevel {
 }
 
 impl TrustLevel {
-    pub fn as_db_str(self) -> &'static str {
+    pub const fn as_db_str(self) -> &'static str {
         match self {
             Self::Observer => "observer",
             Self::Advisor => "advisor",
@@ -30,7 +30,7 @@ impl TrustLevel {
         }
     }
 
-    pub fn from_score(score: i32) -> Self {
+    pub const fn from_score(score: i32) -> Self {
         match score {
             i32::MIN..=49 => Self::Observer,
             50..=99 => Self::Advisor,
@@ -41,7 +41,7 @@ impl TrustLevel {
     }
 
     pub fn vote_weight_for_score(score: i32) -> f64 {
-        let weight = 1.0 + (score as f64 - 100.0) / 200.0;
+        let weight = 1.0 + (f64::from(score) - 100.0) / 200.0;
         weight.clamp(0.5, 2.0)
     }
 }
@@ -55,7 +55,7 @@ pub enum TrustEventType {
 }
 
 impl TrustEventType {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProposalApproved => "proposal_approved",
             Self::ProposalRejected => "proposal_rejected",
@@ -85,7 +85,7 @@ impl TrustScoreService {
         Self {}
     }
 
-    pub fn proposal_score_delta(is_approved: bool) -> i32 {
+    pub const fn proposal_score_delta(is_approved: bool) -> i32 {
         if is_approved { 2 } else { -1 }
     }
 
@@ -574,8 +574,7 @@ pub async fn is_project_admin_or_owner(
     ))
     .one(db)
     .await?
-    .map(|row| row.count)
-    .unwrap_or(0);
+    .map_or(0, |row| row.count);
 
     Ok(count > 0)
 }

@@ -129,8 +129,7 @@ pub fn normalize_import_mapping_template_request(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| import_mapping_header_signature(&headers));
+        .map_or_else(|| import_mapping_header_signature(&headers), str::to_string);
     if header_signature.len() > 2000 {
         return Err(ApiError::BadRequest(
             "header_signature cannot exceed 2000 characters".to_string(),
@@ -308,12 +307,10 @@ pub fn import_rows_from_csv_text(
             let raw = cells.get(column).map(String::as_str).unwrap_or_default();
             let selection = selections
                 .and_then(|values| values.get(column))
-                .map(String::as_str)
-                .unwrap_or(header);
+                .map_or(header.as_str(), String::as_str);
             let transform = transforms
                 .and_then(|values| values.get(column))
-                .map(String::as_str)
-                .unwrap_or("trim");
+                .map_or("trim", String::as_str);
             if selection == "__skip" {
                 continue;
             }
@@ -325,10 +322,10 @@ pub fn import_rows_from_csv_text(
                 }
                 continue;
             }
-            if let Some(field) = field_for_import_header(fields, selection) {
-                if let Some(value) = import_cell_value(field, &transformed) {
-                    values.insert(field.key.clone(), value);
-                }
+            if let Some(field) = field_for_import_header(fields, selection)
+                && let Some(value) = import_cell_value(field, &transformed)
+            {
+                values.insert(field.key.clone(), value);
             }
         }
         rows.push(ImportRecordInput {

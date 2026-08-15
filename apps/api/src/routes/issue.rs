@@ -1,3 +1,13 @@
+// Domain-specific local names remain explicit for audit readability.
+// Pagination retains the established floating-point ceiling and signed wire representation.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::items_after_statements,
+    clippy::similar_names
+)]
+
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
     Extension, Json,
@@ -115,7 +125,7 @@ fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext
     extensions
 }
 
-/// POST /api/v1/projects/:project_id/issues - Create a new issue
+/// POST /`api/v1/projects/:project_id/issues` - Create a new issue
 pub async fn create_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -202,29 +212,26 @@ pub async fn create_issue(
         issue_priority.clone().into(),
     ];
 
-    let assignee_param = if let Some(aid) = req.assignee_id {
+    if let Some(aid) = req.assignee_id {
         values.push(aid.into());
-        "$7"
     } else {
         values.push(sea_orm::Value::from(None::<Uuid>));
-        "$7"
-    };
+    }
+    let assignee_param = "$7";
 
-    let due_param = if let Some(dt) = due_at {
+    if let Some(dt) = due_at {
         values.push(dt.into());
-        "$8"
     } else {
         values.push(sea_orm::Value::from(None::<chrono::DateTime<chrono::Utc>>));
-        "$8"
-    };
+    }
+    let due_param = "$8";
 
     values.push(user_id.into());
     values.push(now.into());
     values.push(now.into());
     values.push(
         req.sprint_id
-            .map(sea_orm::Value::from)
-            .unwrap_or(sea_orm::Value::from(None::<Uuid>)),
+            .map_or_else(|| sea_orm::Value::from(None::<Uuid>), sea_orm::Value::from),
     );
 
     state
@@ -336,7 +343,7 @@ pub async fn create_issue(
     }))
 }
 
-/// GET /api/v1/projects/:project_id/issues - List issues in project
+/// GET /`api/v1/projects/:project_id/issues` - List issues in project
 pub async fn list_issues(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -373,20 +380,20 @@ pub async fn list_issues(
 
     if let Some(state_filter) = query.state {
         validate_project_state(&state, project_id, &state_filter).await?;
-        where_clauses.push(format!("state = ${}", param_idx));
+        where_clauses.push(format!("state = ${param_idx}"));
         values.push(state_filter.into());
         param_idx += 1;
     }
 
     if let Some(assignee) = query.assignee_id {
-        where_clauses.push(format!("assignee_id = ${}", param_idx));
+        where_clauses.push(format!("assignee_id = ${param_idx}"));
         values.push(assignee.into());
         param_idx += 1;
     }
 
     if let Some(priority) = query.priority {
         validate_priority(&priority)?;
-        where_clauses.push(format!("priority = ${}", param_idx));
+        where_clauses.push(format!("priority = ${param_idx}"));
         values.push(priority.into());
         param_idx += 1;
     }
@@ -395,10 +402,9 @@ pub async fn list_issues(
         let search_text = search.trim();
         if !search_text.is_empty() {
             where_clauses.push(format!(
-                "(title ILIKE ${0} OR description ILIKE ${0} OR CAST(id AS TEXT) ILIKE ${0})",
-                param_idx
+                "(title ILIKE ${param_idx} OR description ILIKE ${param_idx} OR CAST(id AS TEXT) ILIKE ${param_idx})"
             ));
-            values.push(format!("%{}%", search_text).into());
+            values.push(format!("%{search_text}%").into());
             param_idx += 1;
         }
     }
@@ -411,7 +417,7 @@ pub async fn list_issues(
             .filter(|value| !value.is_empty())
         {
             let label_id =
-                Uuid::parse_str(raw).map_err(|_| ApiError::BadRequest(format!("invalid label id: {}", raw)))?;
+                Uuid::parse_str(raw).map_err(|_| ApiError::BadRequest(format!("invalid label id: {raw}")))?;
             if !label_ids.contains(&label_id) {
                 label_ids.push(label_id);
             }
@@ -453,11 +459,10 @@ pub async fn list_issues(
     };
     let order_by = if sort_by == "priority" {
         format!(
-            "CASE priority WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 WHEN 'urgent' THEN 4 ELSE 5 END {}",
-            sort_order
+            "CASE priority WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 WHEN 'urgent' THEN 4 ELSE 5 END {sort_order}"
         )
     } else {
-        format!("{} {}", sort_by, sort_order)
+        format!("{sort_by} {sort_order}")
     };
     let where_sql = where_clauses.join(" AND ");
 
@@ -528,10 +533,9 @@ pub async fn list_issues(
                 SELECT wil.work_item_id, l.id AS label_id, l.name AS label_name, l.color AS label_color
                 FROM work_item_labels wil
                 INNER JOIN labels l ON wil.label_id = l.id
-                WHERE wil.work_item_id IN ({})
+                WHERE wil.work_item_id IN ({placeholders})
                 ORDER BY l.name ASC
-            ",
-            placeholders
+            "
         );
         let label_values: Vec<sea_orm::Value> = issue_ids.into_iter().map(Into::into).collect();
 
@@ -738,31 +742,31 @@ pub async fn update_issue(
         if title.trim().is_empty() {
             return Err(ApiError::BadRequest("title cannot be empty".to_string()));
         }
-        updates.push(format!("title = ${}", param_idx));
+        updates.push(format!("title = ${param_idx}"));
         values.push(title.into());
         param_idx += 1;
     }
 
     if let Some(description) = req.description.clone() {
-        updates.push(format!("description = ${}", param_idx));
+        updates.push(format!("description = ${param_idx}"));
         values.push(description.into());
         param_idx += 1;
     }
 
     if let Some(state_val) = req.state.clone() {
-        updates.push(format!("state = ${}", param_idx));
+        updates.push(format!("state = ${param_idx}"));
         values.push(state_val.into());
         param_idx += 1;
     }
 
     if let Some(priority) = req.priority.clone() {
-        updates.push(format!("priority = ${}", param_idx));
+        updates.push(format!("priority = ${param_idx}"));
         values.push(priority.into());
         param_idx += 1;
     }
 
     if let Some(assignee) = req.assignee_id {
-        updates.push(format!("assignee_id = ${}", param_idx));
+        updates.push(format!("assignee_id = ${param_idx}"));
         values.push(assignee.into());
         param_idx += 1;
     }
@@ -771,13 +775,13 @@ pub async fn update_issue(
         let due_at = chrono::DateTime::parse_from_rfc3339(&due_str)
             .map_err(|_| ApiError::BadRequest("invalid due_at format".to_string()))?
             .with_timezone(&chrono::Utc);
-        updates.push(format!("due_at = ${}", param_idx));
+        updates.push(format!("due_at = ${param_idx}"));
         values.push(due_at.into());
         param_idx += 1;
     }
 
     if let Some(sprint_id) = req.sprint_id {
-        updates.push(format!("sprint_id = ${}", param_idx));
+        updates.push(format!("sprint_id = ${param_idx}"));
         values.push(sprint_id.into());
         param_idx += 1;
     }
@@ -787,7 +791,7 @@ pub async fn update_issue(
     }
 
     let now = chrono::Utc::now();
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     values.push(now.into());
     param_idx += 1;
 
@@ -829,13 +833,11 @@ pub async fn update_issue(
     .await?
     .ok_or_else(|| ApiError::Internal)?;
 
-    let assignee_changed = requested_assignee
-        .map(|new_assignee| Some(new_assignee) != current_issue.assignee_id)
-        .unwrap_or(false);
+    let assignee_changed =
+        requested_assignee.is_some_and(|new_assignee| Some(new_assignee) != current_issue.assignee_id);
     let state_changed = requested_state
         .as_ref()
-        .map(|new_state| *new_state != current_issue.state)
-        .unwrap_or(false);
+        .is_some_and(|new_state| *new_state != current_issue.state);
 
     struct ActivityChange {
         action: &'static str,
@@ -1190,9 +1192,7 @@ pub async fn delete_issue(
         "state": issue_ws.state,
         "priority": issue_ws.priority,
         "assignee_ids": issue_ws
-            .assignee_id
-            .map(|id| vec![id.to_string()])
-            .unwrap_or_else(Vec::new),
+            .assignee_id.map_or_else(Vec::new, |id| vec![id.to_string()]),
         "label_ids": Vec::<String>::new(),
         "sprint_id": issue_ws.sprint_id.map(|id| id.to_string()),
         "created_at": issue_ws.created_at.to_rfc3339(),
@@ -1233,7 +1233,7 @@ pub async fn get_issue_by_identifier(
 
     let seq_num: i64 = seq
         .parse()
-        .map_err(|_| ApiError::BadRequest(format!("sequence number '{}' is not a valid integer", seq)))?;
+        .map_err(|_| ApiError::BadRequest(format!("sequence number '{seq}' is not a valid integer")))?;
 
     #[derive(Debug, FromQueryResult)]
     struct IssueRow {
@@ -1271,7 +1271,7 @@ pub async fn get_issue_by_identifier(
     ))
     .one(&state.db)
     .await?
-    .ok_or_else(|| ApiError::NotFound(format!("work item '{}' not found", identifier)))?;
+    .ok_or_else(|| ApiError::NotFound(format!("work item '{identifier}' not found")))?;
 
     Ok(ApiResponse::success(IssueResponse {
         id: issue.id,
@@ -1293,7 +1293,7 @@ pub async fn get_issue_by_identifier(
     }))
 }
 
-/// POST /api/v1/issues/:issue_id/labels/batch (bot-auth)
+/// POST /`api/v1/issues/:issue_id/labels/batch` (bot-auth)
 /// Add multiple labels to a work item in one request.
 #[derive(Debug, serde::Deserialize)]
 pub struct AddLabelsRequest {

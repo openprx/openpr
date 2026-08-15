@@ -1,3 +1,12 @@
+// Explicit branches preserve the established evaluation order and mutation points.
+// Pagination retains the established floating-point ceiling and signed wire representation.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::useless_let_if_seq
+)]
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -243,14 +252,14 @@ enum DecisionResult {
 }
 
 impl DecisionResult {
-    fn as_db_value(self) -> &'static str {
+    const fn as_db_value(self) -> &'static str {
         match self {
             Self::Approved => "approved",
             Self::Rejected => "rejected",
         }
     }
 
-    fn as_proposal_status(self) -> &'static str {
+    const fn as_proposal_status(self) -> &'static str {
         match self {
             Self::Approved => "approved",
             Self::Rejected => "rejected",
@@ -290,7 +299,6 @@ fn validate_comment_type(value: &str) -> bool {
 
 fn default_cycle_template(proposal_type: &str) -> &'static str {
     match proposal_type {
-        "feature" | "priority" | "bugfix" => "rapid",
         "architecture" | "resource" => "standard",
         "governance" => "critical",
         _ => "rapid",
@@ -299,7 +307,6 @@ fn default_cycle_template(proposal_type: &str) -> &'static str {
 
 fn cycle_hours(cycle_template: &str) -> (i64, i64) {
     match cycle_template {
-        "rapid" => (1, 1),
         "fast" => (24, 24),
         "standard" => (72, 48),
         "critical" => (168, 72),
@@ -1059,9 +1066,8 @@ async fn resolve_vote_weight_for_proposal(
         return Ok(1.0);
     };
 
-    let project_id = match resolve_project_id_for_proposal(state, proposal_id, &author.author_id).await? {
-        Some(id) => id,
-        None => return Ok(1.0),
+    let Some(project_id) = resolve_project_id_for_proposal(state, proposal_id, &author.author_id).await? else {
+        return Ok(1.0);
     };
     let participant = parse_participant_type(voter_type);
     let participant_str = match participant {
@@ -1122,18 +1128,15 @@ async fn resolve_vote_weight_from_trust_scores<C: ConnectionTrait>(
         .await?;
         return Ok(row
             .and_then(|item| item.vote_weight)
-            .map(|vote_weight| vote_weight.clamp(0.5, 2.0))
-            .unwrap_or(1.0));
+            .map_or(1.0, |vote_weight| vote_weight.clamp(0.5, 2.0)));
     }
 
     let mut values: Vec<sea_orm::Value> =
         vec![voter_uuid.into(), participant_str.to_string().into(), project_id.into()];
     let mut domain_placeholders = Vec::with_capacity(domains.len());
-    let mut index = 4;
-    for domain in domains {
+    for (index, domain) in (4..).zip(domains) {
         domain_placeholders.push(format!("${index}"));
         values.push(domain.into());
-        index += 1;
     }
 
     let sql = format!(
@@ -1154,8 +1157,7 @@ async fn resolve_vote_weight_from_trust_scores<C: ConnectionTrait>(
 
     Ok(row
         .and_then(|item| item.vote_weight)
-        .map(|vote_weight| vote_weight.clamp(0.5, 2.0))
-        .unwrap_or(1.0))
+        .map_or(1.0, |vote_weight| vote_weight.clamp(0.5, 2.0)))
 }
 
 async fn recalculate_and_tally_votes_with_conn<C: ConnectionTrait>(
@@ -1244,9 +1246,9 @@ async fn apply_trust_score_after_finalize_with_conn<C: ConnectionTrait>(
         return Ok(());
     };
 
-    let project_id = match resolve_project_id_for_proposal_with_conn(db, &proposal.id, &proposal.author_id).await? {
-        Some(id) => id,
-        None => return Ok(()),
+    let Some(project_id) = resolve_project_id_for_proposal_with_conn(db, &proposal.id, &proposal.author_id).await?
+    else {
+        return Ok(());
     };
 
     let user_type: ParticipantType = parse_participant_type(&proposal.author_type);
@@ -1565,23 +1567,23 @@ pub async fn list_proposals(
     }
 
     if let Some(status) = query.status {
-        where_parts.push(format!("status::text = ${}", idx));
+        where_parts.push(format!("status::text = ${idx}"));
         values.push(status.into());
         idx += 1;
     }
     if let Some(proposal_type) = query.proposal_type {
-        where_parts.push(format!("proposal_type::text = ${}", idx));
+        where_parts.push(format!("proposal_type::text = ${idx}"));
         values.push(proposal_type.into());
         idx += 1;
     }
     if let Some(domain) = query.domain {
-        where_parts.push(format!("domains ? ${}", idx));
+        where_parts.push(format!("domains ? ${idx}"));
         values.push(domain.into());
         idx += 1;
     }
 
     let where_sql = if where_parts.is_empty() {
-        "".to_string()
+        String::new()
     } else {
         format!("WHERE {}", where_parts.join(" AND "))
     };
@@ -1608,7 +1610,7 @@ pub async fn list_proposals(
     };
 
     let mut count_values = values.clone();
-    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM proposals {}", where_sql);
+    let count_sql = format!("SELECT COUNT(*)::bigint AS count FROM proposals {where_sql}");
 
     let total = CountRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1617,8 +1619,7 @@ pub async fn list_proposals(
     ))
     .one(&state.db)
     .await?
-    .map(|r| r.count)
-    .unwrap_or(0);
+    .map_or(0, |r| r.count);
 
     let mut list_values = values;
     list_values.push(per_page.into());
@@ -1723,7 +1724,7 @@ pub async fn update_proposal(
                 "title must be between 10 and 200 characters".to_string(),
             ));
         }
-        set_parts.push(format!("title = ${}", idx));
+        set_parts.push(format!("title = ${idx}"));
         values.push(title.into());
         idx += 1;
     }
@@ -1732,7 +1733,7 @@ pub async fn update_proposal(
         if !validate_proposal_type(&proposal_type) {
             return Err(ApiError::BadRequest("invalid proposal_type".to_string()));
         }
-        set_parts.push(format!("proposal_type = ${}::proposal_type", idx));
+        set_parts.push(format!("proposal_type = ${idx}::proposal_type"));
         values.push(proposal_type.into());
         idx += 1;
     }
@@ -1744,7 +1745,7 @@ pub async fn update_proposal(
                 "content must be at least 50 characters".to_string(),
             ));
         }
-        set_parts.push(format!("content = ${}", idx));
+        set_parts.push(format!("content = ${idx}"));
         values.push(content.into());
         idx += 1;
     }
@@ -1753,7 +1754,7 @@ pub async fn update_proposal(
         if domains.is_empty() {
             return Err(ApiError::BadRequest("at least one domain is required".to_string()));
         }
-        set_parts.push(format!("domains = ${}", idx));
+        set_parts.push(format!("domains = ${idx}"));
         values.push(json!(domains).into());
         idx += 1;
     }
@@ -1762,7 +1763,7 @@ pub async fn update_proposal(
         if !validate_voting_rule(&voting_rule) {
             return Err(ApiError::BadRequest("invalid voting_rule".to_string()));
         }
-        set_parts.push(format!("voting_rule = ${}::voting_rule", idx));
+        set_parts.push(format!("voting_rule = ${idx}::voting_rule"));
         values.push(voting_rule.into());
         idx += 1;
     }
@@ -1771,7 +1772,7 @@ pub async fn update_proposal(
         if !validate_cycle_template(&cycle_template) {
             return Err(ApiError::BadRequest("invalid cycle_template".to_string()));
         }
-        set_parts.push(format!("cycle_template = ${}::cycle_template", idx));
+        set_parts.push(format!("cycle_template = ${idx}::cycle_template"));
         values.push(cycle_template.into());
         idx += 1;
     }
@@ -2172,12 +2173,10 @@ pub async fn create_vote(
             .as_deref()
             .map(str::trim)
             .map(str::chars)
-            .map(Iterator::count)
-            .unwrap_or(0);
+            .map_or(0, Iterator::count);
         if reason_len < min_reason {
             return Err(ApiError::BadRequest(format!(
-                "reason is required for AI vote and must be at least {} characters",
-                min_reason
+                "reason is required for AI vote and must be at least {min_reason} characters"
             )));
         }
     }
@@ -2793,7 +2792,7 @@ pub async fn unlink_issue(
         actor.user_id,
         "proposal.issue_unlinked",
         "proposal_issue_link",
-        Some(format!("{}:{}", proposal_id, issue_id)),
+        Some(format!("{proposal_id}:{issue_id}")),
         Some(json!({
             "proposal_id": proposal_id,
             "issue_id": issue_id,

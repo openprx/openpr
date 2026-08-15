@@ -37,7 +37,7 @@ pub struct ImportResult {
     pub errors: Vec<String>,
 }
 
-/// POST /api/v1/workspaces/:workspace_id/import/project
+/// POST /`api/v1/workspaces/:workspace_id/import/project`
 pub async fn import_project(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -66,7 +66,7 @@ pub async fn import_project(
                 vec![workspace_id.into(), project_key.clone().into()],
             ))
             .await?
-            .ok_or_else(|| ApiError::NotFound(format!("Project {} not found", project_key)))?;
+            .ok_or_else(|| ApiError::NotFound(format!("Project {project_key} not found")))?;
 
         let id: Uuid = result.try_get("", "id")?;
         (id, project_key)
@@ -115,7 +115,7 @@ pub async fn import_project(
     // Import issues
     for import_issue in req.issues {
         let issue_id = Uuid::new_v4();
-        let issue_key = format!("{}-{}", project_key, next_num);
+        let issue_key = format!("{project_key}-{next_num}");
         let now = chrono::Utc::now();
         let title = import_issue.title.clone();
 
@@ -148,7 +148,7 @@ pub async fn import_project(
             }
             Err(e) => {
                 issues_failed += 1;
-                errors.push(format!("Failed to import issue '{}': {}", title, e));
+                errors.push(format!("Failed to import issue '{title}': {e}"));
             }
         }
     }

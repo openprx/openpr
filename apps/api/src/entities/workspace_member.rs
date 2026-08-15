@@ -1,3 +1,6 @@
+// The explicit public type contract remains stable without broadening or replacing its API.
+#![allow(clippy::should_implement_trait)]
+
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -9,25 +12,25 @@ pub enum WorkspaceRole {
 }
 
 impl WorkspaceRole {
-    pub fn as_str(&self) -> &str {
+    pub const fn as_str(&self) -> &str {
         match self {
-            WorkspaceRole::Owner => "owner",
-            WorkspaceRole::Admin => "admin",
-            WorkspaceRole::Member => "member",
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Member => "member",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "owner" => Some(WorkspaceRole::Owner),
-            "admin" => Some(WorkspaceRole::Admin),
-            "member" => Some(WorkspaceRole::Member),
+            "owner" => Some(Self::Owner),
+            "admin" => Some(Self::Admin),
+            "member" => Some(Self::Member),
             _ => None,
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "workspace_members")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]

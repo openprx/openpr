@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::proposal::AuthorType;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "proposal_comments")]
 pub struct Model {
     #[sea_orm(primary_key)]

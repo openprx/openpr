@@ -153,7 +153,7 @@ pub async fn update_governance_config(
         .unwrap_or(old_row.trust_update_mode.as_str())
         .trim()
         .to_string();
-    let new_config = req.config.unwrap_or(old_row.config.clone());
+    let new_config = req.config.unwrap_or_else(|| old_row.config.clone());
     let now = Utc::now();
 
     let tx = state.db.begin().await?;
@@ -321,7 +321,7 @@ pub async fn list_governance_audit_logs(
     }
 
     let where_sql = if where_parts.is_empty() {
-        "".to_string()
+        String::new()
     } else {
         format!("WHERE {}", where_parts.join(" AND "))
     };
@@ -334,8 +334,7 @@ pub async fn list_governance_audit_logs(
     ))
     .one(&state.db)
     .await?
-    .map(|row| row.count)
-    .unwrap_or(0);
+    .map_or(0, |row| row.count);
 
     let mut list_values = values;
     list_values.push(per_page.into());

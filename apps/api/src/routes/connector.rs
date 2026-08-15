@@ -1,4 +1,10 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+// Pagination retains the established floating-point ceiling and signed wire representation.
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+
+use std::{
+    fmt::Write as _,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
 use axum::{
     Extension, Json,
@@ -260,12 +266,12 @@ pub async fn list_connectors(
     let mut param_idx = 2;
 
     if let Some(project_id) = query.project_id {
-        where_sql.push_str(&format!(" AND project_id = ${param_idx}"));
+        let _ = write!(where_sql, " AND project_id = ${param_idx}");
         values.push(project_id.into());
         param_idx += 1;
     }
     if let Some(kind) = query.kind {
-        where_sql.push_str(&format!(" AND kind = ${param_idx}"));
+        let _ = write!(where_sql, " AND kind = ${param_idx}");
         values.push(normalize_connector_kind(&kind)?.into());
     }
 
@@ -1244,12 +1250,10 @@ pub async fn report_connector_receipt(
     let source_kind = invocation
         .connector_kind
         .as_deref()
-        .map(|kind| format!("connector.{kind}"))
-        .unwrap_or_else(|| "connector".to_string());
+        .map_or_else(|| "connector".to_string(), |kind| format!("connector.{kind}"));
     let source_id = invocation
         .connector_id
-        .map(|connector_id| connector_id.to_string())
-        .unwrap_or_else(|| invocation_id.to_string());
+        .map_or_else(|| invocation_id.to_string(), |connector_id| connector_id.to_string());
     let event_type = if receipt_status == "failed" {
         "connector.delivery.failed"
     } else {
@@ -1868,7 +1872,7 @@ fn normalize_receipt_idempotency_key(
     if key.len() > 512 {
         return Err(ApiError::BadRequest("receipt idempotency key is too long".to_string()));
     }
-    if key.chars().any(|c| c.is_control()) {
+    if key.chars().any(char::is_control) {
         return Err(ApiError::BadRequest(
             "receipt idempotency key cannot contain control characters".to_string(),
         ));

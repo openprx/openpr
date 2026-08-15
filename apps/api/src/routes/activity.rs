@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 use axum::{
     Extension,
     extract::{Path, Query, State},
@@ -47,7 +50,7 @@ pub struct ListActivitiesQuery {
     pub limit: Option<i64>,
 }
 
-/// GET /api/v1/workspaces/:workspace_id/activities - Get workspace activity feed
+/// GET /`api/v1/workspaces/:workspace_id/activities` - Get workspace activity feed
 pub async fn get_workspace_activities(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -77,19 +80,19 @@ pub async fn get_workspace_activities(
     );
 
     if let Some(resource_type) = query.resource_type {
-        where_clauses.push(format!("a.resource_type = ${}", param_idx));
+        where_clauses.push(format!("a.resource_type = ${param_idx}"));
         values.push(resource_type.into());
         param_idx += 1;
     }
 
     if let Some(resource_id) = query.resource_id {
-        where_clauses.push(format!("a.resource_id = ${}", param_idx));
+        where_clauses.push(format!("a.resource_id = ${param_idx}"));
         values.push(resource_id.into());
         param_idx += 1;
     }
 
     if let Some(event_type) = query.event_type {
-        where_clauses.push(format!("a.event_type = ${}", param_idx));
+        where_clauses.push(format!("a.event_type = ${param_idx}"));
         values.push(event_type.into());
     }
 
@@ -145,7 +148,7 @@ pub async fn get_workspace_activities(
     Ok(ApiResponse::success(PaginatedData::from_items(response)))
 }
 
-/// GET /api/v1/projects/:project_id/activities - Get project activity feed
+/// GET /`api/v1/projects/:project_id/activities` - Get project activity feed
 pub async fn get_project_activities(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -186,19 +189,19 @@ pub async fn get_project_activities(
     let mut param_idx = 2;
 
     if let Some(resource_type) = query.resource_type {
-        where_clauses.push(format!("a.resource_type = ${}", param_idx));
+        where_clauses.push(format!("a.resource_type = ${param_idx}"));
         values.push(resource_type.into());
         param_idx += 1;
     }
 
     if let Some(resource_id) = query.resource_id {
-        where_clauses.push(format!("a.resource_id = ${}", param_idx));
+        where_clauses.push(format!("a.resource_id = ${param_idx}"));
         values.push(resource_id.into());
         param_idx += 1;
     }
 
     if let Some(event_type) = query.event_type {
-        where_clauses.push(format!("a.event_type = ${}", param_idx));
+        where_clauses.push(format!("a.event_type = ${param_idx}"));
         values.push(event_type.into());
     }
 
@@ -254,7 +257,7 @@ pub async fn get_project_activities(
     Ok(ApiResponse::success(PaginatedData::from_items(response)))
 }
 
-/// GET /api/v1/issues/:issue_id/activities - Get issue activity feed
+/// GET /`api/v1/issues/:issue_id/activities` - Get issue activity feed
 pub async fn get_issue_activities(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,

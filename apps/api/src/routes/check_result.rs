@@ -1,3 +1,11 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+// Pagination retains the established floating-point ceiling and signed wire representation.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::needless_pass_by_value
+)]
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -8,6 +16,7 @@ use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use uuid::Uuid;
 
 use crate::{
@@ -149,7 +158,7 @@ pub async fn list_project_check_results(
     let mut values = vec![project_id.into()];
     let mut idx = 2;
     if let Some(status) = query.status {
-        where_sql.push_str(&format!(" AND status = ${idx}"));
+        let _ = write!(where_sql, " AND status = ${idx}");
         values.push(normalize_status(&status)?.into());
         idx += 1;
     }
@@ -1112,8 +1121,7 @@ fn approved_effects_from_result(result: &Value) -> Result<Vec<ApprovedEffect>, A
 
     let items = value
         .as_array()
-        .map(|items| items.to_vec())
-        .unwrap_or_else(|| vec![value.clone()]);
+        .map_or_else(|| vec![value.clone()], std::clone::Clone::clone);
 
     items.into_iter().map(parse_approved_effect).collect()
 }
@@ -1202,7 +1210,6 @@ fn validate_priority_arg(value: &str) -> Result<(), ApiError> {
 
 fn default_proposal_type_for(action_class: &str) -> &'static str {
     match action_class {
-        "external_side_effect" | "financial_legal_compliance" => "governance",
         "high_risk_mutation" => "architecture",
         "low_risk_mutation" => "feature",
         _ => "governance",

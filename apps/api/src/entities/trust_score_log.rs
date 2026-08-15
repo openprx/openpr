@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::trust_score::TrustLevel;
 
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "trust_score_logs")]
 pub struct Model {
     #[sea_orm(primary_key)]

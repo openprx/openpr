@@ -1,3 +1,10 @@
+// Pagination retains the established floating-point ceiling and signed wire representation.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+
 use axum::{
     Extension,
     extract::{Path, Query, State},
@@ -120,7 +127,7 @@ pub async fn list_notifications(
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
             list_query,
-            vec![user_id.into(), (per_page as i64).into(), (offset as i64).into()],
+            vec![user_id.into(), i64::from(per_page).into(), i64::from(offset).into()],
         ))
         .await?;
 
@@ -129,15 +136,15 @@ pub async fn list_notifications(
         .map(|r| NotificationResponse::from_query_result(r, ""))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let total_pages = ((total as f64) / (per_page as f64)).ceil() as u32;
+    let total_pages = ((total as f64) / f64::from(per_page)).ceil() as u32;
 
     Ok(ApiResponse::success(NotificationListData {
         page_data: PaginatedData {
             items: notifications,
             total,
-            page: page as i64,
-            per_page: per_page as i64,
-            total_pages: total_pages as i64,
+            page: i64::from(page),
+            per_page: i64::from(per_page),
+            total_pages: i64::from(total_pages),
         },
         unread_count,
     }))

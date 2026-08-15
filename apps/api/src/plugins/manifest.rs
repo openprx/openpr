@@ -139,8 +139,8 @@ fn validate_hook(hook: &mut PluginHook) -> Result<(), String> {
             .event_type
             .as_deref()
             .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_none()
+            .as_ref()
+            .is_none_or(|value| value.is_empty())
     {
         return Err("event_handler hook requires event_type".to_string());
     }
@@ -196,7 +196,7 @@ mod tests {
                 "tools": [
                     {"name": "restaurant_calc.today_revenue", "description": "Revenue"}
                 ],
-                "runtime": {"timeout_ms": 500, "fuel": 100000, "memory_bytes": 1048576}
+                "runtime": {"timeout_ms": 500, "fuel": 100_000, "memory_bytes": 1_048_576}
             }
         }))
         .expect("manifest should parse");

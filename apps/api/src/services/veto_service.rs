@@ -1,3 +1,11 @@
+// Quorum calculation retains the established floating-point ceiling semantics.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::items_after_statements
+)]
+
 use chrono::{Duration, Utc};
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::Serialize;
@@ -428,8 +436,7 @@ impl VetoService {
         ))
         .one(db)
         .await?
-        .map(|row| row.count)
-        .unwrap_or(0);
+        .map_or(0, |row| row.count);
 
         Ok(count > 0)
     }
@@ -452,8 +459,7 @@ impl VetoService {
         ))
         .one(db)
         .await?
-        .map(|row| row.count)
-        .unwrap_or(0);
+        .map_or(0, |row| row.count);
 
         Ok(count)
     }
@@ -474,9 +480,7 @@ impl VetoService {
         .one(db)
         .await?;
 
-        let consensus = row
-            .map(|r| r.total_human_votes > 0 && r.distinct_choices == 1)
-            .unwrap_or(false);
+        let consensus = row.is_some_and(|r| r.total_human_votes > 0 && r.distinct_choices == 1);
         Ok(consensus)
     }
 }
@@ -612,8 +616,7 @@ async fn proposal_status_after_veto_release<C: ConnectionTrait>(db: &C, proposal
     let in_voting_window = timing.voting_started_at.is_some()
         && timing
             .voting_ended_at
-            .map(|voting_ended_at| voting_ended_at > now)
-            .unwrap_or(true);
+            .is_none_or(|voting_ended_at| voting_ended_at > now);
     if in_voting_window {
         Ok("voting".to_string())
     } else {

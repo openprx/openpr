@@ -1,3 +1,7 @@
+// Domain-specific local names remain explicit for audit readability.
+// Governance counts and ratios retain their established database and JSON numeric representations.
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::similar_names)]
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -276,8 +280,7 @@ async fn get_project_id_for_proposal(
     ))
     .one(db)
     .await?
-    .map(|row| row.count > 0)
-    .unwrap_or(false);
+    .is_some_and(|row| row.count > 0);
 
     if has_direct_project_id_column {
         let row = NullableProjectIdRow::find_by_statement(Statement::from_sql_and_values(
@@ -347,7 +350,7 @@ fn filter_clause(
     }
 
     if where_parts.is_empty() {
-        ("".to_string(), values)
+        (String::new(), values)
     } else {
         (format!("WHERE {}", where_parts.join(" AND ")), values)
     }
@@ -959,7 +962,7 @@ pub async fn create_project_audit_report(
     ))
     .one(&state.db)
     .await?
-    .unwrap_or(RatingAggRow {
+    .unwrap_or_else(|| RatingAggRow {
         reviewed_proposals: 0,
         avg_review_rating: None,
         rating_distribution: json!({"S":0,"A":0,"B":0,"C":0,"F":0}),
@@ -1289,8 +1292,7 @@ pub async fn list_project_audit_reports(
     ))
     .one(&state.db)
     .await?
-    .map(|row| row.count)
-    .unwrap_or(0);
+    .map_or(0, |row| row.count);
 
     let items = AuditReportRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1449,8 +1451,7 @@ pub async fn get_ai_participant_learning(
     ))
     .one(&state.db)
     .await?
-    .map(|row| row.count)
-    .unwrap_or(0);
+    .map_or(0, |row| row.count);
 
     let sql = format!(
         r"

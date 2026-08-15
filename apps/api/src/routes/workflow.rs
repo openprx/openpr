@@ -1,3 +1,13 @@
+// Domain-specific local names remain explicit for audit readability.
+// Workflow positions come from bounded in-memory template indices.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::items_after_statements,
+    clippy::similar_names
+)]
+
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -135,7 +145,7 @@ async fn get_workspace_role(state: &AppState, workspace_id: Uuid, user_id: Uuid)
     Ok(row.role)
 }
 
-/// Fetch a workflow that is NOT a system default; returns (workflow_id, workspace_id).
+/// Fetch a workflow that is NOT a system default; returns (`workflow_id`, `workspace_id`).
 /// Returns Forbidden if it IS a system default.
 async fn get_editable_workflow(state: &AppState, workflow_id: Uuid) -> Result<(Uuid, Option<Uuid>), ApiError> {
     #[derive(Debug, FromQueryResult)]
@@ -203,7 +213,7 @@ fn validate_category(category: &str) -> Result<(), ApiError> {
 // Existing handler (preserved)
 // ============================================================================
 
-/// GET /api/v1/projects/:project_id/workflow/effective
+/// GET /`api/v1/projects/:project_id/workflow/effective`
 pub async fn get_effective_workflow_by_project(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -227,7 +237,7 @@ pub async fn get_effective_workflow_by_project(
 // Workflow CRUD
 // ============================================================================
 
-/// GET /api/v1/workspaces/:workspace_id/workflows
+/// GET /`api/v1/workspaces/:workspace_id/workflows`
 pub async fn list_workflows(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -291,7 +301,7 @@ pub async fn list_workflows(
     Ok(ApiResponse::success(PaginatedData::from_items(items)))
 }
 
-/// POST /api/v1/workspaces/:workspace_id/workflows
+/// POST /`api/v1/workspaces/:workspace_id/workflows`
 pub async fn create_workflow(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -401,7 +411,7 @@ pub async fn create_workflow(
     }))
 }
 
-/// GET /api/v1/workflows/:workflow_id
+/// GET /`api/v1/workflows/:workflow_id`
 pub async fn get_workflow(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -489,7 +499,7 @@ pub async fn get_workflow(
     }))
 }
 
-/// PUT /api/v1/workflows/:workflow_id
+/// PUT /`api/v1/workflows/:workflow_id`
 pub async fn update_workflow(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -540,13 +550,13 @@ pub async fn update_workflow(
     let mut param_idx = 1;
 
     if let Some(name) = req.name {
-        updates.push(format!("name = ${}", param_idx));
+        updates.push(format!("name = ${param_idx}"));
         values.push(name.into());
         param_idx += 1;
     }
 
     if let Some(description) = req.description {
-        updates.push(format!("description = ${}", param_idx));
+        updates.push(format!("description = ${param_idx}"));
         values.push(description.into());
         param_idx += 1;
     }
@@ -555,7 +565,7 @@ pub async fn update_workflow(
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
 
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     values.push(chrono::Utc::now().into());
     param_idx += 1;
 
@@ -610,7 +620,7 @@ pub async fn update_workflow(
     }))
 }
 
-/// DELETE /api/v1/workflows/:workflow_id
+/// DELETE /`api/v1/workflows/:workflow_id`
 pub async fn delete_workflow(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -681,7 +691,7 @@ pub async fn delete_workflow(
 // Workflow State handlers
 // ============================================================================
 
-/// GET /api/v1/workflows/:workflow_id/states
+/// GET /`api/v1/workflows/:workflow_id/states`
 pub async fn list_workflow_states(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -753,7 +763,7 @@ pub async fn list_workflow_states(
     Ok(ApiResponse::success(PaginatedData::from_items(items)))
 }
 
-/// POST /api/v1/workflows/:workflow_id/states
+/// POST /`api/v1/workflows/:workflow_id/states`
 pub async fn create_workflow_state(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -820,7 +830,7 @@ pub async fn create_workflow_state(
         .await?
         .ok_or(ApiError::Internal)?;
 
-        row.max_pos.map(|p| p + 1).unwrap_or(0)
+        row.max_pos.map_or(0, |p| p + 1)
     };
 
     let is_initial = req.is_initial.unwrap_or(false);
@@ -958,37 +968,37 @@ pub async fn update_workflow_state(
     let mut param_idx = 1;
 
     if let Some(display_name) = req.display_name {
-        updates.push(format!("display_name = ${}", param_idx));
+        updates.push(format!("display_name = ${param_idx}"));
         values.push(display_name.into());
         param_idx += 1;
     }
 
     if let Some(category) = req.category {
-        updates.push(format!("category = ${}", param_idx));
+        updates.push(format!("category = ${param_idx}"));
         values.push(category.into());
         param_idx += 1;
     }
 
     if let Some(position) = req.position {
-        updates.push(format!("position = ${}", param_idx));
+        updates.push(format!("position = ${param_idx}"));
         values.push(position.into());
         param_idx += 1;
     }
 
     if let Some(color) = req.color {
-        updates.push(format!("color = ${}", param_idx));
+        updates.push(format!("color = ${param_idx}"));
         values.push(color.into());
         param_idx += 1;
     }
 
     if let Some(is_initial) = req.is_initial {
-        updates.push(format!("is_initial = ${}", param_idx));
+        updates.push(format!("is_initial = ${param_idx}"));
         values.push(is_initial.into());
         param_idx += 1;
     }
 
     if let Some(is_terminal) = req.is_terminal {
-        updates.push(format!("is_terminal = ${}", param_idx));
+        updates.push(format!("is_terminal = ${param_idx}"));
         values.push(is_terminal.into());
         param_idx += 1;
     }
@@ -997,7 +1007,7 @@ pub async fn update_workflow_state(
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
 
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     values.push(chrono::Utc::now().into());
     param_idx += 1;
 
@@ -1129,7 +1139,7 @@ pub async fn delete_workflow_state(
     Ok(ApiResponse::ok())
 }
 
-/// PUT /api/v1/workflows/:workflow_id/states/reorder
+/// PUT /`api/v1/workflows/:workflow_id/states/reorder`
 pub async fn reorder_workflow_states(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -1191,7 +1201,7 @@ pub async fn reorder_workflow_states(
 // Project workflow assignment
 // ============================================================================
 
-/// PUT /api/v1/projects/:project_id/workflow
+/// PUT /`api/v1/projects/:project_id/workflow`
 pub async fn set_project_workflow(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,

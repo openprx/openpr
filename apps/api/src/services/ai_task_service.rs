@@ -244,7 +244,7 @@ pub async fn insert_ai_task_business_event<C: ConnectionTrait>(
 pub fn next_retry_time(attempts: i32) -> DateTime<Utc> {
     let safe_attempts = attempts.max(1);
     let backoff_seconds = (safe_attempts * 30).min(30 * 20);
-    Utc::now() + Duration::seconds(backoff_seconds as i64)
+    Utc::now() + Duration::seconds(i64::from(backoff_seconds))
 }
 
 pub fn valid_task_type(value: &str) -> bool {

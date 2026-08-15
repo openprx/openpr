@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -50,7 +53,7 @@ pub struct SearchUserResponse {
     pub name: String,
 }
 
-/// POST /api/v1/workspaces/:workspace_id/members - Add existing user to workspace
+/// POST /`api/v1/workspaces/:workspace_id/members` - Add existing user to workspace
 pub async fn add_member(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -162,7 +165,7 @@ pub async fn add_member(
     }))
 }
 
-/// PATCH /api/v1/workspaces/:workspace_id/members/:user_id - Update member role
+/// PATCH /`api/v1/workspaces/:workspace_id/members/:user_id` - Update member role
 pub async fn update_member_role(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -241,7 +244,7 @@ pub async fn update_member_role(
     Ok(ApiResponse::ok())
 }
 
-/// GET /api/v1/workspaces/:workspace_id/members - List workspace members
+/// GET /`api/v1/workspaces/:workspace_id/members` - List workspace members
 pub async fn list_members(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -298,7 +301,7 @@ pub async fn list_members(
     Ok(ApiResponse::success(PaginatedData::from_items(response)))
 }
 
-/// DELETE /api/v1/workspaces/:workspace_id/members/:user_id - Remove member from workspace
+/// DELETE /`api/v1/workspaces/:workspace_id/members/:user_id` - Remove member from workspace
 pub async fn remove_member(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -352,7 +355,7 @@ pub async fn remove_member(
     Ok(ApiResponse::ok())
 }
 
-/// GET /api/v1/workspaces/:workspace_id/users?search=xxx - Search users for adding to workspace
+/// GET /`api/v1/workspaces/:workspace_id/users?search=xxx` - Search users for adding to workspace
 pub async fn search_users(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -394,7 +397,7 @@ pub async fn search_users(
                 ORDER BY created_at DESC
                 LIMIT $2
             ",
-            vec![format!("%{}%", search).into(), limit.into()],
+            vec![format!("%{search}%").into(), limit.into()],
         ))
         .all(&state.db)
         .await?

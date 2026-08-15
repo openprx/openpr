@@ -27,7 +27,7 @@ pub struct PermissionService {
 }
 
 impl PermissionService {
-    pub fn new(db: DatabaseConnection) -> Self {
+    pub const fn new(db: DatabaseConnection) -> Self {
         Self { db }
     }
 
@@ -66,7 +66,7 @@ impl PermissionService {
         .one(&self.db)
         .await?;
 
-        let domain_level = TrustLevel::from_score(score_row.map(|row| row.score).unwrap_or(100));
+        let domain_level = TrustLevel::from_score(score_row.map_or(100, |row| row.score));
 
         if user_type != ParticipantType::Ai {
             return Ok(domain_level);
@@ -172,12 +172,11 @@ impl PermissionService {
 
         Ok(ai_row
             .filter(|ai| ai.is_active)
-            .map(|ai| ai.can_veto_human_consensus)
-            .unwrap_or(false))
+            .is_some_and(|ai| ai.can_veto_human_consensus))
     }
 }
 
-fn participant_type_str(value: ParticipantType) -> &'static str {
+const fn participant_type_str(value: ParticipantType) -> &'static str {
     match value {
         ParticipantType::Ai => "ai",
         ParticipantType::Human => "human",
@@ -200,7 +199,6 @@ fn ai_max_level_for_domain(ai: &AiParticipantCapRow, domain: &str) -> TrustLevel
 
 fn parse_level(level: &str) -> TrustLevel {
     match level {
-        "observer" => TrustLevel::Observer,
         "advisor" => TrustLevel::Advisor,
         "voter" => TrustLevel::Voter,
         "vetoer" => TrustLevel::Vetoer,
@@ -209,7 +207,7 @@ fn parse_level(level: &str) -> TrustLevel {
     }
 }
 
-fn min_level(left: TrustLevel, right: TrustLevel) -> TrustLevel {
+const fn min_level(left: TrustLevel, right: TrustLevel) -> TrustLevel {
     if level_rank(left) <= level_rank(right) {
         left
     } else {
@@ -217,7 +215,7 @@ fn min_level(left: TrustLevel, right: TrustLevel) -> TrustLevel {
     }
 }
 
-fn level_rank(level: TrustLevel) -> i32 {
+const fn level_rank(level: TrustLevel) -> i32 {
     match level {
         TrustLevel::Observer => 0,
         TrustLevel::Advisor => 1,

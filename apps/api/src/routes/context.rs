@@ -354,10 +354,8 @@ fn build_agent_policy(
     governance: Option<&ProjectContextGovernance>,
     connectors: &[ProjectContextConnector],
 ) -> Value {
-    let capabilities = project_type
-        .map(|item| item.enabled_capabilities.clone())
-        .unwrap_or_else(|| json!([]));
-    let high_risk_requires_review = governance.map(|item| item.review_required).unwrap_or(true);
+    let capabilities = project_type.map_or_else(|| json!([]), |item| item.enabled_capabilities.clone());
+    let high_risk_requires_review = governance.is_none_or(|item| item.review_required);
     let connector_kinds = connectors
         .iter()
         .map(|connector| connector.kind.clone())
@@ -607,20 +605,17 @@ fn build_mcp_tool_registry(capabilities: &Value, connectors: &[ProjectContextCon
         );
     }
 
+    let connector_tool_names = connector_tools
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let enabled_tools = groups
         .values()
         .flat_map(|tools| tools.iter().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(str::to_string)
-        .collect::<Vec<_>>();
-    let connector_tool_names = connector_tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let enabled_tools = enabled_tools
-        .into_iter()
         .chain(connector_tool_names.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()

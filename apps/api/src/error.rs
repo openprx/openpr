@@ -23,8 +23,7 @@ pub fn localize_error(msg: &str, lang: &str) -> String {
         }
     } else {
         match msg {
-            "content is required" => "内容不能为空".to_string(),
-            "content cannot be empty" => "内容不能为空".to_string(),
+            "content is required" | "content cannot be empty" => "内容不能为空".to_string(),
             "issue not found or access denied" => "Issue 未找到或无权限".to_string(),
             _ => msg.to_string(),
         }

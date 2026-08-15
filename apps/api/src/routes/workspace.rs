@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -282,13 +285,13 @@ pub async fn update_workspace(
     let mut param_idx = 1;
 
     if let Some(name) = req.name {
-        updates.push(format!("name = ${}", param_idx));
+        updates.push(format!("name = ${param_idx}"));
         values.push(name.into());
         param_idx += 1;
     }
 
     if let Some(slug) = req.slug {
-        updates.push(format!("slug = ${}", param_idx));
+        updates.push(format!("slug = ${param_idx}"));
         values.push(slug.into());
         param_idx += 1;
     }
@@ -297,7 +300,7 @@ pub async fn update_workspace(
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
 
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     values.push(chrono::Utc::now().into());
     param_idx += 1;
 

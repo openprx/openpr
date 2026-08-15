@@ -1,3 +1,7 @@
+// Domain-specific local names remain explicit for audit readability.
+// Extension matching stays case-sensitive to preserve the established upload and media policy.
+#![allow(clippy::case_sensitive_file_extension_comparisons, clippy::similar_names)]
+
 use axum::{
     Extension,
     body::Bytes,
@@ -234,7 +238,7 @@ async fn upload_file_from_multipart(headers: HeaderMap, body: Bytes) -> Result<U
 
     let file_name = format!("{}.{}", Uuid::new_v4(), ext);
     let object_ref = object_storage.put(&file_name, &part.data).await?;
-    let thumbnail_url = if is_image_extension(&ext) {
+    let thumbnail_url = if is_image_extension(ext) {
         let thumbnail_name = thumbnail_file_name(&file_name);
         let thumbnail_key = format!("thumbnails/{thumbnail_name}");
         let thumbnail = build_thumbnail_derivative(part.data.clone()).await?;
@@ -247,12 +251,10 @@ async fn upload_file_from_multipart(headers: HeaderMap, body: Bytes) -> Result<U
         None
     };
 
-    let (thumbnail_url, thumbnail_object_key) = thumbnail_url
-        .map(|(url, key)| (Some(url), Some(key)))
-        .unwrap_or((None, None));
+    let (thumbnail_url, thumbnail_object_key) = thumbnail_url.map_or((None, None), |(url, key)| (Some(url), Some(key)));
 
     Ok(UploadResponse {
-        url: format!("/api/v1/uploads/{}", file_name),
+        url: format!("/api/v1/uploads/{file_name}"),
         filename: file_name,
         storage_backend: object_ref.backend,
         object_key: object_ref.key,
@@ -261,7 +263,7 @@ async fn upload_file_from_multipart(headers: HeaderMap, body: Bytes) -> Result<U
     })
 }
 
-/// GET /uploads/:file_name - Serve uploaded file
+/// GET /`uploads/:file_name` - Serve uploaded file
 pub async fn get_uploaded_file(
     State(state): State<AppState>,
     access: UploadAccess,
@@ -314,7 +316,7 @@ pub async fn get_uploaded_file(
     Ok(([(axum::http::header::CONTENT_TYPE, content_type)], data))
 }
 
-/// GET /uploads/thumbnails/:file_name - Serve uploaded thumbnail derivative
+/// GET /`uploads/thumbnails/:file_name` - Serve uploaded thumbnail derivative
 pub async fn get_uploaded_thumbnail(
     State(state): State<AppState>,
     access: UploadAccess,
@@ -328,7 +330,7 @@ pub async fn get_uploaded_thumbnail(
     ))
 }
 
-/// GET /uploads/previews/:file_name - Serve uploaded preview derivative
+/// GET /`uploads/previews/:file_name` - Serve uploaded preview derivative
 pub async fn get_uploaded_preview(
     State(state): State<AppState>,
     access: UploadAccess,
@@ -342,7 +344,7 @@ pub async fn get_uploaded_preview(
     ))
 }
 
-/// GET /uploads/variants/:file_name - Serve uploaded configured variant derivative
+/// GET /`uploads/variants/:file_name` - Serve uploaded configured variant derivative
 pub async fn get_uploaded_variant(
     State(state): State<AppState>,
     access: UploadAccess,
@@ -356,7 +358,7 @@ pub async fn get_uploaded_variant(
     ))
 }
 
-/// GET /uploads/signatures/:file_name - Serve stored signature image
+/// GET /`uploads/signatures/:file_name` - Serve stored signature image
 pub async fn get_uploaded_signature(
     State(state): State<AppState>,
     access: UploadAccess,
@@ -389,7 +391,7 @@ pub async fn create_uploaded_signature_signed_url(
     )?))
 }
 
-/// GET /api/v1/uploads/signatures/:file_name/download - Serve stored signature image after signed URL validation
+/// GET /`api/v1/uploads/signatures/:file_name/download` - Serve stored signature image after signed URL validation
 pub async fn download_signed_uploaded_signature(
     State(state): State<AppState>,
     Path(file_name): Path<String>,
@@ -514,7 +516,7 @@ impl ImageDerivativeFormat {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpeg",
@@ -522,7 +524,7 @@ impl ImageDerivativeFormat {
         }
     }
 
-    fn extension(self) -> &'static str {
+    const fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpg",
@@ -530,7 +532,7 @@ impl ImageDerivativeFormat {
         }
     }
 
-    fn image_format(self) -> ImageFormat {
+    const fn image_format(self) -> ImageFormat {
         match self {
             Self::Png => ImageFormat::Png,
             Self::Jpeg => ImageFormat::Jpeg,

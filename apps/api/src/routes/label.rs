@@ -1,3 +1,7 @@
+// Domain-specific local names remain explicit for audit readability.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements, clippy::similar_names)]
+
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use axum::{
     Extension, Json,
@@ -74,7 +78,7 @@ fn ensure_label_mutation_allowed(role: &str, is_bot: bool, action: &str) -> Resu
     )))
 }
 
-/// POST /api/v1/workspaces/:workspace_id/labels - Create a label
+/// POST /`api/v1/workspaces/:workspace_id/labels` - Create a label
 pub async fn create_label(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -138,7 +142,7 @@ pub async fn create_label(
     }))
 }
 
-/// GET /api/v1/workspaces/:workspace_id/labels - List labels in workspace
+/// GET /`api/v1/workspaces/:workspace_id/labels` - List labels in workspace
 pub async fn list_labels(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -243,19 +247,19 @@ pub async fn update_label(
     let mut param_idx = 1;
 
     if let Some(name) = req.name {
-        updates.push(format!("name = ${}", param_idx));
+        updates.push(format!("name = ${param_idx}"));
         values.push(name.into());
         param_idx += 1;
     }
 
     if let Some(color) = req.color {
-        updates.push(format!("color = ${}", param_idx));
+        updates.push(format!("color = ${param_idx}"));
         values.push(color.into());
         param_idx += 1;
     }
 
     if let Some(description) = req.description {
-        updates.push(format!("description = ${}", param_idx));
+        updates.push(format!("description = ${param_idx}"));
         values.push(description.into());
         param_idx += 1;
     }
@@ -346,7 +350,7 @@ pub async fn delete_label(
 // Work Item Label Association APIs
 // ============================================================================
 
-/// POST /api/v1/issues/:issue_id/labels/:label_id - Add label to issue
+/// POST /`api/v1/issues/:issue_id/labels/:label_id` - Add label to issue
 pub async fn add_label_to_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -442,7 +446,7 @@ pub async fn add_label_to_issue(
     Ok(ApiResponse::ok())
 }
 
-/// GET /api/v1/issues/:issue_id/labels - Get issue's labels
+/// GET /`api/v1/issues/:issue_id/labels` - Get issue's labels
 pub async fn get_issue_labels(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -516,7 +520,7 @@ pub async fn get_issue_labels(
     Ok(ApiResponse::success(PaginatedData::from_items(response)))
 }
 
-/// DELETE /api/v1/issues/:issue_id/labels/:label_id - Remove label from issue
+/// DELETE /`api/v1/issues/:issue_id/labels/:label_id` - Remove label from issue
 pub async fn remove_label_from_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -582,7 +586,7 @@ pub async fn remove_label_from_issue(
     Ok(ApiResponse::ok())
 }
 
-/// GET /api/v1/projects/:project_id/labels (bot-auth)
+/// GET /`api/v1/projects/:project_id/labels` (bot-auth)
 /// Lists all workspace labels available for a project.
 pub async fn list_project_labels(
     State(state): State<AppState>,

@@ -1,3 +1,6 @@
+// Explicit branches preserve the established evaluation order and mutation points.
+#![allow(clippy::useless_let_if_seq)]
+
 use platform::app::AppState;
 use sea_orm::{DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};

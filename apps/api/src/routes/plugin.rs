@@ -576,7 +576,7 @@ async fn count_query(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) -
     Ok(row.map_or(0, |item| item.count))
 }
 
-fn total_pages(total: i64, per_page: i64) -> i64 {
+const fn total_pages(total: i64, per_page: i64) -> i64 {
     if total == 0 {
         0
     } else {

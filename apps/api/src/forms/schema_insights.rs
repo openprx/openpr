@@ -1,3 +1,6 @@
+// This data shape mirrors an established wire or persistence schema and must remain stable.
+#![allow(clippy::struct_excessive_bools)]
+
 use platform::app::AppState;
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::Serialize;

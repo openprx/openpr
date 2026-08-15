@@ -1,3 +1,6 @@
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements)]
+
 use axum::{
     Extension, Json,
     extract::{Path, State},
@@ -123,7 +126,7 @@ fn normalize_bot_permissions(permissions: Vec<String>) -> Result<Vec<String>, Ap
 // Handlers
 // ============================================================================
 
-/// POST /api/v1/workspaces/:workspace_id/bots
+/// POST /`api/v1/workspaces/:workspace_id/bots`
 pub async fn create_bot(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -164,7 +167,7 @@ pub async fn create_bot(
 
     let bot_id = Uuid::new_v4();
     let now = Utc::now();
-    let perms_json = serde_json::to_value(&perms).unwrap_or(serde_json::json!(["read"]));
+    let perms_json = serde_json::to_value(&perms).unwrap_or_else(|_| serde_json::json!(["read"]));
     let workspace_role = workspace_role_from_permissions(&perms);
     let bot_email = format!("{bot_id}@bot.openpr.local");
     let bot_name = req.name.clone();
@@ -231,7 +234,7 @@ pub async fn create_bot(
     }))
 }
 
-/// GET /api/v1/workspaces/:workspace_id/bots
+/// GET /`api/v1/workspaces/:workspace_id/bots`
 pub async fn list_bots(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -298,7 +301,7 @@ pub async fn list_bots(
     Ok(ApiResponse::success(response))
 }
 
-/// DELETE /api/v1/workspaces/:workspace_id/bots/:bot_id
+/// DELETE /`api/v1/workspaces/:workspace_id/bots/:bot_id`
 pub async fn revoke_bot(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,

@@ -20,18 +20,15 @@ pub async fn write_governance_audit_log<C: ConnectionTrait>(
     db: &C,
     input: GovernanceAuditLogInput,
 ) -> Result<(), ApiError> {
-    let old_value = match input.old_value {
-        Some(v) => SeaValue::Json(Some(Box::new(v))),
-        None => SeaValue::Json(None),
-    };
-    let new_value = match input.new_value {
-        Some(v) => SeaValue::Json(Some(Box::new(v))),
-        None => SeaValue::Json(None),
-    };
-    let metadata = match input.metadata {
-        Some(v) => SeaValue::Json(Some(Box::new(v))),
-        None => SeaValue::Json(None),
-    };
+    let old_value = input
+        .old_value
+        .map_or(SeaValue::Json(None), |v| SeaValue::Json(Some(Box::new(v))));
+    let new_value = input
+        .new_value
+        .map_or(SeaValue::Json(None), |v| SeaValue::Json(Some(Box::new(v))));
+    let metadata = input
+        .metadata
+        .map_or(SeaValue::Json(None), |v| SeaValue::Json(Some(Box::new(v))));
 
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,

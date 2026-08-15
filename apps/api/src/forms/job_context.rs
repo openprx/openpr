@@ -1,3 +1,6 @@
+// Public and framework-facing signatures remain stable during this behavior-neutral cleanup.
+#![allow(clippy::needless_pass_by_value)]
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -47,7 +50,7 @@ pub fn form_job_worker_context(input: &Value, created_by: Option<Uuid>) -> Resul
     let is_bot = context
         .as_ref()
         .and_then(|ctx| ctx.is_bot)
-        .unwrap_or(created_by.is_none());
+        .unwrap_or_else(|| created_by.is_none());
     Ok((actor_id, role, is_bot))
 }
 

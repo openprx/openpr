@@ -1,3 +1,6 @@
+// Pagination retains the established floating-point ceiling and signed wire representation.
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
@@ -101,7 +104,7 @@ impl TryFrom<WebhookRow> for WebhookResponse {
     }
 }
 
-/// GET /api/v1/workspaces/:workspace_id/webhooks/:webhook_id/deliveries
+/// GET /`api/v1/workspaces/:workspace_id/webhooks/:webhook_id/deliveries`
 pub async fn list_deliveries(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -131,7 +134,7 @@ pub async fn list_deliveries(
     let total_pages = if total == 0 {
         0
     } else {
-        ((total as f64) / (per_page as f64)).ceil() as i64
+        ((total as f64) / f64::from(per_page)).ceil() as i64
     };
 
     let rows = state
@@ -163,7 +166,7 @@ pub async fn list_deliveries(
                 ORDER BY created_at DESC
                 LIMIT $2 OFFSET $3
             ",
-            vec![webhook_id.into(), (per_page as i64).into(), (offset as i64).into()],
+            vec![webhook_id.into(), i64::from(per_page).into(), i64::from(offset).into()],
         ))
         .await?;
 
@@ -175,13 +178,13 @@ pub async fn list_deliveries(
     Ok(ApiResponse::success(PaginatedData {
         items,
         total,
-        page: page as i64,
-        per_page: per_page as i64,
+        page: i64::from(page),
+        per_page: i64::from(per_page),
         total_pages,
     }))
 }
 
-/// GET /api/v1/workspaces/:workspace_id/webhooks/:webhook_id/deliveries/:delivery_id
+/// GET /`api/v1/workspaces/:workspace_id/webhooks/:webhook_id/deliveries/:delivery_id`
 pub async fn get_delivery(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -228,7 +231,7 @@ pub async fn get_delivery(
     Ok(ApiResponse::success(delivery))
 }
 
-/// POST /api/v1/workspaces/:workspace_id/webhooks
+/// POST /`api/v1/workspaces/:workspace_id/webhooks`
 pub async fn create_webhook(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -249,7 +252,7 @@ pub async fn create_webhook(
     // Validate events
     for event in &req.events {
         if !WEBHOOK_EVENTS.contains(&event.as_str()) {
-            return Err(ApiError::BadRequest(format!("Invalid event type: {}", event)));
+            return Err(ApiError::BadRequest(format!("Invalid event type: {event}")));
         }
     }
 
@@ -297,7 +300,7 @@ pub async fn create_webhook(
     Ok(ApiResponse::success(response))
 }
 
-/// GET /api/v1/workspaces/:workspace_id/webhooks
+/// GET /`api/v1/workspaces/:workspace_id/webhooks`
 pub async fn list_webhooks(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -327,7 +330,7 @@ pub async fn list_webhooks(
     Ok(ApiResponse::success(PaginatedData::from_items(responses)))
 }
 
-/// GET /api/v1/workspaces/:workspace_id/webhooks/:webhook_id
+/// GET /`api/v1/workspaces/:workspace_id/webhooks/:webhook_id`
 pub async fn get_webhook(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -352,7 +355,7 @@ pub async fn get_webhook(
     Ok(ApiResponse::success(response))
 }
 
-/// PATCH /api/v1/workspaces/:workspace_id/webhooks/:webhook_id
+/// PATCH /`api/v1/workspaces/:workspace_id/webhooks/:webhook_id`
 pub async fn update_webhook(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -367,7 +370,7 @@ pub async fn update_webhook(
     if let Some(ref events) = req.events {
         for event in events {
             if !WEBHOOK_EVENTS.contains(&event.as_str()) {
-                return Err(ApiError::BadRequest(format!("Invalid event type: {}", event)));
+                return Err(ApiError::BadRequest(format!("Invalid event type: {event}")));
             }
         }
     }
@@ -386,32 +389,32 @@ pub async fn update_webhook(
     let mut param_idx = 1;
 
     if let Some(name) = req.name {
-        updates.push(format!("name = ${}", param_idx));
+        updates.push(format!("name = ${param_idx}"));
         params.push(name.into());
         param_idx += 1;
     }
     if let Some(url) = req.url {
-        updates.push(format!("url = ${}", param_idx));
+        updates.push(format!("url = ${param_idx}"));
         params.push(url.into());
         param_idx += 1;
     }
     if let Some(secret) = req.secret {
-        updates.push(format!("secret = ${}", param_idx));
+        updates.push(format!("secret = ${param_idx}"));
         params.push(secret.into());
         param_idx += 1;
     }
     if let Some(events) = req.events {
-        updates.push(format!("events = ${}", param_idx));
+        updates.push(format!("events = ${param_idx}"));
         params.push(serde_json::to_value(&events).map_err(|_| ApiError::Internal)?.into());
         param_idx += 1;
     }
     if let Some(active) = req.enabled.or(req.active) {
-        updates.push(format!("active = ${}", param_idx));
+        updates.push(format!("active = ${param_idx}"));
         params.push(active.into());
         param_idx += 1;
     }
     if req.bot_user_id.is_some() {
-        updates.push(format!("bot_user_id = ${}", param_idx));
+        updates.push(format!("bot_user_id = ${param_idx}"));
         params.push(req.bot_user_id.into());
         param_idx += 1;
     }
@@ -420,7 +423,7 @@ pub async fn update_webhook(
         return Err(ApiError::BadRequest("No fields to update".to_string()));
     }
 
-    updates.push(format!("updated_at = ${}", param_idx));
+    updates.push(format!("updated_at = ${param_idx}"));
     params.push(chrono::Utc::now().into());
     param_idx += 1;
 
@@ -462,7 +465,7 @@ pub async fn update_webhook(
     Ok(ApiResponse::success(response))
 }
 
-/// DELETE /api/v1/workspaces/:workspace_id/webhooks/:webhook_id
+/// DELETE /`api/v1/workspaces/:workspace_id/webhooks/:webhook_id`
 pub async fn delete_webhook(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,

@@ -1,3 +1,7 @@
+// Explicit branches preserve the established evaluation order and mutation points.
+// Local SQL row types stay beside the queries whose column shapes they mirror.
+#![allow(clippy::items_after_statements, clippy::option_if_let_else)]
+
 use axum::{
     Extension, Json,
     extract::{Path, State},

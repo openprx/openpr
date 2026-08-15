@@ -955,7 +955,7 @@ async fn process_pending_connector_invocations(
                 );
                 let result = connector_delivery_result(
                     &invocation,
-                    ConnectorDeliveryRecord {
+                    &ConnectorDeliveryRecord {
                         status: "failed",
                         auth_mode: ConnectorAuthMode::None,
                         status_code: None,
@@ -1006,7 +1006,7 @@ async fn process_pending_connector_invocations(
         match connector_retry_decision(invocation.attempts, invocation.max_attempts, outcome.retryable) {
             ConnectorRetryDecision::Retry { delay_seconds } => {
                 let next_attempt_at = (chrono::Utc::now() + chrono::Duration::seconds(delay_seconds)).to_rfc3339();
-                let result = with_retry_schedule(outcome.result, "retrying", Some(next_attempt_at));
+                let result = with_retry_schedule(outcome.result, "retrying", Some(&next_attempt_at));
                 update_connector_invocation_status(
                     db,
                     invocation.id,
@@ -1054,7 +1054,7 @@ fn connector_retry_decision(attempts: i32, max_attempts: i32, retryable: bool) -
 fn with_retry_schedule(
     mut result: serde_json::Value,
     status: &str,
-    next_attempt_at: Option<String>,
+    next_attempt_at: Option<&str>,
 ) -> serde_json::Value {
     if let Some(delivery) = result
         .get_mut("connector_delivery")
@@ -1443,7 +1443,7 @@ async fn dispatch_connector_invocation(
         retryable: false,
         result: connector_delivery_result(
             invocation,
-            ConnectorDeliveryRecord {
+            &ConnectorDeliveryRecord {
                 status: "failed",
                 auth_mode: auth.mode,
                 status_code: None,
@@ -1495,7 +1495,7 @@ async fn dispatch_connector_invocation(
             let status_code = response.status().as_u16();
             let success = response.status().is_success();
             let response_body = truncate_diagnostic(
-                read_capped_body(response, CONNECTOR_RESPONSE_BYTE_LIMIT).await,
+                &read_capped_body(response, CONNECTOR_RESPONSE_BYTE_LIMIT).await,
                 CONNECTOR_DIAGNOSTIC_CHARS,
             );
             let error_message = if success {
@@ -1511,7 +1511,7 @@ async fn dispatch_connector_invocation(
                 retryable: !success,
                 result: connector_delivery_result(
                     invocation,
-                    ConnectorDeliveryRecord {
+                    &ConnectorDeliveryRecord {
                         status: if success { "delivered" } else { "failed" },
                         auth_mode: auth.mode,
                         status_code: Some(status_code),
@@ -1533,7 +1533,7 @@ async fn dispatch_connector_invocation(
                 retryable: true,
                 result: connector_delivery_result(
                     invocation,
-                    ConnectorDeliveryRecord {
+                    &ConnectorDeliveryRecord {
                         status: "failed",
                         auth_mode: auth.mode,
                         status_code: None,
@@ -1643,7 +1643,7 @@ fn redact_endpoint(endpoint: &str) -> String {
 
 fn connector_delivery_result(
     invocation: &ConnectorInvocationDispatchRow,
-    record: ConnectorDeliveryRecord<'_>,
+    record: &ConnectorDeliveryRecord<'_>,
 ) -> serde_json::Value {
     json!({
         "connector_delivery": {
@@ -1665,7 +1665,7 @@ fn connector_delivery_result(
     })
 }
 
-fn truncate_diagnostic(value: String, max_chars: usize) -> String {
+fn truncate_diagnostic(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
@@ -3347,7 +3347,7 @@ PAYMENTS = "payments-token"
         let invocation = dispatch_row("https://hooks.example.com/openpr");
         let result = connector_delivery_result(
             &invocation,
-            ConnectorDeliveryRecord {
+            &ConnectorDeliveryRecord {
                 status: "failed",
                 auth_mode: ConnectorAuthMode::Hmac,
                 status_code: Some(502),
@@ -3359,7 +3359,7 @@ PAYMENTS = "payments-token"
                 next_attempt_at: None,
             },
         );
-        let scheduled = with_retry_schedule(result, "retrying", Some("2026-08-11T00:00:30Z".to_string()));
+        let scheduled = with_retry_schedule(result, "retrying", Some("2026-08-11T00:00:30Z"));
         let delivery = scheduled.get("connector_delivery").unwrap();
 
         assert_eq!(delivery.get("status").unwrap(), "retrying");
@@ -3579,7 +3579,7 @@ PAYMENTS = "payments-token"
         let invocation = dispatch_row("https://user:pass@hooks.example.com/openpr");
         let result = connector_delivery_result(
             &invocation,
-            ConnectorDeliveryRecord {
+            &ConnectorDeliveryRecord {
                 status: "delivered",
                 auth_mode: ConnectorAuthMode::Hmac,
                 status_code: Some(200),
