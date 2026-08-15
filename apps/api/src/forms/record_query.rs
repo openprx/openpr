@@ -416,6 +416,7 @@ fn find_schema_field<'a>(fields: &'a [FormField], raw_key: &str) -> Result<&'a F
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         append_record_filter_expression_sql, indexed_value_kind, query_filter_expression,

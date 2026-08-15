@@ -329,6 +329,7 @@ async fn count_query(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) -
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{FormFieldDependency, SchemaInsightInput, find_schema_field, json_contains_string};
     use serde_json::json;

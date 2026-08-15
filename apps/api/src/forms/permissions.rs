@@ -502,6 +502,7 @@ pub fn normalize_permission_subject_id(value: &str) -> Result<String, ApiError> 
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         FormPermissionPolicyResponse, denied_read_fields_from_policy, filter_values_for_read_policy,

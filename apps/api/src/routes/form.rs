@@ -7082,6 +7082,7 @@ fn total_pages(total: i64, per_page: i64) -> i64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         AttachmentPackageArtifact, BusinessEventResponse, CHILD_AGGREGATE_COUNT_SQL, CHILD_AGGREGATE_DECIMAL_SQL,
@@ -7665,6 +7666,7 @@ mod tests {
 /// `postgres://user:pw@127.0.0.1:5432/postgres`. Without it these tests report that they were
 /// skipped instead of pretending to pass.
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 mod record_link_database_tests {
     use super::create_record_link;

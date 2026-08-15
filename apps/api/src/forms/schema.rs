@@ -359,6 +359,7 @@ fn validate_signature_reason_fields(fields: &[FormField]) -> Result<(), String> 
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{ensure_schema_field_ids, normalize_key, parse_fields, validate_schema};
     use serde_json::json;

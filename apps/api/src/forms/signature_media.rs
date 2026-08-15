@@ -880,6 +880,7 @@ fn is_safe_signature_file_name(file_name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         SignatureAuditVerificationSummary, annotate_signature_audit_entries, append_signature_audit_source,

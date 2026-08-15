@@ -481,6 +481,7 @@ fn import_file_source(file_url: &str, row_number: usize) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         CreateImportJobRequest, ImportMappingTemplateConfig, ImportRecordInput, SaveImportMappingTemplateRequest,

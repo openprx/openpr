@@ -663,7 +663,7 @@ async fn process_pending_event_outbox(db: &sea_orm::DatabaseConnection, concurre
 /// Every pickup stamps a fresh `lease_token`. The completion writes carry it back, so a worker whose
 /// lease already expired and was taken over cannot overwrite the state of the worker that owns the
 /// row now (which would re-queue an already dispatched event).
-fn event_outbox_pickup_sql() -> &'static str {
+const fn event_outbox_pickup_sql() -> &'static str {
     r"
         WITH picked AS (
             SELECT id, (attempts < max_attempts) AS retryable
@@ -1264,7 +1264,7 @@ fn resolve_connector_credential(
 ///
 /// Each pickup stamps a `lease_token` that the completion write has to present, so a worker whose
 /// lease expired cannot overwrite the state owned by the worker that took the delivery over.
-fn connector_invocation_pickup_sql() -> &'static str {
+const fn connector_invocation_pickup_sql() -> &'static str {
     r"
         WITH picked AS (
             SELECT
@@ -2438,7 +2438,62 @@ fn trigger_kind_for_task(task_type: &str) -> &'static str {
     }
 }
 
+async fn insert_task_event(
+    db: &sea_orm::DatabaseConnection,
+    task_id: Uuid,
+    event_type: &str,
+    payload: serde_json::Value,
+) -> anyhow::Result<()> {
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO ai_task_events (id, task_id, event_type, payload, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+        ",
+        vec![
+            Uuid::new_v4().into(),
+            task_id.into(),
+            event_type.to_string().into(),
+            payload.into(),
+            chrono::Utc::now().into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(err) = res {
+                            tracing::warn!(error = %err, "ctrl_c signal error");
+                        }
+                    },
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to register SIGTERM handler, falling back to ctrl_c only");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(error = %err, "ctrl_c signal error");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %err, "ctrl_c signal error");
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::print_stderr)]
 mod tests {
     use super::{
         CONNECTOR_DELIVERY_MAX_ATTEMPTS, ConnectorAuthContextRow, ConnectorAuthMode, ConnectorDeliveryRecord,
@@ -2721,7 +2776,7 @@ PAYMENTS = "payments-token"
     ///
     /// Returns `None` when the variable is unset. The queries under test are pure SQL semantics
     /// (three valued logic on bot writable JSONB, lease reclaim windows, partial unique indexes)
-    /// which nothing but a real PostgreSQL can decide, so without a database the tests report a
+    /// which nothing but a real `PostgreSQL` can decide, so without a database the tests report a
     /// skip instead of pretending to cover them.
     async fn test_db() -> Option<TestDb> {
         let url = std::env::var("OPENPR_TEST_DATABASE_URL").ok()?;
@@ -2846,7 +2901,7 @@ PAYMENTS = "payments-token"
             .unwrap_or_default()
     }
 
-    /// Exercises the outbox pickup against PostgreSQL: reclaim, budget, dead lettering and the
+    /// Exercises the outbox pickup against `PostgreSQL`: reclaim, budget, dead lettering and the
     /// lease ownership that keeps a superseded worker from overwriting the row.
     #[tokio::test]
     async fn event_outbox_pickup_reclaims_expired_leases() {
@@ -2929,7 +2984,7 @@ PAYMENTS = "payments-token"
         test.cleanup().await;
     }
 
-    /// Exercises the connector delivery pickup against PostgreSQL: the backoff and lease windows,
+    /// Exercises the connector delivery pickup against `PostgreSQL`: the backoff and lease windows,
     /// the recovery of bookkeeping a connector bot wiped, and the lease guard on the outcome write.
     #[tokio::test]
     async fn connector_pickup_reclaims_leases_and_honours_backoff() {
@@ -3166,7 +3221,7 @@ PAYMENTS = "payments-token"
         test.cleanup().await;
     }
 
-    /// agent_invocations.project_id is nullable and projects cascade to SET NULL, so a workspace
+    /// `agent_invocations.project_id` is nullable and projects cascade to SET NULL, so a workspace
     /// scoped invocation is normal. Decoding the batch as if it were mandatory made one such row
     /// fail every delivery in the instance behind a single polling warning.
     #[tokio::test]
@@ -3557,60 +3612,6 @@ PAYMENTS = "payments-token"
         }
         for event_type in ["form.record.created", "ai_task.picked_up", "connector.created"] {
             assert!(event_allows_connector_fanout(event_type));
-        }
-    }
-}
-
-async fn insert_task_event(
-    db: &sea_orm::DatabaseConnection,
-    task_id: Uuid,
-    event_type: &str,
-    payload: serde_json::Value,
-) -> anyhow::Result<()> {
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            INSERT INTO ai_task_events (id, task_id, event_type, payload, created_at)
-            VALUES ($1, $2, $3, $4, $5)
-        ",
-        vec![
-            Uuid::new_v4().into(),
-            task_id.into(),
-            event_type.to_string().into(),
-            payload.into(),
-            chrono::Utc::now().into(),
-        ],
-    ))
-    .await?;
-    Ok(())
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    res = tokio::signal::ctrl_c() => {
-                        if let Err(err) = res {
-                            tracing::warn!(error = %err, "ctrl_c signal error");
-                        }
-                    },
-                    _ = sigterm.recv() => {},
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to register SIGTERM handler, falling back to ctrl_c only");
-                if let Err(err) = tokio::signal::ctrl_c().await {
-                    tracing::warn!(error = %err, "ctrl_c signal error");
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %err, "ctrl_c signal error");
         }
     }
 }

@@ -2748,6 +2748,7 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::print_stderr)]
 mod tests {
     use super::{MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, MigrationOptions, migration_checksum};
     use platform::config::MigrationsConfig;
@@ -3003,6 +3004,7 @@ mod tests {
 /// `postgres://user:pw@127.0.0.1:5432/postgres`. Without it these tests report that they were
 /// skipped instead of pretending to pass.
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::print_stderr)]
 mod migration_runner_database_tests {
     use super::{MIGRATIONS, MigrationOptions, migration_is_present, run_migrations_with};
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
@@ -3463,6 +3465,7 @@ mod migration_runner_database_tests {
 ///
 /// Uses the same `OPENPR_TEST_DATABASE_URL` as the migration tests.
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::print_stderr)]
 mod proposal_scope_database_tests {
     use super::migration_runner_database_tests::{Scratch, scratch};
     use super::{MigrationOptions, run_migrations_with};

@@ -413,6 +413,7 @@ async fn count_query(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) -
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         RELEASE_READINESS_SCHEMA_PATH, RELEASE_READINESS_SCHEMA_VERSION, gate, next_actions_for_gates, positive_gate,

@@ -568,6 +568,7 @@ fn is_external_attachment_url(url: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
         attachment_derivative_format, attachment_field_policy, attachment_image_media_metadata, attachment_is_image,

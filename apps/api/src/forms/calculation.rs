@@ -256,6 +256,7 @@ impl DecimalToI64 for Decimal {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{evaluate_calculated_values, merge_values_for_calculation, overlay_calculated_values};
     use crate::forms::values::normalize_record_values_with_existing;

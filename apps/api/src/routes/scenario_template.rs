@@ -331,6 +331,7 @@ pub async fn get_scenario_template(
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{normalize_key, optional_normalized_filter, scenario_template_usage_guide};
 
