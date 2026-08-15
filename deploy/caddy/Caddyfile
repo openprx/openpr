@@ -1,0 +1,60 @@
+# Reference Caddy config for an OpenPR deployment behind Cloudflare.
+#
+# Replace `openpr.example.com` with the real host. Everything else is meant to
+# be deployed as-is: each block below exists because of a failure that only
+# showed up on a real machine.
+#
+# Apply changes with `systemctl reload caddy`, never `restart` -- a restart
+# loads an unvalidated config and takes the site down if anything is wrong.
+# Run `caddy validate --config <file>` first.
+
+{
+	servers {
+		# Cloudflare fronts this site, so every connection arrives from a
+		# Cloudflare address. Without this the client IP in the log is
+		# Cloudflare's -- and any tool that bans on those logs would ban
+		# Cloudflare itself and take the whole site down.
+		trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+		client_ip_headers Cf-Connecting-Ip X-Forwarded-For
+	}
+}
+
+openpr.example.com {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		# `script-src 'self'` only holds because the frontend build moves
+		# SvelteKit's start script out of index.html into its own file (see
+		# frontend/scripts/externalize-bootstrap.mjs). Serving a build without
+		# that step under this policy blocks the inline start script, so the app
+		# never hydrates and every route renders blank -- the SPA fallback means
+		# index.html serves every URL.
+		#
+		# If that happens, fix the build. Do not add 'unsafe-inline', and do not
+		# allow-list the script's hash: the inline source embeds content-hashed
+		# entry module names, so any hash goes stale on the next build and the
+		# site goes blank again.
+		#
+		# Cloudflare Web Analytics injects a beacon from
+		# static.cloudflareinsights.com, which this policy blocks. Turn the
+		# injection off in Cloudflare rather than allow-listing it.
+		Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
+
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	# The frontend container already proxies /api and /uploads to the api
+	# container, so publishing it alone keeps browser, API and uploads on one
+	# origin. The MCP server (127.0.0.1:8090) stays unpublished: callers
+	# authenticate with their own workspace bot token over an SSH tunnel.
+	reverse_proxy 127.0.0.1:3000
+
+	log {
+		output stdout
+		format json
+	}
+}

@@ -1,11 +1,11 @@
 {
 	"name": "frontend",
 	"private": true,
-	"version": "0.2.0",
+	"version": "0.2.1",
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
-		"build": "vite build",
+		"build": "vite build && node scripts/externalize-bootstrap.mjs",
 		"preview": "vite preview",
 		"smoke:mcp-admin": "node scripts/smoke-mcp-admin.mjs",
 		"smoke:connections": "node scripts/smoke-connections-invocations.mjs",
