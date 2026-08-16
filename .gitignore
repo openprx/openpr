@@ -55,3 +55,6 @@ Thumbs.db
 # Generated runtime configuration; contains the signing key and database password.
 /config/openpr.compose*.toml
 /config/openpr.toml
+
+# Claude Code session state, including agent worktrees that are git repos of their own
+.claude/
