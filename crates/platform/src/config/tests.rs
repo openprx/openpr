@@ -67,6 +67,9 @@ access_key_id = "AKIAEXAMPLE"
 secret_access_key = "s3-secret-access-key"
 session_token = "s3-session-token"
 
+[audit]
+operation_log_retention_days = 45
+
 [migrations]
 replay = true
 continue_on_error = true
@@ -133,6 +136,7 @@ fn a_complete_file_parses_into_every_section() {
         s3.session_token.as_ref().map(super::Secret::expose),
         Some("s3-session-token")
     );
+    assert_eq!(config.audit.operation_log_retention_days, 45);
 
     assert!(config.migrations.replay);
     assert!(config.migrations.continue_on_error);
@@ -196,12 +200,26 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
     );
     assert_eq!(config.storage.backend, StorageBackend::Local);
     assert_eq!(config.storage.dir, Path::new("./uploads"));
+    assert_eq!(config.audit.operation_log_retention_days, 30);
     assert!(!config.migrations.replay);
     assert!(!config.migrations.continue_on_error);
     assert!(config.outbound.allowed_hosts.is_empty());
     assert!(!config.outbound.allow_private);
     assert_eq!(config.mcp.transport, McpTransport::Stdio);
     assert_eq!(config.connectors.secrets.workspace_count(), 0);
+}
+
+#[test]
+fn operation_log_retention_days_are_bounded() {
+    for days in [0, 3_651] {
+        let reported = issues(&format!("[audit]\noperation_log_retention_days = {days}\n"));
+        assert!(
+            reported
+                .iter()
+                .any(|issue| issue.contains("audit.operation_log_retention_days")),
+            "invalid retention {days} was not rejected: {reported:?}"
+        );
+    }
 }
 
 // ---- one error report for every problem ----

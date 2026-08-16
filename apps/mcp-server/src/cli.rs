@@ -74,6 +74,9 @@ pub enum Commands {
     Search(SearchArgs),
     /// Upload files
     Files(FilesCmd),
+    /// Inspect metadata-only bot operation records
+    #[command(name = "operation-logs")]
+    OperationLogs(OperationLogsCmd),
     /// Call any MCP tool by name
     Tools(ToolsCmd),
 }
@@ -273,6 +276,31 @@ pub enum FilesAction {
         /// Path to the file to upload
         #[arg(long)]
         file: String,
+    },
+}
+
+// ---- Bot Operation Logs ----
+
+#[derive(Debug, Args)]
+pub struct OperationLogsCmd {
+    #[command(subcommand)]
+    pub action: OperationLogsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OperationLogsAction {
+    /// List operation records in reverse chronological order
+    List {
+        #[arg(long)]
+        bot_id: Option<String>,
+        #[arg(long)]
+        tool_name: Option<String>,
+        #[arg(long)]
+        outcome: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: u64,
     },
 }
 
@@ -511,6 +539,31 @@ pub async fn run_cli_command(command: &Commands, format: &OutputFormat, client: 
         // Files is handled above via `run_file_upload`, which returns before this match.
         Commands::Files(_) => anyhow::bail!("files is handled by run_file_upload before this match"),
 
+        Commands::OperationLogs(cmd) => match &cmd.action {
+            OperationLogsAction::List {
+                bot_id,
+                tool_name,
+                outcome,
+                cursor,
+                limit,
+            } => {
+                let mut args = json!({ "limit": limit });
+                if let Some(value) = bot_id {
+                    args["bot_id"] = json!(value);
+                }
+                if let Some(value) = tool_name {
+                    args["tool_name"] = json!(value);
+                }
+                if let Some(value) = outcome {
+                    args["outcome"] = json!(value);
+                }
+                if let Some(value) = cursor {
+                    args["cursor"] = json!(value);
+                }
+                ("bot_operation_logs.list", args)
+            }
+        },
+
         Commands::Tools(cmd) => match &cmd.action {
             ToolsAction::Call { name, args_json } => (name.as_str(), parse_tool_args_json(args_json)?),
         },
@@ -559,7 +612,7 @@ async fn run_file_upload(cmd: &FilesCmd, server: &McpServer) -> anyhow::Result<C
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, McpTransport, ToolsAction, Transport, parse_tool_args_json};
+    use super::{Cli, Commands, McpTransport, OperationLogsAction, ToolsAction, Transport, parse_tool_args_json};
     use clap::Parser;
     use serde_json::json;
 
@@ -587,6 +640,38 @@ mod tests {
                 }
             },
             _ => panic!("expected tools command"),
+        }
+    }
+
+    #[test]
+    fn parses_operation_log_filters() {
+        let cli = Cli::try_parse_from([
+            "mcp-server",
+            "operation-logs",
+            "list",
+            "--tool-name",
+            "forms.list",
+            "--outcome",
+            "error",
+            "--limit",
+            "25",
+        ])
+        .expect("operation log command should parse");
+
+        match cli.command {
+            Commands::OperationLogs(command) => match command.action {
+                OperationLogsAction::List {
+                    tool_name,
+                    outcome,
+                    limit,
+                    ..
+                } => {
+                    assert_eq!(tool_name.as_deref(), Some("forms.list"));
+                    assert_eq!(outcome.as_deref(), Some("error"));
+                    assert_eq!(limit, 25);
+                }
+            },
+            _ => panic!("expected operation-logs command"),
         }
     }
 

@@ -6,6 +6,7 @@ pub mod files;
 pub mod forms;
 pub mod labels;
 pub mod members;
+pub mod operation_logs;
 pub mod plugins;
 pub mod project_types;
 pub mod projects;
@@ -106,6 +107,7 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         proposals::create_check_result_tool(),
         release::get_release_readiness_tool(),
         members::list_members_tool(),
+        operation_logs::list_bot_operation_logs_tool(),
         sprints::create_sprint_tool(),
         sprints::list_sprints_tool(),
         sprints::update_sprint_tool(),
@@ -204,6 +206,7 @@ mod tests {
             "proposals.create_from_result",
             "check_results.create",
             "release.readiness.get",
+            "bot_operation_logs.list",
             "code.resources.list",
             "code.directory.get",
             "code.task_context.get",
@@ -221,8 +224,8 @@ mod tests {
         }
         assert_eq!(
             tools.len(),
-            105,
-            "Universal forms and plugins slices should expose 105 MCP tools"
+            106,
+            "Universal forms, plugins, and operation logs should expose 106 MCP tools"
         );
     }
 }

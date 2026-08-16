@@ -27,13 +27,13 @@
 ## 2. MCP Skill Package
 
 - `../skills/openpr-mcp/SKILL.md` — Full MCP skill: workflow lines, field reference, templates.
-- `../skills/openpr-mcp/scripts/mcp-regression.py` — 105-tool registry and core-surface regression test across HTTP, stdio, and SSE.
+- `../skills/openpr-mcp/scripts/mcp-regression.py` — 106-tool registry and core-surface regression test across HTTP, stdio, and SSE.
 - `../skills/openpr-mcp/scripts/validate-mcp.sh` — Quick smoke test.
 
 ## 3. Source Code
 
 - `../apps/api/` — REST API server (Axum + SeaORM).
-- `../apps/mcp-server/` — MCP server (105 tools, HTTP/stdio/SSE).
+- `../apps/mcp-server/` — MCP server (106 tools, HTTP/stdio/SSE).
 - `../apps/worker/` — Background task worker.
 - `../frontend/` — SvelteKit frontend.
 - `../migrations/` — PostgreSQL schema migrations.

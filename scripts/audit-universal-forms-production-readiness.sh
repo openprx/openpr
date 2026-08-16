@@ -276,7 +276,7 @@ contains "env example documents MCP workspace placeholder" "$ROOT_DIR/.env.examp
 contains "README stdio MCP config targets API host port" "$ROOT_DIR/README.md" '"OPENPR_API_URL": "http://localhost:8081"'
 contains "README MCP stdio config uses serve subcommand" "$ROOT_DIR/README.md" '"args": ["serve", "--transport", "stdio"]'
 contains "MCP app README local examples target API host port" "$ROOT_DIR/apps/mcp-server/README.md" 'api_url = "http://localhost:8081"'
-contains "MCP app README documents current tool count" "$ROOT_DIR/apps/mcp-server/README.md" "105 MCP Tools"
+contains "MCP app README documents current tool count" "$ROOT_DIR/apps/mcp-server/README.md" "106 MCP Tools"
 contains "MCP app README documents three transports" "$ROOT_DIR/apps/mcp-server/README.md" "Three Transport Modes"
 contains "MCP app README documents SSE transport" "$ROOT_DIR/apps/mcp-server/README.md" "serve --transport sse"
 contains "MCP app README documents universal forms tools" "$ROOT_DIR/apps/mcp-server/README.md" "Universal Forms and Events"
@@ -302,13 +302,13 @@ not_contains "MCP app README does not claim auth is unenforced" "$ROOT_DIR/apps/
 not_contains "MCP app README does not list stale JWT TODO" "$ROOT_DIR/apps/mcp-server/README.md" "Implement JWT token validation"
 contains "MCP regression stdio path targets API host port" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" 'api_url = "http://localhost:8081"'
 contains "MCP regression stdio path uses serve subcommand" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" '[MCP_BIN,"serve","--transport","stdio","--config",MCP_CONFIG]'
-contains "MCP regression checks current 105-tool registry" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" "tools/list.registry_105"
-contains "MCP validation requires exact 105 tools" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 105 tools"
-contains "MCP skill guide documents current tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "enumerate all 105 tools"
+contains "MCP regression checks current 106-tool registry" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" "tools/list.registry_106"
+contains "MCP validation requires exact 106 tools" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 106 tools"
+contains "MCP skill guide documents current tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "enumerate all 106 tools"
 not_contains "MCP skill guide does not retain stale 65-tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "65 tools"
 not_contains "MCP validation does not retain stale 65-tool minimum" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "-ge 65"
-contains "docs index documents current MCP server count" "$ROOT_DIR/docs/README.md" "MCP server (105 tools"
-contains "docs index documents current MCP regression count" "$ROOT_DIR/docs/README.md" "105-tool registry"
+contains "docs index documents current MCP server count" "$ROOT_DIR/docs/README.md" "MCP server (106 tools"
+contains "docs index documents current MCP regression count" "$ROOT_DIR/docs/README.md" "106-tool registry"
 contains "docs index links implementation map" "$ROOT_DIR/docs/README.md" "universal-forms-implementation-map.md"
 contains "readiness summary generator links implementation map" "$ROOT_DIR/scripts/report-universal-forms-readiness-summary.sh" "universal-forms-implementation-map.md"
 contains "user acceptance packet generator links implementation map" "$ROOT_DIR/scripts/prepare-universal-forms-user-acceptance-packet.sh" "universal-forms-implementation-map.md"
@@ -322,7 +322,7 @@ contains "README MCP HTTP example uses serve subcommand" "$ROOT_README" "./targe
 contains "MCP integration test uses current JSON-RPC endpoint" "$TEST_MCP_SCRIPT" "/mcp/rpc"
 contains "MCP integration test lists tools through JSON-RPC" "$TEST_MCP_SCRIPT" '"method":"tools/list"'
 contains "MCP integration test invokes tools through JSON-RPC" "$TEST_MCP_SCRIPT" '"method":"tools/call"'
-contains "MCP integration test expects exact current tool count" "$TEST_MCP_SCRIPT" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-105}"'
+contains "MCP integration test expects exact current tool count" "$TEST_MCP_SCRIPT" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-106}"'
 contains "MCP integration test rejects tool count drift" "$TEST_MCP_SCRIPT" 'expected exactly $EXPECTED_TOOL_COUNT'
 contains "MCP integration test checks form template tool" "$TEST_MCP_SCRIPT" "forms.create_from_template"
 contains "MCP integration test checks scenario template install tool" "$TEST_MCP_SCRIPT" "scenario_templates.install"

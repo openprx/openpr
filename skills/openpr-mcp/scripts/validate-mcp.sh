@@ -83,15 +83,16 @@ TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
 TOOLS=$(printf '%s' "$TOOLS_RESPONSE" | \
   python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
 
-if [ "${TOOLS:-0}" -eq 105 ] 2>/dev/null; then
+if [ "${TOOLS:-0}" -eq 106 ] 2>/dev/null; then
   echo "✅ tools/list: $TOOLS tools available"
 else
-  echo "❌ tools/list expected exactly 105 tools, got ${TOOLS:-0}"
+  echo "❌ tools/list expected exactly 106 tools, got ${TOOLS:-0}"
   exit 1
 fi
 
 MISSING=$(printf '%s' "$TOOLS_RESPONSE" | python3 -c 'import json, sys
 required = {
+    "bot_operation_logs.list",
     "project_types.list",
     "project_types.get",
     "scenario_templates.list",

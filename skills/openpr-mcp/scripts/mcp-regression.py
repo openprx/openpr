@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenPR MCP core regression - 3 transports with 105-tool registry checks."""
+"""OpenPR MCP core regression - 3 transports with 106-tool registry checks."""
 import json, subprocess, requests, time, threading, sys, queue, base64, os, atexit, shutil, tempfile
 
 MCP_HTTP = "http://localhost:8090"
@@ -149,6 +149,7 @@ REQUIRED_REGISTRY_TOOLS = {
     "plugins.install",
     "plugins.invoke",
     "plugin_invocations.list",
+    "bot_operation_logs.list",
 }
 
 def http_list_tools():
@@ -218,10 +219,10 @@ def sse_list_tools():
 
 LISTERS = {"HTTP": http_list_tools, "STDIO": stdio_list_tools, "SSE": sse_list_tools}
 
-def registry_has_105_tools_with_forms_and_plugins(resp):
+def registry_has_106_tools_with_forms_and_plugins(resp):
     tools = resp.get("result", {}).get("tools", []) if isinstance(resp, dict) else []
     names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
-    return len(tools) == 105 and REQUIRED_REGISTRY_TOOLS.issubset(names)
+    return len(tools) == 106 and REQUIRED_REGISTRY_TOOLS.issubset(names)
 
 def check(proto, tool, result, expect_fn):
     global PASS, FAIL
@@ -241,14 +242,14 @@ def get_id(r):
 def ok_or_str(r): return is_ok(r) or (isinstance(r, str) and any(w in r.lower() for w in ["added","removed","deleted","success"]))
 
 print("=" * 60)
-print(f"  OpenPR MCP 核心回归测试 (105工具注册面 × 3协议)")
+print(f"  OpenPR MCP 核心回归测试 (106工具注册面 × 3协议)")
 print(f"  {time.strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 60)
 
 for proto, call in CALLERS.items():
     print(f"\n{'━'*50}\n  协议: {proto}\n{'━'*50}")
 
-    check(proto, "tools/list.registry_105", LISTERS[proto](), registry_has_105_tools_with_forms_and_plugins)
+    check(proto, "tools/list.registry_106", LISTERS[proto](), registry_has_106_tools_with_forms_and_plugins)
     
     # === Projects ===
     print("\n📁 Projects (list/get)")

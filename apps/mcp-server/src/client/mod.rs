@@ -96,6 +96,11 @@ pub const TRANSPORT_LABEL_STDIO: &str = "mcp_stdio";
 pub const TRANSPORT_LABEL_HTTP: &str = "mcp_http";
 /// Audit label of the SSE transport.
 pub const TRANSPORT_LABEL_SSE: &str = "mcp_sse";
+/// Audit label of a direct CLI command.
+pub const TRANSPORT_LABEL_CLI: &str = "cli";
+
+const MCP_TOOL_HEADER: &str = "X-OpenPR-MCP-Tool";
+const MCP_SURFACE_HEADER: &str = "X-OpenPR-MCP-Surface";
 
 /// The audit label a configured transport is reported under.
 ///
@@ -149,6 +154,7 @@ pub struct OpenPrClient {
     pub workspace_id: String,
     invocation_id: Option<String>,
     transport_label: &'static str,
+    operation_tool_name: Option<String>,
 }
 
 fn join_query(params: &[String]) -> String {
@@ -157,6 +163,10 @@ fn join_query(params: &[String]) -> String {
     } else {
         format!("?{}", params.join("&"))
     }
+}
+
+pub fn encode_query_component(value: &str) -> String {
+    urlencoding::encode(value)
 }
 
 fn event_query_params(event_type: Option<&str>, page: Option<u32>, per_page: Option<u32>) -> Vec<String> {
@@ -240,12 +250,13 @@ impl OpenPrClient {
             workspace_id: config.workspace_id,
             invocation_id: config.invocation_id,
             transport_label: config.transport_label,
+            operation_tool_name: None,
         })
     }
 
     /// The same client, speaking to the API as `credential` instead of as itself.
     ///
-    /// This is how a per-request caller identity reaches all 105 tools without threading a
+    /// This is how a per-request caller identity reaches all 106 tools without threading a
     /// credential through every one of them: the request scoped client *is* the identity, so
     /// a tool cannot pick a different one, and neither can the policy gate or the audit
     /// report that run around it. The HTTP connection pool is shared because [`Client`] is
@@ -259,7 +270,32 @@ impl OpenPrClient {
             workspace_id: self.workspace_id.clone(),
             invocation_id: self.invocation_id.clone(),
             transport_label: self.transport_label,
+            operation_tool_name: self.operation_tool_name.clone(),
         }
+    }
+
+    /// Changes the observability surface without changing identity or authorization.
+    #[must_use]
+    pub fn with_transport_label(&self, transport_label: &'static str) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            credential: self.credential.clone(),
+            workspace_id: self.workspace_id.clone(),
+            invocation_id: self.invocation_id.clone(),
+            transport_label,
+            operation_tool_name: self.operation_tool_name.clone(),
+        }
+    }
+
+    /// Binds an internal registered tool name to every API request made for that call.
+    ///
+    /// The API treats both headers as untrusted record labels; they never participate in auth.
+    #[must_use]
+    pub fn recording_operation(&self, tool_name: &str) -> Self {
+        let mut scoped = self.clone();
+        scoped.operation_tool_name = Some(tool_name.to_string());
+        scoped
     }
 
     pub fn invocation_id(&self) -> Option<&str> {
@@ -280,10 +316,19 @@ impl OpenPrClient {
             .ok_or_else(|| NO_OUTBOUND_CREDENTIAL.to_string())
     }
 
+    fn operation_headers(&self, request: RequestBuilder) -> RequestBuilder {
+        let request = request.header(MCP_SURFACE_HEADER, self.transport_label);
+        match self.operation_tool_name.as_deref() {
+            Some(tool_name) => request.header(MCP_TOOL_HEADER, tool_name),
+            None => request,
+        }
+    }
+
     /// Sends an authenticated request and rejects both transport-level failures and
     /// API-level envelope errors before the payload reaches the caller.
     async fn send<T: DeserializeOwned>(&self, request: RequestBuilder, path: &str) -> Result<T, String> {
-        let resp = request
+        let resp = self
+            .operation_headers(request)
             .header("Authorization", self.authorization()?)
             .send()
             .await
@@ -1284,8 +1329,7 @@ impl OpenPrClient {
         let form = multipart::Form::new().part("file", part);
 
         let resp = self
-            .client
-            .post(&url)
+            .operation_headers(self.client.post(&url))
             .header("Authorization", self.authorization()?)
             .multipart(form)
             .send()
@@ -1407,6 +1451,14 @@ impl OpenPrClient {
     pub async fn list_members(&self) -> Result<Value, String> {
         self.get(&format!(
             "/api/v1/workspaces/{}/members",
+            urlencoding::encode(&self.workspace_id)
+        ))
+        .await
+    }
+
+    pub async fn list_bot_operation_logs(&self, query: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/workspaces/{}/bot-operation-logs{query}",
             urlencoding::encode(&self.workspace_id)
         ))
         .await
@@ -1567,6 +1619,7 @@ mod tests {
     use axum::{
         Json, Router,
         extract::RawQuery,
+        http::HeaderMap,
         routing::{delete, get},
     };
     use serde_json::{Value, json};
@@ -1690,6 +1743,41 @@ mod tests {
         let value = client.list_form_records("f1", &ListRecordsQuery::default()).await?;
 
         assert_eq!(value.get("code").and_then(Value::as_i64), Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn operation_headers_are_attached_without_changing_authorization() -> Result<(), Box<dyn Error>> {
+        let router = Router::new().route(
+            "/record",
+            get(|headers: HeaderMap| async move {
+                Json(json!({
+                    "code": 0,
+                    "data": {
+                        "tool": headers.get("x-openpr-mcp-tool").and_then(|value| value.to_str().ok()),
+                        "surface": headers.get("x-openpr-mcp-surface").and_then(|value| value.to_str().ok()),
+                        "authorization": headers.get("authorization").and_then(|value| value.to_str().ok())
+                    }
+                }))
+            }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = client(base_url)?
+            .with_transport_label(super::TRANSPORT_LABEL_CLI)
+            .recording_operation("bot_operation_logs.list");
+
+        let value: Value = client.get("/record").await?;
+        let data = value.get("data").and_then(Value::as_object).ok_or("missing data")?;
+
+        assert_eq!(
+            data.get("tool").and_then(Value::as_str),
+            Some("bot_operation_logs.list")
+        );
+        assert_eq!(data.get("surface").and_then(Value::as_str), Some("cli"));
+        assert_eq!(
+            data.get("authorization").and_then(Value::as_str),
+            Some("Bearer opr_test_token")
+        );
         Ok(())
     }
 

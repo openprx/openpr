@@ -6,6 +6,7 @@ pub mod appeal;
 pub mod auth;
 pub mod board;
 pub mod bot;
+pub mod bot_operation_log;
 pub mod check_result;
 pub mod comment;
 pub mod connector;

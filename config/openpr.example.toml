@@ -130,6 +130,14 @@ dir = "./uploads"
 
 
 # ---------------------------------------------------------------------------------------------
+# [audit] — retention for metadata-only bot operation records.
+# ---------------------------------------------------------------------------------------------
+[audit]
+# Delete records older than this many days. Default: 30. Accepted range: 1..=3650.
+operation_log_retention_days = 30
+
+
+# ---------------------------------------------------------------------------------------------
 # [migrations] — escape hatches of the migration runner. Both default to false, which is the
 # setting a healthy deployment runs with. Turn one on deliberately, then turn it back off.
 # ---------------------------------------------------------------------------------------------

@@ -3,12 +3,13 @@ use crate::protocol::{CallToolParams, CallToolResult, JsonRpcError, JsonRpcReque
 use crate::tools;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (105)
+## Tools (106)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -28,7 +29,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Release: release.readiness.get (gates, blockers, next actions)
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
-### Other: members.list, search.all
+### Other: members.list, search.all, bot_operation_logs.list
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -188,7 +189,7 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 11] = [
 /// this table from the live tool registry (`tools::get_all_tool_definitions`), so a new
 /// or renamed tool cannot silently land outside the policy gate — including tools whose
 /// name shares no prefix with the family they belong to, such as `events.tail`.
-const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 105] = [
+const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 106] = [
     ("projects.list", PolicyScope::WorkspaceWide),
     ("projects.get", PolicyScope::DeclaredProject { required: true }),
     ("projects.create", PolicyScope::WorkspaceWide),
@@ -323,6 +324,7 @@ const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 105] = [
     ("check_results.create", PolicyScope::DeclaredProject { required: true }),
     ("release.readiness.get", PolicyScope::DeclaredProject { required: true }),
     ("members.list", PolicyScope::WorkspaceWide),
+    ("bot_operation_logs.list", PolicyScope::WorkspaceWide),
     ("sprints.create", PolicyScope::DeclaredProject { required: true }),
     ("sprints.list", PolicyScope::DeclaredProject { required: true }),
     ("sprints.update", PolicyScope::OwnedBy(OwnerLookup::Sprint)),
@@ -438,14 +440,14 @@ pub struct McpServer {
     /// map across callers would turn a performance cache into an existence oracle, so the
     /// two lifetimes must not be decoupled. On stdio there is one caller for the life of the
     /// process, so the same map is simply that caller's own.
-    project_id_cache: Mutex<HashMap<String, ResolvedOwner>>,
+    project_id_cache: Arc<Mutex<HashMap<String, ResolvedOwner>>>,
 }
 
 impl McpServer {
     pub fn new(client: OpenPrClient) -> Self {
         Self {
             client,
-            project_id_cache: Mutex::new(HashMap::new()),
+            project_id_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -557,11 +559,16 @@ impl McpServer {
     pub async fn call_tool(&self, name: &str, args: Value) -> CallToolResult {
         let started = Instant::now();
         let audit_args = redact_tool_arguments(&args);
-        let result = match self.enforce_project_tool_policy(name, &args).await {
-            Ok(()) => self.execute_tool(name, args).await,
+        let scoped = Self {
+            client: self.client.recording_operation(name),
+            project_id_cache: Arc::clone(&self.project_id_cache),
+        };
+        let result = match scoped.enforce_project_tool_policy(name, &args).await {
+            Ok(()) => scoped.execute_tool(name, args).await,
             Err(error) => CallToolResult::error(error),
         };
-        self.report_tool_call_audit(name, audit_args, &result, started.elapsed().as_millis())
+        scoped
+            .report_tool_call_audit(name, audit_args, &result, started.elapsed().as_millis())
             .await;
         result
     }
@@ -668,6 +675,7 @@ impl McpServer {
 
             // Members
             "members.list" => tools::members::list_members(&self.client, args).await,
+            "bot_operation_logs.list" => tools::operation_logs::list_bot_operation_logs(&self.client, args).await,
 
             // Sprints
             "sprints.create" => tools::sprints::create_sprint(&self.client, args).await,
@@ -2207,7 +2215,8 @@ mod tests {
 
     #[test]
     fn embedded_skill_guide_matches_registered_universal_tool_surface() {
-        assert!(SKILL_GUIDE_MD.contains("## Tools (105)"));
+        assert!(SKILL_GUIDE_MD.contains("## Tools (106)"));
+        assert!(SKILL_GUIDE_MD.contains("bot_operation_logs.list"));
         assert!(SKILL_GUIDE_MD.contains("scenario_templates.install"));
         assert!(SKILL_GUIDE_MD.contains("forms.list"));
         assert!(SKILL_GUIDE_MD.contains("forms.create_from_template"));

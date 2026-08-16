@@ -1548,6 +1548,15 @@ async fn main() -> anyhow::Result<()> {
                 ),
             ),
         )
+        .route(
+            "/api/v1/workspaces/{workspace_id}/bot-operation-logs",
+            get(routes::bot_operation_log::list_bot_operation_logs).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
         // Activity routes (protected)
         .route(
             "/api/v1/workspaces/{workspace_id}/activities",
@@ -2042,13 +2051,17 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0050_proposal_workspace_scope.sql",
         include_str!("../../../migrations/0050_proposal_workspace_scope.sql"),
     ),
+    (
+        "0051_bot_operation_logs.sql",
+        include_str!("../../../migrations/0051_bot_operation_logs.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
 ///
 /// Frozen on purpose. Everything past it is executed on every database that has no ledger row for
 /// it, which is what keeps a future migration from being adopted by accident because its probe
-/// happens to match an object some other file created. The two files past the cutoff are
+/// happens to match an object some other file created. The files past the cutoff are
 /// idempotent and a test enforces that they stay that way.
 const MIGRATION_ADOPTION_CUTOFF: &str = "0047_form_attachment_media_metadata.sql";
 
@@ -2307,6 +2320,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0050_proposal_workspace_scope.sql",
         SchemaProbe::Column("proposals", "workspace_id"),
+    ),
+    (
+        "0051_bot_operation_logs.sql",
+        SchemaProbe::Relation("bot_operation_logs"),
     ),
 ];
 
@@ -2808,7 +2825,8 @@ mod tests {
             vec![
                 "0048_delivery_lease_and_pickup_indexes.sql",
                 "0049_agent_invocation_duplicate_tagging.sql",
-                "0050_proposal_workspace_scope.sql"
+                "0050_proposal_workspace_scope.sql",
+                "0051_bot_operation_logs.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );

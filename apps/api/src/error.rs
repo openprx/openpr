@@ -4,7 +4,7 @@ use axum::{
 };
 use thiserror::Error;
 
-use crate::response::ApiResponse;
+use crate::response::{ApiResponse, OperationResponseMeta};
 
 pub fn request_lang(headers: &HeaderMap) -> &str {
     headers
@@ -50,19 +50,24 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (code, message) = match self {
-            Self::BadRequest(msg) => (400, msg),
-            Self::Unauthorized(msg) => (401, msg),
-            Self::Forbidden(msg) => (403, msg),
-            Self::NotFound(msg) => (404, msg),
-            Self::Conflict(msg) => (409, msg),
-            Self::Internal => (500, "internal server error".to_string()),
+        let (code, message, error_summary) = match self {
+            Self::BadRequest(msg) => (400, msg, "bad request"),
+            Self::Unauthorized(msg) => (401, msg, "unauthorized"),
+            Self::Forbidden(msg) => (403, msg, "forbidden"),
+            Self::NotFound(msg) => (404, msg, "not found"),
+            Self::Conflict(msg) => (409, msg, "conflict"),
+            Self::Internal => (500, "internal server error".to_string(), "internal server error"),
             Self::Database(err) => {
                 tracing::error!(error = %err, "database error");
-                (500, "database error".to_string())
+                (500, "database error".to_string(), "database error")
             }
         };
 
-        (StatusCode::OK, ApiResponse::error(code, &message)).into_response()
+        let mut response = (StatusCode::OK, ApiResponse::error(code, &message)).into_response();
+        response.extensions_mut().insert(OperationResponseMeta {
+            business_code: code,
+            error_summary: Some(error_summary),
+        });
+        response
     }
 }

@@ -35,6 +35,8 @@ const CONNECTOR_RUNNING_STALE_SECONDS: i32 = 900;
 const CONNECTOR_RESPONSE_BYTE_LIMIT: usize = 64 * 1024;
 /// Characters of connector diagnostics persisted on the invocation.
 const CONNECTOR_DIAGNOSTIC_CHARS: usize = 2_000;
+/// Operation-log retention runs once per day; the first run happens at worker startup.
+const OPERATION_LOG_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
 
 #[derive(Debug, Parser)]
 struct WorkerArgs {
@@ -300,6 +302,8 @@ fn install_runtime_config(config: &OpenPrConfig) -> anyhow::Result<&'static Runt
 async fn main() -> anyhow::Result<()> {
     let args = WorkerArgs::parse();
     let config = OpenPrConfig::load(args.config.as_deref())?;
+    let operation_log_retention_days = i32::try_from(config.audit.operation_log_retention_days)
+        .map_err(|_| anyhow::anyhow!("audit.operation_log_retention_days exceeds the worker range"))?;
     // Installed before the logger, as in `api::main`: a configuration this process cannot publish
     // aborts startup instead of leaving the jobs it runs on the fallback settings.
     let runtime = install_runtime_config(&config)?;
@@ -343,8 +347,21 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let mut next_operation_log_cleanup = tokio::time::Instant::now();
 
     loop {
+        if tokio::time::Instant::now() >= next_operation_log_cleanup {
+            match cleanup_bot_operation_logs(&db, operation_log_retention_days).await {
+                Ok(deleted) => tracing::info!(
+                    deleted,
+                    retention_days = operation_log_retention_days,
+                    "bot operation log retention completed"
+                ),
+                Err(error) => tracing::warn!(error = %error, "bot operation log retention failed"),
+            }
+            next_operation_log_cleanup = tokio::time::Instant::now() + OPERATION_LOG_CLEANUP_INTERVAL;
+        }
+
         tokio::select! {
             () = &mut shutdown => {
                 tracing::info!("worker shutting down");
@@ -392,6 +409,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+async fn cleanup_bot_operation_logs(db: &sea_orm::DatabaseConnection, retention_days: i32) -> anyhow::Result<u64> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "DELETE FROM bot_operation_logs WHERE created_at < now() - make_interval(days => $1::int)",
+            vec![retention_days.into()],
+        ))
+        .await?;
+    Ok(result.rows_affected())
 }
 
 async fn process_received_event_inbox(db: &sea_orm::DatabaseConnection, concurrency: usize) -> anyhow::Result<()> {

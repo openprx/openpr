@@ -17,7 +17,7 @@ use axum::{
 };
 use clap::Parser;
 use cli::{Cli, Commands, ServeArgs};
-use client::{ClientConfig, OpenPrClient, transport_label};
+use client::{ClientConfig, OpenPrClient, TRANSPORT_LABEL_CLI, transport_label};
 use platform::config::{MCP_BOT_TOKEN_REQUIRED, McpConfig, McpRuntime, McpTransport, OpenPrConfig, Secret};
 use protocol::{JsonRpcRequest, JsonRpcResponse};
 use serde::Deserialize;
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // A CLI subcommand is a local process with no caller to act on behalf of, so it
         // speaks to the API as the configured identity and cannot run without one.
-        let client = build_client(&mcp, Some(configured_bot_token(&mcp)?))?;
+        let client = build_client(&mcp, Some(configured_bot_token(&mcp)?))?.with_transport_label(TRANSPORT_LABEL_CLI);
         cli::run_cli_command(&cli.command, &cli.format, client).await
     }
 }

@@ -11,7 +11,7 @@ Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL 16**.
 - **Universal forms** — project-defined business data types with grid/detail views, decimal-safe amounts, record links and child tables, formulas, per-role permissions, import/export, electronic signatures.
 - **WASM plugins** — per-project sandboxed plugins for field validation, formulas, and event handlers.
 - **Events** — transactional outbox/inbox with asynchronous connector delivery, plus a legacy webhook path.
-- **MCP server** — 105 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
+- **MCP server** — 106 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
 - **Scenario templates** — 6 ready-to-start setups: `code_delivery_default`, `contract_review_default`, `equipment_maintenance_default`, `quality_corrective_action_default`, `customer_delivery_default`, `restaurant_ordering_default`.
 
 ## Architecture
@@ -407,9 +407,9 @@ curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 
-### Tools (105)
+### Tools (106)
 
-Per-domain counts; the total is pinned by an `assert_eq!(tools.len(), 105)` test
+Per-domain counts; the total is pinned by an `assert_eq!(tools.len(), 106)` test
 in `apps/mcp-server/src/tools/mod.rs`.
 
 | Domain                    | Count | Representative tools                                                      |
@@ -427,6 +427,7 @@ in `apps/mcp-server/src/tools/mod.rs`.
 | Comments                  |     3 | `comments.create`, `comments.list`                                         |
 | Context                   |     3 | `context.get_project`, `context.get_agent_policy`                          |
 | Scenario templates        |     3 | `scenario_templates.list`, `scenario_templates.install`                    |
+| Operation records         |     1 | `bot_operation_logs.list`                                                  |
 | Single-tool domains       |   4×1 | `files.upload`, `members.list`, `search.all`, `release.readiness.get`      |
 
 The full list with exact parameter schemas is generated from the code — do not
@@ -446,22 +447,23 @@ templates via `resources/templates/list`, including
 
 ### The same binary is a CLI
 
-Besides `serve`, `mcp-server` exposes 8 command groups: `projects`,
-`work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`, and
-`tools call`. The global `--format json|table` selects the output shape, and
-`tools call` reaches any of the 105 tools by name — a complete escape hatch for
+Besides `serve`, `mcp-server` exposes 9 command groups: `projects`,
+`work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`,
+`operation-logs list`, and `tools call`. The global `--format json|table` selects the output shape, and
+`tools call` reaches any of the 106 tools by name — a complete escape hatch for
 anything without a dedicated subcommand.
 
 ```bash
 mcp-server projects list --format table
 mcp-server work-items create --project <uuid> --title "Fix login" --priority high
 mcp-server files upload --file ./report.pdf
+mcp-server operation-logs list --outcome error --limit 50
 mcp-server tools call --name forms.list --args-json '{"project_id":"<uuid>"}'
 ```
 
 ## API
 
-301 method+path endpoints (214 `.route()` calls), all registered in
+302 method+path endpoints (215 `.route()` calls), all registered in
 `apps/api/src/main.rs`. Every route lives under `/api/v1/`, plus an unversioned
 `/health`.
 
@@ -499,7 +501,7 @@ All under `scripts/`.
 | ----------- | ------------------------------------------------------------------------- |
 | Lifecycle   | `start.sh` (first-run `config/openpr.compose.toml` + `config/openpr.compose.mcp.toml` + compose `.env`, random bootstrap secrets, build release binaries, `compose up -d`), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
 | Database    | `init-db.sh` (apply migrations in order), `backup-db.sh` (gzipped dump into `backups/`), `restore-db.sh`                                                                                                                              |
-| Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (asserts the 105 tool count), `verify.sh` (component health check)                                                                           |
+| Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (asserts the 106 tool count), `verify.sh` (component health check)                                                                           |
 | Development | `dev-check.sh` (`cargo fmt --check`, `check`, `clippy -D warnings`, `test`), `ci-universal-forms-gates.sh` (reproduce the CI-only `Universal Forms Gates` bundle locally)                                                              |
 | Demo data   | `bootstrap-restaurant-demo.sh`, `smoke-restaurant-ordering.sh`                                                                                                                                                                        |
 | Other       | `benchmark.sh` (API latency/throughput), `bump-version.sh` (`major\|minor\|patch`, syncs `Cargo.toml` and `frontend/package.json`)                                                                                                     |

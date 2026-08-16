@@ -24,12 +24,100 @@ use platform::{
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::time::Instant;
 use uuid::Uuid;
 
 use crate::{
     error::ApiError,
+    response::OperationResponseMeta,
     routes::auth::{extract_bearer_token, extract_cookie_token},
 };
+
+const MCP_TOOL_HEADER: &str = "x-openpr-mcp-tool";
+const MCP_SURFACE_HEADER: &str = "x-openpr-mcp-surface";
+
+struct BotOperationContext {
+    bot_id: Uuid,
+    workspace_id: Uuid,
+    tool_name: Option<String>,
+    surface: &'static str,
+    method: String,
+    path: String,
+    request_id: Uuid,
+}
+
+fn operation_surface(headers: &axum::http::HeaderMap) -> &'static str {
+    match headers.get(MCP_SURFACE_HEADER).and_then(|value| value.to_str().ok()) {
+        Some("mcp_http") => "mcp_http",
+        Some("mcp_sse") => "mcp_sse",
+        Some("mcp_stdio") => "mcp_stdio",
+        Some("cli") => "cli",
+        _ => "rest",
+    }
+}
+
+fn operation_tool_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    let value = headers.get(MCP_TOOL_HEADER)?.to_str().ok()?.trim();
+    let mut segments = value.split('.');
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment.len() <= 64
+            && segment.starts_with(|character: char| character.is_ascii_lowercase())
+            && segment
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_')
+    };
+    let first = segments.next()?;
+    let second = segments.next()?;
+    if value.len() <= 128 && valid_segment(first) && valid_segment(second) && segments.all(valid_segment) {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+fn spawn_operation_log(
+    db: sea_orm::DatabaseConnection,
+    context: BotOperationContext,
+    business_code: i32,
+    error_message: Option<&'static str>,
+    duration_ms: i64,
+) {
+    tokio::spawn(async move {
+        let outcome = if business_code == 0 { "ok" } else { "error" };
+        let result = db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"INSERT INTO bot_operation_logs
+                   (id, workspace_id, bot_id, tool_name, surface, method, path,
+                    business_code, outcome, error_message, duration_ms, request_id, created_at)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                vec![
+                    Uuid::new_v4().into(),
+                    context.workspace_id.into(),
+                    context.bot_id.into(),
+                    context.tool_name.into(),
+                    context.surface.into(),
+                    context.method.into(),
+                    context.path.into(),
+                    business_code.into(),
+                    outcome.into(),
+                    error_message.map(str::to_string).into(),
+                    duration_ms.into(),
+                    context.request_id.into(),
+                    Utc::now().into(),
+                ],
+            ))
+            .await;
+        if let Err(error) = result {
+            tracing::warn!(
+                request_id = %context.request_id,
+                error = %error,
+                "bot operation log write failed"
+            );
+        }
+    });
+}
 
 /// Auth context injected when a bot token is used.
 #[derive(Debug, Clone, Serialize)]
@@ -184,6 +272,8 @@ pub async fn bot_or_user_auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let mut operation_context = None;
     let token = extract_bearer_token(req.headers())
         .or_else(|| extract_cookie_token(req.headers(), "access_token"))
         .ok_or_else(|| ApiError::Unauthorized("missing access token".to_string()))?;
@@ -252,7 +342,27 @@ pub async fn bot_or_user_auth_middleware(
         // everything else needs `write`. Handlers that mutate behind a POST are covered; the price
         // is that a read-shaped POST (preview, signed-url) also needs `write`, which is the
         // direction to fail in.
-        ensure_bot_permission(&context, required_bot_permission(req.method()))?;
+        let authenticated_operation = BotOperationContext {
+            bot_id: context.bot_id,
+            workspace_id: context.workspace_id,
+            tool_name: operation_tool_name(req.headers()),
+            surface: operation_surface(req.headers()),
+            method: req.method().as_str().to_string(),
+            path: req.uri().path().to_string(),
+            request_id: Uuid::new_v4(),
+        };
+        if let Err(error) = ensure_bot_permission(&context, required_bot_permission(req.method())) {
+            let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            spawn_operation_log(
+                state.db.clone(),
+                authenticated_operation,
+                403,
+                Some("forbidden"),
+                duration_ms,
+            );
+            return Err(error);
+        }
+        operation_context = Some(authenticated_operation);
 
         req.extensions_mut().insert(context);
         req.extensions_mut().insert(JwtClaims {
@@ -276,16 +386,32 @@ pub async fn bot_or_user_auth_middleware(
         req.extensions_mut().insert(claims);
     }
 
-    Ok(next.run(req).await)
+    let response = next.run(req).await;
+    if let Some(context) = operation_context {
+        let meta = response.extensions().get::<OperationResponseMeta>().copied();
+        let (business_code, error_message) = meta.map_or_else(
+            || {
+                if response.status().is_success() {
+                    (0, None)
+                } else {
+                    (i32::from(response.status().as_u16()), Some("http request rejected"))
+                }
+            },
+            |value| (value.business_code, value.error_summary),
+        );
+        let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+        spawn_operation_log(state.db.clone(), context, business_code, error_message, duration_ms);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BotAuthContext, BotPermission, bot_permissions_allow, bot_role_from_permissions, ensure_bot_permission,
-        required_bot_permission,
+        operation_surface, operation_tool_name, required_bot_permission,
     };
-    use axum::http::Method;
+    use axum::http::{HeaderMap, HeaderValue, Method};
     use uuid::Uuid;
 
     fn bot(permissions: &[&str]) -> BotAuthContext {
@@ -342,5 +468,19 @@ mod tests {
         for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             assert_eq!(required_bot_permission(&method), BotPermission::Write);
         }
+    }
+
+    #[test]
+    fn operation_headers_are_bounded_observability_labels_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-openpr-mcp-surface", HeaderValue::from_static("mcp_http"));
+        headers.insert("x-openpr-mcp-tool", HeaderValue::from_static("form_records.list"));
+        assert_eq!(operation_surface(&headers), "mcp_http");
+        assert_eq!(operation_tool_name(&headers).as_deref(), Some("form_records.list"));
+
+        headers.insert("x-openpr-mcp-surface", HeaderValue::from_static("admin"));
+        headers.insert("x-openpr-mcp-tool", HeaderValue::from_static("invalid"));
+        assert_eq!(operation_surface(&headers), "rest");
+        assert!(operation_tool_name(&headers).is_none());
     }
 }

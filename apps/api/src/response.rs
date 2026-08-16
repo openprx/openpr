@@ -4,6 +4,16 @@
 use axum::Json;
 use serde::Serialize;
 
+/// Metadata the bot-operation middleware can inspect without buffering a response body.
+///
+/// The summary is deliberately a fixed server string rather than handler prose, which can
+/// contain caller-provided names or values that do not belong in the operation ledger.
+#[derive(Debug, Clone, Copy)]
+pub struct OperationResponseMeta {
+    pub business_code: i32,
+    pub error_summary: Option<&'static str>,
+}
+
 #[derive(Serialize)]
 pub struct ApiResponse<T: Serialize> {
     pub code: i32,

@@ -22,9 +22,10 @@ use uuid::Uuid;
 use super::connectors::{ConnectorSecrets, validate_connector_secret_name};
 use super::secret::Secret;
 use super::{
-    AuthConfig, ConfigError, ConnectorsConfig, DEFAULT_S3_REGION, DEFAULT_STORAGE_DIR, DatabaseConfig, LogFormat,
-    LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, McpConfig, McpTransport, MigrationsConfig, OpenPrConfig,
-    OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
+    AuditConfig, AuthConfig, ConfigError, ConnectorsConfig, DEFAULT_OPERATION_LOG_RETENTION_DAYS, DEFAULT_S3_REGION,
+    DEFAULT_STORAGE_DIR, DatabaseConfig, LogFormat, LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, McpConfig,
+    McpTransport, MigrationsConfig, OpenPrConfig, OutboundConfig, S3Config, ServerConfig, StorageBackend,
+    StorageConfig,
 };
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
@@ -60,6 +61,8 @@ pub(super) struct RawConfig {
     logging: RawLogging,
     #[serde(default)]
     storage: RawStorage,
+    #[serde(default)]
+    audit: RawAudit,
     #[serde(default)]
     migrations: RawMigrations,
     #[serde(default)]
@@ -112,6 +115,12 @@ struct RawStorage {
     dir: Option<String>,
     #[serde(default)]
     s3: Option<RawS3>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawAudit {
+    operation_log_retention_days: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -206,6 +215,7 @@ impl RawConfig {
         let auth = self.auth.validate(&mut issues);
         let logging = self.logging.validate(&mut issues);
         let storage = self.storage.validate(&mut issues);
+        let audit = self.audit.validate(&mut issues);
         let migrations = self.migrations.validate();
         let outbound = self.outbound.validate(&mut issues);
         let mcp = self.mcp.validate(&mut issues);
@@ -229,6 +239,7 @@ impl RawConfig {
             auth,
             logging,
             storage,
+            audit,
             migrations,
             outbound,
             mcp,
@@ -460,6 +471,24 @@ impl RawStorage {
         }
 
         Some(StorageConfig { backend, dir, s3 })
+    }
+}
+
+impl RawAudit {
+    fn validate(self, issues: &mut Issues) -> AuditConfig {
+        let operation_log_retention_days =
+            self.operation_log_retention_days
+                .map_or(DEFAULT_OPERATION_LOG_RETENTION_DAYS, |days| {
+                    if (1..=3_650).contains(&days) {
+                        days
+                    } else {
+                        issues.push("audit.operation_log_retention_days must be between 1 and 3650");
+                        DEFAULT_OPERATION_LOG_RETENTION_DAYS
+                    }
+                });
+        AuditConfig {
+            operation_log_retention_days,
+        }
     }
 }
 

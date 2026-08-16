@@ -77,6 +77,9 @@ pub const DEFAULT_S3_REGION: &str = "us-east-1";
 /// Directory assumed by the local storage backend.
 pub const DEFAULT_STORAGE_DIR: &str = "./uploads";
 
+/// Days bot operation records are retained unless `[audit]` overrides it.
+pub const DEFAULT_OPERATION_LOG_RETENTION_DAYS: u32 = 30;
+
 /// API base URL assumed by the MCP server when `[mcp]` does not name one.
 pub const DEFAULT_MCP_API_URL: &str = "http://localhost:8081";
 
@@ -96,6 +99,7 @@ pub struct OpenPrConfig {
     pub auth: AuthConfig,
     pub logging: LoggingConfig,
     pub storage: StorageConfig,
+    pub audit: AuditConfig,
     pub migrations: MigrationsConfig,
     pub outbound: OutboundConfig,
     pub mcp: McpConfig,
@@ -378,6 +382,20 @@ pub struct StorageConfig {
     pub dir: PathBuf,
     /// Present and validated whenever `backend` is `s3`.
     pub s3: Option<S3Config>,
+}
+
+/// `[audit]` — retention policy for metadata-only operation records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuditConfig {
+    pub operation_log_retention_days: u32,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            operation_log_retention_days: DEFAULT_OPERATION_LOG_RETENTION_DAYS,
+        }
+    }
 }
 
 /// `[storage.s3]` — credentials and addressing for the S3 compatible backend.
