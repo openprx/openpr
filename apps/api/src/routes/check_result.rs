@@ -31,8 +31,6 @@ pub struct ListCheckResultsQuery {
 
 #[derive(Debug, Deserialize)]
 pub struct CreateCheckResultRequest {
-    pub invocation_id: Option<Uuid>,
-    pub connector_id: Option<Uuid>,
     pub action_class: Option<String>,
     pub risk_level: Option<String>,
     pub title: String,
@@ -56,8 +54,6 @@ pub struct CheckResultRow {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub project_id: Uuid,
-    pub invocation_id: Option<Uuid>,
-    pub connector_id: Option<Uuid>,
     pub action_class: String,
     pub risk_level: String,
     pub title: String,
@@ -95,8 +91,6 @@ struct CheckResultEventInput<'a> {
     workspace_id: Uuid,
     project_id: Uuid,
     check_result_id: Uuid,
-    invocation_id: Option<Uuid>,
-    connector_id: Option<Uuid>,
     action_class: &'a str,
     risk_level: &'a str,
     title: &'a str,
@@ -175,7 +169,7 @@ pub async fn list_project_check_results(
         DbBackend::Postgres,
         format!(
             r"
-                SELECT id, workspace_id, project_id, invocation_id, connector_id,
+                SELECT id, workspace_id, project_id,
                        action_class, risk_level, title, summary, result, status,
                        proposal_id, created_by, created_by_kind, created_at, updated_at
                 FROM check_results
@@ -220,30 +214,21 @@ pub async fn create_project_check_result(
     let check_result_id = Uuid::new_v4();
     let now = Utc::now();
 
-    if let Some(invocation_id) = req.invocation_id {
-        ensure_invocation_in_project(&state, project_id, invocation_id).await?;
-    }
-    if let Some(connector_id) = req.connector_id {
-        ensure_connector_in_project_scope(&state, project.workspace_id, project_id, connector_id).await?;
-    }
-
     let tx = state.db.begin().await?;
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
                 INSERT INTO check_results (
-                    id, workspace_id, project_id, invocation_id, connector_id, action_class,
+                    id, workspace_id, project_id, action_class,
                     risk_level, title, summary, result, status, created_by, created_by_kind,
                     created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
             ",
         vec![
             check_result_id.into(),
             project.workspace_id.into(),
             project_id.into(),
-            req.invocation_id.into(),
-            req.connector_id.into(),
             action_class.clone().into(),
             risk_level.clone().into(),
             title.clone().into(),
@@ -264,8 +249,6 @@ pub async fn create_project_check_result(
             workspace_id: project.workspace_id,
             project_id,
             check_result_id,
-            invocation_id: req.invocation_id,
-            connector_id: req.connector_id,
             action_class: &action_class,
             risk_level: &risk_level,
             title: &title,
@@ -294,10 +277,7 @@ pub async fn create_project_check_result(
                 "risk_level": risk_level,
                 "status": status,
             })),
-            metadata: Some(json!({
-                "invocation_id": req.invocation_id,
-                "connector_id": req.connector_id,
-            })),
+            metadata: None,
         },
     )
     .await?;
@@ -425,8 +405,6 @@ pub async fn create_proposal_from_result(
             workspace_id: row.workspace_id,
             project_id: row.project_id,
             check_result_id,
-            invocation_id: row.invocation_id,
-            connector_id: row.connector_id,
             action_class: &row.action_class,
             risk_level: &row.risk_level,
             title: &row.title,
@@ -514,7 +492,7 @@ async fn find_check_result(state: &AppState, id: Uuid) -> Result<CheckResultRow,
     CheckResultRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            SELECT id, workspace_id, project_id, invocation_id, connector_id,
+            SELECT id, workspace_id, project_id,
                    action_class, risk_level, title, summary, result, status,
                    proposal_id, created_by, created_by_kind, created_at, updated_at
             FROM check_results
@@ -548,8 +526,6 @@ where
                 "check_result_id": input.check_result_id,
                 "workspace_id": input.workspace_id,
                 "project_id": input.project_id,
-                "invocation_id": input.invocation_id,
-                "connector_id": input.connector_id,
                 "action_class": input.action_class,
                 "risk_level": input.risk_level,
                 "title": input.title,
@@ -566,7 +542,7 @@ where
                 "proposal_id": input.proposal_id
             }),
             correlation_id: None,
-            causation_id: input.invocation_id,
+            causation_id: None,
             idempotency_key: None,
         },
     )
@@ -620,54 +596,6 @@ where
     )
     .await?;
     Ok(())
-}
-
-async fn ensure_invocation_in_project(state: &AppState, project_id: Uuid, invocation_id: Uuid) -> Result<(), ApiError> {
-    let ok = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT 1 FROM agent_invocations WHERE id = $1 AND project_id = $2",
-            vec![invocation_id.into(), project_id.into()],
-        ))
-        .await?
-        .is_some();
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
-            "invocation does not belong to this project".to_string(),
-        ))
-    }
-}
-
-async fn ensure_connector_in_project_scope(
-    state: &AppState,
-    workspace_id: Uuid,
-    project_id: Uuid,
-    connector_id: Uuid,
-) -> Result<(), ApiError> {
-    let ok = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r"
-                SELECT 1 FROM connectors
-                WHERE id = $1
-                  AND workspace_id = $2
-                  AND (project_id IS NULL OR project_id = $3)
-            ",
-            vec![connector_id.into(), workspace_id.into(), project_id.into()],
-        ))
-        .await?
-        .is_some();
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
-            "connector does not belong to this project".to_string(),
-        ))
-    }
 }
 
 fn normalize_action_class(value: &str) -> Result<String, ApiError> {

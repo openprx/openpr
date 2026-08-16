@@ -3,7 +3,7 @@
 ## Project Overview
 
 - OpenPR is an open-source project management platform with governance and AI integration.
-- The MCP server exposes 106 tools for managing projects, context, project types/templates/resources, connectors, invocations, operation records, universal forms, WASM plugins, issues, sprints, labels, comments, proposals, check results, release next actions, files, and scenario-specific governed work.
+- The MCP server exposes 98 tools for managing projects, context, project types/templates/resources, operation records, universal forms, WASM plugins, issues, sprints, labels, comments, proposals, check results, release next actions, files, and scenario-specific governed work.
 - Transports: HTTP (`POST /mcp/rpc`), stdio (stdin/stdout), SSE (`GET /sse` + `POST /messages`).
 
 ## MCP Surface (Quick Reference)
@@ -17,8 +17,6 @@
   - `context.get_project`, `context.get_governance`, `context.get_agent_policy`
   - `project_types.list`, `project_types.get`
   - `project_resources.list`, `project_resources.create`, `project_resources.update`, `project_resources.delete`
-  - `connectors.list`, `connectors.get`
-  - `invocations.list`, `invocations.get`, `invocations.create`, `invocations.report_progress`, `invocations.complete`, `invocations.fail`
   - `forms.list`, `forms.get`, `forms.create`, `forms.create_from_template`, `scenario_templates.install`, `forms.update_schema`, `forms.duplicate`
   - `forms.schema_summary`, `forms.field_usage`, `forms.field_dependencies`
   - `form_schema_versions.list`, `form_schema_versions.get`
@@ -101,8 +99,8 @@ curl -X POST http://localhost:8090/mcp/rpc \
 
 ## Testing Guidelines
 
-- MCP regression: test all 106 tools across 3 transports (HTTP, stdio, SSE), plus project-aware `tools/list` when a project id is supplied.
-- CLI business-flow coverage: use `mcp-server tools call --name <tool> --args-json '{...}'` for universal forms, plugins, connectors, and scenario tools so CLI calls reuse the same MCP tool names and audit path.
+- MCP regression: test all 98 tools across 3 transports (HTTP, stdio, SSE), plus project-aware `tools/list` when a project id is supplied.
+- CLI business-flow coverage: use `mcp-server tools call --name <tool> --args-json '{...}'` for universal forms, plugins, operation records, and scenario tools so CLI calls reuse the same MCP tool names and audit path.
 - API: test via `curl` or MCP client against running instance.
 - Frontend: `bun run build` must succeed.
 - When adding a new MCP tool:

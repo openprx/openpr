@@ -33,7 +33,6 @@ struct ScenarioTemplateRow {
     pub resource_schema: JsonValue,
     pub ai_roles: JsonValue,
     pub governance_policy: JsonValue,
-    pub connector_suggestions: JsonValue,
     pub sample_data: JsonValue,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -54,7 +53,6 @@ pub struct ScenarioTemplateResponse {
     pub resource_schema: JsonValue,
     pub ai_roles: JsonValue,
     pub governance_policy: JsonValue,
-    pub connector_suggestions: JsonValue,
     pub sample_data: JsonValue,
     pub usage_guide: JsonValue,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -78,7 +76,6 @@ impl From<ScenarioTemplateRow> for ScenarioTemplateResponse {
             resource_schema: row.resource_schema,
             ai_roles: row.ai_roles,
             governance_policy: row.governance_policy,
-            connector_suggestions: row.connector_suggestions,
             sample_data: row.sample_data,
             usage_guide,
             created_at: row.created_at,
@@ -149,7 +146,6 @@ fn scenario_template_usage_guide(key: &str, name: &str) -> JsonValue {
                 "Record CI and release evidence before handoff"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "events.tail"],
-            "connector_kinds": ["mcp", "webhook"],
             "plugin_keys": [],
             "acceptance_focus": ["Repository resource is visible", "Release check records hold verification evidence"]
         }),
@@ -163,7 +159,6 @@ fn scenario_template_usage_guide(key: &str, name: &str) -> JsonValue {
                 "Route approval records through MCP or webhook consumers"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "form_records.link", "events.tail"],
-            "connector_kinds": ["mcp", "webhook"],
             "plugin_keys": [],
             "acceptance_focus": ["Contract amount stays decimal-safe", "Risk clauses are linked to the contract"]
         }),
@@ -177,7 +172,6 @@ fn scenario_template_usage_guide(key: &str, name: &str) -> JsonValue {
                 "Close the workflow with inspection records"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "form_records.update", "events.tail"],
-            "connector_kinds": ["webhook", "mcp"],
             "plugin_keys": [],
             "acceptance_focus": ["Repair orders reference equipment", "Inspection acceptance is captured as a record"]
         }),
@@ -191,7 +185,6 @@ fn scenario_template_usage_guide(key: &str, name: &str) -> JsonValue {
                 "Record recheck results and audit evidence"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "form_records.link", "events.tail"],
-            "connector_kinds": ["mcp", "webhook"],
             "plugin_keys": [],
             "acceptance_focus": ["Defect, root-cause, and corrective-action records stay linked", "Recheck status is visible to audit consumers"]
         }),
@@ -202,10 +195,9 @@ fn scenario_template_usage_guide(key: &str, name: &str) -> JsonValue {
                 "Create the project from the customer delivery template",
                 "Register customer and acceptance-material resources",
                 "Create milestone and change-request records",
-                "Send updates through MCP, webhook, or REST connectors"
+                "Send updates through MCP, webhooks, or REST APIs"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "form_records.update", "events.tail"],
-            "connector_kinds": ["mcp", "webhook", "rest"],
             "plugin_keys": [],
             "acceptance_focus": ["Milestones expose acceptance status", "Change requests keep commercial risk evidence"]
         }),
@@ -219,20 +211,18 @@ fn scenario_template_usage_guide(key: &str, name: &str) -> JsonValue {
                 "Generate print jobs, receipts, and business reports"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "form_records.link", "form_records.aggregate", "events.tail", "plugins.invoke"],
-            "connector_kinds": ["mcp", "print", "webhook"],
             "plugin_keys": ["restaurant_calc"],
-            "acceptance_focus": ["Order-line totals are calculated by the plugin", "Print connector receipts update delivery state", "Revenue aggregate returns decimal strings"]
+            "acceptance_focus": ["Order-line totals are calculated by the plugin", "Revenue aggregate returns decimal strings"]
         }),
         _ => json!({
             "schema_version": "openpr.scenario_template.usage_guide.v1",
             "operator_entrypoints": common_entrypoints,
             "operator_steps": [
                 format!("Create the project from the {name} template"),
-                "Review generated forms and connector suggestions",
+                "Review generated forms and agent roles",
                 "Create records through the frontend, REST API, or MCP tools"
             ],
             "primary_mcp_tools": ["scenario_templates.get", "projects.create", "forms.list", "form_records.create", "events.tail"],
-            "connector_kinds": ["mcp"],
             "plugin_keys": [],
             "acceptance_focus": ["Generated forms are visible", "Records can be created through the shared API/MCP surface"]
         }),
@@ -276,7 +266,7 @@ pub async fn list_scenario_templates(
         r"
             SELECT id, key, workspace_id, name, description, industry, project_type_key,
                    audience_label, workflow_template, field_schema, resource_schema,
-                   ai_roles, governance_policy, connector_suggestions, sample_data,
+                   ai_roles, governance_policy, sample_data,
                    created_at, updated_at
             FROM scenario_templates
             WHERE {}
@@ -315,7 +305,7 @@ pub async fn get_scenario_template(
         r"
             SELECT id, key, workspace_id, name, description, industry, project_type_key,
                    audience_label, workflow_template, field_schema, resource_schema,
-                   ai_roles, governance_policy, connector_suggestions, sample_data,
+                   ai_roles, governance_policy, sample_data,
                    created_at, updated_at
             FROM scenario_templates
             WHERE {workspace_clause}
@@ -374,13 +364,6 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "form_records.aggregate")
         );
-        assert!(
-            usage["connector_kinds"]
-                .as_array()
-                .expect("connector kinds")
-                .iter()
-                .any(|kind| kind == "print")
-        );
         assert_eq!(usage["plugin_keys"][0], "restaurant_calc");
     }
 
@@ -395,6 +378,5 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "projects.create")
         );
-        assert_eq!(usage["connector_kinds"][0], "mcp");
     }
 }

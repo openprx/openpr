@@ -13,19 +13,16 @@
 //! None of these types derive `Debug`: they hold credential material as plain `String`, and only
 //! the validated types wrap it in [`Secret`].
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::connectors::{ConnectorSecrets, validate_connector_secret_name};
 use super::secret::Secret;
 use super::{
-    AuditConfig, AuthConfig, ConfigError, ConnectorsConfig, DEFAULT_OPERATION_LOG_RETENTION_DAYS, DEFAULT_S3_REGION,
-    DEFAULT_STORAGE_DIR, DatabaseConfig, LogFormat, LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, McpConfig,
-    McpTransport, MigrationsConfig, OpenPrConfig, OutboundConfig, S3Config, ServerConfig, StorageBackend,
-    StorageConfig,
+    AuditConfig, AuthConfig, ConfigError, DEFAULT_OPERATION_LOG_RETENTION_DAYS, DEFAULT_S3_REGION, DEFAULT_STORAGE_DIR,
+    DatabaseConfig, LogFormat, LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, McpConfig, McpTransport, MigrationsConfig,
+    OpenPrConfig, OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
 };
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
@@ -69,8 +66,6 @@ pub(super) struct RawConfig {
     outbound: RawOutbound,
     #[serde(default)]
     mcp: RawMcp,
-    #[serde(default)]
-    connectors: RawConnectors,
 }
 
 #[derive(Deserialize, Default)]
@@ -160,15 +155,6 @@ struct RawMcp {
     auth_token: Option<String>,
     transport: Option<String>,
     bind_addr: Option<String>,
-    invocation_id: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct RawConnectors {
-    /// Workspace id -> credential name -> value.
-    #[serde(default)]
-    secrets: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Collects validation problems so the operator sees all of them at once.
@@ -219,7 +205,6 @@ impl RawConfig {
         let migrations = self.migrations.validate();
         let outbound = self.outbound.validate(&mut issues);
         let mcp = self.mcp.validate(&mut issues);
-        let connectors = self.connectors.validate(&mut issues);
 
         issues.into_result(origin)?;
 
@@ -243,7 +228,6 @@ impl RawConfig {
             migrations,
             outbound,
             mcp,
-            connectors,
         })
     }
 }
@@ -654,67 +638,12 @@ impl RawMcp {
         let bind_addr = self.bind_addr.and_then(|addr| {
             issues.record(validate_bind_addr("mcp.bind_addr", &addr).map(|()| addr.trim().to_string()))
         });
-        let invocation_id = self.invocation_id.and_then(|id| {
-            issues.record(if id.trim().is_empty() {
-                Err("mcp.invocation_id must not be empty when it is set".to_string())
-            } else {
-                Ok(id.trim().to_string())
-            })
-        });
-
         McpConfig {
             api_url,
             bot_token,
             workspace_id,
             transport: transport.unwrap_or_default(),
             bind_addr,
-            invocation_id,
-        }
-    }
-}
-
-impl RawConnectors {
-    fn validate(self, issues: &mut Issues) -> ConnectorsConfig {
-        let mut by_workspace: BTreeMap<Uuid, BTreeMap<String, Secret>> = BTreeMap::new();
-        // Two spellings of the same id (case, dashes, urn form) would otherwise produce two TOML
-        // tables that silently collapse into one workspace, with one of them winning at random.
-        let mut spellings: BTreeMap<Uuid, String> = BTreeMap::new();
-
-        for (raw_workspace, entries) in self.secrets {
-            let field = format!("connectors.secrets.\"{raw_workspace}\"");
-            let Some(workspace_id) = issues.record(parse_workspace_scale_uuid(&field, &raw_workspace)) else {
-                continue;
-            };
-            if let Some(previous) = spellings.get(&workspace_id) {
-                issues.push(format!(
-                    "{field} names the same workspace as connectors.secrets.\"{previous}\"; declare each \
-                     workspace exactly once"
-                ));
-                continue;
-            }
-            spellings.insert(workspace_id, raw_workspace);
-
-            let mut owned: BTreeMap<String, Secret> = BTreeMap::new();
-            for (name, value) in entries {
-                if let Err(err) = validate_connector_secret_name(&name) {
-                    issues.push(format!("{field}: {err}"));
-                    continue;
-                }
-                if is_placeholder(&value) {
-                    issues.push(format!(
-                        "{field}.{name} must be a concrete credential, not a placeholder"
-                    ));
-                    continue;
-                }
-                owned.insert(name, Secret::new(value.trim()));
-            }
-            if !owned.is_empty() {
-                by_workspace.insert(workspace_id, owned);
-            }
-        }
-
-        ConnectorsConfig {
-            secrets: ConnectorSecrets::new(by_workspace),
         }
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: openpr-mcp
-description: Manage projects, universal forms, WASM plugins, connectors, issues, sprints, labels, comments, proposals, and files via the OpenPR MCP server. Supports HTTP, stdio, and SSE transports with bot token authentication.
+description: Manage projects, universal forms, WASM plugins, operation records, issues, sprints, labels, comments, proposals, and files via the OpenPR MCP server. Supports HTTP, stdio, and SSE transports with bot token authentication.
 ---
 
 # OpenPR MCP Skill
@@ -10,7 +10,7 @@ Use this skill when:
 - Creating, updating, or searching issues/work items
 - Creating and operating project-defined universal forms and records
 - Installing or invoking project WASM plugins
-- Reading business events and connector/invocation state
+- Reading business events and metadata-only bot operation records
 - Managing sprints, labels, or project settings
 - Uploading files (logs, zips, screenshots) and attaching to issues or comments
 - Creating or reviewing governance proposals
@@ -23,7 +23,7 @@ Run these in order so a client can use OpenPR MCP immediately.
 
 ### 1. Capability line (verify connectivity)
 ```
-tools/list                          → enumerate all 106 tools
+tools/list                          → enumerate all 98 tools
 tools/list { project_id }           → enumerate tools enabled by the project capability registry
 members.list                       → verify auth + workspace access
 bot_operation_logs.list            → inspect metadata-only bot operation history
@@ -33,7 +33,7 @@ projects.list                      → verify project data
 ### 2. Read line (explore existing data)
 ```
 projects.list → projects.get → work_items.list → work_items.get
-context.get_project                → project type/resources/connectors/governance/workflow context
+context.get_project                → project type/resources/governance/workflow context
 context.get_governance             → review policy, workflow, recent decisions
 context.get_agent_policy           → effective AI/MCP action policy and tool registry
 release.readiness.get              → release/acceptance gates, blockers, next actions, and governance evidence
@@ -48,8 +48,6 @@ form_records.list → form_records.export → form_records.import_preview → fo
 form_records.relation_targets → form_records.children → form_records.child_create → form_records.child_update → form_records.child_archive → form_records.child_restore → form_records.aggregate
 plugins.list → plugins.get → plugin_invocations.list
 events.tail                        → recent business events
-connectors.list                    → automation connection inventory
-invocations.list                   → AI execution ledger
 search.all                         → full-text search
 work_items.get_by_identifier       → lookup by human ID (e.g. PRX-42)
 labels.list                        → available labels
@@ -69,8 +67,6 @@ project_resources.create → project_resources.update → project_resources.dele
 forms.create → forms.create_from_template → scenario_templates.install → forms.update_schema → forms.duplicate
 form_records.create → form_records.import_commit → form_records.update → form_records.link
 plugins.install → plugins.invoke
-invocations.create → invocations.report_progress → invocations.complete
-invocations.create → invocations.fail
 code.change_proposal.create
 documents.extract_summary → documents.review_risk
 approval.request → inspection.report → corrective_action.propose
@@ -205,7 +201,7 @@ comments.create {
 
 ## Scripts
 
-- Regression test: `scripts/mcp-regression.py` — tests the core tool surface across 3 transports and checks the 106-tool registry includes universal forms and plugins
+- Regression test: `scripts/mcp-regression.py` — tests the core tool surface across 3 transports and checks the 98-tool registry includes universal forms and plugins
 - Validation: `scripts/validate-mcp.sh` — quick smoke test for connectivity
 
 ## References

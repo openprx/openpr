@@ -2,7 +2,7 @@
 //!
 //! [`AppState`](platform::app::AppState) carries the database handle and the handful of values
 //! every request handler needs. Three sections do not fit there: object storage, the outbound
-//! allowlist and the connector credentials are read from code paths that are several calls away
+//! allowlist are read from code paths that are several calls away
 //! from an `AppState`, and from free functions the worker also links against.
 //!
 //! They used to be read from the process environment at the point of use, which is precisely what
@@ -15,23 +15,15 @@
 //! their object storage from [`runtime`]; it installs its own configuration file at startup for
 //! the same reason.
 //!
-//! Connector credentials are deliberately *not* read through [`runtime`] by the delivery code.
-//! They are passed as an explicit `&ConnectorSecrets` argument together with the workspace id that
-//! selects the tenant partition, so the tenant boundary is visible in every signature that crosses
-//! it rather than hidden behind a global.
-
 use std::sync::OnceLock;
 
-use platform::config::{
-    ConnectorsConfig, DEFAULT_STORAGE_DIR, OpenPrConfig, OutboundConfig, StorageBackend, StorageConfig,
-};
+use platform::config::{DEFAULT_STORAGE_DIR, OpenPrConfig, OutboundConfig, StorageBackend, StorageConfig};
 
 /// The sections of the configuration file reached from outside `AppState`.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub storage: StorageConfig,
     pub outbound: OutboundConfig,
-    pub connectors: ConnectorsConfig,
 }
 
 impl RuntimeConfig {
@@ -40,7 +32,6 @@ impl RuntimeConfig {
         Self {
             storage: config.storage.clone(),
             outbound: config.outbound.clone(),
-            connectors: config.connectors.clone(),
         }
     }
 
@@ -49,7 +40,7 @@ impl RuntimeConfig {
     /// Only unit tests reach this: every binary linking this library installs the file before it
     /// does any work, and a failure to do so aborts startup. The values are the safe end of each
     /// setting — local storage under [`DEFAULT_STORAGE_DIR`], an empty outbound allowlist with the
-    /// private address checks on, and no connector credentials at all.
+    /// private address checks on.
     ///
     /// Being the safe end is not the same as being correct: a binary that reaches these settings
     /// silently disagrees with the file the rest of the deployment reads. [`runtime`] seals the
@@ -63,7 +54,6 @@ impl RuntimeConfig {
                 s3: None,
             },
             outbound: OutboundConfig::default(),
-            connectors: ConnectorsConfig::default(),
         }
     }
 }
@@ -99,7 +89,6 @@ mod tests {
         assert!(fallback.storage.s3.is_none());
         assert!(!fallback.outbound.allow_private);
         assert!(fallback.outbound.allowlist_csv().is_empty());
-        assert_eq!(fallback.connectors.secrets.entry_count(), 0);
     }
 
     #[test]

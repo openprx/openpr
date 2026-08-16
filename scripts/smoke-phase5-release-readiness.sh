@@ -226,15 +226,7 @@ async function main() {
     type_key: 'code_project',
   });
 
-  const invocation = await request(ownerToken, 'POST', `/api/v1/projects/${project.id}/invocations`, {
-    trigger_kind: 'mcp',
-    payload: { source: 'phase5-release-readiness' },
-  });
-  await request(ownerToken, 'POST', `/api/v1/invocations/${invocation.id}/complete`, {
-    result: { status: 'success', source: 'phase5-release-readiness' },
-  });
   await request(ownerToken, 'POST', `/api/v1/projects/${project.id}/check-results`, {
-    invocation_id: invocation.id,
     action_class: 'comment_result',
     risk_level: 'low',
     title: 'Phase 5 release evidence',
@@ -257,7 +249,7 @@ async function main() {
   assert(ready.schema_version === releaseSchema.properties.schema_version.const, 'release readiness schema version should match schema');
   assert(ready.schema_path === releaseSchemaPath, 'release readiness schema path should be stable');
   assert(ready.status === 'ready', `release readiness should be ready: ${JSON.stringify(ready)}`);
-  assert(ready.metrics.some((metric) => metric.key === 'result_artifacts' && metric.value >= 2), 'readiness should count result artifacts');
+  assert(ready.metrics.some((metric) => metric.key === 'result_artifacts' && metric.value >= 1), 'readiness should count result artifacts');
   assert(
     ready.next_actions?.some(
       (action) =>

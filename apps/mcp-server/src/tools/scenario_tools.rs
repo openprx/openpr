@@ -121,8 +121,6 @@ struct CodeTaskContextInput {
 #[derive(Debug, Deserialize)]
 struct GovernedResultInput {
     project_id: String,
-    invocation_id: Option<String>,
-    connector_id: Option<String>,
     title: String,
     summary: String,
     result: Option<Value>,
@@ -264,8 +262,6 @@ async fn create_governed_result(
     };
 
     let body = json!({
-        "invocation_id": input.invocation_id,
-        "connector_id": input.connector_id,
         "action_class": default_action_class,
         "risk_level": input.risk_level.unwrap_or_else(|| default_risk_level.to_string()),
         "title": input.title,
@@ -287,8 +283,6 @@ fn governed_result_schema(title_description: &str, summary_description: &str) ->
         "type": "object",
         "properties": {
             "project_id": { "type": "string", "description": "Project UUID" },
-            "invocation_id": { "type": "string", "description": "Optional invocation UUID" },
-            "connector_id": { "type": "string", "description": "Optional connector UUID" },
             "title": { "type": "string", "minLength": 10, "maxLength": 200, "description": title_description },
             "summary": { "type": "string", "minLength": 10, "description": summary_description },
             "risk_level": { "type": "string", "enum": ["low", "medium", "high", "critical"], "description": "Optional risk level override" },

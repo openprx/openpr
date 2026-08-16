@@ -43,7 +43,6 @@
 //! missing value of the section at once, and [`AppConfig::from_config`] — the API's and the
 //! worker's single entry point — reports the missing database *and* auth values together.
 
-mod connectors;
 mod error;
 mod raw;
 mod secret;
@@ -53,9 +52,6 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-pub use connectors::{
-    ConnectorSecretError, ConnectorSecrets, MAX_CONNECTOR_SECRET_NAME_LEN, validate_connector_secret_name,
-};
 pub use error::{ConfigError, EXAMPLE_CONFIG_PATH};
 pub use secret::{REDACTED, Secret};
 
@@ -89,7 +85,7 @@ pub const DEFAULT_MCP_BIND_ADDR: &str = "127.0.0.1:8090";
 /// The whole configuration file, parsed and validated.
 ///
 /// `Debug` is derived and is safe: every field carrying credential material is a [`Secret`],
-/// which renders as [`REDACTED`], and [`ConnectorSecrets`] renders as counts only.
+/// which renders as [`REDACTED`].
 #[derive(Clone, Debug)]
 pub struct OpenPrConfig {
     /// File this configuration was read from, used in diagnostics.
@@ -103,7 +99,6 @@ pub struct OpenPrConfig {
     pub migrations: MigrationsConfig,
     pub outbound: OutboundConfig,
     pub mcp: McpConfig,
-    pub connectors: ConnectorsConfig,
 }
 
 impl OpenPrConfig {
@@ -476,8 +471,6 @@ pub struct McpConfig {
     pub workspace_id: Option<Uuid>,
     pub transport: McpTransport,
     pub bind_addr: Option<String>,
-    /// Correlation id stamped onto API calls made on behalf of one agent invocation.
-    pub invocation_id: Option<String>,
 }
 
 /// What a deployment whose transport has no per-request credential is told.
@@ -515,7 +508,6 @@ impl McpConfig {
                 .bind_addr
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MCP_BIND_ADDR.to_string()),
-            invocation_id: self.invocation_id.clone(),
         })
     }
 }
@@ -530,13 +522,6 @@ pub struct McpRuntime {
     pub workspace_id: Uuid,
     pub transport: McpTransport,
     pub bind_addr: String,
-    pub invocation_id: Option<String>,
-}
-
-/// `[connectors]` — credentials the delivery pipeline may present to third parties.
-#[derive(Clone, Debug, Default)]
-pub struct ConnectorsConfig {
-    pub secrets: ConnectorSecrets,
 }
 
 /// The subset of the configuration carried in `AppState` and reached from request handlers.

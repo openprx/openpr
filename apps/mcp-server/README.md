@@ -9,7 +9,6 @@ The MCP Server provides AI models with tools to interact with OpenPR's project m
 - Project types, scenario templates, and project resources
 - Universal forms, form records, aggregate queries, and business events
 - WASM plugin install/invoke and plugin invocation history
-- Connectors and invocation lifecycle tracking
 - Work item/issue tracking
 - Comments and collaboration
 - Global search across all entities
@@ -17,7 +16,7 @@ The MCP Server provides AI models with tools to interact with OpenPR's project m
 
 ## Features
 
-- **106 MCP Tools**: Project, governance, universal forms, WASM plugin, connector, invocation, operation records, release next actions, template, and scenario toolkit
+- **98 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, and scenario toolkit
 - **Three Transport Modes**: stdio (for MCP clients), HTTP JSON-RPC, and SSE
 - **JSON Schema Validation**: All tool parameters are strongly typed
 - **OpenPR API Backend**: Calls the OpenPR API with workspace-scoped bot credentials
@@ -131,11 +130,6 @@ cargo build -p mcp-server --release
 - `project_types.list`, `project_types.get`
 - `scenario_templates.list`, `scenario_templates.get`, `scenario_templates.install`
 - `project_resources.list`, `project_resources.create`, `project_resources.update`, `project_resources.delete`
-
-### Connectors and Invocations
-- `connectors.list`, `connectors.get`
-- `invocations.list`, `invocations.get`, `invocations.create`
-- `invocations.report_progress`, `invocations.complete`, `invocations.fail`
 
 ### Universal Forms and Events
 - `forms.list`, `forms.get`, `forms.create`, `forms.create_from_template`, `forms.update_schema`, `forms.duplicate`
@@ -284,7 +278,7 @@ apps/mcp-server/
 │   ├── tools/            # Tool implementations
 │   │   ├── forms.rs
 │   │   ├── plugins.rs
-│   │   ├── connectors.rs
+│   │   ├── operation_logs.rs
 │   │   ├── project_types.rs
 │   │   ├── scenario_templates.rs
 │   │   ├── projects.rs

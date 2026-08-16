@@ -1,13 +1,12 @@
 {
 	"name": "frontend",
 	"private": true,
-	"version": "0.2.10",
+	"version": "0.2.11",
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build && node scripts/externalize-bootstrap.mjs",
 		"preview": "vite preview",
-		"smoke:mcp-admin": "node scripts/smoke-mcp-admin.mjs",
 		"smoke:connections": "node scripts/smoke-connections-invocations.mjs",
 		"smoke:phase1-project-types": "node scripts/smoke-phase1-project-types-resources.mjs",
 		"prepare": "svelte-kit sync || echo ''",

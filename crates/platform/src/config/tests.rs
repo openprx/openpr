@@ -2,15 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use uuid::Uuid;
-
 use super::{
     AppConfig, ConfigError, DEFAULT_CONFIG_PATH, LogFormat, LogOutput, McpTransport, OpenPrConfig, REDACTED,
     StdoutRole, StorageBackend,
 };
 
 const WORKSPACE: &str = "0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8";
-const OTHER_WORKSPACE: &str = "11111111-2222-4333-8444-555555555555";
 
 fn origin() -> PathBuf {
     PathBuf::from("config/openpr.toml")
@@ -84,14 +81,6 @@ bot_token = "opr_live_botexampletoken"
 workspace_id = "{WORKSPACE}"
 transport = "http"
 bind_addr = "0.0.0.0:8090"
-invocation_id = "inv-42"
-
-[connectors.secrets."{WORKSPACE}"]
-SHIPPING = "shipping-credential"
-PAYMENTS = "payments-credential"
-
-[connectors.secrets."{OTHER_WORKSPACE}"]
-PAYMENTS = "other-tenant-credential"
 "#
     )
 }
@@ -161,10 +150,6 @@ fn a_complete_file_parses_into_every_section() {
     );
     assert_eq!(mcp.workspace_id.to_string(), WORKSPACE);
     assert_eq!(mcp.bind_addr, "0.0.0.0:8090");
-    assert_eq!(mcp.invocation_id.as_deref(), Some("inv-42"));
-
-    assert_eq!(config.connectors.secrets.workspace_count(), 2);
-    assert_eq!(config.connectors.secrets.entry_count(), 3);
 }
 
 #[test]
@@ -206,7 +191,6 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
     assert!(config.outbound.allowed_hosts.is_empty());
     assert!(!config.outbound.allow_private);
     assert_eq!(config.mcp.transport, McpTransport::Stdio);
-    assert_eq!(config.connectors.secrets.workspace_count(), 0);
 }
 
 #[test]
@@ -246,7 +230,7 @@ fn every_value_the_api_is_missing_is_reported_in_one_pass() {
 
 #[test]
 fn unrelated_problems_across_sections_are_all_reported_together() {
-    let reported = issues(&format!(
+    let reported = issues(
         r#"
 [server]
 bind_addr = "0.0.0.0:not-a-port"
@@ -276,10 +260,8 @@ bot_token = "not-prefixed"
 workspace_id = "not-a-uuid"
 transport = "grpc"
 
-[connectors.secrets."{WORKSPACE}"]
-lowercase = "value"
-"#
-    ));
+"#,
+    );
 
     for expected in [
         "server.bind_addr",
@@ -296,14 +278,13 @@ lowercase = "value"
         "mcp.bot_token",
         "mcp.workspace_id",
         "mcp.transport",
-        "connectors.secrets",
     ] {
         assert!(
             reported.iter().any(|issue| issue.contains(expected)),
             "missing {expected:?} in {reported:?}"
         );
     }
-    assert!(reported.len() >= 15, "expected every problem at once, got {reported:?}");
+    assert!(reported.len() >= 14, "expected every problem at once, got {reported:?}");
 }
 
 #[test]
@@ -538,56 +519,6 @@ fn malformed_and_nil_uuids_are_refused_everywhere_they_appear() {
     }
 }
 
-#[test]
-fn a_connector_workspace_key_must_be_a_real_uuid() {
-    let reported = issues(
-        r#"
-[database]
-url = "postgres://localhost/openpr"
-
-[auth]
-jwt_secret = "0123456789abcdef0123456789abcdef"
-
-[connectors.secrets.not-a-uuid]
-SHIPPING = "value"
-
-[connectors.secrets."00000000-0000-0000-0000-000000000000"]
-PAYMENTS = "value"
-"#,
-    );
-    assert!(
-        reported
-            .iter()
-            .any(|issue| issue.contains("not-a-uuid") && issue.contains("not a valid UUID")),
-        "{reported:?}"
-    );
-    assert!(reported.iter().any(|issue| issue.contains("nil UUID")), "{reported:?}");
-}
-
-#[test]
-fn two_spellings_of_one_workspace_are_refused_rather_than_silently_merged() {
-    let upper = WORKSPACE.to_ascii_uppercase();
-    let reported = issues(&format!(
-        r#"
-[database]
-url = "postgres://localhost/openpr"
-
-[auth]
-jwt_secret = "0123456789abcdef0123456789abcdef"
-
-[connectors.secrets."{WORKSPACE}"]
-SHIPPING = "first"
-
-[connectors.secrets."{upper}"]
-SHIPPING = "second"
-"#
-    ));
-    assert!(
-        reported.iter().any(|issue| issue.contains("names the same workspace")),
-        "{reported:?}"
-    );
-}
-
 // ---- tokens ----
 
 /// The shared inbound secret is gone, and a file that still carries it is stopped with an
@@ -703,89 +634,6 @@ bot_token = "opr_live_token"
     assert_eq!(mcp.api_url, super::DEFAULT_MCP_API_URL);
     assert_eq!(mcp.bind_addr, super::DEFAULT_MCP_BIND_ADDR);
     assert_eq!(mcp.transport, McpTransport::Stdio);
-}
-
-// ---- connector credential isolation ----
-
-#[test]
-fn a_connector_reads_only_the_credentials_of_its_own_workspace() {
-    let config = parse(&full_config()).expect("the complete example should validate");
-    let own: Uuid = WORKSPACE.parse().expect("test constant is a uuid");
-    let other: Uuid = OTHER_WORKSPACE.parse().expect("test constant is a uuid");
-
-    assert_eq!(
-        config
-            .connectors
-            .secrets
-            .get(own, "PAYMENTS")
-            .expect("own credential")
-            .expose(),
-        "payments-credential"
-    );
-    assert_eq!(
-        config
-            .connectors
-            .secrets
-            .get(other, "PAYMENTS")
-            .expect("the other tenant's own credential")
-            .expose(),
-        "other-tenant-credential"
-    );
-    // The same name in two workspaces resolves to two different values, and neither workspace can
-    // reach the other's.
-    let error = config
-        .connectors
-        .secrets
-        .get(other, "SHIPPING")
-        .expect_err("SHIPPING belongs to the first workspace only");
-    assert!(error.to_string().contains(&other.to_string()), "{error}");
-    assert!(!error.to_string().contains("shipping-credential"), "{error}");
-
-    // A workspace nobody declared reaches nothing at all.
-    assert!(config.connectors.secrets.get(Uuid::new_v4(), "PAYMENTS").is_err());
-}
-
-#[test]
-fn reserved_and_malformed_credential_names_are_refused_at_load_time() {
-    let reported = issues(&format!(
-        r#"
-[database]
-url = "postgres://localhost/openpr"
-
-[auth]
-jwt_secret = "0123456789abcdef0123456789abcdef"
-
-[connectors.secrets."{WORKSPACE}"]
-JWT_SECRET = "stolen"
-AWS_SECRET_ACCESS_KEY = "stolen"
-lowercase = "bad shape"
-EMPTY = ""
-"#
-    ));
-    assert!(
-        reported
-            .iter()
-            .any(|issue| issue.contains("JWT_SECRET") && issue.contains("reserved")),
-        "{reported:?}"
-    );
-    assert!(
-        reported
-            .iter()
-            .any(|issue| issue.contains("AWS_SECRET_ACCESS_KEY") && issue.contains("reserved")),
-        "{reported:?}"
-    );
-    assert!(
-        reported
-            .iter()
-            .any(|issue| issue.contains("lowercase") && issue.contains("invalid")),
-        "{reported:?}"
-    );
-    assert!(
-        reported
-            .iter()
-            .any(|issue| issue.contains("EMPTY") && issue.contains("placeholder")),
-        "{reported:?}"
-    );
 }
 
 // ---- storage ----

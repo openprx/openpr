@@ -19,7 +19,6 @@ CLEAN_SCRIPT="$ROOT_DIR/scripts/clean.sh"
 TEST_API_SCRIPT="$ROOT_DIR/scripts/test-api.sh"
 TEST_MCP_SCRIPT="$ROOT_DIR/scripts/test-mcp.sh"
 BENCHMARK_SCRIPT="$ROOT_DIR/scripts/benchmark.sh"
-PRODUCTION_AUTOMATION_SMOKE="$ROOT_DIR/scripts/smoke-universal-forms-production-automation.mjs"
 PRODUCTION_OBJECT_STORAGE_SMOKE="$ROOT_DIR/scripts/smoke-universal-forms-production-object-storage.mjs"
 PRODUCTION_ATTACHMENT_LIFECYCLE_SMOKE="$ROOT_DIR/scripts/smoke-universal-forms-production-attachment-lifecycle.mjs"
 PRODUCTION_SIGNATURE_LIFECYCLE_SMOKE="$ROOT_DIR/scripts/smoke-universal-forms-production-signature-lifecycle.mjs"
@@ -165,7 +164,6 @@ for path in \
   "$TEST_API_SCRIPT" \
   "$TEST_MCP_SCRIPT" \
   "$BENCHMARK_SCRIPT" \
-  "$PRODUCTION_AUTOMATION_SMOKE" \
   "$PRODUCTION_OBJECT_STORAGE_SMOKE" \
   "$PRODUCTION_ATTACHMENT_LIFECYCLE_SMOKE" \
   "$PRODUCTION_SIGNATURE_LIFECYCLE_SMOKE" \
@@ -175,7 +173,6 @@ for path in \
   "$ROOT_DIR/scripts/ci-universal-forms-gates.sh"; do
   check_file "$path"
 done
-check_executable "$PRODUCTION_AUTOMATION_SMOKE"
 check_executable "$PRODUCTION_OBJECT_STORAGE_SMOKE"
 check_executable "$PRODUCTION_ATTACHMENT_LIFECYCLE_SMOKE"
 check_executable "$PRODUCTION_SIGNATURE_LIFECYCLE_SMOKE"
@@ -276,7 +273,7 @@ contains "env example documents MCP workspace placeholder" "$ROOT_DIR/.env.examp
 contains "README stdio MCP config targets API host port" "$ROOT_DIR/README.md" '"OPENPR_API_URL": "http://localhost:8081"'
 contains "README MCP stdio config uses serve subcommand" "$ROOT_DIR/README.md" '"args": ["serve", "--transport", "stdio"]'
 contains "MCP app README local examples target API host port" "$ROOT_DIR/apps/mcp-server/README.md" 'api_url = "http://localhost:8081"'
-contains "MCP app README documents current tool count" "$ROOT_DIR/apps/mcp-server/README.md" "106 MCP Tools"
+contains "MCP app README documents current tool count" "$ROOT_DIR/apps/mcp-server/README.md" "98 MCP Tools"
 contains "MCP app README documents three transports" "$ROOT_DIR/apps/mcp-server/README.md" "Three Transport Modes"
 contains "MCP app README documents SSE transport" "$ROOT_DIR/apps/mcp-server/README.md" "serve --transport sse"
 contains "MCP app README documents universal forms tools" "$ROOT_DIR/apps/mcp-server/README.md" "Universal Forms and Events"
@@ -302,13 +299,13 @@ not_contains "MCP app README does not claim auth is unenforced" "$ROOT_DIR/apps/
 not_contains "MCP app README does not list stale JWT TODO" "$ROOT_DIR/apps/mcp-server/README.md" "Implement JWT token validation"
 contains "MCP regression stdio path targets API host port" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" 'api_url = "http://localhost:8081"'
 contains "MCP regression stdio path uses serve subcommand" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" '[MCP_BIN,"serve","--transport","stdio","--config",MCP_CONFIG]'
-contains "MCP regression checks current 106-tool registry" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" "tools/list.registry_106"
-contains "MCP validation requires exact 106 tools" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 106 tools"
-contains "MCP skill guide documents current tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "enumerate all 106 tools"
+contains "MCP regression checks current 98-tool registry" "$ROOT_DIR/skills/openpr-mcp/scripts/mcp-regression.py" "tools/list.registry_98"
+contains "MCP validation requires exact 98 tools" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 98 tools"
+contains "MCP skill guide documents current tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "enumerate all 98 tools"
 not_contains "MCP skill guide does not retain stale 65-tool count" "$ROOT_DIR/skills/openpr-mcp/SKILL.md" "65 tools"
 not_contains "MCP validation does not retain stale 65-tool minimum" "$ROOT_DIR/skills/openpr-mcp/scripts/validate-mcp.sh" "-ge 65"
-contains "docs index documents current MCP server count" "$ROOT_DIR/docs/README.md" "MCP server (106 tools"
-contains "docs index documents current MCP regression count" "$ROOT_DIR/docs/README.md" "106-tool registry"
+contains "docs index documents current MCP server count" "$ROOT_DIR/docs/README.md" "MCP server (98 tools"
+contains "docs index documents current MCP regression count" "$ROOT_DIR/docs/README.md" "98-tool registry"
 contains "docs index links implementation map" "$ROOT_DIR/docs/README.md" "universal-forms-implementation-map.md"
 contains "readiness summary generator links implementation map" "$ROOT_DIR/scripts/report-universal-forms-readiness-summary.sh" "universal-forms-implementation-map.md"
 contains "user acceptance packet generator links implementation map" "$ROOT_DIR/scripts/prepare-universal-forms-user-acceptance-packet.sh" "universal-forms-implementation-map.md"
@@ -322,7 +319,7 @@ contains "README MCP HTTP example uses serve subcommand" "$ROOT_README" "./targe
 contains "MCP integration test uses current JSON-RPC endpoint" "$TEST_MCP_SCRIPT" "/mcp/rpc"
 contains "MCP integration test lists tools through JSON-RPC" "$TEST_MCP_SCRIPT" '"method":"tools/list"'
 contains "MCP integration test invokes tools through JSON-RPC" "$TEST_MCP_SCRIPT" '"method":"tools/call"'
-contains "MCP integration test expects exact current tool count" "$TEST_MCP_SCRIPT" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-106}"'
+contains "MCP integration test expects exact current tool count" "$TEST_MCP_SCRIPT" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-98}"'
 contains "MCP integration test rejects tool count drift" "$TEST_MCP_SCRIPT" 'expected exactly $EXPECTED_TOOL_COUNT'
 contains "MCP integration test checks form template tool" "$TEST_MCP_SCRIPT" "forms.create_from_template"
 contains "MCP integration test checks scenario template install tool" "$TEST_MCP_SCRIPT" "scenario_templates.install"
@@ -531,9 +528,7 @@ contains "runbook states PostgreSQL-only path" "$PRODUCTION_DOC" "Production is 
 contains "runbook includes event outbox audit requirement" "$PRODUCTION_DOC" 'Verify `event_outbox` has no growing backlog'
 contains "runbook includes restaurant acceptance scenario" "$PRODUCTION_DOC" 'Use `restaurant_ordering_default`'
 contains "runbook includes MCP smoke" "$PRODUCTION_DOC" "scripts/smoke-forms-mcp.sh"
-contains "runbook includes production automation smoke" "$PRODUCTION_DOC" "scripts/smoke-universal-forms-production-automation.mjs"
 contains "runbook documents real external automation endpoint" "$PRODUCTION_DOC" "OPENPR_AUTOMATION_ENDPOINT"
-contains "runbook documents automation receipt callback" "$PRODUCTION_DOC" "POST /api/v1/invocations/{invocation_id}/receipt"
 contains "runbook documents automation inbox diagnostics" "$PRODUCTION_DOC" "invocation-scoped and form-scoped inbox diagnostics"
 contains "runbook documents automation receiver 2xx-before-receipt ordering" "$PRODUCTION_DOC" "return a 2xx response to the worker dispatch before it"
 contains "runbook includes production object-storage smoke" "$PRODUCTION_DOC" "scripts/smoke-universal-forms-production-object-storage.mjs"

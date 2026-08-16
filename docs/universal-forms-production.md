@@ -452,41 +452,23 @@ Smoke command:
 scripts/smoke-universal-forms-production-signature-lifecycle.mjs
 ```
 
-## Webhooks And Connectors
+## Webhooks
 
 Webhooks are generic event consumers. They do not have to be agents.
 
-Production connector checks:
+Production webhook checks:
 
-- `webhook`, `rest`, `mcp`, `openprx_tunnel`, `print`, `device`, and `cli` connector kinds are accepted by the API contract.
-- Worker routes by event type, project type, form key, and connector kind.
-- Print/device connectors have reachable local or network receivers.
-- Optional webhook receiver containers are started only when the deployment enables the `connectors` compose profile.
-- Receipts write to `event_inbox` and are idempotent by source and idempotency key.
-- Failed delivery increments attempts and can be retried from `event_outbox`.
-
-Production external automation acceptance uses the deployed API, worker, and a
-real external receiver. Set `OPENPR_AUTOMATION_ENDPOINT` to a connector endpoint
-reachable by the deployed worker, then run
-`scripts/smoke-universal-forms-production-automation.mjs`. The script creates a
-temporary connector and form-triggered invocation, waits for worker dispatch
-diagnostics, then requires the external receiver to call back with
-`POST /api/v1/invocations/{invocation_id}/receipt`. A passing run proves the
-same receipt row appears in invocation-scoped and form-scoped inbox diagnostics,
-and that the project invocation list shows the completed connector
-invocation. Use `OPENPR_AUTOMATION_CLEANUP=0` when operators need to inspect the
-temporary connector/form after a failed run.
-The receiver should return a 2xx response to the worker dispatch before it
-posts the completed receipt callback; otherwise a fast callback can complete the
-invocation before the worker writes delivery diagnostics.
+- API CRUD persists webhook definitions without mirroring them into another table.
+- Signed delivery is verified by the external webhook consumer.
+- Optional webhook receiver containers are started only when the deployment enables its compose profile.
+- Generic webhook delivery is verified independently of bot operation records.
 
 Smoke commands:
 
 ```bash
 scripts/smoke-webhook-generic-consumer.sh
 scripts/smoke-universal-forms-api.sh
-scripts/smoke-restaurant-ordering.sh
-OPENPR_AUTOMATION_ENDPOINT=https://receiver.example/connector scripts/smoke-universal-forms-production-automation.mjs
+bun --cwd frontend run smoke:restaurant-ordering
 ```
 
 ## WASM Plugins

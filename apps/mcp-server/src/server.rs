@@ -4,20 +4,17 @@ use crate::tools;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (106)
+## Tools (98)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
 ### Scenario Templates: scenario_templates.list, scenario_templates.get, scenario_templates.install
 ### Project Resources: project_resources.list, project_resources.create, project_resources.update, project_resources.delete
 ### Context: context.get_project, context.get_governance, context.get_agent_policy
-### Connectors: connectors.list, connectors.get
-### Invocations: invocations.list, invocations.get, invocations.create, invocations.report_progress, invocations.complete, invocations.fail
 ### Universal Forms: forms.list, forms.get, forms.create, forms.create_from_template, forms.update_schema, forms.duplicate, forms.schema_summary, forms.field_usage, forms.field_dependencies, form_schema_versions.list, form_schema_versions.get, form_permissions.get, form_permissions.update, form_views.list, form_attachments.list, form_attachments.create, form_attachments.archive, form_attachments.restore, form_records.list, form_records.export, form_records.import_preview, form_records.import_commit, form_records.get, form_records.create, form_records.update, form_records.link, form_records.relation_targets, form_records.children, form_records.child_create, form_records.child_update, form_records.child_archive, form_records.child_restore, form_records.aggregate, events.tail
 ### Plugins: plugins.list, plugins.get, plugins.install, plugins.invoke, plugin_invocations.list
 ### Work Items: work_items.list, work_items.get, work_items.get_by_identifier, work_items.create, work_items.update, work_items.delete, work_items.search, work_items.add_label, work_items.add_labels, work_items.remove_label, work_items.list_labels
@@ -130,10 +127,6 @@ enum OwnerLookup {
     WorkItemIdentifier,
     /// `plugin_id` -> `GET /api/v1/plugins/{id}`.
     Plugin,
-    /// `invocation_id` -> `GET /api/v1/invocations/{id}`.
-    Invocation,
-    /// `connector_id` -> `GET /api/v1/workspaces/{workspace_id}/connectors/{id}`.
-    Connector,
     /// `check_result_id` -> `GET /api/v1/check-results/{id}`.
     CheckResult,
     /// `sprint_id`. Sprints are project owned (`migrations/0004_sprints.sql`) but the
@@ -153,8 +146,6 @@ impl OwnerLookup {
             Self::WorkItem => "work_item_id",
             Self::WorkItemIdentifier => "identifier",
             Self::Plugin => "plugin_id",
-            Self::Invocation => "invocation_id",
-            Self::Connector => "connector_id",
             Self::CheckResult => "check_result_id",
             Self::Sprint => "sprint_id",
             Self::Comment => "comment_id",
@@ -169,15 +160,13 @@ impl OwnerLookup {
 /// labels carry no project column (`migrations/0012_governance_phase1.sql`,
 /// `migrations/0003_labels.sql`), and `resource_id` only ever appears next to a
 /// `project_id` that already scopes the request path.
-const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 11] = [
+const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 9] = [
     ("record_id", OwnerLookup::FormData),
     ("form_id", OwnerLookup::FormData),
     ("attachment_id", OwnerLookup::FormData),
     ("work_item_id", OwnerLookup::WorkItem),
     ("identifier", OwnerLookup::WorkItemIdentifier),
     ("plugin_id", OwnerLookup::Plugin),
-    ("invocation_id", OwnerLookup::Invocation),
-    ("connector_id", OwnerLookup::Connector),
     ("check_result_id", OwnerLookup::CheckResult),
     ("sprint_id", OwnerLookup::Sprint),
     ("comment_id", OwnerLookup::Comment),
@@ -189,7 +178,7 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 11] = [
 /// this table from the live tool registry (`tools::get_all_tool_definitions`), so a new
 /// or renamed tool cannot silently land outside the policy gate — including tools whose
 /// name shares no prefix with the family they belong to, such as `events.tail`.
-const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 106] = [
+const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 98] = [
     ("projects.list", PolicyScope::WorkspaceWide),
     ("projects.get", PolicyScope::DeclaredProject { required: true }),
     ("projects.create", PolicyScope::WorkspaceWide),
@@ -219,17 +208,6 @@ const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 106] = [
         "project_resources.delete",
         PolicyScope::DeclaredProject { required: true },
     ),
-    ("connectors.list", PolicyScope::DeclaredProject { required: true }),
-    ("connectors.get", PolicyScope::OwnedBy(OwnerLookup::Connector)),
-    ("invocations.list", PolicyScope::DeclaredProject { required: true }),
-    ("invocations.get", PolicyScope::OwnedBy(OwnerLookup::Invocation)),
-    ("invocations.create", PolicyScope::DeclaredProject { required: true }),
-    (
-        "invocations.report_progress",
-        PolicyScope::OwnedBy(OwnerLookup::Invocation),
-    ),
-    ("invocations.complete", PolicyScope::OwnedBy(OwnerLookup::Invocation)),
-    ("invocations.fail", PolicyScope::OwnedBy(OwnerLookup::Invocation)),
     ("forms.list", PolicyScope::DeclaredProject { required: true }),
     ("forms.get", PolicyScope::OwnedBy(OwnerLookup::FormData)),
     ("forms.create", PolicyScope::DeclaredProject { required: true }),
@@ -358,9 +336,8 @@ const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 106] = [
     ),
 ];
 
-/// Scope of one tool. Unregistered names are connector provided tools dispatched by
-/// `tools::connectors::invoke_connector_tool`, which requires a `project_id` itself, so
-/// they are governed as mandatory declared-project calls rather than skipped.
+/// Scope of one registered tool. Unknown names fail closed as mandatory
+/// declared-project calls before dispatch rejects them.
 fn tool_policy_scope(tool_name: &str) -> PolicyScope {
     TOOL_POLICY_SCOPES
         .iter()
@@ -493,9 +470,7 @@ impl McpServer {
             Some(project_id) => match self.client.get_project_agent_policy(&project_id).await {
                 Ok(policy) => match tools::capabilities::extract_enabled_tool_names(&policy) {
                     Some(enabled_tool_names) => {
-                        let mut all_tools = static_tools;
-                        all_tools.extend(tools::capabilities::extract_connector_tool_definitions(&policy));
-                        let missing = tools::capabilities::unknown_tool_names(&all_tools, &enabled_tool_names);
+                        let missing = tools::capabilities::unknown_tool_names(&static_tools, &enabled_tool_names);
                         if !missing.is_empty() {
                             tracing::warn!(
                                 project_id = %project_id,
@@ -503,7 +478,7 @@ impl McpServer {
                                 "Project agent policy references tools not registered by this MCP server"
                             );
                         }
-                        tools::capabilities::filter_tool_definitions(all_tools, &enabled_tool_names)
+                        tools::capabilities::filter_tool_definitions(static_tools, &enabled_tool_names)
                     }
                     None => static_tools,
                 },
@@ -557,20 +532,14 @@ impl McpServer {
     }
 
     pub async fn call_tool(&self, name: &str, args: Value) -> CallToolResult {
-        let started = Instant::now();
-        let audit_args = redact_tool_arguments(&args);
         let scoped = Self {
             client: self.client.recording_operation(name),
             project_id_cache: Arc::clone(&self.project_id_cache),
         };
-        let result = match scoped.enforce_project_tool_policy(name, &args).await {
+        match scoped.enforce_project_tool_policy(name, &args).await {
             Ok(()) => scoped.execute_tool(name, args).await,
             Err(error) => CallToolResult::error(error),
-        };
-        scoped
-            .report_tool_call_audit(name, audit_args, &result, started.elapsed().as_millis())
-            .await;
-        result
+        }
     }
 
     /// Dispatches a tool *after* it has been authorized. Private on purpose: `call_tool`
@@ -595,14 +564,6 @@ impl McpServer {
             "project_resources.create" => tools::project_types::create_project_resource(&self.client, args).await,
             "project_resources.update" => tools::project_types::update_project_resource(&self.client, args).await,
             "project_resources.delete" => tools::project_types::delete_project_resource(&self.client, args).await,
-            "connectors.list" => tools::connectors::list_connectors(&self.client, args).await,
-            "connectors.get" => tools::connectors::get_connector(&self.client, args).await,
-            "invocations.list" => tools::connectors::list_invocations(&self.client, args).await,
-            "invocations.get" => tools::connectors::get_invocation(&self.client, args).await,
-            "invocations.create" => tools::connectors::create_invocation(&self.client, args).await,
-            "invocations.report_progress" => tools::connectors::report_invocation_progress(&self.client, args).await,
-            "invocations.complete" => tools::connectors::complete_invocation(&self.client, args).await,
-            "invocations.fail" => tools::connectors::fail_invocation(&self.client, args).await,
             "forms.list" => tools::forms::list_forms(&self.client, args).await,
             "forms.get" => tools::forms::get_form(&self.client, args).await,
             "forms.create" => tools::forms::create_form(&self.client, args).await,
@@ -704,7 +665,7 @@ impl McpServer {
             "inspection.report" => tools::scenario_tools::inspection_report(&self.client, args).await,
             "corrective_action.propose" => tools::scenario_tools::corrective_action_propose(&self.client, args).await,
 
-            _ => tools::connectors::invoke_connector_tool(&self.client, name, args).await,
+            _ => CallToolResult::error(format!("Unknown tool: {name}")),
         }
     }
 
@@ -811,8 +772,6 @@ impl McpServer {
                 let (prefix, kind) = match lookup {
                     OwnerLookup::WorkItem => ("work_item", "work item"),
                     OwnerLookup::Plugin => ("plugin", "plugin"),
-                    OwnerLookup::Invocation => ("invocation", "invocation"),
-                    OwnerLookup::Connector => ("connector", "connector"),
                     _ => ("check_result", "check result"),
                 };
                 let cache_key = format!("{prefix}:{id}");
@@ -823,8 +782,6 @@ impl McpServer {
                 let response = match lookup {
                     OwnerLookup::WorkItem => self.client.get_work_item(&id).await,
                     OwnerLookup::Plugin => self.client.get_plugin(&id).await,
-                    OwnerLookup::Invocation => self.client.get_invocation(&id).await,
-                    OwnerLookup::Connector => self.client.get_connector(&id).await,
                     _ => self.client.get_check_result(&id).await,
                 }
                 .map_err(|error| format!("Failed to resolve owning project for {description}: {error}"))?;
@@ -1061,38 +1018,6 @@ impl McpServer {
         }
     }
 
-    async fn report_tool_call_audit(
-        &self,
-        tool_name: &str,
-        arguments: Value,
-        result: &CallToolResult,
-        duration_ms: u128,
-    ) {
-        let Some(invocation_id) = self.client.invocation_id().map(str::to_string) else {
-            return;
-        };
-
-        let is_error = result.is_error.unwrap_or(false);
-        let payload = json!({
-            "tool_name": tool_name,
-            "transport": self.client.transport_label(),
-            "status": if is_error { "failed" } else { "succeeded" },
-            "arguments": arguments,
-            "result_summary": summarize_tool_result(result),
-            "error_message": if is_error { summarize_tool_result(result) } else { None },
-            "duration_ms": i64::try_from(duration_ms).unwrap_or(i64::MAX)
-        });
-
-        if let Err(error) = self.client.report_invocation_tool_call(&invocation_id, payload).await {
-            tracing::warn!(
-                invocation_id = %invocation_id,
-                tool_name = %tool_name,
-                error = %error,
-                "Failed to report MCP tool-call audit"
-            );
-        }
-    }
-
     #[allow(clippy::unused_self)]
     fn handle_initialize(&self, id: Option<Value>) -> JsonRpcResponse {
         let result = json!({
@@ -1160,10 +1085,9 @@ impl McpServer {
     /// The URI templates a client can expand.
     ///
     /// Not policy filtered, for the same reason as `handle_resources_list`: a template is
-    /// a `{project_id}` placeholder, never a project. Knowing that
-    /// `openpr://projects/{project_id}/connectors` exists grants nothing, because
-    /// expanding it lands in `handle_resources_read`, which resolves the real owner and
-    /// refuses when the policy does.
+    /// a `{project_id}` placeholder, never a project. Expanding it lands in
+    /// `handle_resources_read`, which resolves the real owner and refuses when the policy
+    /// does.
     #[allow(clippy::unused_self)]
     fn handle_resources_templates_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let templates = vec![
@@ -1218,7 +1142,7 @@ impl McpServer {
             json!({
                 "uriTemplate": "openpr://projects/{project_id}/context",
                 "name": "Project Context",
-                "description": "Read project type, resources, connectors, governance, workflow, and policy in one context payload",
+                "description": "Read project type, resources, governance, workflow, and policy in one context payload",
                 "mimeType": "application/json"
             }),
             json!({
@@ -1249,18 +1173,6 @@ impl McpServer {
                 "uriTemplate": "openpr://projects/{project_id}/resources",
                 "name": "Project Resources",
                 "description": "Read project resources such as repositories, directories, documents, equipment, or business records",
-                "mimeType": "application/json"
-            }),
-            json!({
-                "uriTemplate": "openpr://projects/{project_id}/connectors",
-                "name": "Project Connectors",
-                "description": "Read project automation connectors such as webhook, MCP, REST, CLI, or OpenPRX tunnel",
-                "mimeType": "application/json"
-            }),
-            json!({
-                "uriTemplate": "openpr://projects/{project_id}/invocations",
-                "name": "Project Invocations",
-                "description": "Read AI execution invocation ledger entries for a project",
                 "mimeType": "application/json"
             }),
             json!({
@@ -1300,10 +1212,7 @@ impl McpServer {
 
         // `resources/read` serves the same project owned payloads `tools/call` does, so it
         // is gated by the same project agent policy. Without this the resource door is a
-        // complete bypass of every capability an administrator disabled on the tool door:
-        // `openpr://projects/{id}/connectors` returned the connector list, endpoints and
-        // `auth_policy` blobs included, for a project whose policy refuses
-        // `connectors.list`.
+        // complete bypass of every capability an administrator disabled on the tool door.
         if let Err(error) = self.enforce_resource_read_policy(&uri).await {
             tracing::warn!(
                 uri = %sanitize_for_error(&uri),
@@ -1651,44 +1560,6 @@ impl McpServer {
             };
         }
 
-        if let Some(project_id) = parse_project_resource_uri(&uri, "/connectors") {
-            return match self.client.list_connectors(project_id, None).await {
-                Ok(connectors) => JsonRpcResponse::success(
-                    id,
-                    json!({
-                        "contents": [{
-                            "uri": uri,
-                            "mimeType": "application/json",
-                            "text": connectors.to_string()
-                        }]
-                    }),
-                ),
-                Err(error) => JsonRpcResponse::error(
-                    id,
-                    JsonRpcError::internal_error(format!("Failed to read project connectors: {error}")),
-                ),
-            };
-        }
-
-        if let Some(project_id) = parse_project_resource_uri(&uri, "/invocations") {
-            return match self.client.list_invocations(project_id, None, None, None).await {
-                Ok(invocations) => JsonRpcResponse::success(
-                    id,
-                    json!({
-                        "contents": [{
-                            "uri": uri,
-                            "mimeType": "application/json",
-                            "text": invocations.to_string()
-                        }]
-                    }),
-                ),
-                Err(error) => JsonRpcResponse::error(
-                    id,
-                    JsonRpcError::internal_error(format!("Failed to read project invocations: {error}")),
-                ),
-            };
-        }
-
         if let Some(project_id) = parse_project_resource_uri(&uri, "/recent-decisions") {
             return match self.client.get_project_governance_context(project_id).await {
                 Ok(governance) => {
@@ -1763,7 +1634,7 @@ impl McpServer {
 /// `/recent-decisions` maps to `context.get_governance` because that is the call it is
 /// served from: it reads the governance context and returns one field of it, so it can
 /// carry no weaker authorization than the whole document does.
-const PROJECT_RESOURCE_POLICY_TOOLS: [(&str, &str); 12] = [
+const PROJECT_RESOURCE_POLICY_TOOLS: [(&str, &str); 10] = [
     ("/issues", "work_items.list"),
     ("/forms", "forms.list"),
     ("/context", "context.get_project"),
@@ -1772,8 +1643,6 @@ const PROJECT_RESOURCE_POLICY_TOOLS: [(&str, &str); 12] = [
     ("/release-readiness", "release.readiness.get"),
     ("/type", "projects.get"),
     ("/resources", "project_resources.list"),
-    ("/connectors", "connectors.list"),
-    ("/invocations", "invocations.list"),
     ("/recent-decisions", "context.get_governance"),
     ("/sprints", "sprints.list"),
 ];
@@ -2093,7 +1962,7 @@ fn claimed_project_ids(args: &Value) -> Vec<String> {
 /// project type's capabilities (`apps/api/src/routes/context.rs` `build_agent_policy` ->
 /// `build_mcp_tool_registry`), which always emits the array — at minimum the unconditional
 /// `core` group — so a live API answer always takes the `contains` branch. A project whose
-/// type does not enable the `webhook` capability really does get `connectors.list` refused.
+/// type does not enable a capability really does get its corresponding tools refused.
 ///
 /// The fallback therefore only fires when the field is missing altogether: an API older or
 /// newer than this binary, or a policy payload reshaped in transit. Failing closed there
@@ -2105,6 +1974,7 @@ fn is_tool_enabled_by_policy(policy_response: &Value, tool_name: &str) -> bool {
     tools::capabilities::extract_enabled_tool_names(policy_response).is_none_or(|enabled| enabled.contains(tool_name))
 }
 
+#[cfg(test)]
 fn summarize_tool_result(result: &CallToolResult) -> Option<String> {
     let text = result.content.iter().find_map(|item| match item {
         crate::protocol::ToolContent::Text { text } => Some(text.as_str()),
@@ -2117,6 +1987,7 @@ fn summarize_tool_result(result: &CallToolResult) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn redact_tool_arguments(args: &Value) -> Value {
     match args {
         Value::Object(map) => Value::Object(
@@ -2215,7 +2086,7 @@ mod tests {
 
     #[test]
     fn embedded_skill_guide_matches_registered_universal_tool_surface() {
-        assert!(SKILL_GUIDE_MD.contains("## Tools (106)"));
+        assert!(SKILL_GUIDE_MD.contains("## Tools (98)"));
         assert!(SKILL_GUIDE_MD.contains("bot_operation_logs.list"));
         assert!(SKILL_GUIDE_MD.contains("scenario_templates.install"));
         assert!(SKILL_GUIDE_MD.contains("forms.list"));
@@ -2375,11 +2246,10 @@ mod tests {
 
             let expected = if properties.contains_key("project_id") {
                 // Deliberately *not* `required: required.contains("project_id")`. Deriving
-                // the flag from the schema is what let `connectors.list` ship as
-                // `required: false`: an optional `project_id` means the caller picks
-                // whether the project agent policy applies, and omitting it degrades the
-                // call into a workspace wide read. A tool that accepts a `project_id` is
-                // always gated on one; `declared_project_id_is_mandatory_for_every_project_scoped_tool`
+                // the flag from the schema would let an optional `project_id` make the
+                // caller choose whether project policy applies, degrading an omitted id
+                // into a workspace-wide read. A tool that accepts a `project_id` is always
+                // gated on one; `declared_project_id_is_mandatory_for_every_project_scoped_tool`
                 // holds the other half of the invariant on the schema itself.
                 PolicyScope::DeclaredProject { required: true }
             } else if let Some((_, lookup)) = OWNERSHIP_ARGUMENTS
@@ -2418,8 +2288,6 @@ mod tests {
             "sprints.delete",
             "form_records.update",
             "plugins.invoke",
-            "invocations.complete",
-            "connectors.get",
             "proposals.create_from_result",
             "events.tail",
         ] {
@@ -2430,7 +2298,7 @@ mod tests {
             );
         }
 
-        // An unregistered name is a connector provided tool and needs a project id.
+        // Unknown names fail closed before dispatch rejects them.
         assert_eq!(
             tool_policy_scope("acme.deploy"),
             PolicyScope::DeclaredProject { required: true }
@@ -2440,9 +2308,7 @@ mod tests {
     /// `PolicyScope::DeclaredProject { required: false }` is a bypass, not a relaxation:
     /// `resolve_policy_project_id` answers `Ok(None)` for it and `enforce_project_tool_policy`
     /// then returns `Ok(())` without reading any policy, while the tool itself still runs
-    /// against a workspace addressed endpoint. `connectors.list` shipped that way and
-    /// returned every connector in the workspace to any caller that simply left
-    /// `project_id` out.
+    /// against a workspace addressed endpoint.
     ///
     /// The invariant is checked against the *live registry*, not against a name list, so a
     /// tool added later with an optional `project_id` fails here instead of shipping as a
@@ -2923,8 +2789,8 @@ mod tests {
     }
 
     /// The round-2 gap: everything outside the form family ran with no project policy at
-    /// all. Work items, comments, plugins, invocations, connectors and check results are
-    /// now resolved back to their owning project exactly like form data.
+    /// all. Work items, comments, plugins and check results are now resolved back to their
+    /// owning project exactly like form data.
     #[tokio::test]
     async fn id_addressed_non_form_tools_are_governed_by_the_owning_project() -> TestResult {
         let mutations = Arc::new(AtomicUsize::new(0));
@@ -3149,111 +3015,6 @@ mod tests {
         Ok(())
     }
 
-    /// `connectors.list` shipped as `DeclaredProject { required: false }`. Omitting
-    /// `project_id` made `resolve_policy_project_id` answer `Ok(None)`, which skipped the
-    /// policy load entirely, while the tool still called the workspace addressed endpoint
-    /// and returned every connector in the workspace — endpoints and auth policy
-    /// references included. The refusal has to happen *before* the API is touched, so the
-    /// backend hit counter is part of the assertion.
-    #[tokio::test]
-    async fn connectors_list_without_a_project_id_never_reaches_the_workspace_endpoint() -> TestResult {
-        let connector_hits = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&connector_hits);
-        let queries = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
-        let seen = Arc::clone(&queries);
-
-        let router = Router::new()
-            .route(
-                "/api/v1/workspaces/workspace-1/connectors",
-                get(move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
-                    let counter = Arc::clone(&counter);
-                    let seen = Arc::clone(&seen);
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        seen.lock().await.push(query.unwrap_or_default());
-                        Json(json!({
-                            "code": 0,
-                            "data": { "items": [{
-                                "id": RESOURCE,
-                                "kind": "webhook",
-                                "endpoint": "https://internal.example/hooks/payroll",
-                                "auth_policy": { "secret_ref": "OPENPR_CONNECTOR_SECRET_W_X_DEFAULT" }
-                            }] }
-                        }))
-                    }
-                }),
-            )
-            .route(
-                &format!("/api/v1/projects/{PROJECT}/agent-policy"),
-                policy_route(json!(["connectors.list"])),
-            );
-        let server = server(crate::client::test_api::spawn(router).await?)?;
-
-        for bypass in [json!({}), json!({ "kind": "webhook" }), json!({ "project_id": null })] {
-            let refused = server.call_tool("connectors.list", bypass.clone()).await;
-            assert_eq!(refused.is_error, Some(true), "{bypass} was not refused");
-            assert!(
-                message(&refused).contains("requires a project_id"),
-                "{}",
-                message(&refused)
-            );
-        }
-        assert_eq!(
-            connector_hits.load(Ordering::SeqCst),
-            0,
-            "a refused call must never reach the workspace connector endpoint"
-        );
-
-        // Naming the project loads that project's policy and scopes the backend query.
-        let allowed = server
-            .call_tool("connectors.list", json!({ "project_id": PROJECT }))
-            .await;
-        assert_eq!(allowed.is_error, None, "{}", message(&allowed));
-        assert_eq!(connector_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            queries.lock().await.as_slice(),
-            [format!("project_id={PROJECT}")],
-            "the declared project must reach the API as the filter it was authorized against"
-        );
-        Ok(())
-    }
-
-    /// The declared project is not just a formality: a project whose agent policy does not
-    /// enable the tool is refused, which is the whole point of making the id mandatory.
-    #[tokio::test]
-    async fn connectors_list_is_denied_by_the_declared_project_policy() -> TestResult {
-        let connector_hits = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&connector_hits);
-        let router = Router::new()
-            .route(
-                "/api/v1/workspaces/workspace-1/connectors",
-                get(move || {
-                    let counter = Arc::clone(&counter);
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        Json(json!({ "code": 0, "data": { "items": [] } }))
-                    }
-                }),
-            )
-            .route(
-                &format!("/api/v1/projects/{PROJECT}/agent-policy"),
-                policy_route(json!(["work_items.list"])),
-            );
-        let server = server(crate::client::test_api::spawn(router).await?)?;
-
-        let denied = server
-            .call_tool("connectors.list", json!({ "project_id": PROJECT }))
-            .await;
-        assert_eq!(denied.is_error, Some(true));
-        assert!(
-            message(&denied).contains("disabled by project agent policy"),
-            "{}",
-            message(&denied)
-        );
-        assert_eq!(connector_hits.load(Ordering::SeqCst), 0);
-        Ok(())
-    }
-
     /// Every `Ok(_) => success("... deleted")` call site must still report backend
     /// failures, because the API answers HTTP 200 and carries the real status in the
     /// response envelope.
@@ -3394,8 +3155,6 @@ mod tests {
                 format!("openpr://projects/{PROJECT}/resources"),
                 "project_resources.list",
             ),
-            (format!("openpr://projects/{PROJECT}/connectors"), "connectors.list"),
-            (format!("openpr://projects/{PROJECT}/invocations"), "invocations.list"),
             (
                 format!("openpr://projects/{PROJECT}/recent-decisions"),
                 "context.get_governance",
@@ -3496,9 +3255,9 @@ mod tests {
     #[test]
     fn resource_uris_carrying_an_unparsable_id_are_refused() {
         for uri in [
-            "openpr://projects/not-a-uuid/connectors",
+            "openpr://projects/not-a-uuid/resources",
             &format!("openpr://projects/{PROJECT}%2Fpad/agent-policy"),
-            &format!("openpr://projects/{PROJECT}?pad=/connectors"),
+            &format!("openpr://projects/{PROJECT}?pad=/resources"),
             "openpr://forms/not-a-uuid/records",
             "openpr://form-records/not-a-uuid/events",
             "openpr://issues/PRX 42",
@@ -3520,7 +3279,7 @@ mod tests {
         // Any API call would fail outright: nothing listens on this port.
         let server = server("http://127.0.0.1:1".to_string())?;
         for uri in [
-            "openpr://projects/../../admin/connectors",
+            "openpr://projects/../../admin/resources",
             "openpr://forms/../../workspaces/records",
             "openpr://form-records/a/b/events",
         ] {
@@ -3535,94 +3294,6 @@ mod tests {
             let body = serde_json::to_string(&response)?;
             assert!(body.contains("Unknown resource URI"), "{uri} -> {body}");
         }
-        Ok(())
-    }
-
-    /// The regression itself: a project whose policy refuses `connectors.list` must not be
-    /// able to hand back the same connector list through `resources/read`, and the refusal
-    /// must not reach the connector endpoint at all.
-    #[tokio::test]
-    async fn a_disabled_tool_cannot_be_reached_through_the_resource_door() -> TestResult {
-        let connector_hits = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&connector_hits);
-        let router = Router::new()
-            .route(
-                "/api/v1/projects/{project_id}/agent-policy",
-                policy_route(json!(["work_items.list"])),
-            )
-            .route(
-                "/api/v1/workspaces/{workspace_id}/connectors",
-                get(move || {
-                    let counter = Arc::clone(&counter);
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        Json(json!({
-                            "code": 0,
-                            "data": [{ "name": "payroll-webhook", "auth_policy": { "secret_ref": "TOP_SECRET" } }]
-                        }))
-                    }
-                }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
-
-        let server = server(format!("http://{addr}"))?;
-        let response = server
-            .handle_resources_read(
-                Some(json!(1)),
-                Some(json!({ "uri": format!("openpr://projects/{PROJECT}/connectors") })),
-            )
-            .await;
-
-        let error = serde_json::to_string(&response)?;
-        assert!(
-            error.contains("disabled by project agent policy"),
-            "resources/read was not refused: {error}"
-        );
-        assert!(
-            !error.contains("payroll-webhook") && !error.contains("TOP_SECRET"),
-            "the refusal leaked connector data: {error}"
-        );
-        assert_eq!(
-            connector_hits.load(Ordering::SeqCst),
-            0,
-            "a refused resources/read still reached the connector endpoint"
-        );
-        Ok(())
-    }
-
-    /// The same door still works for a project whose policy enables the tool, so the gate
-    /// is a policy check and not a blanket denial.
-    #[tokio::test]
-    async fn the_resource_door_still_serves_a_policy_enabled_project() -> TestResult {
-        let router = Router::new()
-            .route(
-                "/api/v1/projects/{project_id}/agent-policy",
-                policy_route(json!(["connectors.list"])),
-            )
-            .route(
-                "/api/v1/workspaces/{workspace_id}/connectors",
-                get(|| async { Json(json!({ "code": 0, "data": [{ "name": "payroll-webhook" }] })) }),
-            );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let addr = listener.local_addr()?;
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
-        });
-
-        let server = server(format!("http://{addr}"))?;
-        let response = server
-            .handle_resources_read(
-                Some(json!(1)),
-                Some(json!({ "uri": format!("openpr://projects/{PROJECT}/connectors") })),
-            )
-            .await;
-
-        let body = serde_json::to_string(&response)?;
-        assert!(body.contains("payroll-webhook"), "authorized read was refused: {body}");
         Ok(())
     }
 

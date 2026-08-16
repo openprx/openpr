@@ -62,11 +62,8 @@ pub async fn get_project_release_readiness(
     ensure_project_access(&state, &claims, bot.as_ref().map(|b| &b.0), project.workspace_id).await?;
 
     let pending_ai_tasks = count_pending_ai_tasks(&state, project_id).await?;
-    let active_invocations = count_invocations(&state, project_id, &["pending", "dispatched", "running"]).await?;
-    let failed_invocations = count_invocations(&state, project_id, &["failed"]).await?;
     let pending_check_results = count_check_results(&state, project_id, &["requires_proposal", "proposed"]).await?;
-    let failed_connector_deliveries =
-        count_failed_connector_deliveries(&state, project.workspace_id, project_id).await?;
+    let failed_webhook_deliveries = count_failed_webhook_deliveries(&state, project.workspace_id, project_id).await?;
     let stale_resources = count_stale_resources(&state, project_id).await?;
     let audit_events = count_audit_events(&state, project_id).await?;
     let result_artifacts = count_result_artifacts(&state, project_id).await?;
@@ -79,28 +76,16 @@ pub async fn get_project_release_readiness(
             "pending, processing, and retried AI tasks must be closed",
         ),
         gate(
-            "no_active_invocations",
-            "No active invocations",
-            active_invocations,
-            "pending, dispatched, and running invocations must be closed",
-        ),
-        gate(
-            "no_failed_invocations",
-            "No failed invocations",
-            failed_invocations,
-            "failed invocations require review before release",
-        ),
-        gate(
             "no_pending_governance_results",
             "No pending governed check results",
             pending_check_results,
             "requires_proposal and proposed check results must be resolved",
         ),
         gate(
-            "no_failed_connector_deliveries",
-            "No failed connector deliveries",
-            failed_connector_deliveries,
-            "connector/webhook delivery errors must be reviewed",
+            "no_failed_webhook_deliveries",
+            "No failed webhook deliveries",
+            failed_webhook_deliveries,
+            "webhook delivery errors must be reviewed",
         ),
         gate(
             "no_stale_resources",
@@ -118,7 +103,7 @@ pub async fn get_project_release_readiness(
             "result_artifact_present",
             "AI/result artifact present",
             result_artifacts,
-            "at least one comment, check result, or invocation result should exist",
+            "at least one comment or check result should exist",
         ),
     ];
     let blockers = gates
@@ -139,10 +124,8 @@ pub async fn get_project_release_readiness(
         "next_actions": next_actions,
         "metrics": [
             ReadinessMetric { key: "pending_ai_tasks", value: pending_ai_tasks },
-            ReadinessMetric { key: "active_invocations", value: active_invocations },
-            ReadinessMetric { key: "failed_invocations", value: failed_invocations },
             ReadinessMetric { key: "pending_check_results", value: pending_check_results },
-            ReadinessMetric { key: "failed_connector_deliveries", value: failed_connector_deliveries },
+            ReadinessMetric { key: "failed_webhook_deliveries", value: failed_webhook_deliveries },
             ReadinessMetric { key: "stale_resources", value: stale_resources },
             ReadinessMetric { key: "governance_audit_events", value: audit_events },
             ReadinessMetric { key: "result_artifacts", value: result_artifacts },
@@ -196,10 +179,9 @@ fn next_action_actor(gate_key: &str) -> &'static str {
 fn next_action_tool(gate_key: &str) -> &'static str {
     match gate_key {
         "no_pending_ai_tasks" => "context.get_governance",
-        "no_active_invocations" | "no_failed_invocations" | "no_failed_connector_deliveries" => "invocations.list",
+        "no_failed_webhook_deliveries" | "audit_trail_present" => "context.get_project",
         "no_pending_governance_results" | "result_artifact_present" => "check_results.create",
         "no_stale_resources" => "project_resources.list",
-        "audit_trail_present" => "context.get_project",
         _ => "release.readiness.get",
     }
 }
@@ -280,27 +262,6 @@ async fn count_pending_ai_tasks(state: &AppState, project_id: Uuid) -> Result<i6
     .await
 }
 
-async fn count_invocations(state: &AppState, project_id: Uuid, statuses: &[&str]) -> Result<i64, ApiError> {
-    let status_values = statuses
-        .iter()
-        .map(|status| format!("'{status}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    count_query(
-        state,
-        &format!(
-            r"
-                SELECT COUNT(*)::bigint AS count
-                FROM agent_invocations
-                WHERE project_id = $1
-                  AND status IN ({status_values})
-            "
-        ),
-        vec![project_id.into()],
-    )
-    .await
-}
-
 async fn count_check_results(state: &AppState, project_id: Uuid, statuses: &[&str]) -> Result<i64, ApiError> {
     let status_values = statuses
         .iter()
@@ -322,7 +283,7 @@ async fn count_check_results(state: &AppState, project_id: Uuid, statuses: &[&st
     .await
 }
 
-async fn count_failed_connector_deliveries(
+async fn count_failed_webhook_deliveries(
     state: &AppState,
     workspace_id: Uuid,
     project_id: Uuid,
@@ -382,13 +343,6 @@ async fn count_result_artifacts(state: &AppState, project_id: Uuid) -> Result<i6
                 SELECT COUNT(*)::bigint
                 FROM check_results
                 WHERE project_id = $1
-              )
-              +
-              (
-                SELECT COUNT(*)::bigint
-                FROM agent_invocations
-                WHERE project_id = $1
-                  AND result IS NOT NULL
               )
               +
               (

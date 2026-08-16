@@ -11,7 +11,7 @@ set -e
 #   OPENPR_MCP_BOT_TOKEN   Call as this workspace bot instead (opr_ prefix).
 
 MCP_URL="${MCP_URL:-http://localhost:8090}"
-EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-106}"
+EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-98}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${OPENPR_CONFIG_FILE:-$PROJECT_ROOT/config/openpr.compose.mcp.toml}"
 
@@ -160,7 +160,6 @@ for required_tool in \
   "plugins.list" \
   "plugins.invoke" \
   "plugin_invocations.list" \
-  "connectors.list" \
   "bot_operation_logs.list" \
   "release.readiness.get" \
   "scenario_templates.list" \

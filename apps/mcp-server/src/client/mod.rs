@@ -90,7 +90,7 @@ const fn describe_json_kind(value: &Value) -> &'static str {
     }
 }
 
-/// Audit label of the stdio transport, as the API's `agent_invocation_tool_calls` ledger records it.
+/// Operation-log client label for the stdio transport.
 pub const TRANSPORT_LABEL_STDIO: &str = "mcp_stdio";
 /// Audit label of the HTTP transport.
 pub const TRANSPORT_LABEL_HTTP: &str = "mcp_http";
@@ -139,9 +139,7 @@ pub struct ClientConfig {
     pub credential: Option<Secret>,
     /// Workspace the caller acts in, from `mcp.workspace_id` or `--workspace-id`.
     pub workspace_id: String,
-    /// Correlation id stamped onto the tool-call audit, from `mcp.invocation_id`.
-    pub invocation_id: Option<String>,
-    /// Label the tool-call audit reports this process's transport under.
+    /// Label the operation log reports this process's transport under.
     pub transport_label: &'static str,
 }
 
@@ -152,7 +150,6 @@ pub struct OpenPrClient {
     /// The bearer credential every outbound request carries. See [`ClientConfig::credential`].
     credential: Option<Secret>,
     pub workspace_id: String,
-    invocation_id: Option<String>,
     transport_label: &'static str,
     operation_tool_name: Option<String>,
 }
@@ -248,7 +245,6 @@ impl OpenPrClient {
             base_url: config.base_url,
             credential: config.credential,
             workspace_id: config.workspace_id,
-            invocation_id: config.invocation_id,
             transport_label: config.transport_label,
             operation_tool_name: None,
         })
@@ -256,7 +252,7 @@ impl OpenPrClient {
 
     /// The same client, speaking to the API as `credential` instead of as itself.
     ///
-    /// This is how a per-request caller identity reaches all 106 tools without threading a
+    /// This is how a per-request caller identity reaches all 98 tools without threading a
     /// credential through every one of them: the request scoped client *is* the identity, so
     /// a tool cannot pick a different one, and neither can the policy gate or the audit
     /// report that run around it. The HTTP connection pool is shared because [`Client`] is
@@ -268,7 +264,6 @@ impl OpenPrClient {
             base_url: self.base_url.clone(),
             credential: Some(credential),
             workspace_id: self.workspace_id.clone(),
-            invocation_id: self.invocation_id.clone(),
             transport_label: self.transport_label,
             operation_tool_name: self.operation_tool_name.clone(),
         }
@@ -282,7 +277,6 @@ impl OpenPrClient {
             base_url: self.base_url.clone(),
             credential: self.credential.clone(),
             workspace_id: self.workspace_id.clone(),
-            invocation_id: self.invocation_id.clone(),
             transport_label,
             operation_tool_name: self.operation_tool_name.clone(),
         }
@@ -296,15 +290,6 @@ impl OpenPrClient {
         let mut scoped = self.clone();
         scoped.operation_tool_name = Some(tool_name.to_string());
         scoped
-    }
-
-    pub fn invocation_id(&self) -> Option<&str> {
-        self.invocation_id.as_deref()
-    }
-
-    /// Label the tool-call audit reports this process's transport under.
-    pub const fn transport_label(&self) -> &'static str {
-        self.transport_label
     }
 
     /// The `Authorization` header value for one outbound request, or the refusal that stands
@@ -508,106 +493,6 @@ impl OpenPrClient {
             urlencoding::encode(project_id),
             urlencoding::encode(resource_id)
         ))
-        .await
-    }
-
-    // ---- Connectors / Invocations ----
-
-    /// Lists the connectors of one project.
-    ///
-    /// `project_id` is not optional on purpose. The endpoint is workspace addressed and
-    /// returns *every* connector in the workspace when the filter is omitted, so an
-    /// optional project would let a caller skip the project agent policy simply by not
-    /// naming a project. There is no client-side way to ask for the workspace wide list.
-    pub async fn list_connectors(&self, project_id: &str, kind: Option<&str>) -> Result<Value, String> {
-        let mut params = vec![format!("project_id={}", urlencoding::encode(project_id))];
-        if let Some(kind) = kind {
-            params.push(format!("kind={}", urlencoding::encode(kind)));
-        }
-        self.get(&format!(
-            "/api/v1/workspaces/{}/connectors{}",
-            urlencoding::encode(&self.workspace_id),
-            join_query(&params)
-        ))
-        .await
-    }
-
-    pub async fn get_connector(&self, connector_id: &str) -> Result<Value, String> {
-        self.get(&format!(
-            "/api/v1/workspaces/{}/connectors/{}",
-            urlencoding::encode(&self.workspace_id),
-            urlencoding::encode(connector_id)
-        ))
-        .await
-    }
-
-    pub async fn list_invocations(
-        &self,
-        project_id: &str,
-        status: Option<&str>,
-        page: Option<u32>,
-        per_page: Option<u32>,
-    ) -> Result<Value, String> {
-        let mut params = Vec::new();
-        if let Some(status) = status {
-            params.push(format!("status={}", urlencoding::encode(status)));
-        }
-        if let Some(page) = page {
-            params.push(format!("page={page}"));
-        }
-        if let Some(per_page) = per_page {
-            params.push(format!("per_page={per_page}"));
-        }
-        self.get(&format!(
-            "/api/v1/projects/{}/invocations{}",
-            urlencoding::encode(project_id),
-            join_query(&params)
-        ))
-        .await
-    }
-
-    pub async fn get_invocation(&self, invocation_id: &str) -> Result<Value, String> {
-        self.get(&format!("/api/v1/invocations/{}", urlencoding::encode(invocation_id)))
-            .await
-    }
-
-    pub async fn create_invocation(&self, project_id: &str, body: Value) -> Result<Value, String> {
-        self.post(
-            &format!("/api/v1/projects/{}/invocations", urlencoding::encode(project_id)),
-            &body,
-        )
-        .await
-    }
-
-    pub async fn report_invocation_progress(&self, invocation_id: &str, body: Value) -> Result<Value, String> {
-        self.post(
-            &format!("/api/v1/invocations/{}/progress", urlencoding::encode(invocation_id)),
-            &body,
-        )
-        .await
-    }
-
-    pub async fn complete_invocation(&self, invocation_id: &str, body: Value) -> Result<Value, String> {
-        self.post(
-            &format!("/api/v1/invocations/{}/complete", urlencoding::encode(invocation_id)),
-            &body,
-        )
-        .await
-    }
-
-    pub async fn fail_invocation(&self, invocation_id: &str, body: Value) -> Result<Value, String> {
-        self.post(
-            &format!("/api/v1/invocations/{}/fail", urlencoding::encode(invocation_id)),
-            &body,
-        )
-        .await
-    }
-
-    pub async fn report_invocation_tool_call(&self, invocation_id: &str, body: Value) -> Result<Value, String> {
-        self.post(
-            &format!("/api/v1/invocations/{}/tool-calls", urlencoding::encode(invocation_id)),
-            &body,
-        )
         .await
     }
 
@@ -1597,7 +1482,6 @@ pub mod test_api {
             base_url,
             credential: Some(Secret::new("opr_test_token")),
             workspace_id: "workspace-1".to_string(),
-            invocation_id: None,
             transport_label: TRANSPORT_LABEL_STDIO,
         })
     }

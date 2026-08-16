@@ -1,6 +1,5 @@
 pub mod capabilities;
 pub mod comments;
-pub mod connectors;
 pub mod context;
 pub mod files;
 pub mod forms;
@@ -36,14 +35,6 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         project_types::create_project_resource_tool(),
         project_types::update_project_resource_tool(),
         project_types::delete_project_resource_tool(),
-        connectors::list_connectors_tool(),
-        connectors::get_connector_tool(),
-        connectors::list_invocations_tool(),
-        connectors::get_invocation_tool(),
-        connectors::create_invocation_tool(),
-        connectors::report_invocation_progress_tool(),
-        connectors::complete_invocation_tool(),
-        connectors::fail_invocation_tool(),
         forms::list_forms_tool(),
         forms::get_form_tool(),
         forms::create_form_tool(),
@@ -153,14 +144,6 @@ mod tests {
             "project_resources.create",
             "project_resources.update",
             "project_resources.delete",
-            "connectors.list",
-            "connectors.get",
-            "invocations.list",
-            "invocations.get",
-            "invocations.create",
-            "invocations.report_progress",
-            "invocations.complete",
-            "invocations.fail",
             "forms.list",
             "forms.get",
             "forms.create",
@@ -224,8 +207,8 @@ mod tests {
         }
         assert_eq!(
             tools.len(),
-            106,
-            "Universal forms, plugins, and operation logs should expose 106 MCP tools"
+            98,
+            "Universal forms, plugins, and operation logs should expose 98 MCP tools"
         );
     }
 }

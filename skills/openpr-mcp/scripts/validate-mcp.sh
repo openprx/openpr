@@ -83,10 +83,10 @@ TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
 TOOLS=$(printf '%s' "$TOOLS_RESPONSE" | \
   python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
 
-if [ "${TOOLS:-0}" -eq 106 ] 2>/dev/null; then
+if [ "${TOOLS:-0}" -eq 98 ] 2>/dev/null; then
   echo "✅ tools/list: $TOOLS tools available"
 else
-  echo "❌ tools/list expected exactly 106 tools, got ${TOOLS:-0}"
+  echo "❌ tools/list expected exactly 98 tools, got ${TOOLS:-0}"
   exit 1
 fi
 
@@ -102,8 +102,6 @@ required = {
     "project_resources.create",
     "project_resources.update",
     "project_resources.delete",
-    "connectors.list",
-    "connectors.get",
     "forms.list",
     "forms.get",
     "forms.create",
@@ -143,12 +141,6 @@ required = {
     "plugins.install",
     "plugins.invoke",
     "plugin_invocations.list",
-    "invocations.list",
-    "invocations.get",
-    "invocations.create",
-    "invocations.report_progress",
-    "invocations.complete",
-    "invocations.fail",
     "context.get_project",
     "context.get_governance",
     "context.get_agent_policy",

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Bot, FileText, LayoutPanelTop, Shield, Upload } from '@lucide/svelte';
+	import { FileText, LayoutPanelTop, Shield, Upload } from '@lucide/svelte';
 	import { t } from 'svelte-i18n';
 
 	export type FormWorkflowMode =
@@ -8,8 +8,7 @@
 		| 'design'
 		| 'layout'
 		| 'permissions'
-		| 'importExport'
-		| 'automation';
+		| 'importExport';
 
 	interface Props {
 		activeMode: FormWorkflowMode;
@@ -22,8 +21,7 @@
 		{ key: 'design', icon: LayoutPanelTop },
 		{ key: 'layout', icon: FileText },
 		{ key: 'permissions', icon: Shield },
-		{ key: 'importExport', icon: Upload },
-		{ key: 'automation', icon: Bot }
+		{ key: 'importExport', icon: Upload }
 	];
 </script>
 

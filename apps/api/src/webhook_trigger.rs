@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use uuid::Uuid;
 
-use crate::routes::connector::{truncate_string, validate_outbound_url};
+use crate::outbound::{truncate_string, validate_outbound_url};
 
 /// Hard cap on the response body pulled from a webhook receiver.
 ///

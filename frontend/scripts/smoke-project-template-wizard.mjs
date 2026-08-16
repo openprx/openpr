@@ -20,9 +20,7 @@ let createdIssuePayloads = [];
 let createdIssues = [];
 let createdIssuesByProject = {};
 let aiAgents = [];
-let projectConnectors = [];
 let assistantPatchPayload = null;
-let connectorPatchPayload = null;
 
 function apiResult(data) {
 	return { code: 0, message: 'success', data };
@@ -186,16 +184,6 @@ function restoreMarks() {
   enableAssistant.click();
   await waitFor(() => findButtonExact('Save assistant'), 'assistant saved');
   mark('data-scenario-assistant-enabled');
-  const endpointInput = await waitFor(() => Array.from(document.querySelectorAll('input')).find((input) => input.placeholder === 'https://example.com/webhook'), 'connection endpoint input');
-  endpointInput.value = 'http://127.0.0.1:19092/webhook';
-  endpointInput.dispatchEvent(new Event('input', { bubbles: true }));
-  endpointInput.dispatchEvent(new Event('change', { bubbles: true }));
-  await waitFor(() => Array.from(document.querySelectorAll('pre')).some((pre) => pre.textContent.includes('http://127.0.0.1:19092/webhook')), 'connection endpoint draft');
-  const saveConnection = await waitFor(() => findButtonExact('Save'), 'save connection');
-  saveConnection.click();
-  await waitFor(() => textInElements('Active'), 'connection active');
-  await waitFor(() => Array.from(document.querySelectorAll('pre')).some((pre) => pre.textContent.includes('[[agents]]') && pre.textContent.includes('project_type="contract_review"')), 'webhook snippet');
-  mark('data-scenario-connection-configured');
   const workLink = await waitFor(() => Array.from(document.querySelectorAll('a')).find((link) => link.textContent.includes('Open Work') || link.getAttribute('href')?.endsWith('/issues')), 'open work link');
   workLink.click();
   await createScenarioIssue({ data: 'contract_review_default', title: 'Review ACME contract', fields: { counterparty: 'ACME Manufacturing', amount: '125000', risk_level: 'high' } });
@@ -252,7 +240,6 @@ const projectTypes = [
 		enabled_capabilities: [],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	},
@@ -266,7 +253,6 @@ const projectTypes = [
 		enabled_capabilities: [],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	},
@@ -280,7 +266,6 @@ const projectTypes = [
 		enabled_capabilities: [],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	},
@@ -294,7 +279,6 @@ const projectTypes = [
 		enabled_capabilities: [],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	},
@@ -308,7 +292,6 @@ const projectTypes = [
 		enabled_capabilities: [],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	}
@@ -329,7 +312,6 @@ const scenarioTemplates = [
 		resource_schema: { resources: [{ kind: 'repo', label: 'Repository', required: true }] },
 		ai_roles: [{ key: 'coding_assistant', label: 'AI coding assistant', agent_type: 'cli', capabilities: ['code.task_context.get'] }],
 		governance_policy: {},
-		connector_suggestions: [{ key: 'mcp', label: 'AI connection', type: 'mcp', route_by: ['project_type'] }],
 		sample_data: {},
 		created_at: now,
 		updated_at: now
@@ -360,10 +342,6 @@ const scenarioTemplates = [
 			{ key: 'approval_assistant', label: 'Approval assistant', agent_type: 'webhook', provider: 'openpr-webhook', model: 'external-agent', capabilities: ['approval.request'], writes_require_approval: true }
 		],
 		governance_policy: {},
-		connector_suggestions: [
-			{ key: 'document_review_bot', label: 'Document review connection', type: 'webhook', route_by: ['bot_context.bot_name', 'bot_agent_type', 'project_type'] },
-			{ key: 'mcp', label: 'AI connection', type: 'mcp', route_by: ['project_type'] }
-		],
 		sample_data: {},
 		created_at: now,
 		updated_at: now
@@ -388,7 +366,6 @@ const scenarioTemplates = [
 		resource_schema: { resources: [{ kind: 'equipment', label: 'Equipment record', required: true }] },
 		ai_roles: [{ key: 'maintenance_assistant', label: 'Maintenance assistant', agent_type: 'webhook', capabilities: ['inspection.report'] }],
 		governance_policy: {},
-		connector_suggestions: [{ key: 'maintenance_notification_bot', label: 'Maintenance notification connection', type: 'webhook', route_by: ['bot_context.bot_name', 'bot_agent_type', 'trigger_kind'] }],
 		sample_data: {},
 		created_at: now,
 		updated_at: now
@@ -413,7 +390,6 @@ const scenarioTemplates = [
 		resource_schema: { resources: [{ kind: 'document_library', label: 'Quality documents' }] },
 		ai_roles: [{ key: 'quality_audit_assistant', label: 'Quality audit assistant', agent_type: 'mcp', capabilities: ['corrective_action.propose'] }],
 		governance_policy: {},
-		connector_suggestions: [{ key: 'quality_audit_bot', label: 'Quality audit connection', type: 'webhook', route_by: ['bot_context.bot_name', 'project_type', 'trigger_kind'] }],
 		sample_data: {},
 		created_at: now,
 		updated_at: now
@@ -438,7 +414,6 @@ const scenarioTemplates = [
 		resource_schema: { resources: [{ kind: 'crm_account', label: 'Customer account', required: true }] },
 		ai_roles: [{ key: 'delivery_assistant', label: 'Delivery assistant', agent_type: 'mcp', capabilities: ['approval.request'] }],
 		governance_policy: {},
-		connector_suggestions: [{ key: 'delivery_notification_bot', label: 'Delivery notification connection', type: 'webhook', route_by: ['bot_context.bot_name', 'bot_agent_type', 'project_type'] }],
 		sample_data: {},
 		created_at: now,
 		updated_at: now
@@ -456,7 +431,6 @@ const embeddedContractTemplate = {
 	resource_schema: scenarioTemplates[1].resource_schema,
 	ai_roles: scenarioTemplates[1].ai_roles,
 	governance_policy: scenarioTemplates[1].governance_policy,
-	connector_suggestions: scenarioTemplates[1].connector_suggestions,
 	sample_data: scenarioTemplates[1].sample_data
 };
 
@@ -477,7 +451,6 @@ function embeddedTemplate(template) {
 		resource_schema: template.resource_schema,
 		ai_roles: template.ai_roles,
 		governance_policy: template.governance_policy,
-		connector_suggestions: template.connector_suggestions,
 		sample_data: template.sample_data
 	};
 }
@@ -633,48 +606,6 @@ location.replace('/workspace/${workspaceId}/projects?template_wizard_capture=1')
 					created_at: now
 				}
 			];
-			projectConnectors = [
-				{
-					id: 'connector-document-review',
-					workspace_id: workspaceId,
-					project_id: 'project-created-smoke',
-					webhook_id: null,
-					kind: 'webhook',
-					name: 'Document review connection',
-					description: 'Suggested by scenario template contract_review_default',
-					endpoint: null,
-					auth_policy: { mode: 'unconfigured', template_suggestion: true },
-					capability_manifest: {
-						source: 'scenario_template',
-						scenario_template_key: 'contract_review_default',
-						suggestion: { key: 'document_review_bot', label: 'Document review connection', type: 'webhook' }
-					},
-					is_active: false,
-					created_by: 'user-smoke',
-					created_at: now,
-					updated_at: now
-				},
-				{
-					id: 'connector-mcp',
-					workspace_id: workspaceId,
-					project_id: 'project-created-smoke',
-					webhook_id: null,
-					kind: 'mcp',
-					name: 'AI connection',
-					description: 'Suggested by scenario template contract_review_default',
-					endpoint: 'http://127.0.0.1:8090',
-					auth_policy: { mode: 'unconfigured', template_suggestion: true },
-					capability_manifest: {
-						source: 'scenario_template',
-						scenario_template_key: 'contract_review_default',
-						suggestion: { key: 'mcp', label: 'AI connection', type: 'mcp' }
-					},
-					is_active: false,
-					created_by: 'user-smoke',
-					created_at: now,
-					updated_at: now
-				}
-			];
 		}
 		json(
 			res,
@@ -707,22 +638,6 @@ location.replace('/workspace/${workspaceId}/projects?template_wizard_capture=1')
 				: agent
 		);
 		json(res, 200, apiResult(aiAgents.find((agent) => agent.id === 'tpl-smoke-document_assistant')));
-		return;
-	}
-
-	if (pathname === `/api/v1/workspaces/${workspaceId}/connectors` && req.method === 'GET') {
-		json(res, 200, apiResult(projectConnectors));
-		return;
-	}
-
-	if (pathname === `/api/v1/workspaces/${workspaceId}/connectors/connector-document-review` && req.method === 'PATCH') {
-		connectorPatchPayload = await readBody(req);
-		projectConnectors = projectConnectors.map((connector) =>
-			connector.id === 'connector-document-review'
-				? { ...connector, ...connectorPatchPayload, updated_at: now }
-				: connector
-		);
-		json(res, 200, apiResult(projectConnectors.find((connector) => connector.id === 'connector-document-review')));
 		return;
 	}
 
@@ -950,7 +865,6 @@ server.listen(0, '127.0.0.1', async () => {
 	}
 	assertIncludes(dom, 'data-scenario-dashboard-seen="done"');
 	assertIncludes(dom, 'data-scenario-assistant-enabled="done"');
-	assertIncludes(dom, 'data-scenario-connection-configured="done"');
 	assertIncludes(dom, 'data-scenario-issue-fields-seen="done"');
 	assertIncludes(dom, 'data-scenario-issue-create="done"');
 	assertIncludes(dom, 'Contract Template Smoke');
@@ -985,9 +899,6 @@ server.listen(0, '127.0.0.1', async () => {
 	}
 	if (assistantPatchPayload.provider !== 'openpr-mcp' || assistantPatchPayload.model !== 'mcp-agent-smoke' || assistantPatchPayload.api_endpoint !== 'http://127.0.0.1:8090/mcp/rpc') {
 		throw new Error(`Expected assistant provider/model/endpoint patch, got ${JSON.stringify(assistantPatchPayload)}`);
-	}
-	if (connectorPatchPayload?.endpoint !== 'http://127.0.0.1:19092/webhook' || !connectorPatchPayload?.is_active) {
-		throw new Error(`Expected connector endpoint activation patch, got ${JSON.stringify(connectorPatchPayload)}`);
 	}
 	const contractIssuePayload = createdIssuePayloads.find((entry) => entry.template_key === 'contract_review_default')?.payload;
 	if (!contractIssuePayload) {

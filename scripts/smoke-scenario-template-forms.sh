@@ -180,9 +180,7 @@ async function assertTemplateCreatesForms(templateKey, projectKey, expectedKeys)
     assert(viewKeys.includes('detail'), `${form.key} missing detail view`);
   }
 
-  const connectors = await request('GET', `/api/v1/workspaces/${workspaceId}/connectors?project_id=${projectId}`);
-  assert(connectors.data.length >= 1, `${templateKey} should create connector suggestions`);
-  return { projectId, forms: forms.data.items, connectors: connectors.data };
+  return { projectId, forms: forms.data.items };
 }
 
 async function main() {
@@ -201,10 +199,6 @@ async function main() {
   assert(
     restaurantTemplateListItem.usage_guide.primary_mcp_tools.includes('form_records.aggregate'),
     'restaurant template list item should expose aggregate MCP tool',
-  );
-  assert(
-    restaurantTemplateListItem.usage_guide.connector_kinds.includes('print'),
-    'restaurant template list item should expose print connector kind',
   );
   assert(
     restaurantTemplateListItem.usage_guide.plugin_keys.includes('restaurant_calc'),
@@ -256,10 +250,6 @@ async function main() {
     'print_job',
     'business_report',
   ]);
-  const connectorKinds = restaurant.connectors.map((connector) => connector.kind).sort();
-  assert(connectorKinds.includes('print'), 'restaurant template should create print connector suggestions');
-  assert(connectorKinds.includes('webhook'), 'restaurant template should create webhook connector suggestion');
-
   const plugins = await request('GET', `/api/v1/projects/${restaurant.projectId}/plugins`);
   const restaurantPlugin = plugins.data.items.find((plugin) => plugin.key === 'restaurant_calc');
   assert(restaurantPlugin, 'restaurant template should install restaurant_calc plugin');
@@ -302,21 +292,15 @@ if [[ "$SCENARIO_VIEW_EVENT_COUNT" -lt 44 ]]; then
   exit 1
 fi
 
-SCENARIO_CONNECTOR_EVENT_COUNT="$(psql_smoke -Atqc "SELECT COUNT(*) FROM business_events WHERE event_type = 'connector.created' AND metadata->>'scenario_template_initialized' = 'true'")"
-if [[ "$SCENARIO_CONNECTOR_EVENT_COUNT" -lt 6 ]]; then
-  echo "Expected at least 6 scenario connector.created business events, got $SCENARIO_CONNECTOR_EVENT_COUNT" >&2
-  exit 1
-fi
-
 SCENARIO_PLUGIN_EVENT_COUNT="$(psql_smoke -Atqc "SELECT COUNT(*) FROM business_events WHERE event_type = 'plugin.installed' AND metadata->>'scenario_template_initialized' = 'true' AND metadata->>'plugin_key' = 'restaurant_calc'")"
 if [[ "$SCENARIO_PLUGIN_EVENT_COUNT" -lt 1 ]]; then
   echo "Expected restaurant_calc scenario plugin.installed business event, got $SCENARIO_PLUGIN_EVENT_COUNT" >&2
   exit 1
 fi
 
-SCENARIO_OUTBOX_COUNT="$(psql_smoke -Atqc "SELECT COUNT(*) FROM event_outbox eo JOIN business_events be ON be.id = eo.business_event_id WHERE be.event_type IN ('project.created', 'form.created', 'form.view.created', 'connector.created', 'plugin.installed') AND be.metadata->>'scenario_template_initialized' = 'true'")"
-if [[ "$SCENARIO_OUTBOX_COUNT" -lt 79 ]]; then
-  echo "Expected at least 79 scenario initialization outbox rows, got $SCENARIO_OUTBOX_COUNT" >&2
+SCENARIO_OUTBOX_COUNT="$(psql_smoke -Atqc "SELECT COUNT(*) FROM event_outbox eo JOIN business_events be ON be.id = eo.business_event_id WHERE be.event_type IN ('project.created', 'form.created', 'form.view.created', 'plugin.installed') AND be.metadata->>'scenario_template_initialized' = 'true'")"
+if [[ "$SCENARIO_OUTBOX_COUNT" -lt 73 ]]; then
+  echo "Expected at least 73 scenario initialization outbox rows, got $SCENARIO_OUTBOX_COUNT" >&2
   exit 1
 fi
 

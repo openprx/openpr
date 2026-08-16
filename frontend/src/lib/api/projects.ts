@@ -28,7 +28,6 @@ export interface ProjectType {
 	enabled_capabilities: unknown[];
 	field_schema: Record<string, unknown>;
 	artifact_schema: Record<string, unknown>;
-	default_connectors: unknown[];
 	created_at: string;
 	updated_at: string;
 }
@@ -47,7 +46,6 @@ export interface ScenarioTemplate {
 	resource_schema: Record<string, unknown>;
 	ai_roles: unknown[];
 	governance_policy: Record<string, unknown>;
-	connector_suggestions: unknown[];
 	sample_data: Record<string, unknown>;
 	created_at: string;
 	updated_at: string;
@@ -80,10 +78,8 @@ export interface ProjectAgentPolicy {
 	project_id: string;
 	project_type: string;
 	capabilities: unknown[];
-	connector_kinds: string[];
 	action_classes: Record<string, unknown>;
 	mcp?: {
-		writes_create_invocation?: boolean;
 		workspace_scope_required?: boolean;
 		project_context_required?: boolean;
 		tool_registry?: {
@@ -98,7 +94,6 @@ export interface ProjectContext {
 	project: Project;
 	project_type?: ProjectType | null;
 	resources: ProjectResource[];
-	connectors: unknown[];
 	governance?: unknown;
 	workflow?: unknown;
 	recent_decisions?: unknown[];

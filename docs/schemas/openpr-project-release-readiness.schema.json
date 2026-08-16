@@ -38,14 +38,12 @@
     },
     "gates": {
       "type": "array",
-      "minItems": 8,
-      "maxItems": 8,
+      "minItems": 6,
+      "maxItems": 6,
       "prefixItems": [
         { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_pending_ai_tasks" } } }] },
-        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_active_invocations" } } }] },
-        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_failed_invocations" } } }] },
         { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_pending_governance_results" } } }] },
-        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_failed_connector_deliveries" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_failed_webhook_deliveries" } } }] },
         { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "no_stale_resources" } } }] },
         { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "audit_trail_present" } } }] },
         { "allOf": [{ "$ref": "#/$defs/gate" }, { "properties": { "key": { "const": "result_artifact_present" } } }] }
@@ -60,14 +58,12 @@
     },
     "metrics": {
       "type": "array",
-      "minItems": 8,
-      "maxItems": 8,
+      "minItems": 6,
+      "maxItems": 6,
       "prefixItems": [
         { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "pending_ai_tasks" } } }] },
-        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "active_invocations" } } }] },
-        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "failed_invocations" } } }] },
         { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "pending_check_results" } } }] },
-        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "failed_connector_deliveries" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "failed_webhook_deliveries" } } }] },
         { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "stale_resources" } } }] },
         { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "governance_audit_events" } } }] },
         { "allOf": [{ "$ref": "#/$defs/metric" }, { "properties": { "key": { "const": "result_artifacts" } } }] }
@@ -82,10 +78,8 @@
     "gate_key": {
       "enum": [
         "no_pending_ai_tasks",
-        "no_active_invocations",
-        "no_failed_invocations",
         "no_pending_governance_results",
-        "no_failed_connector_deliveries",
+        "no_failed_webhook_deliveries",
         "no_stale_resources",
         "audit_trail_present",
         "result_artifact_present"
@@ -146,10 +140,8 @@
         "key": {
           "enum": [
             "pending_ai_tasks",
-            "active_invocations",
-            "failed_invocations",
             "pending_check_results",
-            "failed_connector_deliveries",
+            "failed_webhook_deliveries",
             "stale_resources",
             "governance_audit_events",
             "result_artifacts"

@@ -163,7 +163,6 @@ function projectForPlan(plan) {
 				workflow_template: { states: plan.workflowStates.map((key, index) => ({ key, initial: index === 0 })) },
 				resource_schema: { resources: [] },
 				ai_roles: [],
-				connector_suggestions: [],
 				governance_policy: {},
 				sample_data: {}
 			}

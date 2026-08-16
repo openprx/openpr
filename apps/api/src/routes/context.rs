@@ -35,7 +35,6 @@ pub struct ProjectContextType {
     pub enabled_capabilities: Value,
     pub field_schema: Value,
     pub artifact_schema: Value,
-    pub default_connectors: Value,
 }
 
 #[derive(Debug, Serialize, FromQueryResult)]
@@ -48,19 +47,6 @@ pub struct ProjectContextResource {
     pub permission_policy: Value,
     pub sync_status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Serialize, FromQueryResult)]
-pub struct ProjectContextConnector {
-    pub id: Uuid,
-    pub workspace_id: Uuid,
-    pub project_id: Option<Uuid>,
-    pub kind: String,
-    pub name: String,
-    pub endpoint: Option<String>,
-    pub capability_manifest: Value,
-    pub is_active: bool,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -118,17 +104,15 @@ pub async fn get_project_context(
     ensure_project_context_access(&state, &claims, bot.as_ref().map(|b| &b.0), &project).await?;
     let project_type = load_project_type(&state, &project.type_key).await?;
     let resources = load_resources(&state, project_id).await?;
-    let connectors = load_connectors(&state, project.workspace_id, project_id).await?;
     let governance = load_governance(&state, project_id).await?;
     let workflow = load_workflow(&state, project_id).await?;
     let decisions = load_recent_decisions(&state).await?;
-    let agent_policy = build_agent_policy(&project, project_type.as_ref(), governance.as_ref(), &connectors);
+    let agent_policy = build_agent_policy(&project, project_type.as_ref(), governance.as_ref());
 
     Ok(ApiResponse::success(json!({
         "project": project,
         "project_type": project_type,
         "resources": resources,
-        "connectors": connectors,
         "governance": governance,
         "workflow": workflow,
         "recent_decisions": decisions,
@@ -166,8 +150,7 @@ pub async fn get_project_agent_policy(
     ensure_project_context_access(&state, &claims, bot.as_ref().map(|b| &b.0), &project).await?;
     let project_type = load_project_type(&state, &project.type_key).await?;
     let governance = load_governance(&state, project_id).await?;
-    let connectors = load_connectors(&state, project.workspace_id, project_id).await?;
-    let policy = build_agent_policy(&project, project_type.as_ref(), governance.as_ref(), &connectors);
+    let policy = build_agent_policy(&project, project_type.as_ref(), governance.as_ref());
 
     Ok(ApiResponse::success(policy))
 }
@@ -195,7 +178,7 @@ async fn load_project_type(state: &AppState, type_key: &str) -> Result<Option<Pr
         DbBackend::Postgres,
         r"
             SELECT key, name, description, domain, enabled_capabilities,
-                   field_schema, artifact_schema, default_connectors
+                   field_schema, artifact_schema
             FROM project_types
             WHERE key = $1
         ",
@@ -217,29 +200,6 @@ async fn load_resources(state: &AppState, project_id: Uuid) -> Result<Vec<Projec
             ORDER BY created_at DESC
         ",
         vec![project_id.into()],
-    ))
-    .all(&state.db)
-    .await
-    .map_err(ApiError::from)
-}
-
-async fn load_connectors(
-    state: &AppState,
-    workspace_id: Uuid,
-    project_id: Uuid,
-) -> Result<Vec<ProjectContextConnector>, ApiError> {
-    ProjectContextConnector::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            SELECT id, workspace_id, project_id, kind, name, endpoint,
-                   capability_manifest, is_active, updated_at
-            FROM connectors
-            WHERE workspace_id = $1
-              AND (project_id IS NULL OR project_id = $2)
-              AND is_active = true
-            ORDER BY project_id NULLS FIRST, updated_at DESC
-        ",
-        vec![workspace_id.into(), project_id.into()],
     ))
     .all(&state.db)
     .await
@@ -352,20 +312,14 @@ fn build_agent_policy(
     project: &ProjectContextProject,
     project_type: Option<&ProjectContextType>,
     governance: Option<&ProjectContextGovernance>,
-    connectors: &[ProjectContextConnector],
 ) -> Value {
     let capabilities = project_type.map_or_else(|| json!([]), |item| item.enabled_capabilities.clone());
     let high_risk_requires_review = governance.is_none_or(|item| item.review_required);
-    let connector_kinds = connectors
-        .iter()
-        .map(|connector| connector.kind.clone())
-        .collect::<Vec<_>>();
 
     json!({
         "project_id": project.id,
         "project_type": project.type_key,
         "capabilities": capabilities,
-        "connector_kinds": connector_kinds,
         "action_classes": {
             "read_only": { "mode": "direct" },
             "comment_result": { "mode": "direct" },
@@ -373,25 +327,19 @@ fn build_agent_policy(
             "high_risk_mutation": {
                 "mode": if high_risk_requires_review { "proposal_or_check_result" } else { "direct_with_audit" }
             },
-            "external_side_effect": { "mode": "connector_policy_required" },
+            "external_side_effect": { "mode": "explicit_api_policy_required" },
             "financial_legal_compliance": { "mode": "proposal_vote_required" }
         },
         "mcp": {
-            "writes_create_invocation": true,
             "workspace_scope_required": true,
             "project_context_required": true,
-            "tool_registry": build_mcp_tool_registry(&capabilities, connectors)
+            "tool_registry": build_mcp_tool_registry(&capabilities)
         }
     })
 }
 
-fn build_mcp_tool_registry(capabilities: &Value, connectors: &[ProjectContextConnector]) -> Value {
+fn build_mcp_tool_registry(capabilities: &Value) -> Value {
     let capability_set = capability_set(capabilities);
-    let connector_set = connectors
-        .iter()
-        .map(|connector| connector.kind.as_str())
-        .collect::<BTreeSet<_>>();
-    let connector_tools = extract_connector_mcp_tools(connectors);
     let mut groups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
 
     groups.insert(
@@ -492,19 +440,13 @@ fn build_mcp_tool_registry(capabilities: &Value, connectors: &[ProjectContextCon
         );
     }
 
-    if capability_set.contains("mcp") || connector_set.contains("mcp") {
+    if capability_set.contains("mcp") {
         groups.insert(
             "mcp_execution",
             tool_set(&[
                 "context.get_project",
                 "context.get_governance",
                 "context.get_agent_policy",
-                "invocations.list",
-                "invocations.get",
-                "invocations.create",
-                "invocations.report_progress",
-                "invocations.complete",
-                "invocations.fail",
                 "check_results.create",
                 "release.readiness.get",
             ]),
@@ -567,26 +509,6 @@ fn build_mcp_tool_registry(capabilities: &Value, connectors: &[ProjectContextCon
         );
     }
 
-    if capability_set.contains("webhook")
-        || connector_set.contains("webhook")
-        || connector_set.contains("rest")
-        || connector_set.contains("cli")
-        || connector_set.contains("openprx_tunnel")
-        || connector_set.contains("print")
-        || connector_set.contains("device")
-    {
-        groups.insert(
-            "connectors",
-            tool_set(&[
-                "connectors.list",
-                "connectors.get",
-                "invocations.list",
-                "invocations.get",
-                "invocations.create",
-            ]),
-        );
-    }
-
     if capability_set.contains("code_context")
         || capability_set.contains("documents")
         || capability_set.contains("attachments")
@@ -605,99 +527,25 @@ fn build_mcp_tool_registry(capabilities: &Value, connectors: &[ProjectContextCon
         );
     }
 
-    let connector_tool_names = connector_tools
-        .iter()
-        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
     let enabled_tools = groups
         .values()
         .flat_map(|tools| tools.iter().copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(str::to_string)
-        .chain(connector_tool_names.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
 
-    let mut groups_json = groups
+    let groups_json = groups
         .into_iter()
         .map(|(group, tools)| (group, tools.into_iter().map(str::to_string).collect::<Vec<_>>()))
         .collect::<BTreeMap<_, _>>();
-    if !connector_tool_names.is_empty() {
-        groups_json.insert("connector_tools", connector_tool_names);
-    }
-
     json!({
         "source": "project_type_capabilities",
         "groups": groups_json,
         "enabled_tools": enabled_tools,
-        "connector_tools": connector_tools,
     })
-}
-
-fn extract_connector_mcp_tools(connectors: &[ProjectContextConnector]) -> Vec<Value> {
-    let mut seen = BTreeSet::new();
-    let mut tools = Vec::new();
-
-    for connector in connectors {
-        let Some(items) = connector
-            .capability_manifest
-            .get("mcp_tools")
-            .or_else(|| connector.capability_manifest.get("tools"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-
-        for item in items {
-            let Some(name) = item.get("name").and_then(Value::as_str).map(str::trim) else {
-                continue;
-            };
-            if !is_safe_connector_tool_name(name) || !seen.insert(name.to_string()) {
-                continue;
-            }
-
-            let description = item
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or("Connector-provided MCP tool")
-                .trim();
-            let input_schema = item
-                .get("input_schema")
-                .or_else(|| item.get("inputSchema"))
-                .filter(|value| value.is_object())
-                .cloned()
-                .unwrap_or_else(|| json!({ "type": "object" }));
-            let action_class = item
-                .get("action_class")
-                .and_then(Value::as_str)
-                .unwrap_or("external_side_effect")
-                .trim();
-
-            tools.push(json!({
-                "name": name,
-                "description": description,
-                "input_schema": input_schema,
-                "connector_id": connector.id,
-                "connector_kind": connector.kind,
-                "connector_name": connector.name,
-                "action_class": action_class,
-            }));
-        }
-    }
-
-    tools
-}
-
-fn is_safe_connector_tool_name(name: &str) -> bool {
-    let len = name.len();
-    (3..=128).contains(&len)
-        && name.contains('.')
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-' | '.'))
 }
 
 fn capability_set(capabilities: &Value) -> BTreeSet<&str> {
@@ -715,9 +563,8 @@ fn tool_set(tools: &[&'static str]) -> BTreeSet<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProjectContextConnector, build_mcp_tool_registry};
+    use super::build_mcp_tool_registry;
     use serde_json::json;
-    use uuid::Uuid;
 
     fn enabled_tools(registry: &serde_json::Value) -> Vec<String> {
         registry["enabled_tools"]
@@ -730,18 +577,15 @@ mod tests {
 
     #[test]
     fn mcp_tool_registry_enables_tools_from_project_capabilities() {
-        let registry = build_mcp_tool_registry(
-            &json!([
-                "issues",
-                "sprints",
-                "mcp",
-                "governance",
-                "code_context",
-                "forms",
-                "plugins"
-            ]),
-            &[connector("mcp", json!({}))],
-        );
+        let registry = build_mcp_tool_registry(&json!([
+            "issues",
+            "sprints",
+            "mcp",
+            "governance",
+            "code_context",
+            "forms",
+            "plugins"
+        ]));
         let tools = enabled_tools(&registry);
 
         assert!(tools.contains(&"context.get_project".to_string()));
@@ -751,7 +595,6 @@ mod tests {
         assert!(tools.contains(&"proposals.create".to_string()));
         assert!(tools.contains(&"proposals.create_from_result".to_string()));
         assert!(tools.contains(&"check_results.create".to_string()));
-        assert!(tools.contains(&"invocations.create".to_string()));
         assert!(tools.contains(&"project_resources.create".to_string()));
         assert!(tools.contains(&"forms.create_from_template".to_string()));
         assert!(tools.contains(&"scenario_templates.install".to_string()));
@@ -776,65 +619,12 @@ mod tests {
 
     #[test]
     fn mcp_tool_registry_hides_disabled_capability_tools() {
-        let registry = build_mcp_tool_registry(&json!(["issues", "mcp"]), &[]);
+        let registry = build_mcp_tool_registry(&json!(["issues", "mcp"]));
         let tools = enabled_tools(&registry);
 
         assert!(tools.contains(&"work_items.list".to_string()));
-        assert!(tools.contains(&"invocations.create".to_string()));
+        assert!(!tools.iter().any(|tool| tool.starts_with("invocations.")));
         assert!(!tools.contains(&"sprints.create".to_string()));
         assert!(!tools.contains(&"proposals.create".to_string()));
-    }
-
-    #[test]
-    fn mcp_tool_registry_includes_connector_provided_tools() {
-        let registry = build_mcp_tool_registry(
-            &json!(["mcp"]),
-            &[connector(
-                "mcp",
-                json!({
-                    "mcp_tools": [{
-                        "name": "documents.review_risk",
-                        "description": "Review document risk",
-                        "input_schema": { "type": "object", "properties": { "document_id": { "type": "string" } } },
-                        "action_class": "external_side_effect"
-                    }]
-                }),
-            )],
-        );
-        let tools = enabled_tools(&registry);
-
-        assert!(tools.contains(&"documents.review_risk".to_string()));
-        assert_eq!(
-            registry
-                .get("connector_tools")
-                .and_then(|tools| tools.as_array())
-                .and_then(|tools| tools.first())
-                .and_then(|tool| tool.get("name"))
-                .and_then(|name| name.as_str()),
-            Some("documents.review_risk")
-        );
-        assert_eq!(
-            registry
-                .get("groups")
-                .and_then(|groups| groups.get("connector_tools"))
-                .and_then(|tools| tools.as_array())
-                .and_then(|tools| tools.first())
-                .and_then(|name| name.as_str()),
-            Some("documents.review_risk")
-        );
-    }
-
-    fn connector(kind: &str, capability_manifest: serde_json::Value) -> ProjectContextConnector {
-        ProjectContextConnector {
-            id: Uuid::new_v4(),
-            workspace_id: Uuid::new_v4(),
-            project_id: None,
-            kind: kind.to_string(),
-            name: format!("{kind} connector"),
-            endpoint: None,
-            capability_manifest,
-            is_active: true,
-            updated_at: chrono::Utc::now(),
-        }
     }
 }

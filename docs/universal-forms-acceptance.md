@@ -50,7 +50,7 @@ scripts/audit-universal-forms-source-coverage.sh
 scripts/audit-universal-forms-docs.sh
 scripts/smoke-scenario-template-forms.sh
 scripts/smoke-forms-mcp.sh
-scripts/smoke-restaurant-ordering.sh
+bun --cwd frontend run smoke:restaurant-ordering
 cd frontend && bun run check && bun run build
 cd frontend && bun run smoke:project-template && bun run smoke:template-work-items
 cd frontend && bun run smoke:forms-ui && bun run smoke:restaurant-ordering

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenPR MCP core regression - 3 transports with 106-tool registry checks."""
+"""OpenPR MCP core regression - 3 transports with 98-tool registry checks."""
 import json, subprocess, requests, time, threading, sys, queue, base64, os, atexit, shutil, tempfile
 
 MCP_HTTP = "http://localhost:8090"
@@ -219,10 +219,10 @@ def sse_list_tools():
 
 LISTERS = {"HTTP": http_list_tools, "STDIO": stdio_list_tools, "SSE": sse_list_tools}
 
-def registry_has_106_tools_with_forms_and_plugins(resp):
+def registry_has_98_tools_with_forms_and_plugins(resp):
     tools = resp.get("result", {}).get("tools", []) if isinstance(resp, dict) else []
     names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
-    return len(tools) == 106 and REQUIRED_REGISTRY_TOOLS.issubset(names)
+    return len(tools) == 98 and REQUIRED_REGISTRY_TOOLS.issubset(names)
 
 def check(proto, tool, result, expect_fn):
     global PASS, FAIL
@@ -242,14 +242,14 @@ def get_id(r):
 def ok_or_str(r): return is_ok(r) or (isinstance(r, str) and any(w in r.lower() for w in ["added","removed","deleted","success"]))
 
 print("=" * 60)
-print(f"  OpenPR MCP 核心回归测试 (106工具注册面 × 3协议)")
+print(f"  OpenPR MCP 核心回归测试 (98工具注册面 × 3协议)")
 print(f"  {time.strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 60)
 
 for proto, call in CALLERS.items():
     print(f"\n{'━'*50}\n  协议: {proto}\n{'━'*50}")
 
-    check(proto, "tools/list.registry_106", LISTERS[proto](), registry_has_106_tools_with_forms_and_plugins)
+    check(proto, "tools/list.registry_98", LISTERS[proto](), registry_has_98_tools_with_forms_and_plugins)
     
     # === Projects ===
     print("\n📁 Projects (list/get)")
@@ -297,67 +297,6 @@ for proto, call in CALLERS.items():
     check(proto, "context.get_project", call("context.get_project", {"project_id": PID}), is_ok)
     check(proto, "context.get_governance", call("context.get_governance", {"project_id": PID}), is_ok)
     check(proto, "context.get_agent_policy", call("context.get_agent_policy", {"project_id": PID}), is_ok)
-
-    # === Connectors / Invocations ===
-    print("\n🔌 Connectors & Invocations")
-    connectors = call("connectors.list", {"project_id": PID})
-    check(proto, "connectors.list", connectors, is_ok)
-    try:
-        connector_items = connectors.get("data", [])
-        connector_id = connector_items[0]["id"] if connector_items else None
-    except Exception:
-        connector_id = None
-    if connector_id:
-        check(proto, "connectors.get", call("connectors.get", {"connector_id": connector_id}), is_ok)
-    else:
-        SKIP += 1; print(f"  ⏭️  [{proto}] connectors.get (no connector fixture)")
-
-    invocations = call("invocations.list", {"project_id": PID})
-    check(proto, "invocations.list", invocations, is_ok)
-    inv = call("invocations.create", {
-        "project_id": PID,
-        "trigger_kind": "mcp",
-        "connector_id": connector_id,
-        "payload": {"source": "mcp-regression", "protocol": proto}
-    })
-    check(proto, "invocations.create", inv, has_id)
-    invocation_id = get_id(inv)
-    if invocation_id:
-        check(proto, "invocations.report_progress", call("invocations.report_progress", {
-            "invocation_id": invocation_id,
-            "payload": {"step": "smoke", "protocol": proto}
-        }), is_ok)
-        check(proto, "invocations.complete", call("invocations.complete", {
-            "invocation_id": invocation_id,
-            "result": {"ok": True, "protocol": proto}
-        }), is_ok)
-        check(proto, "invocations.get", call("invocations.get", {"invocation_id": invocation_id}), is_ok)
-    else:
-        SKIP += 3; print(f"  ⏭️  [{proto}] invocation lifecycle (create failed)")
-
-    failed_inv = call("invocations.create", {
-        "project_id": PID,
-        "trigger_kind": "mcp",
-        "payload": {"source": "mcp-regression", "protocol": proto, "path": "fail"}
-    })
-    failed_inv_id = get_id(failed_inv)
-    if failed_inv_id:
-        check(proto, "invocations.fail", call("invocations.fail", {
-            "invocation_id": failed_inv_id,
-            "error_message": "regression intentional failure path",
-            "result": {"ok": False, "protocol": proto}
-        }), is_ok)
-    else:
-        SKIP += 1; print(f"  ⏭️  [{proto}] invocations.fail (create failed)")
-    try:
-        invocation_items = invocations.get("data", {}).get("items", [])
-        existing_invocation_id = invocation_items[0]["id"] if invocation_items else None
-    except Exception:
-        existing_invocation_id = None
-    if existing_invocation_id:
-        check(proto, "invocations.get_existing", call("invocations.get", {"invocation_id": existing_invocation_id}), is_ok)
-    else:
-        SKIP += 1; print(f"  ⏭️  [{proto}] invocations.get_existing (no invocation fixture)")
 
     # === Work Items 读 ===
     print("\n📋 Work Items (读: list/get/search/get_by_identifier)")

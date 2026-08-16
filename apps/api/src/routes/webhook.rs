@@ -13,8 +13,8 @@ use crate::entities::webhook::{CreateWebhookRequest, UpdateWebhookRequest, WEBHO
 use crate::{
     error::ApiError,
     events::{BusinessEventInput, insert_business_event},
+    outbound::validate_outbound_url,
     response::{ApiResponse, PaginatedData},
-    routes::connector::validate_outbound_url,
 };
 
 #[derive(Debug, FromQueryResult)]
@@ -67,17 +67,6 @@ pub struct WebhookDeliveryResponse {
     pub success: bool,
     pub delivered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, FromQueryResult)]
-struct WebhookConnectorRow {
-    id: Uuid,
-    workspace_id: Uuid,
-    webhook_id: Option<Uuid>,
-    kind: String,
-    name: String,
-    endpoint: Option<String>,
-    is_active: bool,
 }
 
 impl TryFrom<WebhookRow> for WebhookResponse {
@@ -289,9 +278,7 @@ pub async fn create_webhook(
     .await?;
 
     let response = find_webhook_response_with_conn(&tx, webhook_id).await?;
-    let connector = sync_webhook_connector(&tx, &response).await?;
     insert_webhook_event(&tx, &response, "webhook.created", user_id).await?;
-    insert_webhook_connector_event(&tx, &connector, "connector.created", user_id).await?;
     tx.commit().await?;
 
     Ok(ApiResponse::success(response))
@@ -446,17 +433,7 @@ pub async fn update_webhook(
     }
 
     let response = find_webhook_response_with_conn(&tx, webhook_id).await?;
-    let connector_event_type = if find_webhook_connector_with_conn(&tx, workspace_id, webhook_id)
-        .await?
-        .is_some()
-    {
-        "connector.updated"
-    } else {
-        "connector.created"
-    };
-    let connector = sync_webhook_connector(&tx, &response).await?;
     insert_webhook_event(&tx, &response, "webhook.updated", user_id).await?;
-    insert_webhook_connector_event(&tx, &connector, connector_event_type, user_id).await?;
     tx.commit().await?;
 
     Ok(ApiResponse::success(response))
@@ -474,17 +451,7 @@ pub async fn delete_webhook(
 
     let tx = state.db.begin().await?;
     let webhook = find_webhook_response_with_conn(&tx, webhook_id).await?;
-    let connector = find_webhook_connector_with_conn(&tx, workspace_id, webhook_id).await?;
     insert_webhook_event(&tx, &webhook, "webhook.deleted", user_id).await?;
-    if let Some(connector) = connector.as_ref() {
-        insert_webhook_connector_event(&tx, connector, "connector.deleted", user_id).await?;
-    }
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "DELETE FROM connectors WHERE webhook_id = $1 AND workspace_id = $2",
-        vec![webhook_id.into(), workspace_id.into()],
-    ))
-    .await?;
 
     let result = tx
         .execute(Statement::from_sql_and_values(
@@ -503,80 +470,6 @@ pub async fn delete_webhook(
 }
 
 // Helper functions
-async fn sync_webhook_connector<C>(db: &C, webhook: &WebhookResponse) -> Result<WebhookConnectorRow, ApiError>
-where
-    C: ConnectionTrait,
-{
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-                INSERT INTO connectors (
-                    id,
-                    workspace_id,
-                    webhook_id,
-                    kind,
-                    name,
-                    endpoint,
-                    auth_policy,
-                    capability_manifest,
-                    is_active,
-                    created_by,
-                    created_at,
-                    updated_at
-                )
-                VALUES (
-                    $1,
-                    $2,
-                    $3,
-                    'webhook',
-                    $4,
-                    $5,
-                    jsonb_build_object(
-                        'mode',
-                        CASE
-                            WHEN EXISTS (
-                                SELECT 1 FROM webhooks w
-                                WHERE w.id = $3 AND w.secret IS NOT NULL AND btrim(w.secret) <> ''
-                            ) THEN 'hmac'
-                            ELSE 'none'
-                        END,
-                        'legacy_webhook', true,
-                        'secret_source', 'webhook'
-                    ),
-                    jsonb_build_object('events', $6::jsonb, 'bot_user_id', $7::uuid),
-                    $8,
-                    $9,
-                    $10,
-                    $11
-                )
-                ON CONFLICT (webhook_id) DO UPDATE
-                SET name = EXCLUDED.name,
-                    endpoint = EXCLUDED.endpoint,
-                    auth_policy = EXCLUDED.auth_policy,
-                    capability_manifest = EXCLUDED.capability_manifest,
-                    is_active = EXCLUDED.is_active,
-                    updated_at = EXCLUDED.updated_at
-            ",
-        vec![
-            Uuid::new_v4().into(),
-            webhook.workspace_id.into(),
-            webhook.id.into(),
-            webhook.name.clone().into(),
-            webhook.url.clone().into(),
-            json!(webhook.events).into(),
-            webhook.bot_user_id.into(),
-            webhook.active.into(),
-            webhook.created_by.into(),
-            webhook.created_at.into(),
-            webhook.updated_at.into(),
-        ],
-    ))
-    .await?;
-    find_webhook_connector_with_conn(db, webhook.workspace_id, webhook.id)
-        .await?
-        .ok_or_else(|| ApiError::Internal)
-}
-
 async fn find_webhook_response_with_conn<C>(db: &C, webhook_id: Uuid) -> Result<WebhookResponse, ApiError>
 where
     C: ConnectionTrait,
@@ -591,28 +484,6 @@ where
         .ok_or_else(|| ApiError::NotFound("Webhook not found".to_string()))?;
 
     WebhookResponse::try_from(WebhookRow::from_query_result(&webhook, "")?)
-}
-
-async fn find_webhook_connector_with_conn<C>(
-    db: &C,
-    workspace_id: Uuid,
-    webhook_id: Uuid,
-) -> Result<Option<WebhookConnectorRow>, ApiError>
-where
-    C: ConnectionTrait,
-{
-    WebhookConnectorRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            SELECT id, workspace_id, webhook_id, kind, name, endpoint, is_active
-            FROM connectors
-            WHERE workspace_id = $1 AND webhook_id = $2
-        ",
-        vec![workspace_id.into(), webhook_id.into()],
-    ))
-    .one(db)
-    .await
-    .map_err(ApiError::from)
 }
 
 async fn insert_webhook_event<C>(
@@ -645,48 +516,6 @@ where
             }),
             metadata: json!({
                 "webhook_id": webhook.id,
-                "legacy_webhook": true
-            }),
-            correlation_id: None,
-            causation_id: None,
-            idempotency_key: None,
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-async fn insert_webhook_connector_event<C>(
-    db: &C,
-    connector: &WebhookConnectorRow,
-    event_type: &str,
-    actor_id: Uuid,
-) -> Result<(), ApiError>
-where
-    C: ConnectionTrait,
-{
-    insert_business_event(
-        db,
-        BusinessEventInput {
-            workspace_id: connector.workspace_id,
-            project_id: None,
-            event_type: event_type.to_string(),
-            aggregate_type: "connector".to_string(),
-            aggregate_id: connector.id.to_string(),
-            actor_id: Some(actor_id),
-            source: json!({ "type": "user", "actor_id": actor_id }),
-            payload: json!({
-                "connector_id": connector.id,
-                "kind": connector.kind,
-                "name": connector.name,
-                "endpoint": connector.endpoint,
-                "webhook_id": connector.webhook_id,
-                "active": connector.is_active
-            }),
-            metadata: json!({
-                "connector_id": connector.id,
-                "connector_kind": connector.kind,
-                "webhook_id": connector.webhook_id,
                 "legacy_webhook": true
             }),
             correlation_id: None,

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { Copy, FileText, Plug, Power } from '@lucide/svelte';
+	import { FileText, Power } from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { get } from 'svelte/store';
 	import { t } from 'svelte-i18n';
@@ -13,7 +13,6 @@
 	} from '$lib/api/projects';
 	import { issuesApi, type Issue } from '$lib/api/issues';
 	import { aiAgentsApi, type AiAgent } from '$lib/api/ai-agents';
-	import { connectorsApi, type Connector } from '$lib/api/connectors';
 	import { importExportApi } from '$lib/api/import-export';
 	import { toast } from '$lib/stores/toast';
 	import Button from '$lib/components/Button.svelte';
@@ -42,14 +41,10 @@
 	let importing = $state(false);
 	let resourceSubmitting = $state(false);
 	let aiAgents = $state<AiAgent[]>([]);
-	let projectConnectors = $state<Connector[]>([]);
-	let connectorEndpointDrafts = $state<Record<string, string>>({});
 	let assistantConfigDrafts = $state<
 		Record<string, { provider: string; model: string; api_endpoint: string }>
 	>({});
 	let updatingAssistantId = $state<string | null>(null);
-	let updatingConnectorId = $state<string | null>(null);
-	let copiedSnippetId = $state<string | null>(null);
 	let deletingResourceId = $state<string | null>(null);
 	let editingResourceId = $state<string | null>(null);
 	let resourceEditDrafts = $state<
@@ -85,7 +80,7 @@
 			return;
 		}
 
-		await Promise.all([loadRecentIssues(), loadResources(), loadAiAgents(), loadProjectConnectors()]);
+		await Promise.all([loadRecentIssues(), loadResources(), loadAiAgents()]);
 		loading = false;
 	});
 
@@ -126,16 +121,6 @@
 		}
 	}
 
-	async function loadProjectConnectors() {
-		const response = await connectorsApi.list(workspaceId, { project_id: projectId });
-		if (response.code === 0 && response.data) {
-			projectConnectors = response.data ?? [];
-			connectorEndpointDrafts = Object.fromEntries(
-				projectConnectors.map((connector) => [connector.id, connector.endpoint ?? ''])
-			);
-		}
-	}
-
 	function isRecord(value: unknown): value is Record<string, unknown> {
 		return typeof value === 'object' && value !== null && !Array.isArray(value);
 	}
@@ -163,10 +148,6 @@
 
 	function assistantRoles(): unknown[] {
 		return scenarioTemplate?.ai_roles ?? [];
-	}
-
-	function connectorSuggestions(): unknown[] {
-		return scenarioTemplate?.connector_suggestions ?? [];
 	}
 
 	function assistantForRole(role: unknown): AiAgent | undefined {
@@ -215,32 +196,6 @@
 		};
 	}
 
-	function connectorSuggestionKey(suggestion: unknown): string {
-		return scenarioValue(
-			suggestion,
-			'key',
-			scenarioItemLabel(suggestion, 'connection').toLowerCase().replaceAll(' ', '_')
-		);
-	}
-
-	function connectorForSuggestion(suggestion: unknown): Connector | undefined {
-		const key = connectorSuggestionKey(suggestion);
-		const label = scenarioItemLabel(suggestion, key);
-		return projectConnectors.find((connector) => {
-			const rawSuggestion = connector.capability_manifest?.suggestion;
-			const manifestKey =
-				isRecord(rawSuggestion) && typeof rawSuggestion.key === 'string' ? rawSuggestion.key : '';
-			return manifestKey === key || connector.name === label;
-		});
-	}
-
-	function setConnectorEndpointDraft(connectorId: string, value: string) {
-		connectorEndpointDrafts = {
-			...connectorEndpointDrafts,
-			[connectorId]: value
-		};
-	}
-
 	async function saveAssistantConfig(role: unknown) {
 		const assistant = assistantForRole(role);
 		if (!assistant) return;
@@ -265,79 +220,6 @@
 		}
 		toast.success(get(t)('project.assistantSaved'));
 		await loadAiAgents();
-	}
-
-	async function saveConnectorSuggestion(suggestion: unknown) {
-		const connector = connectorForSuggestion(suggestion);
-		if (!connector) return;
-		updatingConnectorId = connector.id;
-		const endpoint = connectorEndpointDrafts[connector.id]?.trim() ?? '';
-		const response = await connectorsApi.update(workspaceId, connector.id, {
-			endpoint: endpoint || undefined,
-			is_active: Boolean(endpoint) || connector.kind === 'mcp'
-		});
-		updatingConnectorId = null;
-		if (response.code !== 0) {
-			toast.error(response.message);
-			return;
-		}
-		toast.success('Connection saved');
-		await loadProjectConnectors();
-	}
-
-	function openprWebhookSnippet(connector: Connector, suggestion: unknown): string {
-		const key = connectorSuggestionKey(suggestion);
-		const agentType = scenarioValue(
-			suggestion,
-			'agent_type',
-			connector.kind === 'webhook' ? 'webhook' : 'cli'
-		);
-		const endpoint =
-			connectorEndpointDrafts[connector.id]?.trim() ||
-			connector.endpoint ||
-			'http://127.0.0.1:9000/webhook';
-		const projectType = project?.type_key ?? scenarioTemplate?.project_type_key ?? 'project_type';
-		const triggerKind = scenarioArrayValue(suggestion, 'route_by').includes('trigger_kind')
-			? 'mention'
-			: '<trigger_kind>';
-		if (connector.kind === 'webhook') {
-			return [
-				'[[agents]]',
-				`id = "${key}"`,
-				`name = "${connector.name}"`,
-				`agent_type = "${agentType}"`,
-				'message_template = "[{project}] {event}: {key} {title}"',
-				`# route: bot_context.bot_name="${connector.name}", bot_agent_type="${agentType}", project_type="${projectType}", trigger_kind="${triggerKind}"`,
-				'',
-				'[agents.webhook]',
-				`url = "${endpoint}"`,
-				'secret = "<shared-secret>"'
-			].join('\n');
-		}
-		return [
-			'[[agents]]',
-			`id = "${key}"`,
-			`name = "${connector.name}"`,
-			'agent_type = "cli"',
-			`# route: bot_context.bot_name="${connector.name}", project_type="${projectType}", trigger_kind="${triggerKind}"`,
-			'',
-			'[agents.cli]',
-			'executor = "codex"',
-			'workdir = "/path/to/workspace"',
-			'callback = "mcp"',
-			'callback_url = "http://127.0.0.1:8090/mcp/rpc"',
-			'callback_token = "<bot-token>"'
-		].join('\n');
-	}
-
-	async function copyConnectorSnippet(connector: Connector, suggestion: unknown) {
-		try {
-			await navigator.clipboard.writeText(openprWebhookSnippet(connector, suggestion));
-			copiedSnippetId = connector.id;
-			toast.success('Snippet copied');
-		} catch {
-			toast.error('Unable to copy snippet');
-		}
 	}
 
 	function parseLocator(raw: string): Record<string, unknown> {
@@ -726,20 +608,6 @@
 							{/each}
 						</div>
 					</div>
-					<div>
-						<h3 class="mb-2 text-sm font-semibold text-slate-900 dark:text-slate-100">
-							{$t('project.connections')}
-						</h3>
-						<div class="space-y-2">
-							{#each scenarioTemplate.connector_suggestions.slice(0, 5) as item, index}
-								<div
-									class="rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 dark:border-slate-700 dark:text-slate-300"
-								>
-									{scenarioItemLabel(item, `Connection ${index + 1}`)}
-								</div>
-							{/each}
-						</div>
-					</div>
 				</div>
 			</div>
 
@@ -755,16 +623,9 @@
 							{scenarioTemplateAudience(scenarioTemplate.audience_label, scenarioTemplate.key, $t)}
 						</p>
 					</div>
-					<a
-						href={`/workspace/${workspaceId}/connections`}
-						class="inline-flex items-center justify-center rounded-md border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-700 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"
-					>
-						<Plug class="mr-2 h-4 w-4" aria-hidden="true" />
-						{$t('project.connections')}
-					</a>
 				</div>
 
-				<div class="grid gap-5 lg:grid-cols-2">
+				<div class="grid gap-5">
 					<div>
 						<h3 class="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
 							{$t('project.assistantSetup')}
@@ -886,85 +747,6 @@
 						{/if}
 					</div>
 
-					<div>
-						<h3 class="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">
-							{$t('project.connectionSetup')}
-						</h3>
-						{#if connectorSuggestions().length === 0}
-							<p
-								class="rounded-md border border-dashed border-slate-300 p-4 text-sm text-slate-500 dark:border-slate-700 dark:text-slate-400"
-							>
-								{$t('project.noConnectionSuggestions')}
-							</p>
-						{:else}
-							<div class="space-y-3">
-								{#each connectorSuggestions() as suggestion (connectorSuggestionKey(suggestion))}
-									{@const connector = connectorForSuggestion(suggestion)}
-									<div class="rounded-md border border-slate-200 p-4 dark:border-slate-700">
-										<div
-											class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between"
-										>
-											<div>
-												<div class="flex flex-wrap items-center gap-2">
-													<h4 class="text-sm font-semibold text-slate-900 dark:text-slate-100">
-														{scenarioItemLabel(suggestion, $t('project.connection'))}
-													</h4>
-													<span
-														class="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300"
-														>{scenarioValue(suggestion, 'type', 'connector')}</span
-													>
-													<span
-														class="rounded px-2 py-0.5 text-xs font-medium {connector?.is_active
-															? 'bg-emerald-50 text-emerald-700'
-															: 'bg-amber-50 text-amber-700'}"
-													>
-														{connector?.is_active ? $t('project.active') : $t('project.needsSetup')}
-													</span>
-												</div>
-											</div>
-											{#if connector}
-												<Button
-													size="sm"
-													variant="secondary"
-													onclick={() => copyConnectorSnippet(connector, suggestion)}
-												>
-													<Copy class="mr-2 h-4 w-4" aria-hidden="true" />
-													{copiedSnippetId === connector.id
-														? $t('project.copied')
-														: $t('project.copySnippet')}
-												</Button>
-											{/if}
-										</div>
-										{#if connector}
-											<div class="grid gap-2 sm:grid-cols-[1fr_auto]">
-												<input
-													value={connectorEndpointDrafts[connector.id] ?? ''}
-													oninput={(event) =>
-														setConnectorEndpointDraft(connector.id, event.currentTarget.value)}
-													placeholder={connector.kind === 'webhook'
-														? 'https://example.com/webhook'
-														: 'http://127.0.0.1:8090'}
-													class="rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder:text-slate-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-100 dark:placeholder-slate-500 dark:focus:ring-blue-400"
-												/>
-												<Button
-													size="sm"
-													disabled={updatingConnectorId === connector.id}
-													onclick={() => saveConnectorSuggestion(suggestion)}
-												>
-													{$t('project.saveConnection')}
-												</Button>
-											</div>
-											<pre
-												class="mt-3 max-h-52 overflow-auto rounded-md bg-slate-950 p-3 text-xs text-slate-100">{openprWebhookSnippet(
-													connector,
-													suggestion
-												)}</pre>
-										{/if}
-									</div>
-								{/each}
-							</div>
-						{/if}
-					</div>
 				</div>
 			</div>
 		{/if}

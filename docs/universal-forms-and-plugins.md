@@ -103,7 +103,7 @@ cargo test -p api forms::
 scripts/audit-universal-forms-docs.sh
 scripts/smoke-forms-mcp.sh
 scripts/smoke-scenario-template-forms.sh
-scripts/smoke-restaurant-ordering.sh
+bun --cwd frontend run smoke:restaurant-ordering
 ```
 
 Frontend:

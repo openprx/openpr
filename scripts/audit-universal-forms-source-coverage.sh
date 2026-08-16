@@ -138,12 +138,10 @@ for path in \
   apps/api/src/events/mod.rs \
   apps/api/src/routes/form.rs \
   apps/api/src/routes/plugin.rs \
-  apps/api/src/routes/connector.rs \
   apps/api/src/routes/webhook.rs \
   apps/api/src/routes/check_result.rs \
   apps/api/src/routes/project_type.rs \
   apps/api/src/routes/scenario_template.rs \
-  apps/api/src/services/invocation_service.rs \
   apps/worker/src/main.rs; do
   check_file "$path"
 done
@@ -211,7 +209,6 @@ contains "scenario template API emits runtime usage guide" "apps/api/src/routes/
 contains "scenario template API emits usage guide schema version" "apps/api/src/routes/scenario_template.rs" "openpr.scenario_template.usage_guide.v1"
 contains "scenario template API usage guide includes operator entrypoints" "apps/api/src/routes/scenario_template.rs" "operator_entrypoints"
 contains "scenario template API usage guide includes MCP tools" "apps/api/src/routes/scenario_template.rs" "primary_mcp_tools"
-contains "scenario template API usage guide includes connector kinds" "apps/api/src/routes/scenario_template.rs" "connector_kinds"
 contains "scenario template API usage guide includes plugin keys" "apps/api/src/routes/scenario_template.rs" "plugin_keys"
 contains "scenario template API tests restaurant usage guide" "apps/api/src/routes/scenario_template.rs" "restaurant_usage_guide_exposes_runtime_integration_contract"
 contains "MCP scenario template tool documents usage guide" "apps/mcp-server/src/tools/scenario_templates.rs" "usage_guide"
@@ -234,29 +231,11 @@ contains "auth route updates current user profile" "apps/api/src/routes/auth.rs"
 contains "auth route verifies current password before update" "apps/api/src/routes/auth.rs" "invalid current password"
 contains "auth route persists notification preferences" "apps/api/src/routes/auth.rs" "update_preferences"
 
-printf '\nWorker and connector coverage:\n'
-contains "worker consumes event outbox" "apps/worker/src/main.rs" "pickup_pending_event_outbox"
-contains "worker marks outbox dispatched" "apps/worker/src/main.rs" "mark_event_outbox_dispatched"
-contains "worker marks outbox failed for retry" "apps/worker/src/main.rs" "mark_event_outbox_failed"
-contains "worker routes webhook connector kind" "apps/worker/src/main.rs" "'webhook'"
-contains "worker routes print connector kind" "apps/worker/src/main.rs" "'print'"
-contains "worker routes device connector kind" "apps/worker/src/main.rs" "'device'"
+printf '\nWorker and event delivery coverage:\n'
 contains "worker emits AI task business events" "apps/worker/src/main.rs" "ai_task.picked_up"
-contains "worker emits invocation dispatch business events" "apps/worker/src/main.rs" "invocation.dispatched"
-contains "worker emits workflow invocation created events" "apps/worker/src/main.rs" "invocation.created"
-contains "worker does not downgrade terminal invocation status" "apps/worker/src/main.rs" "status NOT IN ('completed', 'failed', 'cancelled')"
-contains "API smoke covers workflow invocation business events" "scripts/smoke-universal-forms-api.sh" "workflow invocation business events and outbox smoke passed"
-contains "worker requires explicit invocation lifecycle subscription" "apps/worker/src/main.rs" "LIKE 'invocation.%'"
-contains "API smoke blocks wildcard lifecycle connector fanout" "scripts/smoke-universal-forms-api.sh" "invocation lifecycle fanout guard smoke passed"
-contains "connector route handles receipts" "apps/api/src/routes/connector.rs" "receipt"
-contains "connector route writes event inbox" "apps/api/src/routes/connector.rs" "event_inbox"
-contains "connector route emits created business events" "apps/api/src/routes/connector.rs" "connector.created"
-contains "connector route emits updated business events" "apps/api/src/routes/connector.rs" "connector.updated"
-contains "connector route emits deleted business events" "apps/api/src/routes/connector.rs" "connector.deleted"
 contains "legacy webhook route emits created business events" "apps/api/src/routes/webhook.rs" "webhook.created"
 contains "legacy webhook route emits updated business events" "apps/api/src/routes/webhook.rs" "webhook.updated"
 contains "legacy webhook route emits deleted business events" "apps/api/src/routes/webhook.rs" "webhook.deleted"
-contains "legacy webhook connector sync marks metadata" "apps/api/src/routes/webhook.rs" "legacy_webhook"
 contains "check result route emits created business events" "apps/api/src/routes/check_result.rs" "check_result.created"
 contains "check result route emits proposed business events" "apps/api/src/routes/check_result.rs" "check_result.proposed"
 contains "check result route emits proposal business events" "apps/api/src/routes/check_result.rs" "proposal.created_from_check_result"
@@ -286,7 +265,6 @@ printf '\nMCP and CLI coverage:\n'
 for path in \
   apps/mcp-server/src/tools/forms.rs \
   apps/mcp-server/src/tools/plugins.rs \
-  apps/mcp-server/src/tools/connectors.rs \
   apps/mcp-server/src/tools/project_types.rs \
   apps/mcp-server/src/tools/scenario_templates.rs \
   apps/mcp-server/src/cli.rs; do
@@ -322,10 +300,9 @@ contains "MCP exposes form_records.aggregate" "apps/mcp-server/src/tools/forms.r
 contains "MCP exposes events.tail" "apps/mcp-server/src/tools/forms.rs" "events.tail"
 contains "MCP exposes plugin install" "apps/mcp-server/src/tools/plugins.rs" "plugins.install"
 contains "MCP exposes plugin invoke" "apps/mcp-server/src/tools/plugins.rs" "plugins.invoke"
-contains "MCP exposes connector list" "apps/mcp-server/src/tools/connectors.rs" "connectors.list"
 contains "MCP registry pins current tool count" "apps/mcp-server/src/tools/mod.rs" "tools.len(),"
-contains "MCP registry expected count is 106" "apps/mcp-server/src/tools/mod.rs" "106,"
-contains "MCP embedded skill guide exposes 106 tools" "apps/mcp-server/src/server.rs" "## Tools (106)"
+contains "MCP registry expected count is 98" "apps/mcp-server/src/tools/mod.rs" "98,"
+contains "MCP embedded skill guide exposes 98 tools" "apps/mcp-server/src/server.rs" "## Tools (98)"
 contains "MCP embedded skill guide exposes universal forms" "apps/mcp-server/src/server.rs" "### Universal Forms:"
 contains "MCP embedded skill guide lists scenario install" "apps/mcp-server/src/server.rs" "scenario_templates.install"
 contains "MCP embedded skill guide lists forms.duplicate" "apps/mcp-server/src/server.rs" "forms.duplicate"
@@ -338,7 +315,7 @@ contains "MCP embedded skill guide lists relation tools" "apps/mcp-server/src/se
 contains "MCP embedded skill guide lists child lifecycle tools" "apps/mcp-server/src/server.rs" "form_records.child_archive"
 contains "MCP embedded skill guide lists import/export tools" "apps/mcp-server/src/server.rs" "form_records.import_commit"
 contains "MCP embedded skill guide exposes plugins" "apps/mcp-server/src/server.rs" "### Plugins:"
-contains "MCP AGENTS guide exposes 106 tools" "apps/mcp-server/AGENTS.md" "106 tools"
+contains "MCP AGENTS guide exposes 98 tools" "apps/mcp-server/AGENTS.md" "98 tools"
 contains "MCP AGENTS guide lists universal forms tools" "apps/mcp-server/AGENTS.md" "form_records.aggregate"
 contains "MCP AGENTS guide lists scenario install" "apps/mcp-server/AGENTS.md" "scenario_templates.install"
 contains "MCP AGENTS guide lists forms.duplicate" "apps/mcp-server/AGENTS.md" "forms.duplicate"
@@ -351,7 +328,7 @@ contains "MCP AGENTS guide lists relation tools" "apps/mcp-server/AGENTS.md" "fo
 contains "MCP AGENTS guide lists child lifecycle tools" "apps/mcp-server/AGENTS.md" "form_records.child_archive"
 contains "MCP AGENTS guide lists import/export tools" "apps/mcp-server/AGENTS.md" "form_records.import_commit"
 contains "MCP AGENTS guide lists plugin tools" "apps/mcp-server/AGENTS.md" "plugin_invocations.list"
-contains "MCP app README exposes 106 tools" "apps/mcp-server/README.md" "106 MCP Tools"
+contains "MCP app README exposes 98 tools" "apps/mcp-server/README.md" "98 MCP Tools"
 contains "MCP app README exposes three transports" "apps/mcp-server/README.md" "Three Transport Modes"
 contains "MCP app README lists universal forms tools" "apps/mcp-server/README.md" "form_records.aggregate"
 contains "MCP app README lists scenario install" "apps/mcp-server/README.md" "scenario_templates.install"
@@ -366,7 +343,7 @@ contains "MCP app README lists child lifecycle tools" "apps/mcp-server/README.md
 contains "MCP app README lists import/export tools" "apps/mcp-server/README.md" "form_records.import_commit"
 contains "MCP app README lists plugin tools" "apps/mcp-server/README.md" "plugin_invocations.list"
 contains "MCP app README uses API client structure" "apps/mcp-server/README.md" "client/           # OpenPR API client helpers"
-contains "MCP skill guide exposes 106 tools" "skills/openpr-mcp/SKILL.md" "enumerate all 106 tools"
+contains "MCP skill guide exposes 98 tools" "skills/openpr-mcp/SKILL.md" "enumerate all 98 tools"
 contains "MCP skill guide lists universal forms tools" "skills/openpr-mcp/SKILL.md" "form_records.aggregate"
 contains "MCP skill guide lists scenario install" "skills/openpr-mcp/SKILL.md" "scenario_templates.install"
 contains "MCP skill guide lists forms.duplicate" "skills/openpr-mcp/SKILL.md" "forms.duplicate"
@@ -379,8 +356,8 @@ contains "MCP skill guide lists relation tools" "skills/openpr-mcp/SKILL.md" "fo
 contains "MCP skill guide lists child lifecycle tools" "skills/openpr-mcp/SKILL.md" "form_records.child_archive"
 contains "MCP skill guide lists import/export tools" "skills/openpr-mcp/SKILL.md" "form_records.import_commit"
 contains "MCP skill guide lists plugin tools" "skills/openpr-mcp/SKILL.md" "plugins.install"
-contains "MCP skill validation requires exact 106 tools" "skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 106 tools"
-contains "MCP regression checks 106-tool registry" "skills/openpr-mcp/scripts/mcp-regression.py" "registry_has_106_tools_with_forms_and_plugins"
+contains "MCP skill validation requires exact 98 tools" "skills/openpr-mcp/scripts/validate-mcp.sh" "expected exactly 98 tools"
+contains "MCP regression checks 98-tool registry" "skills/openpr-mcp/scripts/mcp-regression.py" "registry_has_98_tools_with_forms_and_plugins"
 contains "MCP regression checks universal forms registry tools" "skills/openpr-mcp/scripts/mcp-regression.py" "form_records.aggregate"
 contains "MCP regression checks scenario install" "skills/openpr-mcp/scripts/mcp-regression.py" "scenario_templates.install"
 contains "MCP regression checks forms.duplicate" "skills/openpr-mcp/scripts/mcp-regression.py" "forms.duplicate"
@@ -412,8 +389,8 @@ not_contains "MCP app README does not retain stale two-transport wording" "apps/
 not_contains "MCP app README does not expose direct db module" "apps/mcp-server/README.md" "src/db"
 not_contains "MCP skill guide does not retain stale 65-tool count" "skills/openpr-mcp/SKILL.md" "65 tools"
 not_contains "MCP validation does not accept stale 65-tool minimum" "skills/openpr-mcp/scripts/validate-mcp.sh" "-ge 65"
-contains "docs index records current MCP tool count" "docs/README.md" "MCP server (106 tools"
-contains "docs index records current MCP regression count" "docs/README.md" "106-tool registry"
+contains "docs index records current MCP tool count" "docs/README.md" "MCP server (98 tools"
+contains "docs index records current MCP regression count" "docs/README.md" "98-tool registry"
 contains "docs index links implementation map" "docs/README.md" "universal-forms-implementation-map.md"
 not_contains "docs index does not retain stale 64-tool count" "docs/README.md" "64-tool"
 not_contains "docs index does not retain stale 64 MCP server count" "docs/README.md" "64 tools"
@@ -423,7 +400,6 @@ contains "CLI examples can call forms.list" "apps/mcp-server/src/cli.rs" "forms.
 printf '\nFrontend and browser smoke coverage:\n'
 for path in \
   frontend/src/lib/api/forms.ts \
-  frontend/src/lib/api/connectors.ts \
   frontend/src/lib/api/auth.ts \
   frontend/src/lib/utils/scenario-template.ts \
   'frontend/src/routes/(app)/settings/+page.svelte' \
@@ -458,7 +434,6 @@ not_contains "frontend zh i18n does not expose placeholder settings copy" "front
 contains "forms browser smoke covers mobile overflow" "frontend/scripts/smoke-forms-ui.mjs" "horizontal overflow"
 contains "project template wizard smoke covers template cards" "frontend/scripts/smoke-project-template-wizard.mjs" "data-template-card-seen"
 contains "project template wizard smoke covers scenario setup" "frontend/scripts/smoke-project-template-wizard.mjs" "data-scenario-dashboard-seen"
-contains "project template wizard smoke covers connection config" "frontend/scripts/smoke-project-template-wizard.mjs" "data-scenario-connection-configured"
 contains "project template wizard smoke captures screenshots" "frontend/scripts/smoke-project-template-wizard.mjs" "OPENPR_PROJECT_TEMPLATE_SCREENSHOT_DIR"
 contains "template work items smoke covers all non-restaurant templates" "frontend/scripts/smoke-template-work-items.mjs" "quality_corrective_action_default"
 contains "template work items smoke covers scenario field issue creation" "frontend/scripts/smoke-template-work-items.mjs" "data-template-work-item-smoke"
@@ -484,15 +459,12 @@ printf '\nAcceptance smoke coverage:\n'
 for path in \
   scripts/smoke-universal-forms-api.sh \
   scripts/smoke-forms-mcp.sh \
-  scripts/smoke-phase2-connectors-invocations.sh \
-  scripts/smoke-phase3-mcp-governance-acceptance.sh \
   scripts/smoke-phase5-release-readiness.sh \
   scripts/smoke-plugins-mcp.sh \
   scripts/smoke-phase1-project-types-resources.sh \
   scripts/smoke-user-settings-api.sh \
   scripts/smoke-webhook-generic-consumer.sh \
   scripts/smoke-scenario-template-forms.sh \
-  scripts/smoke-restaurant-ordering.sh \
   scripts/bootstrap-restaurant-demo.sh \
   scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh \
   scripts/smoke-wasm-plugin-runtime.sh \
@@ -552,7 +524,7 @@ done
 check_executable "scripts/smoke-universal-forms-deployed-import.mjs"
 check_executable "scripts/smoke-universal-forms-deployed-permissions.mjs"
 check_executable "scripts/smoke-universal-forms-deployed-duplicate.mjs"
-contains "API smoke covers retry and idempotency" "scripts/smoke-universal-forms-api.sh" "retry, and idempotency"
+contains "API smoke covers retry and idempotency" "scripts/smoke-universal-forms-api.sh" "retry and idempotency covered"
 contains "deployed import smoke covers import preview endpoint" "scripts/smoke-universal-forms-deployed-import.mjs" "/records/import-preview"
 contains "deployed import smoke covers import commit endpoint" "scripts/smoke-universal-forms-deployed-import.mjs" "/records/import"
 contains "deployed import smoke covers browser import modal" "scripts/smoke-universal-forms-deployed-import.mjs" "导入记录"
@@ -565,23 +537,12 @@ contains "deployed permissions smoke covers member denial" "scripts/smoke-univer
 contains "deployed permissions smoke covers form list hiding" "scripts/smoke-universal-forms-deployed-permissions.mjs" "member list should hide form when form.view is false"
 contains "deployed permissions smoke covers browser permissions panel" "scripts/smoke-universal-forms-deployed-permissions.mjs" "保存权限"
 contains "API smoke covers form definition write events" "scripts/smoke-universal-forms-api.sh" "form definition/view write business events"
-contains "API smoke covers connector write events" "scripts/smoke-universal-forms-api.sh" "connector write business events"
 contains "API smoke covers legacy webhook write events" "scripts/smoke-universal-forms-api.sh" "legacy webhook business events"
-contains "API smoke covers legacy webhook connector outbox" "scripts/smoke-universal-forms-api.sh" "legacy webhook connector outbox rows"
 contains "user settings smoke verifies profile update" "scripts/smoke-user-settings-api.sh" "/api/v1/auth/me/profile"
 contains "user settings smoke verifies preference persistence" "scripts/smoke-user-settings-api.sh" "/api/v1/auth/me/preferences"
 contains "user settings smoke verifies password rotation" "scripts/smoke-user-settings-api.sh" "old password login should fail"
 contains "acceptance includes user settings smoke" "scripts/acceptance-universal-forms.sh" "User settings profile password preferences smoke"
-contains "acceptance includes Phase 2 invocation smoke" "scripts/acceptance-universal-forms.sh" "Phase 2 connectors and invocation lifecycle smoke"
-contains "Phase 2 invocation smoke covers lifecycle business events" "scripts/smoke-phase2-connectors-invocations.sh" "invocation lifecycle business events and outbox smoke passed"
-contains "Phase 2 invocation smoke covers AI task invocation business events" "scripts/smoke-phase2-connectors-invocations.sh" "AI task invocation business events and outbox smoke passed"
-contains "AI task invocation service emits business events" "apps/api/src/services/invocation_service.rs" "ai_task_invocation"
-contains "Phase 2 invocation smoke covers AI task business events" "scripts/smoke-phase2-connectors-invocations.sh" "AI task business events and outbox smoke passed"
 contains "AI task service emits business events" "apps/api/src/services/ai_task_service.rs" "ai_task.created"
-contains "Phase 2 invocation smoke covers worker dispatch events" "scripts/smoke-phase2-connectors-invocations.sh" "worker AI task dispatch business events and outbox smoke passed"
-contains "acceptance includes Phase 3 MCP governance smoke" "scripts/acceptance-universal-forms.sh" "Phase 3 MCP governance acceptance smoke"
-contains "Phase 3 MCP governance smoke covers check results" "scripts/smoke-phase3-mcp-governance-acceptance.sh" "check_results.create"
-contains "Phase 3 MCP governance smoke covers check result business events" "scripts/smoke-phase3-mcp-governance-acceptance.sh" "check result business events and outbox smoke passed"
 contains "MCP smoke covers generic CLI" "scripts/smoke-forms-mcp.sh" "tools call"
 contains "MCP smoke covers forms.duplicate" "scripts/smoke-forms-mcp.sh" "forms.duplicate"
 contains "acceptance includes Phase 5 release readiness smoke" "scripts/acceptance-universal-forms.sh" "Phase 5 release readiness live API and MCP smoke"
@@ -617,9 +578,7 @@ contains "webhook smoke covers generic consumer" "scripts/smoke-webhook-generic-
 contains "scenario template smoke covers restaurant plugin" "scripts/smoke-scenario-template-forms.sh" "restaurant_calc plugin"
 contains "scenario template smoke covers runtime usage guide schema" "scripts/smoke-scenario-template-forms.sh" "usage guide schema version"
 contains "scenario template smoke covers runtime usage MCP tools" "scripts/smoke-scenario-template-forms.sh" "aggregate MCP tool"
-contains "scenario template smoke covers runtime usage connectors" "scripts/smoke-scenario-template-forms.sh" "print connector kind"
 contains "scenario template smoke covers initialization business events" "scripts/smoke-scenario-template-forms.sh" "scenario template initialization business events and outbox smoke passed"
-contains "restaurant smoke covers print receipt" "scripts/smoke-restaurant-ordering.sh" "print receipt"
 contains "restaurant demo bootstrap uses public API" "scripts/bootstrap-restaurant-demo.sh" "/api/v1/workspaces"
 contains "restaurant demo bootstrap creates restaurant template project" "scripts/bootstrap-restaurant-demo.sh" "restaurant_ordering_default"
 contains "restaurant demo bootstrap refuses remote API by default" "scripts/bootstrap-restaurant-demo.sh" "OPENPR_DEMO_ALLOW_REMOTE"
@@ -1128,7 +1087,7 @@ contains "delivery manifest includes restore script" "scripts/prepare-universal-
 contains "delivery manifest includes stop script" "scripts/prepare-universal-forms-delivery-manifest.sh" "stop script"
 contains "delivery manifest includes clean script" "scripts/prepare-universal-forms-delivery-manifest.sh" "clean script"
 contains "MCP test script requires exact expected tool count" "scripts/test-mcp.sh" 'expected exactly $EXPECTED_TOOL_COUNT'
-contains "MCP test script defaults to current tool count" "scripts/test-mcp.sh" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-106}"'
+contains "MCP test script defaults to current tool count" "scripts/test-mcp.sh" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-98}"'
 contains "MCP test script requires scenario template install" "scripts/test-mcp.sh" "scenario_templates.install"
 contains "MCP test script requires forms.duplicate" "scripts/test-mcp.sh" "forms.duplicate"
 contains "MCP test script requires form metadata tools" "scripts/test-mcp.sh" "forms.schema_summary"

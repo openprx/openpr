@@ -6,7 +6,6 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     events::{BusinessEventInput, insert_business_event},
-    services::invocation_service::create_invocation_for_ai_task,
 };
 
 #[derive(Debug, Clone, FromQueryResult)]
@@ -147,8 +146,6 @@ pub async fn create_ai_task<C: ConnectionTrait>(
         None,
     )
     .await?;
-
-    create_invocation_for_ai_task(db, &task, input.actor_id).await?;
 
     Ok(Some(task))
 }

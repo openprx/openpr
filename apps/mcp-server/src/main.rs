@@ -95,7 +95,6 @@ fn build_client(mcp: &McpRuntime, credential: Option<Secret>) -> anyhow::Result<
         base_url: mcp.api_url.clone(),
         credential,
         workspace_id: mcp.workspace_id.to_string(),
-        invocation_id: mcp.invocation_id.clone(),
         transport_label: transport_label(mcp.transport),
     })
     .map_err(|e| anyhow::anyhow!(e))
@@ -707,7 +706,6 @@ mod sse_delivery_tests {
             base_url: api_url,
             credential: None,
             workspace_id: WORKSPACE.to_string(),
-            invocation_id: None,
             transport_label: "sse",
         })
         .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;

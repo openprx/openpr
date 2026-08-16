@@ -19,7 +19,6 @@ export interface EmbeddedScenarioTemplate {
 	resource_schema: Record<string, unknown>;
 	ai_roles: unknown[];
 	governance_policy: Record<string, unknown>;
-	connector_suggestions: unknown[];
 	sample_data: Record<string, unknown>;
 }
 
@@ -44,7 +43,6 @@ export function getProjectScenarioTemplate(project: Project | null | undefined):
 		resource_schema: isRecord(raw.resource_schema) ? raw.resource_schema : {},
 		ai_roles: Array.isArray(raw.ai_roles) ? raw.ai_roles : [],
 		governance_policy: isRecord(raw.governance_policy) ? raw.governance_policy : {},
-		connector_suggestions: Array.isArray(raw.connector_suggestions) ? raw.connector_suggestions : [],
 		sample_data: isRecord(raw.sample_data) ? raw.sample_data : {}
 	};
 }

@@ -337,8 +337,8 @@ fi
 
 for _ in $(seq 1 60); do
   task_count="$(psql_smoke -tAc "SELECT COUNT(*) FROM ai_tasks WHERE ai_participant_id = '$BOT_ID' AND task_type = 'comment_requested' AND payload->>'project_type' = 'contract_review';" | tr -d '[:space:]')"
-  dispatched_count="$(psql_smoke -tAc "SELECT COUNT(*) FROM agent_invocations ai INNER JOIN ai_tasks t ON t.id = ai.source_task_id WHERE t.ai_participant_id = '$BOT_ID' AND t.task_type = 'comment_requested' AND ai.status = 'dispatched';" | tr -d '[:space:]')"
-  if [[ "$task_count" == "1" && "$dispatched_count" == "1" ]]; then
+  processing_count="$(psql_smoke -tAc "SELECT COUNT(*) FROM ai_tasks WHERE ai_participant_id = '$BOT_ID' AND task_type = 'comment_requested' AND status = 'processing';" | tr -d '[:space:]')"
+  if [[ "$task_count" == "1" && "$processing_count" == "1" && -s "$WEBHOOK_LOG" ]]; then
     echo "Browser mention to openpr-webhook smoke passed"
     exit 0
   fi
@@ -346,7 +346,7 @@ for _ in $(seq 1 60); do
 done
 
 echo "Timed out waiting for comment_requested task dispatch" >&2
-psql_smoke -x -c "SELECT t.id, t.status, t.task_type, t.payload, ai.status AS invocation_status, ai.connector_kind, ai.error_message FROM ai_tasks t LEFT JOIN agent_invocations ai ON ai.source_task_id = t.id ORDER BY t.created_at DESC LIMIT 5;" >&2 || true
+psql_smoke -x -c "SELECT id, status, task_type, payload, error_message FROM ai_tasks ORDER BY created_at DESC LIMIT 5;" >&2 || true
 echo "--- worker log ---" >&2
 tail -120 "$WORKER_LOG" >&2 || true
 echo "--- webhook log ---" >&2

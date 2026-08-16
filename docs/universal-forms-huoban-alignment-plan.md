@@ -1203,7 +1203,7 @@ scripts/smoke-universal-forms-api.sh
 scripts/smoke-forms-mcp.sh
 scripts/smoke-webhook-generic-consumer.sh
 scripts/smoke-wasm-plugin-runtime.sh
-scripts/smoke-restaurant-ordering.sh
+bun --cwd frontend run smoke:restaurant-ordering
 scripts/smoke-print-connector.sh
 ```
 

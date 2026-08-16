@@ -209,31 +209,3 @@ transport = "stdio"
 # present its caller's own bot token, and the process holds no identity of its own to fall back
 # to, so an unauthenticated caller can reach nothing but /health.
 # bind_addr = "127.0.0.1:8090"
-
-# Correlation id stamped onto API calls made on behalf of one agent invocation. Usually left
-# unset and supplied per invocation.
-# invocation_id = "inv-0001"
-
-
-# ---------------------------------------------------------------------------------------------
-# [connectors.secrets] — credentials the delivery pipeline may present to third parties.
-#
-# One table per workspace, keyed by the workspace's UUID. A connector can only read credentials
-# filed under the UUID of the workspace that owns it: the lookup selects the workspace table
-# first and searches for the name only inside it, so no reference — however it is spelled — can
-# reach another tenant's credentials. Two workspaces may use the same credential name without
-# colliding.
-#
-# Names must match [A-Z_][A-Z0-9_]* and must not start with OPENPR_, POSTGRES_, PG or AWS_, and
-# must not be JWT_SECRET, DATABASE_URL or RUST_LOG. Values are never logged.
-#
-# Reference one from a connector's auth_policy by its short name, for example:
-#
-#     "auth_policy": { "mode": "hmac", "secret_ref": "SHIPPING" }
-#
-# The retired OPENPR_CONNECTOR_SECRET_W_<uuid>_<NAME> environment variables map to this table:
-# drop the whole prefix and file the remaining name under the workspace UUID.
-# ---------------------------------------------------------------------------------------------
-# [connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
-# SHIPPING = "replace_with_connector_credential"
-# PAYMENTS = "replace_with_connector_credential"

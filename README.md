@@ -10,21 +10,21 @@ Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL 16**.
 - **Governance** — proposals, weighted voting, decision records, veto and escalation, trust scores, appeals, impact reviews, audit logs.
 - **Universal forms** — project-defined business data types with grid/detail views, decimal-safe amounts, record links and child tables, formulas, per-role permissions, import/export, electronic signatures.
 - **WASM plugins** — per-project sandboxed plugins for field validation, formulas, and event handlers.
-- **Events** — transactional outbox/inbox with asynchronous connector delivery, plus a legacy webhook path.
-- **MCP server** — 106 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
+- **Events** — transactional business-event ledger and HMAC-signed webhooks.
+- **MCP server** — 98 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
 - **Scenario templates** — 6 ready-to-start setups: `code_delivery_default`, `contract_review_default`, `equipment_maintenance_default`, `quality_corrective_action_default`, `customer_delivery_default`, `restaurant_ordering_default`.
 
 ## Architecture
 
 | Component    | Path              | Role                                                                 |
 | ------------ | ----------------- | -------------------------------------------------------------------- |
-| `api`        | `apps/api`        | HTTP API (301 endpoints), form engine, plugin runtime, event emission |
-| `worker`     | `apps/worker`     | Background pipelines: AI tasks, event outbox/inbox, connectors, jobs  |
+| `api`        | `apps/api`        | HTTP API, form engine, plugin runtime, event emission                 |
+| `worker`     | `apps/worker`     | Background pipelines: AI tasks, operation-log retention, form jobs   |
 | `mcp-server` | `apps/mcp-server` | MCP server (HTTP/stdio/SSE) and CLI over the API                     |
 | `frontend`   | `frontend`        | SvelteKit 2 SPA (adapter-static)                                     |
 
 `crates/platform` holds shared config, DB connection, auth, error, and logging.
-`migrations/` holds 47 SQL migrations (`0001`–`0047`) defining 69 tables.
+`migrations/` holds the ordered SQL schema history through `0052`.
 
 ## Quick Start
 
@@ -93,10 +93,10 @@ being silently ignored.
 | `[auth]` | api, worker | `jwt_secret` (**required**; minimum 16 characters, 64 hex recommended — `openssl rand -hex 32`), `access_ttl_seconds` (`1296000`), `refresh_ttl_seconds` (`1728000`), `default_author_id` (optional, must be a real non-nil UUID) |
 | `[logging]` | all | `filter` — `tracing` directives, validated at startup (`<service>=info,tower_http=info`), `format` — `json` \| `text` (`json`), `output` — `stderr` \| `stdout` (`stderr`) |
 | `[storage]` | api | `backend` — `local` \| `s3` (`local`), `dir` (`./uploads`); `[storage.s3]` with `endpoint`, `bucket`, `region` (`us-east-1`), `access_key_id`, `secret_access_key`, `session_token`, required only when `backend = "s3"` and left unread otherwise |
+| `[audit]` | worker | `operation_log_retention_days` (`30`, range `1..=3650`) |
 | `[migrations]` | api | `replay` (`false`), `continue_on_error` (`false`) — both are escape hatches; turn one on deliberately, then turn it back off |
 | `[outbound]` | api, worker | `allowed_hosts` — a TOML **array of strings** (`[]`), `allow_private` (`false`) |
-| `[mcp]` | mcp-server | `api_url` (`http://localhost:8081`), `bot_token` (`opr_` prefix; **required** for `stdio` and the CLI subcommands, unused by `http`/`sse`), `workspace_id` (**required**, real non-nil UUID), `transport` — `stdio` \| `http` \| `sse` (`stdio`), `bind_addr` (`127.0.0.1:8090`), `invocation_id` (optional ledger correlation id) |
-| `[connectors.secrets."<workspace-uuid>"]` | api, worker | One table per workspace, `NAME = "value"` |
+| `[mcp]` | mcp-server | `api_url` (`http://localhost:8081`), `bot_token` (`opr_` prefix; **required** for `stdio` and the CLI subcommands, unused by `http`/`sse`), `workspace_id` (**required**, real non-nil UUID), `transport` — `stdio` \| `http` \| `sse` (`stdio`), `bind_addr` (`127.0.0.1:8090`) |
 
 > **Eager shape, lazy presence.** Every value the file *does* contain is
 > shape-checked at startup by whichever binary reads it, but whether a mandatory
@@ -120,7 +120,7 @@ server's stdio transport frames JSON-RPC on stdout, where one log line ends the
 session, so it always logs to stderr and reports `output = "stdout"` as
 overridden rather than honouring it.
 
-**Outbound deliveries (api + worker).** Connector and webhook endpoints are
+**Outbound deliveries (api + worker).** Webhook endpoints are
 validated when they are configured and again before every delivery: an endpoint
 whose host resolves to a loopback, private, link-local, NAT64/6to4 or otherwise
 internal address is refused, and redirects are not followed.
@@ -137,115 +137,6 @@ allowed_hosts = ["webhook:9090", "api:8080", "mcp-server:8090", "frontend:80"]
 allow_private = false
 ```
 
-**Connector credentials.** Anything a connector `auth_policy` presents to a
-third party is filed under the UUID of the workspace that owns the connector:
-
-```toml
-[connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
-SHIPPING = "..."
-```
-
-and referenced by its short name — `"auth_policy": {"mode":"hmac","secret_ref":"SHIPPING"}`.
-The lookup selects the workspace table first and searches only inside it, so no
-reference, however it is spelled, can reach another tenant's credentials: any
-user can create a workspace and is its admin there, so a process-wide namespace
-would be readable by every tenant. Names must match `[A-Z_][A-Z0-9_]*`, must not
-start with `OPENPR_`, `POSTGRES_`, `PG` or `AWS_`, and must not be `JWT_SECRET`,
-`DATABASE_URL` or `RUST_LOG`.
-
-> The retired `OPENPR_CONNECTOR_SECRET_W_<UUID>_<NAME>` environment variables map
-> onto this table: drop the whole prefix and file the remaining name under the
-> workspace UUID. `secret_ref` / `token_ref` now carry the bare name, **not** the
-> old `env:...` form.
-
-### Compose deployment
-
-`scripts/start.sh` generates two configuration files and `docker-compose.yml`
-mounts each **read-only** at `/app/config/openpr.toml` inside its containers,
-with every service passing `--config /app/config/openpr.toml`:
-
-| File | Used by | Sections |
-| --- | --- | --- |
-| `config/openpr.compose.toml` | api, worker | `[database]`, `[auth]`, `[logging]`, `[storage]`, `[migrations]`, `[outbound]`, `[connectors]` |
-| `config/openpr.compose.mcp.toml` | mcp-server | `[logging]`, `[mcp]` |
-
-The split follows the trust boundary. api and worker are one trust domain — same
-database, same signing key, and they must not drift apart. The MCP server is the
-network-exposed, agent-facing surface, and it needs neither the database URL nor
-the JWT signing key; handing it the signing key would turn a compromise of the
-MCP server into the ability to forge any user's token. The lazy
-`[database]`/`[auth]` presence check above is what makes an MCP config file
-without those sections a valid one.
-
-Both generated files are `chmod 600` and hold real secrets. **Do not commit
-them.**
-
-Host-side helper scripts call the MCP HTTP endpoints as a workspace bot,
-because that is the only way in — there is no shared inbound secret. The bot has
-to be one of `mcp.workspace_id`, the workspace the server scopes its API calls
-to; a bot from anywhere else is answered *bot not authorized for this
-workspace*. `mcp.bot_token` in the same file is by construction that bot, so
-that is what they read, and `OPENPR_MCP_BOT_TOKEN` overrides it everywhere:
-
-- `scripts/test-mcp.sh` and `skills/openpr-mcp/scripts/validate-mcp.sh` read
-  `mcp.bot_token` out of `config/openpr.compose.mcp.toml`; point them at another
-  file with `OPENPR_CONFIG_FILE`. Both refuse the `opr_local_…` placeholder
-  `scripts/start.sh` generates rather than sending it and reporting a 401.
-- `scripts/bootstrap-restaurant-demo.sh` is what replaces that placeholder: it
-  creates the workspace and the bot through the API, writes both into the file,
-  recreates the `mcp-server` container, then verifies `/mcp/rpc` as the bot it
-  just created. `scripts/e2e-test.sh` runs it between the API and MCP test
-  steps for exactly that reason.
-
-**Consumed only by docker-compose**, never read by the Rust binaries:
-`POSTGRES_PASSWORD` (the `postgres:16` image initialises itself from it, so it
-must match the password inside `database.url`), `OPENPR_BIND_HOST` (default
-`127.0.0.1`), `OPENPR_API_PORT`, `MCP_SERVER_PORT`, `OPENPR_FRONTEND_PORT`,
-`OPENPR_WEBHOOK_PORT`, `OPENPR_RUNTIME_BASE`, `OPENPR_WEBHOOK_IMAGE`,
-`OPENPR_WEBHOOK_CONFIG`, and `VITE_API_BASE_URL` (frontend build). These live in
-`.env`, which exists purely for compose's `${...}` interpolation.
-
-## Universal Forms
-
-A form owns a schema, grid and detail views, per-role permissions, records,
-links, attachments, and events. Frontend entry point:
-`/workspace/<workspace-id>/projects/<project-id>/forms`.
-
-**27 field types**: `text`, `textarea`, `rich_text`, `phone`, `email`,
-`address`, `location`, `scan`, `signature`, `autonumber`, `member`, `number`,
-`integer`, `amount`, `rating`, `progress`, `date`, `datetime`, `single_select`,
-`multi_select`, `boolean`, `attachment`, `image`, `relation`, `child_table`,
-`formula`, `ai_summary`. Also: schema versioning with archived versions, field
-usage and dependency reports, form duplication, parent/child relations with
-child create/update/archive/restore, aggregation, import preview/commit,
-background import/export jobs, mapping templates, and attachment package jobs.
-
-### Boundaries
-
-- **Import/export supports CSV and JSON only.** There is no XLSX reader or writer.
-- **Attachment media processing is image-only** (`gif`, `jpeg`, `png`, `webp`). Thumbnails and dimensions are derived for images; no EXIF extraction, no video processing. The generic upload endpoint accepts more file types but does not process them.
-- **Formulas are a JSON structure, not an expression language.** A formula is `{"op": ..., "args": [...], "scale": n}` with 7 operators — `add`, `sum`, `subtract`, `multiply`, `divide`, `min`, `max`, `count` (`add` and `sum` are the same op) — plus cross-record aggregates `child_sum`, `child_count`, `child_min`, `child_max`. There is no dependency graph; formula fields evaluate in field declaration order.
-- **Electronic signatures are handwritten canvas PNGs plus a SHA-256 audit chain**, with optional reason/consent capture and retention-based expiry. Not PKI: no certificate, no asymmetric key, no timestamp authority.
-- **Amounts use `rust_decimal` and must be passed as strings.** The API rejects JSON numbers with `field '<key>' must be a decimal string, not a JSON number`.
-
-### Scenario templates
-
-Passing `scenario_template_key` to `POST /api/v1/workspaces/{id}/projects` (or
-calling `scenario_templates.install` on an existing project) initializes forms,
-views, connector suggestions, and — where the scenario needs local computation —
-an active WASM plugin. `restaurant_ordering_default` is the reference end-to-end
-example: menu categories, SKUs, tables, orders, order lines, print jobs,
-business reports, print/webhook connector suggestions, and an active
-`restaurant_calc` plugin.
-
-## WASM Plugins
-
-Per-project WebAssembly modules executed by `wasmtime` 45 under three limits:
-**fuel metering** (per-manifest budget, max 1e9), a **memory ceiling** via
-`StoreLimits` (1 instance, 1 memory, 1 table), and a **wall-clock timeout**
-(per-manifest, max 30000 ms). **Zero host functions** — modules are instantiated
-with an empty import list, so there is no WASI, no filesystem, no network, and
-no clock; communication happens only through linear memory.
 
 ABI (`docs/plugins/openpr-plugin-v1.wit`): export `memory`,
 `openpr_alloc(len: i32) -> i32`, and `openpr_invoke(ptr: i32, len: i32) -> i64`
@@ -263,23 +154,17 @@ returning `1`. Input and output are UTF-8 JSON, decimals stay strings.
 > `plugins.invoke`; plugin logic is reached indirectly through the `hook_kind`
 > argument of `plugins.invoke`.
 
-## Events, Connectors, and Webhooks
+## Events and Webhooks
 
-**Transactional outbox/inbox.** Business writes insert into `business_events`
-and `event_outbox` in the same transaction, with envelopes versioned
-`openpr.event.v1`. The worker leases outbox rows, fans them out into connector
-invocations, delivers them, and records receipts back through `event_inbox`.
-**Connector tools are therefore asynchronous**: creating an invocation through
-MCP or the API returns a ledger entry, not a delivery result. Poll
-`invocations.get` or read `events.tail` for the outcome.
+**Transactional event ledger.** Business writes insert into `business_events` and `event_outbox` in the same transaction, with envelopes versioned `openpr.event.v1`. Consumers may use `events.tail` to read the resulting event stream.
+
 
 **Legacy webhooks** are a separate path from the outbox, signed with HMAC-SHA256
 in `X-Webhook-Signature: sha256=<hex>`. 31 event types can be emitted (issue,
 comment, label, sprint, proposal, project, member, veto, escalation, appeal,
 governance config, AI task), while webhook subscriptions are validated against a
 narrower 14-entry allow-list in `apps/api/src/entities/webhook.rs`. **Legacy
-webhook delivery has no retry** — `retry_count` is always written as `0`. Use
-connectors when delivery must survive a failing endpoint.
+webhook delivery has no retry** — `retry_count` is always written as `0`.
 
 ## Worker
 
@@ -291,14 +176,11 @@ and awaits them sequentially.
 | Pipeline             | Source                                                                 | Behavior                                                      |
 | -------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------- |
 | AI task dispatch     | `ai_tasks`                                                             | POSTs to bot webhooks; retry delay `max(attempts, 1) * 30` s  |
-| Event outbox fan-out | `event_outbox` → `connector_invocations`                               | Backoff `LEAST(attempts * 30, 300)` s                        |
-| Event inbox receipts | `event_inbox`                                                          | Applies delivery receipts back onto invocations              |
-| Connector delivery   | `connector_invocations`                                                | HTTP delivery, 10 s client timeout, then status update       |
+| Operation-log cleanup | `bot_operation_logs`                                                  | Deletes metadata records older than `[audit]` retention       |
 | Form jobs            | `form_import_jobs`, `form_export_jobs`, `form_attachment_package_jobs` | Plus expiry cleanup of package artifacts and signature values |
 
-Every pipeline picks rows with `SELECT ... FOR UPDATE SKIP LOCKED`, so multiple
-worker instances scale horizontally against one database with no extra
-coordination.
+Queue-backed pipelines pick rows with `SELECT ... FOR UPDATE SKIP LOCKED`, so
+multiple worker instances can share one database safely.
 
 ## MCP Server
 
@@ -407,9 +289,9 @@ curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 
-### Tools (106)
+### Tools (98)
 
-Per-domain counts; the total is pinned by an `assert_eq!(tools.len(), 106)` test
+Per-domain counts; the total is pinned by an `assert_eq!(tools.len(), 98)` test
 in `apps/mcp-server/src/tools/mod.rs`.
 
 | Domain                    | Count | Representative tools                                                      |
@@ -417,7 +299,6 @@ in `apps/mcp-server/src/tools/mod.rs`.
 | Universal forms & events  |    34 | `forms.create`, `forms.update_schema`, `form_records.create`, `events.tail` |
 | Work items                |    11 | `work_items.create`, `work_items.get_by_identifier`, `work_items.search`   |
 | Scenario tools            |     9 | `code.change_proposal.create`, `documents.review_risk`, `approval.request` |
-| Connectors & invocations  |     8 | `connectors.list`, `invocations.create`, `invocations.complete`            |
 | Project types & resources |     6 | `project_types.get`, `project_resources.create`                            |
 | Projects                  |     5 | `projects.list`, `projects.create`                                         |
 | Labels                    |     5 | `labels.create`, `labels.list_by_project`                                  |
@@ -450,7 +331,7 @@ templates via `resources/templates/list`, including
 Besides `serve`, `mcp-server` exposes 9 command groups: `projects`,
 `work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`,
 `operation-logs list`, and `tools call`. The global `--format json|table` selects the output shape, and
-`tools call` reaches any of the 106 tools by name — a complete escape hatch for
+`tools call` reaches any of the 98 tools by name — a complete escape hatch for
 anything without a dedicated subcommand.
 
 ```bash
@@ -501,9 +382,9 @@ All under `scripts/`.
 | ----------- | ------------------------------------------------------------------------- |
 | Lifecycle   | `start.sh` (first-run `config/openpr.compose.toml` + `config/openpr.compose.mcp.toml` + compose `.env`, random bootstrap secrets, build release binaries, `compose up -d`), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
 | Database    | `init-db.sh` (apply migrations in order), `backup-db.sh` (gzipped dump into `backups/`), `restore-db.sh`                                                                                                                              |
-| Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (asserts the 106 tool count), `verify.sh` (component health check)                                                                           |
+| Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (asserts the 98 tool count), `verify.sh` (component health check)                                                                           |
 | Development | `dev-check.sh` (`cargo fmt --check`, `check`, `clippy -D warnings`, `test`), `ci-universal-forms-gates.sh` (reproduce the CI-only `Universal Forms Gates` bundle locally)                                                              |
-| Demo data   | `bootstrap-restaurant-demo.sh`, `smoke-restaurant-ordering.sh`                                                                                                                                                                        |
+| Demo data   | `bootstrap-restaurant-demo.sh`, `bun --cwd frontend run smoke:restaurant-ordering`                                                                                                                                                   |
 | Other       | `benchmark.sh` (API latency/throughput), `bump-version.sh` (`major\|minor\|patch`, syncs `Cargo.toml` and `frontend/package.json`)                                                                                                     |
 
 > The remaining ~80 `scripts/*universal-forms*` files are historical delivery
@@ -521,8 +402,8 @@ mode, permissions, record CRUD, record detail edit/delete. `playwright.config.ts
 hard-codes an internal `baseURL` of `http://10.72.0.3:3000`; override it with
 `BASE_URL=http://localhost:3000 npx playwright test`.
 
-**Frontend smoke scripts — 7 `.mjs` scripts** in `frontend/scripts/`, run via
-`bun run smoke:*` (`smoke:mcp-admin`, `smoke:connections`,
+**Frontend smoke scripts — 6 `.mjs` scripts** in `frontend/scripts/`, run via
+`bun run smoke:*` (`smoke:connections`,
 `smoke:phase1-project-types`, `smoke:project-template`,
 `smoke:template-work-items`, `smoke:forms-ui`, `smoke:restaurant-ordering`).
 

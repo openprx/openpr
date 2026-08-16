@@ -29,7 +29,6 @@ let projectTypes = [
 		enabled_capabilities: ['issues', 'mcp'],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	},
@@ -43,7 +42,6 @@ let projectTypes = [
 		enabled_capabilities: ['issues', 'documents', 'mcp'],
 		field_schema: {},
 		artifact_schema: {},
-		default_connectors: [],
 		created_at: now,
 		updated_at: now
 	}
@@ -277,7 +275,6 @@ location.replace('/workspace/${workspaceId}/projects?phase1_project_types_smoke=
 			enabled_capabilities: [],
 			field_schema: {},
 			artifact_schema: {},
-			default_connectors: [],
 			created_at: now,
 			updated_at: now
 		};
@@ -320,10 +317,6 @@ location.replace('/workspace/${workspaceId}/projects?phase1_project_types_smoke=
 		return;
 	}
 
-	if (pathname === `/api/v1/workspaces/${workspaceId}/connectors`) {
-		json(res, 200, apiResult([]));
-		return;
-	}
 
 	if (pathname === `/api/v1/projects/${projectId}/resources` && req.method === 'GET') {
 		json(res, 200, apiResult(paginated(resources)));

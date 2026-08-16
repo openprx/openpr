@@ -21,7 +21,6 @@ use crate::{
             AiTaskRow, CreateAiTaskInput, create_ai_task, insert_ai_task_business_event, insert_ai_task_event,
             next_retry_time, valid_reference_type, valid_task_type,
         },
-        invocation_service::update_invocation_for_ai_task,
         trust_score_service::{is_project_admin_or_owner, is_project_member, is_system_admin},
     },
     webhook_trigger::{TriggerContext, WebhookEvent, trigger_webhooks},
@@ -169,16 +168,6 @@ pub async fn complete_task(
         Some(previous_status.as_str()),
     )
     .await?;
-    update_invocation_for_ai_task(
-        &state.db,
-        task_id,
-        "completed",
-        task.result.clone(),
-        None,
-        Some(actor_id),
-    )
-    .await?;
-
     let project = find_project(&state, task.project_id).await?;
     trigger_webhooks(
         state.clone(),
@@ -319,16 +308,6 @@ pub async fn fail_task(
     )
     .await?;
 
-    update_invocation_for_ai_task(
-        &state.db,
-        task_id,
-        if task.status == "failed" { "failed" } else { "pending" },
-        None,
-        task.error_message.clone(),
-        Some(actor_id),
-    )
-    .await?;
-
     if task.status == "failed" {
         let project = find_project(&state, task.project_id).await?;
         trigger_webhooks(
@@ -380,7 +359,6 @@ pub async fn report_progress(
         Some(task.status.as_str()),
     )
     .await?;
-    update_invocation_for_ai_task(&state.db, task_id, "running", None, None, Some(actor_id)).await?;
     Ok(ApiResponse::ok())
 }
 

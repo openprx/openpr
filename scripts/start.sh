@@ -163,18 +163,12 @@ replay = false
 continue_on_error = false
 
 [outbound]
-# Connector and webhook endpoints resolving to a private address are refused unless the host is
+# Webhook and other outbound endpoints resolving to a private address are refused unless the host is
 # listed here. These are the in-compose services, including the optional webhook receiver.
 # Entries are matched literally: "host" or "host:port", no wildcards and no URLs.
 allowed_hosts = ["webhook:9090", "api:8080", "mcp-server:8090", "frontend:80"]
 allow_private = false
 
-# Credentials the connector delivery pipeline may present, one table per workspace, keyed by the
-# workspace UUID. A connector auth_policy references one by its short name, for example
-# {"mode": "hmac", "secret_ref": "SHIPPING"}. A connector can only read names filed under the
-# workspace that owns it.
-# [connectors.secrets."0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8"]
-# SHIPPING = "..."
 EOF
   # 0644, not 0600: the containers run as their own uid and a rootless runtime maps the
   # host owner to a different one inside, so an owner-only file is unreadable there.
@@ -264,9 +258,7 @@ SCHEMA = {
         "workspace_id",
         "transport",
         "bind_addr",
-        "invocation_id",
     },
-    "connectors": {"secrets"},
 }
 # Keys the binaries used to accept and now reject outright. A file that still carries one is not a
 # file with a stale comment in it: the process refuses to start, so this has to be reported as the
@@ -308,9 +300,6 @@ def check_keys(data, label, path):
             issues.append(f"{label}: unknown section [{section}]; the binaries reject unknown keys")
             continue
         if not isinstance(value, dict):
-            continue
-        # Credential names under [connectors.secrets] are data, not schema.
-        if section == "connectors":
             continue
         for key in value:
             retired = RETIRED.get((section, key))

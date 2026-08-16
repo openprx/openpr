@@ -51,11 +51,6 @@ async fn main() -> anyhow::Result<()> {
     let db = connect_db(&config.database_runtime()?).await?;
     run_migrations(&db, config.migrations).await?;
     verify_governance_schema(&db).await?;
-    // A migration that only warned used to leave the delivery pipeline half built. Fail here
-    // instead, while the reason is still on screen.
-    routes::connector::verify_delivery_schema(&db)
-        .await
-        .map_err(|err| anyhow::anyhow!("{err}"))?;
     let state = AppState { cfg: cfg.clone(), db };
     let auth_state = state.clone();
     // Proposal settlement deliberately does not run here. It used to run both as an API
@@ -888,110 +883,6 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         .route(
-            "/api/v1/projects/{project_id}/invocations",
-            get(routes::connector::list_project_invocations)
-                .post(routes::connector::create_project_invocation)
-                .route_layer(axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                )),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}",
-            get(routes::connector::get_invocation).route_layer(axum_middleware::from_fn_with_state(
-                auth_state.clone(),
-                middleware::bot_auth::bot_or_user_auth_middleware,
-            )),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/tool-calls",
-            get(routes::connector::list_invocation_tool_calls)
-                .post(routes::connector::report_invocation_tool_call)
-                .route_layer(axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                )),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/inbox",
-            get(routes::connector::list_invocation_inbox).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/inbox/{inbox_id}/replay",
-            post(routes::connector::replay_invocation_inbox).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/forms/{form_id}/inbox",
-            get(routes::connector::list_form_inbox).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/forms/{form_id}/inbox/{inbox_id}/replay",
-            post(routes::connector::replay_form_inbox).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/progress",
-            post(routes::connector::report_invocation_progress).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/complete",
-            post(routes::connector::complete_invocation).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/fail",
-            post(routes::connector::fail_invocation).route_layer(axum_middleware::from_fn_with_state(
-                auth_state.clone(),
-                middleware::bot_auth::bot_or_user_auth_middleware,
-            )),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/receipt",
-            post(routes::connector::report_connector_receipt).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/cancel",
-            post(routes::connector::cancel_invocation).route_layer(
-                axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                ),
-            ),
-        )
-        .route(
             "/api/v1/projects/{project_id}/check-results",
             get(routes::check_result::list_project_check_results)
                 .post(routes::check_result::create_project_check_result)
@@ -1726,25 +1617,6 @@ async fn main() -> anyhow::Result<()> {
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
-        .route(
-            "/api/v1/workspaces/{workspace_id}/connectors",
-            post(routes::connector::create_connector)
-                .get(routes::connector::list_connectors)
-                .route_layer(axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                )),
-        )
-        .route(
-            "/api/v1/workspaces/{workspace_id}/connectors/{connector_id}",
-            get(routes::connector::get_connector)
-                .patch(routes::connector::update_connector)
-                .delete(routes::connector::delete_connector)
-                .route_layer(axum_middleware::from_fn_with_state(
-                    auth_state.clone(),
-                    middleware::bot_auth::bot_or_user_auth_middleware,
-                )),
-        )
         // Notification routes (protected)
         .route(
             "/api/v1/notifications",
@@ -2055,6 +1927,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0051_bot_operation_logs.sql",
         include_str!("../../../migrations/0051_bot_operation_logs.sql"),
     ),
+    (
+        "0052_drop_connectors_and_agent_invocations.sql",
+        include_str!("../../../migrations/0052_drop_connectors_and_agent_invocations.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2103,6 +1979,8 @@ enum SchemaProbe {
     /// Table, index or view. Resolved through `search_path`, so a deployment that does not use
     /// the `public` schema is judged against its own schema instead of being told nothing exists.
     Relation(&'static str),
+    /// A relation intentionally removed by a destructive migration.
+    RelationAbsent(&'static str),
     /// Column on a table, by table and column name.
     Column(&'static str, &'static str),
     /// Label on an enum type.
@@ -2112,6 +1990,9 @@ enum SchemaProbe {
     /// No object is created that could be probed, but re-executing the file is a no-op, so it is
     /// executed rather than adopted.
     Rerunnable,
+    /// A later migration intentionally removed every object this migration created. Adoption
+    /// still executes it in order, while post-run verification belongs to the removing migration.
+    Superseded,
 }
 
 impl SchemaProbe {
@@ -2123,6 +2004,11 @@ impl SchemaProbe {
             Self::Relation(name) => Some(Statement::from_sql_and_values(
                 DbBackend::Postgres,
                 "SELECT to_regclass($1) IS NOT NULL AS present",
+                vec![name.into()],
+            )),
+            Self::RelationAbsent(name) => Some(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT to_regclass($1) IS NULL AS present",
                 vec![name.into()],
             )),
             Self::Column(table, column) => Some(Statement::from_sql_and_values(
@@ -2161,7 +2047,7 @@ impl SchemaProbe {
                 ",
                 vec![table.into(), constraint.into(), marker.into()],
             )),
-            Self::Rerunnable => None,
+            Self::Rerunnable | Self::Superseded => None,
         }
     }
 }
@@ -2240,15 +2126,9 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         "0025_project_types_resources.sql",
         SchemaProbe::Relation("project_resources"),
     ),
-    (
-        "0026_connectors_invocations.sql",
-        SchemaProbe::Relation("agent_invocations"),
-    ),
+    ("0026_connectors_invocations.sql", SchemaProbe::Superseded),
     ("0027_check_results.sql", SchemaProbe::Relation("check_results")),
-    (
-        "0028_invocation_tool_calls.sql",
-        SchemaProbe::Relation("agent_invocation_tool_calls"),
-    ),
+    ("0028_invocation_tool_calls.sql", SchemaProbe::Superseded),
     (
         "0029_scenario_templates.sql",
         SchemaProbe::Relation("scenario_templates"),
@@ -2261,10 +2141,7 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         "0031_business_events_outbox_inbox.sql",
         SchemaProbe::Relation("event_inbox"),
     ),
-    (
-        "0032_print_device_connector_kinds.sql",
-        SchemaProbe::ConstraintContains("connectors", "connectors_kind_check", "device"),
-    ),
+    ("0032_print_device_connector_kinds.sql", SchemaProbe::Superseded),
     ("0033_plugins_wasm.sql", SchemaProbe::Relation("plugin_invocations")),
     (
         "0034_user_profile_preferences.sql",
@@ -2313,10 +2190,7 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         "0048_delivery_lease_and_pickup_indexes.sql",
         SchemaProbe::Column("event_outbox", "lease_token"),
     ),
-    (
-        "0049_agent_invocation_duplicate_tagging.sql",
-        SchemaProbe::Column("agent_invocations", "duplicate_of"),
-    ),
+    ("0049_agent_invocation_duplicate_tagging.sql", SchemaProbe::Superseded),
     (
         "0050_proposal_workspace_scope.sql",
         SchemaProbe::Column("proposals", "workspace_id"),
@@ -2324,6 +2198,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0051_bot_operation_logs.sql",
         SchemaProbe::Relation("bot_operation_logs"),
+    ),
+    (
+        "0052_drop_connectors_and_agent_invocations.sql",
+        SchemaProbe::RelationAbsent("connectors"),
     ),
 ];
 
@@ -2588,7 +2466,8 @@ async fn verify_recorded_migrations(db: &DatabaseConnection, tolerate_failure: b
         if recorded.status == "failed" {
             continue;
         }
-        if migration_probe(name).is_some_and(|probe| matches!(probe, SchemaProbe::Rerunnable)) {
+        if migration_probe(name).is_some_and(|probe| matches!(probe, SchemaProbe::Rerunnable | SchemaProbe::Superseded))
+        {
             continue;
         }
         if !migration_is_present(db, name).await? {
@@ -2767,7 +2646,9 @@ async fn verify_governance_schema(db: &DatabaseConnection) -> anyhow::Result<()>
     clippy::case_sensitive_file_extension_comparisons
 )]
 mod tests {
-    use super::{MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, MigrationOptions, migration_checksum};
+    use super::{
+        MIGRATION_ADOPTION_CUTOFF, MIGRATION_PROBES, MIGRATIONS, MigrationOptions, SchemaProbe, migration_checksum,
+    };
     use platform::config::MigrationsConfig;
 
     /// A migration file has to be registered in two places: on disk and in [`MIGRATIONS`].
@@ -2826,7 +2707,8 @@ mod tests {
                 "0048_delivery_lease_and_pickup_indexes.sql",
                 "0049_agent_invocation_duplicate_tagging.sql",
                 "0050_proposal_workspace_scope.sql",
-                "0051_bot_operation_logs.sql"
+                "0051_bot_operation_logs.sql",
+                "0052_drop_connectors_and_agent_invocations.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
@@ -2841,11 +2723,14 @@ mod tests {
         assert_eq!(migration_checksum("").len(), 64);
     }
 
-    /// 0048 used to delete rows on every API start. Whatever else it grows, it must never remove
-    /// data again, and it must stay re-runnable because adopted databases execute it.
+    /// Non-destructive post-cutoff migrations must remain safe to replay. The explicitly
+    /// destructive retirement migration is checked separately.
     #[test]
     fn the_delivery_migrations_never_delete_rows() {
         for (name, sql) in MIGRATIONS.iter().filter(|(name, _)| *name > MIGRATION_ADOPTION_CUTOFF) {
+            if *name == "0052_drop_connectors_and_agent_invocations.sql" {
+                continue;
+            }
             let upper = sql.to_uppercase();
             assert!(
                 !upper.contains("DELETE FROM"),
@@ -2856,6 +2741,26 @@ mod tests {
                 "{name} must not drop tables: it re-runs on every adopted database"
             );
         }
+    }
+
+    #[test]
+    fn the_retirement_migration_drops_only_the_confirmed_relations() {
+        let sql = MIGRATIONS
+            .iter()
+            .find(|(name, _)| *name == "0052_drop_connectors_and_agent_invocations.sql")
+            .map(|(_, sql)| *sql)
+            .expect("retirement migration must be registered");
+        for relation in ["agent_invocation_tool_calls", "agent_invocations", "connectors"] {
+            assert!(
+                sql.contains(&format!("DROP TABLE IF EXISTS {relation}")),
+                "retirement migration must drop {relation} idempotently"
+            );
+        }
+        assert_eq!(
+            sql.matches("DROP TABLE").count(),
+            3,
+            "no unrelated table may be dropped"
+        );
     }
 
     /// Every migration needs a probe, otherwise an existing database either replays it (which the
@@ -2877,7 +2782,7 @@ mod tests {
     fn only_rerunnable_probes_have_no_statement() {
         let without: Vec<&str> = MIGRATION_PROBES
             .iter()
-            .filter(|(_, probe)| probe.statement().is_none())
+            .filter(|(_, probe)| matches!(probe, SchemaProbe::Rerunnable))
             .map(|(name, _)| *name)
             .collect();
         assert_eq!(
@@ -2888,6 +2793,24 @@ mod tests {
                 "0035_project_type_two_lanes.sql"
             ],
             "a migration may only skip its probe when re-executing it is a no-op"
+        );
+    }
+
+    #[test]
+    fn only_retired_connector_migrations_are_superseded() {
+        let superseded: Vec<&str> = MIGRATION_PROBES
+            .iter()
+            .filter(|(_, probe)| matches!(probe, SchemaProbe::Superseded))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(
+            superseded,
+            vec![
+                "0026_connectors_invocations.sql",
+                "0028_invocation_tool_calls.sql",
+                "0032_print_device_connector_kinds.sql",
+                "0049_agent_invocation_duplicate_tagging.sql"
+            ]
         );
     }
 

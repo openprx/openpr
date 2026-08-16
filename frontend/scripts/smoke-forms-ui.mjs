@@ -43,10 +43,6 @@ let orderLineRecordListRequests = [];
 let orderLineExportRequests = [];
 let listedOrderLineViewIds = [];
 let viewUpdateCounter = 0;
-let createdAutomationInvocationPayloads = [];
-let automationReceiptPayloads = [];
-let updatedAutomationConnectorPayloads = [];
-let automationInvocationCounter = 0;
 let createdAttachmentPayloads = [];
 let deletedAttachmentIds = [];
 let uploadedAttachmentPayloads = [];
@@ -102,140 +98,6 @@ function applyMemberPermissionSmokePolicy() {
 		}
 	};
 }
-
-let automationConnectors = [
-	{
-		id: 'connector-form-webhook',
-		workspace_id: workspaceId,
-		project_id: projectId,
-		webhook_id: null,
-		kind: 'webhook',
-		name: 'Kitchen webhook',
-		description: 'Dispatch order line updates',
-		endpoint: 'https://hooks.example.test/order-line',
-		auth_policy: { mode: 'none' },
-		capability_manifest: { forms: ['order_line'], events: ['form.record.created', 'form.record.updated'] },
-		is_active: true,
-		created_by: 'user-smoke',
-		created_at: now,
-		updated_at: now
-	},
-	{
-		id: 'connector-form-mcp',
-		workspace_id: workspaceId,
-		project_id: projectId,
-		webhook_id: null,
-		kind: 'mcp',
-		name: 'Kitchen MCP runner',
-		description: 'MCP automation runner',
-		endpoint: 'mcp://kitchen-runner',
-		auth_policy: { mode: 'none' },
-		capability_manifest: { tools: ['forms.records.update', 'events.tail'] },
-		is_active: false,
-		created_by: 'user-smoke',
-		created_at: now,
-		updated_at: now
-	}
-];
-
-let automationInvocations = [
-	{
-		id: 'invocation-form-existing',
-		workspace_id: workspaceId,
-		project_id: projectId,
-		actor_id: 'user-smoke',
-		target_agent_id: null,
-		source_task_id: null,
-		trigger_kind: 'manual',
-		trigger_ref_type: 'form',
-		trigger_ref_id: 'form-order-line',
-		connector_id: 'connector-form-webhook',
-		connector_kind: 'webhook',
-		status: 'completed',
-		payload: {
-			form_id: 'form-order-line',
-			form_key: 'order_line',
-			record_id: 'record-order-line-created',
-			record_title: 'Beef Noodles x2',
-			source: 'seed',
-			business_event_id: 'business-event-form-existing',
-			outbox_id: 'outbox-form-existing',
-			envelope: { event_id: 'business-event-form-existing' }
-		},
-		result: {
-			connector_delivery: {
-				status: 'delivered',
-				endpoint: 'https://hooks.example.test/order-line',
-				connector_id: 'connector-form-webhook',
-				connector_kind: 'webhook',
-				connector_name: 'Kitchen webhook',
-				status_code: 202,
-				response_body: 'accepted kitchen handoff',
-				error_message: null,
-				dispatched_at: now
-			},
-			receipt: {
-				receipt_status: 'completed',
-				inbox_status: 'processed',
-				idempotency_key: 'form-order-line:invocation-form-existing:completed',
-				event_type: 'connector.delivery.received',
-				source_kind: 'connector.webhook',
-				source_id: 'connector-form-webhook',
-				payload: { receipt_source: 'seed' }
-			}
-		},
-		error_message: null,
-		audit_chain_id: 'invocation-form-existing',
-		created_at: now,
-		updated_at: now
-	}
-];
-
-let automationInbox = [
-	{
-		id: 'inbox-invocation-form-existing-completed',
-		workspace_id: workspaceId,
-		project_id: projectId,
-		source_kind: 'connector.webhook',
-		source_id: 'connector-form-webhook',
-		idempotency_key: 'form-order-line:invocation-form-existing:completed',
-		event_type: 'connector.delivery.received',
-		payload: {
-			invocation_id: 'invocation-form-existing',
-			connector_id: 'connector-form-webhook',
-			connector_kind: 'webhook',
-			receipt_status: 'completed',
-			payload: { receipt_source: 'seed' },
-			error_message: null
-		},
-		status: 'processed',
-		attempts: 0,
-		last_error: null,
-		received_at: now,
-		processed_at: now,
-		updated_at: now
-	}
-];
-
-let automationToolCalls = [
-	{
-		id: 'tool-call-invocation-form-existing-deliver',
-		invocation_id: 'invocation-form-existing',
-		workspace_id: workspaceId,
-		project_id: projectId,
-		actor_id: 'user-smoke',
-		tool_name: 'connectors.deliver',
-		transport: 'webhook',
-		status: 'succeeded',
-		arguments: { form_key: 'order_line', event_type: 'form.record.created' },
-		result_summary: 'Delivered to Kitchen webhook',
-		error_message: null,
-		duration_ms: 42,
-		started_at: now,
-		completed_at: now,
-		created_at: now
-	}
-];
 
 const project = {
 	id: projectId,
@@ -913,25 +775,6 @@ function smokeDebug() {
   const attachmentEditDebug = attachmentEditNodes.length
     ? '\\nAttachment edit debug: ' + JSON.stringify(attachmentEditNodes)
     : '';
-  const automationDetailNodes = Array.from(
-    document.querySelectorAll(
-      '[data-record-detail-automation-history],[data-record-detail-automation-invocation],[data-record-detail-automation-connector],[data-record-detail-automation-delivery],[data-record-detail-automation-payload],[data-record-detail-automation-result]'
-    )
-  ).map((node) => [
-    node.getAttribute('data-record-detail-automation-history') ||
-      node.getAttribute('data-record-detail-automation-invocation') ||
-      node.getAttribute('data-record-detail-automation-connector') ||
-      node.getAttribute('data-record-detail-automation-delivery') ||
-      node.getAttribute('data-record-detail-automation-payload') ||
-      node.getAttribute('data-record-detail-automation-result'),
-    node.getAttribute('data-record-detail-automation-count') ||
-      node.getAttribute('data-record-detail-automation-status') ||
-      '',
-    node.textContent.trim().slice(0, 260)
-  ]);
-  const automationDetailDebug = automationDetailNodes.length
-    ? '\\nRecord detail automation debug: ' + JSON.stringify(automationDetailNodes)
-    : '';
   const commentDetailNodes = Array.from(
     document.querySelectorAll(
       '[data-record-detail-comments],[data-record-detail-comment],[data-record-detail-comment-author],[data-record-detail-comment-body],[data-record-detail-comments-empty]'
@@ -949,7 +792,7 @@ function smokeDebug() {
     ? '\\nRecord detail comment debug: ' + JSON.stringify(commentDetailNodes)
     : '';
   const pivot = document.querySelector('[data-view-renderer="pivot"]');
-  if (!pivot) return importMappingDebug + designerDebug + childTableDebug + attachmentDetailDebug + attachmentEditDebug + automationDetailDebug + commentDetailDebug;
+  if (!pivot) return importMappingDebug + designerDebug + childTableDebug + attachmentDetailDebug + attachmentEditDebug + commentDetailDebug;
   const cells = Array.from(document.querySelectorAll('[data-pivot-cell]')).map((cell) => [
     cell.getAttribute('data-pivot-cell'),
     cell.textContent.trim()
@@ -958,7 +801,7 @@ function smokeDebug() {
     field.getAttribute('data-pivot-row-field') || field.getAttribute('data-pivot-column-field') || field.getAttribute('data-pivot-value-field'),
     field.textContent.trim()
   ]);
-  return importMappingDebug + designerDebug + childTableDebug + attachmentDetailDebug + attachmentEditDebug + automationDetailDebug + commentDetailDebug + '\\nPivot debug: ' + JSON.stringify({ fields, cells, html: pivot.outerHTML.slice(0, 2000) });
+  return importMappingDebug + designerDebug + childTableDebug + attachmentDetailDebug + attachmentEditDebug + commentDetailDebug + '\\nPivot debug: ' + JSON.stringify({ fields, cells, html: pivot.outerHTML.slice(0, 2000) });
 }
 async function waitFor(check, label) {
   for (let i = 0; i < 120; i += 1) {
@@ -1193,211 +1036,6 @@ function dragGanttBarToDate(recordId, isoDate) {
     mark('data-forms-detail-url-smoke');
     return;
   }
-
-  buttonExact('Automation').click();
-  await waitFor(
-    () =>
-      document.querySelector('[data-form-automation-panel="form-order-line"]') &&
-      document.querySelector('[data-automation-connector="connector-form-webhook"]')?.textContent?.includes('Kitchen webhook') &&
-      document.querySelector('[data-automation-invocation="invocation-form-existing"]') &&
-      textInElements('Print jobs') &&
-      textInElements('Kitchen ticket'),
-    'automation mode bindings receipts and print jobs list'
-  );
-  mark('data-form-automation-console');
-  mark('data-print-jobs-seen');
-
-  await waitFor(
-    () =>
-      document.querySelector('[data-automation-connector-diagnostics="connector-form-webhook"]') &&
-      document.querySelector('[data-automation-diagnostic-endpoint="connector-form-webhook"]')?.textContent?.includes('https://hooks.example.test/order-line') &&
-      document.querySelector('[data-automation-diagnostic-auth="connector-form-webhook"]')?.textContent?.trim() === 'none' &&
-      document.querySelector('[data-automation-diagnostic-events="connector-form-webhook"]')?.textContent?.includes('form.record.created') &&
-      document.querySelector('[data-automation-diagnostic-last="connector-form-webhook"]')?.textContent?.includes('completed') &&
-      document.querySelector('[data-automation-delivery-diagnostics="connector-form-webhook"]') &&
-      document.querySelector('[data-automation-delivery-status="connector-form-webhook"]')?.textContent?.includes('delivered') &&
-      document.querySelector('[data-automation-delivery-code="connector-form-webhook"]')?.textContent?.includes('202') &&
-      document.querySelector('[data-automation-delivery-body="connector-form-webhook"]')?.textContent?.includes('accepted kitchen handoff'),
-    'automation connector diagnostics initial state'
-  );
-  await waitFor(
-    () =>
-      document.querySelector('[data-automation-global-inbox="form-order-line"]') &&
-      document.querySelector('[data-automation-global-inbox-row="inbox-invocation-form-existing-completed"]') &&
-      document.querySelector('[data-automation-global-inbox-row-status="inbox-invocation-form-existing-completed"]')?.textContent?.includes('processed') &&
-      document.querySelector('[data-automation-global-inbox-row-key="inbox-invocation-form-existing-completed"]')?.textContent?.includes('form-order-line:invocation-form-existing:completed'),
-    'automation global form inbox initial state'
-  );
-
-  document.querySelector('[data-automation-invocation-details-toggle="invocation-form-existing"] button')?.click();
-  await waitFor(
-    () =>
-      document.querySelector('[data-automation-invocation-details="invocation-form-existing"]') &&
-      document.querySelector('[data-automation-detail-connector="invocation-form-existing"]')?.textContent?.includes('Kitchen webhook') &&
-      document.querySelector('[data-automation-detail-payload="invocation-form-existing"]')?.textContent?.includes('"source": "seed"') &&
-      document.querySelector('[data-automation-detail-result="invocation-form-existing"]')?.textContent?.includes('"receipt_status": "completed"') &&
-      document.querySelector('[data-automation-detail-delivery="invocation-form-existing"]') &&
-      document.querySelector('[data-automation-detail-delivery-status="invocation-form-existing"]')?.textContent?.includes('delivered') &&
-      document.querySelector('[data-automation-detail-delivery-code="invocation-form-existing"]')?.textContent?.includes('202') &&
-      document.querySelector('[data-automation-detail-delivery-body="invocation-form-existing"]')?.textContent?.includes('accepted kitchen handoff') &&
-      document.querySelector('[data-automation-correlation="invocation-form-existing"]') &&
-      document.querySelector('[data-automation-correlation-business-event="invocation-form-existing"]')?.textContent?.includes('business-event-form-existing') &&
-      document.querySelector('[data-automation-correlation-outbox="invocation-form-existing"]')?.textContent?.includes('outbox-form-existing') &&
-      document.querySelector('[data-automation-correlation-delivery-at="invocation-form-existing"]')?.textContent?.includes('2026-05-31T12:00:00.000Z') &&
-      document.querySelector('[data-automation-correlation-receipt-key="invocation-form-existing"]')?.textContent?.includes('form-order-line:invocation-form-existing:completed') &&
-      document.querySelector('[data-automation-correlation-inbox="invocation-form-existing"]')?.textContent?.includes('inbox-invocation-form-existing-completed') &&
-      document.querySelector('[data-automation-inbox-status="invocation-form-existing"]')?.textContent?.includes('completed') &&
-      document.querySelector('[data-automation-inbox-key="invocation-form-existing"]')?.textContent?.includes('form-order-line:invocation-form-existing:completed') &&
-      document.querySelector('[data-automation-inbox-event="invocation-form-existing"]')?.textContent?.includes('connector.delivery.received') &&
-      document.querySelector('[data-automation-inbox-row="inbox-invocation-form-existing-completed"]') &&
-      document.querySelector('[data-automation-inbox-row-status="inbox-invocation-form-existing-completed"]')?.textContent?.includes('processed'),
-    'automation completed receipt drill-down'
-  );
-  await waitFor(
-    () =>
-      document.querySelector('[data-automation-tool-call="tool-call-invocation-form-existing-deliver"]') &&
-      document.querySelector('[data-automation-tool-call-status="tool-call-invocation-form-existing-deliver"]')?.textContent?.includes('succeeded') &&
-      document.querySelector('[data-automation-tool-call-name="tool-call-invocation-form-existing-deliver"]')?.textContent?.includes('connectors.deliver') &&
-      document.querySelector('[data-automation-tool-call-result="tool-call-invocation-form-existing-deliver"]')?.textContent?.includes('Delivered to Kitchen webhook') &&
-      document.querySelector('[data-automation-correlation-tool-calls="invocation-form-existing"]')?.textContent?.includes('1') &&
-      document.querySelector('[data-automation-tool-call-arguments="tool-call-invocation-form-existing-deliver"]')?.textContent?.includes('"form_key": "order_line"'),
-    'automation tool-call correlation initial state'
-  );
-
-  const deletedEvent = document.querySelector('input[data-automation-event="connector-form-webhook:form.record.deleted"]');
-  if (!deletedEvent) throw new Error('automation routing deleted event checkbox not found');
-  if (!deletedEvent.checked) deletedEvent.click();
-  const routingKeyInput = document.querySelector('[data-automation-routing-key="connector-form-webhook"]');
-  if (!routingKeyInput) throw new Error('automation routing key input not found');
-  routingKeyInput.value = 'kitchen.order_line';
-  routingKeyInput.dispatchEvent(new Event('input', { bubbles: true }));
-  const addConditionButton = document.querySelector('[data-automation-routing-conditions="connector-form-webhook"] button');
-  if (!addConditionButton) throw new Error('automation add routing condition button not found');
-  addConditionButton.click();
-  await waitFor(() => document.querySelector('[data-automation-routing-condition="connector-form-webhook:0"]'), 'automation routing condition row');
-  const conditionField = document.querySelector('[data-automation-routing-condition-field="connector-form-webhook:0"]');
-  const conditionOperator = document.querySelector('[data-automation-routing-condition-operator="connector-form-webhook:0"]');
-  const conditionValue = document.querySelector('[data-automation-routing-condition-value="connector-form-webhook:0"]');
-  if (!conditionField || !conditionOperator || !conditionValue) throw new Error('automation routing condition controls not found');
-  conditionField.value = 'status';
-  conditionField.dispatchEvent(new Event('change', { bubbles: true }));
-  conditionOperator.value = 'equals';
-  conditionOperator.dispatchEvent(new Event('change', { bubbles: true }));
-  conditionValue.value = 'sent_to_kitchen';
-  conditionValue.dispatchEvent(new Event('input', { bubbles: true }));
-  const saveRoutingButton = document.querySelector('[data-automation-save-routing="connector-form-webhook"] button');
-  if (!saveRoutingButton) throw new Error('automation save routing button not found');
-  saveRoutingButton.click();
-  await waitFor(
-    () =>
-      textInElements('Routing rules saved') &&
-      document.querySelector('input[data-automation-event="connector-form-webhook:form.record.deleted"]')?.checked &&
-      document.querySelector('[data-automation-routing-key="connector-form-webhook"]')?.value === 'kitchen.order_line' &&
-      document.querySelector('[data-automation-routing-condition-value="connector-form-webhook:0"]')?.value === 'sent_to_kitchen' &&
-      document.querySelector('[data-automation-diagnostic-events="connector-form-webhook"]')?.textContent?.includes('form.record.deleted') &&
-      document.querySelector('[data-automation-diagnostic-routing-key="connector-form-webhook"]')?.textContent?.includes('kitchen.order_line'),
-    'automation routing rules save'
-  );
-  mark('data-form-automation-routing-rules');
-  mark('data-form-automation-conditional-routing');
-
-  document.querySelector('[data-automation-create-invocation="form-order-line"] button')?.click();
-  await waitFor(
-    () =>
-      textInElements('Automation invocation created') &&
-      document.querySelector('[data-automation-invocation="invocation-form-created-1"]') &&
-      document.querySelector('[data-automation-invocation-status="invocation-form-created-1"]')?.textContent?.trim() === 'pending',
-    'automation create invocation'
-  );
-  document.querySelector('[data-automation-receipt-complete="invocation-form-created-1"] button')?.click();
-  await waitFor(
-    () =>
-      textInElements('Receipt marked completed') &&
-      document.querySelector('[data-automation-invocation-status="invocation-form-created-1"]')?.textContent?.trim() === 'completed',
-    'automation completed receipt'
-  );
-  document.querySelector('[data-automation-invocation-details-toggle="invocation-form-created-1"] button')?.click();
-  await waitFor(
-    () =>
-      document.querySelector('[data-automation-inbox="invocation-form-created-1"]') &&
-      document.querySelector('[data-automation-inbox-status="invocation-form-created-1"]')?.textContent?.includes('completed') &&
-      document.querySelector('[data-automation-inbox-key="invocation-form-created-1"]')?.textContent?.includes('form-order-line:invocation-form-created-1:completed') &&
-      document.querySelector('[data-automation-inbox-source="invocation-form-created-1"]')?.textContent?.includes('connector.webhook:connector-form-webhook') &&
-      document.querySelector('[data-automation-inbox-row="inbox-invocation-form-created-1-completed"]') &&
-      document.querySelector('[data-automation-inbox-row-status="inbox-invocation-form-created-1-completed"]')?.textContent?.includes('processed') &&
-      document.querySelector('[data-automation-inbox-payload="invocation-form-created-1"]')?.textContent?.includes('"receipt_source": "automation_panel"') &&
-      document.querySelector('[data-automation-tool-call="tool-call-invocation-form-created-1-completed"]') &&
-      document.querySelector('[data-automation-tool-call-status="tool-call-invocation-form-created-1-completed"]')?.textContent?.includes('succeeded') &&
-      document.querySelector('[data-automation-tool-call-result="tool-call-invocation-form-created-1-completed"]')?.textContent?.includes('Connector delivery acknowledged'),
-    'automation completed inbox receipt inspection'
-  );
-  document.querySelector('[data-automation-inbox-replay="inbox-invocation-form-created-1-completed"] button')?.click();
-  await waitFor(
-    () =>
-      textInElements('Inbox replay queued') &&
-      document.querySelector('[data-automation-inbox-row-status="inbox-invocation-form-created-1-completed"]')?.textContent?.includes('received') &&
-      document.querySelector('[data-automation-inbox-row-attempts="inbox-invocation-form-created-1-completed"]')?.textContent?.includes('1') &&
-      document.querySelector('[data-automation-global-inbox-row-status="inbox-invocation-form-created-1-completed"]')?.textContent?.includes('received'),
-    'automation inbox replay'
-  );
-  mark('data-form-automation-inbox-replay');
-  mark('data-form-automation-global-inbox');
-  document.querySelector('[data-automation-create-invocation="form-order-line"] button')?.click();
-  await waitFor(
-    () => document.querySelector('[data-automation-invocation-status="invocation-form-created-2"]')?.textContent?.trim() === 'pending',
-    'automation create failed invocation candidate'
-  );
-  document.querySelector('[data-automation-receipt-fail="invocation-form-created-2"] button')?.click();
-  await waitFor(
-    () =>
-      textInElements('Receipt marked failed') &&
-      document.querySelector('[data-automation-invocation-status="invocation-form-created-2"]')?.textContent?.trim() === 'failed' &&
-      document.querySelector('[data-automation-retry="invocation-form-created-2"]'),
-    'automation failed receipt'
-  );
-  document.querySelector('[data-automation-invocation-details-toggle="invocation-form-created-2"] button')?.click();
-  await waitFor(
-    () =>
-      document.querySelector('[data-automation-invocation-details="invocation-form-created-2"]') &&
-      document.querySelector('[data-automation-detail-payload="invocation-form-created-2"]')?.textContent?.includes('"source": "automation_panel"') &&
-      document.querySelector('[data-automation-detail-result="invocation-form-created-2"]')?.textContent?.includes('"status": "failed"') &&
-      document.querySelector('[data-automation-detail-error="invocation-form-created-2"]')?.textContent?.includes('Manual automation failure') &&
-      document.querySelector('[data-automation-inbox-status="invocation-form-created-2"]')?.textContent?.includes('failed') &&
-      document.querySelector('[data-automation-inbox-key="invocation-form-created-2"]')?.textContent?.includes('form-order-line:invocation-form-created-2:failed') &&
-      document.querySelector('[data-automation-inbox-event="invocation-form-created-2"]')?.textContent?.includes('connector.delivery.failed') &&
-      document.querySelector('[data-automation-inbox-row="inbox-invocation-form-created-2-failed"]') &&
-      document.querySelector('[data-automation-inbox-row-error="inbox-invocation-form-created-2-failed"]')?.textContent?.includes('Manual automation failure') &&
-      document.querySelector('[data-automation-global-inbox-row="inbox-invocation-form-created-2-failed"]') &&
-      document.querySelector('[data-automation-global-inbox-row-error="inbox-invocation-form-created-2-failed"]')?.textContent?.includes('Manual automation failure') &&
-      document.querySelector('[data-automation-tool-call="tool-call-invocation-form-created-2-failed"]') &&
-      document.querySelector('[data-automation-tool-call-status="tool-call-invocation-form-created-2-failed"]')?.textContent?.includes('failed') &&
-      document.querySelector('[data-automation-tool-call-error="tool-call-invocation-form-created-2-failed"]')?.textContent?.includes('Manual automation failure') &&
-      document.querySelector('[data-automation-diagnostic-last="connector-form-webhook"]')?.textContent?.includes('failed') &&
-      document.querySelector('[data-automation-diagnostic-error="connector-form-webhook"]')?.textContent?.includes('Manual automation failure'),
-    'automation failed receipt drill-down'
-  );
-  document.querySelector('[data-automation-global-inbox-replay="inbox-invocation-form-created-2-failed"] button')?.click();
-  await waitFor(
-    () =>
-      textInElements('Inbox replay queued') &&
-      document.querySelector('[data-automation-global-inbox-row-status="inbox-invocation-form-created-2-failed"]')?.textContent?.includes('received') &&
-      document.querySelector('[data-automation-global-inbox-row-attempts="inbox-invocation-form-created-2-failed"]')?.textContent?.includes('1'),
-    'automation global inbox replay'
-  );
-  mark('data-form-automation-receipt-drilldown');
-  mark('data-form-automation-inbox-inspection');
-  mark('data-form-automation-tool-call-correlation');
-  mark('data-form-automation-worker-delivery-correlation');
-  mark('data-form-automation-connector-diagnostics');
-  mark('data-form-automation-external-delivery-diagnostics');
-  document.querySelector('[data-automation-retry="invocation-form-created-2"] button')?.click();
-  await waitFor(
-    () =>
-      textInElements('Automation invocation created') &&
-      document.querySelector('[data-automation-invocation-status="invocation-form-created-3"]')?.textContent?.trim() === 'pending',
-    'automation retry invocation'
-  );
-  mark('data-form-automation-invocation-receipts');
 
   buttonExact('Design').click();
   await waitFor(() => textInElements('Field library') && textInElements('Properties') && textInElements('Save design'), 'designer mode');
@@ -2157,7 +1795,7 @@ function dragGanttBarToDate(recordId, isoDate) {
 	    document.body.setAttribute('data-forms-ui-smoke', 'done');
 	    return;
 	  }
-	  if (mode === 'attachment-detail' || mode === 'automation-detail' || mode === 'comments-detail') {
+	  if (mode === 'attachment-detail' || mode === 'comments-detail') {
 	    buttonExact('Detail').click();
 	    await waitFor(
 	      () =>
@@ -2173,20 +1811,7 @@ function dragGanttBarToDate(recordId, isoDate) {
 	        document.querySelector('[data-record-detail-attachment-download="attachment-3"]')?.getAttribute('download') === 'detail-ticket.pdf',
 	      'record detail attachment widget'
 	    );
-	    mark('data-form-record-detail-attachment-widget');
-	    await waitFor(
-	      () =>
-	        document.querySelector('[data-record-detail-automation-history="record-order-line-created"]')?.getAttribute('data-record-detail-automation-count') === '1' &&
-	        document.querySelector('[data-record-detail-automation-invocation="invocation-form-existing"]') &&
-	        document.querySelector('[data-record-detail-automation-status="completed"]') &&
-	        document.querySelector('[data-record-detail-automation-connector="invocation-form-existing"]')?.textContent?.includes('Kitchen webhook') &&
-	        document.querySelector('[data-record-detail-automation-trigger="invocation-form-existing"]')?.textContent?.includes('form:form-order-line') &&
-	        document.querySelector('[data-record-detail-automation-delivery="invocation-form-existing"]')?.textContent?.includes('delivered') &&
-	        document.querySelector('[data-record-detail-automation-payload="invocation-form-existing"]')?.textContent?.includes('record-order-line-created') &&
-	        document.querySelector('[data-record-detail-automation-result="invocation-form-existing"]')?.textContent?.includes('connector_delivery'),
-	      'record detail automation history widget'
-	    );
-	    mark('data-form-record-detail-automation-history');
+
 	    await waitFor(
 	      () =>
 	        document.querySelector('[data-record-detail-comments="record-order-line-created"]')?.getAttribute('data-record-detail-comment-count') === '1' &&
@@ -3972,7 +3597,7 @@ function dragGanttBarToDate(recordId, isoDate) {
 	  mark('data-form-timeline-view-rendered');
 	  setByLabel('Current view', 'view-order-line-default');
 	  await waitFor(() => document.querySelector('[data-view-renderer="grid"]') && textInElements('Beef Noodles x2'), 'grid view renderer restored');
-	  buttonExact('Automation').click();
+	  buttonExact('Permissions').click();
 	  await waitFor(() => {
 	    try {
 	      return Boolean(labelControl('Record scope')) &&
@@ -4002,7 +3627,7 @@ function dragGanttBarToDate(recordId, isoDate) {
 	    document.querySelector('[data-field-write-denied-count="2"]') &&
 	    document.querySelector('[data-permission-effect-hidden-fields]')?.getAttribute('data-permission-effect-hidden-fields') === 'Unit Price' &&
 	    document.querySelector('[data-permission-effect-locked-fields]')?.getAttribute('data-permission-effect-locked-fields') === 'Quantity|Unit Price' &&
-	    permissionStateMatches('automation'),
+	    permissionStateMatches('permissions'),
 	    'record ownership scope saved'
 	  );
 	  const scopedList = await fetch('/api/v1/forms/form-order-line/records?view_id=view-order-line-default').then((response) => response.json());
@@ -4106,11 +3731,6 @@ function dragGanttBarToDate(recordId, isoDate) {
 	      document.querySelector('[data-record-detail-attachment-url="attachment-3"]')?.textContent?.includes('https://assets.example.test/detail-ticket.pdf') &&
       document.querySelector('[data-record-detail-attachment-open="attachment-3"]')?.getAttribute('href') === '/api/v1/form-attachments/attachment-3/download?expires=1893456000&signature=signed-attachment-3' &&
       document.querySelector('[data-record-detail-attachment-download="attachment-3"]')?.getAttribute('download') === 'detail-ticket.pdf' &&
-      document.querySelector('[data-record-detail-automation-history="record-order-line-created"]')?.getAttribute('data-record-detail-automation-count') === '1' &&
-      document.querySelector('[data-record-detail-automation-invocation="invocation-form-existing"]') &&
-      document.querySelector('[data-record-detail-automation-status="completed"]') &&
-      document.querySelector('[data-record-detail-automation-connector="invocation-form-existing"]')?.textContent?.includes('Kitchen webhook') &&
-      document.querySelector('[data-record-detail-automation-delivery="invocation-form-existing"]')?.textContent?.includes('delivered') &&
       document.querySelector('[data-record-detail-event-history="record-order-line-created"]')?.getAttribute('data-record-detail-event-count') === '1' &&
       document.querySelector('[data-record-detail-event="event-order-line-created"]') &&
       document.querySelector('[data-record-detail-event-kind="event-order-line-created"]')?.textContent?.includes('form.record.created') &&
@@ -4121,7 +3741,6 @@ function dragGanttBarToDate(recordId, isoDate) {
     'created record detail with amount and permission indicators'
   );
   mark('data-form-record-detail-attachment-widget');
-  mark('data-form-record-detail-automation-history');
   mark('data-form-record-detail-event-history');
   await waitFor(
     () =>
@@ -4263,213 +3882,7 @@ location.replace(${JSON.stringify(target)});
 		json(res, 200, apiResult(project));
 		return;
 	}
-	const connectorMatch = pathname.match(new RegExp(`^/api/v1/workspaces/${workspaceId}/connectors/([^/]+)$`));
-	if (connectorMatch && req.method === 'PATCH') {
-		const connectorId = decodeURIComponent(connectorMatch[1]);
-		const body = await readBody(req);
-		updatedAutomationConnectorPayloads.push({ connector_id: connectorId, ...body });
-		let updatedConnector = null;
-		automationConnectors = automationConnectors.map((item) => {
-			if (item.id !== connectorId) return item;
-			updatedConnector = {
-				...item,
-				capability_manifest: body.capability_manifest ?? item.capability_manifest,
-				updated_at: now
-			};
-			return updatedConnector;
-		});
-		if (!updatedConnector) {
-			json(res, 404, apiResult(null, 404, 'Connector not found'));
-			return;
-		}
-		json(res, 200, apiResult(updatedConnector));
-		return;
-	}
-	if (pathname === `/api/v1/workspaces/${workspaceId}/connectors`) {
-		json(res, 200, apiResult(automationConnectors));
-		return;
-	}
-	if (pathname === `/api/v1/projects/${projectId}/invocations`) {
-		if (req.method === 'POST') {
-			const body = await readBody(req);
-			createdAutomationInvocationPayloads.push(body);
-			automationInvocationCounter += 1;
-			const connector = automationConnectors.find((item) => item.id === body.connector_id);
-			const invocation = {
-				id: `invocation-form-created-${automationInvocationCounter}`,
-				workspace_id: workspaceId,
-				project_id: projectId,
-				actor_id: 'user-smoke',
-				target_agent_id: body.target_agent_id ?? null,
-				source_task_id: null,
-				trigger_kind: body.trigger_kind,
-				trigger_ref_type: body.trigger_ref_type ?? null,
-				trigger_ref_id: body.trigger_ref_id ?? null,
-				connector_id: connector?.id ?? null,
-				connector_kind: connector?.kind ?? null,
-				status: 'pending',
-				payload: body.payload ?? {},
-				result: null,
-				error_message: null,
-				audit_chain_id: `invocation-form-created-${automationInvocationCounter}`,
-				created_at: now,
-				updated_at: now
-			};
-			automationInvocations = [invocation, ...automationInvocations];
-			json(res, 200, apiResult(invocation));
-			return;
-		}
-		json(res, 200, apiResult(paginated(automationInvocations)));
-		return;
-	}
-	if (pathname === `/api/v1/forms/${orderLineForm.id}/inbox` && req.method === 'GET') {
-		json(
-			res,
-			200,
-			apiResult(
-				paginated(
-					automationInbox.filter(
-						(row) =>
-							row.payload?.form_id === orderLineForm.id ||
-							row.payload?.form_key === orderLineForm.key ||
-							row.payload?.payload?.form_id === orderLineForm.id ||
-							row.payload?.payload?.form_key === orderLineForm.key ||
-							row.idempotency_key.includes(orderLineForm.id)
-					)
-				)
-			)
-		);
-		return;
-	}
-	const formInboxReplayMatch = pathname.match(new RegExp(`^/api/v1/forms/${orderLineForm.id}/inbox/([^/]+)/replay$`));
-	if (formInboxReplayMatch && req.method === 'POST') {
-		const inboxId = formInboxReplayMatch[1];
-		automationInbox = automationInbox.map((row) =>
-			row.id === inboxId &&
-			(row.payload?.form_id === orderLineForm.id ||
-				row.payload?.form_key === orderLineForm.key ||
-				row.payload?.payload?.form_id === orderLineForm.id ||
-				row.payload?.payload?.form_key === orderLineForm.key ||
-				row.idempotency_key.includes(orderLineForm.id))
-				? {
-						...row,
-						status: 'received',
-						attempts: row.attempts + 1,
-						last_error: null,
-						processed_at: null,
-						updated_at: now
-					}
-				: row
-		);
-		json(res, 200, apiResult(automationInbox.find((row) => row.id === inboxId) ?? null));
-		return;
-	}
-	const inboxListMatch = pathname.match(/^\/api\/v1\/invocations\/([^/]+)\/inbox$/);
-	if (inboxListMatch && req.method === 'GET') {
-		const invocationId = inboxListMatch[1];
-		json(
-			res,
-			200,
-			apiResult(paginated(automationInbox.filter((row) => row.payload?.invocation_id === invocationId || row.idempotency_key.includes(invocationId))))
-		);
-		return;
-	}
-	const inboxReplayMatch = pathname.match(/^\/api\/v1\/invocations\/([^/]+)\/inbox\/([^/]+)\/replay$/);
-	if (inboxReplayMatch && req.method === 'POST') {
-		const [, invocationId, inboxId] = inboxReplayMatch;
-		automationInbox = automationInbox.map((row) =>
-			row.id === inboxId && (row.payload?.invocation_id === invocationId || row.idempotency_key.includes(invocationId))
-				? {
-						...row,
-						status: 'received',
-						attempts: row.attempts + 1,
-						last_error: null,
-						processed_at: null,
-						updated_at: now
-					}
-				: row
-		);
-		json(res, 200, apiResult(automationInbox.find((row) => row.id === inboxId) ?? null));
-		return;
-	}
-	const toolCallsMatch = pathname.match(/^\/api\/v1\/invocations\/([^/]+)\/tool-calls$/);
-	if (toolCallsMatch && req.method === 'GET') {
-		const invocationId = toolCallsMatch[1];
-		json(res, 200, apiResult(paginated(automationToolCalls.filter((call) => call.invocation_id === invocationId))));
-		return;
-	}
-	const receiptMatch = pathname.match(/^\/api\/v1\/invocations\/([^/]+)\/receipt$/);
-	if (receiptMatch && req.method === 'POST') {
-		const invocationId = receiptMatch[1];
-		const body = await readBody(req);
-		const receipt = {
-			...body,
-			receipt_status: body.status,
-			inbox_status: 'processed',
-			event_type: body.status === 'failed' ? 'connector.delivery.failed' : 'connector.delivery.received',
-			source_kind: 'connector.webhook',
-			source_id: 'connector-form-webhook'
-		};
-		const inboxId = `inbox-${invocationId}-${body.status}`;
-		const inboxRow = {
-			id: inboxId,
-			workspace_id: workspaceId,
-			project_id: projectId,
-			source_kind: 'connector.webhook',
-			source_id: 'connector-form-webhook',
-			idempotency_key: body.idempotency_key,
-			event_type: receipt.event_type,
-			payload: {
-				invocation_id: invocationId,
-				connector_id: 'connector-form-webhook',
-				connector_kind: 'webhook',
-				receipt_status: body.status,
-				payload: body.payload ?? {},
-				error_message: body.error_message ?? null
-			},
-			status: 'processed',
-			attempts: 0,
-			last_error: body.status === 'failed' ? body.error_message || 'connector delivery failed' : null,
-			received_at: now,
-			processed_at: now,
-			updated_at: now
-		};
-		automationInbox = [inboxRow, ...automationInbox.filter((row) => row.idempotency_key !== body.idempotency_key)];
-		const toolCallId = `tool-call-${invocationId}-${body.status}`;
-		const toolCall = {
-			id: toolCallId,
-			invocation_id: invocationId,
-			workspace_id: workspaceId,
-			project_id: projectId,
-			actor_id: 'user-smoke',
-			tool_name: 'connectors.deliver',
-			transport: 'webhook',
-			status: body.status === 'failed' ? 'failed' : 'succeeded',
-			arguments: { form_key: body.payload?.form_key, receipt_status: body.status },
-			result_summary: body.status === 'failed' ? null : 'Connector delivery acknowledged',
-			error_message: body.status === 'failed' ? body.error_message || 'connector delivery failed' : null,
-			duration_ms: body.status === 'failed' ? 87 : 55,
-			started_at: now,
-			completed_at: now,
-			created_at: now
-		};
-		automationToolCalls = [toolCall, ...automationToolCalls.filter((call) => call.id !== toolCallId)];
-		automationReceiptPayloads.push({ invocation_id: invocationId, ...body });
-		automationInvocations = automationInvocations.map((invocation) =>
-			invocation.id === invocationId
-				? {
-						...invocation,
-						status: body.status === 'failed' ? 'failed' : body.status === 'completed' ? 'completed' : 'running',
-						result: { receipt },
-						error_message: body.status === 'failed' ? body.error_message || 'connector delivery failed' : null,
-						updated_at: now
-					}
-				: invocation
-		);
-		json(res, 200, apiResult(automationInvocations.find((invocation) => invocation.id === invocationId) ?? null));
-		return;
-	}
-		if (pathname === `/api/v1/projects/${projectId}/forms`) {
+	if (pathname === `/api/v1/projects//forms`) {
 			json(res, 200, apiResult(paginated([orderLineForm, printJobForm])));
 			return;
 		}
@@ -6195,7 +5608,6 @@ await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
 		console.log('Forms UI durable-detail smoke passed');
 	} else if (
 		requestedSmokeMode === 'attachment-detail' ||
-		requestedSmokeMode === 'automation-detail' ||
 		requestedSmokeMode === 'comments-detail'
 	) {
 		const detailWidgetDom = await runChromium(
@@ -6204,12 +5616,9 @@ await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
 			desktopScreenshot,
 			60000
 		);
-		const requiredMarker =
-			requestedSmokeMode === 'automation-detail'
-				? 'data-form-record-detail-automation-history="done"'
-				: requestedSmokeMode === 'comments-detail'
-					? 'data-form-record-detail-comments-widget="done"'
-					: 'data-form-record-detail-attachment-widget="done"';
+		const requiredMarker = requestedSmokeMode === 'comments-detail'
+			? 'data-form-record-detail-comments-widget="done"'
+			: 'data-form-record-detail-attachment-widget="done"';
 		if (
 			!detailWidgetDom.includes('data-forms-ui-smoke="done"') ||
 			!detailWidgetDom.includes(requiredMarker)
@@ -6296,36 +5705,6 @@ await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
 		);
 		if (!attachmentLinkedPayload || !attachmentRemovedPayload || !localAttachmentLinkedPayload) {
 			throw new Error('Expected attachment record value update payloads');
-		}
-		if (
-			createdAutomationInvocationPayloads.length < 3 ||
-			createdAutomationInvocationPayloads[0]?.trigger_ref_type !== 'form' ||
-			createdAutomationInvocationPayloads[0]?.trigger_ref_id !== orderLineForm.id ||
-			createdAutomationInvocationPayloads[0]?.payload?.form_key !== orderLineForm.key ||
-			createdAutomationInvocationPayloads[2]?.payload?.source !== 'retry'
-		) {
-			throw new Error('Expected automation invocation payloads for form trigger and retry');
-		}
-		if (
-			automationReceiptPayloads.length < 2 ||
-			automationReceiptPayloads[0]?.status !== 'completed' ||
-			automationReceiptPayloads[1]?.status !== 'failed' ||
-			automationReceiptPayloads[1]?.payload?.form_id !== orderLineForm.id
-		) {
-			throw new Error('Expected automation receipt payloads for completed and failed delivery');
-		}
-		const routingPayload = updatedAutomationConnectorPayloads[0];
-		if (
-			routingPayload?.connector_id !== 'connector-form-webhook' ||
-			!routingPayload.capability_manifest?.forms?.includes('order_line') ||
-			!routingPayload.capability_manifest?.events?.includes('form.record.deleted') ||
-			routingPayload.capability_manifest?.routing?.forms?.order_line?.routing_key !== 'kitchen.order_line' ||
-			!routingPayload.capability_manifest?.routing?.forms?.order_line?.events?.includes('form.record.deleted') ||
-			routingPayload.capability_manifest?.routing?.forms?.order_line?.conditions?.[0]?.field !== 'status' ||
-			routingPayload.capability_manifest?.routing?.forms?.order_line?.conditions?.[0]?.operator !== 'equals' ||
-			routingPayload.capability_manifest?.routing?.forms?.order_line?.conditions?.[0]?.value !== 'sent_to_kitchen'
-		) {
-			throw new Error('Expected automation routing rules connector update payload');
 		}
 		const multiFilterViewPayload = updatedViewPayloads.find(
 			(payload) =>

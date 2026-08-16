@@ -32,7 +32,6 @@ pub struct ProjectTypeResponse {
     pub enabled_capabilities: JsonValue,
     pub field_schema: JsonValue,
     pub artifact_schema: JsonValue,
-    pub default_connectors: JsonValue,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -62,7 +61,6 @@ pub struct CreateProjectTypeRequest {
     pub enabled_capabilities: Option<JsonValue>,
     pub field_schema: Option<JsonValue>,
     pub artifact_schema: Option<JsonValue>,
-    pub default_connectors: Option<JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +73,6 @@ pub struct UpdateProjectTypeRequest {
     pub enabled_capabilities: Option<JsonValue>,
     pub field_schema: Option<JsonValue>,
     pub artifact_schema: Option<JsonValue>,
-    pub default_connectors: Option<JsonValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,7 +190,7 @@ pub async fn list_project_types(
             r"
                 SELECT key, workspace_id, name, description, domain, default_workflow_id,
                        default_governance_policy_id, enabled_capabilities, field_schema,
-                       artifact_schema, default_connectors, created_at, updated_at
+                       artifact_schema, created_at, updated_at
                 FROM project_types
                 WHERE workspace_id IS NULL OR workspace_id = $1
                 ORDER BY workspace_id NULLS FIRST, name
@@ -205,7 +202,7 @@ pub async fn list_project_types(
             r"
                 SELECT key, workspace_id, name, description, domain, default_workflow_id,
                        default_governance_policy_id, enabled_capabilities, field_schema,
-                       artifact_schema, default_connectors, created_at, updated_at
+                       artifact_schema, created_at, updated_at
                 FROM project_types
                 WHERE workspace_id IS NULL
                 ORDER BY name
@@ -236,7 +233,7 @@ pub async fn list_workspace_project_types(
         r"
             SELECT key, workspace_id, name, description, domain, default_workflow_id,
                    default_governance_policy_id, enabled_capabilities, field_schema,
-                   artifact_schema, default_connectors, created_at, updated_at
+                   artifact_schema, created_at, updated_at
             FROM project_types
             WHERE workspace_id IS NULL OR workspace_id = $1
             ORDER BY workspace_id NULLS FIRST, name
@@ -264,7 +261,7 @@ pub async fn get_project_type(
             r"
                 SELECT key, workspace_id, name, description, domain, default_workflow_id,
                        default_governance_policy_id, enabled_capabilities, field_schema,
-                       artifact_schema, default_connectors, created_at, updated_at
+                       artifact_schema, created_at, updated_at
                 FROM project_types
                 WHERE key = $1 AND (workspace_id IS NULL OR workspace_id = $2)
                 ORDER BY workspace_id NULLS LAST
@@ -277,7 +274,7 @@ pub async fn get_project_type(
             r"
                 SELECT key, workspace_id, name, description, domain, default_workflow_id,
                        default_governance_policy_id, enabled_capabilities, field_schema,
-                       artifact_schema, default_connectors, created_at, updated_at
+                       artifact_schema, created_at, updated_at
                 FROM project_types
                 WHERE key = $1 AND workspace_id IS NULL
                 LIMIT 1
@@ -326,12 +323,6 @@ pub async fn create_project_type(
         .map(|value| ensure_json_object(value, "artifact_schema"))
         .transpose()?
         .unwrap_or_else(|| json!({}));
-    let default_connectors = req
-        .default_connectors
-        .map(|value| ensure_json_array(value, "default_connectors"))
-        .transpose()?
-        .unwrap_or_else(|| json!([]));
-
     let tx = state.db.begin().await?;
     let insert = tx
         .execute(Statement::from_sql_and_values(
@@ -340,9 +331,9 @@ pub async fn create_project_type(
                 INSERT INTO project_types (
                     key, workspace_id, name, description, domain, default_workflow_id,
                     default_governance_policy_id, enabled_capabilities, field_schema,
-                    artifact_schema, default_connectors, created_at, updated_at
+                    artifact_schema, created_at, updated_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ",
             vec![
                 key.clone().into(),
@@ -355,7 +346,6 @@ pub async fn create_project_type(
                 enabled_capabilities.into(),
                 field_schema.into(),
                 artifact_schema.into(),
-                default_connectors.into(),
                 now.into(),
                 now.into(),
             ],
@@ -465,12 +455,6 @@ pub async fn update_project_type(
         values.push(ensure_json_object(artifact_schema, "artifact_schema")?.into());
         param_idx += 1;
     }
-    if let Some(default_connectors) = req.default_connectors {
-        updates.push(format!("default_connectors = ${param_idx}"));
-        values.push(ensure_json_array(default_connectors, "default_connectors")?.into());
-        param_idx += 1;
-    }
-
     if updates.is_empty() {
         return Err(ApiError::BadRequest("no fields to update".to_string()));
     }
@@ -778,7 +762,7 @@ where
         r"
             SELECT key, workspace_id, name, description, domain, default_workflow_id,
                    default_governance_policy_id, enabled_capabilities, field_schema,
-                   artifact_schema, default_connectors, created_at, updated_at
+                   artifact_schema, created_at, updated_at
             FROM project_types
             WHERE key = $1
             LIMIT 1

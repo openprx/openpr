@@ -9,7 +9,6 @@ pub mod bot;
 pub mod bot_operation_log;
 pub mod check_result;
 pub mod comment;
-pub mod connector;
 pub mod context;
 pub mod decision;
 pub mod decision_domain;

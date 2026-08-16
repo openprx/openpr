@@ -221,8 +221,6 @@ pub fn create_check_result_tool() -> ToolDefinition {
             "type": "object",
             "properties": {
                 "project_id": { "type": "string", "description": "Project UUID" },
-                "invocation_id": { "type": "string", "description": "Optional invocation UUID" },
-                "connector_id": { "type": "string", "description": "Optional connector UUID" },
                 "action_class": {
                     "type": "string",
                     "enum": ["read_only", "comment_result", "low_risk_mutation", "high_risk_mutation", "external_side_effect", "financial_legal_compliance"]
@@ -277,8 +275,6 @@ pub fn create_proposal_from_result_tool() -> ToolDefinition {
 #[derive(Debug, Deserialize)]
 struct CreateCheckResultInput {
     project_id: String,
-    invocation_id: Option<String>,
-    connector_id: Option<String>,
     action_class: Option<String>,
     risk_level: Option<String>,
     title: String,
@@ -305,8 +301,6 @@ pub async fn create_check_result(client: &OpenPrClient, args: serde_json::Value)
     };
 
     let body = json!({
-        "invocation_id": input.invocation_id,
-        "connector_id": input.connector_id,
         "action_class": input.action_class.unwrap_or_else(|| "high_risk_mutation".to_string()),
         "risk_level": input.risk_level.unwrap_or_else(|| "high".to_string()),
         "title": input.title,

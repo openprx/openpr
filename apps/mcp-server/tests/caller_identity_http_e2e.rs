@@ -4,8 +4,7 @@
 //! The regression under test is not a missing check but a missing distinction. The MCP
 //! server used to hold one workspace bot token and present it on every outbound call, so
 //! every caller of the HTTP port acted as that single bot: the API could not tell two of them
-//! apart, the project agent policy applied to all of them was the bot's, and the tool-call
-//! audit recorded one identity no matter who had called. The bearer token the port asked for
+//! apart and the project agent policy applied to all of them was the bot's. The bearer token the port asked for
 //! was a shared secret — proof of admission, not of identity.
 //!
 //! So the assertions here are about *which token the backend saw*, per request. A test that
@@ -17,12 +16,7 @@
 
 mod support;
 
-use axum::{
-    Json, Router,
-    extract::Path,
-    http::HeaderMap,
-    routing::{get, post},
-};
+use axum::{Json, Router, extract::Path, http::HeaderMap, routing::get};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::process::Stdio;
@@ -58,7 +52,6 @@ struct ApiProbe {
     seen: SeenCredentials,
     policy_hits: Arc<AtomicUsize>,
     form_hits: Arc<AtomicUsize>,
-    audit_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
 }
 
 impl ApiProbe {
@@ -114,15 +107,12 @@ async fn spawn_api() -> Result<(String, ApiProbe), Box<dyn Error>> {
     let seen: SeenCredentials = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let policy_hits = Arc::new(AtomicUsize::new(0));
     let form_hits = Arc::new(AtomicUsize::new(0));
-    let audit_bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
     let policy_seen = Arc::clone(&seen);
     let policy_counter = Arc::clone(&policy_hits);
     let form_seen = Arc::clone(&seen);
     let form_counter = Arc::clone(&form_hits);
     let issues_seen = Arc::clone(&seen);
-    let audit_seen = Arc::clone(&seen);
-    let audit_log = Arc::clone(&audit_bodies);
 
     let router = Router::new()
         .route(
@@ -169,23 +159,6 @@ async fn spawn_api() -> Result<(String, ApiProbe), Box<dyn Error>> {
                     }))
                 }
             }),
-        )
-        .route(
-            "/api/v1/invocations/{invocation_id}/tool-calls",
-            post(
-                move |Path(invocation_id): Path<String>, headers: HeaderMap, Json(body): Json<Value>| {
-                    let seen = Arc::clone(&audit_seen);
-                    let log = Arc::clone(&audit_log);
-                    async move {
-                        seen.lock().await.push((
-                            format!("/invocations/{invocation_id}/tool-calls"),
-                            presented_token(&headers),
-                        ));
-                        log.lock().await.push(body);
-                        Json(json!({ "code": 0, "message": "ok", "data": {} }))
-                    }
-                },
-            ),
         );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -200,7 +173,6 @@ async fn spawn_api() -> Result<(String, ApiProbe), Box<dyn Error>> {
             seen,
             policy_hits,
             form_hits,
-            audit_bodies,
         },
     ))
 }
@@ -502,92 +474,6 @@ async fn the_ownership_cache_never_answers_for_a_different_caller() -> TestResul
     );
 
     server.shutdown().await
-}
-
-/// The tool-call audit is reported as the caller, and reports what the caller did — never
-/// what the caller presented. A credential in an audit payload would be a credential at rest
-/// in the API's database.
-#[tokio::test]
-async fn the_tool_call_audit_carries_the_callers_identity_but_never_its_token() -> TestResult {
-    let (api_url, probe) = spawn_api().await?;
-    let bind_addr = free_bind_addr().await?;
-
-    // `invocation_id` is what switches the audit report on.
-    let config = support::write_config_with_extra_mcp_keys(
-        &McpSettings {
-            api_url: &api_url,
-            bot_token: None,
-            workspace_id: WORKSPACE,
-            transport: Some("http"),
-            bind_addr: Some(&bind_addr),
-        },
-        "invocation_id = \"inv-0001\"\n",
-    )?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mcp-server"))
-        .args(["serve", "--config"])
-        .arg(config.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-
-    let client = reqwest::Client::new();
-    let base_url = format!("http://{bind_addr}");
-    for _ in 0..100 {
-        if let Ok(response) = client.get(format!("{base_url}/health")).send().await
-            && response.status().is_success()
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let response = client
-        .post(format!("{base_url}/mcp/rpc"))
-        .bearer_auth(ALICE_TOKEN)
-        .json(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "work_items.list", "arguments": { "project_id": PROJECT } }
-        }))
-        .send()
-        .await?;
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-
-    let audit_tokens = probe.tokens_for("tool-calls").await;
-    assert_eq!(
-        audit_tokens,
-        vec![ALICE_TOKEN.to_string()],
-        "the audit report was not made as the caller"
-    );
-
-    let bodies = probe.audit_bodies.lock().await;
-    assert_eq!(bodies.len(), 1, "expected exactly one audit report: {bodies:?}");
-    for body in bodies.iter() {
-        let rendered = serde_json::to_string(body)?;
-        for token in [ALICE_TOKEN, BOB_TOKEN, STRANGER_TOKEN, CONFIGURED_TOKEN] {
-            assert!(
-                !rendered.contains(token),
-                "the audit payload carried a token: {rendered}"
-            );
-        }
-        assert!(
-            !rendered.contains("Bearer") && !rendered.contains("uthorization"),
-            "the audit payload carried an authorization header: {rendered}"
-        );
-        assert_eq!(
-            body.get("tool_name").and_then(Value::as_str),
-            Some("work_items.list"),
-            "the audit payload lost the thing it exists to record: {rendered}"
-        );
-        assert_eq!(body.get("transport").and_then(Value::as_str), Some("mcp_http"));
-    }
-    drop(bodies);
-
-    child.start_kill()?;
-    tokio::time::timeout(Duration::from_secs(10), child.wait()).await??;
-    Ok(())
 }
 
 /// stdio has no per-request header, so its identity is the configured one — and that is

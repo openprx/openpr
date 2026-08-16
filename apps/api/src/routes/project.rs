@@ -81,7 +81,6 @@ struct ScenarioTemplateRow {
     resource_schema: JsonValue,
     ai_roles: JsonValue,
     governance_policy: JsonValue,
-    connector_suggestions: JsonValue,
     sample_data: JsonValue,
 }
 
@@ -148,7 +147,7 @@ async fn load_scenario_template(
         r"
             SELECT key, name, industry, project_type_key, audience_label, workflow_template,
                    field_schema, resource_schema, ai_roles, governance_policy,
-                   connector_suggestions, sample_data
+                   sample_data
             FROM scenario_templates
             WHERE key = $1 AND (workspace_id IS NULL OR workspace_id = $2)
             ORDER BY workspace_id NULLS LAST
@@ -187,7 +186,6 @@ fn merge_template_type_settings(
                 "resource_schema": template.resource_schema,
                 "ai_roles": template.ai_roles,
                 "governance_policy": template.governance_policy,
-                "connector_suggestions": template.connector_suggestions,
                 "sample_data": template.sample_data
             }),
         );
@@ -297,7 +295,6 @@ async fn apply_scenario_template(
     tx: &DatabaseTransaction,
     workspace_id: Uuid,
     project_id: Uuid,
-    project_key: &str,
     actor_id: Option<Uuid>,
     registered_by: Uuid,
     template: &ScenarioTemplateRow,
@@ -306,16 +303,6 @@ async fn apply_scenario_template(
     create_template_labels(tx, workspace_id, template).await?;
     create_template_governance_config(tx, project_id, actor_id, template).await?;
     create_template_ai_placeholders(tx, project_id, registered_by, template).await?;
-    create_template_connector_suggestions(
-        tx,
-        workspace_id,
-        project_id,
-        actor_id,
-        project_key,
-        template,
-        causation_id,
-    )
-    .await?;
     create_template_forms(tx, workspace_id, project_id, actor_id, template, causation_id).await?;
     create_template_plugins(tx, workspace_id, project_id, actor_id, template, causation_id).await?;
     Ok(())
@@ -767,131 +754,6 @@ async fn create_template_ai_placeholders(
             ],
         ))
         .await?;
-    }
-
-    Ok(())
-}
-
-async fn create_template_connector_suggestions(
-    tx: &DatabaseTransaction,
-    workspace_id: Uuid,
-    project_id: Uuid,
-    actor_id: Option<Uuid>,
-    project_key: &str,
-    template: &ScenarioTemplateRow,
-    causation_id: Option<Uuid>,
-) -> Result<(), ApiError> {
-    let event_ctx = ScenarioTemplateEventContext {
-        workspace_id,
-        project_id,
-        actor_id,
-        template,
-        causation_id,
-    };
-    let Some(suggestions) = template.connector_suggestions.as_array() else {
-        return Ok(());
-    };
-
-    for suggestion in suggestions {
-        let kind = suggestion
-            .get("type")
-            .or_else(|| suggestion.get("kind"))
-            .and_then(JsonValue::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("webhook");
-        if !matches!(
-            kind,
-            "webhook" | "mcp" | "rest" | "cli" | "openprx_tunnel" | "print" | "device"
-        ) {
-            continue;
-        }
-        let label = suggestion
-            .get("label")
-            .or_else(|| suggestion.get("name"))
-            .and_then(JsonValue::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("Template connection");
-        let endpoint = suggestion
-            .get("endpoint")
-            .and_then(JsonValue::as_str)
-            .map(ToOwned::to_owned);
-        let connector_id = Uuid::new_v4();
-
-        let inserted_connector = IdRow::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            r"
-                INSERT INTO connectors (
-                    id, workspace_id, project_id, kind, name, description, endpoint,
-                    auth_policy, capability_manifest, is_active, created_by, created_at, updated_at
-                )
-                SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10, now(), now()
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM connectors
-                    WHERE project_id = $3
-                      AND kind = $4
-                      AND name = $5
-                      AND capability_manifest->>'source' = 'scenario_template'
-                      AND capability_manifest->>'scenario_template_key' = $11
-                )
-                RETURNING id
-            ",
-            vec![
-                connector_id.into(),
-                workspace_id.into(),
-                project_id.into(),
-                kind.to_string().into(),
-                label.to_string().into(),
-                format!(
-                    "Suggested by scenario template {} for project {project_key}",
-                    template.key
-                )
-                .into(),
-                endpoint.into(),
-                json!({
-                    "mode": "unconfigured",
-                    "template_suggestion": true
-                })
-                .into(),
-                json!({
-                    "source": "scenario_template",
-                    "scenario_template_key": template.key,
-                    "suggestion": suggestion
-                })
-                .into(),
-                actor_id.into(),
-                template.key.clone().into(),
-            ],
-        ))
-        .one(tx)
-        .await?;
-        if let Some(inserted_connector) = inserted_connector {
-            insert_scenario_business_event(
-                tx,
-                &event_ctx,
-                ScenarioBusinessEvent {
-                    event_type: "connector.created",
-                    aggregate_type: "connector",
-                    aggregate_id: inserted_connector.id.to_string(),
-                    payload: json!({
-                        "connector_id": inserted_connector.id,
-                        "kind": kind,
-                        "name": label,
-                        "project_id": project_id,
-                        "scenario_template_key": template.key
-                    }),
-                    metadata: json!({
-                        "connector_id": inserted_connector.id,
-                        "connector_kind": kind,
-                        "project_id": project_id,
-                        "scenario_template_initialized": true
-                    }),
-                },
-            )
-            .await?;
-        }
     }
 
     Ok(())
@@ -1810,7 +1672,6 @@ pub async fn create_project(
             &tx,
             workspace_id,
             project_id,
-            &req.key,
             Some(user_id),
             user_id,
             template,
@@ -1910,22 +1771,6 @@ pub async fn install_project_scenario_template(
         .into_iter()
         .filter_map(|form| template_string(&form, "key", "form").ok())
         .collect::<Vec<_>>();
-    let connector_kinds = template
-        .connector_suggestions
-        .as_array()
-        .map(|suggestions| {
-            suggestions
-                .iter()
-                .filter_map(|suggestion| {
-                    suggestion
-                        .get("type")
-                        .or_else(|| suggestion.get("kind"))
-                        .and_then(JsonValue::as_str)
-                        .map(ToOwned::to_owned)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let plugin_keys = scenario_plugin_templates(&template)?
         .into_iter()
         .filter_map(|plugin| parse_manifest(&plugin.manifest).ok().map(|manifest| manifest.key))
@@ -1973,7 +1818,6 @@ pub async fn install_project_scenario_template(
                 "scenario_template_name": template.name.clone(),
                 "workflow_installed": installed_workflow_id.is_some(),
                 "form_keys": form_keys.clone(),
-                "connector_kinds": connector_kinds.clone(),
                 "plugin_keys": plugin_keys.clone()
             }),
             metadata: json!({
@@ -1993,7 +1837,6 @@ pub async fn install_project_scenario_template(
         &tx,
         project.workspace_id,
         project.id,
-        &project.key,
         event_actor_id,
         project.created_by,
         &template,
@@ -2061,7 +1904,6 @@ pub async fn install_project_scenario_template(
         "workflow_installed": installed_workflow_id.is_some(),
         "installed": {
             "form_keys": form_keys,
-            "connector_kinds": connector_kinds,
             "plugin_keys": plugin_keys
         }
     })))
@@ -2548,7 +2390,6 @@ mod tests {
             resource_schema: json!({"resources":[]}),
             ai_roles: json!([]),
             governance_policy: json!({"risk_model":"financial_legal_compliance"}),
-            connector_suggestions: json!([]),
             sample_data: json!({"example_project_key":"LEGAL"}),
         }
     }
