@@ -53,6 +53,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The action adds the target to the stable toolchain, but rust-toolchain.toml
+      # pins the channel, so cargo builds with a toolchain that action never touched.
+      # Only a non-host native target notices: the host one ships with every toolchain.
+      - name: Add target to the pinned toolchain
+        if: "!matrix.use_cross"
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
