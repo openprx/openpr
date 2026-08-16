@@ -1267,7 +1267,8 @@
     "backlog": "Backlog",
     "todo": "To Do",
     "inProgress": "In Progress",
-    "done": "Done"
+    "done": "Done",
+    "statesReadOnly": "The system default workflow cannot be modified; this view is read-only."
   },
   "projectTypes": {
     "title": "Project types",

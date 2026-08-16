@@ -1267,7 +1267,8 @@
     "backlog": "待办池",
     "todo": "待处理",
     "inProgress": "进行中",
-    "done": "已完成"
+    "done": "已完成",
+    "statesReadOnly": "系统默认工作流不可修改，此处仅供查看。"
   },
   "projectTypes": {
     "title": "项目类型",

@@ -25,6 +25,9 @@
 	let showStatesModal = $state(false);
 	let editingWorkflow = $state<WorkflowSummary | null>(null);
 	let managingWorkflow = $state<WorkflowDetail | null>(null);
+	// Every state mutation is refused for the system default workflow, so the modal offers
+	// the controls only when they can succeed. Reading its states stays allowed.
+	const statesReadOnly = $derived(managingWorkflow?.is_system_default ?? false);
 	let saving = $state(false);
 	let createForm = $state({ name: '', description: '' });
 	let editForm = $state({ name: '', description: '' });
@@ -446,8 +449,8 @@
 									</td>
 									<td class="px-3 py-2 text-right">
 										<div class="flex items-center justify-end gap-1">
-											<Button variant="ghost" size="sm" onclick={() => openEditStateForm(state)}>{$t('common.edit')}</Button>
-											<Button variant="danger" size="sm" onclick={() => handleDeleteState(state)}>{$t('common.delete')}</Button>
+											<Button variant="ghost" size="sm" disabled={statesReadOnly} onclick={() => openEditStateForm(state)}>{$t('common.edit')}</Button>
+											<Button variant="danger" size="sm" disabled={statesReadOnly} onclick={() => handleDeleteState(state)}>{$t('common.delete')}</Button>
 										</div>
 									</td>
 								</tr>
@@ -457,7 +460,9 @@
 				</div>
 			{/if}
 
-			{#if !showStateForm}
+			{#if statesReadOnly}
+				<p class="text-sm text-slate-500 dark:text-slate-400">{$t('workflow.statesReadOnly')}</p>
+			{:else if !showStateForm}
 				<div>
 					<Button variant="secondary" size="sm" onclick={openAddStateForm}>+ {$t('workflow.addState')}</Button>
 				</div>
