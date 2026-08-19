@@ -156,7 +156,7 @@ returning `1`. Input and output are UTF-8 JSON, decimals stay strings.
 
 ## Events and Webhooks
 
-**Transactional event ledger.** Business writes insert into `business_events` and `event_outbox` in the same transaction, with envelopes versioned `openpr.event.v1`. Consumers may use `events.tail` to read the resulting event stream.
+**Business event ledger.** Business writes append to `business_events`. Consumers read the resulting stream with `events.tail`; there is no push-based delivery of these events.
 
 
 **Legacy webhooks** are a separate path from the outbox, signed with HMAC-SHA256
@@ -175,7 +175,7 @@ and awaits them sequentially.
 
 | Pipeline             | Source                                                                 | Behavior                                                      |
 | -------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------- |
-| AI task dispatch     | `ai_tasks`                                                             | POSTs to bot webhooks; retry delay `max(attempts, 1) * 30` s  |
+| AI task dispatch     | `ai_tasks`                                                             | POSTs to bot webhooks, HMAC-signed; retry delay `max(attempts, 1) * 30` s |
 | Operation-log cleanup | `bot_operation_logs`                                                  | Deletes metadata records older than `[audit]` retention       |
 | Form jobs            | `form_import_jobs`, `form_export_jobs`, `form_attachment_package_jobs` | Plus expiry cleanup of package artifacts and signature values |
 
@@ -352,7 +352,7 @@ Prefixes, all relative to `/api/v1`: auth and admin (`/auth/*`, `/admin/*`,
 `/users/*`, `/my/*`); core PM (`/workspaces/*`, `/projects/*`, `/issues/*`,
 `/comments/*`, `/sprints/*`, `/labels/*`); forms (`/forms/*`,
 `/form-records/*`, `/form-views/*`, `/form-attachments/*`, `/form-*-jobs/*`);
-plugins and events (`/plugins/*`, `/invocations/*`, `/check-results/*`);
+plugins and events (`/plugins/*`, `/check-results/*`);
 governance (`/proposals/*`, `/decisions/*`, `/governance/*`, `/trust-scores/*`,
 `/impact-reviews/*`, `/vetoers/*`); AI (`/ai/*`, `/ai-participants/*`,
 `/ai-learning/*`); templates (`/scenario-templates/*`, `/project-types/*`,
@@ -414,7 +414,7 @@ delivery surfaces still have concrete entrypoints. Behavior is covered by
 
 ## Documentation
 
-- `docs/universal-forms-and-plugins.md` — form data model, plugin behavior, connector flow
+- `docs/universal-forms-and-plugins.md` — form data model and plugin behavior
 - `docs/scenario-templates.md` — built-in scenario template catalog
 - `docs/universal-forms-production.md` — production runbook
 - `docs/universal-forms-implementation-map.md` — source module / verification command map

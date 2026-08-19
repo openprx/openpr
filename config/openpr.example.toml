@@ -152,9 +152,9 @@ continue_on_error = false
 
 
 # ---------------------------------------------------------------------------------------------
-# [outbound] — what the connector delivery pipeline is allowed to call.
+# [outbound] — what the webhook and AI-task delivery paths are allowed to call.
 #
-# Outbound requests to private and loopback addresses are blocked by default, so a connector
+# Outbound requests to private and loopback addresses are blocked by default, so a webhook
 # cannot be pointed at the cluster's own metadata service or at an internal admin port.
 # ---------------------------------------------------------------------------------------------
 [outbound]

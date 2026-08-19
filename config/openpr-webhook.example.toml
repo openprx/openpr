@@ -1,7 +1,15 @@
+# Example configuration for the openpr-webhook receiver
+# (https://github.com/openprx/openpr-webhook), pointed at this deployment.
+#
+# The `events` a route may match are the ones a webhook subscription can actually request:
+# see WEBHOOK_EVENTS in apps/api/src/entities/webhook.rs.
+
 [server]
 listen = "0.0.0.0:9090"
 
 [security]
+# Must equal the `secret` of the webhook subscription created in OpenPR. Both the API's own
+# deliveries and the worker's AI-task dispatch sign the exact request body with it.
 webhook_secrets = ["replace_with_openpr_webhook_secret"]
 allow_unsigned = false
 
@@ -15,15 +23,31 @@ cli_max_concurrency = 1
 http_timeout_secs = 15
 tunnel_reconnect_backoff_max_secs = 60
 
+# Bot work: OpenPR marks a delivery with `bot_context.is_bot_task = true` when the webhook's
+# bot user is the assignee or is mentioned.
 [[agents]]
-id = "connector-log"
-name = "Connector Log"
+id = "bot-log"
+name = "Bot Task Log"
 agent_type = "custom"
-message_template = "{event} {project_id} {form_key} {record_id} {connector_kind}"
+message_template = "{event} {project} {key} {title}"
 
 [agents.route]
-events = ["form.record.created", "form.record.updated", "print_job.created"]
-connector_kinds = ["webhook", "rest", "print", "device"]
+events = ["issue.assigned", "issue.state_changed", "comment.created"]
+
+[agents.custom]
+command = "echo"
+args = ["{message}"]
+
+# AI tasks the worker dispatches carry `task_id` and `ai_participant_id` instead of an
+# `event`, so this route matches on the bot rather than on an event name.
+[[agents]]
+id = "ai-task-log"
+name = "AI Task Log"
+agent_type = "custom"
+message_template = "ai_task {project_id} {issue_id} {reason}"
+
+[agents.route]
+bot_agent_types = ["claude-code"]
 
 [agents.custom]
 command = "echo"
