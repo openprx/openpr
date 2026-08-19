@@ -130,10 +130,8 @@ else
   fail "cargo audit JSON is valid"
 fi
 
-sqlx_mysql_tree="$(cd "$ROOT_DIR" && cargo tree -i sqlx-mysql --workspace 2>&1 || true)"
 features_tree="$(cd "$ROOT_DIR" && cargo tree -e features --workspace 2>&1)"
 
-not_contains_output "workspace has no active sqlx-mysql dependency tree" "$sqlx_mysql_tree" "sqlx-mysql v"
 if rg -q --fixed-strings -- 'sea-orm feature "sqlx-postgres"' <<<"$features_tree" \
   && rg -q --fixed-strings -- 'sqlx-postgres v' <<<"$features_tree"; then
   pass "workspace feature tree resolves PostgreSQL SQLx backend"
@@ -142,9 +140,10 @@ else
 fi
 not_contains_output "workspace feature tree does not enable SQLx MySQL backend" "$features_tree" 'sqlx feature "mysql"'
 not_contains_output "workspace feature tree does not enable sqlx-mysql crate" "$features_tree" 'sqlx-mysql v'
-# rsa is in the lockfile only as a dependency of sqlx-mysql, so the feature tree is where its
-# reachability is actually decided. `cargo tree -i rsa` was used here before and did not agree
-# with itself across environments.
+# Both crates are in the lockfile only through SQLx's optional MySQL backend, so the feature
+# tree is where their reachability is actually decided. `cargo tree -i` was used here before and
+# did not agree with itself across environments: on CI it reported rsa as reachable while
+# reporting sqlx-mysql, its only dependent, as unreachable.
 not_contains_output "workspace feature tree does not resolve the rsa crate" "$features_tree" 'rsa v'
 
 if [[ "$failures" -ne 0 ]]; then

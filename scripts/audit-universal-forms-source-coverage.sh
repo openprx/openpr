@@ -596,7 +596,7 @@ contains "acceptance includes PostgreSQL-only security scope audit" "scripts/acc
 contains "security scope audit exists" "scripts/audit-universal-forms-security-scope.sh" "Universal forms security scope audit"
 contains "security scope audit runs cargo audit JSON" "scripts/audit-universal-forms-security-scope.sh" "cargo audit --json"
 contains "security scope audit proves PostgreSQL SQLx backend" "scripts/audit-universal-forms-security-scope.sh" "sqlx-postgres"
-contains "security scope audit blocks active sqlx-mysql tree" "scripts/audit-universal-forms-security-scope.sh" "workspace has no active sqlx-mysql dependency tree"
+contains "security scope audit blocks the sqlx-mysql backend" "scripts/audit-universal-forms-security-scope.sh" "workspace feature tree does not enable sqlx-mysql crate"
 contains "security scope audit blocks a resolved rsa crate" "scripts/audit-universal-forms-security-scope.sh" "workspace feature tree does not resolve the rsa crate"
 contains "acceptance evidence preserves key pass fail lines" "scripts/acceptance-universal-forms.sh" "Key PASS/FAIL lines"
 contains "acceptance evidence extracts full pass fail summary" "scripts/acceptance-universal-forms.sh" "rg '^(PASS|FAIL):'"
