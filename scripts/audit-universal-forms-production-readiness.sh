@@ -228,7 +228,9 @@ contains "env example documents webhook receiver config" "$ROOT_DIR/.env.example
 contains "webhook example listens on compose service port" "$WEBHOOK_EXAMPLE_CONFIG" 'listen = "0.0.0.0:9090"'
 contains "webhook example keeps unsigned webhooks disabled" "$WEBHOOK_EXAMPLE_CONFIG" "allow_unsigned = false"
 contains "webhook example documents secret placeholder" "$WEBHOOK_EXAMPLE_CONFIG" "replace_with_openpr_webhook_secret"
-contains "webhook example routes connector events" "$WEBHOOK_EXAMPLE_CONFIG" 'connector_kinds = ["webhook", "rest", "print", "device"]'
+# Connectors were retired; a route may only name events a webhook subscription can request,
+# which is what WEBHOOK_EVENTS in apps/api/src/entities/webhook.rs enumerates.
+contains "webhook example routes deliverable events" "$WEBHOOK_EXAMPLE_CONFIG" 'events = ["issue.assigned", "issue.state_changed", "comment.created"]'
 not_contains "compose does not hardcode local openpr-webhook binary path" "$COMPOSE_FILE" "/opt/opsx/openpr-webhook"
 not_contains "webhook example does not use machine-specific paths" "$WEBHOOK_EXAMPLE_CONFIG" "/opt/"
 
