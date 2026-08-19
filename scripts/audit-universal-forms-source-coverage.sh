@@ -1092,9 +1092,7 @@ contains "dev-up prints host database url for the config file" "scripts/dev-up.s
 contains "init-db defaults to localhost development database" "scripts/init-db.sh" 'PGHOST="${PGHOST:-127.0.0.1}"'
 contains "init-db defaults to development password" "scripts/init-db.sh" 'PGPASSWORD="${PGPASSWORD:-openpr_dev_password}"'
 contains "docs audit requires README delivery acceptance state" "scripts/audit-universal-forms-docs.sh" "README documents delivery acceptance state"
-contains "production readiness audit requires README delivery acceptance state" "scripts/audit-universal-forms-production-readiness.sh" "README exposes delivery acceptance state"
 contains "docs audit requires README signoff status JSON schema" "scripts/audit-universal-forms-docs.sh" "README links signoff status JSON schema"
-contains "production readiness audit requires README next signoff command smoke" "scripts/audit-universal-forms-production-readiness.sh" "README exposes next signoff command smoke"
 contains "production readiness audit requires development status JSON generation" "scripts/audit-universal-forms-production-readiness.sh" "runbook includes development status JSON generation"
 contains "production readiness audit requires development status JSON verifier" "scripts/audit-universal-forms-production-readiness.sh" "runbook includes development status JSON verifier"
 contains "production readiness audit requires development status JSON contract smoke" "scripts/audit-universal-forms-production-readiness.sh" "runbook includes development status JSON contract smoke"

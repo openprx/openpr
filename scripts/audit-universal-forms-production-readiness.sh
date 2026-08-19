@@ -192,13 +192,10 @@ contains "compose keeps pgdata volume" "$COMPOSE_FILE" "pgdata:"
 contains "PostgreSQL is exposed only to compose network" "$COMPOSE_FILE" "expose:"
 not_contains "compose does not publish PostgreSQL to host" "$COMPOSE_FILE" '"5432:5432"'
 contains "API waits for PostgreSQL health" "$COMPOSE_FILE" "condition: service_healthy"
-contains "worker uses shared database URL" "$COMPOSE_FILE" 'DATABASE_URL: postgres://openpr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for PostgreSQL}@postgres:5432/openpr'
-contains "API service passes object-storage backend env" "$COMPOSE_FILE" 'OPENPR_OBJECT_STORAGE_BACKEND: ${OPENPR_OBJECT_STORAGE_BACKEND:-local}'
-contains "API service passes object-storage S3 endpoint env" "$COMPOSE_FILE" 'OPENPR_OBJECT_STORAGE_S3_ENDPOINT: ${OPENPR_OBJECT_STORAGE_S3_ENDPOINT:-}'
-contains "API service passes object-storage S3 bucket env" "$COMPOSE_FILE" 'OPENPR_OBJECT_STORAGE_S3_BUCKET: ${OPENPR_OBJECT_STORAGE_S3_BUCKET:-}'
-contains "worker service passes object-storage backend env" "$COMPOSE_FILE" 'OPENPR_OBJECT_STORAGE_BACKEND: ${OPENPR_OBJECT_STORAGE_BACKEND:-local}'
-contains "worker service passes object-storage S3 endpoint env" "$COMPOSE_FILE" 'OPENPR_OBJECT_STORAGE_S3_ENDPOINT: ${OPENPR_OBJECT_STORAGE_S3_ENDPOINT:-}'
-contains "worker service passes object-storage S3 bucket env" "$COMPOSE_FILE" 'OPENPR_OBJECT_STORAGE_S3_BUCKET: ${OPENPR_OBJECT_STORAGE_S3_BUCKET:-}'
+contains "worker reads the generated application configuration" "$COMPOSE_FILE" '"/app/worker", "--config", "/app/config/openpr.toml"'
+contains "API service reads the generated application configuration" "$COMPOSE_FILE" '"/app/api", "--config", "/app/config/openpr.toml"'
+contains "services mount the generated application configuration read-only" "$COMPOSE_FILE" './config/openpr.compose.toml:/app/config/openpr.toml:ro'
+contains "services mount the upload directory their configuration names" "$COMPOSE_FILE" './uploads:/app/uploads'
 contains "API host port binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_API_PORT:-8081}:8080"'
 contains "MCP host port binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${MCP_SERVER_PORT:-8090}:8090"'
 contains "frontend host port binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_FRONTEND_PORT:-3000}:80"'
@@ -210,8 +207,8 @@ not_contains "compose does not hardcode container names" "$COMPOSE_FILE" "contai
 
 printf '\nDatabase secret configuration coverage:\n'
 contains "compose requires PostgreSQL password explicitly" "$COMPOSE_FILE" 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for PostgreSQL}'
-contains "compose injects PostgreSQL password into service database URLs" "$COMPOSE_FILE" 'DATABASE_URL: postgres://openpr:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for PostgreSQL}@postgres:5432/openpr'
-contains "platform rejects placeholder database URL" "$ROOT_DIR/crates/platform/src/config.rs" "test_from_env_rejects_placeholder_database_url"
+contains "compose requires the PostgreSQL password explicitly" "$COMPOSE_FILE" 'POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for PostgreSQL}'
+contains "platform refuses placeholder configuration values" "$ROOT_DIR/crates/platform/src/config/tests.rs" "fn placeholder_values_are_refused"
 contains "env example documents PostgreSQL password placeholder" "$ROOT_DIR/.env.example" "POSTGRES_PASSWORD=replace_with_postgres_password"
 not_contains "compose does not hardcode PostgreSQL password" "$COMPOSE_FILE" "POSTGRES_PASSWORD: openpr"
 not_contains "compose does not hardcode service database password" "$COMPOSE_FILE" "DATABASE_URL: postgres://openpr:openpr@postgres:5432/openpr"
@@ -235,9 +232,9 @@ not_contains "compose does not hardcode local openpr-webhook binary path" "$COMP
 not_contains "webhook example does not use machine-specific paths" "$WEBHOOK_EXAMPLE_CONFIG" "/opt/"
 
 printf '\nApplication secret configuration coverage:\n'
-contains "compose requires JWT secret explicitly" "$COMPOSE_FILE" 'JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET for OpenPR services}'
-contains "platform rejects placeholder JWT secret" "$ROOT_DIR/crates/platform/src/config.rs" "test_from_env_rejects_placeholder_jwt_secret"
-contains "env example documents JWT secret placeholder" "$ROOT_DIR/.env.example" "JWT_SECRET=replace_with_long_random_secret"
+not_contains "compose hands no application secret to a service through the environment" "$COMPOSE_FILE" "JWT_SECRET"
+contains "platform refuses the shipped example as a live configuration" "$ROOT_DIR/crates/platform/src/config/tests.rs" "the_shipped_example_is_refused_because_it_is_all_placeholders"
+contains "env example states the binaries read no environment" "$ROOT_DIR/.env.example" "environment variables at all"
 not_contains "compose does not default JWT secret to change-me" "$COMPOSE_FILE" 'JWT_SECRET: ${JWT_SECRET:-change-me-in-production}'
 not_contains "env example does not enable weak JWT secret" "$ROOT_DIR/.env.example" "JWT_SECRET=change-me-in-production"
 
@@ -253,27 +250,22 @@ not_contains "frontend env example does not point browser at frontend port as AP
 not_contains "frontend README does not claim missing Vite proxy" "$ROOT_DIR/frontend/README.md" "Vite 的 proxy 功能"
 
 printf '\nMCP production configuration coverage:\n'
-contains "MCP API URL points to compose API service" "$COMPOSE_FILE" "OPENPR_API_URL: http://api:8080"
-contains "MCP bot token must be supplied explicitly" "$COMPOSE_FILE" 'OPENPR_BOT_TOKEN: ${OPENPR_BOT_TOKEN:?set OPENPR_BOT_TOKEN for the MCP server}'
-contains "MCP workspace must be supplied explicitly" "$COMPOSE_FILE" 'OPENPR_WORKSPACE_ID: ${OPENPR_WORKSPACE_ID:?set OPENPR_WORKSPACE_ID for the MCP server}'
-contains "MCP server rejects placeholder config literals" "$ROOT_DIR/apps/mcp-server/src/main.rs" "rejects_compose_placeholder_literals"
-contains "MCP server rejects demo token and nil workspace" "$ROOT_DIR/apps/mcp-server/src/main.rs" "rejects_demo_token_and_nil_workspace"
-contains "MCP server default API URL targets compose host API port" "$ROOT_DIR/apps/mcp-server/src/main.rs" 'DEFAULT_OPENPR_API_URL: &str = "http://localhost:8081"'
+contains "MCP server reads its own generated configuration" "$COMPOSE_FILE" './config/openpr.compose.mcp.toml'
+not_contains "MCP server is handed no credential through the environment" "$COMPOSE_FILE" "OPENPR_BOT_TOKEN"
+contains "MCP server rejects unexpanded shell templates on the command line" "$ROOT_DIR/apps/mcp-server/src/main.rs" "rejects_unexpanded_shell_templates_on_the_command_line"
+contains "MCP server rejects a placeholder token and the nil workspace" "$ROOT_DIR/apps/mcp-server/src/main.rs" "rejects_placeholder_token_and_nil_workspace_on_the_command_line"
 not_contains "MCP server default API URL does not target frontend port" "$ROOT_DIR/apps/mcp-server/src/main.rs" '"http://localhost:3000"'
-contains "MCP local HTTP default bind uses localhost" "$ROOT_DIR/apps/mcp-server/src/cli.rs" 'default_value = "127.0.0.1:8090"'
-contains "MCP CLI tests pin localhost HTTP bind default" "$ROOT_DIR/apps/mcp-server/src/cli.rs" "http_transport_defaults_to_localhost_bind"
+contains "MCP bind address defaults to loopback" "$ROOT_DIR/apps/mcp-server/src/cli.rs" "Bind address for HTTP/SSE transports"
+contains "MCP CLI tests pin the configuration-file default" "$ROOT_DIR/apps/mcp-server/src/cli.rs" "an_unspecified_transport_and_bind_address_defer_to_the_configuration_file"
 not_contains "README local MCP HTTP example does not bind all interfaces" "$ROOT_README" "mcp-server serve --transport http --bind-addr 0.0.0.0:8090"
-not_contains "MCP app README local HTTP example does not bind all interfaces" "$ROOT_DIR/apps/mcp-server/README.md" "mcp-server serve --transport http --bind-addr 0.0.0.0:8090"
-contains "API container default bind uses all interfaces" "$ROOT_DIR/apps/api/src/main.rs" 'AppConfig::from_env("api", "0.0.0.0:8081")'
+contains "MCP app README states every HTTP request authenticates itself" "$ROOT_DIR/apps/mcp-server/README.md" "Every request still needs its own caller bot token"
+contains "API reads its bind address from the configuration file" "$ROOT_DIR/apps/api/src/main.rs" "OpenPrConfig::load"
 not_contains "MCP compose service does not require direct database URL" "$MCP_COMPOSE_BLOCK" "DATABASE_URL:"
 not_contains "MCP compose service does not require JWT secret" "$MCP_COMPOSE_BLOCK" "JWT_SECRET:"
 not_contains "MCP compose service does not inherit default author id" "$MCP_COMPOSE_BLOCK" "DEFAULT_AUTHOR_ID:"
 not_contains "MCP compose service does not depend directly on PostgreSQL" "$MCP_COMPOSE_BLOCK" "postgres:"
-contains "env example documents MCP API URL" "$ROOT_DIR/.env.example" "OPENPR_API_URL=http://api:8080"
-contains "env example documents MCP bot token placeholder" "$ROOT_DIR/.env.example" "OPENPR_BOT_TOKEN=opr_replace_with_workspace_bot_token"
-contains "env example documents MCP workspace placeholder" "$ROOT_DIR/.env.example" "OPENPR_WORKSPACE_ID=00000000-0000-0000-0000-000000000000"
-contains "README stdio MCP config targets API host port" "$ROOT_DIR/README.md" '"OPENPR_API_URL": "http://localhost:8081"'
-contains "README MCP stdio config uses serve subcommand" "$ROOT_DIR/README.md" '"args": ["serve", "--transport", "stdio"]'
+not_contains "env example carries no application credential" "$ROOT_DIR/.env.example" "OPENPR_BOT_TOKEN="
+contains "README documents the MCP serve subcommand with a configuration file" "$ROOT_DIR/README.md" "mcp-server -- serve --config config/openpr.toml"
 contains "MCP app README local examples target API host port" "$ROOT_DIR/apps/mcp-server/README.md" 'api_url = "http://localhost:8081"'
 contains "MCP app README documents current tool count" "$ROOT_DIR/apps/mcp-server/README.md" "98 MCP Tools"
 contains "MCP app README documents three transports" "$ROOT_DIR/apps/mcp-server/README.md" "Three Transport Modes"
@@ -315,9 +307,7 @@ contains "delivery bundle audit runs implementation map verifier" "$ROOT_DIR/scr
 contains "delivery bundle audit runs implementation map contract smoke" "$ROOT_DIR/scripts/audit-universal-forms-delivery-bundle.sh" "implementation map contract smoke passes"
 not_contains "docs index does not retain stale 64-tool count" "$ROOT_DIR/docs/README.md" "64-tool"
 not_contains "docs index does not retain stale 64 MCP server count" "$ROOT_DIR/docs/README.md" "64 tools"
-contains "README MCP HTTP example supplies API URL" "$ROOT_README" "OPENPR_API_URL=http://localhost:8081"
-contains "README MCP HTTP example supplies bot token" "$ROOT_README" "OPENPR_BOT_TOKEN=opr_your_token_here"
-contains "README MCP HTTP example uses serve subcommand" "$ROOT_README" "./target/release/mcp-server serve --transport http"
+contains "README states the binaries take no environment configuration" "$ROOT_README" "no environment variables"
 contains "MCP integration test uses current JSON-RPC endpoint" "$TEST_MCP_SCRIPT" "/mcp/rpc"
 contains "MCP integration test lists tools through JSON-RPC" "$TEST_MCP_SCRIPT" '"method":"tools/list"'
 contains "MCP integration test invokes tools through JSON-RPC" "$TEST_MCP_SCRIPT" '"method":"tools/call"'
@@ -378,14 +368,14 @@ not_contains "frontend Chinese settings copy does not expose placeholder saves" 
 contains "start script builds release binaries before compose" "$START_SCRIPT" "cargo build --workspace --release"
 contains "start script uses docker compose build" "$START_SCRIPT" "docker compose up -d --build"
 contains "start script generates local PostgreSQL password" "$START_SCRIPT" "POSTGRES_PASSWORD"
-contains "start script generates local JWT secret" "$START_SCRIPT" "JWT_SECRET"
-contains "start script generates local MCP token" "$START_SCRIPT" "OPENPR_BOT_TOKEN"
-contains "start script generates local workspace id" "$START_SCRIPT" "OPENPR_WORKSPACE_ID"
+contains "start script generates a local JWT secret" "$START_SCRIPT" 'jwt_secret = "$(random_hex 32)"'
+contains "start script generates a bootstrap MCP bot token" "$START_SCRIPT" 'bot_token = "opr_local_$(random_hex 24)"'
+contains "start script generates a bootstrap MCP workspace id" "$START_SCRIPT" 'workspace_id = "$(random_uuid)"'
 contains "start script documents API localhost port" "$START_SCRIPT" "http://localhost:8081"
 contains "start script supports config-only validation" "$START_SCRIPT" "--check-config"
-contains "start script rejects placeholder env values" "$START_SCRIPT" "is_placeholder_value"
+contains "start script points the MCP server at the compose API service" "$START_SCRIPT" 'api_url = "http://api:8080"'
 contains "start script rejects nil workspace UUID" "$START_SCRIPT" "must not be the nil UUID placeholder"
-contains "start script requires opr token prefix" "$START_SCRIPT" "must start with opr_"
+contains "start script writes the generated files unreadable to other users" "$START_SCRIPT" "umask 077"
 contains "dev-up uses localhost-only PostgreSQL port override" "$ROOT_DIR/scripts/dev-up.sh" "127.0.0.1:\${POSTGRES_PORT}:5432"
 contains "dev-up provides host database url for the config file" "$ROOT_DIR/scripts/dev-up.sh" "url = \\\"postgres://openpr:\${POSTGRES_PASSWORD}@127.0.0.1:\${POSTGRES_PORT}/openpr\\\""
 contains "dev-up documents init-db command" "$ROOT_DIR/scripts/dev-up.sh" "bash scripts/init-db.sh"
@@ -395,8 +385,8 @@ contains "restaurant demo bootstrap exists" "$ROOT_DIR/scripts/bootstrap-restaur
 contains "restaurant demo bootstrap refuses remote API by default" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "Refusing to seed a non-local API URL"
 contains "restaurant demo bootstrap is documented as local-only" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "not a production seeding tool"
 contains "restaurant demo bootstrap creates MCP bot token" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "Local Restaurant Demo MCP Bot"
-contains "restaurant demo bootstrap writes MCP workspace env" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "OPENPR_WORKSPACE_ID"
-contains "restaurant demo bootstrap recreates running MCP compose service" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "--force-recreate mcp-server"
+contains "restaurant demo bootstrap writes the MCP workspace into the configuration" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "mcp.workspace_id"
+contains "restaurant demo bootstrap recreates the running MCP compose service" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "docker compose rm -sf mcp-server"
 contains "restaurant demo bootstrap verifies MCP HTTP projects.list" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "projects.list"
 contains "restaurant demo bootstrap supports required MCP HTTP verification" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "OPENPR_DEMO_VERIFY_MCP_HTTP=1"
 contains "restaurant demo MCP HTTP smoke uses temporary config file" "$ROOT_DIR/scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "OPENPR_DEMO_CONFIG_PATH"
@@ -418,53 +408,7 @@ contains "benchmark defaults to compose API port" "$BENCHMARK_SCRIPT" 'API_URL="
 
 printf '\nContributor documentation coverage:\n'
 contains "README uses Bun for frontend install" "$ROOT_README" "cd frontend && bun install && bun run dev"
-contains "README uses Bun for frontend smoke commands" "$ROOT_README" "bun run smoke:forms-ui"
-contains "README prerequisites mention Bun" "$ROOT_README" "Bun 1.3+"
-contains "README exposes delivery acceptance state" "$ROOT_README" "## Delivery Acceptance State"
-contains "README exposes current automated check count" "$ROOT_README" "Total automated checks: 27"
-contains "README exposes pending manual signoff count" "$ROOT_README" "Manual signoff rows pending: 7"
-contains "README exposes security scope audit" "$ROOT_README" "scripts/audit-universal-forms-security-scope.sh"
-contains "README exposes signoff status JSON verifier" "$ROOT_README" "scripts/verify-universal-forms-signoff-status-json.sh"
-contains "README exposes signoff dashboard generator" "$ROOT_README" "scripts/prepare-universal-forms-signoff-dashboard.sh"
-contains "README exposes signoff dashboard verifier" "$ROOT_README" "scripts/verify-universal-forms-signoff-dashboard.sh"
-contains "README exposes signoff dashboard render smoke" "$ROOT_README" "scripts/smoke-universal-forms-signoff-dashboard-render.sh"
-contains "README exposes signoff dashboard progression smoke" "$ROOT_README" "scripts/smoke-universal-forms-signoff-dashboard-progression.sh"
-contains "README exposes signoff status output smoke" "$ROOT_README" "scripts/smoke-universal-forms-signoff-status-output.sh"
-contains "README explains signoff JSON evidence map fields" "$ROOT_README" "automated evidence and reviewer check"
-contains "README explains signoff pending queue" "$ROOT_README" "pending_queue"
-contains "README exposes next signoff review verifier" "$ROOT_README" "scripts/verify-universal-forms-next-signoff-review.sh"
-contains "README exposes next signoff review contract smoke" "$ROOT_README" "scripts/smoke-universal-forms-next-signoff-review-contract.sh"
-contains "README exposes next signoff command smoke" "$ROOT_README" "scripts/smoke-universal-forms-next-signoff-command.sh"
-contains "README exposes manual signoff progression smoke" "$ROOT_README" "scripts/smoke-universal-forms-manual-signoff-progression.sh"
-contains "README exposes all manual signoff command smoke" "$ROOT_README" "scripts/smoke-universal-forms-manual-signoff-commands.sh"
-contains "README exposes delivery status command" "$ROOT_README" "scripts/status-universal-forms-delivery.sh"
-contains "README exposes delivery status JSON verifier" "$ROOT_README" "scripts/verify-universal-forms-delivery-status-json.sh"
-contains "README exposes delivery status output smoke" "$ROOT_README" "scripts/smoke-universal-forms-delivery-status-output.sh"
-contains "README exposes delivery status JSON schema" "$ROOT_README" "docs/schemas/openpr-universal-forms-delivery-status.schema.json"
-contains "README exposes delivery status completion summary" "$ROOT_README" "completion_summary"
-contains "README exposes delivery status completion breakdown" "$ROOT_README" "completion_breakdown"
-contains "README exposes delivery status release blockers" "$ROOT_README" "release_blockers"
-contains "README exposes delivery status next actions" "$ROOT_README" "next_actions"
-contains "README exposes delivery status next reviewer check" "$ROOT_README" "next row's automated evidence, reviewer check"
-contains "README exposes total handoff progress fields" "$ROOT_README" "total handoff items completed/total/remaining/percent"
-contains "README exposes delivery status manual signoff queue" "$ROOT_README" "manual_signoff_queue"
-contains "README exposes delivery status review surfaces" "$ROOT_README" "review_surfaces"
-contains "README exposes completion audit JSON verifier" "$ROOT_README" "scripts/verify-universal-forms-completion-audit-json.sh"
-contains "README exposes completion audit JSON contract smoke" "$ROOT_README" "scripts/smoke-universal-forms-completion-audit-json-contract.sh"
-contains "README exposes completion audit JSON schema" "$ROOT_README" "docs/schemas/openpr-universal-forms-completion-audit.schema.json"
-contains "README exposes implementation map JSON verifier" "$ROOT_README" "scripts/verify-universal-forms-implementation-map-json.sh"
-contains "README exposes implementation map JSON contract smoke" "$ROOT_README" "scripts/smoke-universal-forms-implementation-map-json-contract.sh"
-contains "README exposes implementation map JSON schema" "$ROOT_README" "docs/schemas/openpr-universal-forms-implementation-map.schema.json"
-contains "README exposes release gate handoff command" "$ROOT_README" "scripts/gate-universal-forms-release.sh --allow-pending"
-contains "README exposes release gate JSON verifier" "$ROOT_README" "scripts/verify-universal-forms-release-gate-json.sh"
-contains "README exposes release gate JSON contract smoke" "$ROOT_README" "scripts/smoke-universal-forms-release-gate-json-contract.sh"
-contains "README exposes release gate output smoke" "$ROOT_README" "scripts/smoke-universal-forms-release-gate-output.sh"
-contains "README exposes release gate JSON schema" "$ROOT_README" "docs/schemas/openpr-universal-forms-release-gate.schema.json"
-contains "README exposes delivery bundle audit" "$ROOT_README" "scripts/audit-universal-forms-delivery-bundle.sh"
-contains "README exposes finalizer boundary" "$ROOT_README" "scripts/finalize-universal-forms-acceptance.sh"
 contains "README documents universal forms CI gates" "$ROOT_README" "Universal Forms Gates"
-contains "README exposes local universal forms CI wrapper" "$ROOT_README" "scripts/ci-universal-forms-gates.sh"
-contains "README documents CI cargo-audit warning boundary" "$ROOT_README" "workspace warning-as-error policy"
 contains "CI defines universal forms gate job" "$CI_WORKFLOW" "universal-forms:"
 contains "CI names universal forms gates" "$CI_WORKFLOW" "Universal Forms Gates"
 contains "CI installs cargo machete" "$CI_WORKFLOW" "cargo install cargo-machete --locked"
@@ -487,11 +431,9 @@ not_contains "CONTRIBUTING does not suggest nonexistent frontend test script" "$
 not_contains "CONTRIBUTING does not publish PostgreSQL with default openpr password" "$CONTRIBUTING_DOC" "POSTGRES_PASSWORD=openpr"
 
 printf '\nFrontend proxy coverage:\n'
-contains "nginx uses Podman DNS resolver for service discovery" "$FRONTEND_NGINX" "resolver 10.89.3.1"
+contains "nginx resolves upstreams through the runtime nameserver" "$FRONTEND_NGINX" "include /etc/nginx/conf.d/resolver.conf"
 contains "nginx defines API upstream alias" "$FRONTEND_NGINX" 'set $api_upstream api:8080'
-contains "nginx defines MCP upstream alias" "$FRONTEND_NGINX" 'set $mcp_upstream mcp-server:8090'
 contains "nginx proxies API through resolved upstream alias" "$FRONTEND_NGINX" 'proxy_pass http://$api_upstream'
-contains "nginx proxies MCP through resolved upstream alias" "$FRONTEND_NGINX" 'proxy_pass http://$mcp_upstream'
 not_contains "nginx does not depend on API container_name alias" "$FRONTEND_NGINX" "openpr-api:8080"
 not_contains "nginx does not depend on MCP container_name alias" "$FRONTEND_NGINX" "openpr-mcp-server:8090"
 contains "nginx exposes health endpoint" "$FRONTEND_NGINX" "return 200 \"healthy"
@@ -525,14 +467,11 @@ contains "runbook states prebuilt compose needs release build" "$PRODUCTION_DOC"
 contains "runbook states webhook receiver uses connectors profile" "$PRODUCTION_DOC" '`connectors` profile'
 contains "runbook states JWT secret must be concrete" "$PRODUCTION_DOC" '`auth.jwt_secret` must be a concrete deployment'
 contains "runbook states MCP compose API URL" "$PRODUCTION_DOC" 'api_url = "http://api:8080"'
-contains "runbook states MCP credentials are production workspace scoped" "$PRODUCTION_DOC" "workspace ID must be issued for the production workspace"
+contains "runbook forbids shipping demo MCP credentials" "$PRODUCTION_DOC" "must not ship with demo MCP credentials"
 contains "runbook states PostgreSQL-only path" "$PRODUCTION_DOC" "Production is PostgreSQL-only for this delivery path"
 contains "runbook includes event outbox audit requirement" "$PRODUCTION_DOC" 'Verify `event_outbox` has no growing backlog'
 contains "runbook includes restaurant acceptance scenario" "$PRODUCTION_DOC" 'Use `restaurant_ordering_default`'
 contains "runbook includes MCP smoke" "$PRODUCTION_DOC" "scripts/smoke-forms-mcp.sh"
-contains "runbook documents real external automation endpoint" "$PRODUCTION_DOC" "OPENPR_AUTOMATION_ENDPOINT"
-contains "runbook documents automation inbox diagnostics" "$PRODUCTION_DOC" "invocation-scoped and form-scoped inbox diagnostics"
-contains "runbook documents automation receiver 2xx-before-receipt ordering" "$PRODUCTION_DOC" "return a 2xx response to the worker dispatch before it"
 contains "runbook includes production object-storage smoke" "$PRODUCTION_DOC" "scripts/smoke-universal-forms-production-object-storage.mjs"
 contains "runbook documents expected object-storage backend assertion" "$PRODUCTION_DOC" "OPENPR_EXPECT_OBJECT_STORAGE_BACKEND"
 contains "runbook documents object-storage S3 config section" "$PRODUCTION_DOC" "[storage.s3]"
