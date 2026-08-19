@@ -19,7 +19,7 @@ use crate::outbound::{truncate_string, validate_outbound_url};
 
 /// Hard cap on the response body pulled from a webhook receiver.
 ///
-/// Matches the connector delivery path so both outbound pipelines behave the same way.
+/// Bounded so a receiver cannot stream an unbounded body into the delivery record.
 const WEBHOOK_RESPONSE_BYTE_LIMIT: usize = 64 * 1024;
 /// Characters of receiver diagnostics persisted on `webhook_deliveries`.
 const WEBHOOK_DIAGNOSTIC_CHARS: usize = 2_000;
@@ -821,7 +821,7 @@ async fn deliver_webhook(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static("OpenPR-Webhook/1.0"));
     headers.insert(
-        "X-Webhook-Signature",
+        WEBHOOK_SIGNATURE_HEADER,
         HeaderValue::from_str(&format!("sha256={signature}")).unwrap_or(HeaderValue::from_static("sha256=")),
     );
     headers.insert(
@@ -1064,7 +1064,14 @@ async fn record_delivery(state: &AppState, rec: DeliveryRecord) -> Result<(), se
     Ok(())
 }
 
-fn sign_payload(secret: &str, raw_body: &str) -> Result<String, String> {
+/// Header carrying the outbound HMAC, shared with the worker so both paths agree on the name.
+pub const WEBHOOK_SIGNATURE_HEADER: &str = "X-Webhook-Signature";
+
+/// Signs an outbound webhook body the way `X-Webhook-Signature: sha256=<hex>` is verified.
+///
+/// Shared with the worker's AI-task dispatch so both outbound paths present the same signature
+/// instead of one of them delivering unauthenticated.
+pub fn sign_payload(secret: &str, raw_body: &str) -> Result<String, String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|e| format!("invalid hmac secret: {e}"))?;
     mac.update(raw_body.as_bytes());
     let bytes = mac.finalize().into_bytes();

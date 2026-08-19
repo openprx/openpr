@@ -2,12 +2,14 @@ use std::path::PathBuf;
 
 use api::config::RuntimeConfig;
 use api::outbound::validate_outbound_url;
+use api::webhook_trigger::{WEBHOOK_SIGNATURE_HEADER, sign_payload};
 use clap::Parser;
 use platform::{
     app::{AppState, connect_db},
     config::{AppConfig, OpenPrConfig},
     logging,
 };
+use reqwest::header::CONTENT_TYPE;
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde_json::json;
 use uuid::Uuid;
@@ -46,6 +48,7 @@ struct AiTaskDispatchRow {
 struct BotWebhookRow {
     webhook_id: Uuid,
     url: String,
+    secret: String,
 }
 
 /// Publishes the configuration file to the API library this binary links, and hands back the
@@ -286,7 +289,8 @@ async fn dispatch_task(
         r"
             SELECT
                 w.id AS webhook_id,
-                w.url
+                w.url,
+                w.secret
             FROM webhooks w
             INNER JOIN projects p ON p.workspace_id = w.workspace_id
             WHERE p.id = $1
@@ -327,7 +331,19 @@ async fn dispatch_task(
         .await
         .map_err(|err| anyhow::anyhow!("webhook {} url rejected: {err}", webhook.webhook_id))?;
 
-    let response = client.post(target).json(&body).send().await?;
+    // Signed over the exact bytes that are sent, the same way the API's own webhook deliveries
+    // are, so a receiver can refuse unsigned traffic instead of having to trust this path.
+    let raw_body = serde_json::to_string(&body)?;
+    let signature = sign_payload(&webhook.secret, &raw_body)
+        .map_err(|err| anyhow::anyhow!("webhook {} signing failed: {err}", webhook.webhook_id))?;
+
+    let response = client
+        .post(target)
+        .header(CONTENT_TYPE, "application/json")
+        .header(WEBHOOK_SIGNATURE_HEADER, format!("sha256={signature}"))
+        .body(raw_body)
+        .send()
+        .await?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
