@@ -472,11 +472,10 @@ async fn insert_worker_ai_task_business_event(
         "worker_event": true
     });
 
-    insert_business_event_and_outbox(
+    insert_business_event(
         db,
         WorkerBusinessEventInput {
             event_id: Uuid::new_v4(),
-            outbox_id: Uuid::new_v4(),
             workspace_id: task.workspace_id,
             project_id: Some(task.project_id),
             event_type,
@@ -495,7 +494,6 @@ async fn insert_worker_ai_task_business_event(
 
 struct WorkerBusinessEventInput<'a> {
     event_id: Uuid,
-    outbox_id: Uuid,
     workspace_id: Uuid,
     project_id: Option<Uuid>,
     event_type: &'a str,
@@ -509,34 +507,10 @@ struct WorkerBusinessEventInput<'a> {
     causation_id: Option<Uuid>,
 }
 
-async fn insert_business_event_and_outbox(
+async fn insert_business_event(
     db: &sea_orm::DatabaseConnection,
     input: WorkerBusinessEventInput<'_>,
 ) -> anyhow::Result<()> {
-    let envelope = json!({
-        "version": "openpr.event.v1",
-        "event_id": input.event_id,
-        "event_type": input.event_type,
-        "workspace_id": input.workspace_id,
-        "project_id": input.project_id,
-        "aggregate": {
-            "type": input.aggregate_type,
-            "id": input.aggregate_id
-        },
-        "actor_id": input.actor_id,
-        "source": input.source,
-        "payload": input.payload,
-        "metadata": input.metadata,
-        "correlation_id": input.correlation_id,
-        "causation_id": input.causation_id
-    });
-    let headers = json!({
-        "schema": "openpr.event.v1",
-        "idempotency_key": null,
-        "correlation_id": input.correlation_id,
-        "causation_id": input.causation_id
-    });
-
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
@@ -553,7 +527,7 @@ async fn insert_business_event_and_outbox(
             input.project_id.into(),
             input.event_type.to_string().into(),
             input.aggregate_type.to_string().into(),
-            input.aggregate_id.clone().into(),
+            input.aggregate_id.into(),
             input.actor_id.into(),
             input.source.into(),
             input.payload.into(),
@@ -564,29 +538,6 @@ async fn insert_business_event_and_outbox(
     ))
     .await?;
 
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            INSERT INTO event_outbox (
-                id, business_event_id, workspace_id, project_id, event_type,
-                aggregate_type, aggregate_id, payload, headers, status,
-                attempts, max_attempts, available_at, created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', 0, 10, now(), now(), now())
-        ",
-        vec![
-            input.outbox_id.into(),
-            input.event_id.into(),
-            input.workspace_id.into(),
-            input.project_id.into(),
-            input.event_type.to_string().into(),
-            input.aggregate_type.to_string().into(),
-            input.aggregate_id.into(),
-            envelope.into(),
-            headers.into(),
-        ],
-    ))
-    .await?;
     Ok(())
 }
 

@@ -1931,6 +1931,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0052_drop_connectors_and_agent_invocations.sql",
         include_str!("../../../migrations/0052_drop_connectors_and_agent_invocations.sql"),
     ),
+    (
+        "0053_drop_event_outbox.sql",
+        include_str!("../../../migrations/0053_drop_event_outbox.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2186,10 +2190,7 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         "0047_form_attachment_media_metadata.sql",
         SchemaProbe::Column("form_attachments", "media_metadata"),
     ),
-    (
-        "0048_delivery_lease_and_pickup_indexes.sql",
-        SchemaProbe::Column("event_outbox", "lease_token"),
-    ),
+    ("0048_delivery_lease_and_pickup_indexes.sql", SchemaProbe::Superseded),
     ("0049_agent_invocation_duplicate_tagging.sql", SchemaProbe::Superseded),
     (
         "0050_proposal_workspace_scope.sql",
@@ -2202,6 +2203,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0052_drop_connectors_and_agent_invocations.sql",
         SchemaProbe::RelationAbsent("connectors"),
+    ),
+    (
+        "0053_drop_event_outbox.sql",
+        SchemaProbe::RelationAbsent("event_outbox"),
     ),
 ];
 
@@ -2708,7 +2713,8 @@ mod tests {
                 "0049_agent_invocation_duplicate_tagging.sql",
                 "0050_proposal_workspace_scope.sql",
                 "0051_bot_operation_logs.sql",
-                "0052_drop_connectors_and_agent_invocations.sql"
+                "0052_drop_connectors_and_agent_invocations.sql",
+                "0053_drop_event_outbox.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
@@ -2723,12 +2729,19 @@ mod tests {
         assert_eq!(migration_checksum("").len(), 64);
     }
 
+    /// The post-cutoff files that intentionally drop relations. Everything else past the cutoff
+    /// must stay replay-safe.
+    const RETIREMENT_MIGRATIONS: [&str; 2] = [
+        "0052_drop_connectors_and_agent_invocations.sql",
+        "0053_drop_event_outbox.sql",
+    ];
+
     /// Non-destructive post-cutoff migrations must remain safe to replay. The explicitly
-    /// destructive retirement migration is checked separately.
+    /// destructive retirement migrations are checked separately.
     #[test]
     fn the_delivery_migrations_never_delete_rows() {
         for (name, sql) in MIGRATIONS.iter().filter(|(name, _)| *name > MIGRATION_ADOPTION_CUTOFF) {
-            if *name == "0052_drop_connectors_and_agent_invocations.sql" {
+            if RETIREMENT_MIGRATIONS.contains(name) {
                 continue;
             }
             let upper = sql.to_uppercase();
@@ -2744,23 +2757,31 @@ mod tests {
     }
 
     #[test]
-    fn the_retirement_migration_drops_only_the_confirmed_relations() {
-        let sql = MIGRATIONS
-            .iter()
-            .find(|(name, _)| *name == "0052_drop_connectors_and_agent_invocations.sql")
-            .map(|(_, sql)| *sql)
-            .expect("retirement migration must be registered");
-        for relation in ["agent_invocation_tool_calls", "agent_invocations", "connectors"] {
-            assert!(
-                sql.contains(&format!("DROP TABLE IF EXISTS {relation}")),
-                "retirement migration must drop {relation} idempotently"
+    fn the_retirement_migrations_drop_only_the_confirmed_relations() {
+        for (name, dropped) in [
+            (
+                "0052_drop_connectors_and_agent_invocations.sql",
+                ["agent_invocation_tool_calls", "agent_invocations", "connectors"].as_slice(),
+            ),
+            ("0053_drop_event_outbox.sql", ["event_outbox"].as_slice()),
+        ] {
+            let sql = MIGRATIONS
+                .iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, sql)| *sql)
+                .expect("retirement migration must be registered");
+            for relation in dropped {
+                assert!(
+                    sql.contains(&format!("DROP TABLE IF EXISTS {relation}")),
+                    "{name} must drop {relation} idempotently"
+                );
+            }
+            assert_eq!(
+                sql.matches("DROP TABLE").count(),
+                dropped.len(),
+                "{name} must not drop an unrelated table"
             );
         }
-        assert_eq!(
-            sql.matches("DROP TABLE").count(),
-            3,
-            "no unrelated table may be dropped"
-        );
     }
 
     /// Every migration needs a probe, otherwise an existing database either replays it (which the
@@ -2797,7 +2818,7 @@ mod tests {
     }
 
     #[test]
-    fn only_retired_connector_migrations_are_superseded() {
+    fn only_retired_delivery_migrations_are_superseded() {
         let superseded: Vec<&str> = MIGRATION_PROBES
             .iter()
             .filter(|(_, probe)| matches!(probe, SchemaProbe::Superseded))
@@ -2809,6 +2830,7 @@ mod tests {
                 "0026_connectors_invocations.sql",
                 "0028_invocation_tool_calls.sql",
                 "0032_print_device_connector_kinds.sql",
+                "0048_delivery_lease_and_pickup_indexes.sql",
                 "0049_agent_invocation_duplicate_tagging.sql"
             ]
         );
