@@ -5,8 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "$ROOT_DIR"
 
-# Covers form.record.* delivery from event_outbox to a plain HTTP connector
-# receiver. This verifies webhook/connector delivery without requiring an agent.
+# Covers the form.record.* writes a webhook consumer subscribes to. The outbox and the
+# connector delivery pipeline this once described were retired; what remains verifiable
+# without an agent is that those writes still happen.
 ./scripts/smoke-form-events-outbox.sh
 
 echo "webhook generic consumer smoke passed"

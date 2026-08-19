@@ -2756,6 +2756,36 @@ mod tests {
         }
     }
 
+    /// A post-cutoff migration is executed whenever the ledger has no row for it, and that can
+    /// happen after the relations it touches were already dropped: a database restored without
+    /// its ledger, or one retrying the file after a single failed run. Referencing a dropped
+    /// relation unguarded then fails on every start and never reaches the migration that drops
+    /// it, which is an unrecoverable restart loop rather than a bad run.
+    #[test]
+    fn post_cutoff_migrations_guard_the_relations_a_retirement_migration_drops() {
+        let dropped = [
+            "connectors",
+            "agent_invocation_tool_calls",
+            "agent_invocations",
+            "event_outbox",
+        ];
+        for (name, sql) in MIGRATIONS.iter().filter(|(name, _)| *name > MIGRATION_ADOPTION_CUTOFF) {
+            if RETIREMENT_MIGRATIONS.contains(name) {
+                continue;
+            }
+            for relation in dropped {
+                if !sql.contains(relation) {
+                    continue;
+                }
+                assert!(
+                    sql.contains(&format!("to_regclass('{relation}')")),
+                    "{name} touches {relation}, which a later migration drops, so every statement \
+                     reaching it must sit behind a to_regclass('{relation}') guard"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_retirement_migrations_drop_only_the_confirmed_relations() {
         for (name, dropped) in [

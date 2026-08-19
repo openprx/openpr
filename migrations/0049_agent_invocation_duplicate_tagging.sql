@@ -11,47 +11,57 @@
 --   * auditable  - SELECT count(*) FROM agent_invocations WHERE duplicate_of IS NOT NULL
 --   * reversible - UPDATE agent_invocations SET duplicate_of = NULL WHERE ...
 -- The worker pickup query skips tagged rows, so a copy is still never delivered.
-
-ALTER TABLE agent_invocations
-  ADD COLUMN IF NOT EXISTS duplicate_of UUID REFERENCES agent_invocations(id) ON DELETE SET NULL;
-
-DO $$
+--
+-- 0052 later dropped agent_invocations, while this file stays past the adoption cutoff and is
+-- therefore still executed. Guarding on the relation is what keeps that from being a hard
+-- failure: without it a database reaching this file after the drop, or retrying it after one
+-- failed run, fails here on every start and never reaches 0052.
+DO $migration$
 DECLARE
   tagged bigint;
 BEGIN
-  WITH kept AS (
-    SELECT DISTINCT ON (audit_chain_id, connector_id)
-           audit_chain_id, connector_id, id, created_at
-    FROM agent_invocations
-    WHERE audit_chain_id IS NOT NULL
-      AND connector_id IS NOT NULL
-      AND duplicate_of IS NULL
-    ORDER BY audit_chain_id, connector_id, created_at, id
-  ),
-  marked AS (
-    UPDATE agent_invocations duplicate
-    SET duplicate_of = kept.id
-    FROM kept
-    WHERE duplicate.audit_chain_id = kept.audit_chain_id
-      AND duplicate.connector_id = kept.connector_id
-      AND duplicate.duplicate_of IS NULL
-      AND (duplicate.created_at, duplicate.id) > (kept.created_at, kept.id)
-    RETURNING duplicate.id
-  )
-  SELECT count(*) INTO tagged FROM marked;
+  IF to_regclass('agent_invocations') IS NULL THEN
+    RETURN;
+  END IF;
+
+  EXECUTE 'ALTER TABLE agent_invocations
+             ADD COLUMN IF NOT EXISTS duplicate_of UUID REFERENCES agent_invocations(id) ON DELETE SET NULL';
+
+  EXECUTE '
+    WITH kept AS (
+      SELECT DISTINCT ON (audit_chain_id, connector_id)
+             audit_chain_id, connector_id, id, created_at
+      FROM agent_invocations
+      WHERE audit_chain_id IS NOT NULL
+        AND connector_id IS NOT NULL
+        AND duplicate_of IS NULL
+      ORDER BY audit_chain_id, connector_id, created_at, id
+    ),
+    marked AS (
+      UPDATE agent_invocations duplicate
+      SET duplicate_of = kept.id
+      FROM kept
+      WHERE duplicate.audit_chain_id = kept.audit_chain_id
+        AND duplicate.connector_id = kept.connector_id
+        AND duplicate.duplicate_of IS NULL
+        AND (duplicate.created_at, duplicate.id) > (kept.created_at, kept.id)
+      RETURNING duplicate.id
+    )
+    SELECT count(*) FROM marked'
+  INTO tagged;
 
   RAISE WARNING 'agent_invocations de-duplication: tagged % duplicate fan-out row(s) via duplicate_of, deleted 0', tagged;
-END $$;
 
-CREATE INDEX IF NOT EXISTS idx_agent_invocations_duplicate_of
-  ON agent_invocations(duplicate_of)
-  WHERE duplicate_of IS NOT NULL;
+  EXECUTE 'CREATE INDEX IF NOT EXISTS idx_agent_invocations_duplicate_of
+             ON agent_invocations(duplicate_of)
+             WHERE duplicate_of IS NOT NULL';
 
--- An earlier build created this index without the duplicate_of predicate. The worker fan-out
--- insert infers the predicate in its ON CONFLICT clause, so the old shape has to go rather than
--- survive under IF NOT EXISTS.
-DROP INDEX IF EXISTS uq_agent_invocations_audit_chain_connector;
+  -- An earlier build created this index without the duplicate_of predicate. The worker fan-out
+  -- insert infers the predicate in its ON CONFLICT clause, so the old shape has to go rather than
+  -- survive under IF NOT EXISTS.
+  EXECUTE 'DROP INDEX IF EXISTS uq_agent_invocations_audit_chain_connector';
 
-CREATE UNIQUE INDEX uq_agent_invocations_audit_chain_connector
-  ON agent_invocations(audit_chain_id, connector_id)
-  WHERE audit_chain_id IS NOT NULL AND connector_id IS NOT NULL AND duplicate_of IS NULL;
+  EXECUTE 'CREATE UNIQUE INDEX uq_agent_invocations_audit_chain_connector
+             ON agent_invocations(audit_chain_id, connector_id)
+             WHERE audit_chain_id IS NOT NULL AND connector_id IS NOT NULL AND duplicate_of IS NULL';
+END $migration$;
