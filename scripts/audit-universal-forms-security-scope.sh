@@ -60,6 +60,18 @@ contains() {
   fi
 }
 
+not_contains() {
+  local description="$1"
+  local path="$2"
+  local needle="$3"
+  if rg -q --fixed-strings -- "$needle" "$path"; then
+    fail "$description"
+    printf '  unexpected in %s: %s\n' "$path" "$needle" >&2
+  else
+    pass "$description"
+  fi
+}
+
 not_contains_output() {
   local description="$1"
   local output="$2"
@@ -67,6 +79,7 @@ not_contains_output() {
   if rg -q --fixed-strings -- "$needle" <<<"$output"; then
     fail "$description"
     printf '  unexpected output: %s\n' "$needle" >&2
+    rg --fixed-strings -- "$needle" <<<"$output" | head -n 3 | sed 's/^/    /' >&2
   else
     pass "$description"
   fi
@@ -138,13 +151,15 @@ if rg -q --fixed-strings -- 'sea-orm feature "sqlx-postgres"' <<<"$features_tree
 else
   fail "workspace feature tree resolves PostgreSQL SQLx backend"
 fi
-not_contains_output "workspace feature tree does not enable SQLx MySQL backend" "$features_tree" 'sqlx feature "mysql"'
-not_contains_output "workspace feature tree does not enable sqlx-mysql crate" "$features_tree" 'sqlx-mysql v'
-# Both crates are in the lockfile only through SQLx's optional MySQL backend, so the feature
-# tree is where their reachability is actually decided. `cargo tree -i` was used here before and
-# did not agree with itself across environments: on CI it reported rsa as reachable while
-# reporting sqlx-mysql, its only dependent, as unreachable.
-not_contains_output "workspace feature tree does not resolve the rsa crate" "$features_tree" 'rsa v'
+# Reachability is asserted on feature edges, not on crate nodes. `cargo tree` lists an optional
+# dependency as a node even where no feature enables it, and it does so inconsistently: locally
+# neither sqlx-mysql nor rsa appears at all, while on CI both do even though the `sqlx feature
+# "mysql"` edge that would activate them is absent in the same run. The edge is what decides
+# whether the code is built. rsa is in the lockfile only as a dependency of sqlx-mysql, so the
+# MySQL backend being off is what puts it out of reach.
+not_contains_output "workspace feature tree does not enable the SQLx MySQL backend" "$features_tree" 'sqlx feature "mysql"'
+not_contains_output "workspace feature tree does not enable the SeaORM MySQL backend" "$features_tree" 'sea-orm feature "sqlx-mysql"'
+not_contains "workspace does not declare the SeaORM MySQL backend" "$ROOT_DIR/Cargo.toml" '"sqlx-mysql"'
 
 if [[ "$failures" -ne 0 ]]; then
   printf '\nUniversal forms security scope audit failed: %s issue(s)\n' "$failures" >&2
