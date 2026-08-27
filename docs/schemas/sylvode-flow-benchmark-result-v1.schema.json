@@ -1,0 +1,291 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-benchmark-result-v1.schema.json",
+  "title": "Sylvode Flow v0.3 Benchmark Result v1",
+  "description": "Dual-candidate benchmark evidence emitted by scripts/benchmark-flow-v0.3.sh and recomputed by the v0.3 benchmark_budgets_met verifier against gates/v0.3-gate.yaml.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "release",
+    "source_head",
+    "generated_at",
+    "budgets",
+    "run_sequence",
+    "candidates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "sylvode.flow.benchmark-result.v1"
+    },
+    "schema_path": {
+      "const": "docs/schemas/sylvode-flow-benchmark-result-v1.schema.json"
+    },
+    "release": {
+      "const": "0.3.0"
+    },
+    "source_head": {
+      "$ref": "#/$defs/git_sha"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "browser_engine_bundle_gzip_bytes_max",
+        "cold_start_ms_p95_max",
+        "apply_update_ms_p95_max",
+        "bootstrap_10k_ops_ms_p95_max",
+        "bootstrap_100k_ops_ms_p95_max",
+        "peak_memory_100k_ops_bytes_max"
+      ],
+      "properties": {
+        "browser_engine_bundle_gzip_bytes_max": { "const": 2097152 },
+        "cold_start_ms_p95_max": { "const": 250 },
+        "apply_update_ms_p95_max": { "const": 20 },
+        "bootstrap_10k_ops_ms_p95_max": { "const": 1000 },
+        "bootstrap_100k_ops_ms_p95_max": { "const": 5000 },
+        "peak_memory_100k_ops_bytes_max": { "const": 268435456 }
+      }
+    },
+    "run_sequence": {
+      "type": "array",
+      "minItems": 2,
+      "items": { "$ref": "#/$defs/candidate_name" }
+    },
+    "candidates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loro", "yrs-yjs"],
+      "properties": {
+        "loro": {
+          "allOf": [
+            { "$ref": "#/$defs/candidate_result" },
+            { "properties": { "candidate": { "const": "loro" } } }
+          ]
+        },
+        "yrs-yjs": {
+          "allOf": [
+            { "$ref": "#/$defs/candidate_result" },
+            { "properties": { "candidate": { "const": "yrs-yjs" } } }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "candidate_name": {
+      "enum": ["loro", "yrs-yjs"]
+    },
+    "status": {
+      "enum": ["passed", "failed"]
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cpu_model",
+        "cpu_cores",
+        "ram_bytes",
+        "os",
+        "kernel",
+        "rust_toolchain",
+        "browser",
+        "node_version",
+        "bun_version",
+        "release_flags",
+        "bundle_build_tool",
+        "gzip_tool",
+        "engine_version",
+        "package_version",
+        "lockfile_hash",
+        "source_commit",
+        "machine_idle",
+        "optimized_build"
+      ],
+      "properties": {
+        "cpu_model": { "type": "string", "minLength": 1 },
+        "cpu_cores": { "type": "integer", "minimum": 1 },
+        "ram_bytes": { "type": "integer", "minimum": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "kernel": { "type": "string", "minLength": 1 },
+        "rust_toolchain": { "type": "string", "minLength": 1 },
+        "browser": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version"],
+          "properties": {
+            "name": { "type": "string", "minLength": 1 },
+            "version": { "type": "string", "minLength": 1 }
+          }
+        },
+        "node_version": { "type": "string", "minLength": 1 },
+        "bun_version": { "type": "string", "minLength": 1 },
+        "release_flags": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "bundle_build_tool": { "type": "string", "minLength": 1 },
+        "gzip_tool": { "type": "string", "minLength": 1 },
+        "engine_version": { "type": "string", "minLength": 1 },
+        "package_version": { "type": "string", "minLength": 1 },
+        "lockfile_hash": { "$ref": "#/$defs/sha256" },
+        "source_commit": { "$ref": "#/$defs/git_sha" },
+        "machine_idle": { "type": "boolean" },
+        "optimized_build": { "type": "boolean" }
+      }
+    },
+    "distribution_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "warmup_count", "sample_count", "median", "p95", "p99", "min", "max", "raw_samples"],
+      "properties": {
+        "unit": { "enum": ["ms", "bytes"] },
+        "warmup_count": { "type": "integer", "minimum": 5 },
+        "sample_count": { "type": "integer", "minimum": 30 },
+        "median": { "type": "number", "minimum": 0 },
+        "p95": { "type": "number", "minimum": 0 },
+        "p99": { "type": "number", "minimum": 0 },
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 },
+        "raw_samples": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "time_distribution_metric": {
+      "allOf": [
+        { "$ref": "#/$defs/distribution_metric" },
+        { "properties": { "unit": { "const": "ms" } } }
+      ]
+    },
+    "bundle_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_gzip_bytes", "metafile", "files"],
+      "properties": {
+        "total_gzip_bytes": { "type": "integer", "minimum": 1 },
+        "metafile": { "$ref": "#/$defs/artifact" },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "kind", "gzip_bytes"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
+              "kind": { "enum": ["javascript", "wasm", "glue"] },
+              "gzip_bytes": { "type": "integer", "minimum": 0 }
+            }
+          }
+        }
+      }
+    },
+    "measurements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "browser_engine_bundle",
+        "cold_start_ms",
+        "apply_update_ms",
+        "bootstrap_10k_ops_ms",
+        "bootstrap_100k_ops_ms",
+        "peak_memory_100k_ops_bytes"
+      ],
+      "properties": {
+        "browser_engine_bundle": { "$ref": "#/$defs/bundle_result" },
+        "cold_start_ms": { "$ref": "#/$defs/time_distribution_metric" },
+        "apply_update_ms": { "$ref": "#/$defs/time_distribution_metric" },
+        "bootstrap_10k_ops_ms": { "$ref": "#/$defs/time_distribution_metric" },
+        "bootstrap_100k_ops_ms": { "$ref": "#/$defs/time_distribution_metric" },
+        "peak_memory_100k_ops_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "supplemental_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["update_bytes", "snapshot_bytes", "indexeddb_bytes", "reconnect_duration_ms", "compaction_time_ms"],
+      "properties": {
+        "update_bytes": { "type": "integer", "minimum": 0 },
+        "snapshot_bytes": { "type": "integer", "minimum": 0 },
+        "indexeddb_bytes": { "type": "integer", "minimum": 0 },
+        "reconnect_duration_ms": { "type": "number", "minimum": 0 },
+        "compaction_time_ms": { "type": "number", "minimum": 0 }
+      }
+    },
+    "hostile_input_safety": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["decode_apply_cpu_ms", "decode_apply_wall_ms", "isolated_apply_memory_bytes", "status"],
+      "properties": {
+        "decode_apply_cpu_ms": { "type": "number", "minimum": 0 },
+        "decode_apply_wall_ms": { "type": "number", "minimum": 0 },
+        "isolated_apply_memory_bytes": { "type": "integer", "minimum": 0 },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "budget_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "browser_engine_bundle_gzip_bytes_max",
+        "cold_start_ms_p95_max",
+        "apply_update_ms_p95_max",
+        "bootstrap_10k_ops_ms_p95_max",
+        "bootstrap_100k_ops_ms_p95_max",
+        "peak_memory_100k_ops_bytes_max"
+      ],
+      "properties": {
+        "browser_engine_bundle_gzip_bytes_max": { "$ref": "#/$defs/status" },
+        "cold_start_ms_p95_max": { "$ref": "#/$defs/status" },
+        "apply_update_ms_p95_max": { "$ref": "#/$defs/status" },
+        "bootstrap_10k_ops_ms_p95_max": { "$ref": "#/$defs/status" },
+        "bootstrap_100k_ops_ms_p95_max": { "$ref": "#/$defs/status" },
+        "peak_memory_100k_ops_bytes_max": { "$ref": "#/$defs/status" }
+      }
+    },
+    "candidate_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "environment",
+        "measurements",
+        "supplemental_metrics",
+        "hostile_input_safety",
+        "budget_checks",
+        "benchmark_budgets_met"
+      ],
+      "properties": {
+        "candidate": { "$ref": "#/$defs/candidate_name" },
+        "environment": { "$ref": "#/$defs/environment" },
+        "measurements": { "$ref": "#/$defs/measurements" },
+        "supplemental_metrics": { "$ref": "#/$defs/supplemental_metrics" },
+        "hostile_input_safety": { "$ref": "#/$defs/hostile_input_safety" },
+        "budget_checks": { "$ref": "#/$defs/budget_checks" },
+        "benchmark_budgets_met": { "$ref": "#/$defs/status" }
+      }
+    }
+  }
+}

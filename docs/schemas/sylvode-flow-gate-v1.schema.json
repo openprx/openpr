@@ -1,0 +1,337 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-gate-v1.schema.json",
+  "title": "Sylvode Flow Gate Result v1",
+  "description": "Machine-readable v0.3 gate envelope emitted by scripts/report-flow-v0.3-json.sh and consumed by scripts/verify-flow-v0.3-json.sh and scripts/gate-flow-v0.3.sh.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "release",
+    "source_baseline",
+    "source",
+    "generated_at",
+    "mode",
+    "gate_passed",
+    "counts",
+    "checks",
+    "required_commands",
+    "hard_gates",
+    "artifacts",
+    "manual_signoffs",
+    "blockers"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "sylvode.flow.gate-result.v1"
+    },
+    "schema_path": {
+      "const": "docs/schemas/sylvode-flow-gate-v1.schema.json"
+    },
+    "release": {
+      "const": "0.3.0"
+    },
+    "source_baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "rust_workspace_version",
+        "frontend_package_version",
+        "reviewed_head"
+      ],
+      "properties": {
+        "repository": { "const": "/opt/worker/code/openpr" },
+        "rust_workspace_version": { "const": "0.2.21" },
+        "frontend_package_version": { "const": "0.2.11" },
+        "reviewed_head": { "$ref": "#/$defs/git_sha" }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "head", "dirty"],
+      "properties": {
+        "repository": { "const": "/opt/worker/code/openpr" },
+        "head": { "$ref": "#/$defs/git_sha" },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mode": {
+      "enum": ["blocked", "pre_signoff", "release"]
+    },
+    "gate_passed": {
+      "type": "boolean"
+    },
+    "selected_candidate": {
+      "$ref": "#/$defs/candidate_name"
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automated", "passed", "failed", "manual_pending", "unresolved"],
+      "properties": {
+        "automated": { "type": "integer", "minimum": 0 },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "manual_pending": { "type": "integer", "minimum": 0 },
+        "unresolved": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/check_result" }
+    },
+    "required_commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "report",
+        "verify",
+        "gate",
+        "manual_signoff",
+        "editor_binding_loro",
+        "editor_binding_yrs_yjs",
+        "editor_binding_aggregate",
+        "csp_bundle_verify"
+      ],
+      "properties": {
+        "report": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/report-flow-v0.3-json.sh" } } }
+          ]
+        },
+        "verify": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/verify-flow-v0.3-json.sh evidence/v0.3/gate-result.json" } } }
+          ]
+        },
+        "gate": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/gate-flow-v0.3.sh --json" } } }
+          ]
+        },
+        "manual_signoff": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/record-flow-v0.3-manual-signoff.sh" } } }
+          ]
+        },
+        "editor_binding_loro": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/verify-flow-editor-binding-v0.3.sh --candidate loro --soak-hours 8 --out evidence/v0.3/editor-binding-loro.json" } } }
+          ]
+        },
+        "editor_binding_yrs_yjs": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/verify-flow-editor-binding-v0.3.sh --candidate yrs-yjs --soak-hours 8 --out evidence/v0.3/editor-binding-yrs-yjs.json" } } }
+          ]
+        },
+        "editor_binding_aggregate": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/aggregate-flow-editor-binding-v0.3.sh --json" } } }
+          ]
+        },
+        "csp_bundle_verify": {
+          "allOf": [
+            { "$ref": "#/$defs/command_result" },
+            { "properties": { "command": { "const": "scripts/verify-flow-csp-bundle-v0.3.sh --policy deploy/caddy/Caddyfile --json" } } }
+          ]
+        }
+      }
+    },
+    "hard_gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "benchmark_budgets_met",
+        "isolated_apply_not_async_timeout",
+        "rust_wasm_roundtrip",
+        "snapshot_tail_rebuild_hash",
+        "concurrent_tree_move_invariants",
+        "ime_selection_undo_cursor",
+        "editor_binding_maturity",
+        "vite_bundle_static_deep_route",
+        "offline_replay_no_accepted_loss",
+        "unauthorized_update_rejected",
+        "corrupt_duplicate_out_of_order_limits",
+        "dependency_license_security"
+      ],
+      "properties": {
+        "benchmark_budgets_met": { "$ref": "#/$defs/gate_status" },
+        "isolated_apply_not_async_timeout": { "$ref": "#/$defs/gate_status" },
+        "rust_wasm_roundtrip": { "$ref": "#/$defs/gate_status" },
+        "snapshot_tail_rebuild_hash": { "$ref": "#/$defs/gate_status" },
+        "concurrent_tree_move_invariants": { "$ref": "#/$defs/gate_status" },
+        "ime_selection_undo_cursor": { "$ref": "#/$defs/gate_status" },
+        "editor_binding_maturity": { "$ref": "#/$defs/gate_status" },
+        "vite_bundle_static_deep_route": { "$ref": "#/$defs/gate_status" },
+        "offline_replay_no_accepted_loss": { "$ref": "#/$defs/gate_status" },
+        "unauthorized_update_rejected": { "$ref": "#/$defs/gate_status" },
+        "corrupt_duplicate_out_of_order_limits": { "$ref": "#/$defs/gate_status" },
+        "dependency_license_security": { "$ref": "#/$defs/gate_status" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "convergence_result",
+        "engine_adr",
+        "editor_adr",
+        "transport_auth_adr",
+        "mcp_naming_uri_adr",
+        "domain_schema",
+        "protocol_contract",
+        "threat_model",
+        "convergence_corpus",
+        "benchmark_spec",
+        "benchmark_result",
+        "editor_binding_result",
+        "csp_bundle_result",
+        "gate_result"
+      ],
+      "properties": {
+        "convergence_result": { "$ref": "#/$defs/convergence_result_artifact" },
+        "engine_adr": { "$ref": "#/$defs/engine_adr_artifact" },
+        "editor_adr": { "$ref": "#/$defs/editor_adr_artifact" },
+        "transport_auth_adr": { "$ref": "#/$defs/transport_auth_adr_artifact" },
+        "mcp_naming_uri_adr": { "$ref": "#/$defs/mcp_naming_uri_adr_artifact" },
+        "domain_schema": { "$ref": "#/$defs/domain_schema_artifact" },
+        "protocol_contract": { "$ref": "#/$defs/protocol_contract_artifact" },
+        "threat_model": { "$ref": "#/$defs/threat_model_artifact" },
+        "convergence_corpus": { "$ref": "#/$defs/convergence_corpus_artifact" },
+        "benchmark_spec": { "$ref": "#/$defs/benchmark_spec_artifact" },
+        "benchmark_result": { "$ref": "#/$defs/benchmark_result_artifact" },
+        "editor_binding_result": { "$ref": "#/$defs/editor_binding_result_artifact" },
+        "csp_bundle_result": { "$ref": "#/$defs/csp_bundle_result_artifact" },
+        "gate_result": { "$ref": "#/$defs/gate_result_artifact" }
+      }
+    },
+    "manual_signoffs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["editor_ime", "selection_cursor", "dependency_license", "engine_decision"],
+      "properties": {
+        "editor_ime": { "$ref": "#/$defs/manual_signoff" },
+        "selection_cursor": { "$ref": "#/$defs/manual_signoff" },
+        "dependency_license": { "$ref": "#/$defs/manual_signoff" },
+        "engine_decision": { "$ref": "#/$defs/manual_signoff" }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  },
+  "$defs": {
+    "candidate_name": {
+      "enum": ["loro", "yrs-yjs"]
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)"
+    },
+    "gate_status": {
+      "enum": ["passed", "failed"]
+    },
+    "command_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "status", "exit_code", "duration_ms", "evidence", "sha256"],
+      "properties": {
+        "command": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/gate_status" },
+        "exit_code": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "evidence": { "$ref": "#/$defs/relative_path" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "check_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "command", "exit_code", "duration_ms", "evidence", "sha256"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9]+(?:[._][a-z0-9]+)*$" },
+        "status": { "enum": ["passed", "failed", "skipped"] },
+        "command": { "type": "string", "minLength": 1 },
+        "exit_code": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "evidence": { "$ref": "#/$defs/relative_path" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relative_path" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "convergence_result_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "evidence/v0.3/convergence-result.json" } } }] },
+    "engine_adr_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "decisions/ADR-0005-crdt-engine-selection.md" } } }] },
+    "editor_adr_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "decisions/ADR-0006-editor-stack.md" } } }] },
+    "transport_auth_adr_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "decisions/ADR-0007-collab-transport-auth.md" } } }] },
+    "mcp_naming_uri_adr_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "decisions/ADR-0008-mcp-naming-and-uri.md" } } }] },
+    "domain_schema_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "contracts/domain-model-v1.md" } } }] },
+    "protocol_contract_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "contracts/collab-protocol-v1.md" } } }] },
+    "threat_model_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "security/threat-model.md" } } }] },
+    "convergence_corpus_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "testing/convergence-corpus.md" } } }] },
+    "benchmark_spec_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "testing/benchmark-spec.md" } } }] },
+    "benchmark_result_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "evidence/v0.3/benchmark-result.json" } } }] },
+    "editor_binding_result_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "evidence/v0.3/editor-binding-result.json" } } }] },
+    "csp_bundle_result_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "evidence/v0.3/csp-bundle-result.json" } } }] },
+    "gate_result_artifact": { "allOf": [{ "$ref": "#/$defs/artifact" }, { "properties": { "path": { "const": "evidence/v0.3/gate-result.json" } } }] },
+    "manual_signoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reviewer", "evidence"],
+      "properties": {
+        "status": { "enum": ["pending", "passed", "failed", "needs_rework"] },
+        "reviewer": { "type": "string" },
+        "evidence": { "type": "string" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": { "enum": ["passed", "failed", "needs_rework"] }
+            },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "reviewer": { "type": "string", "minLength": 1 },
+              "evidence": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

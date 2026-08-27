@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-editor-binding-result-v1.schema.json",
+  "title": "Sylvode Flow v0.3 Editor Binding Result v1",
+  "description": "Atomic dual-candidate editor-binding aggregate emitted by scripts/aggregate-flow-editor-binding-v0.3.sh after the two verify-flow-editor-binding-v0.3.sh runs and consumed by the v0.3 editor_binding_maturity gate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "release",
+    "source_head",
+    "generated_at",
+    "candidate_inputs",
+    "aggregation",
+    "candidates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "sylvode.flow.editor-binding-result.v1"
+    },
+    "schema_path": {
+      "const": "docs/schemas/sylvode-flow-editor-binding-result-v1.schema.json"
+    },
+    "release": {
+      "const": "0.3.0"
+    },
+    "source_head": {
+      "$ref": "#/$defs/git_sha"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "candidate_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loro", "yrs-yjs"],
+      "properties": {
+        "loro": {
+          "allOf": [
+            { "$ref": "#/$defs/artifact" },
+            { "properties": { "path": { "const": "evidence/v0.3/editor-binding-loro.json" } } }
+          ]
+        },
+        "yrs-yjs": {
+          "allOf": [
+            { "$ref": "#/$defs/artifact" },
+            { "properties": { "path": { "const": "evidence/v0.3/editor-binding-yrs-yjs.json" } } }
+          ]
+        }
+      }
+    },
+    "aggregation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["both_candidate_files_present", "parameters_match", "six_criteria_complete", "atomic_write"],
+      "properties": {
+        "both_candidate_files_present": { "const": true },
+        "parameters_match": { "const": true },
+        "six_criteria_complete": { "const": true },
+        "atomic_write": { "const": true }
+      }
+    },
+    "candidates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["loro", "yrs-yjs"],
+      "properties": {
+        "loro": {
+          "allOf": [
+            { "$ref": "#/$defs/candidate_result" },
+            { "properties": { "candidate": { "const": "loro" } } }
+          ]
+        },
+        "yrs-yjs": {
+          "allOf": [
+            { "$ref": "#/$defs/candidate_result" },
+            { "properties": { "candidate": { "const": "yrs-yjs" } } }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "candidate_name": {
+      "enum": ["loro", "yrs-yjs"]
+    },
+    "status": {
+      "enum": ["passed", "failed"]
+    },
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "runner_parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["soak_hours", "transactions_per_minute", "destroy_remount_interval_minutes"],
+      "properties": {
+        "soak_hours": { "const": 8 },
+        "transactions_per_minute": { "type": "integer", "minimum": 30 },
+        "destroy_remount_interval_minutes": { "type": "integer", "minimum": 1, "maximum": 15 }
+      }
+    },
+    "editor_corpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cases_total", "cases_passed", "cases_failed", "pass_rate", "cases", "status"],
+      "properties": {
+        "cases_total": { "type": "integer", "minimum": 5 },
+        "cases_passed": { "type": "integer", "minimum": 0 },
+        "cases_failed": { "type": "integer", "minimum": 0 },
+        "pass_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "cases": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ime", "emoji", "combining_marks", "selection_fallback", "local_only_undo"],
+          "properties": {
+            "ime": { "$ref": "#/$defs/status" },
+            "emoji": { "$ref": "#/$defs/status" },
+            "combining_marks": { "$ref": "#/$defs/status" },
+            "selection_fallback": { "$ref": "#/$defs/status" },
+            "local_only_undo": { "$ref": "#/$defs/status" }
+          }
+        },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "soak": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "duration_hours",
+        "transactions_per_minute",
+        "destroy_remount_interval_minutes",
+        "semantic_hash_divergences",
+        "subscription_leak_delta",
+        "timer_leak_delta",
+        "uncaught_errors",
+        "raw_result",
+        "status"
+      ],
+      "properties": {
+        "duration_hours": { "type": "number", "minimum": 0 },
+        "transactions_per_minute": { "type": "number", "minimum": 0 },
+        "destroy_remount_interval_minutes": { "type": "number", "exclusiveMinimum": 0 },
+        "semantic_hash_divergences": { "type": "integer", "minimum": 0 },
+        "subscription_leak_delta": { "type": "integer", "minimum": 0 },
+        "timer_leak_delta": { "type": "integer", "minimum": 0 },
+        "uncaught_errors": { "type": "integer", "minimum": 0 },
+        "raw_result": { "$ref": "#/$defs/artifact" },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "binding_patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files_changed", "lines_changed", "binding_patch_budget_failed", "diff", "status"],
+      "properties": {
+        "files_changed": { "type": "integer", "minimum": 0 },
+        "lines_changed": { "type": "integer", "minimum": 0 },
+        "binding_patch_budget_failed": { "type": "boolean" },
+        "diff": { "$ref": "#/$defs/artifact" },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "dependency_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["registry_artifact", "source_repository", "license", "lockfile_checksum", "status"],
+      "properties": {
+        "registry_artifact": { "type": "string", "minLength": 1 },
+        "source_repository": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 },
+        "lockfile_checksum": { "$ref": "#/$defs/sha256" },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "known_blocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "severity", "minimal_reproduction"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["low", "medium", "high", "critical"] },
+        "minimal_reproduction": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "defects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unresolved_critical", "unresolved_high", "known_blockers", "status"],
+      "properties": {
+        "unresolved_critical": { "type": "integer", "minimum": 0 },
+        "unresolved_high": { "type": "integer", "minimum": 0 },
+        "known_blockers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/known_blocker" }
+        },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "manual_item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "video_index", "issue_link"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/status" },
+        "video_index": { "type": "string", "minLength": 1 },
+        "issue_link": { "type": "string", "minLength": 1 }
+      }
+    },
+    "manual_acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["script_checksum", "reviewer", "browser", "os", "input_method", "items", "status"],
+      "properties": {
+        "script_checksum": { "$ref": "#/$defs/sha256" },
+        "reviewer": { "type": "string", "minLength": 1 },
+        "browser": { "type": "string", "minLength": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "input_method": { "type": "string", "minLength": 1 },
+        "items": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/manual_item" }
+        },
+        "status": { "$ref": "#/$defs/status" }
+      }
+    },
+    "candidate_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate",
+        "source_head",
+        "runner_parameters",
+        "editor_corpus",
+        "soak",
+        "binding_patch",
+        "dependency_evidence",
+        "defects",
+        "manual_acceptance",
+        "editor_binding_maturity"
+      ],
+      "properties": {
+        "candidate": { "$ref": "#/$defs/candidate_name" },
+        "source_head": { "$ref": "#/$defs/git_sha" },
+        "runner_parameters": { "$ref": "#/$defs/runner_parameters" },
+        "editor_corpus": { "$ref": "#/$defs/editor_corpus" },
+        "soak": { "$ref": "#/$defs/soak" },
+        "binding_patch": { "$ref": "#/$defs/binding_patch" },
+        "dependency_evidence": { "$ref": "#/$defs/dependency_evidence" },
+        "defects": { "$ref": "#/$defs/defects" },
+        "manual_acceptance": { "$ref": "#/$defs/manual_acceptance" },
+        "editor_binding_maturity": { "$ref": "#/$defs/status" }
+      }
+    }
+  }
+}
