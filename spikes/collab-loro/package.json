@@ -1,0 +1,21 @@
+{
+  "name": "@openpr/collab-loro-spike",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "loro-crdt": "1.14.1",
+    "loro-prosemirror": "0.4.3",
+    "prosemirror-model": "1.25.11",
+    "prosemirror-state": "1.4.4",
+    "prosemirror-view": "1.42.2"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  },
+  "license": "MIT OR Apache-2.0"
+}

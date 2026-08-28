@@ -5,6 +5,8 @@ members = [
   "apps/worker",
   "apps/mcp-server",
   "crates/platform",
+  "spikes/collab-loro",
+  "spikes/collab-yrs-yjs",
 ]
 
 [workspace.package]
