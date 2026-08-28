@@ -129,7 +129,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "api"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "axum",
@@ -611,13 +611,28 @@ dependencies = [
 name = "collab-loro-spike"
 version = "0.0.0"
 dependencies = [
+ "collab-shared",
  "loro",
+]
+
+[[package]]
+name = "collab-shared"
+version = "0.0.0"
+dependencies = [
+ "collab-loro-spike",
+ "collab-yrs-yjs-spike",
+ "crc32fast",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "collab-yrs-yjs-spike"
 version = "0.0.0"
 dependencies = [
+ "collab-shared",
  "yrs",
 ]
 
@@ -2348,7 +2363,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-server"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "axum",
@@ -2788,7 +2803,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "chrono",
  "jsonwebtoken",
@@ -5549,7 +5564,7 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "anyhow",
  "api",

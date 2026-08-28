@@ -1,0 +1,24 @@
+{
+  "name": "@sylvode/collab-shared",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "bun-types": "1.4.0",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT OR Apache-2.0"
+}

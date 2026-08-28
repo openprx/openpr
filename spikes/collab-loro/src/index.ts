@@ -18,3 +18,8 @@ export type {
   WorkerSandboxHost,
 } from "./isolation/worker-protocol";
 export type { IndexedDbEngineStore, StoredDocument } from "./storage";
+export { LoroScenarioAdapter } from "./engine";
+export { BrowserIndexedDbBackend, InMemoryKeyValueBackend, LoroIndexedDbStore } from "./engine-store";
+export type { KeyValueBackend } from "./engine-store";
+export { LoroEditorAdapter } from "./editor-adapter";
+export type { LoroRichTextCommandPayload } from "./editor-adapter";

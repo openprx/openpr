@@ -1,0 +1,51 @@
+[package]
+name = "collab-shared"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.10"
+# Isolation calibration host (ADR-0014 work package 3a): raw fork/mmap/sigaction/setitimer/
+# wait4/setrlimit syscalls, and the result frame's CRC32 checksum. Both already resolve in the
+# workspace lockfile as transitive dependencies, so promoting them to direct dependencies here
+# adds no new supply-chain surface.
+libc = "0.2"
+crc32fast = "1"
+
+[[bin]]
+name = "isolation-calibrate"
+path = "src/bin/isolation_calibrate.rs"
+
+# Dev-dependency-only: both real engine adapters, for the native (P1, in-process) cross-candidate
+# benchmark below. `collab-shared` cannot take these as ordinary [dependencies] -- each adapter
+# already depends on `collab-shared`, so that would be a hard (non-dev) dependency cycle Cargo
+# rejects outright. A dev-dependency cycle is explicitly supported by Cargo (dev-dependencies are
+# only linked into test/bench/example targets, never into the library or [[bin]] targets that
+# other crates would in turn depend on).
+[dev-dependencies]
+collab-loro-spike = { path = "../collab-loro" }
+collab-yrs-yjs-spike = { path = "../collab-yrs-yjs" }
+
+# Declared as `[[example]]`, not `[[test]]`: a plain `cargo test` (this crate's normal regression
+# check) builds an `[[example]]` target but never *executes* it, whereas a `[[test]]` target -- even
+# `harness = false` -- is run automatically by every `cargo test` invocation. This benchmark's own
+# 100k-op-scale cases can legitimately run for minutes (see the file's own module docs and the
+# delivery report for the measured yrs-yjs superlinear cost at that scale); letting an ordinary
+# `cargo test` sweep transparently balloon into that would turn every routine regression check
+# into a multi-minute-to-much-longer run, and a first attempt at this (declaring it as `[[test]]`)
+# did exactly that -- an unrelated `cargo test` invocation ended up truncated/killed partway
+# through because it had unknowingly started running the full benchmark. `harness = false` still
+# applies (own `main`/argv parsing, see the file's module docs), and `[dev-dependencies]` above is
+# available to `[[example]]` targets exactly as it is to `[[test]]` targets. Run explicitly via
+# `cargo run --release -p collab-shared --example benchmark_native -- <args>`.
+[[example]]
+name = "benchmark_native"
+path = "examples/benchmark_native.rs"
+harness = false
+
+[lints]
+workspace = true

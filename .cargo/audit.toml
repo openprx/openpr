@@ -11,6 +11,23 @@ ignore = [
     # proc-macro-error2 unmaintained: build-time proc-macro only, never linked into the
     # shipped binaries. Pulled in transitively; waiting on its dependents to migrate.
     "RUSTSEC-2026-0173",
+    # atomic-polyfill unmaintained: build-graph-only through wasmtime's Cranelift backend
+    # (wasmtime -> cranelift-codegen -> postcard -> heapless). It emulates atomics on
+    # single-core targets; OpenPR builds only targets with native atomics, so those paths are
+    # never compiled in. Resolvable only when heapless 0.7 is dropped upstream.
+    "RUSTSEC-2023-0089",
+    # im / sized-chunks / bitmaps (via loro -> loro-internal) and smallstr (via yrs) are
+    # unmaintained. All four are reachable ONLY from the Sylvode Flow v0.3 CRDT evaluation
+    # spikes: cargo tree -p api|worker|mcp-server shows zero dependency on spikes/*, so none is
+    # linked into any shipped binary. These are unmaintained advisories, not vulnerabilities.
+    # ADR-0005 selects exactly one engine, after which the losing candidate's subtree leaves the
+    # lockfile entirely, so this set shrinks rather than grows. Re-evaluate at that decision and
+    # treat the surviving engine's unmaintained transitive deps as an input to the decision
+    # itself rather than a permanent exemption.
+    "RUSTSEC-2026-0247",
+    "RUSTSEC-2026-0248",
+    "RUSTSEC-2026-0251",
+    "RUSTSEC-2026-0215",
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"

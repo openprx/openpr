@@ -1,11 +1,6 @@
-export type StoredDocument = Readonly<{
-  snapshot: Uint8Array;
-  updates: readonly Uint8Array[];
-}>;
-
-export interface IndexedDbEngineStore {
-  load(documentId: string): Promise<StoredDocument | null>;
-  save(documentId: string, document: StoredDocument): Promise<void>;
-  remove(documentId: string): Promise<void>;
-  close(): Promise<void>;
-}
+// Moved to spikes/collab-shared/src/storage.ts (work package 3b). This
+// candidate's concrete implementation is IndexedDbEngineStore in this same
+// directory's engine binding module -- see the delivery report for the
+// storage-asymmetry note (this candidate has no maintained upstream
+// IndexedDB adapter for loro-crdt, unlike y-indexeddb on the Yjs side).
+export type { EngineStore, IndexedDbEngineStore, StoredDocument } from "@sylvode/collab-shared";

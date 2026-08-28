@@ -18,3 +18,7 @@ export type {
   WorkerSandboxHost,
 } from "./isolation/worker-protocol";
 export type { IndexedDbEngineStore, StoredDocument } from "./storage";
+export { YjsScenarioAdapter } from "./engine";
+export { YjsEditorAdapter } from "./editor-adapter";
+export type { YjsRichTextCommandPayload } from "./editor-adapter";
+export { InMemoryEngineStore, YjsIndexedDbStore } from "./engine-store";

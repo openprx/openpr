@@ -5,7 +5,14 @@
   "description": "Dual-candidate convergence corpus evidence emitted by scripts/verify-flow-convergence-v0.3.sh and verified for the v0.3 rust_wasm_roundtrip, rebuild, tree, replay, frame-rejection, limit, and isolated-apply gates.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "schema_path", "release", "source_head", "generated_at", "candidates"],
+  "required": [
+    "schema_version",
+    "schema_path",
+    "release",
+    "source_head",
+    "generated_at",
+    "candidates"
+  ],
   "properties": {
     "schema_version": {
       "const": "sylvode.flow.convergence-result.v1"
@@ -26,18 +33,37 @@
     "candidates": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["loro", "yrs-yjs"],
+      "required": [
+        "loro",
+        "yrs-yjs"
+      ],
       "properties": {
         "loro": {
           "allOf": [
-            { "$ref": "#/$defs/candidate_result" },
-            { "properties": { "candidate": { "const": "loro" } } }
+            {
+              "$ref": "#/$defs/candidate_result"
+            },
+            {
+              "properties": {
+                "candidate": {
+                  "const": "loro"
+                }
+              }
+            }
           ]
         },
         "yrs-yjs": {
           "allOf": [
-            { "$ref": "#/$defs/candidate_result" },
-            { "properties": { "candidate": { "const": "yrs-yjs" } } }
+            {
+              "$ref": "#/$defs/candidate_result"
+            },
+            {
+              "properties": {
+                "candidate": {
+                  "const": "yrs-yjs"
+                }
+              }
+            }
           ]
         }
       }
@@ -45,7 +71,10 @@
   },
   "$defs": {
     "candidate_name": {
-      "enum": ["loro", "yrs-yjs"]
+      "enum": [
+        "loro",
+        "yrs-yjs"
+      ]
     },
     "git_sha": {
       "type": "string",
@@ -58,28 +87,513 @@
     "artifact": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["path", "sha256"],
+      "required": [
+        "path",
+        "sha256"
+      ],
       "properties": {
-        "path": { "type": "string", "minLength": 1, "pattern": "^(?!/)" },
-        "sha256": { "$ref": "#/$defs/sha256" }
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
       }
     },
     "status": {
-      "enum": ["passed", "failed"]
+      "enum": [
+        "passed",
+        "failed"
+      ]
     },
     "isolation_kind": {
-      "enum": ["terminable_instance", "worker_sandbox", "async_timeout"]
+      "enum": [
+        "terminable_instance",
+        "worker_sandbox",
+        "async_timeout"
+      ]
+    },
+    "isolation_oracle": {
+      "enum": [
+        "completed",
+        "cpu_ceiling",
+        "wall_ceiling",
+        "memory_ceiling",
+        "cpu_ceiling_enforcement_failed",
+        "address_space_backstop",
+        "crashed",
+        "meter_unavailable"
+      ]
+    },
+    "isolation_ceiling_oracle": {
+      "enum": [
+        "cpu_ceiling",
+        "wall_ceiling",
+        "memory_ceiling",
+        "cpu_ceiling_enforcement_failed",
+        "address_space_backstop"
+      ]
+    },
+    "isolation_cpu_meter": {
+      "enum": [
+        "native_itimer_prof",
+        "not_applicable_web",
+        "unavailable"
+      ]
+    },
+    "isolation_memory_meter": {
+      "enum": [
+        "counting_allocator",
+        "diagnostic_only",
+        "unavailable"
+      ]
+    },
+    "isolation_memory_sampling": {
+      "enum": [
+        "continuous_high_water",
+        "endpoints"
+      ]
+    },
+    "isolation_termination_cause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cause",
+        "source",
+        "observed_at_ms"
+      ],
+      "properties": {
+        "cause": {
+          "$ref": "#/$defs/isolation_oracle"
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observed_at_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "isolation_host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifact_sha256",
+        "artifact_path",
+        "config_digest",
+        "source_tree_hash",
+        "lockfile_hash",
+        "toolchain",
+        "features",
+        "release_flags",
+        "isolation_host_hash"
+      ],
+      "properties": {
+        "artifact_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "artifact_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config_digest": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_tree_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "lockfile_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "toolchain": {
+          "type": "string",
+          "minLength": 1
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "release_flags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "isolation_host_hash": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "isolation_platform_native": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "kernel",
+        "version"
+      ],
+      "properties": {
+        "os": {
+          "enum": [
+            "linux"
+          ]
+        },
+        "kernel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "isolation_platform_web": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "browser",
+        "version",
+        "cross_origin_isolated"
+      ],
+      "properties": {
+        "browser": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cross_origin_isolated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "isolation_platform": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/isolation_platform_native"
+        },
+        {
+          "$ref": "#/$defs/isolation_platform_web"
+        }
+      ]
+    },
+    "isolation_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_id",
+        "expected_oracle",
+        "kind",
+        "cpu_ms",
+        "cpu_meter",
+        "wall_ms",
+        "wall_meter",
+        "allocated_active_peak_bytes",
+        "allocated_attempted_peak_bytes",
+        "rss_peak_bytes",
+        "memory_meter",
+        "memory_sampling",
+        "termination_causes",
+        "raw_wait_status",
+        "meter_tampered",
+        "head_hash_before",
+        "head_hash_after",
+        "frontier_hash_before",
+        "frontier_hash_after",
+        "partial_state_unchanged",
+        "fork_overhead_ms",
+        "total_wall_ms",
+        "verdict"
+      ],
+      "properties": {
+        "fixture_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_oracle": {
+          "$ref": "#/$defs/isolation_oracle"
+        },
+        "kind": {
+          "$ref": "#/$defs/isolation_kind"
+        },
+        "cpu_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "cpu_meter": {
+          "$ref": "#/$defs/isolation_cpu_meter"
+        },
+        "wall_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wall_meter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "allocated_active_peak_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "allocated_attempted_peak_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rss_peak_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "memory_meter": {
+          "$ref": "#/$defs/isolation_memory_meter"
+        },
+        "memory_sampling": {
+          "$ref": "#/$defs/isolation_memory_sampling"
+        },
+        "termination_causes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/isolation_termination_cause"
+          }
+        },
+        "raw_wait_status": {
+          "type": "integer"
+        },
+        "meter_tampered": {
+          "type": "boolean"
+        },
+        "head_hash_before": {
+          "$ref": "#/$defs/sha256"
+        },
+        "head_hash_after": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_hash_before": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_hash_after": {
+          "$ref": "#/$defs/sha256"
+        },
+        "partial_state_unchanged": {
+          "type": "boolean"
+        },
+        "fork_overhead_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "total_wall_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "verdict": {
+          "$ref": "#/$defs/status"
+        },
+        "failure_artifact_ref": {
+          "$ref": "#/$defs/artifact"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "verdict"
+            ]
+          },
+          "then": {
+            "required": [
+              "failure_artifact_ref"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "async_timeout"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "verdict": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "verdict"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "meter_tampered": {
+                "const": true
+              }
+            },
+            "required": [
+              "meter_tampered"
+            ]
+          },
+          "then": {
+            "properties": {
+              "verdict": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "verdict"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "expected_oracle": {
+                "$ref": "#/$defs/isolation_ceiling_oracle"
+              }
+            },
+            "required": [
+              "expected_oracle"
+            ]
+          },
+          "then": {
+            "properties": {
+              "termination_causes": {
+                "minItems": 1
+              }
+            },
+            "required": [
+              "termination_causes"
+            ]
+          }
+        }
+      ]
     },
     "isolation_result": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "adversarial_cases_run", "partial_state_unchanged", "status"],
+      "required": [
+        "host",
+        "platform",
+        "cases",
+        "status",
+        "calibration_ref",
+        "calibration_sha256"
+      ],
       "properties": {
-        "kind": { "$ref": "#/$defs/isolation_kind" },
-        "adversarial_cases_run": { "type": "integer", "minimum": 1 },
-        "partial_state_unchanged": { "type": "boolean" },
-        "status": { "$ref": "#/$defs/status" }
-      }
+        "host": {
+          "$ref": "#/$defs/isolation_host"
+        },
+        "platform": {
+          "$ref": "#/$defs/isolation_platform"
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/isolation_case"
+          }
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "calibration_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path (relative to the evidence root) of the isolation-calibration.json whose per-machine overshoot bounds were used to judge this side's ceiling cases. ADR-0014: the tolerance is calibrated per machine, never a global constant, so the binding between a verdict and its calibration data must be recorded rather than implied."
+        },
+        "calibration_sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "SHA-256 of the calibration file named by calibration_ref, so a verifier can prove which calibration data produced these verdicts."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "required": [
+                  "os"
+                ]
+              }
+            },
+            "required": [
+              "platform"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cases": {
+                "items": {
+                  "properties": {
+                    "cpu_meter": {
+                      "const": "native_itimer_prof"
+                    },
+                    "memory_meter": {
+                      "const": "counting_allocator"
+                    },
+                    "memory_sampling": {
+                      "const": "continuous_high_water"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "platform": {
+                "required": [
+                  "browser"
+                ]
+              }
+            },
+            "required": [
+              "platform"
+            ]
+          },
+          "then": {
+            "properties": {
+              "cases": {
+                "items": {
+                  "properties": {
+                    "cpu_meter": {
+                      "const": "not_applicable_web"
+                    },
+                    "memory_meter": {
+                      "const": "diagnostic_only"
+                    },
+                    "memory_sampling": {
+                      "const": "endpoints"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "hard_gate_results": {
       "type": "object",
@@ -94,13 +608,27 @@
         "corrupt_duplicate_out_of_order_limits"
       ],
       "properties": {
-        "isolated_apply_not_async_timeout": { "$ref": "#/$defs/status" },
-        "rust_wasm_roundtrip": { "$ref": "#/$defs/status" },
-        "snapshot_tail_rebuild_hash": { "$ref": "#/$defs/status" },
-        "concurrent_tree_move_invariants": { "$ref": "#/$defs/status" },
-        "offline_replay_no_accepted_loss": { "$ref": "#/$defs/status" },
-        "unauthorized_update_rejected": { "$ref": "#/$defs/status" },
-        "corrupt_duplicate_out_of_order_limits": { "$ref": "#/$defs/status" }
+        "isolated_apply_not_async_timeout": {
+          "$ref": "#/$defs/status"
+        },
+        "rust_wasm_roundtrip": {
+          "$ref": "#/$defs/status"
+        },
+        "snapshot_tail_rebuild_hash": {
+          "$ref": "#/$defs/status"
+        },
+        "concurrent_tree_move_invariants": {
+          "$ref": "#/$defs/status"
+        },
+        "offline_replay_no_accepted_loss": {
+          "$ref": "#/$defs/status"
+        },
+        "unauthorized_update_rejected": {
+          "$ref": "#/$defs/status"
+        },
+        "corrupt_duplicate_out_of_order_limits": {
+          "$ref": "#/$defs/status"
+        }
       }
     },
     "fixture_coverage": {
@@ -123,20 +651,48 @@
         "policy_rejected_intent_recovery"
       ],
       "properties": {
-        "same_text_range_edit": { "$ref": "#/$defs/status" },
-        "concurrent_block_move": { "$ref": "#/$defs/status" },
-        "ancestor_delete_descendant_move": { "$ref": "#/$defs/status" },
-        "concurrent_reorder": { "$ref": "#/$defs/status" },
-        "same_key_nested_container_creation": { "$ref": "#/$defs/status" },
-        "duplicate_out_of_order_partial_batch": { "$ref": "#/$defs/status" },
-        "offline_reconnect": { "$ref": "#/$defs/status" },
-        "snapshot_tail_restore": { "$ref": "#/$defs/status" },
-        "snapshot_boundary_update": { "$ref": "#/$defs/status" },
-        "adversarial_update_limits": { "$ref": "#/$defs/status" },
-        "unicode_ime": { "$ref": "#/$defs/status" },
-        "local_undo_remote_update": { "$ref": "#/$defs/status" },
-        "cursor_target_move_delete": { "$ref": "#/$defs/status" },
-        "policy_rejected_intent_recovery": { "$ref": "#/$defs/status" }
+        "same_text_range_edit": {
+          "$ref": "#/$defs/status"
+        },
+        "concurrent_block_move": {
+          "$ref": "#/$defs/status"
+        },
+        "ancestor_delete_descendant_move": {
+          "$ref": "#/$defs/status"
+        },
+        "concurrent_reorder": {
+          "$ref": "#/$defs/status"
+        },
+        "same_key_nested_container_creation": {
+          "$ref": "#/$defs/status"
+        },
+        "duplicate_out_of_order_partial_batch": {
+          "$ref": "#/$defs/status"
+        },
+        "offline_reconnect": {
+          "$ref": "#/$defs/status"
+        },
+        "snapshot_tail_restore": {
+          "$ref": "#/$defs/status"
+        },
+        "snapshot_boundary_update": {
+          "$ref": "#/$defs/status"
+        },
+        "adversarial_update_limits": {
+          "$ref": "#/$defs/status"
+        },
+        "unicode_ime": {
+          "$ref": "#/$defs/status"
+        },
+        "local_undo_remote_update": {
+          "$ref": "#/$defs/status"
+        },
+        "cursor_target_move_delete": {
+          "$ref": "#/$defs/status"
+        },
+        "policy_rejected_intent_recovery": {
+          "$ref": "#/$defs/status"
+        }
       }
     },
     "limit_kind": {
@@ -154,56 +710,139 @@
     "state_hashes": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["head_before", "head_after", "frontier_before", "frontier_after"],
+      "required": [
+        "head_before",
+        "head_after",
+        "frontier_before",
+        "frontier_after"
+      ],
       "properties": {
-        "head_before": { "$ref": "#/$defs/sha256" },
-        "head_after": { "$ref": "#/$defs/sha256" },
-        "frontier_before": { "$ref": "#/$defs/sha256" },
-        "frontier_after": { "$ref": "#/$defs/sha256" }
+        "head_before": {
+          "$ref": "#/$defs/sha256"
+        },
+        "head_after": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_before": {
+          "$ref": "#/$defs/sha256"
+        },
+        "frontier_after": {
+          "$ref": "#/$defs/sha256"
+        }
       }
     },
     "accepted_boundary_fixture": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["observed_value", "expected_outcome", "observed_outcome", "operation_log", "final_semantic_json", "semantic_hash", "status"],
+      "required": [
+        "observed_value",
+        "expected_outcome",
+        "observed_outcome",
+        "operation_log",
+        "final_semantic_json",
+        "semantic_hash",
+        "status"
+      ],
       "properties": {
-        "observed_value": { "type": "integer", "minimum": 0 },
-        "expected_outcome": { "const": "accepted" },
-        "observed_outcome": { "enum": ["accepted", "rejected", "cancelled"] },
-        "operation_log": { "$ref": "#/$defs/artifact" },
-        "final_semantic_json": { "$ref": "#/$defs/artifact" },
-        "semantic_hash": { "$ref": "#/$defs/sha256" },
-        "status": { "$ref": "#/$defs/status" }
+        "observed_value": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_outcome": {
+          "const": "accepted"
+        },
+        "observed_outcome": {
+          "enum": [
+            "accepted",
+            "rejected",
+            "cancelled"
+          ]
+        },
+        "operation_log": {
+          "$ref": "#/$defs/artifact"
+        },
+        "final_semantic_json": {
+          "$ref": "#/$defs/artifact"
+        },
+        "semantic_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        }
       }
     },
     "rejected_boundary_fixture": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["observed_value", "expected_outcome", "observed_outcome", "error_limit_kind", "operation_log", "state_hashes", "status"],
+      "required": [
+        "observed_value",
+        "expected_outcome",
+        "observed_outcome",
+        "error_limit_kind",
+        "operation_log",
+        "state_hashes",
+        "status"
+      ],
       "properties": {
-        "observed_value": { "type": "integer", "minimum": 1 },
-        "expected_outcome": { "const": "rejected" },
-        "observed_outcome": { "enum": ["accepted", "rejected", "cancelled"] },
-        "error_limit_kind": {
-          "anyOf": [
-            { "$ref": "#/$defs/limit_kind" },
-            { "type": "null" }
+        "observed_value": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expected_outcome": {
+          "const": "rejected"
+        },
+        "observed_outcome": {
+          "enum": [
+            "accepted",
+            "rejected",
+            "cancelled"
           ]
         },
-        "operation_log": { "$ref": "#/$defs/artifact" },
-        "state_hashes": { "$ref": "#/$defs/state_hashes" },
-        "status": { "$ref": "#/$defs/status" }
+        "error_limit_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/limit_kind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operation_log": {
+          "$ref": "#/$defs/artifact"
+        },
+        "state_hashes": {
+          "$ref": "#/$defs/state_hashes"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        }
       }
     },
     "boundary_pair": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["limit_kind", "limit_value", "exact", "boundary_plus_one"],
+      "required": [
+        "limit_kind",
+        "limit_value",
+        "exact",
+        "boundary_plus_one"
+      ],
       "properties": {
-        "limit_kind": { "$ref": "#/$defs/limit_kind" },
-        "limit_value": { "type": "integer", "minimum": 1 },
-        "exact": { "$ref": "#/$defs/accepted_boundary_fixture" },
-        "boundary_plus_one": { "$ref": "#/$defs/rejected_boundary_fixture" }
+        "limit_kind": {
+          "$ref": "#/$defs/limit_kind"
+        },
+        "limit_value": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "exact": {
+          "$ref": "#/$defs/accepted_boundary_fixture"
+        },
+        "boundary_plus_one": {
+          "$ref": "#/$defs/rejected_boundary_fixture"
+        }
       }
     },
     "boundary_results": {
@@ -220,14 +859,142 @@
         "semantic_patch_operations"
       ],
       "properties": {
-        "update_bytes": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "update_bytes" }, "limit_value": { "const": 65536 } } }] },
-        "websocket_frame_bytes": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "websocket_frame_bytes" }, "limit_value": { "const": 131072 } } }] },
-        "tree_depth": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "tree_depth" }, "limit_value": { "const": 32 } } }] },
-        "container_count": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "container_count" }, "limit_value": { "const": 10000 } } }] },
-        "document_block_count": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "document_block_count" }, "limit_value": { "const": 10000 } } }] },
-        "text_block_chars": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "text_block_chars" }, "limit_value": { "const": 100000 } } }] },
-        "document_text_chars": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "document_text_chars" }, "limit_value": { "const": 1000000 } } }] },
-        "semantic_patch_operations": { "allOf": [{ "$ref": "#/$defs/boundary_pair" }, { "properties": { "limit_kind": { "const": "semantic_patch_operations" }, "limit_value": { "const": 100 } } }] }
+        "update_bytes": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "update_bytes"
+                },
+                "limit_value": {
+                  "const": 65536
+                }
+              }
+            }
+          ]
+        },
+        "websocket_frame_bytes": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "websocket_frame_bytes"
+                },
+                "limit_value": {
+                  "const": 131072
+                }
+              }
+            }
+          ]
+        },
+        "tree_depth": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "tree_depth"
+                },
+                "limit_value": {
+                  "const": 32
+                }
+              }
+            }
+          ]
+        },
+        "container_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "container_count"
+                },
+                "limit_value": {
+                  "const": 10000
+                }
+              }
+            }
+          ]
+        },
+        "document_block_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "document_block_count"
+                },
+                "limit_value": {
+                  "const": 10000
+                }
+              }
+            }
+          ]
+        },
+        "text_block_chars": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "text_block_chars"
+                },
+                "limit_value": {
+                  "const": 100000
+                }
+              }
+            }
+          ]
+        },
+        "document_text_chars": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "document_text_chars"
+                },
+                "limit_value": {
+                  "const": 1000000
+                }
+              }
+            }
+          ]
+        },
+        "semantic_patch_operations": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/boundary_pair"
+            },
+            {
+              "properties": {
+                "limit_kind": {
+                  "const": "semantic_patch_operations"
+                },
+                "limit_value": {
+                  "const": 100
+                }
+              }
+            }
+          ]
+        }
       }
     },
     "case_category": {
@@ -251,30 +1018,79 @@
     "case_result": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "category", "seed", "status", "operation_log", "final_semantic_json", "semantic_hash", "binary_sizes"],
+      "required": [
+        "id",
+        "category",
+        "seed",
+        "status",
+        "operation_log",
+        "final_semantic_json",
+        "semantic_hash",
+        "binary_sizes"
+      ],
       "properties": {
-        "id": { "type": "string", "minLength": 1 },
-        "category": { "$ref": "#/$defs/case_category" },
-        "seed": { "type": "string", "minLength": 1 },
-        "status": { "$ref": "#/$defs/status" },
-        "operation_log": { "$ref": "#/$defs/artifact" },
-        "final_semantic_json": { "$ref": "#/$defs/artifact" },
-        "semantic_hash": { "$ref": "#/$defs/sha256" },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "category": {
+          "$ref": "#/$defs/case_category"
+        },
+        "seed": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "operation_log": {
+          "$ref": "#/$defs/artifact"
+        },
+        "final_semantic_json": {
+          "$ref": "#/$defs/artifact"
+        },
+        "semantic_hash": {
+          "$ref": "#/$defs/sha256"
+        },
         "binary_sizes": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["update_bytes", "snapshot_bytes"],
+          "required": [
+            "update_bytes",
+            "snapshot_bytes"
+          ],
           "properties": {
-            "update_bytes": { "type": "integer", "minimum": 0 },
-            "snapshot_bytes": { "type": "integer", "minimum": 0 }
+            "update_bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "snapshot_bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         },
-        "failure_minimal_reproduction": { "$ref": "#/$defs/artifact" }
+        "failure_minimal_reproduction": {
+          "$ref": "#/$defs/artifact"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
-          "then": { "required": ["failure_minimal_reproduction"] }
+          "if": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "failure_minimal_reproduction"
+            ]
+          }
         }
       ]
     },
@@ -293,26 +1109,51 @@
         "cases"
       ],
       "properties": {
-        "candidate": { "$ref": "#/$defs/candidate_name" },
-        "corpus_seed": { "type": "string", "minLength": 1 },
-        "case_count": { "type": "integer", "minimum": 1 },
-        "budget_hash": { "$ref": "#/$defs/sha256" },
+        "candidate": {
+          "$ref": "#/$defs/candidate_name"
+        },
+        "corpus_seed": {
+          "type": "string",
+          "minLength": 1
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "budget_hash": {
+          "$ref": "#/$defs/sha256"
+        },
         "isolation": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["rust", "web"],
+          "required": [
+            "rust",
+            "web"
+          ],
           "properties": {
-            "rust": { "$ref": "#/$defs/isolation_result" },
-            "web": { "$ref": "#/$defs/isolation_result" }
+            "rust": {
+              "$ref": "#/$defs/isolation_result"
+            },
+            "web": {
+              "$ref": "#/$defs/isolation_result"
+            }
           }
         },
-        "hard_gates": { "$ref": "#/$defs/hard_gate_results" },
-        "fixture_coverage": { "$ref": "#/$defs/fixture_coverage" },
-        "boundary_results": { "$ref": "#/$defs/boundary_results" },
+        "hard_gates": {
+          "$ref": "#/$defs/hard_gate_results"
+        },
+        "fixture_coverage": {
+          "$ref": "#/$defs/fixture_coverage"
+        },
+        "boundary_results": {
+          "$ref": "#/$defs/boundary_results"
+        },
         "cases": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/case_result" }
+          "items": {
+            "$ref": "#/$defs/case_result"
+          }
         }
       }
     }

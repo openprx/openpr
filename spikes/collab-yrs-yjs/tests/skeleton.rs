@@ -17,7 +17,7 @@ fn guards_update_input_before_engine_apply() {
     let result = limits.validate_update(&[1, 2, 3]);
     assert!(matches!(
         result,
-        Err(InputError::LimitExceeded {
+        Err(InputError::InputTooLarge {
             input: "update",
             actual_bytes: 3,
             max_bytes: 2
