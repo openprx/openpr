@@ -20,6 +20,15 @@
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write ."
 	},
+	"dependencies": {
+		"loro-crdt": "1.14.1",
+		"loro-prosemirror": "0.4.3",
+		"prosemirror-commands": "1.7.1",
+		"prosemirror-keymap": "1.2.3",
+		"prosemirror-model": "1.25.11",
+		"prosemirror-state": "1.4.4",
+		"prosemirror-view": "1.42.2"
+	},
 	"devDependencies": {
 		"@eslint/compat": "^2.0.2",
 		"@eslint/js": "^9.39.2",

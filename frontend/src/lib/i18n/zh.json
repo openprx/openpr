@@ -2262,6 +2262,95 @@
     "aiAgents": "OpenPR - AI 参与者管理",
     "aiLearning": "OpenPR - AI 学习轨迹",
     "trustAppeals": "OpenPR - 积分申诉",
-    "login": "OpenPR - 登录"
+    "login": "OpenPR - 登录",
+    "flow": "Flow"
+  },
+  "flow": {
+    "nav": {
+      "title": "导航",
+      "newPage": "新建 Page",
+      "empty": "还没有页面",
+      "createFirst": "创建第一个页面",
+      "untitled": "无标题",
+      "loading": "正在加载导航…",
+      "liveRegion": {
+        "lifted": "{title} 已提起，使用方向键移动，Space 放下，Escape 取消",
+        "moved": "{title} 移动到第 {position} 位",
+        "nested": "{title} 缩进到 {title2} 之下",
+        "outdented": "{title} 已取消缩进",
+        "dropped": "{title} 已放下",
+        "cancelled": "移动已取消",
+        "reorderFailed": "重新排序失败，已还原"
+      },
+      "expand": "展开",
+      "collapse": "折叠"
+    },
+    "canvas": {
+      "emptyTitle": "无标题页面",
+      "placeholder": "输入 “/” 插入区块，或直接开始输入",
+      "slashMenu": {
+        "paragraph": "文本",
+        "heading1": "标题 1",
+        "heading2": "标题 2",
+        "heading3": "标题 3",
+        "bullet": "项目符号列表",
+        "code": "代码块",
+        "empty": "没有匹配的区块类型"
+      }
+    },
+    "block": {
+      "handleLabel": "拖动手柄",
+      "menuLabel": "区块操作",
+      "nest": "缩进",
+      "outdent": "取消缩进"
+    },
+    "sync": {
+      "local": "本地",
+      "saving": "保存中…",
+      "saved": "已保存",
+      "offline": "离线",
+      "reconnecting": "重新连接中…",
+      "resyncing": "正在同步…",
+      "auth_required": "需要重新登录",
+      "read_only": "只读",
+      "error": "同步出错"
+    },
+    "error": {
+      "unauthenticated": "登录状态已失效，请重新登录",
+      "forbidden": "你没有权限执行该操作",
+      "feature_disabled": "Flow 尚未在此工作区启用",
+      "not_found": "未找到该对象",
+      "unsupported_protocol": "客户端版本过旧，请刷新页面",
+      "stale_frontier": "内容已过期，正在同步最新版本…",
+      "invalid_update": "该操作无法应用",
+      "policy_rejected": "该操作被权限策略拒绝",
+      "limit_exceeded": "已超出限制（上限 {limit}，当前 {observed}）",
+      "resync_required": "需要重新同步，正在获取最新内容…",
+      "server_draining": {
+        "drain": "服务正在维护，将自动重新连接",
+        "contention": "正在重试，请稍候"
+      }
+    },
+    "history": {
+      "title": "历史记录",
+      "empty": "暂无历史记录",
+      "loadMore": "加载更多",
+      "entry": "{actor} 于 {time}"
+    },
+    "panel": {
+      "title": "页面信息",
+      "objectId": "对象 ID",
+      "created": "创建于",
+      "updated": "更新于",
+      "copyReference": "复制引用",
+      "copied": "已复制"
+    },
+    "route": {
+      "disabledTitle": "Flow 未启用",
+      "disabledBody": "该工作区尚未启用 Flow。",
+      "notFoundTitle": "未找到",
+      "notFoundBody": "该页面不存在，或你没有访问权限。"
+    },
+    "titlePlaceholder": "无标题"
   }
 }

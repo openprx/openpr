@@ -2262,6 +2262,95 @@
     "aiAgents": "OpenPR - AI Participants",
     "aiLearning": "OpenPR - AI Learning",
     "trustAppeals": "OpenPR - Trust Appeals",
-    "login": "OpenPR - Login"
+    "login": "OpenPR - Login",
+    "flow": "Flow"
+  },
+  "flow": {
+    "nav": {
+      "title": "Navigator",
+      "newPage": "New Page",
+      "empty": "No pages yet",
+      "createFirst": "Create your first page",
+      "untitled": "Untitled",
+      "loading": "Loading navigator…",
+      "liveRegion": {
+        "lifted": "{title} picked up. Use arrow keys to move, Space to drop, Escape to cancel.",
+        "moved": "{title} moved to position {position}",
+        "nested": "{title} nested under {title2}",
+        "outdented": "{title} outdented",
+        "dropped": "{title} dropped",
+        "cancelled": "Move cancelled",
+        "reorderFailed": "Reorder failed, reverted"
+      },
+      "expand": "Expand",
+      "collapse": "Collapse"
+    },
+    "canvas": {
+      "emptyTitle": "Untitled page",
+      "placeholder": "Type \"/\" to insert a block, or just start typing",
+      "slashMenu": {
+        "paragraph": "Text",
+        "heading1": "Heading 1",
+        "heading2": "Heading 2",
+        "heading3": "Heading 3",
+        "bullet": "Bulleted list",
+        "code": "Code block",
+        "empty": "No matching block type"
+      }
+    },
+    "block": {
+      "handleLabel": "Drag handle",
+      "menuLabel": "Block actions",
+      "nest": "Nest",
+      "outdent": "Outdent"
+    },
+    "sync": {
+      "local": "Local",
+      "saving": "Saving…",
+      "saved": "Saved",
+      "offline": "Offline",
+      "reconnecting": "Reconnecting…",
+      "resyncing": "Resyncing…",
+      "auth_required": "Sign-in required",
+      "read_only": "Read-only",
+      "error": "Sync error"
+    },
+    "error": {
+      "unauthenticated": "Your session has expired. Please sign in again.",
+      "forbidden": "You do not have permission to do that.",
+      "feature_disabled": "Flow is not enabled for this workspace.",
+      "not_found": "This object could not be found.",
+      "unsupported_protocol": "Your client is out of date. Please refresh.",
+      "stale_frontier": "Content is stale, syncing the latest version…",
+      "invalid_update": "That change could not be applied.",
+      "policy_rejected": "That action was rejected by policy.",
+      "limit_exceeded": "Limit exceeded (max {limit}, got {observed}).",
+      "resync_required": "Resync required, fetching the latest content…",
+      "server_draining": {
+        "drain": "The service is undergoing maintenance and will reconnect automatically.",
+        "contention": "Retrying, please wait."
+      }
+    },
+    "history": {
+      "title": "History",
+      "empty": "No history yet",
+      "loadMore": "Load more",
+      "entry": "{actor} at {time}"
+    },
+    "panel": {
+      "title": "Page info",
+      "objectId": "Object ID",
+      "created": "Created",
+      "updated": "Updated",
+      "copyReference": "Copy reference",
+      "copied": "Copied"
+    },
+    "route": {
+      "disabledTitle": "Flow is not enabled",
+      "disabledBody": "This workspace has not enabled Flow.",
+      "notFoundTitle": "Not found",
+      "notFoundBody": "This page does not exist, or you do not have access."
+    },
+    "titlePlaceholder": "Untitled"
   }
 }
