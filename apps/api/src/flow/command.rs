@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::events::{BusinessEventInput, insert_business_event};
 
-use super::model::{AcceptedChange, FlowObjectView};
+use super::model::{AcceptedChange, FlowFeatureUpdateView, FlowObjectView};
 use super::projection;
+use super::query::feature_view_from_row;
 use super::repository::{self, NewCollabDocument, NewFlowObject, NewProjection};
 
 /// Registered `object_type` values (`domain-model-v1.md` "Object types": v0.4 ships `navigator`
@@ -262,6 +263,130 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         event_id,
         command_result: None,
         object,
+    })
+}
+
+/// `flow_object_grants.level` / `flow_workspace_settings.default_member_level`'s four values
+/// (`domain-model-v1.md`), reused here so `set_flow_feature` rejects an unknown level the same way
+/// the database `CHECK` constraint would, instead of surfacing a `Database` 500.
+const MEMBER_LEVELS: &[&str] = &["full_access", "edit", "comment", "view"];
+
+pub struct SetFlowFeatureInput {
+    pub workspace_id: Uuid,
+    pub actor_id: Uuid,
+    pub enabled: Option<bool>,
+    pub default_member_level: Option<String>,
+    pub idempotency_key: String,
+}
+
+fn validate_set_flow_feature(input: &SetFlowFeatureInput) -> Result<(), ApiError> {
+    if input.enabled.is_none() && input.default_member_level.is_none() {
+        return Err(ApiError::BadRequest(
+            "at least one of enabled or default_member_level must be supplied".to_string(),
+        ));
+    }
+    if let Some(level) = input.default_member_level.as_deref() {
+        if !MEMBER_LEVELS.contains(&level) {
+            return Err(ApiError::BadRequest(format!(
+                "default_member_level must be one of {MEMBER_LEVELS:?}"
+            )));
+        }
+        // `v0.4-flow-alpha.md` / `rest-api-v1.md`: "default_member_level 在 v0.5 授权面上线前只
+        // 接受默认值 edit" — the column's own default is 'edit' and nothing in this version can
+        // move it, so any other (otherwise-valid) level is rejected here rather than silently
+        // ignored.
+        if level != "edit" {
+            return Err(ApiError::BadRequest(
+                "default_member_level only accepts 'edit' before the v0.5 authorization surface ships".to_string(),
+            ));
+        }
+    }
+    let key_bytes = input.idempotency_key.len();
+    if !(IDEMPOTENCY_KEY_MIN_BYTES..=IDEMPOTENCY_KEY_MAX_BYTES).contains(&key_bytes) {
+        return Err(ApiError::BadRequest(format!(
+            "idempotency_key must be {IDEMPOTENCY_KEY_MIN_BYTES}-{IDEMPOTENCY_KEY_MAX_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// `PUT /api/v1/workspaces/{workspace_id}/features/flow`.
+///
+/// Only `enabled` can actually change anything in v0.4 (`default_member_level` is validated above
+/// to always already equal the column default); a change is `flow.feature.enabled`/
+/// `flow.feature.disabled` (`events-v1.md`), written in the same transaction as the settings row
+/// update and dispatched exactly like every other Flow business event
+/// (`repository::insert_event_dispatch`). A request whose `enabled` already matches the current
+/// value still succeeds and still stamps `updated_at`/`updated_by` (the caller's admin action is
+/// real even when it changes nothing observable) but produces no event — see
+/// [`FlowFeatureUpdateView`]'s doc comment.
+pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> Result<FlowFeatureUpdateView, ApiError> {
+    validate_set_flow_feature(&input)?;
+
+    if let Some(existing) =
+        repository::find_idempotent_event(&state.db, input.workspace_id, &input.idempotency_key).await?
+    {
+        if existing.event_type != "flow.feature.enabled" && existing.event_type != "flow.feature.disabled" {
+            return Err(ApiError::Conflict(
+                "idempotency_key was already used for a different operation".to_string(),
+            ));
+        }
+        let row = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;
+        return Ok(FlowFeatureUpdateView {
+            feature: feature_view_from_row(row),
+            event_id: Some(existing.id),
+        });
+    }
+
+    let tx = state.db.begin().await?;
+
+    repository::ensure_flow_settings_row(&tx, input.workspace_id).await?;
+    let current = repository::fetch_flow_settings_for_update(&tx, input.workspace_id)
+        .await?
+        .ok_or(ApiError::Internal)?;
+
+    let new_enabled = input.enabled.unwrap_or(current.flow_enabled);
+    let transition = input.enabled.filter(|&enabled| enabled != current.flow_enabled);
+
+    let event_id = if let Some(enabled) = transition {
+        let event_type = if enabled {
+            "flow.feature.enabled"
+        } else {
+            "flow.feature.disabled"
+        };
+        let id = insert_business_event(
+            &tx,
+            BusinessEventInput {
+                workspace_id: input.workspace_id,
+                project_id: None,
+                event_type: event_type.to_string(),
+                aggregate_type: "flow_feature".to_string(),
+                aggregate_id: input.workspace_id.to_string(),
+                actor_id: Some(input.actor_id),
+                source: json!({ "surface": "rest" }),
+                payload: json!({ "workspace_id": input.workspace_id }),
+                metadata: json!({}),
+                correlation_id: None,
+                causation_id: None,
+                idempotency_key: Some(input.idempotency_key.clone()),
+            },
+        )
+        .await?;
+
+        let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
+        repository::insert_event_dispatch(&tx, id, input.workspace_id, event_type, dispatch_max_attempts).await?;
+        Some(id)
+    } else {
+        None
+    };
+
+    repository::update_flow_settings(&tx, input.workspace_id, new_enabled, input.actor_id).await?;
+    tx.commit().await?;
+
+    let updated = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;
+    Ok(FlowFeatureUpdateView {
+        feature: feature_view_from_row(updated),
+        event_id,
     })
 }
 

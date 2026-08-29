@@ -85,3 +85,33 @@ pub struct HistoryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_before_seq: Option<i64>,
 }
+
+/// `{flow_enabled,default_member_level,authz_epoch,updated_at,updated_by}` from `rest-api-v1.md`
+/// (`GET|PUT /workspaces/{workspace_id}/features/flow`).
+///
+/// `updated_at`/`updated_by` are `null` (key still present, matching every other field here) for a
+/// workspace whose `flow_workspace_settings` row does not exist yet — `flow_workspace_settings` is
+/// provisioned lazily by the first `PUT`, and a `GET` must not have the side effect of creating one
+/// (see [`super::policy::require_flow_enabled`]'s "provisioned lazily" doc comment).
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowFeatureView {
+    pub flow_enabled: bool,
+    pub default_member_level: String,
+    pub authz_epoch: i64,
+    pub updated_at: Option<String>,
+    pub updated_by: Option<Uuid>,
+}
+
+/// The `PUT` response: the same fields as [`FlowFeatureView`] plus `event_id`.
+///
+/// `event_id` is `null` when the request changed nothing observable (e.g. `enabled` was supplied
+/// but already matched the current value): `flow.feature.enabled`/`flow.feature.disabled` are
+/// transition events (`events-v1.md`: "false→true"/"true→false"), so a call that does not cross
+/// that transition legitimately produces no new `business_events` row to point at. An idempotent
+/// replay of a prior transition, and a request that does cross it, both return the real id.
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowFeatureUpdateView {
+    #[serde(flatten)]
+    pub feature: FlowFeatureView,
+    pub event_id: Option<Uuid>,
+}

@@ -354,6 +354,90 @@ pub async fn insert_event_dispatch<C: ConnectionTrait>(
     Ok(())
 }
 
+/// A `flow_workspace_settings` row (`GET|PUT /workspaces/{workspace_id}/features/flow`).
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct FlowSettingsRow {
+    pub flow_enabled: bool,
+    pub default_member_level: String,
+    pub authz_epoch: i64,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: Option<Uuid>,
+}
+
+/// Reads a `flow_workspace_settings` row.
+///
+/// `None` when the workspace has never had a row written — the handler synthesizes the column
+/// defaults (`flow_enabled=false`, `default_member_level='edit'`, `authz_epoch=0`) with
+/// `updated_at`/`updated_by` as `null` rather than this function inventing a timestamp for a write
+/// that never happened.
+pub async fn fetch_flow_settings<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<Option<FlowSettingsRow>, ApiError> {
+    Ok(FlowSettingsRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT flow_enabled, default_member_level, authz_epoch, updated_at, updated_by \
+         FROM flow_workspace_settings WHERE workspace_id = $1",
+        vec![workspace_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// Provisions the `flow_workspace_settings` row on first write, at column defaults.
+///
+/// (`flow_enabled=false`, `default_member_level='edit'`), so the subsequent `FOR UPDATE` read in
+/// the same transaction always finds a row regardless of whether one existed before this call.
+pub async fn ensure_flow_settings_row<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO flow_workspace_settings (workspace_id) VALUES ($1) ON CONFLICT (workspace_id) DO NOTHING",
+        vec![workspace_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Reads the settings row for update, inside the caller's transaction.
+///
+/// Holds the row lock [`ensure_flow_settings_row`] guarantees exists, so a concurrent `PUT` on the
+/// same workspace serializes rather than racing on `flow_enabled`.
+pub async fn fetch_flow_settings_for_update<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<Option<FlowSettingsRow>, ApiError> {
+    Ok(FlowSettingsRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT flow_enabled, default_member_level, authz_epoch, updated_at, updated_by \
+         FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE",
+        vec![workspace_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// Writes the new `flow_enabled` value and stamps `updated_at`/`updated_by`.
+///
+/// `default_member_level` is never written here: v0.4 accepts only its existing default value
+/// (`command::set_flow_feature` rejects anything else before touching this function), so the
+/// column's own `DEFAULT 'edit'` is always the truth and `authz_epoch` — which only advances for
+/// an actual baseline change — is correctly left untouched.
+pub async fn update_flow_settings<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    flow_enabled: bool,
+    updated_by: Uuid,
+) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_workspace_settings SET flow_enabled = $2, updated_at = now(), updated_by = $3 \
+         WHERE workspace_id = $1",
+        vec![workspace_id.into(), flow_enabled.into(), updated_by.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
 pub struct HistoryFilter {
     pub document_id: Uuid,
     pub before_seq: Option<i64>,

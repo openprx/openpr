@@ -1,4 +1,4 @@
-//! HTTP handlers for the four Flow REST endpoints this package ships.
+//! HTTP handlers for the Flow REST endpoints this package ships.
 //!
 //! `rest-api-v1.md` "v0.4 Flow Alpha", minus `bootstrap`/`commands`/`collab`/`collab/verify`/the
 //! WebSocket ticket pair, which are a later package — see `apps/api/src/flow/mod.rs`'s module
@@ -9,6 +9,8 @@
 //! GET  /api/v1/workspaces/{workspace_id}/flow/objects
 //! GET  /api/v1/flow/objects/{object_id}
 //! GET  /api/v1/flow/objects/{object_id}/history
+//! GET  /api/v1/workspaces/{workspace_id}/features/flow
+//! PUT  /api/v1/workspaces/{workspace_id}/features/flow
 //! ```
 //!
 //! Every handler here only parses/extracts HTTP-shaped input and calls into `crate::flow`; domain
@@ -28,7 +30,11 @@ use uuid::Uuid;
 use crate::middleware::bot_auth::BotAuthContext;
 use crate::{
     error::ApiError,
-    flow::{command::CreateObjectInput, policy, query, query::Render},
+    flow::{
+        command::{CreateObjectInput, SetFlowFeatureInput},
+        policy, query,
+        query::Render,
+    },
     response::ApiResponse,
 };
 
@@ -175,6 +181,62 @@ pub async fn get_flow_object_history(
     Ok(ApiResponse::success(response))
 }
 
+/// `GET /api/v1/workspaces/{workspace_id}/features/flow`.
+///
+/// Plain workspace membership (`policy::require_flow_feature_read_access`), *not*
+/// `require_flow_workspace_access` — this is the endpoint a caller uses to find out whether Flow
+/// is enabled, so it must be readable even when the flag is currently `false`.
+pub async fn get_flow_feature(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    policy::require_flow_feature_read_access(&state, &extensions, workspace_id).await?;
+
+    let view = query::get_flow_feature(&state, workspace_id).await?;
+
+    Ok(ApiResponse::success(view))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetFlowFeatureRequest {
+    pub enabled: Option<bool>,
+    pub default_member_level: Option<String>,
+    pub idempotency_key: String,
+}
+
+/// `PUT /api/v1/workspaces/{workspace_id}/features/flow`.
+///
+/// Workspace admin only (`policy::require_flow_workspace_admin_access`) — `rest-api-v1.md`:
+/// "workspace admin user 或 policy-approved Flow admin bot".
+pub async fn set_flow_feature(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Json(req): Json<SetFlowFeatureRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let (actor_id, _role, _is_bot) =
+        policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+
+    let view = crate::flow::command::set_flow_feature(
+        &state,
+        SetFlowFeatureInput {
+            workspace_id,
+            actor_id,
+            enabled: req.enabled,
+            default_member_level: req.default_member_level,
+            idempotency_key: req.idempotency_key,
+        },
+    )
+    .await?;
+
+    Ok(ApiResponse::success(view))
+}
+
 // ---- Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
 //
 // These call the four handlers exactly the way the router does — through their public
@@ -202,8 +264,9 @@ mod flow_database_tests {
     use uuid::Uuid;
 
     use super::{
-        CreateFlowObjectRequest, FlowObjectHistoryQuery, GetFlowObjectQuery, ListFlowObjectsQuery, create_flow_object,
-        get_flow_object, get_flow_object_history, list_flow_objects,
+        CreateFlowObjectRequest, FlowObjectHistoryQuery, GetFlowObjectQuery, ListFlowObjectsQuery,
+        SetFlowFeatureRequest, create_flow_object, get_flow_feature, get_flow_object, get_flow_object_history,
+        list_flow_objects, set_flow_feature,
     };
     use crate::error::ApiError;
     use axum::extract::{Path, Query, State};
@@ -348,6 +411,59 @@ mod flow_database_tests {
         )
         .await;
         (workspace_id, owner_id)
+    }
+
+    /// A workspace + owner member with **no** `flow_workspace_settings` row at all — unlike
+    /// [`seed_workspace`], which always inserts one (`flow_enabled` true or false). Used by the
+    /// `features/flow` "never provisioned" default test, where the row's mere absence (not an
+    /// explicit `flow_enabled=false`) is exactly what is under test.
+    async fn seed_bare_workspace(state: &AppState) -> (Uuid, Uuid) {
+        let workspace_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        exec(
+            state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'test', 'user', true)",
+            vec![owner_id.into(), format!("{owner_id}@flow.test").into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'flow test', $3)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        (workspace_id, owner_id)
+    }
+
+    /// Adds a plain (`role='member'`, not `owner`/`admin`) member to an already-seeded workspace,
+    /// for the `features/flow` admin-gate tests.
+    async fn seed_member(state: &AppState, workspace_id: Uuid) -> Uuid {
+        let member_id = Uuid::new_v4();
+        exec(
+            state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'test', 'user', true)",
+            vec![member_id.into(), format!("{member_id}@flow.test").into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+            vec![workspace_id.into(), member_id.into()],
+        )
+        .await;
+        member_id
     }
 
     fn claims_for(user_id: Uuid) -> Extension<JwtClaims> {
@@ -662,6 +778,174 @@ mod flow_database_tests {
             .expect("count query returns a row");
         let n: i64 = count.try_get("", "n").expect("count column reads");
         assert_eq!(n, 1);
+
+        scratch.drop_self().await;
+    }
+
+    // ---- `GET|PUT /workspaces/{workspace_id}/features/flow` ----
+
+    #[tokio::test]
+    async fn get_feature_on_a_never_provisioned_workspace_returns_the_column_defaults() {
+        let scratch = scratch_or_skip!("feature-default");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_bare_workspace(&state).await;
+        let claims = claims_for(owner_id);
+
+        let response = to_response(get_flow_feature(State(state.clone()), claims, None, Path(workspace_id)).await);
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["flow_enabled"], false, "{body}");
+        assert_eq!(body["data"]["default_member_level"], "edit", "{body}");
+        assert_eq!(body["data"]["authz_epoch"], 0, "{body}");
+        assert!(body["data"]["updated_at"].is_null(), "{body}");
+        assert!(body["data"]["updated_by"].is_null(), "{body}");
+
+        // A `GET` must be side-effect free: no row was provisioned by reading it.
+        let count = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM flow_workspace_settings WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("count query runs")
+            .expect("count query returns a row");
+        let n: i64 = count.try_get("", "n").expect("count column reads");
+        assert_eq!(n, 0);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn admin_put_enables_flow_and_the_change_is_persisted_and_visible_to_a_later_get() {
+        let scratch = scratch_or_skip!("feature-put-persist");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_bare_workspace(&state).await;
+        let claims = claims_for(owner_id);
+
+        let put_response = to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: Some(true),
+                    default_member_level: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        );
+        assert_eq!(put_response.status(), axum::http::StatusCode::OK);
+        let put_body = body_json(put_response).await;
+        assert_eq!(put_body["code"], 0, "{put_body}");
+        assert_eq!(put_body["data"]["flow_enabled"], true, "{put_body}");
+        assert!(!put_body["data"]["event_id"].is_null(), "{put_body}");
+        assert!(!put_body["data"]["updated_at"].is_null(), "{put_body}");
+        assert_eq!(put_body["data"]["updated_by"], owner_id.to_string(), "{put_body}");
+
+        // A fresh `GET` — not the `PUT` handler's own return value — proves the write actually
+        // reached the database rather than only being reflected in the response the handler built.
+        let get_response = to_response(get_flow_feature(State(state.clone()), claims, None, Path(workspace_id)).await);
+        let get_body = body_json(get_response).await;
+        assert_eq!(get_body["data"]["flow_enabled"], true, "{get_body}");
+
+        // Exactly one `flow.feature.enabled` business event, with a same-transaction `event_dispatch` row.
+        let event_row = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id, event_type FROM business_events WHERE workspace_id = $1 AND aggregate_type = 'flow_feature'",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("event query runs")
+            .expect("exactly one flow_feature business event exists");
+        let event_type: String = event_row.try_get("", "event_type").expect("event_type reads");
+        assert_eq!(event_type, "flow.feature.enabled");
+        let event_id: Uuid = event_row.try_get("", "id").expect("id reads");
+
+        let dispatch_count = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM event_dispatch WHERE event_id = $1",
+                vec![event_id.into()],
+            ))
+            .await
+            .expect("dispatch count query runs")
+            .expect("dispatch count query returns a row");
+        let n: i64 = dispatch_count.try_get("", "n").expect("count column reads");
+        assert_eq!(n, 1, "exactly one event_dispatch row per business event");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_member_cannot_put_the_feature_flag_via_body_code_not_http_status() {
+        let scratch = scratch_or_skip!("feature-put-forbidden");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, _owner_id) = seed_bare_workspace(&state).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let claims = claims_for(member_id);
+
+        let response = to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims,
+                None,
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: Some(true),
+                    default_member_level: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        );
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 403, "{body}");
+        assert!(body["data"].is_null(), "{body}");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn put_with_a_non_edit_default_member_level_is_rejected_via_body_code() {
+        let scratch = scratch_or_skip!("feature-put-bad-level");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_bare_workspace(&state).await;
+        let claims = claims_for(owner_id);
+
+        let response = to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims,
+                None,
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: None,
+                    default_member_level: Some("full_access".to_string()),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "errors must not change the transport status code"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 400, "{body}");
+        assert!(body["data"].is_null(), "{body}");
 
         scratch.drop_self().await;
     }

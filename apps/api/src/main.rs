@@ -1382,6 +1382,18 @@ async fn main() -> anyhow::Result<()> {
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
+        // `flow_workspace_settings` read/write — `ADR-0012` §3.1's `flow_enabled` rollout flag
+        // and (v0.5-frozen) `default_member_level`/`authz_epoch`. GET is plain workspace
+        // membership; PUT requires a workspace admin (see `flow::policy`).
+        .route(
+            "/api/v1/workspaces/{workspace_id}/features/flow",
+            get(routes::flow::get_flow_feature)
+                .put(routes::flow::set_flow_feature)
+                .route_layer(axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                )),
+        )
         // Collab tickets/diagnostics/verify (protected, user or bot per `rest-api-v1.md`); the
         // WebSocket upgrade route below is deliberately unprotected by this middleware — it
         // authenticates via the one-time ticket itself (`ADR-0007`), never a Bearer/cookie token.

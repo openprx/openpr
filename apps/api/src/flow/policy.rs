@@ -34,6 +34,41 @@ pub async fn require_flow_workspace_access(
     Ok(actor)
 }
 
+/// Plain workspace membership, deliberately *not* gated on `flow_enabled`.
+///
+/// `GET /workspaces/{workspace_id}/features/flow` is how a caller discovers whether Flow is
+/// enabled at all, so gating it on `require_flow_enabled` would make the flag unreadable exactly
+/// when a caller most needs to read it (before it is ever turned on). `rest-api-v1.md` lists this
+/// endpoint's auth as plain "member user/bot read", not the `OwnedBy(FlowObject)`/workspace-access
+/// gate every object endpoint uses.
+pub async fn require_flow_feature_read_access(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+) -> Result<(Uuid, String, bool), ApiError> {
+    require_workspace_access(state, extensions, workspace_id).await
+}
+
+/// Workspace membership *and* an admin-level role, for `PUT /workspaces/{workspace_id}/features/flow`.
+///
+/// `rest-api-v1.md`: "workspace admin user 或 policy-approved Flow admin bot；显式 workspace admin
+/// policy". `require_workspace_access` already synthesizes `role="admin"` for a bot token carrying
+/// `BotPermission::Admin` (see `middleware::bot_auth::bot_role_from_permissions`) and the human
+/// workspace role otherwise, so one role check here covers both actor kinds — matching the
+/// `role != "owner" && role != "admin"` gate every other workspace-admin endpoint in this crate
+/// uses (`routes::webhook::verify_workspace_admin`, `routes::workspace`, ...).
+pub async fn require_flow_workspace_admin_access(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+) -> Result<(Uuid, String, bool), ApiError> {
+    let actor = require_workspace_access(state, extensions, workspace_id).await?;
+    if actor.1 != "owner" && actor.1 != "admin" {
+        return Err(ApiError::Forbidden("workspace admin access required".to_string()));
+    }
+    Ok(actor)
+}
+
 /// `feature_disabled` (`error-mapping-v1.md`: `Forbidden`/403/HTTP 200) when the workspace has no
 /// `flow_workspace_settings` row yet, or has one with `flow_enabled = false`.
 ///

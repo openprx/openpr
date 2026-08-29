@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
+pub mod dispatcher;
+
 pub struct BusinessEventInput {
     pub workspace_id: Uuid,
     pub project_id: Option<Uuid>,

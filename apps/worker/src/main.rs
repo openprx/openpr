@@ -152,6 +152,15 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(error = %err, "governance polling failed");
         }
 
+        // ADR-0011 dispatcher: expands pending `event_dispatch` work (Flow's `flow.object.*` /
+        // `flow.content.accepted` / `flow.feature.*` events, and any future non-Flow producer)
+        // into `event_deliveries`, then sends what is ready. `--concurrency` is the same batch
+        // multiplier every other job on this loop already treats it as, not parallelism — see
+        // `process_pending_tasks` above. `FOR UPDATE SKIP LOCKED` throughout makes this safe to
+        // run from several worker replicas at once, matching every other job here.
+        let dispatch_report = api::events::dispatcher::run_tick(&state, &client, args.concurrency).await;
+        tracing::debug!(?dispatch_report, "flow event dispatcher tick");
+
         tokio::select! {
             () = &mut shutdown => {
                 tracing::info!("worker shutting down");

@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
-use super::model::{FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
+use super::model::{FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
 use super::projection;
-use super::repository::{self, HistoryFilter, ListFilter, ObjectViewRow};
+use super::repository::{self, FlowSettingsRow, HistoryFilter, ListFilter, ObjectViewRow};
 
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
 pub const MAX_LIST_LIMIT: u64 = 100;
@@ -199,6 +199,35 @@ pub async fn get_history(
             .collect(),
         next_before_seq,
     })
+}
+
+/// Row-to-wire mapping shared by the `GET` handler and `command::set_flow_feature`'s response.
+///
+/// `None` (never-provisioned workspace) maps to the column defaults with `updated_at`/`updated_by`
+/// left `null` (see [`FlowFeatureView`]'s doc comment).
+pub fn feature_view_from_row(row: Option<FlowSettingsRow>) -> FlowFeatureView {
+    row.map_or_else(
+        || FlowFeatureView {
+            flow_enabled: false,
+            default_member_level: "edit".to_string(),
+            authz_epoch: 0,
+            updated_at: None,
+            updated_by: None,
+        },
+        |row| FlowFeatureView {
+            flow_enabled: row.flow_enabled,
+            default_member_level: row.default_member_level,
+            authz_epoch: row.authz_epoch,
+            updated_at: Some(row.updated_at.to_rfc3339()),
+            updated_by: row.updated_by,
+        },
+    )
+}
+
+/// `GET /api/v1/workspaces/{workspace_id}/features/flow`.
+pub async fn get_flow_feature(state: &AppState, workspace_id: Uuid) -> Result<FlowFeatureView, ApiError> {
+    let row = repository::fetch_flow_settings(&state.db, workspace_id).await?;
+    Ok(feature_view_from_row(row))
 }
 
 fn encode_cursor(created_at: DateTime<Utc>, id: Uuid) -> String {
