@@ -1,0 +1,861 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-gate-v0.4.schema.json",
+  "title": "Sylvode Flow Gate Result v0.4",
+  "description": "Machine-readable v0.4 gate envelope emitted by scripts/report-flow-v0.4-json.sh and consumed by scripts/verify-flow-v0.4-json.sh and scripts/gate-flow-v0.4.sh. Contract: /opt/working/sylvode-flow/gates/v0.4-gate.yaml and gates/gate-commands.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "release",
+    "source_baseline",
+    "source",
+    "generated_at",
+    "mode",
+    "gate_passed",
+    "counts",
+    "checks",
+    "required_commands",
+    "hard_gates",
+    "artifacts",
+    "manual_signoffs",
+    "blockers"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "sylvode.flow.gate-result.v1"
+    },
+    "schema_path": {
+      "const": "docs/schemas/sylvode-flow-gate-v0.4.schema.json"
+    },
+    "release": {
+      "const": "0.4.0"
+    },
+    "source_baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "rust_workspace_version",
+        "frontend_package_version",
+        "reviewed_head"
+      ],
+      "properties": {
+        "repository": {
+          "const": "/opt/worker/code/openpr"
+        },
+        "rust_workspace_version": {
+          "type": "string"
+        },
+        "frontend_package_version": {
+          "type": "string"
+        },
+        "reviewed_head": {
+          "$ref": "#/$defs/git_sha"
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "head",
+        "dirty"
+      ],
+      "properties": {
+        "repository": {
+          "const": "/opt/worker/code/openpr"
+        },
+        "head": {
+          "$ref": "#/$defs/git_sha"
+        },
+        "dirty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mode": {
+      "enum": [
+        "blocked",
+        "pre_signoff",
+        "release"
+      ]
+    },
+    "gate_passed": {
+      "type": "boolean"
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "automated",
+        "passed",
+        "failed",
+        "manual_pending",
+        "unresolved"
+      ],
+      "properties": {
+        "automated": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "manual_pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unresolved": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/check_result"
+      }
+    },
+    "required_commands": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface_parity",
+        "legacy_pages_inventory",
+        "legacy_pages_entry_verify",
+        "collab_architecture_verify",
+        "error_contract_verify",
+        "deployed_chain_websocket_upgrade",
+        "cardinality_verify",
+        "integrity_records_verify",
+        "authz_baseline_verify",
+        "report",
+        "verify",
+        "gate",
+        "manual_signoff"
+      ],
+      "properties": {
+        "surface_parity": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "legacy_pages_inventory": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "legacy_pages_entry_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "collab_architecture_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "error_contract_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "deployed_chain_websocket_upgrade": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "cardinality_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "integrity_records_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "authz_baseline_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "report": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "gate": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "manual_signoff": {
+          "$ref": "#/$defs/required_command_result"
+        }
+      }
+    },
+    "hard_gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rest_mcp_cli_ui_surface_parity",
+        "mcp_default_rest_coverage_three_adr_threat_exceptions_only",
+        "migration_forward_and_rollback_strategy",
+        "document_row_lock_seq_unique",
+        "collab_architecture_adr_accepted",
+        "bounded_warm_cache_lock_hold_and_round_trip_budgets",
+        "minimal_snapshot_advancement_bounds_tail",
+        "snapshot_tail_restart_recovery",
+        "bootstrap_repeatable_read_and_ws_parity",
+        "accepted_egress_seq_monotonic_and_gap_resync",
+        "rest_envelope_and_error_contract",
+        "server_draining_reason_cross_surface_error_coverage",
+        "ticket_single_use_origin_bot_exclusion",
+        "secure_cookie_and_local_dev_guard",
+        "cross_workspace_and_policy_bypass_negative",
+        "unauthorized_update_rejected",
+        "mcp_three_transport_contract",
+        "tool_registry_expected_107_or_rebased",
+        "cli_json_and_exit_code_contract",
+        "web_ime_undo_selection_and_sync_state",
+        "navigator_keyboard_drag_equivalence",
+        "i18n_zh_en_flow_key_parity",
+        "vite_wasm_static_build_and_deep_route",
+        "feature_flag_navigation_and_direct_url",
+        "feature_flag_mcp_read_admin_write_and_cli_equivalence",
+        "forms_regression_no_degradation",
+        "flow_limits_exact_boundary_and_plus_one_rejection",
+        "isolated_decode_apply_cpu_wall_memory",
+        "websocket_rate_connection_and_backpressure_limits",
+        "deployed_chain_websocket_upgrade",
+        "bootstrap_limits_web_server_parity",
+        "limit_exceeded_kind_coverage",
+        "flow_event_registry_payload_policy_complete",
+        "business_event_dispatch_same_transaction",
+        "dispatch_expansion_snapshot_semantics",
+        "no_subscribers_terminalized_and_reaped",
+        "dispatcher_liveness_and_backlog",
+        "flow_content_delivery_coalescing",
+        "coalescing_seal_and_source_first_expansion",
+        "dispatch_numeric_budgets_locked",
+        "command_contended_document_cardinality",
+        "integrity_record_on_fail_closed",
+        "flow_parent_authority_in_postgres",
+        "member_baseline_no_behaviour_regression",
+        "event_idempotency_audit_and_redaction",
+        "legacy_pages_inventory_three_environments_complete",
+        "legacy_pages_zero_or_importer_surface_available",
+        "legacy_pages_mcp_admin_policy_and_semantic_equivalence",
+        "legacy_pages_dry_run_and_rerun_idempotent",
+        "legacy_pages_failure_source_immutable",
+        "legacy_pages_lineage_complete",
+        "legacy_pages_drop_requires_separate_adr"
+      ],
+      "properties": {
+        "rest_mcp_cli_ui_surface_parity": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "mcp_default_rest_coverage_three_adr_threat_exceptions_only": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "migration_forward_and_rollback_strategy": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "document_row_lock_seq_unique": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "collab_architecture_adr_accepted": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "bounded_warm_cache_lock_hold_and_round_trip_budgets": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "minimal_snapshot_advancement_bounds_tail": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "snapshot_tail_restart_recovery": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "bootstrap_repeatable_read_and_ws_parity": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "accepted_egress_seq_monotonic_and_gap_resync": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "rest_envelope_and_error_contract": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "server_draining_reason_cross_surface_error_coverage": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "ticket_single_use_origin_bot_exclusion": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "secure_cookie_and_local_dev_guard": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "cross_workspace_and_policy_bypass_negative": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "unauthorized_update_rejected": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "mcp_three_transport_contract": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "tool_registry_expected_107_or_rebased": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "cli_json_and_exit_code_contract": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "web_ime_undo_selection_and_sync_state": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "navigator_keyboard_drag_equivalence": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "i18n_zh_en_flow_key_parity": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "vite_wasm_static_build_and_deep_route": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "feature_flag_navigation_and_direct_url": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "feature_flag_mcp_read_admin_write_and_cli_equivalence": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "forms_regression_no_degradation": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "flow_limits_exact_boundary_and_plus_one_rejection": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "isolated_decode_apply_cpu_wall_memory": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "websocket_rate_connection_and_backpressure_limits": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "deployed_chain_websocket_upgrade": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "bootstrap_limits_web_server_parity": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "limit_exceeded_kind_coverage": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "flow_event_registry_payload_policy_complete": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "business_event_dispatch_same_transaction": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "dispatch_expansion_snapshot_semantics": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "no_subscribers_terminalized_and_reaped": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "dispatcher_liveness_and_backlog": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "flow_content_delivery_coalescing": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "coalescing_seal_and_source_first_expansion": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "dispatch_numeric_budgets_locked": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "command_contended_document_cardinality": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "integrity_record_on_fail_closed": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "flow_parent_authority_in_postgres": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "member_baseline_no_behaviour_regression": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "event_idempotency_audit_and_redaction": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_inventory_three_environments_complete": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_zero_or_importer_surface_available": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_mcp_admin_policy_and_semantic_equivalence": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_dry_run_and_rerun_idempotent": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_failure_source_immutable": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_lineage_complete": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        },
+        "legacy_pages_drop_requires_separate_adr": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_verified"
+          ]
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "migration",
+        "api_contract_fixture",
+        "error_contract_result",
+        "mcp_contract_fixture",
+        "cli_contract_fixture",
+        "ui_e2e_result",
+        "deployed_chain_websocket_result",
+        "integrity_result",
+        "collab_architecture_result",
+        "forms_regression_result",
+        "limits_result",
+        "flow_events_result",
+        "cardinality_result",
+        "integrity_records_result",
+        "authz_baseline_result",
+        "surface_coverage_result",
+        "legacy_pages_inventory",
+        "gate_result"
+      ],
+      "properties": {
+        "migration": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "api_contract_fixture": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "error_contract_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "mcp_contract_fixture": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "cli_contract_fixture": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "ui_e2e_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "deployed_chain_websocket_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "integrity_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "collab_architecture_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "forms_regression_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "limits_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "flow_events_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "cardinality_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "integrity_records_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "authz_baseline_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "surface_coverage_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "legacy_pages_inventory": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "gate_result": {
+          "$ref": "#/$defs/artifact_entry"
+        }
+      }
+    },
+    "manual_signoffs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "page_editor",
+        "navigator_a11y",
+        "restart_recovery",
+        "feature_flag",
+        "forms_regression"
+      ],
+      "properties": {
+        "page_editor": {
+          "$ref": "#/$defs/manual_entry"
+        },
+        "navigator_a11y": {
+          "$ref": "#/$defs/manual_entry"
+        },
+        "restart_recovery": {
+          "$ref": "#/$defs/manual_entry"
+        },
+        "feature_flag": {
+          "$ref": "#/$defs/manual_entry"
+        },
+        "forms_regression": {
+          "$ref": "#/$defs/manual_entry"
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "check_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "status",
+        "command",
+        "exit_code",
+        "duration_ms",
+        "evidence",
+        "sha256"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "command": {
+          "type": "string"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "required_command_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command",
+        "status",
+        "exit_code",
+        "duration_ms",
+        "evidence",
+        "sha256"
+      ],
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "skipped"
+          ]
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifact_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "manual_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reviewer",
+        "evidence"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pending",
+            "passed",
+            "failed",
+            "needs_rework"
+          ]
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

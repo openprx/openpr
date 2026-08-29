@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-surface-coverage-result-v1.schema.json",
+  "title": "Sylvode Flow Surface Coverage Result v1",
+  "description": "Machine-readable REST/MCP/CLI/UI parity result emitted by scripts/verify-flow-surface-coverage.sh, shared v0.4-v1.0. Contract: /opt/working/sylvode-flow/gates/gate-commands.md \"Surface coverage verifier\" section.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release",
+    "source_head",
+    "generated_at",
+    "contracts",
+    "counts",
+    "violations",
+    "passed"
+  ],
+  "properties": {
+    "schema_version": { "const": "sylvode.flow.surface-coverage-result.v1" },
+    "release": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+    "source_head": { "type": "string" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rest_sha256", "mcp_sha256", "cli_sha256", "ui_sha256", "matrix_sha256"],
+      "properties": {
+        "rest_sha256": { "$ref": "#/$defs/sha256" },
+        "mcp_sha256": { "$ref": "#/$defs/sha256" },
+        "cli_sha256": { "$ref": "#/$defs/sha256" },
+        "ui_sha256": { "$ref": "#/$defs/sha256" },
+        "matrix_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rest_total", "rest_in_release", "matrix_rows",
+        "mcp_tools_total", "mcp_resources_total", "cli_commands_total",
+        "not_exposed"
+      ],
+      "properties": {
+        "rest_total": { "type": "integer", "minimum": 0 },
+        "rest_in_release": { "type": "integer", "minimum": 0 },
+        "matrix_rows": { "type": "integer", "minimum": 0 },
+        "mcp_tools_total": { "type": "integer", "minimum": 0 },
+        "mcp_resources_total": { "type": "integer", "minimum": 0 },
+        "cli_commands_total": { "type": "integer", "minimum": 0 },
+        "not_exposed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mcp", "cli", "ui"],
+          "properties": {
+            "mcp": { "type": "integer", "minimum": 0 },
+            "cli": { "type": "integer", "minimum": 0 },
+            "ui": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "violations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "missing_rest_rows", "duplicate_rest_rows", "unknown_matrix_rest_rows",
+        "orphan_mcp_tools", "orphan_mcp_resources", "orphan_cli_commands",
+        "unknown_mcp_refs", "unknown_cli_refs", "unknown_ui_consumers",
+        "blank_cells", "invalid_reason_codes", "reason_column_mismatches",
+        "mcp_exception_endpoint_mismatches", "mcp_exception_without_authority",
+        "version_inversions", "future_exposure_counted_as_shipped"
+      ],
+      "properties": {
+        "missing_rest_rows": { "type": "array", "items": { "type": "string" } },
+        "duplicate_rest_rows": { "type": "array", "items": { "type": "string" } },
+        "unknown_matrix_rest_rows": { "type": "array", "items": { "type": "string" } },
+        "orphan_mcp_tools": { "type": "array", "items": { "type": "string" } },
+        "orphan_mcp_resources": { "type": "array", "items": { "type": "string" } },
+        "orphan_cli_commands": { "type": "array", "items": { "type": "string" } },
+        "unknown_mcp_refs": { "type": "array", "items": { "type": "string" } },
+        "unknown_cli_refs": { "type": "array", "items": { "type": "string" } },
+        "unknown_ui_consumers": { "type": "array", "items": { "type": "string" } },
+        "blank_cells": { "type": "array", "items": { "type": "string" } },
+        "invalid_reason_codes": { "type": "array", "items": { "type": "string" } },
+        "reason_column_mismatches": { "type": "array", "items": { "type": "string" } },
+        "mcp_exception_endpoint_mismatches": { "type": "array", "items": { "type": "string" } },
+        "mcp_exception_without_authority": { "type": "array", "items": { "type": "string" } },
+        "version_inversions": { "type": "array", "items": { "type": "string" } },
+        "future_exposure_counted_as_shipped": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "passed": { "type": "boolean" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-legacy-pages-inventory-v1.schema.json",
+  "title": "Sylvode Flow Legacy Pages Inventory v1",
+  "description": "Machine-readable inventory of the legacy `pages` table across development/test/target_deployment, emitted by scripts/inventory-flow-legacy-pages.sh and consumed by scripts/verify-flow-legacy-pages-v0.4.sh. Contract: /opt/working/sylvode-flow/contracts/legacy-pages-import-v1.md \"无条件 inventory evidence\".",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_head",
+    "generated_at",
+    "executor",
+    "environments",
+    "total_rows"
+  ],
+  "properties": {
+    "schema_version": { "const": "sylvode.flow.legacy-pages-inventory.v1" },
+    "source_head": { "$ref": "#/$defs/git_sha" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "role"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "role": { "type": "string", "minLength": 1 }
+      }
+    },
+    "environments": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "$ref": "#/$defs/environment" }
+    },
+    "total_rows": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "identity_sha256",
+        "collected_at",
+        "row_count",
+        "workspace_distribution",
+        "max_body_md_bytes",
+        "query_sha256",
+        "source_schema_sha256"
+      ],
+      "properties": {
+        "kind": { "enum": ["development", "test", "target_deployment"] },
+        "identity_sha256": { "$ref": "#/$defs/sha256" },
+        "collected_at": { "type": "string", "format": "date-time" },
+        "row_count": { "type": "integer", "minimum": 0 },
+        "workspace_distribution": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["workspace_id_sha256", "row_count"],
+            "properties": {
+              "workspace_id_sha256": { "$ref": "#/$defs/sha256" },
+              "row_count": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "max_body_md_bytes": { "type": "integer", "minimum": 0 },
+        "query_sha256": { "$ref": "#/$defs/sha256" },
+        "source_schema_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
