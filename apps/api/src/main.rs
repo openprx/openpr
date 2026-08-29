@@ -1357,8 +1357,8 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         // Sylvode Flow routes (protected). v0.4 REST API layer, package 1: object create/list/get
-        // /history/commands — package 2 (collab tickets/ws/diagnostics/verify) follows below;
-        // `bootstrap` is still a later package.
+        // /history/commands/bootstrap — package 2 (collab tickets/ws/diagnostics/verify) follows
+        // below.
         .route(
             "/api/v1/workspaces/{workspace_id}/flow/objects",
             post(routes::flow::create_flow_object)
@@ -1378,6 +1378,13 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/flow/objects/{object_id}/commands",
             post(routes::flow::post_flow_object_command).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/bootstrap",
+            get(routes::flow::get_flow_object_bootstrap).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),

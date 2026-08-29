@@ -380,6 +380,7 @@ mod collab_database_tests {
     use super::{create_ticket, get_collab_diagnostics, verify_collab, ws_upgrade};
     use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
     use crate::middleware::bot_auth::bot_or_user_auth_middleware;
+    use crate::routes::flow::get_flow_object_bootstrap;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
     const TEST_ORIGIN: &str = "http://collab-test.local";
@@ -550,9 +551,12 @@ mod collab_database_tests {
             .expect("token issues")
     }
 
-    /// Spins up a real listener serving exactly the four collab routes, the same way
-    /// `apps/api/src/main.rs` wires them (ticket/diagnostics/verify behind
+    /// Spins up a real listener serving the four collab routes plus `GET .../bootstrap`, the same
+    /// way `apps/api/src/main.rs` wires them (ticket/diagnostics/verify/bootstrap behind
     /// `bot_or_user_auth_middleware`, the WS upgrade route deliberately unauthenticated).
+    /// `bootstrap` is registered here — not only in `routes::flow`'s own test module — because
+    /// this is the one place a real WebSocket `open`/`snapshot` round trip exists to compare it
+    /// against (`ADR-0010`'s "REST 与 WS 使用同一 loader" requirement).
     async fn spawn_server(state: AppState) -> SocketAddr {
         let auth_state = state.clone();
         let app = Router::new()
@@ -574,6 +578,13 @@ mod collab_database_tests {
             .route(
                 "/api/v1/flow/objects/{object_id}/collab/verify",
                 post(verify_collab).route_layer(axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    bot_or_user_auth_middleware,
+                )),
+            )
+            .route(
+                "/api/v1/flow/objects/{object_id}/bootstrap",
+                get(get_flow_object_bootstrap).route_layer(axum_middleware::from_fn_with_state(
                     auth_state,
                     bot_or_user_auth_middleware,
                 )),
@@ -1109,6 +1120,242 @@ mod collab_database_tests {
                 .expect("the node A created is present on B")
                 .text,
             "hello from A"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `GET /api/v1/flow/objects/{object_id}/bootstrap` and a WebSocket `open`/`snapshot` on the
+    /// exact same document must return byte-identical snapshot/frontier/seq state — the concrete
+    /// proof that both surfaces call `flow::collab::bootstrap::load`, not two independently
+    /// assembled read paths (`ADR-0010`: "WS `open` 与 REST endpoint 使用同一 loader/authorization
+    /// policy，不允许 REST 一致而 WS 仍以两次 READ COMMITTED 查询拼装").
+    #[tokio::test]
+    async fn rest_bootstrap_and_websocket_snapshot_share_the_same_loader_and_agree_byte_for_byte() {
+        let scratch = scratch_or_skip!("bootstrap-ws-parity");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        // ---- WS side: hello / open / snapshot ----
+        let client_id = "bootstrap-parity-client";
+        let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+        let mut ws = connect(addr, &ticket, client_id).await;
+        send_frame(
+            &mut ws,
+            &Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: vec![],
+                client_id: client_id.to_string(),
+                session_id: Uuid::new_v4(),
+            },
+        )
+        .await;
+        let hello_reply = recv_frame(&mut ws).await;
+        assert!(matches!(hello_reply, Frame::Hello { .. }), "{hello_reply:?}");
+        send_frame(
+            &mut ws,
+            &Frame::Open {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                known_seq: None,
+                known_frontier: None,
+            },
+        )
+        .await;
+        let snapshot_frame = recv_frame(&mut ws).await;
+        let Frame::Snapshot {
+            snapshot: ws_snapshot_b64,
+            snapshot_seq: ws_snapshot_seq,
+            head_seq: ws_head_seq,
+            head_frontier: ws_head_frontier,
+            ..
+        } = snapshot_frame
+        else {
+            panic!("expected a snapshot frame, got {snapshot_frame:?}");
+        };
+
+        // ---- REST side: bootstrap ----
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/api/v1/flow/objects/{object_id}/bootstrap"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("bootstrap request completes");
+        let body: Value = response.json().await.expect("bootstrap response is JSON");
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(
+            body["data"]["snapshot_base64"], ws_snapshot_b64,
+            "REST bootstrap and WS snapshot must return byte-identical snapshot bytes from the shared loader: {body}"
+        );
+        assert_eq!(body["data"]["snapshot_seq"], ws_snapshot_seq);
+        assert_eq!(body["data"]["head_seq"], ws_head_seq);
+        assert_eq!(body["data"]["head_frontier"], ws_head_frontier);
+        assert_eq!(body["data"]["document_id"], document_id.to_string());
+        assert_eq!(body["data"]["object_id"], object_id.to_string());
+        assert_eq!(body["data"]["engine"], "loro");
+        assert!(
+            body["data"]["tail_updates"]
+                .as_array()
+                .expect("tail_updates is an array")
+                .is_empty()
+        );
+
+        // `known_frontier` that is not valid base64 is `invalid_update`, never a 500.
+        let bad_query_response = client
+            .get(format!(
+                "http://{addr}/api/v1/flow/objects/{object_id}/bootstrap?known_frontier=not-base64!!"
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("request completes");
+        let bad_query_body: Value = bad_query_response.json().await.expect("response is JSON");
+        assert_eq!(bad_query_body["code"], 400, "{bad_query_body}");
+
+        scratch.drop_self().await;
+    }
+
+    /// The bootstrap loader's own fail-closed integrity check (`collab-protocol-v1.md`: "任一
+    /// gap/corruption 必须整次 fail closed 为 `resync_required`/integrity alert") now also writes a
+    /// `flow_integrity_records` row (`ADR-0013` §4) — this proves the row actually lands by
+    /// corrupting a real, already-accepted update's `content_hash` and driving the fail-closed
+    /// path through the real `GET .../bootstrap` HTTP handler.
+    #[tokio::test]
+    #[allow(clippy::items_after_statements)]
+    async fn a_corrupted_tail_update_fails_closed_and_writes_a_real_integrity_record() {
+        let scratch = scratch_or_skip!("bootstrap-integrity-record");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        // Produce one real, accepted `collab_updates` row to corrupt.
+        let client_id = "integrity-record-client";
+        let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+        let mut ws = connect(addr, &ticket, client_id).await;
+        send_frame(
+            &mut ws,
+            &Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: vec![],
+                client_id: client_id.to_string(),
+                session_id: Uuid::new_v4(),
+            },
+        )
+        .await;
+        assert!(matches!(recv_frame(&mut ws).await, Frame::Hello { .. }));
+        send_frame(
+            &mut ws,
+            &Frame::Open {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                known_seq: None,
+                known_frontier: None,
+            },
+        )
+        .await;
+        let Frame::Snapshot {
+            snapshot: snapshot_b64, ..
+        } = recv_frame(&mut ws).await
+        else {
+            panic!("expected a snapshot frame");
+        };
+        let snapshot_bytes = BASE64.decode(&snapshot_b64).expect("snapshot is valid base64");
+        let mut engine = LoroCollabEngine::load(&snapshot_bytes).expect("engine loads the snapshot");
+        let base_frontier = engine.frontier();
+        engine.set_title("Corrupt me").expect("set_title succeeds");
+        let update_bytes = engine.export_from(&base_frontier).expect("exports a real delta");
+        send_frame(
+            &mut ws,
+            &Frame::Update {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                update_id: Uuid::new_v4(),
+                base_frontier: BASE64.encode(base_frontier.as_bytes()),
+                bytes: BASE64.encode(&update_bytes),
+                idempotency_key: None,
+                origin: "web".to_string(),
+                message: None,
+            },
+        )
+        .await;
+        let accepted = recv_frame(&mut ws).await;
+        assert!(matches!(accepted, Frame::Accepted { .. }), "{accepted:?}");
+        drop(ws);
+
+        // Corrupt the persisted `content_hash` directly -- the one invariant only the loader's
+        // own verification (not any database constraint) can catch.
+        state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE collab_updates SET content_hash = $2 WHERE document_id = $1 AND seq = 1",
+                vec![document_id.into(), "0".repeat(64).into()],
+            ))
+            .await
+            .expect("corrupting the content_hash succeeds");
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{addr}/api/v1/flow/objects/{object_id}/bootstrap"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .expect("bootstrap request completes");
+        let body: Value = response.json().await.expect("bootstrap response is JSON");
+        assert_eq!(
+            body["code"], 409,
+            "a corrupted tail must fail closed as resync_required: {body}"
+        );
+
+        use sea_orm::FromQueryResult as _;
+        #[derive(sea_orm::FromQueryResult)]
+        struct IntegrityRow {
+            workspace_id: Uuid,
+            kind: String,
+            subject_kind: String,
+            subject_id: String,
+            detected_by: String,
+            status: String,
+            details_redacted: Value,
+        }
+        let rows = IntegrityRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT workspace_id, kind, subject_kind, subject_id, detected_by, status, details_redacted \
+             FROM flow_integrity_records WHERE workspace_id = $1 AND kind = 'collab_tail_integrity_violation'",
+            vec![workspace_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("integrity record query runs");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one integrity record must be written for the one corruption"
+        );
+        let row = &rows[0];
+        assert_eq!(row.workspace_id, workspace_id);
+        assert_eq!(row.kind, "collab_tail_integrity_violation");
+        assert_eq!(row.subject_kind, "collab_document");
+        assert_eq!(row.subject_id, document_id.to_string());
+        assert_eq!(row.detected_by, "flow.collab.bootstrap_loader");
+        assert_eq!(row.status, "open");
+        let reason = row.details_redacted["reason"]
+            .as_str()
+            .expect("details_redacted.reason is a string");
+        assert!(
+            reason.contains("content_hash"),
+            "the recorded reason must name the real check that failed, got '{reason}'"
+        );
+        assert!(
+            !row.details_redacted.to_string().contains("Corrupt me"),
+            "details_redacted must never carry document content"
         );
 
         scratch.drop_self().await;

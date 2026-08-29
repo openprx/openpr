@@ -1,13 +1,14 @@
 //! HTTP handlers for the Flow REST endpoints this package ships.
 //!
-//! `rest-api-v1.md` "v0.4 Flow Alpha", minus `bootstrap`/`collab`/`collab/verify`/the WebSocket
-//! ticket pair, which are a later package — see `apps/api/src/flow/mod.rs`'s module docs.
+//! `rest-api-v1.md` "v0.4 Flow Alpha", minus `collab`/`collab/verify`/the WebSocket ticket pair,
+//! which live in `routes::collab` — see `apps/api/src/flow/mod.rs`'s module docs.
 //!
 //! ```text
 //! POST /api/v1/workspaces/{workspace_id}/flow/objects
 //! GET  /api/v1/workspaces/{workspace_id}/flow/objects
 //! GET  /api/v1/flow/objects/{object_id}
 //! POST /api/v1/flow/objects/{object_id}/commands
+//! GET  /api/v1/flow/objects/{object_id}/bootstrap
 //! GET  /api/v1/flow/objects/{object_id}/history
 //! GET  /api/v1/workspaces/{workspace_id}/features/flow
 //! PUT  /api/v1/workspaces/{workspace_id}/features/flow
@@ -155,6 +156,43 @@ pub async fn get_flow_object(
     let view = query::get_object(&state, object_id, params.at_seq, render).await?;
 
     Ok(ApiResponse::success(view))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetFlowObjectBootstrapQuery {
+    pub known_seq: Option<i64>,
+    pub known_frontier: Option<String>,
+}
+
+/// `GET /api/v1/flow/objects/{object_id}/bootstrap` (`rest-api-v1.md`: "**user only**；object
+/// read/write；flag").
+///
+/// Unlike every other handler in this module, a bot token is rejected outright rather than
+/// folded into the workspace-access check — matching `routes::collab::create_ticket`'s identical
+/// "issued a `bot_or_user_auth_middleware`-gated route but this one endpoint is user-only" shape.
+/// `flow::query::get_bootstrap` shares `flow::collab::bootstrap::load` with the WebSocket
+/// `snapshot` frame, so this and a WS `open` on the same document can never diverge (`ADR-0010`).
+pub async fn get_flow_object_bootstrap(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Query(params): Query<GetFlowObjectBootstrapQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    if bot.is_some() {
+        return Err(ApiError::Forbidden(
+            "bot tokens cannot call the bootstrap endpoint; user access token only".to_string(),
+        ));
+    }
+    let extensions = build_auth_extensions(claims, None);
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+
+    let bootstrap = query::get_bootstrap(&state, object_id, params.known_seq, params.known_frontier).await?;
+
+    Ok(ApiResponse::success(bootstrap))
 }
 
 #[derive(Debug, Deserialize)]
@@ -329,8 +367,9 @@ mod flow_database_tests {
 
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectHistoryQuery,
-        GetFlowObjectQuery, ListFlowObjectsQuery, SetFlowFeatureRequest, create_flow_object, get_flow_feature,
-        get_flow_object, get_flow_object_history, list_flow_objects, post_flow_object_command, set_flow_feature,
+        GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, SetFlowFeatureRequest,
+        create_flow_object, get_flow_feature, get_flow_object, get_flow_object_bootstrap, get_flow_object_history,
+        list_flow_objects, post_flow_object_command, set_flow_feature,
     };
     use crate::error::ApiError;
     use axum::extract::{Path, Query, State};
@@ -1204,6 +1243,203 @@ mod flow_database_tests {
             body["code"], 400,
             "an unregistered command type must surface as body code 400: {body}"
         );
+
+        scratch.drop_self().await;
+    }
+
+    /// `GET /api/v1/flow/objects/{object_id}/bootstrap`: a user request returns the complete
+    /// `Bootstrap` shape (`snapshot_base64`/`tail_updates`/`head_frontier`/`limits`/
+    /// `websocket_path`) with the real document identity; a bot token is rejected outright
+    /// (`rest-api-v1.md`: "**user only**").
+    #[tokio::test]
+    async fn bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot() {
+        let scratch = scratch_or_skip!("bootstrap-basic");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Bootstrap Test Page".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let object_id = Uuid::parse_str(
+            create_body["data"]["object"]["id"]
+                .as_str()
+                .expect("object id is a string"),
+        )
+        .expect("object id is a uuid");
+        let document_id = Uuid::parse_str(
+            create_body["data"]["object"]["document_id"]
+                .as_str()
+                .expect("document id is a string"),
+        )
+        .expect("document id is a uuid");
+
+        let response = to_response(
+            get_flow_object_bootstrap(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(object_id),
+                Query(GetFlowObjectBootstrapQuery {
+                    known_seq: None,
+                    known_frontier: None,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["object_id"], object_id.to_string());
+        assert_eq!(body["data"]["document_id"], document_id.to_string());
+        assert_eq!(body["data"]["engine"], "loro");
+        assert_eq!(body["data"]["snapshot_seq"], 0);
+        assert_eq!(body["data"]["head_seq"], 0);
+        assert!(body["data"]["snapshot_base64"].is_string(), "{body}");
+        assert!(!body["data"]["snapshot_base64"].as_str().unwrap().is_empty(), "{body}");
+        assert!(body["data"]["tail_updates"].as_array().unwrap().is_empty(), "{body}");
+        assert!(body["data"]["head_frontier"].is_string(), "{body}");
+        assert_eq!(body["data"]["websocket_path"], "/api/v1/collab/ws");
+        let limits = &body["data"]["limits"];
+        assert_eq!(limits["version"], "sylvode.flow.limits.v1", "{body}");
+        assert_eq!(limits["update_bytes_max"], 65_536, "{body}");
+        assert_eq!(limits["bootstrap_decoded_bytes_max"], 8_388_608, "{body}");
+        assert_eq!(limits["import_compression_ratio_max"], 100, "{body}");
+
+        // A bot token must never reach the bootstrap handler's actual logic.
+        let bot_ctx = Extension(crate::middleware::bot_auth::BotAuthContext {
+            bot_id: Uuid::new_v4(),
+            workspace_id,
+            permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+        });
+        let bot_response = to_response(
+            get_flow_object_bootstrap(
+                State(state.clone()),
+                claims.clone(),
+                Some(bot_ctx),
+                Path(object_id),
+                Query(GetFlowObjectBootstrapQuery {
+                    known_seq: None,
+                    known_frontier: None,
+                }),
+            )
+            .await,
+        );
+        let bot_body = body_json(bot_response).await;
+        assert_eq!(bot_body["code"], 403, "a bot token must be rejected: {bot_body}");
+
+        scratch.drop_self().await;
+    }
+
+    /// `create_object`'s cross-workspace `parent_object_id`/`project_id` check
+    /// (`rest-api-v1.md` "`RelationView`"; `ADR-0013` §4): the request fails closed as
+    /// `invalid_update` *and* a real `flow_integrity_records` row is written for it — proving the
+    /// producer this package was missing, not just the rejection it already had.
+    #[tokio::test]
+    #[allow(clippy::items_after_statements)]
+    async fn cross_workspace_parent_is_rejected_and_recorded_as_an_integrity_alert() {
+        let scratch = scratch_or_skip!("cross-workspace-integrity");
+        let state = state_for(scratch.db.clone());
+        let (workspace_a, owner_a) = seed_workspace(&state, true).await;
+        let (workspace_b, owner_b) = seed_workspace(&state, true).await;
+        let claims_b = claims_for(owner_b);
+
+        // A real, existing page in workspace A.
+        let page_in_a = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims_for(owner_a),
+                None,
+                Path(workspace_a),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Page In Workspace A".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let parent_id_in_a = Uuid::parse_str(
+            page_in_a["data"]["object"]["id"]
+                .as_str()
+                .expect("object id is a string"),
+        )
+        .expect("object id is a uuid");
+
+        // A workspace-B member tries to create a page parented under that workspace-A object.
+        let response = to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims_b,
+                None,
+                Path(workspace_b),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: Some(parent_id_in_a),
+                    title: "Cross-Workspace Attempt".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 400, "{body}");
+        assert_eq!(body["message"], "invalid_update", "{body}");
+
+        use sea_orm::FromQueryResult as _;
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct IntegrityRow {
+            workspace_id: Uuid,
+            kind: String,
+            subject_kind: String,
+            subject_id: String,
+            detected_by: String,
+            status: String,
+        }
+        let rows = IntegrityRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT workspace_id, kind, subject_kind, subject_id, detected_by, status \
+             FROM flow_integrity_records WHERE workspace_id = $1",
+            vec![workspace_b.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("integrity record query runs");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one integrity record must be written for the one fail-closed attempt"
+        );
+        let row = &rows[0];
+        assert_eq!(row.workspace_id, workspace_b);
+        assert_eq!(row.kind, "cross_workspace_relation");
+        assert_eq!(row.subject_kind, "flow_object");
+        assert_eq!(row.subject_id, parent_id_in_a.to_string());
+        assert_eq!(row.detected_by, "flow.command.create_object");
+        assert_eq!(row.status, "open");
 
         scratch.drop_self().await;
     }

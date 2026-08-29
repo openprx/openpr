@@ -406,6 +406,51 @@ pub async fn insert_event_dispatch<C: ConnectionTrait>(
     Ok(())
 }
 
+/// One `flow_integrity_records` row to write (`ADR-0013` §4's verbatim column list, minus `id`/
+/// `detected_at`/`status`/`resolved_at`, which the table itself defaults).
+pub struct IntegrityRecordInput<'a> {
+    pub workspace_id: Uuid,
+    /// `flow_integrity_records_kind_check`: `^[a-z][a-z0-9_]*$`.
+    pub kind: &'a str,
+    /// `flow_integrity_records_subject_kind_check`: `^[a-z][a-z0-9_]*$`.
+    pub subject_kind: &'a str,
+    pub subject_id: &'a str,
+    pub detected_by: &'a str,
+    /// Must never carry document/body content or CRDT bytes (`events-v1.md` redaction rules,
+    /// reused here per the table's own `COMMENT ON TABLE flow_integrity_records`).
+    pub details_redacted: Value,
+}
+
+/// Records an invariant drift a database constraint could not catch by itself (`ADR-0013` §4):
+/// an operational fact, never a `business_events` row, never delivered or replayed. Callers write
+/// this in the same fail-closed path that already rejects the request — this call never changes
+/// whether the request is rejected, only whether the rejection leaves an audit trail.
+pub async fn insert_integrity_record<C: ConnectionTrait>(
+    conn: &C,
+    input: IntegrityRecordInput<'_>,
+) -> Result<Uuid, ApiError> {
+    let id = Uuid::new_v4();
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO flow_integrity_records
+                (id, workspace_id, kind, subject_kind, subject_id, detected_by, details_redacted)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ",
+        vec![
+            id.into(),
+            input.workspace_id.into(),
+            input.kind.into(),
+            input.subject_kind.into(),
+            input.subject_id.into(),
+            input.detected_by.into(),
+            input.details_redacted.into(),
+        ],
+    ))
+    .await?;
+    Ok(id)
+}
+
 /// A `flow_workspace_settings` row (`GET|PUT /workspaces/{workspace_id}/features/flow`).
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct FlowSettingsRow {

@@ -50,6 +50,76 @@ const IDEMPOTENCY_KEY_MAX_BYTES: usize = 128;
 /// with a dependency bump.
 const DOCUMENT_FORMAT_VERSION: &str = "loro-1";
 
+/// `ADR-0013` §"Gate 接线" (`command_contended_document_cardinality`): every write command must
+/// machine-verifiably declare how many *already-existing* documents its execution contends a head
+/// advance on (the "contended existing document set", not the full set of rows a command writes —
+/// a brand-new document a command also creates in the same transaction never counts here).
+///
+/// - `Zero`: no existing document's head is advanced — pure `PostgreSQL` governance/metadata
+///   (`ADR-0013` §1's first table row: archive/restore, feature flag, authz change,
+///   relation link/unlink).
+/// - `One`: exactly one existing document's head is advanced — v0.4's content commands, and
+///   (from v0.5) a parented create that only touches its navigator's ordering.
+/// - `BoundedMany(n)`: `n` existing documents contend a head advance in one command — `ADR-0013`
+///   §2's multi-document lock-order path, first introduced by v0.5's cross-project `move_object`.
+///   **No v0.4-registered command may declare this** (`ADR-0013` §1: "v0.4 的竞争文档集合恒 ≤ 1");
+///   `v0_4_command_cardinality_registry`'s own test below is the machine gate for that bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingDocumentCardinality {
+    Zero,
+    One,
+    BoundedMany(u8),
+}
+
+impl ExistingDocumentCardinality {
+    pub const fn count(self) -> u8 {
+        match self {
+            Self::Zero => 0,
+            Self::One => 1,
+            Self::BoundedMany(n) => n,
+        }
+    }
+}
+
+/// `create_object`'s declared `existing_document_cardinality`: `Zero`, matching what this
+/// function actually does today — it only ever inserts a brand-new `flow_objects` row and a
+/// brand-new `collab_documents` row (see `create_object`'s own "no existing row to lock" doc
+/// comment above); a `parent_object_id` only sets `flow_objects.parent_id` (a plain `PostgreSQL` FK
+/// column), it does not touch the parent navigator's own CRDT document. This is *not* yet the
+/// "带 parent 的 create 只锁 navigator" cardinality-1 case `ADR-0013` §1's table describes for a
+/// future navigator-ordering feature — that feature does not exist in this package, so declaring
+/// `One` here would assert a lock this code never takes.
+pub const CREATE_OBJECT_CARDINALITY: ExistingDocumentCardinality = ExistingDocumentCardinality::Zero;
+
+/// `set_flow_feature`'s declared `existing_document_cardinality`: `Zero` — a
+/// `flow_workspace_settings` row transition, no `collab_documents` row involved at all.
+pub const SET_FLOW_FEATURE_CARDINALITY: ExistingDocumentCardinality = ExistingDocumentCardinality::Zero;
+
+/// Every v0.4-registered write command, by its wire `command.type`/endpoint name, alongside its
+/// declared [`ExistingDocumentCardinality`] — the machine-checkable registry
+/// `command_contended_document_cardinality` asserts over (this module's own test below, and any
+/// future `verify-flow-cardinality-v0.4.sh` gate script that wants the same facts from Rust rather
+/// than re-deriving them from prose).
+pub fn v0_4_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
+    let mut registry = vec![
+        ("create_object", CREATE_OBJECT_CARDINALITY),
+        ("set_flow_feature", SET_FLOW_FEATURE_CARDINALITY),
+    ];
+    for content in [
+        ContentCommandType::SetTitle,
+        ContentCommandType::InsertBlock,
+        ContentCommandType::UpdateBlock,
+        ContentCommandType::DeleteBlock,
+        ContentCommandType::MoveBlock,
+    ] {
+        registry.push((content.wire_name(), content.existing_document_cardinality()));
+    }
+    for lifecycle in [LifecycleCommandType::Archive, LifecycleCommandType::Restore] {
+        registry.push((lifecycle.wire_name(), lifecycle.existing_document_cardinality()));
+    }
+    registry
+}
+
 pub struct CreateObjectInput {
     pub workspace_id: Uuid,
     pub actor_id: Uuid,
@@ -92,6 +162,43 @@ fn validate(input: &CreateObjectInput) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A caller-supplied `project_id`/`parent_object_id` that resolves to a *real* row, but one that
+/// lives in a different workspace than the request's own `workspace_id`. `rest-api-v1.md`
+/// ("RelationView"): "数据库约束外出现跨 workspace relation 时整次请求 fail closed 为
+/// `invalid_update`、记录 integrity alert" — `v0.4-flow-alpha.md` names this exact check as the
+/// v0.4-scoped instance of that rule (no `flow_relations` table exists before v0.5; a create's
+/// `project_id`/`parent_object_id` are v0.4's only cross-object references). Records the drift in
+/// `flow_integrity_records` (`ADR-0013` §4) before failing closed — the id existing at all but in
+/// the wrong workspace is never a plain "not found" typo, so it gets a paper trail a genuine
+/// missing-row `BadRequest` does not.
+async fn record_cross_workspace_relation_and_fail_closed(
+    state: &AppState,
+    requesting_workspace_id: Uuid,
+    subject_kind: &str,
+    referenced_id: Uuid,
+    referenced_workspace_id: Uuid,
+) -> ApiError {
+    if let Err(err) = repository::insert_integrity_record(
+        &state.db,
+        repository::IntegrityRecordInput {
+            workspace_id: requesting_workspace_id,
+            kind: "cross_workspace_relation",
+            subject_kind,
+            subject_id: &referenced_id.to_string(),
+            detected_by: "flow.command.create_object",
+            details_redacted: json!({
+                "referenced_workspace_id": referenced_workspace_id,
+                "requesting_workspace_id": requesting_workspace_id,
+            }),
+        },
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to record integrity alert for a cross-workspace relation");
+    }
+    ApiError::BadRequest("invalid_update".to_string())
+}
+
 pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result<AcceptedChange, ApiError> {
     validate(&input)?;
     let title = input.title.trim().to_string();
@@ -124,9 +231,14 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             .await?
             .ok_or_else(|| ApiError::BadRequest("project not found".to_string()))?;
         if project_workspace != input.workspace_id {
-            return Err(ApiError::BadRequest(
-                "project does not belong to this workspace".to_string(),
-            ));
+            return Err(record_cross_workspace_relation_and_fail_closed(
+                state,
+                input.workspace_id,
+                "project",
+                project_id,
+                project_workspace,
+            )
+            .await);
         }
     }
 
@@ -135,9 +247,14 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             .await?
             .ok_or_else(|| ApiError::BadRequest("parent_object_id not found".to_string()))?;
         if parent.workspace_id != input.workspace_id {
-            return Err(ApiError::BadRequest(
-                "parent_object_id does not belong to this workspace".to_string(),
-            ));
+            return Err(record_cross_workspace_relation_and_fail_closed(
+                state,
+                input.workspace_id,
+                "flow_object",
+                parent_id,
+                parent.workspace_id,
+            )
+            .await);
         }
         if parent.lifecycle_status == "archived" {
             return Err(ApiError::BadRequest("parent_object_id is archived".to_string()));
@@ -448,6 +565,30 @@ impl ContentCommandType {
             _ => None,
         }
     }
+
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::SetTitle => "set_title",
+            Self::InsertBlock => "insert_block",
+            Self::UpdateBlock => "update_block",
+            Self::DeleteBlock => "delete_block",
+            Self::MoveBlock => "move_block",
+        }
+    }
+
+    /// `ADR-0013` §1's table: "所有内容编辑" → cardinality 1. Every content command loads and
+    /// advances exactly the one existing `collab_documents` row `execute_content_command` reads
+    /// via `bootstrap::load(&state.db, document_id)` — never zero (there is always a document to
+    /// edit) and never more than one (v0.4 has no cross-document content command). Matched on
+    /// `self` (rather than a bare constant) so a future content command variant with a different
+    /// cardinality must edit this match, not silently inherit `One`.
+    const fn existing_document_cardinality(self) -> ExistingDocumentCardinality {
+        match self {
+            Self::SetTitle | Self::InsertBlock | Self::UpdateBlock | Self::DeleteBlock | Self::MoveBlock => {
+                ExistingDocumentCardinality::One
+            }
+        }
+    }
 }
 
 /// The two v0.4 lifecycle command types. Neither advances a document head
@@ -464,6 +605,21 @@ impl LifecycleCommandType {
             "archive" => Some(Self::Archive),
             "restore" => Some(Self::Restore),
             _ => None,
+        }
+    }
+
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Archive => "archive",
+            Self::Restore => "restore",
+        }
+    }
+
+    /// `ADR-0013` §1's table, first row: pure `flow_objects.lifecycle_status` governance, no
+    /// `collab_documents` row touched at all.
+    const fn existing_document_cardinality(self) -> ExistingDocumentCardinality {
+        match self {
+            Self::Archive | Self::Restore => ExistingDocumentCardinality::Zero,
         }
     }
 }
@@ -1009,4 +1165,60 @@ async fn execute_lifecycle_command(
         .await?
         .ok_or(ApiError::Internal)?;
     Ok(accepted_change_from_row(view, event_id))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod cardinality_gate_tests {
+    use super::{ExistingDocumentCardinality, v0_4_command_cardinality_registry};
+
+    /// `command_contended_document_cardinality` (`ADR-0013` §1, v0.4): "v0.4 的竞争文档集合恒
+    /// ≤ 1". Every command this package registers — content, lifecycle, and the two
+    /// non-`CommandKind` write paths (`create_object`, `set_flow_feature`) — must declare a
+    /// cardinality of at most 1; a future command that needs `BoundedMany` must fail this test
+    /// until it also ships the `ADR-0013` §2 multi-document lock-order machinery, not slip in
+    /// silently.
+    #[test]
+    fn v0_4_command_set_existing_document_cardinality_is_always_at_most_one() {
+        let registry = v0_4_command_cardinality_registry();
+        assert!(!registry.is_empty(), "the v0.4 command registry must not be empty");
+        for (name, cardinality) in registry {
+            assert!(
+                cardinality.count() <= 1,
+                "command '{name}' declares existing_document_cardinality={cardinality:?} \
+                 (count={}), violating ADR-0013's v0.4 bound of <= 1",
+                cardinality.count()
+            );
+        }
+    }
+
+    #[test]
+    fn v0_4_registry_covers_every_registered_command_name() {
+        let registry = v0_4_command_cardinality_registry();
+        let names: Vec<&str> = registry.iter().map(|(name, _)| *name).collect();
+        for expected in [
+            "create_object",
+            "set_flow_feature",
+            "set_title",
+            "insert_block",
+            "update_block",
+            "delete_block",
+            "move_block",
+            "archive",
+            "restore",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "command '{expected}' is missing from the cardinality registry"
+            );
+        }
+        assert_eq!(names.len(), 9, "registry must not silently gain or lose commands");
+    }
+
+    #[test]
+    fn cardinality_count_matches_each_variant() {
+        assert_eq!(ExistingDocumentCardinality::Zero.count(), 0);
+        assert_eq!(ExistingDocumentCardinality::One.count(), 1);
+        assert_eq!(ExistingDocumentCardinality::BoundedMany(3).count(), 3);
+    }
 }

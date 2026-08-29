@@ -9,6 +9,9 @@ use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::collab::frame::TailUpdate;
+use super::collab::limits::FlowLimitsV1;
+
 /// `FlowObjectView` from `rest-api-v1.md`.
 ///
 /// `title` and `semantic_content` are read from `flow_object_projections` (the rebuildable
@@ -55,6 +58,31 @@ pub struct AcceptedChange {
     pub event_id: Uuid,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_result: Option<Value>,
+}
+
+/// `Bootstrap` from `rest-api-v1.md` (`GET /flow/objects/{object_id}/bootstrap`).
+///
+/// Built from `flow::collab::bootstrap::load`'s `BootstrapResult` —
+/// the exact same `REPEATABLE READ READ ONLY` loader the WebSocket `snapshot` frame uses
+/// (`flow::collab::session::run`), so this response and that frame can never observe divergent
+/// document state (`ADR-0010`, `collab-protocol-v1.md`: "WS `open` 与 REST endpoint 使用同一
+/// loader/authorization policy").
+#[derive(Debug, Clone, Serialize)]
+pub struct Bootstrap {
+    pub object_id: Uuid,
+    pub document_id: Uuid,
+    pub engine: String,
+    pub format_version: String,
+    pub snapshot_seq: i64,
+    pub head_seq: i64,
+    /// Base64 of the full document snapshot bytes — only present on this diagnostics/bootstrap
+    /// surface, never in `FlowObjectView`/`AcceptedChange` (`rest-api-v1.md`: "`snapshot_base64`
+    /// 和 tail bytes 只在 bootstrap/受控 diagnostics 出现").
+    pub snapshot_base64: String,
+    pub tail_updates: Vec<TailUpdate>,
+    pub head_frontier: String,
+    pub limits: FlowLimitsV1,
+    pub websocket_path: String,
 }
 
 /// `{items:FlowObjectView[],next_cursor?}` from the list endpoint.

@@ -14,7 +14,10 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 
-use super::model::{FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
+use super::collab::bootstrap;
+use super::collab::frame::TailUpdate;
+use super::collab::limits;
+use super::model::{Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
 use super::projection;
 use super::repository::{self, FlowSettingsRow, HistoryFilter, ListFilter, ObjectViewRow};
 
@@ -106,6 +109,76 @@ pub async fn get_object(
         view.semantic_content = json!({ "rendered": projection::render_markdown(&view.title) });
     }
     Ok(view)
+}
+
+/// `GET /api/v1/flow/objects/{object_id}/bootstrap` (`rest-api-v1.md`: "**user only**；object
+/// read/write；flag").
+///
+/// `known_seq`/`known_frontier` are accepted and shape-validated (a malformed `known_frontier` is
+/// `invalid_update`) but do not change the response: v0.4 keeps the full, un-compacted history
+/// for every document (no compaction path exists before v0.8), so there is never a "resume from
+/// partial tail" case to compute — exactly the same no-op treatment the WebSocket `Open` frame's
+/// identical fields already get in `flow::collab::session::run`. `known_seq` beyond the current
+/// `head_seq` is not an error either: a caller racing a concurrent write may legitimately observe
+/// a `known_seq` the server has not caught up to broadcasting yet, and the full bootstrap it gets
+/// back is still a correct, current view.
+pub async fn get_bootstrap(
+    state: &AppState,
+    object_id: Uuid,
+    known_seq: Option<i64>,
+    known_frontier: Option<String>,
+) -> Result<Bootstrap, ApiError> {
+    let _ = known_seq;
+    if let Some(raw) = known_frontier.as_deref() {
+        base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map_err(|_| ApiError::BadRequest("invalid_update: known_frontier is not valid base64".to_string()))?;
+    }
+
+    let row = repository::fetch_object_view(&state.db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let document_id = row.document_id;
+
+    // The exact loader the WebSocket `snapshot` frame uses (`flow::collab::session::run`) —
+    // `ADR-0010`/`collab-protocol-v1.md` require REST and WS to share it so the two surfaces can
+    // never observe divergent document state.
+    let boot = bootstrap::load(&state.db, document_id).await?;
+
+    let decoded_bytes = boot
+        .snapshot
+        .len()
+        .saturating_add(boot.tail_updates.iter().map(|update| update.bytes.len()).sum::<usize>());
+    if decoded_bytes as u64 > limits::BOOTSTRAP_DECODED_BYTES_MAX {
+        // `limits-v1.md`: "超出保留边界返回 resync_required" — v0.4 has no compaction path to
+        // shrink the tail, so the only fail-closed response available is the same one the loader
+        // itself already uses for a corrupted tail.
+        return Err(ApiError::Conflict("resync_required".to_string()));
+    }
+
+    Ok(Bootstrap {
+        object_id,
+        document_id,
+        engine: boot.engine,
+        format_version: boot.format_version,
+        snapshot_seq: boot.snapshot_seq,
+        head_seq: boot.head_seq,
+        snapshot_base64: base64::engine::general_purpose::STANDARD.encode(&boot.snapshot),
+        tail_updates: boot
+            .tail_updates
+            .into_iter()
+            .map(|update| TailUpdate {
+                seq: update.seq,
+                update_id: update.update_id,
+                bytes: base64::engine::general_purpose::STANDARD.encode(&update.bytes),
+                before_frontier: base64::engine::general_purpose::STANDARD.encode(&update.before_frontier),
+                after_frontier: base64::engine::general_purpose::STANDARD.encode(&update.after_frontier),
+            })
+            .collect(),
+        head_frontier: base64::engine::general_purpose::STANDARD.encode(&boot.head_frontier),
+        limits: limits::effective_limits(),
+        websocket_path: "/api/v1/collab/ws".to_string(),
+    })
 }
 
 /// Parameters for [`list_objects`], bundled into one struct so the handler-facing signature does
