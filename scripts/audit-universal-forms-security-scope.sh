@@ -136,9 +136,18 @@ if jq empty "$AUDIT_JSON" >/dev/null; then
   # Pinned as a set, not as a count: every entry has been reviewed for reachability and is
   # documented in .cargo/audit.toml. Adding one has to be justified here as well, which is the
   # point of the gate -- an ignore list that grows silently is not a policy.
+  #
+  # 2023-0089 atomic-polyfill: build-graph only, through wasmtime's Cranelift backend. It emulates
+  # atomics for single-core targets and is never compiled for the targets we build.
+  #
+  # 2026-0215 smallstr, 2026-0247 bitmaps, 2026-0248 im, 2026-0251 sized-chunks: unmaintained, not
+  # vulnerable. Reachable only from the Sylvode Flow engine spikes -- yrs pulls smallstr, loro pulls
+  # the im family. `cargo tree -p api|worker|mcp-server` shows no path to spikes/*, so none is linked
+  # into a shipped binary. ADR-0005 selected Loro, so the yrs subtree leaves the lockfile when the
+  # losing candidate's spike is retired, and this set shrinks rather than grows.
   equals "cargo audit ignore list matches the reviewed advisories" \
     "$(jq -r '.settings.ignore | sort | join(" ")' "$AUDIT_JSON")" \
-    "RUSTSEC-2023-0071 RUSTSEC-2026-0173 RUSTSEC-2026-0235"
+    "RUSTSEC-2023-0071 RUSTSEC-2023-0089 RUSTSEC-2026-0173 RUSTSEC-2026-0215 RUSTSEC-2026-0235 RUSTSEC-2026-0247 RUSTSEC-2026-0248 RUSTSEC-2026-0251"
 else
   fail "cargo audit JSON is valid"
 fi
