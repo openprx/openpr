@@ -362,7 +362,7 @@ mod collab_database_tests {
     use axum::routing::{get, post};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use collab_core::{CollabEngine, LoroCollabEngine};
+    use collab_core::{CollabEngine, LoroCollabEngine, NodeId, NodeKind, Operation};
     use futures_util::{SinkExt, StreamExt};
     use platform::{
         app::AppState,
@@ -940,6 +940,176 @@ mod collab_database_tests {
             .expect("request completes");
         let deep_body: Value = deep_response.json().await.expect("response is JSON");
         assert_eq!(deep_body["code"], 400, "{deep_body}");
+
+        scratch.drop_self().await;
+    }
+
+    /// ★ The multi-tab gap this module's `session::broadcast_content_update` closes: a second,
+    /// already-`open` WebSocket session on the *same* document must receive a real `update` frame
+    /// carrying bytes it can incrementally apply — not just an `accepted` ack it cannot act on, and
+    /// not a forced reconnect/re-bootstrap. `B` never calls `bootstrap`/`snapshot` a second time
+    /// anywhere in this test; it applies exactly one relayed `update` on top of the one snapshot it
+    /// received at `open` time, and the resulting semantic state must hash identically to `A`'s own
+    /// local state.
+    #[tokio::test]
+    #[allow(clippy::similar_names)] // `snapshot_a_b64`/`snapshot_b_b64` are deliberately parallel tab A/B names
+    async fn a_second_open_session_receives_an_incremental_update_and_converges_on_the_same_semantic_hash() {
+        let scratch = scratch_or_skip!("two-tabs");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        async fn hello_open_snapshot(ws: &mut WsStream, client_id: &str, document_id: Uuid) -> String {
+            send_frame(
+                ws,
+                &Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: vec![],
+                    client_id: client_id.to_string(),
+                    session_id: Uuid::new_v4(),
+                },
+            )
+            .await;
+            let hello_reply = recv_frame(ws).await;
+            assert!(matches!(hello_reply, Frame::Hello { .. }), "{hello_reply:?}");
+
+            send_frame(
+                ws,
+                &Frame::Open {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    known_seq: None,
+                    known_frontier: None,
+                },
+            )
+            .await;
+            let snapshot_frame = recv_frame(ws).await;
+            let Frame::Snapshot { snapshot, head_seq, .. } = snapshot_frame else {
+                panic!("expected a snapshot frame, got {snapshot_frame:?}");
+            };
+            assert_eq!(head_seq, 0, "a brand-new document starts at head_seq 0");
+            snapshot
+        }
+
+        // Tab A and tab B: two independent WebSocket connections open on the exact same document,
+        // exactly like two browser tabs.
+        let client_a = "two-tabs-client-a";
+        let ticket_a = issue_ticket(addr, &token, workspace_id, document_id, client_a).await;
+        let mut ws_a = connect(addr, &ticket_a, client_a).await;
+        let snapshot_a_b64 = hello_open_snapshot(&mut ws_a, client_a, document_id).await;
+
+        let client_b = "two-tabs-client-b";
+        let ticket_b = issue_ticket(addr, &token, workspace_id, document_id, client_b).await;
+        let mut ws_b = connect(addr, &ticket_b, client_b).await;
+        let snapshot_b_b64 = hello_open_snapshot(&mut ws_b, client_b, document_id).await;
+        assert_eq!(
+            snapshot_a_b64, snapshot_b_b64,
+            "both tabs bootstrap from the same document state"
+        );
+
+        // A performs a real local CRDT edit and submits it as an `update` frame.
+        let snapshot_bytes = BASE64.decode(&snapshot_a_b64).expect("snapshot is valid base64");
+        let mut engine_a = LoroCollabEngine::load(&snapshot_bytes).expect("A loads the shared snapshot");
+        let base_frontier = engine_a.frontier();
+        let node_id = NodeId::from("blk-two-tabs");
+        engine_a
+            .apply_operation(&Operation::CreateNode {
+                id: node_id.clone(),
+                parent: None,
+                index: 0,
+                kind: NodeKind::Block,
+            })
+            .expect("create succeeds");
+        engine_a
+            .apply_operation(&Operation::InsertText {
+                id: node_id.clone(),
+                index: 0,
+                text: "hello from A".to_string(),
+            })
+            .expect("insert succeeds");
+        let update_bytes = engine_a.export_from(&base_frontier).expect("exports a real delta");
+
+        let update_id = Uuid::new_v4();
+        send_frame(
+            &mut ws_a,
+            &Frame::Update {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                update_id,
+                base_frontier: BASE64.encode(base_frontier.as_bytes()),
+                bytes: BASE64.encode(&update_bytes),
+                idempotency_key: None,
+                origin: "web".to_string(),
+                message: None,
+            },
+        )
+        .await;
+
+        // A gets its own ack.
+        let accepted_to_a = recv_frame(&mut ws_a).await;
+        let Frame::Accepted {
+            update_id: acked_id,
+            head_seq: a_head_seq,
+            ..
+        } = accepted_to_a
+        else {
+            panic!("expected an accepted frame for A, got {accepted_to_a:?}");
+        };
+        assert_eq!(acked_id, update_id);
+        assert_eq!(a_head_seq, 1);
+
+        // B -- the *other* tab, never reconnecting and never re-bootstrapping -- must receive a
+        // real `update` frame it can apply incrementally, immediately followed by the matching
+        // `accepted` seq anchor. This is the assertion that fails against the pre-fix behavior
+        // (broadcasting only a bytes-less `accepted`).
+        let relay_to_b = recv_frame(&mut ws_b).await;
+        let Frame::Update {
+            update_id: relay_update_id,
+            bytes: relay_bytes_b64,
+            ..
+        } = relay_to_b
+        else {
+            panic!("B must receive a real `update` frame carrying bytes, not just an ack; got {relay_to_b:?}");
+        };
+        assert_eq!(relay_update_id, update_id);
+
+        let accepted_to_b = recv_frame(&mut ws_b).await;
+        let Frame::Accepted {
+            update_id: accepted_to_b_id,
+            head_seq: b_head_seq,
+            ..
+        } = accepted_to_b
+        else {
+            panic!("expected an accepted frame for B, got {accepted_to_b:?}");
+        };
+        assert_eq!(accepted_to_b_id, update_id);
+        assert_eq!(b_head_seq, 1);
+
+        // B applies the relayed bytes to a fresh copy of the *same* snapshot it bootstrapped from
+        // at `open` time -- proving genuine incremental application, not a disguised full resync.
+        let mut engine_b = LoroCollabEngine::load(&snapshot_bytes).expect("B loads its own bootstrapped snapshot");
+        let relay_bytes = BASE64.decode(&relay_bytes_b64).expect("relay bytes are valid base64");
+        engine_b
+            .import_update(&relay_bytes)
+            .expect("B applies the incremental update");
+
+        let semantic_a = engine_a.semantic_snapshot().expect("A's semantic snapshot reads");
+        let semantic_b = engine_b.semantic_snapshot().expect("B's semantic snapshot reads");
+        assert_eq!(
+            semantic_a.semantic_hash(),
+            semantic_b.semantic_hash(),
+            "B's incrementally-applied state must be semantically identical to A's local state"
+        );
+        assert_eq!(
+            semantic_b
+                .nodes
+                .get(&node_id)
+                .expect("the node A created is present on B")
+                .text,
+            "hello from A"
+        );
 
         scratch.drop_self().await;
     }

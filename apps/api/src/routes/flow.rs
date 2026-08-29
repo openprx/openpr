@@ -1,13 +1,13 @@
 //! HTTP handlers for the Flow REST endpoints this package ships.
 //!
-//! `rest-api-v1.md` "v0.4 Flow Alpha", minus `bootstrap`/`commands`/`collab`/`collab/verify`/the
-//! WebSocket ticket pair, which are a later package — see `apps/api/src/flow/mod.rs`'s module
-//! docs.
+//! `rest-api-v1.md` "v0.4 Flow Alpha", minus `bootstrap`/`collab`/`collab/verify`/the WebSocket
+//! ticket pair, which are a later package — see `apps/api/src/flow/mod.rs`'s module docs.
 //!
 //! ```text
 //! POST /api/v1/workspaces/{workspace_id}/flow/objects
 //! GET  /api/v1/workspaces/{workspace_id}/flow/objects
 //! GET  /api/v1/flow/objects/{object_id}
+//! POST /api/v1/flow/objects/{object_id}/commands
 //! GET  /api/v1/flow/objects/{object_id}/history
 //! GET  /api/v1/workspaces/{workspace_id}/features/flow
 //! PUT  /api/v1/workspaces/{workspace_id}/features/flow
@@ -25,13 +25,14 @@ use axum::{
 };
 use platform::{app::AppState, auth::JwtClaims};
 use serde::Deserialize;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::middleware::bot_auth::BotAuthContext;
 use crate::{
     error::ApiError,
     flow::{
-        command::{CreateObjectInput, SetFlowFeatureInput},
+        command::{CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput},
         policy, query,
         query::Render,
     },
@@ -157,6 +158,68 @@ pub async fn get_flow_object(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct FlowCommandEnvelope {
+    #[serde(rename = "type")]
+    pub command_type: String,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExecuteFlowCommandRequest {
+    pub command: FlowCommandEnvelope,
+    #[serde(default)]
+    pub expected_frontier: Option<String>,
+    pub idempotency_key: String,
+    pub message: Option<String>,
+}
+
+/// `POST /api/v1/flow/objects/{object_id}/commands` (`rest-api-v1.md`: `set_title|insert_block|
+/// update_block|delete_block|move_block|archive|restore`).
+///
+/// `command::execute_command` re-runs the object-level `edit`/`full_access` permission check
+/// itself (`authz::effective_permission`) on top of the workspace-membership gate here — the same
+/// split `flow::collab::ticket::issue` uses for the WebSocket path (workspace access, then a
+/// separate object-level check), since `OwnedBy(FlowObject)` is stricter than plain membership.
+pub async fn post_flow_object_command(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Json(req): Json<ExecuteFlowCommandRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let (actor_id, role, is_bot) = policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+
+    // This surface has no client-id handshake like the WebSocket ticket flow (`ADR-0007`), so a
+    // stable per-actor tag is synthesized for `collab_updates.origin_client_id` / the relayed
+    // `update` frame's `origin` field — descriptive metadata only, never an authority.
+    let origin_client_id = format!("rest:{actor_id}");
+
+    let accepted = crate::flow::command::execute_command(
+        &state,
+        ExecuteCommandInput {
+            object_id,
+            actor_id,
+            principal_kind: if is_bot { "bot".to_string() } else { "user".to_string() },
+            role,
+            command_type: req.command.command_type,
+            payload: req.command.payload,
+            expected_frontier: req.expected_frontier,
+            idempotency_key: req.idempotency_key,
+            message: req.message,
+            origin_client_id,
+        },
+    )
+    .await?;
+
+    Ok(ApiResponse::success(accepted))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FlowObjectHistoryQuery {
     pub before_seq: Option<i64>,
     pub limit: Option<u64>,
@@ -254,19 +317,20 @@ pub async fn set_flow_feature(
 mod flow_database_tests {
     use axum::body::to_bytes;
     use axum::response::{IntoResponse, Response};
+    use base64::Engine as _;
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
         config::{AppConfig, Secret},
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     use super::{
-        CreateFlowObjectRequest, FlowObjectHistoryQuery, GetFlowObjectQuery, ListFlowObjectsQuery,
-        SetFlowFeatureRequest, create_flow_object, get_flow_feature, get_flow_object, get_flow_object_history,
-        list_flow_objects, set_flow_feature,
+        CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectHistoryQuery,
+        GetFlowObjectQuery, ListFlowObjectsQuery, SetFlowFeatureRequest, create_flow_object, get_flow_feature,
+        get_flow_object, get_flow_object_history, list_flow_objects, post_flow_object_command, set_flow_feature,
     };
     use crate::error::ApiError;
     use axum::extract::{Path, Query, State};
@@ -946,6 +1010,200 @@ mod flow_database_tests {
         let body = body_json(response).await;
         assert_eq!(body["code"], 400, "{body}");
         assert!(body["data"].is_null(), "{body}");
+
+        scratch.drop_self().await;
+    }
+
+    /// `POST /api/v1/flow/objects/{object_id}/commands`: all seven v0.4 command types, each
+    /// exercised at least once against a real database and the real shared write path
+    /// (`flow::command::execute_content_command` calls the identical `write::accept_update`
+    /// `flow::collab::session` uses), plus two independent error paths — an `expected_frontier`
+    /// mismatch (`stale_frontier`) and an unregistered `command.type` (`invalid_update`) — both
+    /// surfaced through the envelope `code`, never the HTTP transport status.
+    #[tokio::test]
+    #[allow(clippy::items_after_statements)]
+    async fn commands_endpoint_covers_all_seven_v04_types_and_two_error_paths() {
+        let scratch = scratch_or_skip!("commands-all-types");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+
+        let create_response = to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Commands Test Page".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        );
+        let create_body = body_json(create_response).await;
+        assert_eq!(create_body["code"], 0, "{create_body}");
+        let object_id = Uuid::parse_str(
+            create_body["data"]["object"]["id"]
+                .as_str()
+                .expect("object id is a string"),
+        )
+        .expect("object id is a uuid");
+
+        async fn run_command(
+            state: &AppState,
+            claims: &Extension<JwtClaims>,
+            object_id: Uuid,
+            command_type: &str,
+            payload: Value,
+            expected_frontier: Option<String>,
+        ) -> Value {
+            let response = to_response(
+                post_flow_object_command(
+                    State(state.clone()),
+                    claims.clone(),
+                    None,
+                    Path(object_id),
+                    Json(ExecuteFlowCommandRequest {
+                        command: FlowCommandEnvelope {
+                            command_type: command_type.to_string(),
+                            payload,
+                        },
+                        expected_frontier,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        message: Some(format!("e2e {command_type}")),
+                    }),
+                )
+                .await,
+            );
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            body_json(response).await
+        }
+
+        // 1. set_title
+        let body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "set_title",
+            json!({"title": "Renamed"}),
+            None,
+        )
+        .await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["object"]["title"], "Renamed");
+        assert_eq!(body["data"]["accepted_seq"], 1);
+
+        // 2. insert_block
+        let body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "insert_block",
+            json!({"block_id": "blk-1", "index": 0, "text": "Hello"}),
+            None,
+        )
+        .await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["accepted_seq"], 2);
+
+        // 3. update_block
+        let body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "update_block",
+            json!({"block_id": "blk-1", "text": "Hello world"}),
+            None,
+        )
+        .await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["accepted_seq"], 3);
+
+        // 4. move_block
+        let body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "move_block",
+            json!({"block_id": "blk-1", "index": 0}),
+            None,
+        )
+        .await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["accepted_seq"], 4);
+
+        // 5. delete_block
+        let body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "delete_block",
+            json!({"block_id": "blk-1"}),
+            None,
+        )
+        .await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["accepted_seq"], 5);
+
+        // 6. archive
+        let body = run_command(&state, &claims, object_id, "archive", json!({}), None).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["object"]["lifecycle_status"], "archived");
+        assert!(body["data"]["object"]["archived_at"].is_string(), "{body}");
+
+        // 7. restore -- idempotent lifecycle transition back to active.
+        let body = run_command(&state, &claims, object_id, "restore", json!({}), None).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["object"]["lifecycle_status"], "active");
+        assert!(body["data"]["object"]["archived_at"].is_null(), "{body}");
+
+        // ---- error path 1: `expected_frontier` does not match the real current frontier ----
+        // `stale_frontier` -> `ApiError::Conflict` -> envelope `code = 409`.
+        let bogus_frontier = base64::engine::general_purpose::STANDARD.encode(b"not-the-real-frontier");
+        let body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "set_title",
+            json!({"title": "Must not apply"}),
+            Some(bogus_frontier),
+        )
+        .await;
+        assert_eq!(
+            body["code"], 409,
+            "a stale expected_frontier must surface as body code 409: {body}"
+        );
+        let get_after_stale = to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(object_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        );
+        let get_after_stale_body = body_json(get_after_stale).await;
+        assert_ne!(
+            get_after_stale_body["data"]["title"], "Must not apply",
+            "the rejected write must not have been applied: {get_after_stale_body}"
+        );
+
+        // ---- error path 2: an unregistered command.type ----
+        // `invalid_update` -> `ApiError::BadRequest` -> envelope `code = 400`.
+        let body = run_command(&state, &claims, object_id, "not_a_real_command", json!({}), None).await;
+        assert_eq!(
+            body["code"], 400,
+            "an unregistered command type must surface as body code 400: {body}"
+        );
 
         scratch.drop_self().await;
     }

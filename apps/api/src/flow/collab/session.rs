@@ -253,6 +253,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             ctx.object_id,
                             session_id,
                             consumed.user_id,
+                            &consumed.client_id,
                             checked_epoch,
                             frame,
                             &mut socket,
@@ -365,6 +366,7 @@ async fn handle_client_frame(
     object_id: Uuid,
     session_id: Uuid,
     actor_id: Uuid,
+    origin_client_id: &str,
     checked_epoch: i64,
     frame: Frame,
     socket: &mut WebSocket,
@@ -394,6 +396,13 @@ async fn handle_client_frame(
                 .await;
                 return;
             };
+            // Kept for the peer relay below: `accept_update` takes ownership of its own copies,
+            // and a successful commit does not otherwise hand the applied bytes back (`Accepted`
+            // deliberately carries no `bytes` field — the whole point of relaying is to let *other*
+            // sessions apply the same bytes this session already has locally).
+            let relay_bytes = raw_bytes.clone();
+            let relay_idempotency_key = idempotency_key.clone();
+            let relay_message = message.clone();
             let outcome = write::accept_update(
                 &state.db,
                 &collab.cache,
@@ -404,7 +413,7 @@ async fn handle_client_frame(
                     update_id,
                     bytes: raw_bytes,
                     idempotency_key,
-                    origin_client_id: None,
+                    origin_client_id: Some(origin_client_id.to_string()),
                     message,
                     actor_id,
                     workspace_id: if let Some(id) = fetch_object_workspace_id(state, object_id).await {
@@ -418,6 +427,7 @@ async fn handle_client_frame(
                         return;
                     },
                     checked_epoch,
+                    expected_frontier: None,
                 },
             )
             .await;
@@ -434,7 +444,26 @@ async fn handle_client_frame(
                         event_id: accepted.event_id,
                     };
                     send(socket, &frame).await;
-                    collab.registry.broadcast(document_id, &frame, Some(session_id));
+                    // Peers other than the committer get the actual `update` bytes first — the
+                    // frame `collab-protocol-v1.md`'s field table already defines for exactly this
+                    // payload shape, relayed rather than invented — immediately followed by this
+                    // same `accepted` (both sent over the one per-session channel `registry`
+                    // already owns, so order is preserved: no second broadcast mechanism). A peer
+                    // applies `update.bytes` (commutative CRDT import, order-independent) and uses
+                    // the trailing `accepted.seq` as its gap-detection/`saved` anchor, exactly like
+                    // `collab-protocol-v1.md`'s "客户端仅在 accepted.seq==last_applied_seq+1 时应用"
+                    // rule already requires for its own commit ack.
+                    let relay_frame = Frame::Update {
+                        protocol_version: PROTOCOL_VERSION,
+                        document_id,
+                        update_id: accepted.update_id,
+                        base_frontier: BASE64.encode(&accepted.before_frontier),
+                        bytes: BASE64.encode(&relay_bytes),
+                        idempotency_key: relay_idempotency_key,
+                        origin: origin_client_id.to_string(),
+                        message: relay_message,
+                    };
+                    broadcast_content_update(collab, document_id, Some(session_id), &relay_frame, &frame);
                 }
                 Ok(AcceptOutcome::Rejected(rejected)) => {
                     send(
@@ -555,6 +584,31 @@ async fn handle_client_frame(
             .await;
         }
     }
+}
+
+/// Broadcasts one committed content write to every other session with `document_id` open: the
+/// `update` frame carrying the actual CRDT bytes (so a peer can apply it incrementally, not just
+/// learn that `head_seq` moved), immediately followed by the `accepted` frame carrying the
+/// resulting seq/frontier/projection-seq anchor.
+///
+/// This is the *only* place either frame is broadcast from — the WebSocket write path above and
+/// `flow::command::execute_command`'s REST `POST .../commands` path (`ADR-0010`'s "enqueue ordered
+/// egress notice" step, `collab-protocol-v1.md`: "复用 ADR-0010 的 ordered egress / invalidation
+/// 通道，不另起一套") both call this instead of touching `collab.registry` directly, so there is
+/// exactly one broadcast call site regardless of which write path produced the commit. Both calls
+/// happen strictly after their write already committed; ordering across commits for one document
+/// on this instance falls out of the per-document coordinator serializing writers and every commit
+/// broadcasting exactly once, in commit order (see `registry::SessionRegistry::broadcast`'s own doc
+/// comment for why that is sufficient in a single-instance deployment).
+pub(crate) fn broadcast_content_update(
+    collab: &runtime::CollabRuntime,
+    document_id: Uuid,
+    exclude: Option<Uuid>,
+    update_frame: &Frame,
+    accepted_frame: &Frame,
+) {
+    collab.registry.broadcast(document_id, update_frame, exclude);
+    collab.registry.broadcast(document_id, accepted_frame, exclude);
 }
 
 async fn fetch_object_workspace_id(state: &AppState, object_id: Uuid) -> Option<Uuid> {

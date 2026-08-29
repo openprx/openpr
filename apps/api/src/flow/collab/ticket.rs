@@ -139,6 +139,11 @@ pub struct ConsumedTicket {
     pub user_id: Uuid,
     pub workspace_id: Uuid,
     pub document_id: Uuid,
+    /// The `client_id` this ticket was bound to at issuance (`ADR-0007`) and just matched
+    /// exactly by the `UPDATE ... WHERE client_id = $2` above — carried through so the session
+    /// loop can stamp it onto every `collab_updates.origin_client_id` this connection writes,
+    /// instead of that column silently staying `NULL` for every direct WebSocket write.
+    pub client_id: String,
 }
 
 /// Atomically consumes a ticket (`ADR-0007` point 2): a single conditional `UPDATE` requires an
@@ -195,6 +200,7 @@ pub async fn consume<C: ConnectionTrait>(
         user_id: row.user_id,
         workspace_id: row.workspace_id,
         document_id: row.document_id,
+        client_id: client_id.to_string(),
     })
 }
 

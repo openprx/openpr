@@ -1,7 +1,7 @@
 // Local SQL row types stay beside the queries whose column shapes they mirror, matching the
 // convention `apps/api/src/routes/label.rs` and every module past migration 0024 already follow:
 // hand-written parameterized SQL, no SeaORM entities.
-#![allow(clippy::items_after_statements)]
+#![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
 
 use std::fmt::Write as _;
 
@@ -193,6 +193,58 @@ pub async fn fetch_parent_object<C: ConnectionTrait>(conn: &C, parent_id: Uuid) 
         workspace_id: r.workspace_id,
         lifecycle_status: r.lifecycle_status,
     }))
+}
+
+/// `flow_objects` columns `command::execute_command` needs under a row lock before flipping
+/// `lifecycle_status` (`archive`/`restore`): just enough to compute the archive-tier permission
+/// (`object_type`) and to reject a redundant transition without a second round trip.
+#[derive(Debug, FromQueryResult)]
+pub struct ObjectLifecycleRow {
+    pub workspace_id: Uuid,
+    pub object_type: String,
+    pub lifecycle_status: String,
+}
+
+/// Locks the `flow_objects` row for the duration of the caller's transaction
+/// (`ADR-0013`'s "object/ancestor 行" lock-rank layer), so two concurrent `archive`/`restore`
+/// requests for the same object serialize instead of racing on `lifecycle_status`.
+pub async fn fetch_object_lifecycle_for_update<C: ConnectionTrait>(
+    conn: &C,
+    object_id: Uuid,
+) -> Result<Option<ObjectLifecycleRow>, ApiError> {
+    Ok(ObjectLifecycleRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id, object_type, lifecycle_status FROM flow_objects WHERE id = $1 FOR UPDATE",
+        vec![object_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// Sets `lifecycle_status`/`archived_at`/`updated_by` in one parameterized statement. `archived_at`
+/// is `Some(now)` for `archived`, `None` for `active` — callers never build a raw SQL fragment for
+/// either half of `flow_objects_archived_at_check`'s `(lifecycle_status = 'archived') = (archived_at
+/// IS NOT NULL)` invariant.
+pub async fn set_object_lifecycle<C: ConnectionTrait>(
+    conn: &C,
+    object_id: Uuid,
+    lifecycle_status: &str,
+    archived_at: Option<DateTime<Utc>>,
+    updated_by: Uuid,
+) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_objects SET lifecycle_status = $2, archived_at = $3, updated_at = now(), updated_by = $4 \
+         WHERE id = $1",
+        vec![
+            object_id.into(),
+            lifecycle_status.into(),
+            archived_at.into(),
+            updated_by.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// A prior `business_events` row for this `(workspace_id, idempotency_key)`, if any.

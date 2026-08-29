@@ -58,6 +58,14 @@ pub struct UpdateRequest {
     /// The `authz_epoch` the caller's effective permission was last verified against (`open` time,
     /// or the most recent successful write). See [`fence_epoch_for_share`].
     pub checked_epoch: i64,
+    /// Optimistic-concurrency guard some callers (the `POST .../commands` REST surface) supply:
+    /// when `Some`, the update is rejected `stale_frontier` unless it equals the document's
+    /// observed `head_frontier` at hydrate time (re-checked on every bounded-rebase attempt, so a
+    /// caller cannot straddle a concurrent commit the way a single pre-check would). WebSocket
+    /// `update` frames never set this — a directly-typed CRDT edit merges commutatively regardless
+    /// of the frontier it was locally based on, which is the whole point of shipping a CRDT; this
+    /// guard exists only for callers that explicitly want strict optimistic locking instead.
+    pub expected_frontier: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +75,11 @@ pub struct Accepted {
     pub head_frontier: Vec<u8>,
     pub projection_seq: i64,
     pub event_id: Uuid,
+    /// The document's `head_frontier` immediately before this update was applied
+    /// (`collab_updates.before_frontier`). Callers that relay this update's `bytes` to other
+    /// sessions (`collab-protocol-v1.md`'s `update` frame) need it for that frame's
+    /// `base_frontier` field.
+    pub before_frontier: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,13 +190,14 @@ async fn find_prior_update<C: ConnectionTrait>(
     #[derive(FromQueryResult)]
     struct Row {
         seq: i64,
+        before_frontier: Vec<u8>,
         after_frontier: Vec<u8>,
         projection_seq: i64,
         event_id: Uuid,
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT seq, after_frontier, projection_seq, event_id FROM collab_updates \
+        "SELECT seq, before_frontier, after_frontier, projection_seq, event_id FROM collab_updates \
          WHERE document_id = $1 AND update_id = $2",
         vec![document_id.into(), update_id.into()],
     ))
@@ -195,6 +209,7 @@ async fn find_prior_update<C: ConnectionTrait>(
         head_frontier: r.after_frontier,
         projection_seq: r.projection_seq,
         event_id: r.event_id,
+        before_frontier: r.before_frontier,
     }))
 }
 
@@ -226,6 +241,7 @@ async fn hydrate_and_apply(
     document_id: Uuid,
     update_id: Uuid,
     bytes: &[u8],
+    expected_frontier: Option<&[u8]>,
 ) -> Result<HydrateOutcome, ApiError> {
     let Some(observed) = read_observed_head(db, document_id).await? else {
         return Ok(HydrateOutcome::Rejected(rejected(
@@ -234,6 +250,23 @@ async fn hydrate_and_apply(
             Some(update_id),
         )));
     };
+
+    // Optimistic-concurrency guard (`UpdateRequest::expected_frontier`'s doc comment): checked
+    // against the *observed* head on every hydrate/rebase attempt, never a value read once
+    // before the coordinator permit or before a rebase — so a caller cannot straddle a concurrent
+    // commit the way a single pre-check would.
+    if let Some(expected) = expected_frontier
+        && expected != observed.head_frontier.as_slice()
+    {
+        return Ok(HydrateOutcome::Rejected(AcceptOutcome::Rejected(Rejected {
+            update_id: Some(update_id),
+            code: RejectedCode::StaleFrontier,
+            recoverable: true,
+            details: None,
+            current_seq: Some(observed.head_seq),
+            current_frontier: Some(observed.head_frontier.clone()),
+        })));
+    }
 
     let base_engine = match cache.fork_matching(document_id, observed.head_seq, &observed.format_version) {
         Ok(Some(engine)) => engine,
@@ -479,6 +512,7 @@ async fn run_locked_phase(
         head_frontier: after_frontier,
         projection_seq: new_head_seq,
         event_id,
+        before_frontier: prepared.observed.head_frontier.clone(),
     }))
 }
 
@@ -545,11 +579,19 @@ pub async fn accept_update(
     let mut attempts = 0u32;
     loop {
         attempts += 1;
-        let prepared =
-            match hydrate_and_apply(db, cache, request.document_id, request.update_id, &request.bytes).await? {
-                HydrateOutcome::Prepared(prepared) => prepared,
-                HydrateOutcome::Rejected(outcome) => return Ok(outcome),
-            };
+        let prepared = match hydrate_and_apply(
+            db,
+            cache,
+            request.document_id,
+            request.update_id,
+            &request.bytes,
+            request.expected_frontier.as_deref(),
+        )
+        .await?
+        {
+            HydrateOutcome::Prepared(prepared) => prepared,
+            HydrateOutcome::Rejected(outcome) => return Ok(outcome),
+        };
 
         let locked = tokio::time::timeout(
             Duration::from_millis(DOCUMENT_LOCK_HOLD_MS_MAX.saturating_mul(4)),
@@ -845,6 +887,7 @@ mod database_tests {
                 actor_id: owner_id,
                 workspace_id,
                 checked_epoch,
+                expected_frontier: None,
             },
         )
         .await
@@ -954,6 +997,7 @@ mod database_tests {
                     actor_id: owner_id,
                     workspace_id,
                     checked_epoch: original_epoch,
+                    expected_frontier: None,
                 },
             )
             .await
