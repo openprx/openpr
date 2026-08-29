@@ -1,0 +1,52 @@
+//! Workspace-level gates every Flow REST handler must pass before touching `flow_objects`.
+//!
+//! v0.4 has no `flow_object_grants` yet (`ADR-0012` only lands the schema this version).
+//!
+//! The effective policy is exactly the workspace baseline `domain-model-v1.md` describes
+//! (workspace admin gets `full_access`; a member gets the workspace's `default_member_level`,
+//! frozen at `edit` in v0.4), which — since `flow_object_grants` is reserved-but-empty this
+//! version — collapses to plain workspace membership: any member can read, and any member can
+//! write, with zero regression from pre-Flow behavior. This module does not implement
+//! `flow_object_grants`/`inherit_from_parent` inheritance — that is `ADR-0012`'s v0.5 surface.
+
+use axum::http::Extensions;
+use platform::app::AppState;
+use uuid::Uuid;
+
+use crate::error::ApiError;
+use crate::middleware::bot_auth::require_workspace_access;
+
+use super::repository;
+
+/// Workspace membership (`unauthenticated`/`forbidden`/`not_found` per `error-mapping-v1.md`)
+/// *and* the workspace's `flow_enabled` rollout flag.
+///
+/// Checked independently of any UI navigation gate, as `v0.4-flow-alpha.md` requires ("API 和
+/// WebSocket 必须独立执行同一 flag 检查，不能只依赖 UI"). Returns `(actor_id, role, is_bot)`,
+/// mirroring [`require_workspace_access`].
+pub async fn require_flow_workspace_access(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+) -> Result<(Uuid, String, bool), ApiError> {
+    let actor = require_workspace_access(state, extensions, workspace_id).await?;
+    require_flow_enabled(state, workspace_id).await?;
+    Ok(actor)
+}
+
+/// `feature_disabled` (`error-mapping-v1.md`: `Forbidden`/403/HTTP 200) when the workspace has no
+/// `flow_workspace_settings` row yet, or has one with `flow_enabled = false`.
+///
+/// A missing row is deliberately treated the same as an explicit `false`: `flow_workspace_settings`
+/// is provisioned lazily (nothing in this package inserts a default row), so "never turned on" and
+/// "turned off" must fail exactly the same way (fail closed, not fail open on absence).
+pub async fn require_flow_enabled(state: &AppState, workspace_id: Uuid) -> Result<(), ApiError> {
+    let enabled = repository::fetch_flow_enabled(&state.db, workspace_id).await?;
+    if enabled {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "flow is not enabled for this workspace".to_string(),
+        ))
+    }
+}

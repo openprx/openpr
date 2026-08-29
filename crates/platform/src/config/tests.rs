@@ -796,6 +796,77 @@ jwt_secret = "0123456789abcdef0123456789abcdef"
     assert_eq!(cfg.bind_addr, "0.0.0.0:8081");
 }
 
+// ---- auth.allow_insecure_cookies (Secure attribute fail-closed gate) ----
+
+#[test]
+fn cookies_stay_secure_by_default() {
+    let config = parse(&full_config()).expect("the complete example should validate");
+    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081").expect("the file names both values");
+    assert!(!cfg.allow_insecure_cookies);
+}
+
+#[test]
+fn allow_insecure_cookies_is_accepted_on_an_explicit_loopback_bind() {
+    let config = parse(
+        r#"
+[server]
+bind_addr = "127.0.0.1:8081"
+
+[database]
+url = "postgres://localhost/openpr"
+
+[auth]
+jwt_secret = "0123456789abcdef0123456789abcdef"
+allow_insecure_cookies = true
+"#,
+    )
+    .expect("minimal file");
+    let cfg = AppConfig::from_config(&config, "api", "0.0.0.0:8081")
+        .expect("a loopback bind_addr paired with the explicit opt-in must start");
+    assert!(cfg.allow_insecure_cookies);
+    assert_eq!(cfg.bind_addr, "127.0.0.1:8081");
+}
+
+#[test]
+fn allow_insecure_cookies_fails_closed_on_a_non_loopback_bind() {
+    let config = parse(&full_config().replace(
+        "jwt_secret = \"0123456789abcdef0123456789abcdef\"",
+        "jwt_secret = \"0123456789abcdef0123456789abcdef\"\nallow_insecure_cookies = true",
+    ))
+    .expect("the complete example should validate at the parse stage");
+    // `full_config()`'s bind_addr is "0.0.0.0:8081", which is not loopback.
+    let error = AppConfig::from_config(&config, "api", "0.0.0.0:8081")
+        .expect_err("a non-loopback bind_addr must refuse to start with insecure cookies allowed");
+    let ConfigError::Invalid { issues, .. } = error else {
+        panic!("expected ConfigError::Invalid, got {error}");
+    };
+    assert!(
+        issues.iter().any(|issue| issue.contains("allow_insecure_cookies")),
+        "{issues:?}"
+    );
+}
+
+#[test]
+fn allow_insecure_cookies_fails_closed_when_bind_addr_is_left_to_the_binary_default() {
+    // No `[server]` section at all: `bind_addr` resolves to the binary's own default, which for
+    // every real binary in this workspace is a non-loopback wildcard bind. A missing bind_addr
+    // must not be silently treated as "safe enough" just because the operator wrote nothing.
+    let config = parse(
+        r#"
+[database]
+url = "postgres://localhost/openpr"
+
+[auth]
+jwt_secret = "0123456789abcdef0123456789abcdef"
+allow_insecure_cookies = true
+"#,
+    )
+    .expect("minimal file");
+    let error = AppConfig::from_config(&config, "api", "0.0.0.0:8081")
+        .expect_err("an unset bind_addr must resolve through the (non-loopback) binary default and fail closed");
+    assert!(matches!(error, ConfigError::Invalid { .. }), "{error}");
+}
+
 // ---- redaction ----
 
 #[test]

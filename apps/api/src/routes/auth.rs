@@ -276,12 +276,16 @@ pub async fn refresh(
     Ok(resp)
 }
 
-pub async fn logout() -> Result<Response, ApiError> {
+pub async fn logout(State(state): State<AppState>) -> Result<Response, ApiError> {
     let mut resp = ApiResponse::ok().into_response();
-    resp.headers_mut()
-        .append(header::SET_COOKIE, clear_cookie_header("access_token"));
-    resp.headers_mut()
-        .append(header::SET_COOKIE, clear_cookie_header("refresh_token"));
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        clear_cookie_header("access_token", state.cfg.allow_insecure_cookies),
+    );
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        clear_cookie_header("refresh_token", state.cfg.allow_insecure_cookies),
+    );
     Ok(resp)
 }
 
@@ -534,19 +538,44 @@ fn build_auth_response(
         refresh_expires_in: state.cfg.jwt_refresh_ttl_seconds,
     };
 
-    let access_cookie = auth_cookie_header("access_token", &access_token, state.cfg.jwt_access_ttl_seconds)?;
-    let refresh_cookie = auth_cookie_header("refresh_token", &refresh_token, state.cfg.jwt_refresh_ttl_seconds)?;
+    let access_cookie = auth_cookie_header(
+        "access_token",
+        &access_token,
+        state.cfg.jwt_access_ttl_seconds,
+        state.cfg.allow_insecure_cookies,
+    )?;
+    let refresh_cookie = auth_cookie_header(
+        "refresh_token",
+        &refresh_token,
+        state.cfg.jwt_refresh_ttl_seconds,
+        state.cfg.allow_insecure_cookies,
+    )?;
 
     Ok((tokens, (access_cookie, refresh_cookie)))
 }
 
-fn auth_cookie_header(name: &str, value: &str, max_age_seconds: i64) -> Result<HeaderValue, ApiError> {
-    let cookie = format!("{name}={value}; HttpOnly; Path=/; Max-Age={max_age_seconds}; SameSite=Lax");
+/// `Secure` is dropped only when `allow_insecure_cookies` is true, which
+/// [`platform::config::AppConfig::from_config`] only ever sets when `server.bind_addr` also
+/// resolves to a loopback host — see `auth.allow_insecure_cookies` in `config/openpr.example.toml`.
+/// Every other deployment gets `Secure` unconditionally (fail closed).
+const fn secure_attribute(allow_insecure_cookies: bool) -> &'static str {
+    if allow_insecure_cookies { "" } else { "; Secure" }
+}
+
+fn auth_cookie_header(
+    name: &str,
+    value: &str,
+    max_age_seconds: i64,
+    allow_insecure_cookies: bool,
+) -> Result<HeaderValue, ApiError> {
+    let secure = secure_attribute(allow_insecure_cookies);
+    let cookie = format!("{name}={value}; HttpOnly; Path=/; Max-Age={max_age_seconds}; SameSite=Lax{secure}");
     HeaderValue::from_str(&cookie).map_err(|_| ApiError::Internal)
 }
 
-fn clear_cookie_header(name: &str) -> HeaderValue {
-    HeaderValue::from_str(&format!("{name}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"))
+fn clear_cookie_header(name: &str, allow_insecure_cookies: bool) -> HeaderValue {
+    let secure = secure_attribute(allow_insecure_cookies);
+    HeaderValue::from_str(&format!("{name}=; HttpOnly; Path=/; Max-Age=0; SameSite=Lax{secure}"))
         .unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 

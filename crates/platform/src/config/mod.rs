@@ -76,6 +76,13 @@ pub const DEFAULT_STORAGE_DIR: &str = "./uploads";
 /// Days bot operation records are retained unless `[audit]` overrides it.
 pub const DEFAULT_OPERATION_LOG_RETENTION_DAYS: u32 = 30;
 
+/// `event_dispatch` expansion-failure retry ceiling assumed unless `[flow]` overrides it.
+///
+/// `limits-v1.md`'s own `dispatch_max_attempts` rationale ("与 `delivery_max_attempts` 同量级即可")
+/// is followed literally here: it is set equal to the one sibling limit the same document *does*
+/// freeze (`delivery_max_attempts = 10`), not invented independently.
+pub const DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS: i32 = 10;
+
 /// API base URL assumed by the MCP server when `[mcp]` does not name one.
 pub const DEFAULT_MCP_API_URL: &str = "http://localhost:8081";
 
@@ -99,6 +106,7 @@ pub struct OpenPrConfig {
     pub migrations: MigrationsConfig,
     pub outbound: OutboundConfig,
     pub mcp: McpConfig,
+    pub flow: FlowConfig,
 }
 
 impl OpenPrConfig {
@@ -250,6 +258,13 @@ pub struct AuthConfig {
     pub access_ttl_seconds: i64,
     pub refresh_ttl_seconds: i64,
     pub default_author_id: Option<Uuid>,
+    /// Explicit developer opt-out of the `Secure` attribute on the access/refresh/clear auth
+    /// cookies. Defaults to `false` (cookies are always `Secure`). `AppConfig::from_config`
+    /// refuses to start when this is `true` but `server.bind_addr` does not resolve to a loopback
+    /// host: skipping `Secure` is only safe when the listener itself is unreachable from outside
+    /// the machine, and a missing/non-loopback bind must fail closed rather than silently ship an
+    /// insecure cookie to the network.
+    pub allow_insecure_cookies: bool,
 }
 
 impl AuthConfig {
@@ -389,6 +404,26 @@ impl Default for AuditConfig {
     fn default() -> Self {
         Self {
             operation_log_retention_days: DEFAULT_OPERATION_LOG_RETENTION_DAYS,
+        }
+    }
+}
+
+/// `[flow]` — Sylvode Flow settings `limits-v1.md` marks `status: unset` (the app, not the
+/// contract, picks and owns the value; see that file's "冻结前不得填入自造数值" instruction).
+///
+/// v0.4 only reads `dispatch_max_attempts`: the `event_dispatch.max_attempts` column has no
+/// database default (`limits-v1.md`'s `dispatch_max_attempts` row) precisely so this value has to
+/// come from a deployment's own configuration rather than an invented literal in the insert
+/// statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowConfig {
+    pub dispatch_max_attempts: i32,
+}
+
+impl Default for FlowConfig {
+    fn default() -> Self {
+        Self {
+            dispatch_max_attempts: DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS,
         }
     }
 }
@@ -537,6 +572,10 @@ pub struct AppConfig {
     pub jwt_access_ttl_seconds: i64,
     pub jwt_refresh_ttl_seconds: i64,
     pub default_author_id: Option<Uuid>,
+    /// See [`AuthConfig::allow_insecure_cookies`]. Already validated against `bind_addr` by
+    /// [`Self::from_config`]: by the time a handler reads this field, `true` implies `bind_addr`
+    /// is a loopback host.
+    pub allow_insecure_cookies: bool,
 }
 
 impl AppConfig {
@@ -549,6 +588,12 @@ impl AppConfig {
     /// Fails when the file carries no database URL or no signing key. This is the API's and the
     /// worker's declaration that they need both, so it reports both at once rather than sending
     /// the operator round the loop twice.
+    ///
+    /// Also fails when `auth.allow_insecure_cookies = true` but the *resolved* `bind_addr`
+    /// (file value, or `default_bind` when the file names none) is not a loopback host: skipping
+    /// the `Secure` cookie attribute is only ever safe on a listener nothing off-machine can
+    /// reach, and an operator who set the flag without also pinning the bind to loopback gets a
+    /// startup failure instead of a cookie silently sent in the clear on a public interface.
     pub fn from_config(config: &OpenPrConfig, default_name: &str, default_bind: &str) -> Result<Self, ConfigError> {
         let (Some(database_url), Some(jwt_secret)) = (config.database.url.as_ref(), config.auth.jwt_secret.as_ref())
         else {
@@ -559,22 +604,37 @@ impl AppConfig {
                 .collect();
             return Err(missing_values(&config.origin, issues));
         };
+
+        let bind_addr = config
+            .server
+            .bind_addr
+            .clone()
+            .unwrap_or_else(|| default_bind.to_string());
+
+        if config.auth.allow_insecure_cookies && !raw::is_loopback_bind_addr(&bind_addr) {
+            return Err(missing_values(
+                &config.origin,
+                vec![format!(
+                    "auth.allow_insecure_cookies=true requires server.bind_addr to resolve to a loopback host \
+                     (127.0.0.1, ::1 or localhost); it resolves to '{bind_addr}'. Either bind to loopback for \
+                     local development, or remove auth.allow_insecure_cookies so auth cookies stay Secure"
+                )],
+            ));
+        }
+
         Ok(Self {
             app_name: config
                 .server
                 .app_name
                 .clone()
                 .unwrap_or_else(|| default_name.to_string()),
-            bind_addr: config
-                .server
-                .bind_addr
-                .clone()
-                .unwrap_or_else(|| default_bind.to_string()),
+            bind_addr,
             database_url: database_url.clone(),
             jwt_secret: jwt_secret.clone(),
             jwt_access_ttl_seconds: config.auth.access_ttl_seconds,
             jwt_refresh_ttl_seconds: config.auth.refresh_ttl_seconds,
             default_author_id: config.auth.default_author_id,
+            allow_insecure_cookies: config.auth.allow_insecure_cookies,
         })
     }
 }
@@ -589,6 +649,7 @@ impl std::fmt::Debug for AppConfig {
             .field("jwt_access_ttl_seconds", &self.jwt_access_ttl_seconds)
             .field("jwt_refresh_ttl_seconds", &self.jwt_refresh_ttl_seconds)
             .field("default_author_id", &self.default_author_id)
+            .field("allow_insecure_cookies", &self.allow_insecure_cookies)
             .finish()
     }
 }

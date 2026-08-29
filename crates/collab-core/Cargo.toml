@@ -1,0 +1,16 @@
+[package]
+name = "collab-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Production Loro CRDT adapter for Sylvode Flow (selected in v0.3; see spikes/collab-loro for the evaluation evidence)"
+
+[dependencies]
+loro = "=1.13.9"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+
+[lints]
+workspace = true

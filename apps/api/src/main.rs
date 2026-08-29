@@ -1356,6 +1356,31 @@ async fn main() -> anyhow::Result<()> {
                 ),
             ),
         )
+        // Sylvode Flow routes (protected). v0.4 REST API layer, package 1: object create/list/get
+        // /history only — no bootstrap/commands/collab/ws (next package).
+        .route(
+            "/api/v1/workspaces/{workspace_id}/flow/objects",
+            post(routes::flow::create_flow_object)
+                .get(routes::flow::list_flow_objects)
+                .route_layer(axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                )),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}",
+            get(routes::flow::get_flow_object).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/history",
+            get(routes::flow::get_flow_object_history).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
         // Label routes (protected)
         .route(
             "/api/v1/workspaces/{workspace_id}/labels",
@@ -3613,6 +3638,7 @@ mod proposal_scope_database_tests {
                 jwt_access_ttl_seconds: 900,
                 jwt_refresh_ttl_seconds: 3600,
                 default_author_id: None,
+                allow_insecure_cookies: false,
             },
             db: scratch.connection().clone(),
         }

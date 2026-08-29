@@ -20,9 +20,10 @@ use uuid::Uuid;
 
 use super::secret::Secret;
 use super::{
-    AuditConfig, AuthConfig, ConfigError, DEFAULT_OPERATION_LOG_RETENTION_DAYS, DEFAULT_S3_REGION, DEFAULT_STORAGE_DIR,
-    DatabaseConfig, LogFormat, LogOutput, LoggingConfig, MIN_JWT_SECRET_LEN, McpConfig, McpTransport, MigrationsConfig,
-    OpenPrConfig, OutboundConfig, S3Config, ServerConfig, StorageBackend, StorageConfig,
+    AuditConfig, AuthConfig, ConfigError, DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS, DEFAULT_OPERATION_LOG_RETENTION_DAYS,
+    DEFAULT_S3_REGION, DEFAULT_STORAGE_DIR, DatabaseConfig, FlowConfig, LogFormat, LogOutput, LoggingConfig,
+    MIN_JWT_SECRET_LEN, McpConfig, McpTransport, MigrationsConfig, OpenPrConfig, OutboundConfig, S3Config,
+    ServerConfig, StorageBackend, StorageConfig,
 };
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 20;
@@ -66,6 +67,8 @@ pub(super) struct RawConfig {
     outbound: RawOutbound,
     #[serde(default)]
     mcp: RawMcp,
+    #[serde(default)]
+    flow: RawFlow,
 }
 
 #[derive(Deserialize, Default)]
@@ -93,6 +96,13 @@ struct RawAuth {
     access_ttl_seconds: Option<i64>,
     refresh_ttl_seconds: Option<i64>,
     default_author_id: Option<String>,
+    allow_insecure_cookies: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawFlow {
+    dispatch_max_attempts: Option<i32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -205,6 +215,7 @@ impl RawConfig {
         let migrations = self.migrations.validate();
         let outbound = self.outbound.validate(&mut issues);
         let mcp = self.mcp.validate(&mut issues);
+        let flow = self.flow.validate(&mut issues);
 
         issues.into_result(origin)?;
 
@@ -228,6 +239,7 @@ impl RawConfig {
             migrations,
             outbound,
             mcp,
+            flow,
         })
     }
 }
@@ -365,6 +377,7 @@ impl RawAuth {
             access_ttl_seconds,
             refresh_ttl_seconds,
             default_author_id,
+            allow_insecure_cookies: self.allow_insecure_cookies.unwrap_or(false),
         }
     }
 }
@@ -473,6 +486,22 @@ impl RawAudit {
         AuditConfig {
             operation_log_retention_days,
         }
+    }
+}
+
+impl RawFlow {
+    fn validate(self, issues: &mut Issues) -> FlowConfig {
+        let dispatch_max_attempts = self
+            .dispatch_max_attempts
+            .map_or(DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS, |value| {
+                if value > 0 {
+                    value
+                } else {
+                    issues.push("flow.dispatch_max_attempts must be greater than 0");
+                    DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS
+                }
+            });
+        FlowConfig { dispatch_max_attempts }
     }
 }
 
@@ -723,6 +752,22 @@ fn split_host_port(authority: &str) -> Option<(&str, &str)> {
     }
     let (host, port) = authority.rsplit_once(':')?;
     Some((host, port))
+}
+
+/// Whether a `host:port` bind address (already validated by [`validate_bind_addr`], or a
+/// binary's own hardcoded default) resolves to a host that only accepts connections from the
+/// local machine.
+///
+/// Used exclusively to gate `auth.allow_insecure_cookies` (see
+/// [`super::AuthConfig::allow_insecure_cookies`]): a listener bound to anything else is reachable
+/// from the network, so an auth cookie sent to it must always carry `Secure`. Deliberately strict
+/// (no hostname resolution, no `0.0.0.0`/`[::]` special-casing beyond loopback) — the failure mode
+/// of guessing wrong here is a cookie sent over plain HTTP to a browser on an untrusted network.
+pub(super) fn is_loopback_bind_addr(bind_addr: &str) -> bool {
+    let trimmed = bind_addr.trim();
+    let host = split_host_port(trimmed).map_or_else(|| trimmed, |(host, _)| host);
+    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    matches!(host, "127.0.0.1" | "::1" | "localhost") || host.starts_with("127.")
 }
 
 fn validate_port(field: &str, port: &str) -> Result<(), String> {

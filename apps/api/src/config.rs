@@ -17,13 +17,14 @@
 //!
 use std::sync::OnceLock;
 
-use platform::config::{DEFAULT_STORAGE_DIR, OpenPrConfig, OutboundConfig, StorageBackend, StorageConfig};
+use platform::config::{DEFAULT_STORAGE_DIR, FlowConfig, OpenPrConfig, OutboundConfig, StorageBackend, StorageConfig};
 
 /// The sections of the configuration file reached from outside `AppState`.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub storage: StorageConfig,
     pub outbound: OutboundConfig,
+    pub flow: FlowConfig,
 }
 
 impl RuntimeConfig {
@@ -32,6 +33,7 @@ impl RuntimeConfig {
         Self {
             storage: config.storage.clone(),
             outbound: config.outbound.clone(),
+            flow: config.flow,
         }
     }
 
@@ -54,6 +56,7 @@ impl RuntimeConfig {
                 s3: None,
             },
             outbound: OutboundConfig::default(),
+            flow: FlowConfig::default(),
         }
     }
 }

@@ -2,6 +2,7 @@ pub mod config;
 pub mod entities;
 pub mod error;
 pub mod events;
+pub mod flow;
 pub mod forms;
 pub mod middleware;
 pub mod outbound;

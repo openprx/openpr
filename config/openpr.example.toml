@@ -83,6 +83,13 @@ refresh_ttl_seconds = 1728000  # default: 1728000 (20 days)
 # must be a real, non-nil UUID of an existing user.
 # default_author_id = "00000000-0000-0000-0000-000000000000"  # the nil UUID is rejected
 
+# Drops the `Secure` attribute from the access/refresh/clear auth cookies. Default: false (cookies
+# are always Secure, even over plain HTTP). ONLY for local development over plain http://: the api
+# refuses to start with this set to true unless [server].bind_addr also resolves to a loopback
+# host (127.0.0.1 / ::1 / localhost) — a listener anything off-machine can reach must never ship an
+# insecure cookie.
+# allow_insecure_cookies = true
+
 
 # ---------------------------------------------------------------------------------------------
 # [logging] — replaces RUST_LOG.

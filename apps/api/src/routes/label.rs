@@ -743,6 +743,7 @@ mod tests {
             jwt_access_ttl_seconds: 60,
             jwt_refresh_ttl_seconds: 60,
             default_author_id: None,
+            allow_insecure_cookies: false,
         };
         Some(AppState { cfg, db })
     }
