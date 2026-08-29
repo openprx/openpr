@@ -15,13 +15,13 @@ members = [
 authors = ["g1e2x87"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.2.25"
+version = "0.2.26"
 description = "Open-source project management platform"
 repository = "https://github.com/openprx/openpr"
 
 [workspace.dependencies]
 anyhow = "1.0"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.38", features = ["derive"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls"], default-features = false }

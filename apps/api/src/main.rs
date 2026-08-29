@@ -1357,7 +1357,8 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         // Sylvode Flow routes (protected). v0.4 REST API layer, package 1: object create/list/get
-        // /history only — no bootstrap/commands/collab/ws (next package).
+        // /history — package 2 (collab tickets/ws/diagnostics/verify) follows below; commands
+        // and bootstrap are still a later package.
         .route(
             "/api/v1/workspaces/{workspace_id}/flow/objects",
             post(routes::flow::create_flow_object)
@@ -1377,6 +1378,31 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/v1/flow/objects/{object_id}/history",
             get(routes::flow::get_flow_object_history).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        // Collab tickets/diagnostics/verify (protected, user or bot per `rest-api-v1.md`); the
+        // WebSocket upgrade route below is deliberately unprotected by this middleware — it
+        // authenticates via the one-time ticket itself (`ADR-0007`), never a Bearer/cookie token.
+        .route(
+            "/api/v1/collab/tickets",
+            post(routes::collab::create_ticket).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route("/api/v1/collab/ws", get(routes::collab::ws_upgrade))
+        .route(
+            "/api/v1/flow/objects/{object_id}/collab",
+            get(routes::collab::get_collab_diagnostics).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/collab/verify",
+            post(routes::collab::verify_collab).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),
@@ -2955,6 +2981,11 @@ mod tests {
             "/api/v1/auth/register",
             "/api/v1/auth/login",
             "/api/v1/auth/refresh",
+            // WebSocket upgrade: authenticates via the one-time collab ticket the handler itself
+            // consumes atomically (`ADR-0007`), never a Bearer/cookie token — a browser WebSocket
+            // cannot set an `Authorization` header, so this route deliberately carries no
+            // `bot_or_user_auth_middleware` layer.
+            "/api/v1/collab/ws",
         ];
 
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
@@ -3639,6 +3670,7 @@ mod proposal_scope_database_tests {
                 jwt_refresh_ttl_seconds: 3600,
                 default_author_id: None,
                 allow_insecure_cookies: false,
+                collab_allowed_origins: Vec::new(),
             },
             db: scratch.connection().clone(),
         }

@@ -17,6 +17,7 @@
 //! module owns the domain rules (idempotency, workspace/project/parent validation, the CRDT
 //! document lifecycle, and the SQL).
 
+pub mod collab;
 pub mod command;
 pub mod model;
 pub mod policy;

@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "list-tools"
 path = "src/bin/list-tools.rs"
 
+[[bin]]
+name = "sylvode"
+path = "src/bin/sylvode.rs"
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

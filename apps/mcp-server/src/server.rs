@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (98)
+## Tools (107)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -27,6 +27,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
 ### Other: members.list, search.all, bot_operation_logs.list
+### Flow (v0.4): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -60,7 +61,15 @@ comments.delete (needs GET /api/v1/comments/{comment_id}).
 Workspace wide tools carry no owning project and are therefore not filtered by a
 project policy: projects.list, projects.create, project_types.*, scenario_templates.list,
 scenario_templates.get, members.list, search.all, work_items.search, files.upload,
-proposals.get, labels.create, labels.list, labels.update, labels.delete.
+proposals.get, labels.create, labels.list, labels.update, labels.delete, flow.feature_get.
+
+flow.feature_set and legacy_pages.* are also workspace wide, and additionally require the
+calling bot/user to be a workspace admin with Flow admin capability; the API is the
+authority on that check. objects.get and objects.history are governed by the project agent
+policy of the Flow object's owning project when it has one, and are workspace wide (no
+project policy) when it does not. objects.query accepts a project_id but does not require
+one: pass project_id to be governed by that project's policy, or unprojected=true to list
+objects that belong to no project workspace wide.
 ";
 
 const AGENTS_GUIDE_MD: &str = r#"# OpenPR Agent Guide
@@ -114,6 +123,32 @@ enum PolicyScope {
     /// (project types, scenario templates). No project agent policy can govern these;
     /// see `report`/`README` notes and `TOOL_POLICY_SCOPES` for the full list.
     WorkspaceWide,
+    /// `WorkspaceWide`, plus the call is a Flow administrative operation
+    /// (`mcp-surface-v1.md`: "WorkspaceWide(admin)") — a workspace rollout flag change or an
+    /// ADR-0003 legacy migration step. Like `WorkspaceWide`, no *project* agent policy can
+    /// govern these, so `resolve_policy_project_id` answers `Ok(None)` for both the same
+    /// way. The variant exists as its own name, not a bool on `WorkspaceWide`, only so a
+    /// tool's admin intent is visible at the `TOOL_POLICY_SCOPES` call site and in the
+    /// coverage tests below.
+    ///
+    /// What this scope does *not* itself do: `mcp-surface-v1.md` specifies that
+    /// `WorkspaceWide(admin)` "要求当前 bot 同时具有 Flow admin capability、exact tool policy
+    /// 与 route workspace admin policy". `apps/api` does carry a real bot-capability model for
+    /// this — `middleware::bot_auth::BotPermission::{Read,Write,Admin}`, stored per bot on
+    /// `workspace_bots.permissions` — and every Flow admin REST endpoint checked here
+    /// (`PUT .../features/flow`, `.../collab/verify` at `write`, the legacy-pages admin
+    /// routes) already enforces it: a bot without the right permission gets a real `403`, not
+    /// a fiction, as confirmed against a live `apps/api` instance while building this change.
+    /// What is missing is purely a *pre-check*: the MCP server has no endpoint that lets it
+    /// introspect a caller's own bot permissions before dispatch, and no existing tool in this
+    /// registry pre-filters `tools/list` by bot capability either (the only filter is
+    /// `is_tool_enabled_by_policy`, which is keyed by *project* agent policy and does not apply
+    /// to workspace-scoped tools at all) — so `WorkspaceWideAdmin`'s enforcement at this layer
+    /// is the same defense in depth `WorkspaceWide` already does (refusing an ownership-bearing
+    /// argument a workspace-wide tool cannot legitimately receive), and the real admit/refuse
+    /// decision is, consistently with every other admin-gated surface in this codebase, made
+    /// once by the REST endpoint the call actually reaches.
+    WorkspaceWideAdmin,
 }
 
 /// The API read that maps a resource id to its owning project.
@@ -136,6 +171,22 @@ enum OwnerLookup {
     /// `comment_id`. Comments are owned through their work item but the API exposes no
     /// `GET /api/v1/comments/{comment_id}`, so the call fails closed.
     Comment,
+    /// `object_id` -> `GET /api/v1/flow/objects/{id}`.
+    ///
+    /// Unlike every other lookup here, the owner this returns is *optional*: a Flow object
+    /// may belong to no project at all (`v0.4-flow-alpha.md`'s `flow_objects.project_id` is
+    /// nullable), which `resolve_policy_project_id` handles as its own match arm rather than
+    /// through the generic `resolve_owning_project` path every mandatory-owner lookup shares
+    /// (`mcp-surface-v1.md` describes this as `project_id=None` falling back to
+    /// `WorkspaceWide`). `mcp-surface-v1.md` also
+    /// names `source_object_id` and `collection_id` as owner-bearing keys this lookup covers;
+    /// only `object_id` is wired here because it is the only key any v0.4 tool declares
+    /// (`objects.get`, `objects.history`) — `source_object_id` (move/link) and `collection_id`
+    /// (Collections) belong to v0.5/v0.6 tools this change does not register, and adding
+    /// unreachable match arms for them now would be exactly the untested surface the seven
+    /// iron rules ban. Extend [`OwnerLookup::argument`] and
+    /// [`McpServer::resolve_flow_object_owner`] when those tools land.
+    FlowObject,
 }
 
 impl OwnerLookup {
@@ -149,6 +200,7 @@ impl OwnerLookup {
             Self::CheckResult => "check_result_id",
             Self::Sprint => "sprint_id",
             Self::Comment => "comment_id",
+            Self::FlowObject => "object_id",
         }
     }
 }
@@ -160,7 +212,7 @@ impl OwnerLookup {
 /// labels carry no project column (`migrations/0012_governance_phase1.sql`,
 /// `migrations/0003_labels.sql`), and `resource_id` only ever appears next to a
 /// `project_id` that already scopes the request path.
-const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 9] = [
+const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 10] = [
     ("record_id", OwnerLookup::FormData),
     ("form_id", OwnerLookup::FormData),
     ("attachment_id", OwnerLookup::FormData),
@@ -170,6 +222,7 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 9] = [
     ("check_result_id", OwnerLookup::CheckResult),
     ("sprint_id", OwnerLookup::Sprint),
     ("comment_id", OwnerLookup::Comment),
+    ("object_id", OwnerLookup::FlowObject),
 ];
 
 /// The policy scope of every registered tool.
@@ -178,7 +231,7 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 9] = [
 /// this table from the live tool registry (`tools::get_all_tool_definitions`), so a new
 /// or renamed tool cannot silently land outside the policy gate — including tools whose
 /// name shares no prefix with the family they belong to, such as `events.tail`.
-const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 98] = [
+const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 107] = [
     ("projects.list", PolicyScope::WorkspaceWide),
     ("projects.get", PolicyScope::DeclaredProject { required: true }),
     ("projects.create", PolicyScope::WorkspaceWide),
@@ -334,6 +387,16 @@ const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 98] = [
         "corrective_action.propose",
         PolicyScope::DeclaredProject { required: true },
     ),
+    // Flow v0.4 (`mcp-surface-v1.md`).
+    ("flow.feature_get", PolicyScope::WorkspaceWide),
+    ("flow.feature_set", PolicyScope::WorkspaceWideAdmin),
+    ("objects.get", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.query", PolicyScope::DeclaredProject { required: false }),
+    ("objects.history", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("legacy_pages.inventory", PolicyScope::WorkspaceWideAdmin),
+    ("legacy_pages.import_preview", PolicyScope::WorkspaceWideAdmin),
+    ("legacy_pages.import_commit", PolicyScope::WorkspaceWideAdmin),
+    ("legacy_pages.import_status", PolicyScope::WorkspaceWideAdmin),
 ];
 
 /// Scope of one registered tool. Unknown names fail closed as mandatory
@@ -665,6 +728,17 @@ impl McpServer {
             "inspection.report" => tools::scenario_tools::inspection_report(&self.client, args).await,
             "corrective_action.propose" => tools::scenario_tools::corrective_action_propose(&self.client, args).await,
 
+            // Flow v0.4
+            "flow.feature_get" => tools::flow_features::get_flow_feature(&self.client, args).await,
+            "flow.feature_set" => tools::flow_features::set_flow_feature(&self.client, args).await,
+            "objects.get" => tools::objects::get_flow_object(&self.client, args).await,
+            "objects.query" => tools::objects::query_flow_objects(&self.client, args).await,
+            "objects.history" => tools::objects::get_flow_object_history(&self.client, args).await,
+            "legacy_pages.inventory" => tools::legacy_pages::legacy_pages_inventory(&self.client, args).await,
+            "legacy_pages.import_preview" => tools::legacy_pages::legacy_pages_import_preview(&self.client, args).await,
+            "legacy_pages.import_commit" => tools::legacy_pages::legacy_pages_import_commit(&self.client, args).await,
+            "legacy_pages.import_status" => tools::legacy_pages::legacy_pages_import_status(&self.client, args).await,
+
             _ => CallToolResult::error(format!("Unknown tool: {name}")),
         }
     }
@@ -680,25 +754,12 @@ impl McpServer {
     /// call is refused as well (fail closed).
     async fn resolve_policy_project_id(&self, tool_name: &str, args: &Value) -> Result<Option<String>, String> {
         match tool_policy_scope(tool_name) {
-            PolicyScope::WorkspaceWide => {
+            PolicyScope::WorkspaceWide | PolicyScope::WorkspaceWideAdmin => {
                 // Nothing this tool touches belongs to a project, so there is no policy
                 // to evaluate. Refuse anyway if the call somehow carries an ownership
                 // bearing id: that means the classification and the schema disagree, and
                 // the safe reading of a disagreement is "not authorized".
-                if let Some((argument, _)) = OWNERSHIP_ARGUMENTS
-                    .iter()
-                    .find(|(argument, _)| args.get(*argument).is_some_and(|value| !value.is_null()))
-                {
-                    tracing::warn!(
-                        tool_name = %tool_name,
-                        argument = %argument,
-                        "Refusing workspace scoped call that carries a project owned identifier"
-                    );
-                    return Err(format!(
-                        "Tool '{tool_name}' is registered as workspace scoped but was called with '{argument}'; \
-                         refusing because the owning project would go unchecked"
-                    ));
-                }
+                self.reject_ownership_bearing_arguments(tool_name, args)?;
                 Ok(None)
             }
             PolicyScope::DeclaredProject { required } => match declared_project_id(args)? {
@@ -715,12 +776,47 @@ impl McpServer {
                 }
                 None => Ok(None),
             },
+            // A Flow object may belong to no project at all, unlike every other id addressed
+            // resource this file governs — see `OwnerLookup::FlowObject`'s doc comment for why
+            // this cannot share the generic `OwnedBy(lookup)` arm below, whose owner is always
+            // mandatory.
+            PolicyScope::OwnedBy(OwnerLookup::FlowObject) => {
+                let owner = self.resolve_flow_object_owner(tool_name, args).await?;
+                match &owner {
+                    Some(project_id) => self.reject_foreign_project_claims(tool_name, args, project_id)?,
+                    None => self.reject_any_project_claim(tool_name, args)?,
+                }
+                Ok(owner)
+            }
             PolicyScope::OwnedBy(lookup) => {
                 let owner = self.resolve_owning_project(tool_name, lookup, args).await?;
                 self.reject_foreign_project_claims(tool_name, args, &owner)?;
                 Ok(Some(owner))
             }
         }
+    }
+
+    /// Refuses a call whose schema is workspace scoped (no project agent policy applies) but
+    /// which was somehow called with a project-owned resource id anyway. Shared by
+    /// `WorkspaceWide` and `WorkspaceWideAdmin`, which differ only in what they address, never
+    /// in this guard.
+    #[allow(clippy::unused_self)]
+    fn reject_ownership_bearing_arguments(&self, tool_name: &str, args: &Value) -> Result<(), String> {
+        if let Some((argument, _)) = OWNERSHIP_ARGUMENTS
+            .iter()
+            .find(|(argument, _)| args.get(*argument).is_some_and(|value| !value.is_null()))
+        {
+            tracing::warn!(
+                tool_name = %tool_name,
+                argument = %argument,
+                "Refusing workspace scoped call that carries a project owned identifier"
+            );
+            return Err(format!(
+                "Tool '{tool_name}' is registered as workspace scoped but was called with '{argument}'; \
+                 refusing because the owning project would go unchecked"
+            ));
+        }
+        Ok(())
     }
 
     /// Reads the owning project of an id addressed call back from the API.
@@ -731,6 +827,19 @@ impl McpServer {
         args: &Value,
     ) -> Result<String, String> {
         match lookup {
+            OwnerLookup::FlowObject => {
+                // `resolve_policy_project_id` never reaches here: `FlowObject`'s owner is
+                // optional (a Flow object may belong to no project) and is resolved by its
+                // own match arm through `resolve_flow_object_owner`, not through this
+                // mandatory-owner path. This arm exists only so the match stays exhaustive
+                // over every `OwnerLookup` variant instead of silently falling into the `_`
+                // arm below and calling the wrong endpoint if a future refactor ever did
+                // route it here.
+                Err(format!(
+                    "Tool '{tool_name}' is refused: FlowObject ownership must be resolved through \
+                     resolve_flow_object_owner, not resolve_owning_project"
+                ))
+            }
             OwnerLookup::FormData => self.resolve_form_data_owner(tool_name, args).await,
             OwnerLookup::Sprint | OwnerLookup::Comment => {
                 let id = required_owner_argument(tool_name, lookup, args)?;
@@ -790,6 +899,24 @@ impl McpServer {
                     .map(|owner| owner.project_id)
             }
         }
+    }
+
+    /// Reads a Flow object's owning project back from the API, or `None` when the object
+    /// belongs to no project at all — the one owner-bearing resource in this file for which
+    /// that is a legitimate, expected answer rather than a resolution failure. Not cached: a
+    /// v0.4 read is one call, and `project_id_cache`'s `ResolvedOwner` is typed for a
+    /// mandatory `project_id`, which a projectless Flow object does not have.
+    async fn resolve_flow_object_owner(&self, tool_name: &str, args: &Value) -> Result<Option<String>, String> {
+        let object_id = required_owner_argument(tool_name, OwnerLookup::FlowObject, args)?;
+        let response = self
+            .client
+            .get_flow_object(&object_id, "")
+            .await
+            .map_err(|error| format!("Failed to resolve owning project for flow object {object_id}: {error}"))?;
+        let data = response
+            .get("data")
+            .ok_or_else(|| format!("API response for flow object {object_id} carries no data"))?;
+        Ok(data.get("project_id").and_then(Value::as_str).map(str::to_string))
     }
 
     /// Resolves the owner of a form, record or attachment. When the caller names both a
@@ -959,6 +1086,28 @@ impl McpServer {
                      '{owner}'; refusing to evaluate the project agent policy against a foreign project"
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// For an id addressed call whose target turned out to belong to no project (a Flow
+    /// object with `project_id = null`): any project claim in the payload is foreign by
+    /// construction, since there is no real owner to match it against, so it is refused
+    /// rather than silently ignored (`mcp-surface-v1.md`: "如 payload 任意位置出现 project
+    /// claim，必须拒绝而非忽略").
+    #[allow(clippy::unused_self)]
+    fn reject_any_project_claim(&self, tool_name: &str, args: &Value) -> Result<(), String> {
+        if let Some(claimed) = claimed_project_ids(args).into_iter().next() {
+            let claimed = sanitize_for_error(&claimed);
+            tracing::warn!(
+                tool_name = %tool_name,
+                declared_project_id = %claimed,
+                "Refusing call: caller supplied a project_id for a target that belongs to no project"
+            );
+            return Err(format!(
+                "Tool '{tool_name}' was called with project_id '{claimed}', but the target belongs to no project; \
+                 refusing to evaluate a project agent policy that cannot exist"
+            ));
         }
         Ok(())
     }
@@ -2086,7 +2235,7 @@ mod tests {
 
     #[test]
     fn embedded_skill_guide_matches_registered_universal_tool_surface() {
-        assert!(SKILL_GUIDE_MD.contains("## Tools (98)"));
+        assert!(SKILL_GUIDE_MD.contains("## Tools (107)"));
         assert!(SKILL_GUIDE_MD.contains("bot_operation_logs.list"));
         assert!(SKILL_GUIDE_MD.contains("scenario_templates.install"));
         assert!(SKILL_GUIDE_MD.contains("forms.list"));
@@ -2109,7 +2258,17 @@ mod tests {
         assert!(SKILL_GUIDE_MD.contains("plugins.install"));
         assert!(SKILL_GUIDE_MD.contains("plugin_invocations.list"));
         assert!(SKILL_GUIDE_MD.contains("decimal/amount form fields: send decimal strings"));
+        assert!(SKILL_GUIDE_MD.contains("flow.feature_get"));
+        assert!(SKILL_GUIDE_MD.contains("flow.feature_set"));
+        assert!(SKILL_GUIDE_MD.contains("objects.get"));
+        assert!(SKILL_GUIDE_MD.contains("objects.query"));
+        assert!(SKILL_GUIDE_MD.contains("objects.history"));
+        assert!(SKILL_GUIDE_MD.contains("legacy_pages.inventory"));
+        assert!(SKILL_GUIDE_MD.contains("legacy_pages.import_preview"));
+        assert!(SKILL_GUIDE_MD.contains("legacy_pages.import_commit"));
+        assert!(SKILL_GUIDE_MD.contains("legacy_pages.import_status"));
         assert!(!SKILL_GUIDE_MD.contains("Tools (65)"));
+        assert!(!SKILL_GUIDE_MD.contains("Tools (98)"));
         assert!(AGENTS_GUIDE_MD.contains("cargo build --release --bin mcp-server"));
     }
 
@@ -2223,6 +2382,20 @@ mod tests {
         );
     }
 
+    /// Tools whose schema carries no `project_id` or ownership argument but which are
+    /// nonetheless a Flow *administrative* operation (`WorkspaceWideAdmin`, not plain
+    /// `WorkspaceWide`). Nothing in a schema shape distinguishes "workspace wide" from
+    /// "workspace wide and admin only" — both address a workspace, never a project or a
+    /// project-owned resource — so unlike every other branch of the derivation below this
+    /// one is necessarily a name list, exactly like the `destructive` list further down.
+    const WORKSPACE_ADMIN_TOOLS: [&str; 5] = [
+        "flow.feature_set",
+        "legacy_pages.inventory",
+        "legacy_pages.import_preview",
+        "legacy_pages.import_commit",
+        "legacy_pages.import_status",
+    ];
+
     /// The coverage gate. It re-derives the scope of every tool from the *live* registry
     /// (`tools::get_all_tool_definitions`), so it sees exactly the tools that are served
     /// and cannot be fooled by naming: a name based filter never saw `events.tail`, which
@@ -2249,14 +2422,26 @@ mod tests {
                 // the flag from the schema would let an optional `project_id` make the
                 // caller choose whether project policy applies, degrading an omitted id
                 // into a workspace-wide read. A tool that accepts a `project_id` is always
-                // gated on one; `declared_project_id_is_mandatory_for_every_project_scoped_tool`
-                // holds the other half of the invariant on the schema itself.
-                PolicyScope::DeclaredProject { required: true }
+                // gated on one *unless* its schema also carries the explicit `unprojected`
+                // marker, which is Flow's one deliberate exception
+                // (`mcp-surface-v1.md`: "project_id=None：降级 WorkspaceWide" for
+                // `objects.query`): a caller may address a project directly, or opt into
+                // the workspace-wide, no-project-policy branch by name. Any tool that wants
+                // that bypass has to say so in its own schema, so the marker — not a name
+                // list — is what `declared_project_id_is_mandatory_for_every_project_scoped_tool`
+                // checks below too.
+                if properties.contains_key("unprojected") {
+                    PolicyScope::DeclaredProject { required: false }
+                } else {
+                    PolicyScope::DeclaredProject { required: true }
+                }
             } else if let Some((_, lookup)) = OWNERSHIP_ARGUMENTS
                 .iter()
                 .find(|(argument, _)| properties.contains_key(*argument))
             {
                 PolicyScope::OwnedBy(*lookup)
+            } else if WORKSPACE_ADMIN_TOOLS.contains(&tool.name.as_str()) {
+                PolicyScope::WorkspaceWideAdmin
             } else {
                 PolicyScope::WorkspaceWide
             };
@@ -2308,27 +2493,40 @@ mod tests {
     /// `PolicyScope::DeclaredProject { required: false }` is a bypass, not a relaxation:
     /// `resolve_policy_project_id` answers `Ok(None)` for it and `enforce_project_tool_policy`
     /// then returns `Ok(())` without reading any policy, while the tool itself still runs
-    /// against a workspace addressed endpoint.
+    /// against a workspace addressed endpoint. Flow's `objects.query` is the one deliberate
+    /// use of it (`mcp-surface-v1.md` describes this as `project_id=None` falling back to
+    /// `WorkspaceWide`), and it is only
+    /// legitimate because its schema says so explicitly with the `unprojected` marker
+    /// alongside `project_id` — a tool that used the bypass without also declaring both
+    /// properties would be indistinguishable from a hole and is still refused here.
     ///
     /// The invariant is checked against the *live registry*, not against a name list, so a
     /// tool added later with an optional `project_id` fails here instead of shipping as a
-    /// hole. Both halves matter: the scope table must say `required: true`, and the
-    /// published schema must tell the caller so.
+    /// hole. Three things matter: a `required: true` tool's scope table must say so and its
+    /// published schema must require `project_id`; a `required: false` tool must declare
+    /// both `project_id` and `unprojected` in its schema.
     #[test]
     fn declared_project_id_is_mandatory_for_every_project_scoped_tool() {
-        let mut optional_scope = Vec::new();
+        let mut bad_optional_scope = Vec::new();
         let mut optional_schema = Vec::new();
 
         for tool in &crate::tools::get_all_tool_definitions() {
-            if tool_policy_scope(&tool.name) == (PolicyScope::DeclaredProject { required: false }) {
-                optional_scope.push(tool.name.clone());
-            }
-
-            let declares_project_id = tool
+            let properties = tool
                 .input_schema
                 .get("properties")
                 .and_then(Value::as_object)
-                .is_some_and(|properties| properties.contains_key("project_id"));
+                .cloned()
+                .unwrap_or_default();
+            let declares_project_id = properties.contains_key("project_id");
+            let declares_unprojected = properties.contains_key("unprojected");
+
+            if tool_policy_scope(&tool.name) == (PolicyScope::DeclaredProject { required: false }) {
+                if !declares_project_id || !declares_unprojected {
+                    bad_optional_scope.push(tool.name.clone());
+                }
+                continue;
+            }
+
             if !declares_project_id {
                 continue;
             }
@@ -2343,8 +2541,8 @@ mod tests {
         }
 
         assert!(
-            optional_scope.is_empty(),
-            "these tools are gated on a project_id the caller may omit, which skips the policy entirely: {optional_scope:?}"
+            bad_optional_scope.is_empty(),
+            "these tools use the projectless bypass without declaring both project_id and unprojected in their schema, so the bypass is not visible to a caller reading the schema: {bad_optional_scope:?}"
         );
         assert!(
             optional_schema.is_empty(),

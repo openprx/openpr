@@ -2,9 +2,12 @@ pub mod capabilities;
 pub mod comments;
 pub mod context;
 pub mod files;
+pub mod flow_features;
 pub mod forms;
 pub mod labels;
+pub mod legacy_pages;
 pub mod members;
+pub mod objects;
 pub mod operation_logs;
 pub mod plugins;
 pub mod project_types;
@@ -119,6 +122,15 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         scenario_tools::approval_request_tool(),
         scenario_tools::inspection_report_tool(),
         scenario_tools::corrective_action_propose_tool(),
+        flow_features::get_flow_feature_tool(),
+        flow_features::set_flow_feature_tool(),
+        objects::get_flow_object_tool(),
+        objects::query_flow_objects_tool(),
+        objects::get_flow_object_history_tool(),
+        legacy_pages::legacy_pages_inventory_tool(),
+        legacy_pages::legacy_pages_import_preview_tool(),
+        legacy_pages::legacy_pages_import_commit_tool(),
+        legacy_pages::legacy_pages_import_status_tool(),
     ]
 }
 
@@ -199,6 +211,15 @@ mod tests {
             "approval.request",
             "inspection.report",
             "corrective_action.propose",
+            "flow.feature_get",
+            "flow.feature_set",
+            "objects.get",
+            "objects.query",
+            "objects.history",
+            "legacy_pages.inventory",
+            "legacy_pages.import_preview",
+            "legacy_pages.import_commit",
+            "legacy_pages.import_status",
         ] {
             assert!(
                 unique.contains(expected),
@@ -207,8 +228,8 @@ mod tests {
         }
         assert_eq!(
             tools.len(),
-            98,
-            "Universal forms, plugins, and operation logs should expose 98 MCP tools"
+            107,
+            "Universal forms, plugins, operation logs, and Flow v0.4 should expose 107 MCP tools"
         );
     }
 }

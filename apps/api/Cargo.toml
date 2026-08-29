@@ -19,6 +19,7 @@ hmac = "0.12"
 hex = "0.4"
 image.workspace = true
 jsonwebtoken.workspace = true
+parking_lot = "0.12"
 platform = { path = "../../crates/platform" }
 rand = "0.8"
 reqwest.workspace = true
@@ -36,6 +37,8 @@ wasmtime.workspace = true
 
 [dev-dependencies]
 wat = "1"
+tokio-tungstenite = "0.26"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 
 [lints]
 workspace = true

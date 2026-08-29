@@ -83,10 +83,10 @@ TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
 TOOLS=$(printf '%s' "$TOOLS_RESPONSE" | \
   python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
 
-if [ "${TOOLS:-0}" -eq 98 ] 2>/dev/null; then
+if [ "${TOOLS:-0}" -eq 107 ] 2>/dev/null; then
   echo "✅ tools/list: $TOOLS tools available"
 else
-  echo "❌ tools/list expected exactly 98 tools, got ${TOOLS:-0}"
+  echo "❌ tools/list expected exactly 107 tools, got ${TOOLS:-0}"
   exit 1
 fi
 
@@ -156,6 +156,15 @@ required = {
     "approval.request",
     "inspection.report",
     "corrective_action.propose",
+    "flow.feature_get",
+    "flow.feature_set",
+    "objects.get",
+    "objects.query",
+    "objects.history",
+    "legacy_pages.inventory",
+    "legacy_pages.import_preview",
+    "legacy_pages.import_commit",
+    "legacy_pages.import_status",
 }
 payload = json.load(sys.stdin)
 names = {tool["name"] for tool in payload["result"]["tools"]}

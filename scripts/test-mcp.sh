@@ -11,7 +11,7 @@ set -e
 #   OPENPR_MCP_BOT_TOKEN   Call as this workspace bot instead (opr_ prefix).
 
 MCP_URL="${MCP_URL:-http://localhost:8090}"
-EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-98}"
+EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-107}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${OPENPR_CONFIG_FILE:-$PROJECT_ROOT/config/openpr.compose.mcp.toml}"
 
@@ -164,7 +164,16 @@ for required_tool in \
   "release.readiness.get" \
   "scenario_templates.list" \
   "scenario_templates.get" \
-  "scenario_templates.install"; do
+  "scenario_templates.install" \
+  "flow.feature_get" \
+  "flow.feature_set" \
+  "objects.get" \
+  "objects.query" \
+  "objects.history" \
+  "legacy_pages.inventory" \
+  "legacy_pages.import_preview" \
+  "legacy_pages.import_commit" \
+  "legacy_pages.import_status"; do
   if ! printf '%s\n' "$tool_names" | grep -Fxq "$required_tool"; then
     echo "❌ Missing required MCP tool: $required_tool"
     echo "$tool_names"

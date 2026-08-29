@@ -415,15 +415,22 @@ impl Default for AuditConfig {
 /// database default (`limits-v1.md`'s `dispatch_max_attempts` row) precisely so this value has to
 /// come from a deployment's own configuration rather than an invented literal in the insert
 /// statement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// `collab_allowed_origins` is the `ADR-0007` "严格 Origin allowlist" a collab ticket's `Origin`
+/// must belong to, both at ticket issuance and at WebSocket upgrade. Each entry is a normalized
+/// `scheme://host[:port]` literal (no path, no wildcard); empty means no origin is allowed
+/// (fail closed, matching every other Flow gate's "absent means off" convention).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowConfig {
     pub dispatch_max_attempts: i32,
+    pub collab_allowed_origins: Vec<String>,
 }
 
 impl Default for FlowConfig {
     fn default() -> Self {
         Self {
             dispatch_max_attempts: DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS,
+            collab_allowed_origins: Vec::new(),
         }
     }
 }
@@ -576,6 +583,11 @@ pub struct AppConfig {
     /// [`Self::from_config`]: by the time a handler reads this field, `true` implies `bind_addr`
     /// is a loopback host.
     pub allow_insecure_cookies: bool,
+    /// See [`FlowConfig::collab_allowed_origins`]. Copied onto `AppConfig` (rather than read
+    /// through `crate::config::runtime()` the way `dispatch_max_attempts` is) so every handler
+    /// and test that already builds an `AppConfig` by hand can set it directly, per-case, instead
+    /// of racing a process-wide `OnceLock` install.
+    pub collab_allowed_origins: Vec<String>,
 }
 
 impl AppConfig {
@@ -635,6 +647,7 @@ impl AppConfig {
             jwt_refresh_ttl_seconds: config.auth.refresh_ttl_seconds,
             default_author_id: config.auth.default_author_id,
             allow_insecure_cookies: config.auth.allow_insecure_cookies,
+            collab_allowed_origins: config.flow.collab_allowed_origins.clone(),
         })
     }
 }
@@ -650,6 +663,7 @@ impl std::fmt::Debug for AppConfig {
             .field("jwt_refresh_ttl_seconds", &self.jwt_refresh_ttl_seconds)
             .field("default_author_id", &self.default_author_id)
             .field("allow_insecure_cookies", &self.allow_insecure_cookies)
+            .field("collab_allowed_origins", &self.collab_allowed_origins)
             .finish()
     }
 }

@@ -33,7 +33,7 @@ impl RuntimeConfig {
         Self {
             storage: config.storage.clone(),
             outbound: config.outbound.clone(),
-            flow: config.flow,
+            flow: config.flow.clone(),
         }
     }
 

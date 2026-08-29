@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// JSON-RPC 2.0 Request
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -161,6 +161,28 @@ impl CallToolResult {
     pub fn error(msg: impl Into<String>) -> Self {
         Self {
             content: vec![ToolContent::error(msg)],
+            is_error: Some(true),
+        }
+    }
+
+    /// A Flow-style typed business error: `isError:true` and a first text content that is
+    /// pure UTF-8 JSON shaped `{"error":{"code","message","recoverable","details"}}`
+    /// (`error-mapping-v1.md`: "Flow 业务错误返回 result.isError=true，首个 text content 是
+    /// UTF-8 JSON"). Deliberately distinct from [`Self::error`], whose `"Error: "` prefixed
+    /// plain text every one of this server's pre-Flow tools already returns and whose
+    /// callers/tests depend on: this constructor never prefixes or otherwise mangles `body`,
+    /// so a client that parses the JSON gets exactly the stable `code` the contract promises.
+    pub fn business_error(code: &str, message: impl Into<String>, recoverable: bool, details: &Value) -> Self {
+        let body = json!({
+            "error": {
+                "code": code,
+                "message": message.into(),
+                "recoverable": recoverable,
+                "details": details,
+            }
+        });
+        Self {
+            content: vec![ToolContent::Text { text: body.to_string() }],
             is_error: Some(true),
         }
     }

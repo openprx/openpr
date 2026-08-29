@@ -103,6 +103,7 @@ struct RawAuth {
 #[serde(deny_unknown_fields)]
 struct RawFlow {
     dispatch_max_attempts: Option<i32>,
+    collab_allowed_origins: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -501,8 +502,61 @@ impl RawFlow {
                     DEFAULT_FLOW_DISPATCH_MAX_ATTEMPTS
                 }
             });
-        FlowConfig { dispatch_max_attempts }
+        let collab_allowed_origins = self
+            .collab_allowed_origins
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| issues.record(validate_origin_entry(&entry)))
+            .collect();
+        FlowConfig {
+            dispatch_max_attempts,
+            collab_allowed_origins,
+        }
     }
+}
+
+/// Checks one `flow.collab_allowed_origins` entry (`ADR-0007`'s ticket/upgrade Origin allowlist).
+///
+/// Unlike `outbound.allowed_hosts`, this *is* a scheme-qualified origin (`scheme://host[:port]`,
+/// no path, no wildcard) — a browser's `Origin` header is never anything else, so accepting a bare
+/// host here would silently never match.
+fn validate_origin_entry(entry: &str) -> Result<String, String> {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return Err("flow.collab_allowed_origins must not contain empty entries".to_string());
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "flow.collab_allowed_origins entry {entry} must not contain whitespace"
+        ));
+    }
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(format!(
+            "flow.collab_allowed_origins entry {entry} must be scheme://host[:port]"
+        ));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "flow.collab_allowed_origins entry {entry} has scheme {scheme}, expected http or https"
+        ));
+    }
+    if rest.contains('/') {
+        return Err(format!(
+            "flow.collab_allowed_origins entry {entry} must not contain a path"
+        ));
+    }
+    if rest.is_empty() {
+        return Err(format!("flow.collab_allowed_origins entry {entry} names no host"));
+    }
+    let authority = rest.to_ascii_lowercase();
+    if let Some((host, port)) = split_host_port(&authority) {
+        validate_port(&format!("flow.collab_allowed_origins entry {entry}"), port)?;
+        if host.is_empty() {
+            return Err(format!("flow.collab_allowed_origins entry {entry} names no host"));
+        }
+    }
+    Ok(format!("{scheme}://{authority}"))
 }
 
 impl RawS3 {

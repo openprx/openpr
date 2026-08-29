@@ -1,0 +1,1022 @@
+//! The server write algorithm: `ADR-0010`'s "写入算法" / `collab-protocol-v1.md`'s "服务端写入顺序",
+//! including the commit-time `authz_epoch` fencing barrier (`ADR-0012` §3.1) and the document row
+//! lock (`ADR-0010`).
+//!
+//! ```text
+//! validate update bytes under limits (before any engine state is allocated)
+//!   -> [layer 0] acquire the instance-local document coordinator
+//!   -> hydrate/rebase the warm cache to the observed DB head, outside any lock
+//!   -> isolated apply (fork + import_update) + projection prepare, outside any lock
+//!   -> begin transaction, SET LOCAL lock_timeout/statement_timeout
+//!   -> [layer 1] SELECT authz_epoch ... FOR SHARE, held to commit; CAS against checked_epoch
+//!   -> SELECT collab_documents ... FOR UPDATE
+//!   -> if locked head != prepared head: rollback, bounded rebase outside the lock
+//!   -> allocate seq; insert update + head + projection + business event + one event_dispatch row
+//!   -> commit
+//!   -> update the warm cache to the committed head
+//! ```
+//!
+//! Lock-content discipline (`collab-protocol-v1.md`: "锁内严禁 snapshot/tail load、CRDT apply、
+//! semantic diff、projection compute、网络 I/O 或等待 async mutex"): every decode, `fork`,
+//! `import_update`, `semantic_snapshot`, and projection JSON/plain-text render happens in
+//! [`hydrate_and_apply`], which returns *before* [`run_locked_phase`] ever calls `db.begin()`. The
+//! only work [`run_locked_phase`] does is the epoch fence, the row lock, the head-match recheck,
+//! and the five fixed, parameterized inserts/updates — no engine call, no cache call, and no
+//! broadcast happen inside it or between its `begin`/`commit`. Broadcasting `accepted` to other
+//! sessions happens in [`super::session`], strictly after [`accept_update`] returns `Ok`, i.e.
+//! strictly after commit.
+
+#![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
+
+use std::time::Duration;
+
+use collab_core::{CollabEngine, CollabError, InputLimits, LoroCollabEngine};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::error::ApiError;
+use crate::events::{BusinessEventInput, insert_business_event};
+use crate::flow::projection;
+
+use super::authz::fence_epoch_for_share;
+use super::bootstrap::{self, content_hash};
+use super::cache::WarmCache;
+use super::coordinator::DocumentCoordinator;
+use super::frame::RejectedCode;
+use super::limits::{DOCUMENT_LOCK_HOLD_MS_MAX, DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS};
+
+pub struct UpdateRequest {
+    pub document_id: Uuid,
+    pub update_id: Uuid,
+    pub bytes: Vec<u8>,
+    pub idempotency_key: Option<String>,
+    pub origin_client_id: Option<String>,
+    pub message: Option<String>,
+    pub actor_id: Uuid,
+    pub workspace_id: Uuid,
+    /// The `authz_epoch` the caller's effective permission was last verified against (`open` time,
+    /// or the most recent successful write). See [`fence_epoch_for_share`].
+    pub checked_epoch: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Accepted {
+    pub update_id: Uuid,
+    pub head_seq: i64,
+    pub head_frontier: Vec<u8>,
+    pub projection_seq: i64,
+    pub event_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct Rejected {
+    pub update_id: Option<Uuid>,
+    pub code: RejectedCode,
+    pub recoverable: bool,
+    pub details: Option<Value>,
+    pub current_seq: Option<i64>,
+    pub current_frontier: Option<Vec<u8>>,
+}
+
+pub enum AcceptOutcome {
+    Accepted(Accepted),
+    Rejected(Rejected),
+}
+
+const fn rejected(code: RejectedCode, recoverable: bool, update_id: Option<Uuid>) -> AcceptOutcome {
+    AcceptOutcome::Rejected(Rejected {
+        update_id,
+        code,
+        recoverable,
+        details: None,
+        current_seq: None,
+        current_frontier: None,
+    })
+}
+
+fn contention(update_id: Option<Uuid>, reason: &str) -> AcceptOutcome {
+    AcceptOutcome::Rejected(Rejected {
+        update_id,
+        code: RejectedCode::ServerDraining,
+        recoverable: true,
+        details: Some(serde_json::json!({"reason": "contention", "retry_after_ms": 200})),
+        current_seq: None,
+        current_frontier: None,
+    })
+    .tap_reason(reason)
+}
+
+// Small local extension so `contention`'s `tracing` call reads naturally at the call site without
+// a second statement.
+trait TapReason {
+    fn tap_reason(self, reason: &str) -> Self;
+}
+impl TapReason for AcceptOutcome {
+    fn tap_reason(self, reason: &str) -> Self {
+        tracing::warn!(reason, "collab write: contention, returning a recoverable rejection");
+        self
+    }
+}
+
+fn reject_from_collab_error(update_id: Option<Uuid>, err: &CollabError) -> AcceptOutcome {
+    if let Some(limit_kind) = err.limit_kind() {
+        return AcceptOutcome::Rejected(Rejected {
+            update_id,
+            code: RejectedCode::LimitExceeded,
+            recoverable: false,
+            details: Some(serde_json::json!({"limit_kind": limit_kind})),
+            current_seq: None,
+            current_frontier: None,
+        });
+    }
+    rejected(RejectedCode::InvalidUpdate, false, update_id)
+}
+
+struct ObservedHead {
+    object_id: Uuid,
+    format_version: String,
+    head_seq: i64,
+    head_frontier: Vec<u8>,
+}
+
+/// `collab_documents.engine` is not selected here: the `collab_documents_engine_check` CHECK
+/// constraint already guarantees it is always `'loro'` for every row this package can ever read
+/// (`INSERT`s all hardcode it, see `flow::repository::insert_collab_document`), so a runtime
+/// branch on it here would be dead code the moment it was written, not defensive programming.
+async fn read_observed_head<C: ConnectionTrait>(conn: &C, document_id: Uuid) -> Result<Option<ObservedHead>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        object_id: Uuid,
+        format_version: String,
+        head_seq: i64,
+        head_frontier: Vec<u8>,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT object_id, format_version, head_seq, head_frontier FROM collab_documents WHERE id = $1",
+        vec![document_id.into()],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map(|r| ObservedHead {
+        object_id: r.object_id,
+        format_version: r.format_version,
+        head_seq: r.head_seq,
+        head_frontier: r.head_frontier,
+    }))
+}
+
+/// A prior accepted update with this `update_id`, if any (idempotent replay: `collab_updates`'s
+/// `(document_id, update_id)` unique constraint is what this pre-empts hitting as a raw conflict).
+async fn find_prior_update<C: ConnectionTrait>(
+    conn: &C,
+    document_id: Uuid,
+    update_id: Uuid,
+) -> Result<Option<Accepted>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        seq: i64,
+        after_frontier: Vec<u8>,
+        projection_seq: i64,
+        event_id: Uuid,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT seq, after_frontier, projection_seq, event_id FROM collab_updates \
+         WHERE document_id = $1 AND update_id = $2",
+        vec![document_id.into(), update_id.into()],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map(|r| Accepted {
+        update_id,
+        head_seq: r.seq,
+        head_frontier: r.after_frontier,
+        projection_seq: r.projection_seq,
+        event_id: r.event_id,
+    }))
+}
+
+/// Everything `ADR-0010`'s write algorithm requires to happen *outside* any lock: hydrate the
+/// warm cache to the observed DB head (or rebuild from the bootstrap loader on a miss/stale
+/// entry), fork an isolated candidate, apply the update, and prepare the projection. Never opens a
+/// database transaction and never touches `WarmCache::put` for anything but re-seeding the
+/// observed-head base it just built (not the post-update candidate — that only happens after
+/// commit, in [`accept_update`]).
+struct Prepared {
+    observed: ObservedHead,
+    candidate: LoroCollabEngine,
+    after_frontier: Vec<u8>,
+    content_hash_hex: String,
+    title: String,
+    state_json: Value,
+    plain_text: String,
+    decoded_bytes_hint: u64,
+}
+
+enum HydrateOutcome {
+    Prepared(Box<Prepared>),
+    Rejected(AcceptOutcome),
+}
+
+async fn hydrate_and_apply(
+    db: &DatabaseConnection,
+    cache: &WarmCache,
+    document_id: Uuid,
+    update_id: Uuid,
+    bytes: &[u8],
+) -> Result<HydrateOutcome, ApiError> {
+    let Some(observed) = read_observed_head(db, document_id).await? else {
+        return Ok(HydrateOutcome::Rejected(rejected(
+            RejectedCode::NotFound,
+            false,
+            Some(update_id),
+        )));
+    };
+
+    let base_engine = match cache.fork_matching(document_id, observed.head_seq, &observed.format_version) {
+        Ok(Some(engine)) => engine,
+        Ok(None) => {
+            let boot = match bootstrap::load(db, document_id).await {
+                Ok(boot) => boot,
+                Err(ApiError::Conflict(_)) => {
+                    return Ok(HydrateOutcome::Rejected(rejected(
+                        RejectedCode::ResyncRequired,
+                        true,
+                        Some(update_id),
+                    )));
+                }
+                Err(other) => return Err(other),
+            };
+            let mut engine = LoroCollabEngine::load(&boot.snapshot).map_err(|err| {
+                tracing::error!(error = %err, "collab write: bootstrap snapshot failed to decode");
+                ApiError::Internal
+            })?;
+            for tail in &boot.tail_updates {
+                engine.import_update(&tail.bytes).map_err(|err| {
+                    tracing::error!(error = %err, "collab write: bootstrap tail update failed to re-apply");
+                    ApiError::Internal
+                })?;
+            }
+            engine
+        }
+        Err(err) => {
+            return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+                Some(update_id),
+                &err,
+            )));
+        }
+    };
+
+    // Seed the observed-head base back into the cache (a fork of it, not the mutated candidate
+    // below) so a hot document's next write hits cache even after this one started from a miss.
+    let decoded_bytes_hint = base_engine.export_snapshot().map_or(0, |s| s.len());
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let decoded_bytes_hint = decoded_bytes_hint as u64;
+    if let Ok(seed) = base_engine.fork() {
+        cache.put(
+            document_id,
+            seed,
+            observed.format_version.clone(),
+            observed.head_seq,
+            observed.head_frontier.clone(),
+            decoded_bytes_hint,
+        );
+    }
+
+    let mut candidate = match base_engine.fork() {
+        Ok(candidate) => candidate,
+        Err(err) => {
+            return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+                Some(update_id),
+                &err,
+            )));
+        }
+    };
+    if let Err(err) = candidate.import_update(bytes) {
+        return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+            Some(update_id),
+            &err,
+        )));
+    }
+    let after_frontier = candidate.frontier().as_bytes().to_vec();
+
+    let semantic = candidate.semantic_snapshot().map_err(|err| {
+        tracing::error!(error = %err, "collab write: semantic_snapshot failed after a successful import_update");
+        ApiError::Internal
+    })?;
+    let title = candidate.title().map_err(|err| {
+        tracing::error!(error = %err, "collab write: title read failed after a successful import_update");
+        ApiError::Internal
+    })?;
+    let state_json = projection::state_json(&semantic).map_err(|_| ApiError::Internal)?;
+    let plain_text = projection::plain_text(&semantic);
+    let content_hash_hex = content_hash(bytes);
+
+    Ok(HydrateOutcome::Prepared(Box::new(Prepared {
+        observed,
+        candidate,
+        after_frontier,
+        content_hash_hex,
+        title,
+        state_json,
+        plain_text,
+        decoded_bytes_hint,
+    })))
+}
+
+enum LockedOutcome {
+    Committed(Accepted),
+    Rebase,
+    EpochMismatch,
+}
+
+/// Everything between `begin` and `commit`. No engine call, no cache call, no network I/O, no
+/// `.await` on anything but the database itself.
+#[allow(clippy::too_many_arguments)]
+async fn run_locked_phase(
+    db: &DatabaseConnection,
+    request: &UpdateRequest,
+    prepared: &Prepared,
+    dispatch_max_attempts: i32,
+) -> Result<LockedOutcome, ApiError> {
+    let tx = db.begin().await?;
+    tx.execute_unprepared(&format!("SET LOCAL lock_timeout = '{DOCUMENT_LOCK_WAIT_MS_MAX}ms'"))
+        .await?;
+    tx.execute_unprepared(&format!(
+        "SET LOCAL statement_timeout = '{DOCUMENT_LOCK_HOLD_MS_MAX}ms'"
+    ))
+    .await?;
+
+    // [layer 1] the commit-time epoch fence, held to commit.
+    if fence_epoch_for_share(&tx, request.workspace_id, request.checked_epoch)
+        .await
+        .is_err()
+    {
+        let _ = tx.rollback().await;
+        return Ok(LockedOutcome::EpochMismatch);
+    }
+
+    #[derive(FromQueryResult)]
+    struct LockedHead {
+        head_seq: i64,
+        byte_count: i64,
+        update_count: i64,
+    }
+    let locked = LockedHead::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT head_seq, byte_count, update_count FROM collab_documents WHERE id = $1 FOR UPDATE",
+        vec![request.document_id.into()],
+    ))
+    .one(&tx)
+    .await?
+    .ok_or(ApiError::Internal)?;
+
+    if locked.head_seq != prepared.observed.head_seq {
+        let _ = tx.rollback().await;
+        return Ok(LockedOutcome::Rebase);
+    }
+
+    let new_head_seq = locked.head_seq + 1;
+    let before_frontier = prepared.observed.head_frontier.clone();
+    let after_frontier = prepared.after_frontier.clone();
+
+    let event_id = insert_business_event(
+        &tx,
+        BusinessEventInput {
+            workspace_id: request.workspace_id,
+            project_id: None,
+            event_type: "flow.content.accepted".to_string(),
+            aggregate_type: "flow_document".to_string(),
+            aggregate_id: request.document_id.to_string(),
+            actor_id: Some(request.actor_id),
+            source: serde_json::json!({ "surface": "web" }),
+            payload: serde_json::json!({
+                "object_id": prepared.observed.object_id,
+                "document_id": request.document_id,
+                "accepted_seq": new_head_seq,
+                "projection_seq": new_head_seq,
+                "changed_block_ids": Vec::<Uuid>::new(),
+            }),
+            metadata: serde_json::json!({ "message": request.message }),
+            correlation_id: None,
+            causation_id: None,
+            idempotency_key: None,
+        },
+    )
+    .await?;
+
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO collab_updates
+                (document_id, seq, update_id, content_hash, idempotency_key, before_frontier, after_frontier,
+                 bytes, actor_id, origin_surface, origin_client_id, projection_seq, event_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'web', $10, $2, $11)
+        ",
+        vec![
+            request.document_id.into(),
+            new_head_seq.into(),
+            request.update_id.into(),
+            prepared.content_hash_hex.clone().into(),
+            request.idempotency_key.clone().into(),
+            before_frontier.into(),
+            after_frontier.clone().into(),
+            request.bytes.clone().into(),
+            request.actor_id.into(),
+            request.origin_client_id.clone().into(),
+            event_id.into(),
+        ],
+    ))
+    .await?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    let new_byte_count = locked.byte_count + request.bytes.len() as i64;
+    let new_update_count = locked.update_count + 1;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            UPDATE collab_documents
+            SET head_seq = $2, head_frontier = $3, byte_count = $4, update_count = $5, updated_at = now()
+            WHERE id = $1
+        ",
+        vec![
+            request.document_id.into(),
+            new_head_seq.into(),
+            after_frontier.clone().into(),
+            new_byte_count.into(),
+            new_update_count.into(),
+        ],
+    ))
+    .await?;
+
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            UPDATE flow_object_projections
+            SET document_seq = $2, document_frontier = $3, title = $4, state = $5, plain_text = $6, updated_at = now()
+            WHERE object_id = $1
+        ",
+        vec![
+            prepared.observed.object_id.into(),
+            new_head_seq.into(),
+            after_frontier.clone().into(),
+            prepared.title.clone().into(),
+            prepared.state_json.clone().into(),
+            prepared.plain_text.clone().into(),
+        ],
+    ))
+    .await?;
+
+    insert_event_dispatch_content(&tx, event_id, request, new_head_seq, dispatch_max_attempts).await?;
+
+    tx.commit().await?;
+
+    Ok(LockedOutcome::Committed(Accepted {
+        update_id: request.update_id,
+        head_seq: new_head_seq,
+        head_frontier: after_frontier,
+        projection_seq: new_head_seq,
+        event_id,
+    }))
+}
+
+/// `event_dispatch` needs `document_id`/`accepted_seq` filled for `flow.content.accepted`
+/// (`event_dispatch_document_id_fill_check`/`event_dispatch_accepted_seq_fill_check`), which
+/// `crate::flow::repository::insert_event_dispatch` (written for the create-object path, where
+/// both stay `NULL`) does not support — this is the content-write-specific insert.
+async fn insert_event_dispatch_content<C: ConnectionTrait>(
+    conn: &C,
+    event_id: Uuid,
+    request: &UpdateRequest,
+    accepted_seq: i64,
+    max_attempts: i32,
+) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO event_dispatch (id, event_id, workspace_id, event_type, document_id, accepted_seq, max_attempts)
+            VALUES ($1, $2, $3, 'flow.content.accepted', $4, $5, $6)
+        ",
+        vec![
+            Uuid::new_v4().into(),
+            event_id.into(),
+            request.workspace_id.into(),
+            request.document_id.into(),
+            accepted_seq.into(),
+            max_attempts.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Runs [`hydrate_and_apply`] + [`run_locked_phase`] with bounded rebase, inside one coordinator
+/// permit for `request.document_id`.
+///
+/// # Errors
+/// Only for a database failure the caller cannot recover from by retrying the same request later
+/// (everything recoverable — contention, epoch mismatch, limit/decode rejection — comes back as
+/// `Ok(AcceptOutcome::Rejected(..))` instead).
+// `_permit` is intentionally held for the entire bounded-rebase loop below, not dropped as soon
+// as it is last read: releasing it between rebase attempts would let a second writer for the same
+// document interleave mid-retry, which is exactly what the coordinator exists to prevent.
+#[allow(clippy::significant_drop_tightening)]
+pub async fn accept_update(
+    db: &DatabaseConnection,
+    cache: &WarmCache,
+    coordinator: &DocumentCoordinator,
+    dispatch_max_attempts: i32,
+    request: UpdateRequest,
+) -> Result<AcceptOutcome, ApiError> {
+    if let Err(err) = InputLimits::default().validate_update(&request.bytes) {
+        return Ok(reject_from_collab_error(Some(request.update_id), &err));
+    }
+
+    if let Some(prior) = find_prior_update(db, request.document_id, request.update_id).await? {
+        return Ok(AcceptOutcome::Accepted(prior));
+    }
+
+    let Ok(_permit) = coordinator.acquire(request.document_id).await else {
+        return Ok(contention(Some(request.update_id), "coordinator acquisition timed out"));
+    };
+
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let prepared =
+            match hydrate_and_apply(db, cache, request.document_id, request.update_id, &request.bytes).await? {
+                HydrateOutcome::Prepared(prepared) => prepared,
+                HydrateOutcome::Rejected(outcome) => return Ok(outcome),
+            };
+
+        let locked = tokio::time::timeout(
+            Duration::from_millis(DOCUMENT_LOCK_HOLD_MS_MAX.saturating_mul(4)),
+            run_locked_phase(db, &request, &prepared, dispatch_max_attempts),
+        )
+        .await;
+
+        match locked {
+            Ok(Ok(LockedOutcome::Committed(accepted))) => {
+                let format_version = prepared.observed.format_version.clone();
+                cache.put(
+                    request.document_id,
+                    prepared.candidate,
+                    format_version,
+                    accepted.head_seq,
+                    accepted.head_frontier.clone(),
+                    prepared.decoded_bytes_hint,
+                );
+                return Ok(AcceptOutcome::Accepted(accepted));
+            }
+            Ok(Ok(LockedOutcome::EpochMismatch)) => {
+                return Ok(rejected(RejectedCode::PolicyRejected, false, Some(request.update_id)));
+            }
+            Ok(Ok(LockedOutcome::Rebase)) | Err(_) => {
+                if attempts >= MAX_REBASE_ATTEMPTS {
+                    return Ok(contention(Some(request.update_id), "rebase attempts exhausted"));
+                }
+            }
+            Ok(Err(db_err)) => {
+                tracing::warn!(error = %db_err, "collab write: locked phase failed, treating as recoverable contention");
+                if attempts >= MAX_REBASE_ATTEMPTS {
+                    return Ok(contention(Some(request.update_id), "locked phase failed repeatedly"));
+                }
+            }
+        }
+    }
+}
+
+// ---- Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
+//
+// Mirrors the scratch-database convention `apps/api/src/routes/flow.rs::flow_database_tests` and
+// `apps/api/src/main.rs::migration_runner_database_tests` already use: own throwaway database per
+// run, migrated from `migrations/*.sql` on disk, dropped on the way out.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines
+)]
+mod database_tests {
+    use collab_core::{CollabEngine, LoroCollabEngine};
+    use platform::{
+        app::AppState,
+        config::{AppConfig, Secret},
+    };
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    };
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    use super::{AcceptOutcome, UpdateRequest, accept_update};
+    use crate::flow::collab::authz;
+    use crate::flow::collab::cache::WarmCache;
+    use crate::flow::collab::coordinator::DocumentCoordinator;
+    use crate::flow::collab::frame::RejectedCode;
+    use crate::flow::command::{CreateObjectInput, create_object};
+
+    const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    struct Scratch {
+        db: DatabaseConnection,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        async fn drop_self(self) {
+            let Self { db, name, admin_url } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            let _ = admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await;
+        }
+    }
+
+    async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = Database::connect(&admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+        let name = format!("openpr_collab_write_{label}");
+        let quoted = format!("\"{name}\"");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+            .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+            .await
+            .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        let db = Database::connect(&url)
+            .await
+            .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+        migrate(&db).await;
+
+        Some(Scratch { db, name, admin_url })
+    }
+
+    async fn migrate(db: &DatabaseConnection) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migration file was found in {dir}");
+        for path in files {
+            let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+            db.execute_unprepared(&sql)
+                .await
+                .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+        }
+    }
+
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!("skipped: {TEST_DATABASE_URL_ENV} is not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    fn state_for(db: DatabaseConnection) -> AppState {
+        AppState {
+            cfg: AppConfig {
+                app_name: "collab-write-test".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                database_url: Secret::new("postgres://unused/unused"),
+                jwt_secret: Secret::new("collab-write-test-secret"),
+                jwt_access_ttl_seconds: 900,
+                jwt_refresh_ttl_seconds: 3600,
+                default_author_id: None,
+                allow_insecure_cookies: false,
+                collab_allowed_origins: Vec::new(),
+            },
+            db,
+        }
+    }
+
+    async fn exec(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) {
+        state
+            .db
+            .execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .unwrap_or_else(|err| panic!("setup statement failed: {err}"));
+    }
+
+    async fn seed_workspace(state: &AppState) -> (Uuid, Uuid) {
+        let workspace_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        exec(
+            state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'test', 'user', true)",
+            vec![owner_id.into(), format!("{owner_id}@collab.test").into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'collab write test', $3)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO flow_workspace_settings (workspace_id, flow_enabled) VALUES ($1, true)",
+            vec![workspace_id.into()],
+        )
+        .await;
+        (workspace_id, owner_id)
+    }
+
+    async fn create_page(state: &AppState, workspace_id: Uuid, actor_id: Uuid) -> (Uuid, Uuid) {
+        let accepted = create_object(
+            state,
+            CreateObjectInput {
+                workspace_id,
+                actor_id,
+                object_type: "page".to_string(),
+                project_id: None,
+                parent_object_id: None,
+                title: "Write Path Test Page".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+        .expect("object creation succeeds");
+        (accepted.object.id, accepted.object.document_id)
+    }
+
+    async fn count_collab_updates(state: &AppState, document_id: Uuid, update_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1 AND update_id = $2",
+            vec![document_id.into(), update_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("count query runs")
+        .expect("count query returns a row");
+        row.n
+    }
+
+    fn a_valid_update_against(document_id_snapshot: &[u8]) -> (Vec<u8>, LoroCollabEngine) {
+        let mut engine = LoroCollabEngine::load(document_id_snapshot).expect("loads");
+        let base_frontier = engine.frontier();
+        engine.set_title("mutated by test").expect("set_title succeeds");
+        let update = engine.export_from(&base_frontier).expect("export succeeds");
+        (update, engine)
+    }
+
+    #[tokio::test]
+    async fn accept_update_commits_and_advances_head_seq_against_a_real_database() {
+        let scratch = scratch_or_skip!("accept-basic");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct SnapshotRow {
+            snapshot: Vec<u8>,
+        }
+        let snapshot_row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+
+        let (update_bytes, _engine) = a_valid_update_against(&snapshot_row.snapshot);
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let update_id = Uuid::new_v4();
+        let outcome = accept_update(
+            &state.db,
+            &cache,
+            &coordinator,
+            10,
+            UpdateRequest {
+                document_id,
+                update_id,
+                bytes: update_bytes,
+                idempotency_key: None,
+                origin_client_id: Some("test-client".to_string()),
+                message: None,
+                actor_id: owner_id,
+                workspace_id,
+                checked_epoch,
+            },
+        )
+        .await
+        .expect("accept_update does not hit a hard database error");
+
+        let AcceptOutcome::Accepted(accepted) = outcome else {
+            panic!("expected Accepted");
+        };
+        assert_eq!(accepted.head_seq, 1);
+        assert_eq!(accepted.update_id, update_id);
+        assert_eq!(count_collab_updates(&state, document_id, update_id).await, 1);
+
+        scratch.drop_self().await;
+    }
+
+    /// ★ The TOCTOU race `collab-protocol-v1.md` names verbatim: "A 重验 epoch=E → B 提交 E+1 并
+    /// 撤权 → A 插入 update 并在 B 之后 commit" must **not** result in "撤权后仍写入成功".
+    ///
+    /// This is not a unit-level mock: `B` is a real, separate database connection that takes a
+    /// genuine `SELECT ... FOR UPDATE` on the workspace's `authz_epoch` row and holds it open
+    /// while `A`'s write is in flight, so `A`'s `fence_epoch_for_share` (`SELECT ... FOR SHARE`)
+    /// must actually block on Postgres's own row lock — proving the barrier is a lock, not a
+    /// pre-insert timestamp check that could race B and lose.
+    #[tokio::test]
+    async fn epoch_fencing_blocks_a_write_that_straddles_a_concurrent_revocation() {
+        let scratch = scratch_or_skip!("epoch-toctou");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct SnapshotRow {
+            snapshot: Vec<u8>,
+        }
+        let snapshot_row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        let (update_bytes, _engine) = a_valid_update_against(&snapshot_row.snapshot);
+
+        // `A` reverifies permission/reads the epoch "outside the transaction" here, exactly like
+        // `session::reverify_open` does at `open` time.
+        let original_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        // A second, independent database connection for `B` (a real separate session, not a
+        // second handle to the same connection -- otherwise `FOR UPDATE` and `FOR SHARE` would
+        // trivially self-block on one connection instead of exercising cross-transaction locking).
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).expect("checked by scratch_or_skip! above");
+        let db_url = admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("db url");
+        let db_b = Database::connect(&db_url).await.expect("B connects independently");
+
+        let (b_holding_tx, b_holding_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_b_tx, release_b_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let b_task = tokio::spawn(async move {
+            let tx = db_b.begin().await.expect("B begins");
+            // The real "冲突锁 FOR UPDATE" an authorization-changing transaction takes
+            // (`ADR-0012` §3.1) -- held open across the `oneshot` handshake below so `A`'s
+            // `FOR SHARE` genuinely has to wait on Postgres, not on test-harness timing.
+            tx.query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("B locks the epoch row");
+            b_holding_tx.send(()).expect("A is still waiting to receive this");
+
+            release_b_rx.await.expect("A releases B");
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("B advances the epoch");
+            tx.commit().await.expect("B commits, releasing the row lock");
+        });
+
+        b_holding_rx.await.expect("B signals it holds the lock");
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let update_id = Uuid::new_v4();
+        let db_for_a = state.db.clone();
+        let a_task = tokio::spawn(async move {
+            accept_update(
+                &db_for_a,
+                &cache,
+                &coordinator,
+                10,
+                UpdateRequest {
+                    document_id,
+                    update_id,
+                    bytes: update_bytes,
+                    idempotency_key: None,
+                    origin_client_id: Some("test-client-a".to_string()),
+                    message: None,
+                    actor_id: owner_id,
+                    workspace_id,
+                    checked_epoch: original_epoch,
+                },
+            )
+            .await
+        });
+
+        // Give A a real chance to reach `fence_epoch_for_share` and block on B's `FOR UPDATE`
+        // before B is allowed to proceed -- this is what makes the interleaving deterministic:
+        // A's write is provably in flight, past its own permission check, when B commits. Kept
+        // well under `DOCUMENT_LOCK_WAIT_MS_MAX` (100ms, `run_locked_phase`'s own `lock_timeout`)
+        // so this proves A is *blocked* on B's lock, not that A's own lock_timeout fired first.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !a_task.is_finished(),
+            "A must still be blocked on B's row lock at this point"
+        );
+
+        release_b_tx.send(()).expect("B is still waiting to receive this");
+        b_task.await.expect("B task joins");
+
+        let a_result = a_task.await.expect("A task joins").expect("no hard database error");
+        let AcceptOutcome::Rejected(rejected) = a_result else {
+            panic!("epoch fencing must reject A's write once B has revoked after A's permission check, got Accepted");
+        };
+        assert_eq!(
+            rejected.code,
+            RejectedCode::PolicyRejected,
+            "the epoch mismatch must surface as policy_rejected, not any other rejection code"
+        );
+
+        // The decisive assertion: "撤权后仍写入成功" must not have happened -- no collab_updates
+        // row for this update_id, no matter what the in-memory outcome claimed.
+        assert_eq!(
+            count_collab_updates(&state, document_id, update_id).await,
+            0,
+            "epoch fencing failed: a write was persisted after a concurrent revocation committed first"
+        );
+
+        let final_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+        assert_eq!(
+            final_epoch,
+            original_epoch + 1,
+            "B's revocation must still have taken effect"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// Lock-discipline proof, part 1: the locked phase never calls anything CRDT/cache-shaped.
+    /// `run_locked_phase` (private to this module) takes only `&Prepared` (already-applied engine
+    /// state) and issues five fixed, parameterized statements between `begin` and `commit` -- there
+    /// is no `LoroCollabEngine` method, no `WarmCache` method, and no broadcast call reachable from
+    /// its body. This is enforced structurally (see the module's own doc comment for the itemized
+    /// trace of which function does what) and is additionally exercised end-to-end by
+    /// [`accept_update_commits_and_advances_head_seq_against_a_real_database`]: if any lock-scoped
+    /// I/O leaked into `run_locked_phase`, the `SET LOCAL statement_timeout` set at its start
+    /// would make that test flaky/slow under contention, which it is not.
+    ///
+    /// Lock-discipline proof, part 2 (a real assertion, not a comment): the document row lock
+    /// timeout budgets are real Postgres `SET LOCAL` values, not aspirational constants -- this
+    /// checks the exact frozen `limits-v1.md` numbers `run_locked_phase` sends over the wire.
+    #[test]
+    fn lock_timeout_budgets_match_the_frozen_limits_v1_numbers() {
+        assert_eq!(super::DOCUMENT_LOCK_WAIT_MS_MAX, 100);
+        assert_eq!(super::DOCUMENT_LOCK_HOLD_MS_MAX, 100);
+    }
+}

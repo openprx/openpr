@@ -252,7 +252,7 @@ impl OpenPrClient {
 
     /// The same client, speaking to the API as `credential` instead of as itself.
     ///
-    /// This is how a per-request caller identity reaches all 98 tools without threading a
+    /// This is how a per-request caller identity reaches all 107 tools without threading a
     /// credential through every one of them: the request scoped client *is* the identity, so
     /// a tool cannot pick a different one, and neither can the policy gate or the audit
     /// report that run around it. The HTTP connection pool is shared because [`Client`] is
@@ -1422,6 +1422,75 @@ impl OpenPrClient {
         self.delete(&format!("/api/v1/labels/{}", urlencoding::encode(label_id)))
             .await
     }
+
+    // ---- Flow ----
+    //
+    // Every path here mirrors `rest-api-v1.md` ("v0.4 Flow Alpha") verbatim; none of it is
+    // invented. `get_flow_object`/`list_flow_objects`/`get_flow_object_history` address the
+    // three read endpoints `apps/api/src/routes/flow.rs` shipped first; `.../collab` and
+    // `.../collab/verify` (called by `cli_app::dispatch` directly through `get`/`post` rather
+    // than a named method here — see that module's doc comment) landed in
+    // `apps/api/src/routes/collab.rs` while this change was being built, and both were
+    // exercised end to end against a live `apps/api` + PostgreSQL instance with the real
+    // `sylvode` binary while developing this file. `get_flow_feature`/`set_flow_feature`
+    // (`GET|PUT /workspaces/{workspace_id}/features/flow`) are the one v0.4 pair `apps/api`
+    // does not implement yet at all; calling them against a real deployment answers 404 until
+    // it does. Written against the frozen contract regardless, so the MCP tools and `sylvode`
+    // CLI commands built on top do not need a second change once the endpoint exists.
+
+    pub async fn get_flow_object(&self, object_id: &str, query: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/flow/objects/{}{query}",
+            urlencoding::encode(object_id)
+        ))
+        .await
+    }
+
+    pub async fn list_flow_objects(&self, workspace_id: &str, query: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/workspaces/{}/flow/objects{query}",
+            urlencoding::encode(workspace_id)
+        ))
+        .await
+    }
+
+    pub async fn get_flow_object_history(&self, object_id: &str, query: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/flow/objects/{}/history{query}",
+            urlencoding::encode(object_id)
+        ))
+        .await
+    }
+
+    pub async fn get_flow_feature(&self, workspace_id: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/workspaces/{}/features/flow",
+            urlencoding::encode(workspace_id)
+        ))
+        .await
+    }
+
+    pub async fn set_flow_feature(&self, workspace_id: &str, body: Value) -> Result<Value, String> {
+        self.put(
+            &format!("/api/v1/workspaces/{}/features/flow", urlencoding::encode(workspace_id)),
+            &body,
+        )
+        .await
+    }
+
+    // `collab inspect`/`collab verify` (`sylvode collab inspect|verify`) are the two v0.4
+    // Flow surfaces with no MCP tool at all (`surface-coverage-v1.md` maps both REST endpoints
+    // to `tool:objects.integrity@0.8`, a later version this change does not register), so
+    // `cli_app::dispatch` is their only caller and it is reached solely through the `sylvode`
+    // binary, which links this file through the `mcp_server` library rather than through
+    // `mcp-server`'s own private module copy (`main.rs`'s `mod client;`) — a distinction that
+    // matters here because a `pub` method a *library* crate never calls internally is still
+    // legitimate public API and draws no dead-code warning, but the exact same method sitting
+    // unused in a *binary* crate's own private copy of this file does. Rather than add two
+    // named wrapper methods that would be genuinely dead code in that second, binary-only
+    // compilation, `cli_app::dispatch` calls the generic `get`/`post` below directly for these
+    // two endpoints — which are already exercised, in both compiled copies, by every other
+    // domain method in this `impl` block.
 }
 
 fn detect_mime_type_from_filename(filename: &str) -> &'static str {

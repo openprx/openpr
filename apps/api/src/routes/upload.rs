@@ -1018,6 +1018,7 @@ mod tests {
                 jwt_refresh_ttl_seconds: 7200,
                 default_author_id: None,
                 allow_insecure_cookies: false,
+                collab_allowed_origins: Vec::new(),
             },
             db: DatabaseConnection::default(),
         }

@@ -1,6 +1,7 @@
 // Library interface for MCP server modules
 pub mod protocol;
 
+pub mod cli_app;
 pub mod client;
 pub mod tools;
 

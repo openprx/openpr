@@ -221,6 +221,34 @@ impl LoroCollabEngine {
         format!("{position:08}")
     }
 
+    /// A deep, independent copy of this engine (Loro's `LoroDoc::fork`, not `Clone`: `Clone` on a
+    /// `LoroDoc` is a *reference* clone that shares the same underlying document, which would let
+    /// a caller that mutates the copy also mutate `self`).
+    ///
+    /// Exists so a caller can apply a candidate update to an isolated working copy without
+    /// touching the original — the shape the v0.4 collab server's warm cache needs (`ADR-0010`:
+    /// hydrate/isolated-apply happen outside any lock and outside the shared cache entry; only a
+    /// *successful, committed* write is allowed to replace it).
+    ///
+    /// # Errors
+    /// Propagates [`Self::rebuild_id_cache`]'s failure mode, which cannot happen for a `self` that
+    /// was itself produced by `new_empty`/`load`/`apply_operation`/`import_update` (i.e. every
+    /// engine this crate can hand a caller), but is surfaced rather than assumed away.
+    pub fn fork(&self) -> Result<Self, CollabError> {
+        let doc = self.doc.fork();
+        let tree = Self::attach_tree(&doc);
+        let meta = Self::attach_meta(&doc);
+        let mut engine = Self {
+            doc,
+            tree,
+            meta,
+            id_to_tree: HashMap::new(),
+            tree_to_id: HashMap::new(),
+        };
+        engine.rebuild_id_cache()?;
+        Ok(engine)
+    }
+
     /// Creates a fresh, empty document (no blocks, no title). `replica_seed` deterministically
     /// seeds the engine's internal peer id.
     #[must_use]
@@ -530,5 +558,22 @@ mod tests {
         assert_eq!(node.text, "hello");
         assert_eq!(node.kind, NodeKind::Block);
         assert!(!node.deleted);
+    }
+
+    #[test]
+    fn fork_is_independent_of_the_original() {
+        let mut engine = LoroCollabEngine::new_empty(1);
+        engine.set_title("before fork").expect("set_title succeeds");
+
+        let mut forked = engine.fork().expect("fork succeeds");
+        assert_eq!(forked.title().expect("title reads"), "before fork");
+
+        forked
+            .set_title("mutated only on the fork")
+            .expect("set_title succeeds");
+        assert_eq!(forked.title().expect("title reads"), "mutated only on the fork");
+        // The original must be untouched -- this is the whole point of `fork` over `Clone`.
+        assert_eq!(engine.title().expect("title reads"), "before fork");
+        assert_ne!(engine.frontier(), forked.frontier());
     }
 }
