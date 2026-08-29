@@ -1,0 +1,113 @@
+{
+  "schema_version": "sylvode.flow.legacy-pages-inventory.v2",
+  "source_head": "7945f3fb2eff3547ee8ba8dde9056ed6200f0503",
+  "topology_manifest": "spikes/legacy-pages-inventory/environment-topology-v2.json",
+  "generated_at": "2026-08-29T15:17:41Z",
+  "executor": {
+    "name": "claude-agent-sonnet5",
+    "role": "v0.4-topology-v2-subagent"
+  },
+  "query_text_for_audit": "SELECT count(*) FROM pages;",
+  "query_sha256": "aa9d1afcbd7029c3939f069984d3db5d74070ab80d668517dabebae324d77a21",
+  "databases_collected": [
+    {
+      "database_id": "db-local-dev-openpr",
+      "cluster_id": "cluster-local-dev-compose",
+      "state_bearing": true,
+      "status": "collected",
+      "collected_at": "2026-08-29T15:14:00Z",
+      "access_method": "docker compose exec -T postgres psql -U openpr -d openpr (compose service started, not recreated, from a previously-exited container)",
+      "transaction_mode": "BEGIN TRANSACTION READ ONLY; SELECT count(*) FROM pages; COMMIT;",
+      "row_count": 0,
+      "schema_migrations_applied_count": 54,
+      "workspace_distribution": []
+    },
+    {
+      "database_id": "db-host-openpr_api_test",
+      "cluster_id": "cluster-host-pg17-main",
+      "state_bearing": true,
+      "status": "collected",
+      "collected_at": "2026-08-29T15:16:00Z",
+      "access_method": "sudo -n -u postgres psql -p 5366 -d openpr_api_test (local unix-socket peer auth on host cluster)",
+      "transaction_mode": "BEGIN TRANSACTION READ ONLY; SELECT count(*) FROM pages; COMMIT;",
+      "row_count": 0,
+      "schema_migrations_table_present": false,
+      "schema_fingerprint_sha256": "9790ae7178ed8610b1268dd0c362faa918013994f636a3b7bd2c16b6feb37af1",
+      "schema_fingerprint_note": "66-table application schema including pre-0052 `connectors`/`agent_invocations` tables; identical fingerprint to db-host-r3_replay",
+      "workspace_distribution": []
+    },
+    {
+      "database_id": "db-host-r3_replay",
+      "cluster_id": "cluster-host-pg17-main",
+      "state_bearing": true,
+      "status": "collected",
+      "collected_at": "2026-08-29T15:16:05Z",
+      "access_method": "sudo -n -u postgres psql -p 5366 -d r3_replay (local unix-socket peer auth on host cluster)",
+      "transaction_mode": "BEGIN TRANSACTION READ ONLY; SELECT count(*) FROM pages; COMMIT;",
+      "row_count": 0,
+      "schema_migrations_table_present": false,
+      "schema_fingerprint_sha256": "9790ae7178ed8610b1268dd0c362faa918013994f636a3b7bd2c16b6feb37af1",
+      "schema_fingerprint_note": "identical to db-host-openpr_api_test; discovered by schema scan, not name match (name does not contain 'openpr')",
+      "workspace_distribution": []
+    },
+    {
+      "database_id": "db-kkso-openpr",
+      "cluster_id": "cluster-kkso-target-deployment",
+      "state_bearing": true,
+      "status": "collected",
+      "collected_at": "2026-08-29T15:15:30Z",
+      "access_method": "ssh kkso docker exec openpr-postgres-1 psql -U openpr -d openpr",
+      "transaction_mode": "BEGIN TRANSACTION READ ONLY; SELECT count(*) FROM pages; COMMIT;",
+      "row_count": 0,
+      "schema_migrations_applied_count": 53,
+      "schema_migrations_latest_applied": "0052_drop_connectors_and_agent_invocations.sql",
+      "workspace_distribution": []
+    }
+  ],
+  "databases_table_absent": [
+    {
+      "database_id": "db-host-openpr_e2e",
+      "cluster_id": "cluster-host-pg17-main",
+      "state_bearing": true,
+      "status": "table_absent",
+      "checked_at": "2026-08-29T15:16:10Z",
+      "access_method": "sudo -n -u postgres psql -p 5366 -d openpr_e2e -At -c \"SELECT to_regclass('public.pages');\"",
+      "result": "NULL (no relation named pages in any schema; zero tables in this database at all)",
+      "row_count": null,
+      "excluded_from_total_reason": "no `pages` table exists to count; table_absent is not the same as a confirmed-zero pages table and must not be folded into total_rows as 0"
+    }
+  ],
+  "environments_not_collected": [
+    {
+      "id": "mech-worktree-compose-sources",
+      "reason": "not_materialized -- 28 worktree compose sources exist but none has a running container or volume at scan time; nothing addressable to query",
+      "row_count": null
+    },
+    {
+      "id": "mech-ci-workflow-test-job",
+      "reason": "not_applicable_no_preexisting_state -- no services: block, no OPENPR_TEST_DATABASE_URL set by the workflow",
+      "state_bearing": false,
+      "row_count": null
+    },
+    {
+      "id": "OPENPR_TEST_DATABASE_URL (contract A + contract B, 5 consumers)",
+      "reason": "unbound -- environment variable not set anywhere in this shell/session or in repo .env files (`env | grep OPENPR_TEST_DATABASE_URL` empty); nothing materialized to query",
+      "row_count": null
+    },
+    {
+      "id": "PGHOST/PGPORT/PGDATABASE (scripts/init-db.sh)",
+      "reason": "unbound in this environment; resolves to documented defaults 127.0.0.1:5432/openpr, which is db-local-dev-openpr (already collected under that identity)",
+      "row_count": null
+    },
+    {
+      "id": "OPENPR_SMOKE_PG_PORT (9 smoke scripts)",
+      "reason": "unbound in this environment; resolves to documented default 5366, which is cluster-host-pg17-main (databases on it already enumerated and checked)",
+      "row_count": null
+    }
+  ],
+  "total_rows": 0,
+  "total_rows_computation": "sum of row_count over databases_collected where state_bearing=true: db-local-dev-openpr(0) + db-host-openpr_api_test(0) + db-host-r3_replay(0) + db-kkso-openpr(0) = 0. db-host-openpr_e2e excluded (table_absent, not a confirmed-zero pages table). mech-worktree-compose-sources and mech-ci-workflow-test-job excluded (not materialized / not_applicable, row_count=null by rule).",
+  "total_rows_status": "complete -- every registered state_bearing database with a pages table has been measured; no unavailable/unresolvable state_bearing database remains",
+  "unavailable_items": [],
+  "unavailable_impact_on_conclusion": "none -- there are zero `unavailable` entries in this round. The only null-row-count entries are `table_absent` (one database, legitimately has no pages table) and `not_materialized`/`not_applicable`/`unbound` (nothing exists yet to be unavailable against)."
+}

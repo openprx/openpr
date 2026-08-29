@@ -1935,6 +1935,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0053_drop_event_outbox.sql",
         include_str!("../../../migrations/0053_drop_event_outbox.sql"),
     ),
+    (
+        "0054_flow_data_layer.sql",
+        include_str!("../../../migrations/0054_flow_data_layer.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2208,6 +2212,7 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         "0053_drop_event_outbox.sql",
         SchemaProbe::RelationAbsent("event_outbox"),
     ),
+    ("0054_flow_data_layer.sql", SchemaProbe::Relation("flow_objects")),
 ];
 
 /// One recorded migration outcome.
@@ -2714,7 +2719,8 @@ mod tests {
                 "0050_proposal_workspace_scope.sql",
                 "0051_bot_operation_logs.sql",
                 "0052_drop_connectors_and_agent_invocations.sql",
-                "0053_drop_event_outbox.sql"
+                "0053_drop_event_outbox.sql",
+                "0054_flow_data_layer.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
@@ -3157,6 +3163,99 @@ mod migration_runner_database_tests {
             assert_eq!(status_of(&ledger, name), "applied", "{name} should have been executed");
         }
         assert_schema_complete(&scratch.db).await;
+
+        scratch.drop_self().await;
+    }
+
+    /// 0054 lands the whole Sylvode Flow v0.4 data layer in one migration: every table from
+    /// `contracts/domain-model-v1.md` plus the ADR-0011 delivery substrate must exist afterward,
+    /// and the legacy `pages` table (ADR-0003 zero-inventory branch) must be left exactly as
+    /// 0001 created it — 0054 must not reference it at all.
+    #[tokio::test]
+    async fn flow_v04_data_layer_lands_and_leaves_pages_untouched() {
+        /// Every table the Sylvode Flow v0.4 data layer (migration 0054) must create.
+        const FLOW_TABLES: &[&str] = &[
+            "flow_objects",
+            "flow_workspace_settings",
+            "collab_documents",
+            "collab_updates",
+            "collab_tickets",
+            "flow_relations",
+            "flow_object_projections",
+            "flow_projection_jobs",
+            "flow_integrity_records",
+            "flow_object_grants",
+            "event_dispatch",
+            "event_deliveries",
+            "event_delivery_sources",
+        ];
+
+        let scratch = scratch_or_skip!("flow_v04");
+
+        run_migrations_with(&scratch.db, MigrationOptions::default())
+            .await
+            .expect("a fresh database migrates cleanly");
+
+        for table in FLOW_TABLES {
+            let row = scratch
+                .db
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT to_regclass($1) IS NOT NULL AS present",
+                    vec![(*table).into()],
+                ))
+                .await
+                .expect("probe query runs")
+                .expect("probe query returns a row");
+            let present: bool = row.try_get("", "present").expect("present column");
+            assert!(present, "{table} must exist after migration 0054");
+        }
+
+        // `pages` predates Flow (0001_init.sql) and is the ADR-0003 legacy table 0054 must not
+        // touch. Its column set is checked, not just its existence, so a stray `ALTER TABLE
+        // pages` in a future edit of 0054 would fail this test even though the table still
+        // "exists".
+        let pages_columns = scratch
+            .db
+            .query_all(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT attname FROM pg_attribute \
+                 WHERE attrelid = to_regclass('pages') AND attnum > 0 AND NOT attisdropped \
+                 ORDER BY attname"
+                    .to_string(),
+            ))
+            .await
+            .expect("pages columns are readable");
+        let mut columns: Vec<String> = pages_columns
+            .iter()
+            .map(|row| row.try_get::<String>("", "attname").expect("attname column"))
+            .collect();
+        columns.sort();
+        assert_eq!(
+            columns,
+            vec![
+                "body_md",
+                "created_at",
+                "created_by",
+                "id",
+                "title",
+                "updated_at",
+                "workspace_id"
+            ],
+            "pages must keep exactly the columns 0001_init.sql created; 0054 must never alter it"
+        );
+
+        let pages_rows = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM pages".to_string(),
+            ))
+            .await
+            .expect("pages is queryable")
+            .expect("count query returns a row");
+        let pages_rows: i64 = pages_rows.try_get("", "n").expect("n column");
+        assert_eq!(pages_rows, 0, "0054 must not insert into pages");
 
         scratch.drop_self().await;
     }

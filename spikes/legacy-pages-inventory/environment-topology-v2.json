@@ -1,0 +1,343 @@
+{
+  "schema_version": "sylvode.flow.environment-topology.v2",
+  "purpose": "Restructured, capability-based inventory of every addressable PostgreSQL database environment relevant to this repository. Supersedes environment-topology-v1.json, which the independent audit at /opt/worker/report/codex-topology-presign-2026-08-29.md judged HOLD for two reasons: (1) it omitted a materialized host PostgreSQL 17/main cluster and nine database-creation scripts targeting it, and (2) it mixed physical database identity, access/lifecycle mechanism, and potential-environment-generator into one flat environments[] array. This file splits those into clusters[] (physical DB server identity), databases[] (concrete databases, each owned by exactly one cluster), and mechanisms[] (creation/access/lifecycle paths, each pointing at the cluster/database it acts on).",
+  "source_head": "7945f3fb2eff3547ee8ba8dde9056ed6200f0503",
+  "generated_at": "2026-08-29T15:17:41Z",
+  "supersedes": "environment-topology-v1.json (sha256 5da0daa82fcda25e987436b2708869b111cd2e6272d4e3db49aae86914eadd8f)",
+  "audit_reference": "/opt/worker/report/codex-topology-presign-2026-08-29.md",
+  "executor": {
+    "name": "claude-agent-sonnet5",
+    "role": "v0.4-topology-v2-subagent"
+  },
+  "constraints_honored": [
+    "read-only everywhere: no INSERT/UPDATE/DELETE/DDL issued by this task against any of the discovered databases",
+    "local dev compose: only `docker compose start postgres` on the already-existing, previously-exited container (no create/recreate/down/-v), matching the precedent already accepted in v1",
+    "host PostgreSQL 17/main cluster: read-only `psql` via `sudo -n -u postgres` (peer auth), used only for `\\l`, `information_schema.tables`, `pg_roles`, and `SELECT count(*) FROM pages` inside `BEGIN TRANSACTION READ ONLY; ... COMMIT;` where applicable",
+    "kkso: read-only only (`docker compose ps`, `psql -c '\\l'`, `SELECT count(*) FROM schema_migrations`, `SELECT count(*) FROM pages` in a read-only transaction); no restart, no config change",
+    "no git commit / push / stash performed"
+  ],
+  "clusters": [
+    {
+      "id": "cluster-local-dev-compose",
+      "identity_sha256": "45c183ad9fa3572297425cb2508cc0f8f9be41d781a7d404296424bfe075c6c3",
+      "kind": "development",
+      "description": "podman-compose project 'openpr' (default project name = repo root directory basename; no `name:` override in docker-compose.yml, no COMPOSE_PROJECT_NAME in .env/.env.example), service 'postgres', container 'openpr_postgres_1', image docker.io/library/postgres:16, persistent named volume 'openpr_pgdata'",
+      "location": "docker-compose.yml:20-35, working_dir /opt/worker/code/openpr",
+      "evidence": "`podman inspect openpr_postgres_1` labels: com.docker.compose.project=openpr, com.docker.compose.service=postgres, com.docker.compose.project.config_files=docker-compose.yml. Container observed 'Exited (0) 26 minutes ago (healthy)' at scan start, started (not recreated) via `docker compose start postgres` for read-only querying, matching v1's precedent.",
+      "persistence": "named volume 'openpr_pgdata' survives `docker compose down` (without -v) and host reboot by construction"
+    },
+    {
+      "id": "cluster-host-pg17-main",
+      "identity_sha256": "e5c7604fcf670e2787b2bfa51913a9cc3076fc384ead90e0bfb72f7c81fc7035",
+      "kind": "host_shared",
+      "description": "Directly-installed PostgreSQL 17 cluster 'main', managed by systemd unit postgresql@17-main.service, independent of any container/compose stack. This is the cluster v1 omitted entirely.",
+      "location": "data_directory=/var/lib/postgresql/17/main, config_file=/etc/postgresql/17/main/postgresql.conf, port=5366 (postgresql.conf: 'port = 5366'), listening on 0.0.0.0:5366 and [::]:5366",
+      "evidence": "`systemctl status postgresql@17-main.service` -> active (running) since 2026-08-26 14:23:23 EDT, Main PID 1183 /usr/lib/postgresql/17/bin/postgres -D /var/lib/postgresql/17/main. `ss -tlnp` confirms LISTEN on 0.0.0.0:5366 and [::]:5366, owning process postgres/1183. `sudo -n cat /etc/postgresql/17/main/postgresql.conf` confirms data_directory and port=5366 match the systemd process.",
+      "auth": "pg_hba.conf: 'local all postgres peer', 'local all all peer', 'host all all 127.0.0.1/32 scram-sha-256', 'host all all ::1/128 scram-sha-256', 'host all all 0.0.0.0/0 md5' -- reachable both via local unix-socket peer auth (used by the 9 smoke scripts through `sudo -n -u postgres psql`) and via password auth from any host reaching this VM's IP on 5366.",
+      "non_template_databases_observed": 24,
+      "database_enumeration_method": "`sudo -n -u postgres psql -p 5366 -d postgres -c '\\\\l'` (superuser, lists every database on the cluster, not name-filtered)"
+    },
+    {
+      "id": "cluster-kkso-target-deployment",
+      "identity_sha256": "774188f54395215a24996d994a2657b370becbbaca5b060e3365e5f418fb0d91",
+      "kind": "target_deployment",
+      "description": "ssh host alias 'kkso' -> compose project at /opt/openpr, container 'openpr-postgres-1', image docker.io/library/postgres:16",
+      "location": "ssh kkso, /opt/openpr (no .git checkout on host -- deployed via scp'd pre-built binaries per documented SOP)",
+      "evidence": "`ssh kkso docker compose ps` (run from /opt/openpr) shows all 5 services 'Up 13 days': postgres, api, worker, mcp-server, frontend.",
+      "public_surface": "https://pp.opsxsx.com (Cloudflare -> Caddy -> nginx frontend -> api), admin account admin@kkso.local"
+    }
+  ],
+  "databases": [
+    {
+      "id": "db-local-dev-openpr",
+      "identity_sha256": "981cd409b366326c30283728f34d9e88e8b4e18b90d2bc7cc4ceff1a14fd64de",
+      "cluster_id": "cluster-local-dev-compose",
+      "database_name": "openpr",
+      "owner": "openpr",
+      "state_bearing": true,
+      "materialization_state": "materialized",
+      "classification_basis": [
+        "on a named volume that survives `compose down` (without -v) and reboot",
+        "scripts/backup-db.sh:28 `pg_dump -U openpr openpr` and scripts/restore-db.sh:52-56 `DROP DATABASE IF EXISTS openpr; CREATE DATABASE openpr;` + arbitrary .sql.gz pipe give explicit human-invokable mechanisms to overwrite this identity with historical/foreign data",
+        "scripts/init-db.sh:24-33 applies migrations/*.sql directly via psql, a second independent write path into the same identity"
+      ],
+      "schema_migrations_applied_count": 54,
+      "schema_migrations_latest_on_disk": "migrations/0053_drop_event_outbox.sql (54 files, 0000-0053)"
+    },
+    {
+      "id": "db-host-openpr_api_test",
+      "identity_sha256": "13b154c6a92ffad6e145f3c23bc2166fcf66f1cad480f793bd1dd2e74d22d6a2",
+      "cluster_id": "cluster-host-pg17-main",
+      "database_name": "openpr_api_test",
+      "owner": "ck",
+      "state_bearing": true,
+      "materialization_state": "materialized",
+      "discovered_via": "schema fingerprint (information_schema.tables contains pages, workspaces, work_items), not name filtering -- name happens to match the 'openpr' prefix but no script in this repository checkout creates a fixed-name database called 'openpr_api_test' (all 9 smoke scripts and all 3 scratch-test consumers generate randomized names with $$ + timestamp suffixes; grep for the literal string 'openpr_api_test' across the repository returns zero hits outside this evidence)",
+      "classification_basis": [
+        "full OpenPR application schema present (66 tables incl. pages, workspaces, work_items, users, projects)",
+        "contains `connectors` and `agent_invocations` tables, which migration 0052_drop_connectors_and_agent_invocations.sql removes -- so this database's schema predates migration 0052 and was NOT created by any migration path currently in the repo's own migration runner (no `schema_migrations` table exists in it at all -- see mechanism note)",
+        "materialized, addressable, human-writable; origin/creation-time could not be forensically attributed to any current repository code path -- treated as state_bearing per the task's 'uncertain => true and measure' instruction"
+      ],
+      "schema_migrations_table_present": false,
+      "note": "absence of a schema_migrations table alongside a full application schema means this database's DDL was applied by a path other than apps/api's own embedded migration runner (e.g. manual psql/sea-orm-cli or a restored dump) -- flagged, not further attributable from read-only inspection"
+    },
+    {
+      "id": "db-host-r3_replay",
+      "identity_sha256": "68f1ab60b43fdf074f7efcb6a305c40ccfda12e0351eb5bb4a20bb7cc10a527e",
+      "cluster_id": "cluster-host-pg17-main",
+      "database_name": "r3_replay",
+      "owner": "openpr_r3",
+      "state_bearing": true,
+      "materialization_state": "materialized",
+      "discovered_via": "schema fingerprint only -- name contains no 'openpr' substring and would be skipped by any name-filtered scan; found by enumerating information_schema.tables for a 'pages' table across all 24 non-template databases on cluster-host-pg17-main",
+      "classification_basis": [
+        "full OpenPR application schema present (66 tables incl. pages, workspaces, work_items), byte-identical table set to db-host-openpr_api_test including the pre-0052 `connectors`/`agent_invocations` tables",
+        "owning role 'openpr_r3' has CREATEDB privilege and is not referenced anywhere in this repository checkout (grep for 'openpr_r3' returns zero hits)",
+        "this is the concrete, materialized instance of the failure mode the independent audit warned about: 'filtering by the openpr string would miss it'"
+      ],
+      "schema_migrations_table_present": false
+    },
+    {
+      "id": "db-host-openpr_e2e",
+      "identity_sha256": "6b9f11bde7df4b95827038c1399333693642384232538c47528e78aff1a966cd",
+      "cluster_id": "cluster-host-pg17-main",
+      "database_name": "openpr_e2e",
+      "owner": "openpr_e2e",
+      "state_bearing": true,
+      "materialization_state": "materialized_empty",
+      "discovered_via": "host database enumeration (`\\l` on cluster-host-pg17-main)",
+      "classification_basis": [
+        "materialized database with a dedicated owning role, persists on the host cluster, addressable by anyone who can reach 5366 -- no different in kind from any other database on this cluster; kept state_bearing=true per the conservative default even though it currently has zero tables",
+        "zero tables of any kind (not just no `pages` table) -- `information_schema.tables` for schema 'public' returns no rows; no other non-system schema exists",
+        "not created by any script currently in this repository (no literal 'openpr_e2e' database-name string anywhere in the checkout); origin not attributable from read-only inspection"
+      ],
+      "schema_migrations_table_present": false,
+      "pages_table_present": false
+    },
+    {
+      "id": "db-kkso-openpr",
+      "identity_sha256": "05e28ddd2dbf4e750fde502d370824c9028a42ae1e03a35764ef0b415d39fee1",
+      "cluster_id": "cluster-kkso-target-deployment",
+      "database_name": "openpr",
+      "owner": "openpr",
+      "state_bearing": true,
+      "materialization_state": "materialized",
+      "classification_basis": [
+        "live production stack with a public URL (https://pp.opsxsx.com) and a real admin account; per CLAUDE.md's connector-retirement note, already carries real usage -- unambiguously state-bearing"
+      ],
+      "schema_migrations_applied_count": 53,
+      "schema_migrations_latest_applied": "0052_drop_connectors_and_agent_invocations.sql (one behind local dev's 0053)"
+    }
+  ],
+  "databases_checked_and_excluded": {
+    "note": "Every non-template database on cluster-host-pg17-main was checked for OpenPR schema fingerprint (presence of a `pages`, `workspaces`, or `work_items` table in ANY schema, not just `public`) before exclusion -- exclusion here is schema-based, not name-based, per the audit's requirement.",
+    "method": "for each database: `SELECT table_schema||'.'||table_name FROM information_schema.tables WHERE table_name='pages'` (also separately checked for workspaces/work_items); zero matches outside db-host-openpr_api_test and db-host-r3_replay",
+    "excluded": [
+      {"database_name": "account", "reason": "no OpenPR schema; unrelated project (PRX ecosystem), owner ck"},
+      {"database_name": "admin", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "bot", "reason": "no OpenPR schema; unrelated project (PRX bot), owner ck"},
+      {"database_name": "bot_flow", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "bot_game", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "bots-admin", "reason": "no OpenPR schema; unrelated project, owner bots_user"},
+      {"database_name": "bsc", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "community", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "media", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "message", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "mind_scale", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "notifys", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "openprx_community", "reason": "no OpenPR schema; this is the separate 'OpenPRX Community' product (code/openprx-community/), not OpenPR, owner community"},
+      {"database_name": "postgres", "reason": "system default database, no OpenPR schema"},
+      {"database_name": "prx_audit_scratch", "reason": "zero tables; owning role 'prx_audit' and name pattern belong to a different project's audit tooling, not referenced anywhere in this repository checkout"},
+      {"database_name": "rtc", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "social_feed", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "span", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "tv", "reason": "no OpenPR schema; unrelated project, owner tv"},
+      {"database_name": "tv_flow", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "wallet", "reason": "no OpenPR schema; unrelated project, owner ck"},
+      {"database_name": "template0", "reason": "PostgreSQL system template"},
+      {"database_name": "template1", "reason": "PostgreSQL system template"}
+    ],
+    "orphaned_role_note": "role 'openpr_test' exists on cluster-host-pg17-main with SUPERUSER + LOGIN and owns no database; not referenced anywhere in this repository checkout. No database to query, so it does not affect row-count collection, but is flagged as an unexplained credential on a shared host cluster."
+  },
+  "mechanisms": [
+    {
+      "id": "mech-compose-dsn-generation",
+      "type": "compose_service_definition",
+      "location": "docker-compose.yml:20-35; scripts/start.sh:139 writes url into config/openpr.compose.toml:22",
+      "acts_on": ["db-local-dev-openpr"]
+    },
+    {
+      "id": "mech-dev-up-host-port",
+      "type": "host_port_exposure",
+      "location": "scripts/dev-up.sh:10-24",
+      "description": "starts the same compose service/volume with an added host port mapping (127.0.0.1:<port>:5432); same identity, not a new database",
+      "acts_on": ["db-local-dev-openpr"]
+    },
+    {
+      "id": "mech-backup-db",
+      "type": "read_snapshot",
+      "location": "scripts/backup-db.sh:28",
+      "description": "`pg_dump -U openpr openpr`",
+      "acts_on": ["db-local-dev-openpr"]
+    },
+    {
+      "id": "mech-restore-db",
+      "type": "destructive_restore",
+      "location": "scripts/restore-db.sh:52-56",
+      "description": "`DROP DATABASE IF EXISTS openpr; CREATE DATABASE openpr;` then pipes an arbitrary .sql.gz backup into it",
+      "acts_on": ["db-local-dev-openpr"]
+    },
+    {
+      "id": "mech-init-db",
+      "type": "raw_migration_apply",
+      "location": "scripts/init-db.sh:7-9,24-33 (PGHOST default 127.0.0.1, PGPORT default 5432, PGDATABASE default openpr)",
+      "description": "applies migrations/*.sql directly via psql, independent of the app's own migration runner; PGHOST/PGPORT/PGDATABASE are overridable and were unset in this environment (resolves to the default, i.e. db-local-dev-openpr)",
+      "acts_on": ["db-local-dev-openpr"],
+      "env_binding_status": "unbound (PGHOST/PGPORT/PGDATABASE not set in this environment; default resolves to db-local-dev-openpr)"
+    },
+    {
+      "id": "mech-e2e-test-lifecycle",
+      "type": "compose_lifecycle_wrapper",
+      "location": "scripts/e2e-test.sh:9-11,64,73-92 (KEEP_STACK read from OPENPR_E2E_KEEP_STACK at line 26)",
+      "description": "`docker compose down -v` then `scripts/start.sh` against the same compose project/volume as db-local-dev-openpr, then seeds real data via scripts/test-api.sh, scripts/bootstrap-restaurant-demo.sh, scripts/test-mcp.sh; with OPENPR_E2E_KEEP_STACK=1 the teardown trap returns early and the seeded stack is left running",
+      "acts_on": ["db-local-dev-openpr"],
+      "env_binding_status": "unbound (OPENPR_E2E_KEEP_STACK not set in this environment)"
+    },
+    {
+      "id": "mech-scratch-test-main-rs",
+      "type": "test_scratch_database",
+      "location": "apps/api/src/main.rs:2996-3090 (TEST_DATABASE_URL_ENV line 3015, prefix 'openpr_mig_' ~line 3067)",
+      "binding_contract": "maintenance/admin DSN semantics -- connects to the URL, then `CREATE DATABASE openpr_mig_<label>` (no TEMPLATE clause), migrates, asserts, best-effort DROPs",
+      "acts_on": ["OPENPR_TEST_DATABASE_URL (contract A: maintenance DSN)"],
+      "env_binding_status": "unbound (OPENPR_TEST_DATABASE_URL not set anywhere in this environment or in repo .env files)"
+    },
+    {
+      "id": "mech-scratch-test-decision-rs",
+      "type": "test_scratch_database",
+      "location": "apps/api/src/routes/decision.rs:210-300 (TEST_DATABASE_URL_ENV line 244, prefix 'openpr_dec_' ~line 264)",
+      "binding_contract": "maintenance/admin DSN semantics, same as mech-scratch-test-main-rs",
+      "acts_on": ["OPENPR_TEST_DATABASE_URL (contract A: maintenance DSN)"],
+      "env_binding_status": "unbound"
+    },
+    {
+      "id": "mech-scratch-test-form-rs",
+      "type": "test_scratch_database",
+      "location": "apps/api/src/routes/form.rs:7650-7730 (TEST_DATABASE_URL_ENV line 7677, prefix 'openpr_link_' ~line 7714)",
+      "binding_contract": "maintenance/admin DSN semantics, same as mech-scratch-test-main-rs",
+      "acts_on": ["OPENPR_TEST_DATABASE_URL (contract A: maintenance DSN)"],
+      "env_binding_status": "unbound"
+    },
+    {
+      "id": "mech-direct-fixture-search-rs",
+      "type": "test_direct_fixture",
+      "location": "apps/api/src/routes/search.rs:404-407,416-534,536-547",
+      "binding_contract": "application DSN semantics -- connects DIRECTLY to the URL as the live application database (no CREATE/DROP), inserts real fixture rows into users/workspaces/projects/work_items/comments/labels, cleans up with DELETE only after assertions pass",
+      "acts_on": ["OPENPR_TEST_DATABASE_URL (contract B: application DSN -- conflicts with contract A on the identical env var name)"],
+      "env_binding_status": "unbound"
+    },
+    {
+      "id": "mech-direct-fixture-label-rs",
+      "type": "test_direct_fixture",
+      "location": "apps/api/src/routes/label.rs:734-737,824-833",
+      "binding_contract": "application DSN semantics, same as mech-direct-fixture-search-rs (contract B)",
+      "acts_on": ["OPENPR_TEST_DATABASE_URL (contract B: application DSN)"],
+      "env_binding_status": "unbound"
+    },
+    {
+      "id": "mech-smoke-phase1",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-phase1-project-types-resources.sh:5 (POSTGRES_PORT default 5366), :7 (DB_NAME openpr_phase1_smoke_$$_<ts>), :83 (CREATE DATABASE)",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366 resolves to cluster-host-pg17-main"
+    },
+    {
+      "id": "mech-smoke-phase5",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-phase5-release-readiness.sh:5,7,79",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-forms-mcp",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-forms-mcp.sh:5,7,79",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-plugins-mcp",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-plugins-mcp.sh:5,7,79",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-user-settings",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-user-settings-api.sh:5,7,66",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-universal-forms",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-universal-forms-api.sh:5,7,105",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-scenario-template-forms",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-scenario-template-forms.sh:5,7,73",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-browser-mention-webhook",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-browser-mention-openpr-webhook.sh:6,8,96",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-smoke-restaurant-demo-bootstrap",
+      "type": "smoke_scratch_database",
+      "location": "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh:5,7,104",
+      "acts_on": ["cluster-host-pg17-main"],
+      "env_binding_status": "OPENPR_SMOKE_PG_PORT unbound; default 5366"
+    },
+    {
+      "id": "mech-worktree-compose-sources",
+      "type": "potential_environment_generator",
+      "location": "28 directories under .claude/worktrees/agent-*/, each with its own docker-compose.yml identical in shape to the repo root's",
+      "description": "each is a compose-capable source checkout that COULD materialize an independent stack/volume if `docker compose up` were run inside it (default project-name-from-directory-basename applies -- no `name:` override, no COMPOSE_PROJECT_NAME)",
+      "materialization_state": "not_materialized",
+      "scan_evidence": "`podman ps -a` and `podman volume ls` show no container/volume tagged with any worktree's directory-basename project name at scan time",
+      "acts_on": [],
+      "collection_disposition": "not_collected -- no materialized instance exists to query; would require re-scan if this changes"
+    },
+    {
+      "id": "mech-ci-workflow-test-job",
+      "type": "ci_job",
+      "location": ".github/workflows/ci.yml:42-52",
+      "description": "single step `cargo test --workspace --all-features` on a fresh ubuntu-latest runner; no services: block, no compose/docker invocation, OPENPR_TEST_DATABASE_URL not set by the workflow -- all real-database test helpers evaluate to None and skip",
+      "state_bearing": false,
+      "acts_on": [],
+      "collection_disposition": "not_applicable_no_preexisting_state"
+    }
+  ],
+  "not_environments": [
+    {
+      "candidate": "playwright.config.ts baseURL http://10.72.0.3:3000",
+      "why_excluded": "10.72.0.3 is this host's own WireGuard interface address -- reaches db-local-dev-openpr's frontend, not a separate deployment"
+    },
+    {
+      "candidate": "apps/mcp-server/tests/support/mod.rs:21 postgres://openpr:e2e-unused-password@127.0.0.1:5432/openpr",
+      "why_excluded": "doc comment confirms the MCP server test harness opens no real database connection; string only satisfies config-loader syntax"
+    },
+    {
+      "candidate": "crates/platform/src/config/tests.rs and apps/api/src/routes/upload.rs:1015 postgres:// literals",
+      "why_excluded": "unit-test fixtures paired with a disconnected mock DatabaseConnection::default(); no real connection attempted"
+    }
+  ]
+}

@@ -1,0 +1,162 @@
+{
+  "schema_version": "sylvode.flow.environment-topology.v1",
+  "purpose": "Exhaustive, capability-based inventory of every addressable database environment in this repository, frozen BEFORE any row-count data collection. Universe declared and signed here; no query against the `pages` table (or any table) was run while building this file. Supersedes the per-kind (development/test/target_deployment) framing used in the prior round's legacy-pages-inventory.json, which the codex ADR amendment review (report at /opt/worker/report/codex-adr0003-amendment-2026-08-29.md) found too coarse to close the entry gate.",
+  "source_head": "7945f3fb2eff3547ee8ba8dde9056ed6200f0503",
+  "generated_at": "2026-08-29T14:47:30Z",
+  "executor": {
+    "name": "claude-agent-sonnet5",
+    "role": "v0.4-entry-gate-topology-subagent"
+  },
+  "constraints_honored": [
+    "read-only: no INSERT/UPDATE/DELETE/DDL issued by this task, except starting the already-existing (previously exited) local 'openpr_postgres_1' container via `docker compose start postgres` so `\\l` could be run -- no volume created/destroyed, no `up -d --build`, no `down`, no `-v`",
+    "no `SELECT count(*) FROM pages` or any query against `pages` run against any environment in this round",
+    "kkso: read-only only (`docker compose ps`, `psql -c '\\l'`, `SELECT count(*) FROM schema_migrations`); no restart, no config change",
+    "no git commit / push / stash performed"
+  ],
+  "environments": [
+    {
+      "id": "local-dev-compose-postgres",
+      "kind": "development",
+      "status": "materialized",
+      "addressing": {
+        "mechanism": "docker-compose.yml service 'postgres', compose project 'openpr' (default project name = repo root directory basename; no `name:` override in docker-compose.yml, no COMPOSE_PROJECT_NAME in .env/.env.example -- confirmed by grep)",
+        "compose_file_ref": "docker-compose.yml:20-35",
+        "volume": "openpr_pgdata (confirmed via `podman volume ls`)",
+        "container_observed_at_scan": "openpr_postgres_1 (docker.io/library/postgres:16), state at task start: 'Exited (0) 7 minutes ago (healthy)'; started via `docker compose start postgres` (no recreate) to run `\\l`, now Up",
+        "dsn_generation": "scripts/start.sh:139 writes url = \"postgres://openpr:${postgres_password}@postgres:5432/openpr\" into config/openpr.compose.toml:22 (compose-internal network hostname)",
+        "alternate_host_access": "scripts/dev-up.sh:10-24 starts the SAME service ('postgres') in the SAME compose project against the SAME 'pgdata' volume, only adding a host port mapping override (127.0.0.1:<port>:5432) so a host-side `cargo run`/`cargo test` can reach it directly -- not a distinct environment identity"
+      },
+      "state_bearing": true,
+      "classification_basis": [
+        "docker-compose.yml:31 'pgdata:/var/lib/postgresql/data' is a named volume, which survives `docker compose down` (without -v) and host reboot by construction",
+        "scripts/backup-db.sh:28 runs `pg_dump -U openpr openpr` against this exact database/service; scripts/restore-db.sh:52-56 runs `DROP DATABASE IF EXISTS openpr` then `CREATE DATABASE openpr` (no TEMPLATE clause) then pipes an arbitrary .sql.gz backup file into it -- an explicit, human-invokable mechanism to inject historical/foreign data into this identity",
+        "scripts/init-db.sh:24-33 applies migrations/*.sql directly with psql against PGHOST/PGDATABASE env defaults pointing at this same server -- a second, independent write path into the same identity, not gated by any of the app's own migration runner code",
+        "confirmed present at scan time via `podman volume ls` ('openpr_pgdata') and `podman ps -a` ('openpr_postgres_1', previously exited but not removed) -- this is not a fresh-every-run environment"
+      ]
+    },
+    {
+      "id": "test-scratch-migration-databases",
+      "kind": "test",
+      "status": "opt-in, no persistent addressable name (created and, best-effort, dropped within a single `cargo test` process)",
+      "addressing": {
+        "mechanism": "#[cfg(test)] modules connect to an admin/maintenance URL named by env var OPENPR_TEST_DATABASE_URL, then `CREATE DATABASE \"<prefix>_<label>\"` on that server, migrate it, run assertions, then attempt `DROP DATABASE ... WITH (FORCE)`",
+        "consumers": [
+          "apps/api/src/main.rs:2996-3090 -- mod migration_runner_database_tests, TEST_DATABASE_URL_ENV at line 3015, scratch db name prefix 'openpr_mig_' (line ~3067)",
+          "apps/api/src/routes/decision.rs:210-300 -- mod decision_scope_database_tests, TEST_DATABASE_URL_ENV at line 244, scratch db name prefix 'openpr_dec_' (line ~264)",
+          "apps/api/src/routes/form.rs:7650-7730 -- mod record_link_database_tests, TEST_DATABASE_URL_ENV at line 7677, scratch db name prefix 'openpr_link_' (line ~7714)"
+        ],
+        "typical_admin_url_in_this_repo": "developer-supplied; scripts/dev-up.sh:24 documents the intended value as pointing at the SAME server/volume as the 'local-dev-compose-postgres' entry above (127.0.0.1:<port>, same pgdata volume) -- so in the common local workflow these scratch databases live on the identical physical volume as development data, not a separate disk"
+      },
+      "state_bearing": true,
+      "classification_basis": [
+        "apps/api/src/main.rs:3070 `admin.execute_unprepared(&format!(\"CREATE DATABASE {quoted}\"))` -- no TEMPLATE clause, so PostgreSQL clones template1 (the mutable, admin-writable template) rather than the guaranteed-pristine template0; identical pattern at apps/api/src/routes/decision.rs:281-284 and apps/api/src/routes/form.rs:7719-7721. Per the codex ADR amendment (finding 3), a prior DROP+CREATE at this call site cannot be treated as a proof of an empty schema-plus-no-custom-objects database.",
+        "no panic-safe teardown: `grep -n 'impl Drop\\|scopeguard\\|catch_unwind'` across main.rs/decision.rs/form.rs returns zero matches. `drop_self`/cleanup is a plain async fn invoked explicitly at the end of a test body (e.g. main.rs Scratch::drop_self ~line 3041), so a panicking assertion earlier in the same test body skips it entirely and leaves the scratch database behind.",
+        "drop_self fails open, silently: apps/api/src/main.rs ~3047-3052 `let Ok(admin) = Database::connect(&admin_url).await else { return; };` -- if the maintenance reconnect fails, the function returns with no error surfaced anywhere; the scratch database stays.",
+        "these databases are created on whatever server OPENPR_TEST_DATABASE_URL's host names -- in this repo that is documented (dev-up.sh) to be the same server as the persistent development volume, so a leaked scratch database is a leak into state-bearing storage, not into disposable storage."
+      ]
+    },
+    {
+      "id": "test-direct-fixture-databases",
+      "kind": "test",
+      "status": "opt-in, writes directly into whatever database the env var names -- no isolation database is created at all",
+      "addressing": {
+        "mechanism": "#[cfg(test)] modules read OPENPR_TEST_DATABASE_URL and connect to it AS THE APPLICATION DATABASE ITSELF (not as a maintenance/admin URL used to CREATE a throwaway database around it), then INSERT fixture rows (users, workspaces, workspace_members, projects, work_items, comments, labels) directly against it and run the real HTTP handler code against those rows",
+        "consumers": [
+          "apps/api/src/routes/search.rs:404-407 (state_from_env), fixture builders lines ~416-534, cleanup() lines 536-547, invoked at lines 674 and 729",
+          "apps/api/src/routes/label.rs:734-737 (state_from_env), cleanup() lines 824-833, invoked at lines 953 and 990"
+        ]
+      },
+      "state_bearing": true,
+      "classification_basis": [
+        "search.rs:404-407 and label.rs:734-737 both do `let url = std::env::var(\"OPENPR_TEST_DATABASE_URL\").ok()?; let db = Database::connect(&url)...` and hand that connection straight to AppState -- no CREATE DATABASE, no DROP, no per-test namespacing of any kind.",
+        "this is a second, mutually incompatible contract for the identical env var name used by the scratch-database entry above: main.rs:2996-2999 / decision.rs:220-222 / form.rs:7658-7660 all document OPENPR_TEST_DATABASE_URL as 'a maintenance connection string, for example postgres://user:pw@127.0.0.1:5432/postgres' meant to be used to CREATE a throwaway database around it -- while search.rs/label.rs instead connect to that exact URL as an already-migrated, already-live application database and INSERT real rows into `users`/`workspaces`/`projects` at whatever address it names. Whichever database a developer happens to point OPENPR_TEST_DATABASE_URL at when running these two test files receives permanent writes.",
+        "cleanup is DELETE-based and executed only after all assertions pass (search.rs cleanup() called at lines 674/729 -- both after the test's own `assert!`/`assert_eq!` calls; label.rs identically at 953/990); no Drop guard, no scopeguard, no catch_unwind anywhere in either file -- a failed assertion or panic leaves the inserted rows permanently in whatever database the URL named."
+      ]
+    },
+    {
+      "id": "e2e-compose-lifecycle-scripts-e2e-test-sh",
+      "kind": "test",
+      "status": "same physical identity as local-dev-compose-postgres; this entry documents a distinct LIFECYCLE mechanism over that identity, not a separate database",
+      "same_identity_as": "local-dev-compose-postgres",
+      "addressing": {
+        "mechanism": "scripts/e2e-test.sh drives the SAME docker-compose.yml / 'openpr' compose project as local-dev-compose-postgres: `docker compose down -v --remove-orphans` (line 64) then `bash scripts/start.sh` (line 92) to bring it back up, then runs scripts/test-api.sh, scripts/bootstrap-restaurant-demo.sh, scripts/test-mcp.sh against the running stack over HTTP",
+        "keep_stack_env_var": "OPENPR_E2E_KEEP_STACK (documented scripts/e2e-test.sh:19, read into KEEP_STACK at line 26)"
+      },
+      "state_bearing": true,
+      "classification_basis": [
+        "scripts/e2e-test.sh:9-11 (script header comment): 'It runs `docker compose down -v` both before and after the test run, which deletes the `pgdata` volume of THIS compose project' -- explicitly the same volume/project as local-dev-compose-postgres, confirming this is a lifecycle wrapper, not an isolated environment.",
+        "scripts/e2e-test.sh:73-88, the `cleanup()` function registered via `trap cleanup EXIT` at line 88:\\n```\\ncleanup() {\\n  if [ \"$KEEP_STACK\" = \"1\" ]; then\\n    echo \"\"\\n    echo \"\\u2139\\ufe0f  OPENPR_E2E_KEEP_STACK=1; leaving the stack running.\"\\n    echo \"   Tear it down with: docker compose down -v\"\\n    return\\n  fi\\n  echo \"\"\\n  echo \"\\ud83e\\uddf9 Cleaning up...\"\\n  docker compose down -v --remove-orphans\\n  echo \"\\u2705 Cleanup complete\"\\n}\\n```\\nWith OPENPR_E2E_KEEP_STACK=1, the function returns before the `docker compose down -v` call -- the post-run teardown that the rest of this script's safety story depends on is explicitly skipped, and the stack (postgres + whatever test-api.sh/bootstrap-restaurant-demo.sh/test-mcp.sh wrote into it) is left running indefinitely.",
+        "the run itself is not read-only: scripts/test-api.sh registers a real admin account (e2e-test.sh:135-141, the very first account -- registration is admin-only afterward), scripts/bootstrap-restaurant-demo.sh (invoked e2e-test.sh:151-155) seeds a full restaurant demo scenario including a real workspace and MCP bot, and scripts/test-mcp.sh (line 158) exercises the MCP server against that seeded state.",
+        "the up-front `docker compose down -v` (line 64) is a precondition of THIS script being invoked, not a property of the environment: any other entry point (dev-up.sh, backup-db.sh, restore-db.sh, or simply leaving the stack from a KEEP_STACK=1 run) reuses the identical volume without ever going through this reset."
+      ]
+    },
+    {
+      "id": "ci-workflow-test-job",
+      "kind": "ci",
+      "status": "not_applicable_no_preexisting_state",
+      "addressing": {
+        "mechanism": "GitHub Actions job 'test' in .github/workflows/ci.yml:42-52 -- a single step `cargo test --workspace --all-features` on a fresh ubuntu-latest runner; no `services:` block, no docker/podman/compose invocation anywhere in this or any other workflow file in .github/workflows/"
+      },
+      "state_bearing": false,
+      "reason_code": "not_applicable_no_preexisting_state",
+      "source_chain_closure": [
+        "Template/creation: N/A -- no database is ever created. `grep -in \"compose|db|sql|pg\"` across all 4 files in .github/workflows/ (ci.yml, release.yml, release-mcp.yml, sec-audit.yml) returns exactly one hit, ci.yml:87 `sudo apt-get install -y jq ripgrep`, which is the package name 'ripgrep' matching the substring 'pg' -- confirmed not a database reference by inspection.",
+        "No restore/seed/import: none of the workflow files reference scripts/restore-db.sh, scripts/bootstrap-restaurant-demo.sh, or scripts/e2e-test.sh.",
+        "No connection to an existing business DB: GitHub-hosted runners start with no OPENPR_TEST_DATABASE_URL set, and none of the 4 workflow files sets it (confirmed: grep for OPENPR_TEST_DATABASE_URL under .github/workflows/ returns nothing) -- so every real-database test helper (`scratch()` in main.rs/decision.rs/form.rs, `state_from_env()` in search.rs/label.rs) evaluates `std::env::var(...).ok()?` to `None` and the enclosing test body returns immediately via the `scratch_or_skip!` macro or an equivalent early return with an `eprintln!(\"skipped: ...\")` message (e.g. main.rs:3500) -- no CREATE DATABASE, no connection, no INSERT is issued.",
+        "No identifier reuse: since no database is created, there is nothing to reuse.",
+        "Teardown/residue detection: N/A -- the runner VM itself is destroyed by GitHub Actions after the job regardless of exit status, which is a stronger guarantee than any teardown code in this repo could provide.",
+        "Closed: this job has zero database capability in this repository's current CI configuration -- it is not an environment in the sense the other entries are, and its exclusion does not depend on any 'per-run construction is empty' argument this task was asked to distrust."
+      ]
+    },
+    {
+      "id": "kkso-target-deployment-postgres",
+      "kind": "target_deployment",
+      "status": "materialized, production, publicly reachable",
+      "addressing": {
+        "mechanism": "ssh host alias 'kkso' -> compose project at /opt/openpr (docker-compose.yml of identical service shape to this repo's root; deployed via scp'd pre-built binaries per the documented SOP -- no .git checkout on the host, confirmed: `ssh kkso ls /opt/openpr/.git` -> 'No such file or directory')",
+        "container": "openpr-postgres-1 (docker.io/library/postgres:16), observed 'Up 13 days' at scan time via `ssh kkso docker compose ps`",
+        "volume": "openpr_pgdata (confirmed via `ssh kkso docker volume ls`)",
+        "public_surface": "https://pp.opsxsx.com (Cloudflare -> Caddy -> nginx frontend -> api), admin account admin@kkso.local"
+      },
+      "state_bearing": true,
+      "classification_basis": [
+        "live production stack with a public URL and a real admin account and (per CLAUDE.md's own connector-retirement note) is understood to already carry real usage -- unambiguously state-bearing by any definition.",
+        "read-only confirmation collected this round: `docker compose ps` on kkso shows all 5 services (postgres, api, worker, mcp-server, frontend) 'Up 13 days'; `SELECT count(*) FROM schema_migrations` (the migration ledger table, NOT pages) = 53, consistent with migrations/0053_drop_event_outbox.sql being the latest file on disk at this repo's current HEAD."
+      ]
+    },
+    {
+      "id": "worktree-cloned-compose-stacks",
+      "kind": "development",
+      "status": "dormant_not_currently_materialized",
+      "addressing": {
+        "mechanism": "28 directories under /opt/worker/code/openpr/.claude/worktrees/agent-*/ (git worktrees created by this Claude Code session's own agent/subagent tooling, not an OpenPR product surface) each carry a full checkout including their own docker-compose.yml, identical in shape to the repo root's (confirmed via `find . -iname '*compose*'`)",
+        "would_be_project_naming": "docker-compose.yml has no top-level `name:` field and .env/.env.example set no COMPOSE_PROJECT_NAME (confirmed by grep), so compose's default project-name-from-directory-basename rule applies -- `docker compose up` run from inside any one of these 28 directories would create an independently named stack and an independently named volume, isolated from 'openpr_pgdata' and from every other worktree"
+      },
+      "state_bearing": true,
+      "status_note": "conservative classification -- flagged as an explicit uncertain/edge-case call in the accompanying report",
+      "classification_basis": [
+        "capability, not current status, drives this classification per this task's own instruction: these directories carry the identical mechanism (named-volume compose postgres, no keep-stack guard of its own beyond what e2e-test.sh provides when invoked from that copy) as 'local-dev-compose-postgres'; if any one is ever run with `docker compose up` it becomes state-bearing in exactly the same way that entry is.",
+        "full-host scan at task time (`podman ps -a`) shows exactly one openpr-tagged container ('openpr_postgres_1') and `podman volume ls` shows exactly one openpr-tagged volume ('openpr_pgdata') -- none of the 28 worktrees currently has a running container or a materialized volume, so today this is a latent capability, not an active data-bearing instance.",
+        "recorded as true rather than false because the source chain cannot be closed the way the CI entry's chain was closed: there is no code-level or CI-level guarantee that these worktrees are never run, never accumulate a volume across two runs, or are cleaned up on abnormal exit -- 'currently dormant' is an observation about this scan moment, not a structural guarantee."
+      ]
+    }
+  ],
+  "entries_not_created_as_separate_environments": [
+    {
+      "candidate": "scripts/dev-up.sh host-port exposure of postgres",
+      "why_folded_in": "same compose project 'openpr', same 'pgdata' volume as local-dev-compose-postgres -- only an additional port mapping, not a new identity. See local-dev-compose-postgres.addressing.alternate_host_access."
+    },
+    {
+      "candidate": "playwright.config.ts baseURL http://10.72.0.3:3000",
+      "why_folded_in": "10.72.0.3 is this host's own WireGuard interface address (confirmed via `ip -4 addr show`), i.e. the same local compose stack's frontend, reached over its VPN IP instead of localhost -- not a separate deployment."
+    },
+    {
+      "candidate": "apps/mcp-server/tests/support/mod.rs:21 postgres://openpr:e2e-unused-password@127.0.0.1:5432/openpr",
+      "why_folded_in": "the module's own doc comment (lines 15-17) states the MCP server opens no database connection at all; this string exists only to satisfy the shared config file's [database] section syntax so the loader validates -- no TCP connection is ever attempted with it."
+    },
+    {
+      "candidate": "crates/platform/src/config/tests.rs and apps/api/src/routes/upload.rs:1015 postgres:// literals",
+      "why_folded_in": "pure unit-test fixtures for the TOML config parser / access-check logic; upload.rs:1015 explicitly pairs its literal with `db: DatabaseConnection::default()`, i.e. a disconnected mock -- none of these open a real connection."
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "schema_version": "sylvode.flow.legacy-pages-inventory.v1",
+  "source_head": "7945f3fb2eff3547ee8ba8dde9056ed6200f0503",
+  "generated_at": "2026-08-29T14:34:49Z",
+  "executor": {
+    "name": "claude-agent-sonnet5",
+    "role": "v0.4-entry-gate-inventory-subagent"
+  },
+  "environments": [
+    {
+      "kind": "development",
+      "status": "collected",
+      "identity_sha256": "577cca309a8c5c3d493cb205d6f7610aadf63fcdbddb377b57f73a69205fdf3e",
+      "identity_description": "local podman-compose project 'openpr', service 'postgres', persistent volume 'openpr_pgdata' (created 2026-08-19), database 'openpr', reached via `docker compose exec postgres psql` from /opt/worker/code/openpr",
+      "collected_at": "2026-08-29T14:33:47Z",
+      "row_count": 0,
+      "workspace_distribution": [],
+      "max_body_md_bytes": 0,
+      "query_sha256": "aa9d1afcbd7029c3939f069984d3db5d74070ab80d668517dabebae324d77a21",
+      "query_text_for_audit": "SELECT count(*) FROM pages;",
+      "source_schema_sha256": "9ca12b7b5be0ec4bd0ca8091f230e8cfbcbe9f5bf6eb5dbc320a7a7104ceeed1",
+      "schema_migrations_latest": "0053_drop_event_outbox.sql",
+      "schema_migrations_applied_count": 54,
+      "transaction_mode": "BEGIN TRANSACTION READ ONLY; ... COMMIT;"
+    },
+    {
+      "kind": "test",
+      "status": "unavailable",
+      "unavailable_reason": "This repository provisions no persistent 'test' database distinct from 'development'. The only test-database mechanism is apps/api/src/main.rs::migration_runner_database_tests, which requires an explicit OPENPR_TEST_DATABASE_URL (unset in this environment) and, when set, creates a throwaway 'openpr_mig_<label>' database per test, migrates it, and DROPs it before the process exits -- it has no addressable at-rest state outside an active `cargo test` run. The only other candidate, scripts/e2e-test.sh, was explicitly excluded from this task because it runs `docker compose down -v` (destroys the development volume) both before and after. No separate test docker-compose file, CI postgres service, or persistent test DSN exists anywhere in this checkout. Spinning up a fresh scratch database ourselves to inspect it would itself be a write operation this task's read-only mandate forbids, and would not represent any state that exists independent of our own action. Recorded as unavailable rather than guessed at 0, per the task's explicit instruction that 'cannot be determined' and 'confirmed zero' are different conclusions.",
+      "identity_sha256": null,
+      "collected_at": null,
+      "row_count": null,
+      "workspace_distribution": null,
+      "max_body_md_bytes": null,
+      "query_sha256": null,
+      "source_schema_sha256": null,
+      "schema_migrations_latest": null,
+      "schema_migrations_applied_count": null
+    },
+    {
+      "kind": "target_deployment",
+      "status": "collected",
+      "identity_sha256": "2b0e958887bf7d5f3cb86e952abc02a39e06177227a2b3d9efbe4ac52a127591",
+      "identity_description": "ssh host alias 'kkso', compose project at /opt/openpr, container 'openpr-postgres-1', database 'openpr', public site https://pp.opsxsx.com; reached via `ssh kkso docker exec openpr-postgres-1 psql`",
+      "collected_at": "2026-08-29T14:34:31Z",
+      "row_count": 0,
+      "workspace_distribution": [],
+      "max_body_md_bytes": 0,
+      "query_sha256": "aa9d1afcbd7029c3939f069984d3db5d74070ab80d668517dabebae324d77a21",
+      "query_text_for_audit": "SELECT count(*) FROM pages;",
+      "source_schema_sha256": "9ca12b7b5be0ec4bd0ca8091f230e8cfbcbe9f5bf6eb5dbc320a7a7104ceeed1",
+      "schema_migrations_latest": "0052_drop_connectors_and_agent_invocations.sql",
+      "schema_migrations_applied_count": 53,
+      "transaction_mode": "BEGIN TRANSACTION READ ONLY; ... COMMIT;",
+      "note": "No local .git checkout at /opt/openpr (deployed via scp binaries per deployment SOP), so the 547ee78 commit reference cited in the task prompt could not be independently verified from a .git directory on that host; schema_migrations (the authoritative in-database ledger) confirms migration 0052 is the latest applied, matching the prompt's stated 'migrated to 0052'."
+    }
+  ],
+  "total_rows": 0,
+  "total_rows_status": "incomplete_one_environment_unavailable",
+  "environments_collected": ["development", "target_deployment"],
+  "environments_unavailable": ["test"],
+  "checksum_recipe": "sha256 of the UTF-8 string formed by joining, for each of the 3 kinds in fixed order development|test|target_deployment, the fields `kind:status:row_count_or_NA:source_schema_sha256_or_NA` with '|' between fields and ';' between environments (e.g. 'development:collected:0:9ca12b7b...;test:unavailable:NA:NA;target_deployment:collected:0:9ca12b7b...')",
+  "checksum": "8da8fb44a34733160a73496cb6476bfd67c418b4c7d116b92327d700ca7de895",
+  "gate_verdict": {
+    "entry_rule_branch": "cannot_lock_zero_branch_yet",
+    "reasoning": "development and target_deployment both independently confirm pages row_count=0 with identical schema. But the entry_rule and legacy-pages-import-v1.md contract require inventory to cover all three named environments before a zero-branch checksum can lock; 'test' is unavailable (not confirmed zero), so total_rows=0 here is a partial sum, not the complete-coverage zero this gate requires to pass on the zero branch. The nonzero/importer branch is also not triggered, since nothing confirmed nonzero. Net effect: entry_gate stays blocked pending either (a) a decision to formally exempt 'test' as structurally not applicable in this repo (requires a documentation/ADR amendment, not something this inventory can decide unilaterally), or (b) provisioning a real addressable test environment and re-running collection against it."
+  }
+}
