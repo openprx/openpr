@@ -1,0 +1,9 @@
+{
+  "candidate": "yrs-yjs",
+  "canonical_json_path": "rust_semantic_yrs-yjs.json",
+  "node_count": 14,
+  "seed": 424242,
+  "semantic_hash": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7",
+  "snapshot_bytes": 2185,
+  "snapshot_path": "rust_snapshot_yrs-yjs.bin"
+}

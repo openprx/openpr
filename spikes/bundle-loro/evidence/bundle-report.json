@@ -1,0 +1,31 @@
+{
+  "candidate": "loro",
+  "engine_versions": {
+    "loro-crdt": "1.14.1",
+    "loro-prosemirror": "0.4.3"
+  },
+  "excluded_shared_chunk_prefixes": [
+    "assets/vendor-prosemirror-"
+  ],
+  "main_entry": "assets/index-C-S9sr0-.js",
+  "flow_entry_chunk": "assets/flow-entry-CYMLIr8u.js",
+  "home_entry_chunk": "assets/home-entry-Xrlxeanp.js",
+  "home_route_carries_engine_chunk": false,
+  "files": [
+    {
+      "path": "assets/flow-entry-CYMLIr8u.js",
+      "kind": "javascript",
+      "raw_bytes": 92930,
+      "gzip_bytes": 16210
+    },
+    {
+      "path": "assets/loro_wasm_bg-JBAr9c7M.wasm",
+      "kind": "wasm",
+      "raw_bytes": 3179170,
+      "gzip_bytes": 1052078
+    }
+  ],
+  "total_gzip_bytes": 1068288,
+  "budget_bytes_max": 2097152,
+  "budget_status": "passed"
+}

@@ -1,0 +1,63 @@
+{
+  "checked_at": "2026-08-29T13:37:24.733Z",
+  "ok": true,
+  "results": [
+    {
+      "candidate": "loro",
+      "module_count": 4,
+      "module_ids": [
+        "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/index.js",
+        "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/loro_wasm.js",
+        "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/loro_wasm_bg.js",
+        "/opt/worker/code/openpr/spikes/coldstart-measure/probe/src/loro-engine-only-entry.ts"
+      ],
+      "deny_patterns": [
+        "prosemirror",
+        "orderedmap"
+      ],
+      "violations": [],
+      "ok": true
+    },
+    {
+      "candidate": "yrs-yjs",
+      "module_count": 29,
+      "module_ids": [
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/array.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/binary.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/conditions.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/dom.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/encoding.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/environment.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/error.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/function.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/iterator.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/logging.common.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/logging.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/map.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/math.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/number.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/object.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/observable.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/pair.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/prng.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/promise.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/random.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/schema.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/set.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/storage.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/string.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/symbol.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/trait/equality.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/webcrypto.js",
+        "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/yjs/dist/yjs.mjs",
+        "/opt/worker/code/openpr/spikes/coldstart-measure/probe/src/yrs-yjs-engine-only-entry.ts"
+      ],
+      "deny_patterns": [
+        "prosemirror",
+        "orderedmap"
+      ],
+      "violations": [],
+      "ok": true
+    }
+  ]
+}

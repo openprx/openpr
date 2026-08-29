@@ -1,0 +1,37 @@
+{
+  "loro": {
+    "home_route_requests": [
+      "/",
+      "/assets/index-C-S9sr0-.js",
+      "/assets/home-entry-Xrlxeanp.js",
+      "/favicon.ico"
+    ],
+    "home_route_carries_engine_chunk": false,
+    "flow_route_requests": [
+      "/flow/verify-object-1",
+      "/assets/index-C-S9sr0-.js",
+      "/assets/flow-entry-CYMLIr8u.js",
+      "/assets/vendor-prosemirror-D94XFtvz.js",
+      "/assets/loro_wasm_bg-JBAr9c7M.wasm"
+    ],
+    "flow_route_carries_all_engine_markers": true,
+    "flow_route_dataset_route_attr": "flow"
+  },
+  "yrs-yjs": {
+    "home_route_requests": [
+      "/",
+      "/assets/index-BfNyb9R1.js",
+      "/assets/home-entry-DIc_iZtT.js",
+      "/favicon.ico"
+    ],
+    "home_route_carries_engine_chunk": false,
+    "flow_route_requests": [
+      "/flow/verify-object-1",
+      "/assets/index-BfNyb9R1.js",
+      "/assets/flow-entry-_B6Sebp0.js",
+      "/assets/vendor-prosemirror-PNi2HqOP.js"
+    ],
+    "flow_route_carries_all_engine_markers": true,
+    "flow_route_dataset_route_attr": "flow"
+  }
+}

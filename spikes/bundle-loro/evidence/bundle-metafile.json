@@ -1,0 +1,86 @@
+[
+  {
+    "type": "chunk",
+    "fileName": "assets/index-C-S9sr0-.js",
+    "isEntry": true,
+    "isDynamicEntry": false,
+    "facadeModuleId": "/opt/worker/code/openpr/spikes/bundle-loro/index.html",
+    "imports": [],
+    "dynamicImports": [
+      "assets/flow-entry-CYMLIr8u.js",
+      "assets/home-entry-Xrlxeanp.js"
+    ],
+    "importedAssets": [],
+    "moduleIds": [
+      "\u0000vite/modulepreload-polyfill.js",
+      "\u0000vite/preload-helper.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/src/main.ts",
+      "/opt/worker/code/openpr/spikes/bundle-loro/index.html"
+    ]
+  },
+  {
+    "type": "chunk",
+    "fileName": "assets/vendor-prosemirror-D94XFtvz.js",
+    "isEntry": false,
+    "isDynamicEntry": false,
+    "facadeModuleId": null,
+    "imports": [],
+    "dynamicImports": [],
+    "importedAssets": [],
+    "moduleIds": [
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/orderedmap/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/prosemirror-model/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/prosemirror-transform/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/prosemirror-state/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/prosemirror-view/dist/index.js"
+    ]
+  },
+  {
+    "type": "chunk",
+    "fileName": "assets/flow-entry-CYMLIr8u.js",
+    "isEntry": false,
+    "isDynamicEntry": true,
+    "facadeModuleId": "/opt/worker/code/openpr/spikes/bundle-loro/src/flow-entry.ts",
+    "imports": [
+      "assets/vendor-prosemirror-D94XFtvz.js"
+    ],
+    "dynamicImports": [],
+    "importedAssets": [
+      "assets/loro_wasm_bg-JBAr9c7M.wasm"
+    ],
+    "moduleIds": [
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/loro_wasm_bg.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/loro_wasm.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/lib0/trait/equality.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/lib0/object.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/lib0/function.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/lib0/diff.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-prosemirror/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-loro/src/flow-entry.ts"
+    ]
+  },
+  {
+    "type": "chunk",
+    "fileName": "assets/home-entry-Xrlxeanp.js",
+    "isEntry": false,
+    "isDynamicEntry": true,
+    "facadeModuleId": "/opt/worker/code/openpr/spikes/bundle-loro/src/home-entry.ts",
+    "imports": [],
+    "dynamicImports": [],
+    "importedAssets": [],
+    "moduleIds": [
+      "/opt/worker/code/openpr/spikes/bundle-loro/src/home-entry.ts"
+    ]
+  },
+  {
+    "type": "asset",
+    "fileName": "assets/loro_wasm_bg-JBAr9c7M.wasm",
+    "bytes": 3179170
+  },
+  {
+    "type": "asset",
+    "fileName": "index.html",
+    "bytes": 260
+  }
+]

@@ -1,0 +1,242 @@
+{
+  "schema_note": "Follow-up to cold-start-result.json: same method, Fast-4G throttle, but served through gzip-static-server.mjs (real Content-Encoding: gzip verified per-response) instead of vite preview (uncompressed).",
+  "chromium_version": "Chrome/144.0.7559.109",
+  "budget_ms_p95_max": 250,
+  "warmup_count": 3,
+  "sample_count": 8,
+  "meets_benchmark_spec_sample_floor": false,
+  "results": [
+    {
+      "candidate": "loro",
+      "network_profile": "fast_4g_gzip",
+      "gzip_header_verified": true,
+      "uncompressed_responses_seen": [],
+      "flow_ready_mark_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 1838.800000011921,
+        "p95": 1841.2999999821186,
+        "p99": 1841.2999999821186,
+        "min": 1836.8999999761581,
+        "max": 1841.2999999821186,
+        "raw_samples": [
+          1836.8999999761581,
+          1837.300000011921,
+          1838,
+          1838.800000011921,
+          1838.9000000059605,
+          1839.300000011921,
+          1839.5,
+          1841.2999999821186
+        ]
+      },
+      "wall_clock_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 1849,
+        "p95": 1852,
+        "p99": 1852,
+        "min": 1846,
+        "max": 1852,
+        "raw_samples": [
+          1846,
+          1848,
+          1849,
+          1849,
+          1849,
+          1850,
+          1852,
+          1852
+        ]
+      },
+      "budget_ms_p95_max": 250,
+      "budget_status": "failed",
+      "runs": [
+        {
+          "index": 0,
+          "warmup": true,
+          "wallElapsedMs": 1852,
+          "markStartTime": 1836.0999999940395
+        },
+        {
+          "index": 1,
+          "warmup": true,
+          "wallElapsedMs": 1848,
+          "markStartTime": 1834.7000000178814
+        },
+        {
+          "index": 2,
+          "warmup": true,
+          "wallElapsedMs": 1852,
+          "markStartTime": 1840
+        },
+        {
+          "index": 3,
+          "warmup": false,
+          "wallElapsedMs": 1848,
+          "markStartTime": 1836.8999999761581
+        },
+        {
+          "index": 4,
+          "warmup": false,
+          "wallElapsedMs": 1852,
+          "markStartTime": 1838.9000000059605
+        },
+        {
+          "index": 5,
+          "warmup": false,
+          "wallElapsedMs": 1849,
+          "markStartTime": 1839.5
+        },
+        {
+          "index": 6,
+          "warmup": false,
+          "wallElapsedMs": 1849,
+          "markStartTime": 1838
+        },
+        {
+          "index": 7,
+          "warmup": false,
+          "wallElapsedMs": 1846,
+          "markStartTime": 1837.300000011921
+        },
+        {
+          "index": 8,
+          "warmup": false,
+          "wallElapsedMs": 1850,
+          "markStartTime": 1839.300000011921
+        },
+        {
+          "index": 9,
+          "warmup": false,
+          "wallElapsedMs": 1852,
+          "markStartTime": 1841.2999999821186
+        },
+        {
+          "index": 10,
+          "warmup": false,
+          "wallElapsedMs": 1849,
+          "markStartTime": 1838.800000011921
+        }
+      ]
+    },
+    {
+      "candidate": "yrs-yjs",
+      "network_profile": "fast_4g_gzip",
+      "gzip_header_verified": true,
+      "uncompressed_responses_seen": [],
+      "flow_ready_mark_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 614.8000000119209,
+        "p95": 617.4000000059605,
+        "p99": 617.4000000059605,
+        "min": 609.8000000119209,
+        "max": 617.4000000059605,
+        "raw_samples": [
+          609.8000000119209,
+          611.5999999940395,
+          614.6999999880791,
+          614.8000000119209,
+          614.8999999761581,
+          615.7000000178814,
+          615.8000000119209,
+          617.4000000059605
+        ]
+      },
+      "wall_clock_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 616,
+        "p95": 623,
+        "p99": 623,
+        "min": 611,
+        "max": 623,
+        "raw_samples": [
+          611,
+          613,
+          616,
+          616,
+          617,
+          617,
+          617,
+          623
+        ]
+      },
+      "budget_ms_p95_max": 250,
+      "budget_status": "failed",
+      "runs": [
+        {
+          "index": 0,
+          "warmup": true,
+          "wallElapsedMs": 617,
+          "markStartTime": 615.0999999940395
+        },
+        {
+          "index": 1,
+          "warmup": true,
+          "wallElapsedMs": 615,
+          "markStartTime": 613.3000000119209
+        },
+        {
+          "index": 2,
+          "warmup": true,
+          "wallElapsedMs": 616,
+          "markStartTime": 615.3000000119209
+        },
+        {
+          "index": 3,
+          "warmup": false,
+          "wallElapsedMs": 623,
+          "markStartTime": 617.4000000059605
+        },
+        {
+          "index": 4,
+          "warmup": false,
+          "wallElapsedMs": 617,
+          "markStartTime": 614.6999999880791
+        },
+        {
+          "index": 5,
+          "warmup": false,
+          "wallElapsedMs": 616,
+          "markStartTime": 614.8000000119209
+        },
+        {
+          "index": 6,
+          "warmup": false,
+          "wallElapsedMs": 617,
+          "markStartTime": 615.7000000178814
+        },
+        {
+          "index": 7,
+          "warmup": false,
+          "wallElapsedMs": 617,
+          "markStartTime": 615.8000000119209
+        },
+        {
+          "index": 8,
+          "warmup": false,
+          "wallElapsedMs": 611,
+          "markStartTime": 609.8000000119209
+        },
+        {
+          "index": 9,
+          "warmup": false,
+          "wallElapsedMs": 613,
+          "markStartTime": 611.5999999940395
+        },
+        {
+          "index": 10,
+          "warmup": false,
+          "wallElapsedMs": 616,
+          "markStartTime": 614.8999999761581
+        }
+      ]
+    }
+  ]
+}

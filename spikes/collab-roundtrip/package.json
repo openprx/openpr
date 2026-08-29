@@ -1,0 +1,20 @@
+{
+  "name": "@openpr/collab-roundtrip-spike",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@sylvode/collab-shared": "file:../collab-shared",
+    "loro-crdt": "1.14.1",
+    "yjs": "13.6.32"
+  },
+  "devDependencies": {
+    "bun-types": "1.4.0",
+    "typescript": "5.9.3"
+  },
+  "license": "MIT OR Apache-2.0"
+}

@@ -1,0 +1,2879 @@
+{
+  "measurement_protocol_id": "sylvode.flow.coldstart.v1",
+  "protocol_status_note": "ADR-0015 is status=Proposed as of this run (revision R7; this metric's adapter-API-only / vendor-exclusion design dates to R4 and was independently CONFIRMED correct through the predregistration rounds, no functional changes to this file since). This evidence is protocol-conformant but MUST NOT be used to decide any hard gate until the ADR is Accepted.",
+  "run_kind": "formal_candidate",
+  "smoke_note": null,
+  "preregistration_signature": {
+    "status": "APPROVED_FOR_FORMAL_RUN",
+    "record_path": "evidence/v2/PREREGISTRATION-SIGNATURE.md",
+    "reviewer": "OpenAI Codex (independent reviewer, did not write this runner)",
+    "signed_at": "2026-08-29T13:41:56Z",
+    "bound_hashes": {
+      "adr_0015_r7_sha256": "7b6725f4f09fc5804f3e7cfede99c4233cc9825f9b3dd6107c284970907aadb5",
+      "probe_coldstart_probe_v1_json_sha256": "6fb9ed16e62e2a5714f5268f3c8cceb58bd0cfef740d38e6833145320184c386",
+      "probe_calibration_256k_bin_sha256": "e23d9c02e637b253337bf7dee349235783b6a63a059934fe526c5ba7f1329904"
+    },
+    "hash_verification_this_run": {
+      "ok": true,
+      "expected": {
+        "adr_0015_r7_sha256": "7b6725f4f09fc5804f3e7cfede99c4233cc9825f9b3dd6107c284970907aadb5",
+        "probe_coldstart_probe_v1_json_sha256": "6fb9ed16e62e2a5714f5268f3c8cceb58bd0cfef740d38e6833145320184c386",
+        "probe_calibration_256k_bin_sha256": "e23d9c02e637b253337bf7dee349235783b6a63a059934fe526c5ba7f1329904"
+      },
+      "actual": {
+        "adr_0015_r7_sha256": "7b6725f4f09fc5804f3e7cfede99c4233cc9825f9b3dd6107c284970907aadb5",
+        "probe_coldstart_probe_v1_json_sha256": "6fb9ed16e62e2a5714f5268f3c8cceb58bd0cfef740d38e6833145320184c386",
+        "probe_calibration_256k_bin_sha256": "e23d9c02e637b253337bf7dee349235783b6a63a059934fe526c5ba7f1329904"
+      },
+      "mismatches": []
+    },
+    "note": "hash_verification_this_run is this actual run's machine-executed check result (verifyPreregistrationHashes(), lib/common.mjs), computed at process start before any browser/timing work -- not merely a claim."
+  },
+  "metric": "engine_runtime_ready_ms_p95",
+  "ready_postconditions_used": "1-4 only, ALL redefined as adapter-API-only CRDT operations (ADR-0015 R4 3.2 item 4) -- no DOM, no ProseMirror, no EditorView anywhere in the timed window. NOT postcondition 5 (mount+rAF), which remains flow_route_cold_load's alone.",
+  "module_graph_check": {
+    "checked_at": "2026-08-29T14:03:48.174Z",
+    "ok": true,
+    "results": [
+      {
+        "candidate": "loro",
+        "module_count": 4,
+        "module_ids": [
+          "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/index.js",
+          "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/loro_wasm.js",
+          "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/browser/loro_wasm_bg.js",
+          "/opt/worker/code/openpr/spikes/coldstart-measure/probe/src/loro-engine-only-entry.ts"
+        ],
+        "deny_patterns": [
+          "prosemirror",
+          "orderedmap"
+        ],
+        "violations": [],
+        "ok": true
+      },
+      {
+        "candidate": "yrs-yjs",
+        "module_count": 29,
+        "module_ids": [
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/array.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/binary.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/conditions.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/dom.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/encoding.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/environment.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/error.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/function.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/iterator.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/logging.common.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/logging.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/map.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/math.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/number.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/object.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/observable.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/pair.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/prng.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/promise.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/random.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/schema.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/set.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/storage.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/string.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/symbol.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/trait/equality.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/webcrypto.js",
+          "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/yjs/dist/yjs.mjs",
+          "/opt/worker/code/openpr/spikes/coldstart-measure/probe/src/yrs-yjs-engine-only-entry.ts"
+        ],
+        "deny_patterns": [
+          "prosemirror",
+          "orderedmap"
+        ],
+        "violations": [],
+        "ok": true
+      }
+    ]
+  },
+  "engine_probe_dependency_identity": {
+    "loro": {
+      "package_json_path": "/opt/worker/code/openpr/spikes/bundle-loro/node_modules/loro-crdt/package.json",
+      "package_json_sha256": "690f299d2b30c3589201a07079983f5637da01265a08dd90e1f8a0a0dabeb997",
+      "package_version": "1.14.1"
+    },
+    "yrs-yjs": {
+      "package_json_path": "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/yjs/package.json",
+      "package_json_sha256": "6173fb9eef1ce7e96443c298ff6abf37ac80b7155935ee7e2ee801319da2e149",
+      "package_version": "13.6.32"
+    }
+  },
+  "run_id": "engine-runtime-ready-2026-08-29T14-03-47-638Z",
+  "source_commit": "235ce64239cb7782d4b725336f35fd35e1b40023",
+  "shared_runner_hash": "0822c85780cba840c766fae359f562623005d6b7edae6a969d833ab97eaed056",
+  "frozen_probe_spec_sha256": "6fb9ed16e62e2a5714f5268f3c8cceb58bd0cfef740d38e6833145320184c386",
+  "server_config_hash": null,
+  "browser_version": "Chrome/144.0.7559.109",
+  "toolchain_versions_by_candidate": {
+    "loro": {
+      "bun": "1.3.8",
+      "vite": "7.3.1",
+      "typescript": "5.9.3"
+    },
+    "yrs-yjs": {
+      "bun": "1.3.8",
+      "vite": "7.3.1",
+      "typescript": "5.9.3"
+    }
+  },
+  "toolchain_versions_equal_across_candidates": true,
+  "p95_algorithm": "nearest-rank, 1-based ceil(0.95*n), no interpolation",
+  "warmup_count": 5,
+  "sample_count_target": 30,
+  "scheduling": "per-sample-pair alternating (AB, BA, AB, BA, ...), see lib/common.mjs buildAlternatingPairSchedule; global_index/pair_index/position_in_pair/started_at/finished_at recorded per sample below.",
+  "fresh_realm_strategy": "new puppeteer.launch() process per warmup/sample, closed after each sample",
+  "read_write_probe": {
+    "expected_full_hash_hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+    "expected_canonical_json": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]",
+    "description": "SHA-256 of a fixed structural block array (id/type/parent/index/text) read back EXCLUSIVELY via the candidate's own CRDT container API (LoroMap/LoroText or Y.Map/Y.Text) -- no DOM involved at all in this metric. See probe/coldstart-probe-v1.json."
+  },
+  "fixture_text": "SYLVODE_FLOW_COLDSTART_FIXTURE_v1",
+  "probe_text": "SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1",
+  "results": [
+    {
+      "candidate": "loro",
+      "has_wasm": true,
+      "engine_probe_built_artifact_hash": "8a055d2956fc2df0df37bf8790dac6ca22f546016aae70ed38e2a7811a633d32",
+      "package_lockfile_hash": "db92d238d498a51c87517496ac67a0d02326a07ac2955b5b515ad288d599486b",
+      "toolchain_versions": {
+        "bun": "1.3.8",
+        "vite": "7.3.1",
+        "typescript": "5.9.3"
+      },
+      "warmup_count": 5,
+      "sample_count_attempted": 30,
+      "sample_count_successful": 30,
+      "failed_sample_count": 0,
+      "failed_samples": [],
+      "run_valid": true,
+      "raw_samples_ms": [
+        26.8,
+        27.1,
+        27.4,
+        27.5,
+        27.5,
+        27.5,
+        27.5,
+        27.5,
+        27.5,
+        27.7,
+        27.7,
+        27.8,
+        27.8,
+        27.8,
+        27.9,
+        27.9,
+        27.9,
+        27.9,
+        27.9,
+        27.9,
+        28,
+        28,
+        28,
+        28,
+        28.1,
+        28.2,
+        28.2,
+        28.3,
+        28.8,
+        28.9
+      ],
+      "p95_ms": 28.8,
+      "budget_ms": 250,
+      "budget_status": "passed",
+      "wasm_segments_by_sample": [
+        {
+          "global_index": 11,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.5,
+              "endMs": 76.59999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.59999999403954,
+              "endMs": 77.09999999403954
+            }
+          ]
+        },
+        {
+          "global_index": 12,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.59999999403954,
+              "endMs": 76.5
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.5,
+              "endMs": 77.09999999403954
+            }
+          ]
+        },
+        {
+          "global_index": 15,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.19999998807907,
+              "endMs": 75.30000001192093
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.30000001192093,
+              "endMs": 75.80000001192093
+            }
+          ]
+        },
+        {
+          "global_index": 16,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 74.60000002384186,
+              "endMs": 78.7000000178814
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 78.7000000178814,
+              "endMs": 79.30000001192093
+            }
+          ]
+        },
+        {
+          "global_index": 19,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.80000001192093,
+              "endMs": 74.69999998807907
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74.69999998807907,
+              "endMs": 75.30000001192093
+            }
+          ]
+        },
+        {
+          "global_index": 20,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 74.30000001192093,
+              "endMs": 79.19999998807907
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 79.30000001192093,
+              "endMs": 79.90000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 23,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.69999998807907,
+              "endMs": 74.89999997615814
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75,
+              "endMs": 75.59999999403954
+            }
+          ]
+        },
+        {
+          "global_index": 24,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70,
+              "endMs": 74
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74,
+              "endMs": 74.5
+            }
+          ]
+        },
+        {
+          "global_index": 27,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 74.19999998807907,
+              "endMs": 78.09999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 78.19999998807907,
+              "endMs": 78.80000001192093
+            }
+          ]
+        },
+        {
+          "global_index": 28,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.7000000178814,
+              "endMs": 74.7000000178814
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74.80000001192093,
+              "endMs": 75.40000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 31,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.40000000596046,
+              "endMs": 75.40000000596046
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.5,
+              "endMs": 76
+            }
+          ]
+        },
+        {
+          "global_index": 32,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71,
+              "endMs": 75.09999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.09999999403954,
+              "endMs": 75.7000000178814
+            }
+          ]
+        },
+        {
+          "global_index": 35,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 76.59999999403954,
+              "endMs": 80.59999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 80.69999998807907,
+              "endMs": 81.19999998807907
+            }
+          ]
+        },
+        {
+          "global_index": 36,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70,
+              "endMs": 73.90000000596046
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74,
+              "endMs": 74.59999999403954
+            }
+          ]
+        },
+        {
+          "global_index": 39,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.59999999403954,
+              "endMs": 76.59999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.69999998807907,
+              "endMs": 77.19999998807907
+            }
+          ]
+        },
+        {
+          "global_index": 40,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 74.80000001192093,
+              "endMs": 78.80000001192093
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 78.80000001192093,
+              "endMs": 79.40000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 43,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.2000000178814,
+              "endMs": 76.30000001192093
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.30000001192093,
+              "endMs": 76.90000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 44,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.19999998807907,
+              "endMs": 74.19999998807907
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74.30000001192093,
+              "endMs": 74.90000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 47,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.5,
+              "endMs": 75.40000000596046
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.40000000596046,
+              "endMs": 76
+            }
+          ]
+        },
+        {
+          "global_index": 48,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.5,
+              "endMs": 74.5
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74.5,
+              "endMs": 75.10000002384186
+            }
+          ]
+        },
+        {
+          "global_index": 51,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.69999998807907,
+              "endMs": 74.69999998807907
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74.7999999821186,
+              "endMs": 75.39999997615814
+            }
+          ]
+        },
+        {
+          "global_index": 52,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.2999999821186,
+              "endMs": 76.19999998807907
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.19999998807907,
+              "endMs": 76.7999999821186
+            }
+          ]
+        },
+        {
+          "global_index": 55,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.60000002384186,
+              "endMs": 75.80000001192093
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.90000000596046,
+              "endMs": 76.40000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 56,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.7999999821186,
+              "endMs": 75.7999999821186
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.89999997615814,
+              "endMs": 76.5
+            }
+          ]
+        },
+        {
+          "global_index": 59,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.59999999403954,
+              "endMs": 76.59999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.69999998807907,
+              "endMs": 77.19999998807907
+            }
+          ]
+        },
+        {
+          "global_index": 60,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.10000002384186,
+              "endMs": 75.10000002384186
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.2000000178814,
+              "endMs": 75.7000000178814
+            }
+          ]
+        },
+        {
+          "global_index": 63,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.59999999403954,
+              "endMs": 75.59999999403954
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.69999998807907,
+              "endMs": 76.19999998807907
+            }
+          ]
+        },
+        {
+          "global_index": 64,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 71.7000000178814,
+              "endMs": 75.80000001192093
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 75.80000001192093,
+              "endMs": 76.40000000596046
+            }
+          ]
+        },
+        {
+          "global_index": 67,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 70.7999999821186,
+              "endMs": 74.7999999821186
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 74.89999997615814,
+              "endMs": 75.5
+            }
+          ]
+        },
+        {
+          "global_index": 68,
+          "ok": true,
+          "wasm_segments": [
+            {
+              "op": "wasm_module_compile_sync",
+              "startMs": 72.10000002384186,
+              "endMs": 76.2000000178814
+            },
+            {
+              "op": "wasm_instance_instantiate_sync",
+              "startMs": 76.2000000178814,
+              "endMs": 76.80000001192093
+            }
+          ]
+        }
+      ],
+      "runs": [
+        {
+          "global_index": 0,
+          "pair_index": 0,
+          "position_in_pair": 0,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:48.186Z",
+          "finished_at": "2026-08-29T14:03:48.968Z",
+          "ok": true,
+          "elapsedMs": 28.299999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 74.2000000178814,
+                  "endMs": 78.2000000178814
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 78.2000000178814,
+                  "endMs": 78.80000001192093
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 3,
+          "pair_index": 1,
+          "position_in_pair": 1,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:49.549Z",
+          "finished_at": "2026-08-29T14:03:50.269Z",
+          "ok": true,
+          "elapsedMs": 27.799999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70,
+                  "endMs": 74
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.09999999403954,
+                  "endMs": 74.59999999403954
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 4,
+          "pair_index": 2,
+          "position_in_pair": 0,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:50.269Z",
+          "finished_at": "2026-08-29T14:03:51.006Z",
+          "ok": true,
+          "elapsedMs": 27.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.30000001192093,
+                  "endMs": 76.30000001192093
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.40000000596046,
+                  "endMs": 77
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 7,
+          "pair_index": 3,
+          "position_in_pair": 1,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:51.575Z",
+          "finished_at": "2026-08-29T14:03:52.301Z",
+          "ok": true,
+          "elapsedMs": 28.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 69.59999999403954,
+                  "endMs": 73.5
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 73.59999999403954,
+                  "endMs": 74.40000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 8,
+          "pair_index": 4,
+          "position_in_pair": 0,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:52.302Z",
+          "finished_at": "2026-08-29T14:03:53.049Z",
+          "ok": true,
+          "elapsedMs": 27.599999994039536,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 69.90000000596046,
+                  "endMs": 73.90000000596046
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 73.90000000596046,
+                  "endMs": 74.59999999403954
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 11,
+          "pair_index": 5,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:53.645Z",
+          "finished_at": "2026-08-29T14:03:54.394Z",
+          "ok": true,
+          "elapsedMs": 28.200000017881393,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.5,
+                  "endMs": 76.59999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.59999999403954,
+                  "endMs": 77.09999999403954
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 12,
+          "pair_index": 6,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:54.394Z",
+          "finished_at": "2026-08-29T14:03:55.150Z",
+          "ok": true,
+          "elapsedMs": 27.400000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.59999999403954,
+                  "endMs": 76.5
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.5,
+                  "endMs": 77.09999999403954
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 15,
+          "pair_index": 7,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:55.739Z",
+          "finished_at": "2026-08-29T14:03:56.487Z",
+          "ok": true,
+          "elapsedMs": 28,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.19999998807907,
+                  "endMs": 75.30000001192093
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.30000001192093,
+                  "endMs": 75.80000001192093
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 16,
+          "pair_index": 8,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:56.487Z",
+          "finished_at": "2026-08-29T14:03:57.230Z",
+          "ok": true,
+          "elapsedMs": 28.299999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 74.60000002384186,
+                  "endMs": 78.7000000178814
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 78.7000000178814,
+                  "endMs": 79.30000001192093
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 19,
+          "pair_index": 9,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:57.797Z",
+          "finished_at": "2026-08-29T14:03:58.530Z",
+          "ok": true,
+          "elapsedMs": 27.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.80000001192093,
+                  "endMs": 74.69999998807907
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.69999998807907,
+                  "endMs": 75.30000001192093
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 20,
+          "pair_index": 10,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:58.530Z",
+          "finished_at": "2026-08-29T14:03:59.273Z",
+          "ok": true,
+          "elapsedMs": 28.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 74.30000001192093,
+                  "endMs": 79.19999998807907
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 79.30000001192093,
+                  "endMs": 79.90000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 23,
+          "pair_index": 11,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:59.893Z",
+          "finished_at": "2026-08-29T14:04:00.620Z",
+          "ok": true,
+          "elapsedMs": 27.099999994039536,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.69999998807907,
+                  "endMs": 74.89999997615814
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75,
+                  "endMs": 75.59999999403954
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 24,
+          "pair_index": 12,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:00.620Z",
+          "finished_at": "2026-08-29T14:04:01.392Z",
+          "ok": true,
+          "elapsedMs": 26.799999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70,
+                  "endMs": 74
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74,
+                  "endMs": 74.5
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 27,
+          "pair_index": 13,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:01.979Z",
+          "finished_at": "2026-08-29T14:04:02.737Z",
+          "ok": true,
+          "elapsedMs": 27.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 74.19999998807907,
+                  "endMs": 78.09999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 78.19999998807907,
+                  "endMs": 78.80000001192093
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 28,
+          "pair_index": 14,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:02.737Z",
+          "finished_at": "2026-08-29T14:04:03.452Z",
+          "ok": true,
+          "elapsedMs": 27.799999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.7000000178814,
+                  "endMs": 74.7000000178814
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.80000001192093,
+                  "endMs": 75.40000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 31,
+          "pair_index": 15,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:04.059Z",
+          "finished_at": "2026-08-29T14:04:04.792Z",
+          "ok": true,
+          "elapsedMs": 27.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.40000000596046,
+                  "endMs": 75.40000000596046
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.5,
+                  "endMs": 76
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 32,
+          "pair_index": 16,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:04.793Z",
+          "finished_at": "2026-08-29T14:04:05.514Z",
+          "ok": true,
+          "elapsedMs": 27.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71,
+                  "endMs": 75.09999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.09999999403954,
+                  "endMs": 75.7000000178814
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 35,
+          "pair_index": 17,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:06.102Z",
+          "finished_at": "2026-08-29T14:04:06.849Z",
+          "ok": true,
+          "elapsedMs": 28,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 76.59999999403954,
+                  "endMs": 80.59999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 80.69999998807907,
+                  "endMs": 81.19999998807907
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 36,
+          "pair_index": 18,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:06.849Z",
+          "finished_at": "2026-08-29T14:04:07.606Z",
+          "ok": true,
+          "elapsedMs": 27.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70,
+                  "endMs": 73.90000000596046
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74,
+                  "endMs": 74.59999999403954
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 39,
+          "pair_index": 19,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:08.155Z",
+          "finished_at": "2026-08-29T14:04:08.903Z",
+          "ok": true,
+          "elapsedMs": 27.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.59999999403954,
+                  "endMs": 76.59999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.69999998807907,
+                  "endMs": 77.19999998807907
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 40,
+          "pair_index": 20,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:08.903Z",
+          "finished_at": "2026-08-29T14:04:09.646Z",
+          "ok": true,
+          "elapsedMs": 27.69999998807907,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 74.80000001192093,
+                  "endMs": 78.80000001192093
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 78.80000001192093,
+                  "endMs": 79.40000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 43,
+          "pair_index": 21,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:10.283Z",
+          "finished_at": "2026-08-29T14:04:11.021Z",
+          "ok": true,
+          "elapsedMs": 28.80000001192093,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.2000000178814,
+                  "endMs": 76.30000001192093
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.30000001192093,
+                  "endMs": 76.90000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 44,
+          "pair_index": 22,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:11.021Z",
+          "finished_at": "2026-08-29T14:04:11.757Z",
+          "ok": true,
+          "elapsedMs": 27.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.19999998807907,
+                  "endMs": 74.19999998807907
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.30000001192093,
+                  "endMs": 74.90000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 47,
+          "pair_index": 23,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:12.334Z",
+          "finished_at": "2026-08-29T14:04:13.064Z",
+          "ok": true,
+          "elapsedMs": 27.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.5,
+                  "endMs": 75.40000000596046
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.40000000596046,
+                  "endMs": 76
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 48,
+          "pair_index": 24,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:13.064Z",
+          "finished_at": "2026-08-29T14:04:13.774Z",
+          "ok": true,
+          "elapsedMs": 28,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.5,
+                  "endMs": 74.5
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.5,
+                  "endMs": 75.10000002384186
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 51,
+          "pair_index": 25,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:14.367Z",
+          "finished_at": "2026-08-29T14:04:15.094Z",
+          "ok": true,
+          "elapsedMs": 27.799999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.69999998807907,
+                  "endMs": 74.69999998807907
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.7999999821186,
+                  "endMs": 75.39999997615814
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 52,
+          "pair_index": 26,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:15.094Z",
+          "finished_at": "2026-08-29T14:04:15.829Z",
+          "ok": true,
+          "elapsedMs": 27.69999998807907,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.2999999821186,
+                  "endMs": 76.19999998807907
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.19999998807907,
+                  "endMs": 76.7999999821186
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 55,
+          "pair_index": 27,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:16.399Z",
+          "finished_at": "2026-08-29T14:04:17.134Z",
+          "ok": true,
+          "elapsedMs": 27.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.60000002384186,
+                  "endMs": 75.80000001192093
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.90000000596046,
+                  "endMs": 76.40000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 56,
+          "pair_index": 28,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:17.134Z",
+          "finished_at": "2026-08-29T14:04:17.853Z",
+          "ok": true,
+          "elapsedMs": 28.099999994039536,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.7999999821186,
+                  "endMs": 75.7999999821186
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.89999997615814,
+                  "endMs": 76.5
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 59,
+          "pair_index": 29,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:18.420Z",
+          "finished_at": "2026-08-29T14:04:19.149Z",
+          "ok": true,
+          "elapsedMs": 28.200000017881393,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.59999999403954,
+                  "endMs": 76.59999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.69999998807907,
+                  "endMs": 77.19999998807907
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 60,
+          "pair_index": 30,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:19.149Z",
+          "finished_at": "2026-08-29T14:04:19.889Z",
+          "ok": true,
+          "elapsedMs": 27.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.10000002384186,
+                  "endMs": 75.10000002384186
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.2000000178814,
+                  "endMs": 75.7000000178814
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 63,
+          "pair_index": 31,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:20.482Z",
+          "finished_at": "2026-08-29T14:04:21.207Z",
+          "ok": true,
+          "elapsedMs": 27.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.59999999403954,
+                  "endMs": 75.59999999403954
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.69999998807907,
+                  "endMs": 76.19999998807907
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 64,
+          "pair_index": 32,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:21.207Z",
+          "finished_at": "2026-08-29T14:04:21.931Z",
+          "ok": true,
+          "elapsedMs": 27.899999976158142,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 71.7000000178814,
+                  "endMs": 75.80000001192093
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 75.80000001192093,
+                  "endMs": 76.40000000596046
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 67,
+          "pair_index": 33,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:22.478Z",
+          "finished_at": "2026-08-29T14:04:23.196Z",
+          "ok": true,
+          "elapsedMs": 27.80000001192093,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 70.7999999821186,
+                  "endMs": 74.7999999821186
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 74.89999997615814,
+                  "endMs": 75.5
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 68,
+          "pair_index": 34,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:23.196Z",
+          "finished_at": "2026-08-29T14:04:23.947Z",
+          "ok": true,
+          "elapsedMs": 28,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": [
+                {
+                  "op": "wasm_module_compile_sync",
+                  "startMs": 72.10000002384186,
+                  "endMs": 76.2000000178814
+                },
+                {
+                  "op": "wasm_instance_instantiate_sync",
+                  "startMs": 76.2000000178814,
+                  "endMs": 76.80000001192093
+                }
+              ]
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        }
+      ]
+    },
+    {
+      "candidate": "yrs-yjs",
+      "has_wasm": false,
+      "engine_probe_built_artifact_hash": "0e63c17fd8614c6603cbe2e11e3bab551206d7b50ccd47a561371a35f2c142e7",
+      "package_lockfile_hash": "3abdd5c8cd9b57d3a4c92baf93dd85f3775ab78efad4b1ac8d175805b7d7fa51",
+      "toolchain_versions": {
+        "bun": "1.3.8",
+        "vite": "7.3.1",
+        "typescript": "5.9.3"
+      },
+      "warmup_count": 5,
+      "sample_count_attempted": 30,
+      "sample_count_successful": 30,
+      "failed_sample_count": 0,
+      "failed_samples": [],
+      "run_valid": true,
+      "raw_samples_ms": [
+        10.5,
+        10.5,
+        10.5,
+        10.6,
+        10.8,
+        10.9,
+        11,
+        11.1,
+        11.2,
+        11.3,
+        11.3,
+        11.3,
+        11.4,
+        11.5,
+        11.7,
+        11.8,
+        11.9,
+        11.9,
+        11.9,
+        12.2,
+        12.2,
+        12.2,
+        12.5,
+        12.5,
+        12.6,
+        12.7,
+        12.7,
+        12.8,
+        12.9,
+        12.9
+      ],
+      "p95_ms": 12.9,
+      "budget_ms": 250,
+      "budget_status": "passed",
+      "wasm_segments_by_sample": [
+        {
+          "global_index": 10,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 13,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 14,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 17,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 18,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 21,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 22,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 25,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 26,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 29,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 30,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 33,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 34,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 37,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 38,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 41,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 42,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 45,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 46,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 49,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 50,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 53,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 54,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 57,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 58,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 61,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 62,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 65,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 66,
+          "ok": true,
+          "wasm_segments": []
+        },
+        {
+          "global_index": 69,
+          "ok": true,
+          "wasm_segments": []
+        }
+      ],
+      "runs": [
+        {
+          "global_index": 1,
+          "pair_index": 0,
+          "position_in_pair": 1,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:48.968Z",
+          "finished_at": "2026-08-29T14:03:49.254Z",
+          "ok": true,
+          "elapsedMs": 11.299999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 2,
+          "pair_index": 1,
+          "position_in_pair": 0,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:49.254Z",
+          "finished_at": "2026-08-29T14:03:49.549Z",
+          "ok": true,
+          "elapsedMs": 12.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 5,
+          "pair_index": 2,
+          "position_in_pair": 1,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:51.006Z",
+          "finished_at": "2026-08-29T14:03:51.279Z",
+          "ok": true,
+          "elapsedMs": 11.800000011920929,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 6,
+          "pair_index": 3,
+          "position_in_pair": 0,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:51.279Z",
+          "finished_at": "2026-08-29T14:03:51.575Z",
+          "ok": true,
+          "elapsedMs": 11.200000017881393,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 9,
+          "pair_index": 4,
+          "position_in_pair": 1,
+          "warmup": true,
+          "started_at": "2026-08-29T14:03:53.049Z",
+          "finished_at": "2026-08-29T14:03:53.360Z",
+          "ok": true,
+          "elapsedMs": 11.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 10,
+          "pair_index": 5,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:53.361Z",
+          "finished_at": "2026-08-29T14:03:53.644Z",
+          "ok": true,
+          "elapsedMs": 11.400000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 13,
+          "pair_index": 6,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:55.150Z",
+          "finished_at": "2026-08-29T14:03:55.455Z",
+          "ok": true,
+          "elapsedMs": 10.800000011920929,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 14,
+          "pair_index": 7,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:55.455Z",
+          "finished_at": "2026-08-29T14:03:55.739Z",
+          "ok": true,
+          "elapsedMs": 11.300000011920929,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 17,
+          "pair_index": 8,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:57.230Z",
+          "finished_at": "2026-08-29T14:03:57.524Z",
+          "ok": true,
+          "elapsedMs": 11.199999988079071,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 18,
+          "pair_index": 9,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:57.524Z",
+          "finished_at": "2026-08-29T14:03:57.797Z",
+          "ok": true,
+          "elapsedMs": 10.599999994039536,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 21,
+          "pair_index": 10,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:59.273Z",
+          "finished_at": "2026-08-29T14:03:59.571Z",
+          "ok": true,
+          "elapsedMs": 12.199999988079071,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 22,
+          "pair_index": 11,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:03:59.572Z",
+          "finished_at": "2026-08-29T14:03:59.893Z",
+          "ok": true,
+          "elapsedMs": 12.699999988079071,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 25,
+          "pair_index": 12,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:01.392Z",
+          "finished_at": "2026-08-29T14:04:01.683Z",
+          "ok": true,
+          "elapsedMs": 11.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 26,
+          "pair_index": 13,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:01.684Z",
+          "finished_at": "2026-08-29T14:04:01.978Z",
+          "ok": true,
+          "elapsedMs": 10.899999976158142,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 29,
+          "pair_index": 14,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:03.452Z",
+          "finished_at": "2026-08-29T14:04:03.752Z",
+          "ok": true,
+          "elapsedMs": 12.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 30,
+          "pair_index": 15,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:03.752Z",
+          "finished_at": "2026-08-29T14:04:04.059Z",
+          "ok": true,
+          "elapsedMs": 12.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 33,
+          "pair_index": 16,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:05.514Z",
+          "finished_at": "2026-08-29T14:04:05.812Z",
+          "ok": true,
+          "elapsedMs": 12.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 34,
+          "pair_index": 17,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:05.812Z",
+          "finished_at": "2026-08-29T14:04:06.102Z",
+          "ok": true,
+          "elapsedMs": 11.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 37,
+          "pair_index": 18,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:07.606Z",
+          "finished_at": "2026-08-29T14:04:07.871Z",
+          "ok": true,
+          "elapsedMs": 10.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 38,
+          "pair_index": 19,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:07.871Z",
+          "finished_at": "2026-08-29T14:04:08.155Z",
+          "ok": true,
+          "elapsedMs": 12.200000017881393,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 41,
+          "pair_index": 20,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:09.646Z",
+          "finished_at": "2026-08-29T14:04:09.960Z",
+          "ok": true,
+          "elapsedMs": 10.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 42,
+          "pair_index": 21,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:09.960Z",
+          "finished_at": "2026-08-29T14:04:10.283Z",
+          "ok": true,
+          "elapsedMs": 12.799999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 45,
+          "pair_index": 22,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:11.757Z",
+          "finished_at": "2026-08-29T14:04:12.053Z",
+          "ok": true,
+          "elapsedMs": 11.899999976158142,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 46,
+          "pair_index": 23,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:12.053Z",
+          "finished_at": "2026-08-29T14:04:12.334Z",
+          "ok": true,
+          "elapsedMs": 11.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 49,
+          "pair_index": 24,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:13.774Z",
+          "finished_at": "2026-08-29T14:04:14.073Z",
+          "ok": true,
+          "elapsedMs": 12.600000023841858,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 50,
+          "pair_index": 25,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:14.074Z",
+          "finished_at": "2026-08-29T14:04:14.367Z",
+          "ok": true,
+          "elapsedMs": 12.699999988079071,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 53,
+          "pair_index": 26,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:15.829Z",
+          "finished_at": "2026-08-29T14:04:16.105Z",
+          "ok": true,
+          "elapsedMs": 11.700000017881393,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 54,
+          "pair_index": 27,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:16.105Z",
+          "finished_at": "2026-08-29T14:04:16.399Z",
+          "ok": true,
+          "elapsedMs": 10.5,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 57,
+          "pair_index": 28,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:17.853Z",
+          "finished_at": "2026-08-29T14:04:18.133Z",
+          "ok": true,
+          "elapsedMs": 11,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 58,
+          "pair_index": 29,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:18.133Z",
+          "finished_at": "2026-08-29T14:04:18.420Z",
+          "ok": true,
+          "elapsedMs": 11.299999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 61,
+          "pair_index": 30,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:19.889Z",
+          "finished_at": "2026-08-29T14:04:20.181Z",
+          "ok": true,
+          "elapsedMs": 11.099999994039536,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 62,
+          "pair_index": 31,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:20.181Z",
+          "finished_at": "2026-08-29T14:04:20.482Z",
+          "ok": true,
+          "elapsedMs": 12.900000005960464,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 65,
+          "pair_index": 32,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:21.931Z",
+          "finished_at": "2026-08-29T14:04:22.205Z",
+          "ok": true,
+          "elapsedMs": 11.300000011920929,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 66,
+          "pair_index": 33,
+          "position_in_pair": 0,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:22.205Z",
+          "finished_at": "2026-08-29T14:04:22.478Z",
+          "ok": true,
+          "elapsedMs": 11.799999982118607,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        },
+        {
+          "global_index": 69,
+          "pair_index": 34,
+          "position_in_pair": 1,
+          "warmup": false,
+          "started_at": "2026-08-29T14:04:23.947Z",
+          "finished_at": "2026-08-29T14:04:24.218Z",
+          "ok": true,
+          "elapsedMs": 12.200000017881393,
+          "reasons": {
+            "probe": {
+              "ok": true,
+              "hex": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+              "canonicalJson": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]"
+            },
+            "wasmCheck": {
+              "ok": true,
+              "trace": []
+            }
+          },
+          "chromiumVersion": "Chrome/144.0.7559.109",
+          "requestCount": 3
+        }
+      ]
+    }
+  ]
+}

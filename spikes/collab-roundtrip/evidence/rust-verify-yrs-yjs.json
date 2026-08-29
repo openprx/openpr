@@ -1,0 +1,10 @@
+{
+  "bytes_len": 2185,
+  "candidate": "yrs-yjs",
+  "expected_hash": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7",
+  "matched": true,
+  "node_count": 14,
+  "rust_reimport_hash": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7",
+  "status": "passed",
+  "step": "rust_import_of_browser_export"
+}

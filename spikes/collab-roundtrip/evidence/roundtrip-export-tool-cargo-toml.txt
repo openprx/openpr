@@ -1,0 +1,11 @@
+[package]
+name = "roundtrip-export"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+collab-shared = { path = "/opt/worker/code/openpr/spikes/collab-shared" }
+collab-loro-spike = { path = "/opt/worker/code/openpr/spikes/collab-loro" }
+collab-yrs-yjs-spike = { path = "/opt/worker/code/openpr/spikes/collab-yrs-yjs" }
+serde_json = "1"

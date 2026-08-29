@@ -1,0 +1,110 @@
+[
+  {
+    "type": "chunk",
+    "fileName": "assets/index-BfNyb9R1.js",
+    "isEntry": true,
+    "isDynamicEntry": false,
+    "facadeModuleId": "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/index.html",
+    "imports": [],
+    "dynamicImports": [
+      "assets/flow-entry-_B6Sebp0.js",
+      "assets/home-entry-DIc_iZtT.js"
+    ],
+    "importedAssets": [],
+    "moduleIds": [
+      "\u0000vite/modulepreload-polyfill.js",
+      "\u0000vite/preload-helper.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/src/main.ts",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/index.html"
+    ]
+  },
+  {
+    "type": "chunk",
+    "fileName": "assets/vendor-prosemirror-PNi2HqOP.js",
+    "isEntry": false,
+    "isDynamicEntry": false,
+    "facadeModuleId": null,
+    "imports": [],
+    "dynamicImports": [],
+    "importedAssets": [],
+    "moduleIds": [
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/orderedmap/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/prosemirror-model/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/prosemirror-transform/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/prosemirror-state/dist/index.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/prosemirror-view/dist/index.js"
+    ]
+  },
+  {
+    "type": "chunk",
+    "fileName": "assets/flow-entry-_B6Sebp0.js",
+    "isEntry": false,
+    "isDynamicEntry": true,
+    "facadeModuleId": "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/src/flow-entry.ts",
+    "imports": [
+      "assets/vendor-prosemirror-PNi2HqOP.js"
+    ],
+    "dynamicImports": [],
+    "importedAssets": [],
+    "moduleIds": [
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/map.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/set.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/array.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/observable.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/math.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/binary.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/number.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/string.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/encoding.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/error.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/decoding.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/webcrypto.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/random.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/time.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/promise.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/conditions.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/storage.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/trait/equality.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/object.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/function.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/environment.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/buffer.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/pair.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/prng.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/schema.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/dom.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/eventloop.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/symbol.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/logging.common.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/logging.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/iterator.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/yjs/dist/yjs.mjs",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/mutex.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/diff.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/y-prosemirror/src/plugins/keys.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/lib0/hash/sha256.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/y-prosemirror/src/utils.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/y-prosemirror/src/plugins/sync-plugin.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/node_modules/y-prosemirror/src/lib.js",
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/src/flow-entry.ts"
+    ]
+  },
+  {
+    "type": "chunk",
+    "fileName": "assets/home-entry-DIc_iZtT.js",
+    "isEntry": false,
+    "isDynamicEntry": true,
+    "facadeModuleId": "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/src/home-entry.ts",
+    "imports": [],
+    "dynamicImports": [],
+    "importedAssets": [],
+    "moduleIds": [
+      "/opt/worker/code/openpr/spikes/bundle-yrs-yjs/src/home-entry.ts"
+    ]
+  },
+  {
+    "type": "asset",
+    "fileName": "index.html",
+    "bytes": 263
+  }
+]

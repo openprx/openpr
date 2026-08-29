@@ -1,0 +1,28 @@
+{
+  "loro_serializer_fidelity": {
+    "byte_identical": true,
+    "hash_from_reserialized_json": "be7d37ca5d90694027ed04918cb0ba40b8d078460f9e25649bea47097699453a",
+    "rust_semantic_hash": "be7d37ca5d90694027ed04918cb0ba40b8d078460f9e25649bea47097699453a"
+  },
+  "yrs-yjs_serializer_fidelity": {
+    "byte_identical": true,
+    "hash_from_reserialized_json": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7",
+    "rust_semantic_hash": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7"
+  },
+  "loro_rust_to_browser": {
+    "bytes_in": 2021,
+    "node_count": 14,
+    "rust_hash": "be7d37ca5d90694027ed04918cb0ba40b8d078460f9e25649bea47097699453a",
+    "browser_reimport_hash": "be7d37ca5d90694027ed04918cb0ba40b8d078460f9e25649bea47097699453a",
+    "matched": true,
+    "ts_export_bytes": 1976
+  },
+  "yrs-yjs_rust_to_browser": {
+    "bytes_in": 2185,
+    "node_count": 14,
+    "rust_hash": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7",
+    "browser_reimport_hash": "4bef8be40fe57f07c35f6d6630b87d0c16a0d73072a82ea3c16f2b36d771bdc7",
+    "matched": true,
+    "ts_export_bytes": 2185
+  }
+}

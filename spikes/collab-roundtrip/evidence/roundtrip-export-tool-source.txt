@@ -1,0 +1,139 @@
+//! Standalone, read-only evidence tool for the Sylvode Flow v0.3 `rust_wasm_roundtrip` hard gate.
+//!
+//! Lives OUTSIDE the openpr repository entirely (scratchpad), and only ever calls the public
+//! `CollabEngine`/`CorpusEngine` APIs already exposed by `collab-shared`, `collab-loro-spike`,
+//! `collab-yrs-yjs-spike` via path dependencies. It does not modify any file inside the repo.
+//!
+//! Subcommands:
+//!   export <candidate> <out_dir>              -- build the shared fixture, export snapshot
+//!                                                 bytes + semantic hash to <out_dir>
+//!   verify <candidate> <bytes_file> <expected_hash> -- import real browser-exported bytes into a
+//!                                                 fresh Rust replica and check the semantic hash
+
+use std::fs;
+use std::path::Path;
+
+use collab_loro_spike::LoroCollabEngine;
+use collab_shared::corpus::apply_all;
+use collab_shared::fixture::{collection_ops, page_ops};
+use collab_shared::CorpusEngine;
+use collab_yrs_yjs_spike::YrsCollabEngine;
+
+const SEED: u64 = 424_242;
+
+fn fixture_ops() -> Vec<collab_shared::Operation> {
+    // Reuses the two existing shared-corpus generators (collab_shared::fixture) rather than
+    // inventing a new fixture: page_ops exercises nested CreateNode + InsertText (parent/text
+    // fields), collection_ops adds SetProperty + MoveNode (properties/order_key/reparent fields)
+    // on a disjoint node-id namespace, so concatenating the two logs is safe.
+    let mut ops = page_ops(SEED, 6);
+    ops.extend(collection_ops(SEED.wrapping_add(1), 4, 2));
+    ops
+}
+
+fn run_export<E: CorpusEngine<Error = collab_shared::CollabError>>(candidate: &str, out_dir: &Path) {
+    let mut engine = E::new_empty(SEED);
+    apply_all(&mut engine, &fixture_ops()).unwrap_or_else(|e| panic!("apply_all failed for {candidate}: {e}"));
+
+    let snapshot = engine.semantic_snapshot().unwrap_or_else(|e| panic!("semantic_snapshot failed: {e}"));
+    let hash = snapshot.semantic_hash();
+    let canonical_json = snapshot.canonical_json().unwrap_or_default();
+
+    let export_bytes = engine
+        .export_snapshot()
+        .unwrap_or_else(|e| panic!("export_snapshot failed: {e}"));
+
+    let snapshot_path = out_dir.join(format!("rust_snapshot_{candidate}.bin"));
+    fs::write(&snapshot_path, &export_bytes).unwrap_or_else(|e| panic!("write snapshot failed: {e}"));
+
+    let canonical_path = out_dir.join(format!("rust_semantic_{candidate}.json"));
+    fs::write(&canonical_path, &canonical_json).unwrap_or_else(|e| panic!("write canonical json failed: {e}"));
+
+    let manifest = serde_json::json!({
+        "candidate": candidate,
+        "seed": SEED,
+        "node_count": snapshot.nodes.len(),
+        "semantic_hash": hash,
+        "snapshot_bytes": export_bytes.len(),
+        "snapshot_path": snapshot_path.file_name().and_then(|n| n.to_str()),
+        "canonical_json_path": canonical_path.file_name().and_then(|n| n.to_str()),
+    });
+    let manifest_path = out_dir.join(format!("rust_manifest_{candidate}.json"));
+    fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap_or_default())
+        .unwrap_or_else(|e| panic!("write manifest failed: {e}"));
+
+    println!("{}", serde_json::to_string_pretty(&manifest).unwrap_or_default());
+}
+
+fn run_verify<E: CorpusEngine<Error = collab_shared::CollabError>>(candidate: &str, bytes_file: &Path, expected_hash: &str) {
+    let bytes = fs::read(bytes_file).unwrap_or_else(|e| panic!("read {bytes_file:?} failed: {e}"));
+    let engine = match E::load(&bytes) {
+        Ok(e) => e,
+        Err(err) => {
+            let out = serde_json::json!({
+                "candidate": candidate,
+                "step": "rust_import_of_browser_export",
+                "status": "failed",
+                "error": err.to_string(),
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+            std::process::exit(1);
+        }
+    };
+    let snapshot = engine.semantic_snapshot().unwrap_or_else(|e| panic!("semantic_snapshot failed: {e}"));
+    let hash = snapshot.semantic_hash();
+    let matched = hash == expected_hash;
+    let out = serde_json::json!({
+        "candidate": candidate,
+        "step": "rust_import_of_browser_export",
+        "status": if matched { "passed" } else { "failed" },
+        "bytes_len": bytes.len(),
+        "node_count": snapshot.nodes.len(),
+        "rust_reimport_hash": hash,
+        "expected_hash": expected_hash,
+        "matched": matched,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    if !matched {
+        std::process::exit(1);
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(String::as_str).unwrap_or("");
+    match mode {
+        "export" => {
+            let candidate = args.get(2).map(String::as_str).unwrap_or("");
+            let out_dir = Path::new(args.get(3).map(String::as_str).unwrap_or("."));
+            fs::create_dir_all(out_dir).unwrap_or_else(|e| panic!("create_dir_all failed: {e}"));
+            match candidate {
+                "loro" => run_export::<LoroCollabEngine>(candidate, out_dir),
+                "yrs-yjs" => run_export::<YrsCollabEngine>(candidate, out_dir),
+                other => {
+                    eprintln!("unknown candidate {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "verify" => {
+            let candidate = args.get(2).map(String::as_str).unwrap_or("");
+            let bytes_file = Path::new(args.get(3).map(String::as_str).unwrap_or(""));
+            let expected_hash = args.get(4).map(String::as_str).unwrap_or("");
+            match candidate {
+                "loro" => run_verify::<LoroCollabEngine>(candidate, bytes_file, expected_hash),
+                "yrs-yjs" => run_verify::<YrsCollabEngine>(candidate, bytes_file, expected_hash),
+                other => {
+                    eprintln!("unknown candidate {other}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        other => {
+            eprintln!("usage: roundtrip-export export <candidate> <out_dir>");
+            eprintln!("       roundtrip-export verify <candidate> <bytes_file> <expected_hash>");
+            eprintln!("unknown mode {other:?}");
+            std::process::exit(2);
+        }
+    }
+}

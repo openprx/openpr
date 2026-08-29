@@ -1,0 +1,9 @@
+{
+  "candidate": "loro",
+  "canonical_json_path": "rust_semantic_loro.json",
+  "node_count": 14,
+  "seed": 424242,
+  "semantic_hash": "be7d37ca5d90694027ed04918cb0ba40b8d078460f9e25649bea47097699453a",
+  "snapshot_bytes": 2021,
+  "snapshot_path": "rust_snapshot_loro.bin"
+}

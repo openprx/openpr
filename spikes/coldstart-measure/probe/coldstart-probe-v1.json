@@ -1,0 +1,72 @@
+{
+  "case_id": "sylvode.flow.coldstart.v1.probe.block-0.v1",
+  "measurement_protocol_id": "sylvode.flow.coldstart.v1",
+  "generated_at": "2026-08-29T00:00:00Z",
+  "note_to_reviewer": "Pre-registration file per coordinator directive 2026-08-29 item 3: this file's own SHA-256 is meant to be recorded in the ADR and signed alongside it. DO NOT EDIT after that hash is recorded -- any edit changes the hash. Both sub-probes below write the SAME two strings (fixture_text then probe_text) into the SAME conceptual single block (id/type/parent/index all identical across both sub-probes) so the two metrics remain a like-for-like workload; only the write/read MECHANISM differs (adapter-API-only vs DOM+adapter-API), matching ADR-0015 R4 3.2 item 4's split.",
+  "fixture_text": "SYLVODE_FLOW_COLDSTART_FIXTURE_v1",
+  "probe_text": "SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1",
+  "fixture_checksum_sha256": "ea45f2f3145dacd5c7e77393539c5343d74e1ae95fb04cd448e35c142c943336",
+  "fixture_checksum_note": "SHA-256 of fixture_text as UTF-8 bytes, hex-encoded. Covers the bootstrap write's content only (before probe_text is appended).",
+  "block": { "id": "block-0", "type": "paragraph", "parent": "root", "index": 0 },
+  "engine_runtime_ready_probe": {
+    "description": "ADR-0015 3.2 item 4, engine_runtime_ready half: adapter-API-only, zero DOM, zero ProseMirror import. Implemented by probe/src/loro-engine-only-entry.ts and probe/src/yrs-yjs-engine-only-entry.ts (dedicated build entries, see probe/vite.config.*.mjs; verified to contain zero prosemirror-family modules by probe/check-module-graph.mjs).",
+    "adapter_call_sequence": {
+      "loro": [
+        "doc = new LoroDoc()",
+        "blocks = doc.getMap(\"blocks\")",
+        "block = blocks.setContainer(\"block-0\", new LoroMap())",
+        "block.set(\"id\", \"block-0\")",
+        "block.set(\"type\", \"paragraph\")",
+        "block.set(\"parent\", \"root\")",
+        "block.set(\"index\", 0)",
+        "text = block.setContainer(\"text\", new LoroText())",
+        "-- fixture bootstrap boundary --",
+        "text.insert(0, fixture_text)",
+        "-- probe write boundary --",
+        "text.insert(text.length, probe_text)",
+        "-- independent read-back (no DOM involved) --",
+        "id = String(block.get(\"id\")); type = String(block.get(\"type\")); parent = String(block.get(\"parent\")); index = Number(block.get(\"index\")); text_out = text.toString()"
+      ],
+      "yrs-yjs": [
+        "doc = new Y.Doc()",
+        "blocks = doc.getMap(\"blocks\")",
+        "block = new Y.Map(); blocks.set(\"block-0\", block)",
+        "block.set(\"id\", \"block-0\")",
+        "block.set(\"type\", \"paragraph\")",
+        "block.set(\"parent\", \"root\")",
+        "block.set(\"index\", 0)",
+        "text = new Y.Text(); block.set(\"text\", text)",
+        "-- fixture bootstrap boundary --",
+        "text.insert(0, fixture_text)",
+        "-- probe write boundary --",
+        "text.insert(text.length, probe_text)",
+        "-- independent read-back (no DOM involved) --",
+        "id = String(block.get(\"id\")); type = String(block.get(\"type\")); parent = String(block.get(\"parent\")); index = Number(block.get(\"index\")); text_out = text.toString()"
+      ]
+    },
+    "canonical_encoding": "JSON.stringify([{id, type, parent, index, text}]) with keys in exactly this order; single-element array (one block); text = fixture_text + probe_text (post both writes, no separator).",
+    "expected_canonical_json": "[{\"id\":\"block-0\",\"type\":\"paragraph\",\"parent\":\"root\",\"index\":0,\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]",
+    "expected_semantic_hash_sha256": "b9cbff6bfbe2d09a423fcf3b5f99179d52865a060693417473c7f11458d26b0f",
+    "expected_semantic_hash_note": "Full 64-hex-char SHA-256 of expected_canonical_json as UTF-8 bytes -- not a prefix. Same value expected for BOTH candidates (loro and yrs-yjs), since both implement the identical call sequence shape and must produce identical observable state -- this is the genuine cross-candidate semantic check.",
+    "comparison_authority": "The harness (not candidate/adapter code) computes SHA-256 of the actual read-back canonical JSON and compares it to expected_semantic_hash_sha256 verbatim. Neither loro-engine-only-entry.ts nor yrs-yjs-engine-only-entry.ts contains any comparison or boolean self-report -- readBackBlocks() only returns the observed block array; the runner (measure-engine-runtime-ready.mjs) does the hashing and comparison."
+  },
+  "flow_route_cold_load_probe": {
+    "description": "ADR-0015 3.2 item 4, flow_route_cold_load half: DOM probe via synthetic keyboard input into the real ProseMirror EditorView (postconditions 1-5, including mount+rAF).",
+    "adapter_call_sequence": [
+      "page.focus('.ProseMirror')",
+      "-- fixture bootstrap boundary --",
+      "page.keyboard.sendCharacter(fixture_text)",
+      "-- probe write boundary --",
+      "page.keyboard.sendCharacter(probe_text)",
+      "-- postcondition 5: one requestAnimationFrame --",
+      "-- read-back: DOM only, see known_gap below --",
+      "blocks = Array.from(document.querySelector('.ProseMirror').children).map((el, index) => ({ parent: 'root', index, type: el.tagName.toLowerCase(), text: el.textContent }))"
+    ],
+    "canonical_encoding": "JSON.stringify([{parent, index, type, text}]) with keys in exactly this order; single-element array; text = fixture_text + probe_text as typed via two sequential keyboard events into the one pre-existing default paragraph (neither candidate wires a keymap plugin -- no Enter-splits-paragraph command exists, confirmed empirically, see lib/common.mjs's EXPECTED_PROBE_BLOCKS header comment).",
+    "expected_canonical_json": "[{\"parent\":\"root\",\"index\":0,\"type\":\"p\",\"text\":\"SYLVODE_FLOW_COLDSTART_FIXTURE_v1SYLVODE_FLOW_COLDSTART_PROBE_BLOCK_v1\"}]",
+    "expected_semantic_hash_sha256": "913017fc943b792bc59b12ca7d0211b23a597d02392661acd28c387273cd83ad",
+    "expected_semantic_hash_note": "Full 64-hex-char SHA-256 of expected_canonical_json as UTF-8 bytes -- not a prefix.",
+    "comparison_authority": "The harness (lib/browser-harness-src.mjs's readBackAndHashBlocks, injected via evaluateOnNewDocument before any candidate script runs) computes this hash and compares; candidate code never sees expected_semantic_hash_sha256 and has no path to self-report ok.",
+    "known_gap_not_yet_closed": "This sub-probe's read-back is DOM-only, NOT independently cross-checked against CRDT state (LoroDoc/Y.Doc), unlike the engine_runtime_ready sub-probe above. Root cause: `mountFlowEditor` is the ONLY export of bundle-loro/src/flow-entry.ts and bundle-yrs-yjs/src/flow-entry.ts, it always constructs a ProseMirror EditorView bound to an internal, non-exported LoroDoc/Y.Doc instance, and main.ts (not this harness) is what calls it during real route navigation -- so this harness has no reachable JS reference to that specific run's CRDT document instance, and no known robust way to obtain one without either (a) a source change to flow-entry.ts adding an export (out of this delivery's file scope: spikes/coldstart-measure/** only), or (b) a fragile, version-specific internal-API technique (`dom.pmViewDesc`) that was investigated and found NOT to expose a `.view` back-reference in the installed prosemirror-view version (see delivery report). The `id` field is deliberately OMITTED from this sub-probe's compared shape (rather than filled with a value nothing verifies) to avoid implying a CRDT-identity check that is not actually performed. This is flagged to the coordinator as an open item, not silently worked around."
+  }
+}

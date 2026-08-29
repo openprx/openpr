@@ -1,0 +1,947 @@
+{
+  "schema_note": "cold_start_ms distribution_metric shape, one object per (candidate, network_profile) pair",
+  "chromium_version": "Chrome/144.0.7559.109",
+  "budget_ms_p95_max": 250,
+  "network_profiles": [
+    {
+      "key": "loopback_no_throttle",
+      "warmup_count": 5,
+      "sample_count": 30
+    },
+    {
+      "key": "fast_4g",
+      "warmup_count": 3,
+      "sample_count": 8
+    }
+  ],
+  "results": [
+    {
+      "candidate": "loro",
+      "network_profile": "loopback_no_throttle",
+      "meets_benchmark_spec_sample_floor": true,
+      "flow_ready_mark_ms": {
+        "unit": "ms",
+        "warmup_count": 5,
+        "sample_count": 30,
+        "median": 69.59999999403954,
+        "p95": 77.5,
+        "p99": 78.90000000596046,
+        "min": 66,
+        "max": 78.90000000596046,
+        "raw_samples": [
+          66,
+          66,
+          66.2999999821186,
+          66.39999997615814,
+          66.5,
+          66.90000000596046,
+          67.2999999821186,
+          67.30000001192093,
+          67.90000000596046,
+          68,
+          68.19999998807907,
+          68.39999997615814,
+          69.19999998807907,
+          69.5,
+          69.59999999403954,
+          69.80000001192093,
+          69.90000000596046,
+          70.60000002384186,
+          70.7000000178814,
+          71.2000000178814,
+          71.30000001192093,
+          71.59999999403954,
+          72.5,
+          72.59999999403954,
+          73.10000002384186,
+          73.90000000596046,
+          75.40000000596046,
+          76.2000000178814,
+          77.5,
+          78.90000000596046
+        ]
+      },
+      "wall_clock_ms": {
+        "unit": "ms",
+        "warmup_count": 5,
+        "sample_count": 30,
+        "median": 71,
+        "p95": 80,
+        "p99": 81,
+        "min": 68,
+        "max": 81,
+        "raw_samples": [
+          68,
+          68,
+          69,
+          69,
+          69,
+          69,
+          70,
+          70,
+          70,
+          70,
+          70,
+          70,
+          71,
+          71,
+          71,
+          72,
+          72,
+          72,
+          73,
+          73,
+          73,
+          74,
+          75,
+          75,
+          75,
+          76,
+          78,
+          78,
+          80,
+          81
+        ]
+      },
+      "budget_ms_p95_max": 250,
+      "budget_status": "passed",
+      "runs": [
+        {
+          "index": 0,
+          "warmup": true,
+          "wallElapsedMs": 74,
+          "markStartTime": 71.30000001192093,
+          "requestCount": 6
+        },
+        {
+          "index": 1,
+          "warmup": true,
+          "wallElapsedMs": 74,
+          "markStartTime": 71.59999999403954,
+          "requestCount": 5
+        },
+        {
+          "index": 2,
+          "warmup": true,
+          "wallElapsedMs": 74,
+          "markStartTime": 71.2999999821186,
+          "requestCount": 5
+        },
+        {
+          "index": 3,
+          "warmup": true,
+          "wallElapsedMs": 77,
+          "markStartTime": 74.30000001192093,
+          "requestCount": 5
+        },
+        {
+          "index": 4,
+          "warmup": true,
+          "wallElapsedMs": 72,
+          "markStartTime": 68.5,
+          "requestCount": 5
+        },
+        {
+          "index": 5,
+          "warmup": false,
+          "wallElapsedMs": 70,
+          "markStartTime": 66.5,
+          "requestCount": 5
+        },
+        {
+          "index": 6,
+          "warmup": false,
+          "wallElapsedMs": 75,
+          "markStartTime": 72.5,
+          "requestCount": 5
+        },
+        {
+          "index": 7,
+          "warmup": false,
+          "wallElapsedMs": 70,
+          "markStartTime": 68.39999997615814,
+          "requestCount": 5
+        },
+        {
+          "index": 8,
+          "warmup": false,
+          "wallElapsedMs": 69,
+          "markStartTime": 66.2999999821186,
+          "requestCount": 5
+        },
+        {
+          "index": 9,
+          "warmup": false,
+          "wallElapsedMs": 73,
+          "markStartTime": 71.30000001192093,
+          "requestCount": 5
+        },
+        {
+          "index": 10,
+          "warmup": false,
+          "wallElapsedMs": 74,
+          "markStartTime": 71.59999999403954,
+          "requestCount": 5
+        },
+        {
+          "index": 11,
+          "warmup": false,
+          "wallElapsedMs": 73,
+          "markStartTime": 70.7000000178814,
+          "requestCount": 5
+        },
+        {
+          "index": 12,
+          "warmup": false,
+          "wallElapsedMs": 72,
+          "markStartTime": 69.80000001192093,
+          "requestCount": 5
+        },
+        {
+          "index": 13,
+          "warmup": false,
+          "wallElapsedMs": 68,
+          "markStartTime": 66,
+          "requestCount": 5
+        },
+        {
+          "index": 14,
+          "warmup": false,
+          "wallElapsedMs": 69,
+          "markStartTime": 66.90000000596046,
+          "requestCount": 5
+        },
+        {
+          "index": 15,
+          "warmup": false,
+          "wallElapsedMs": 70,
+          "markStartTime": 67.30000001192093,
+          "requestCount": 5
+        },
+        {
+          "index": 16,
+          "warmup": false,
+          "wallElapsedMs": 75,
+          "markStartTime": 72.59999999403954,
+          "requestCount": 5
+        },
+        {
+          "index": 17,
+          "warmup": false,
+          "wallElapsedMs": 70,
+          "markStartTime": 68,
+          "requestCount": 5
+        },
+        {
+          "index": 18,
+          "warmup": false,
+          "wallElapsedMs": 71,
+          "markStartTime": 69.5,
+          "requestCount": 5
+        },
+        {
+          "index": 19,
+          "warmup": false,
+          "wallElapsedMs": 70,
+          "markStartTime": 68.19999998807907,
+          "requestCount": 5
+        },
+        {
+          "index": 20,
+          "warmup": false,
+          "wallElapsedMs": 70,
+          "markStartTime": 67.90000000596046,
+          "requestCount": 5
+        },
+        {
+          "index": 21,
+          "warmup": false,
+          "wallElapsedMs": 72,
+          "markStartTime": 70.60000002384186,
+          "requestCount": 5
+        },
+        {
+          "index": 22,
+          "warmup": false,
+          "wallElapsedMs": 73,
+          "markStartTime": 71.2000000178814,
+          "requestCount": 5
+        },
+        {
+          "index": 23,
+          "warmup": false,
+          "wallElapsedMs": 71,
+          "markStartTime": 69.19999998807907,
+          "requestCount": 5
+        },
+        {
+          "index": 24,
+          "warmup": false,
+          "wallElapsedMs": 75,
+          "markStartTime": 73.10000002384186,
+          "requestCount": 5
+        },
+        {
+          "index": 25,
+          "warmup": false,
+          "wallElapsedMs": 69,
+          "markStartTime": 66.39999997615814,
+          "requestCount": 5
+        },
+        {
+          "index": 26,
+          "warmup": false,
+          "wallElapsedMs": 71,
+          "markStartTime": 69.90000000596046,
+          "requestCount": 5
+        },
+        {
+          "index": 27,
+          "warmup": false,
+          "wallElapsedMs": 68,
+          "markStartTime": 66,
+          "requestCount": 5
+        },
+        {
+          "index": 28,
+          "warmup": false,
+          "wallElapsedMs": 72,
+          "markStartTime": 69.59999999403954,
+          "requestCount": 5
+        },
+        {
+          "index": 29,
+          "warmup": false,
+          "wallElapsedMs": 69,
+          "markStartTime": 67.2999999821186,
+          "requestCount": 5
+        },
+        {
+          "index": 30,
+          "warmup": false,
+          "wallElapsedMs": 78,
+          "markStartTime": 75.40000000596046,
+          "requestCount": 5
+        },
+        {
+          "index": 31,
+          "warmup": false,
+          "wallElapsedMs": 81,
+          "markStartTime": 78.90000000596046,
+          "requestCount": 5
+        },
+        {
+          "index": 32,
+          "warmup": false,
+          "wallElapsedMs": 78,
+          "markStartTime": 76.2000000178814,
+          "requestCount": 5
+        },
+        {
+          "index": 33,
+          "warmup": false,
+          "wallElapsedMs": 80,
+          "markStartTime": 77.5,
+          "requestCount": 5
+        },
+        {
+          "index": 34,
+          "warmup": false,
+          "wallElapsedMs": 76,
+          "markStartTime": 73.90000000596046,
+          "requestCount": 5
+        }
+      ]
+    },
+    {
+      "candidate": "yrs-yjs",
+      "network_profile": "loopback_no_throttle",
+      "meets_benchmark_spec_sample_floor": true,
+      "flow_ready_mark_ms": {
+        "unit": "ms",
+        "warmup_count": 5,
+        "sample_count": 30,
+        "median": 31.099999994039536,
+        "p95": 34.69999998807907,
+        "p99": 34.79999998211861,
+        "min": 29.099999994039536,
+        "max": 34.79999998211861,
+        "raw_samples": [
+          29.099999994039536,
+          29.599999994039536,
+          29.900000005960464,
+          30,
+          30.099999994039536,
+          30.099999994039536,
+          30.19999998807907,
+          30.200000017881393,
+          30.30000001192093,
+          30.5,
+          30.69999998807907,
+          30.700000017881393,
+          30.799999982118607,
+          30.900000005960464,
+          31.099999994039536,
+          31.30000001192093,
+          31.5,
+          31.69999998807907,
+          31.900000005960464,
+          32,
+          32,
+          32,
+          32.099999994039536,
+          32.29999998211861,
+          32.30000001192093,
+          32.69999998807907,
+          34.10000002384186,
+          34.20000001788139,
+          34.69999998807907,
+          34.79999998211861
+        ]
+      },
+      "wall_clock_ms": {
+        "unit": "ms",
+        "warmup_count": 5,
+        "sample_count": 30,
+        "median": 32,
+        "p95": 40,
+        "p99": 40,
+        "min": 31,
+        "max": 40,
+        "raw_samples": [
+          31,
+          31,
+          31,
+          31,
+          31,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          33,
+          33,
+          33,
+          34,
+          34,
+          35,
+          36,
+          36,
+          37,
+          39,
+          39,
+          40,
+          40,
+          40,
+          40
+        ]
+      },
+      "budget_ms_p95_max": 250,
+      "budget_status": "passed",
+      "runs": [
+        {
+          "index": 0,
+          "warmup": true,
+          "wallElapsedMs": 37,
+          "markStartTime": 34.400000005960464,
+          "requestCount": 5
+        },
+        {
+          "index": 1,
+          "warmup": true,
+          "wallElapsedMs": 36,
+          "markStartTime": 34.5,
+          "requestCount": 4
+        },
+        {
+          "index": 2,
+          "warmup": true,
+          "wallElapsedMs": 36,
+          "markStartTime": 34.39999997615814,
+          "requestCount": 4
+        },
+        {
+          "index": 3,
+          "warmup": true,
+          "wallElapsedMs": 37,
+          "markStartTime": 35.5,
+          "requestCount": 4
+        },
+        {
+          "index": 4,
+          "warmup": true,
+          "wallElapsedMs": 31,
+          "markStartTime": 30,
+          "requestCount": 4
+        },
+        {
+          "index": 5,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 31.30000001192093,
+          "requestCount": 4
+        },
+        {
+          "index": 6,
+          "warmup": false,
+          "wallElapsedMs": 36,
+          "markStartTime": 34.79999998211861,
+          "requestCount": 4
+        },
+        {
+          "index": 7,
+          "warmup": false,
+          "wallElapsedMs": 37,
+          "markStartTime": 34.20000001788139,
+          "requestCount": 4
+        },
+        {
+          "index": 8,
+          "warmup": false,
+          "wallElapsedMs": 31,
+          "markStartTime": 29.599999994039536,
+          "requestCount": 4
+        },
+        {
+          "index": 9,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.700000017881393,
+          "requestCount": 4
+        },
+        {
+          "index": 10,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 31.099999994039536,
+          "requestCount": 4
+        },
+        {
+          "index": 11,
+          "warmup": false,
+          "wallElapsedMs": 35,
+          "markStartTime": 34.10000002384186,
+          "requestCount": 4
+        },
+        {
+          "index": 12,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.200000017881393,
+          "requestCount": 4
+        },
+        {
+          "index": 13,
+          "warmup": false,
+          "wallElapsedMs": 39,
+          "markStartTime": 32,
+          "requestCount": 4
+        },
+        {
+          "index": 14,
+          "warmup": false,
+          "wallElapsedMs": 34,
+          "markStartTime": 32,
+          "requestCount": 4
+        },
+        {
+          "index": 15,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.900000005960464,
+          "requestCount": 4
+        },
+        {
+          "index": 16,
+          "warmup": false,
+          "wallElapsedMs": 40,
+          "markStartTime": 32.099999994039536,
+          "requestCount": 4
+        },
+        {
+          "index": 17,
+          "warmup": false,
+          "wallElapsedMs": 31,
+          "markStartTime": 29.099999994039536,
+          "requestCount": 4
+        },
+        {
+          "index": 18,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.099999994039536,
+          "requestCount": 4
+        },
+        {
+          "index": 19,
+          "warmup": false,
+          "wallElapsedMs": 31,
+          "markStartTime": 29.900000005960464,
+          "requestCount": 4
+        },
+        {
+          "index": 20,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.69999998807907,
+          "requestCount": 4
+        },
+        {
+          "index": 21,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.099999994039536,
+          "requestCount": 4
+        },
+        {
+          "index": 22,
+          "warmup": false,
+          "wallElapsedMs": 33,
+          "markStartTime": 31.900000005960464,
+          "requestCount": 4
+        },
+        {
+          "index": 23,
+          "warmup": false,
+          "wallElapsedMs": 39,
+          "markStartTime": 31.5,
+          "requestCount": 4
+        },
+        {
+          "index": 24,
+          "warmup": false,
+          "wallElapsedMs": 36,
+          "markStartTime": 34.69999998807907,
+          "requestCount": 4
+        },
+        {
+          "index": 25,
+          "warmup": false,
+          "wallElapsedMs": 40,
+          "markStartTime": 32.29999998211861,
+          "requestCount": 4
+        },
+        {
+          "index": 26,
+          "warmup": false,
+          "wallElapsedMs": 31,
+          "markStartTime": 30.19999998807907,
+          "requestCount": 4
+        },
+        {
+          "index": 27,
+          "warmup": false,
+          "wallElapsedMs": 31,
+          "markStartTime": 30,
+          "requestCount": 4
+        },
+        {
+          "index": 28,
+          "warmup": false,
+          "wallElapsedMs": 33,
+          "markStartTime": 31.69999998807907,
+          "requestCount": 4
+        },
+        {
+          "index": 29,
+          "warmup": false,
+          "wallElapsedMs": 40,
+          "markStartTime": 32.69999998807907,
+          "requestCount": 4
+        },
+        {
+          "index": 30,
+          "warmup": false,
+          "wallElapsedMs": 33,
+          "markStartTime": 30.799999982118607,
+          "requestCount": 4
+        },
+        {
+          "index": 31,
+          "warmup": false,
+          "wallElapsedMs": 34,
+          "markStartTime": 32,
+          "requestCount": 4
+        },
+        {
+          "index": 32,
+          "warmup": false,
+          "wallElapsedMs": 40,
+          "markStartTime": 32.30000001192093,
+          "requestCount": 4
+        },
+        {
+          "index": 33,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.5,
+          "requestCount": 4
+        },
+        {
+          "index": 34,
+          "warmup": false,
+          "wallElapsedMs": 32,
+          "markStartTime": 30.30000001192093,
+          "requestCount": 4
+        }
+      ]
+    },
+    {
+      "candidate": "loro",
+      "network_profile": "fast_4g",
+      "meets_benchmark_spec_sample_floor": false,
+      "flow_ready_mark_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 3944.7000000178814,
+        "p95": 3946,
+        "p99": 3946,
+        "min": 3942.0999999940395,
+        "max": 3946,
+        "raw_samples": [
+          3942.0999999940395,
+          3942.2999999821186,
+          3942.9000000059605,
+          3944.7000000178814,
+          3944.9000000059605,
+          3945,
+          3945.199999988079,
+          3946
+        ]
+      },
+      "wall_clock_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 3964,
+        "p95": 3970,
+        "p99": 3970,
+        "min": 3960,
+        "max": 3970,
+        "raw_samples": [
+          3960,
+          3963,
+          3963,
+          3964,
+          3965,
+          3966,
+          3966,
+          3970
+        ]
+      },
+      "budget_ms_p95_max": 250,
+      "budget_status": "failed",
+      "runs": [
+        {
+          "index": 0,
+          "warmup": true,
+          "wallElapsedMs": 3970,
+          "markStartTime": 3943.5,
+          "requestCount": 5
+        },
+        {
+          "index": 1,
+          "warmup": true,
+          "wallElapsedMs": 3971,
+          "markStartTime": 3945.5,
+          "requestCount": 5
+        },
+        {
+          "index": 2,
+          "warmup": true,
+          "wallElapsedMs": 3972,
+          "markStartTime": 3946.0999999940395,
+          "requestCount": 5
+        },
+        {
+          "index": 3,
+          "warmup": false,
+          "wallElapsedMs": 3963,
+          "markStartTime": 3942.0999999940395,
+          "requestCount": 5
+        },
+        {
+          "index": 4,
+          "warmup": false,
+          "wallElapsedMs": 3970,
+          "markStartTime": 3944.9000000059605,
+          "requestCount": 5
+        },
+        {
+          "index": 5,
+          "warmup": false,
+          "wallElapsedMs": 3966,
+          "markStartTime": 3942.9000000059605,
+          "requestCount": 5
+        },
+        {
+          "index": 6,
+          "warmup": false,
+          "wallElapsedMs": 3965,
+          "markStartTime": 3945,
+          "requestCount": 5
+        },
+        {
+          "index": 7,
+          "warmup": false,
+          "wallElapsedMs": 3960,
+          "markStartTime": 3942.2999999821186,
+          "requestCount": 5
+        },
+        {
+          "index": 8,
+          "warmup": false,
+          "wallElapsedMs": 3966,
+          "markStartTime": 3944.7000000178814,
+          "requestCount": 5
+        },
+        {
+          "index": 9,
+          "warmup": false,
+          "wallElapsedMs": 3963,
+          "markStartTime": 3946,
+          "requestCount": 5
+        },
+        {
+          "index": 10,
+          "warmup": false,
+          "wallElapsedMs": 3964,
+          "markStartTime": 3945.199999988079,
+          "requestCount": 5
+        }
+      ]
+    },
+    {
+      "candidate": "yrs-yjs",
+      "network_profile": "fast_4g",
+      "meets_benchmark_spec_sample_floor": false,
+      "flow_ready_mark_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 614.5,
+        "p95": 616.4000000059605,
+        "p99": 616.4000000059605,
+        "min": 613.1999999880791,
+        "max": 616.4000000059605,
+        "raw_samples": [
+          613.1999999880791,
+          614,
+          614,
+          614.5,
+          615.2999999821186,
+          615.4000000059605,
+          615.6999999880791,
+          616.4000000059605
+        ]
+      },
+      "wall_clock_ms": {
+        "unit": "ms",
+        "warmup_count": 3,
+        "sample_count": 8,
+        "median": 616,
+        "p95": 623,
+        "p99": 623,
+        "min": 615,
+        "max": 623,
+        "raw_samples": [
+          615,
+          615,
+          615,
+          616,
+          617,
+          617,
+          623,
+          623
+        ]
+      },
+      "budget_ms_p95_max": 250,
+      "budget_status": "failed",
+      "runs": [
+        {
+          "index": 0,
+          "warmup": true,
+          "wallElapsedMs": 615,
+          "markStartTime": 614.4000000059605,
+          "requestCount": 4
+        },
+        {
+          "index": 1,
+          "warmup": true,
+          "wallElapsedMs": 616,
+          "markStartTime": 614.6999999880791,
+          "requestCount": 4
+        },
+        {
+          "index": 2,
+          "warmup": true,
+          "wallElapsedMs": 622,
+          "markStartTime": 614.6999999880791,
+          "requestCount": 4
+        },
+        {
+          "index": 3,
+          "warmup": false,
+          "wallElapsedMs": 617,
+          "markStartTime": 615.6999999880791,
+          "requestCount": 4
+        },
+        {
+          "index": 4,
+          "warmup": false,
+          "wallElapsedMs": 615,
+          "markStartTime": 613.1999999880791,
+          "requestCount": 4
+        },
+        {
+          "index": 5,
+          "warmup": false,
+          "wallElapsedMs": 616,
+          "markStartTime": 614,
+          "requestCount": 4
+        },
+        {
+          "index": 6,
+          "warmup": false,
+          "wallElapsedMs": 615,
+          "markStartTime": 614,
+          "requestCount": 4
+        },
+        {
+          "index": 7,
+          "warmup": false,
+          "wallElapsedMs": 623,
+          "markStartTime": 615.2999999821186,
+          "requestCount": 4
+        },
+        {
+          "index": 8,
+          "warmup": false,
+          "wallElapsedMs": 617,
+          "markStartTime": 616.4000000059605,
+          "requestCount": 4
+        },
+        {
+          "index": 9,
+          "warmup": false,
+          "wallElapsedMs": 615,
+          "markStartTime": 614.5,
+          "requestCount": 4
+        },
+        {
+          "index": 10,
+          "warmup": false,
+          "wallElapsedMs": 623,
+          "markStartTime": 615.4000000059605,
+          "requestCount": 4
+        }
+      ]
+    }
+  ]
+}
