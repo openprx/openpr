@@ -43,18 +43,40 @@ impl PermissionLevel {
     }
 }
 
-/// Bounds the ancestor walk. Matches `ADR-0012` §3's frozen `tree_depth_max` (32): a chain longer
-/// than that would mean `flow_objects.parent_id` has a cycle or the schema's depth invariant was
-/// otherwise violated, neither of which this read path should loop forever trying to honor.
-const MAX_CHAIN_HOPS: usize = 32;
+/// `ADR-0012` §3's inheritance-chain depth limit, pinned to `limits-v1.md`'s frozen
+/// `tree_depth_max`. Depth is counted the way `collab_core::limits::depth_of` counts it — a root
+/// object has depth 0 and its direct child depth 1 — so this is a bound on `parent_id` *hops*,
+/// not on nodes.
+const TREE_DEPTH_MAX: usize = 32;
+
+/// Nodes in a chain that sits exactly at [`TREE_DEPTH_MAX`]: depths `0..=32`, i.e. 33 rows joined
+/// by 32 hops. `gates/gate-commands.md` requires `depth=32` — and an authorization boundary
+/// landing exactly on the deepest node — to be evaluated *in full*, so this many nodes is legal
+/// and must never be truncated ("不得以性能为由把鉴权深度降回 20").
+const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 1;
 
 struct ChainNode {
     id: Uuid,
     inherit_from_parent: bool,
 }
 
-/// Walks `object_id`'s ancestor chain via `parent_id`, starting at the object itself, in that
-/// order, bounded to [`MAX_CHAIN_HOPS`] hops.
+/// Walks `object_id`'s ancestor chain via `parent_id`, starting at the object itself and ending at
+/// the root, in that order.
+///
+/// Fail-closed by construction: this returns a chain only when it is *complete* — it starts at
+/// `object_id` and terminates at a genuine root (`parent_id IS NULL`) within
+/// [`MAX_CHAIN_NODES`]. A truncated chain can hide the authorization boundary that
+/// [`effective_permission`] exists to find, and a hidden boundary silently re-applies the
+/// workspace baseline — exactly the escalation `ADR-0012` R16 was revised to remove. So a chain
+/// deeper than [`TREE_DEPTH_MAX`], a `parent_id` cycle, and a chain whose named ancestor row is
+/// missing from this workspace are all rejected outright rather than evaluated partially, per
+/// `gates/gate-commands.md`: "`depth=33`、继承链成环、或链不完整…**必须 fail closed** 并返回可
+/// 判定的拒绝，不得像 R15 之前那样把 21-32 层静默截断成别的结果".
+///
+/// # Errors
+/// `NotFound` when `object_id` itself has no row in `workspace_id` (the caller's object simply
+/// does not exist — a 404, not a broken invariant). `Forbidden` when the chain is over-deep,
+/// cyclic, or incomplete. Propagates a database read failure otherwise.
 async fn fetch_chain<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
@@ -67,29 +89,62 @@ async fn fetch_chain<C: ConnectionTrait>(
         inherit_from_parent: bool,
     }
 
-    let mut chain = Vec::new();
-    let mut current = Some(object_id);
-    let mut hops = 0usize;
-    while let Some(node_id) = current {
-        if hops > MAX_CHAIN_HOPS {
-            break;
-        }
-        hops += 1;
-        let row = Row::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT id, parent_id, inherit_from_parent FROM flow_objects WHERE id = $1 AND workspace_id = $2",
-            vec![node_id.into(), workspace_id.into()],
-        ))
-        .one(conn)
-        .await?;
-        let Some(row) = row else { break };
-        current = row.parent_id;
-        chain.push(ChainNode {
+    // One `WITH RECURSIVE` round trip for the whole chain, replacing one `SELECT` per hop. This
+    // walk runs on the commit-time content-write path that `ADR-0010` holds to a 25 ms
+    // `document_lock_hold_ms_p95_max` budget, where 33 serial round trips are not affordable —
+    // and `gate-commands.md` names the recursive CTE as the reference implementation.
+    //
+    // `$3` bounds the recursion *inside* the database, so a `parent_id` cycle terminates instead
+    // of spinning. It is deliberately one hop past the legal maximum: walking to depth
+    // `MAX_CHAIN_NODES` yields up to `MAX_CHAIN_NODES + 1` rows, which is what lets an over-deep
+    // or cyclic chain be *detected* below rather than come back looking like a valid short one.
+    let probe_depth = i64::try_from(MAX_CHAIN_NODES).unwrap_or(i64::MAX);
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "WITH RECURSIVE chain AS ( \
+             SELECT o.id, o.parent_id, o.inherit_from_parent, 0 AS depth \
+               FROM flow_objects o \
+              WHERE o.id = $1 AND o.workspace_id = $2 \
+             UNION ALL \
+             SELECT p.id, p.parent_id, p.inherit_from_parent, c.depth + 1 \
+               FROM chain c \
+               JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $2 \
+              WHERE c.parent_id IS NOT NULL AND c.depth < $3::int \
+         ) \
+         SELECT id, parent_id, inherit_from_parent FROM chain ORDER BY depth",
+        vec![object_id.into(), workspace_id.into(), probe_depth.into()],
+    ))
+    .all(conn)
+    .await?;
+
+    // `ORDER BY depth` keeps `chain[0]` the object itself with each later entry its parent —
+    // `effective_permission`'s `chain.get(..=index)` ("the boundary node and everything below
+    // it") depends on exactly this order.
+    let Some(top) = rows.last() else {
+        return Err(ApiError::NotFound("flow object not found".to_string()));
+    };
+    if rows.len() > MAX_CHAIN_NODES {
+        return Err(ApiError::Forbidden(
+            "object inheritance chain is deeper than the frozen tree depth limit".to_string(),
+        ));
+    }
+    if top.parent_id.is_some() {
+        // The walk did not reach a root: either the recursion bound cut a longer chain or a
+        // `parent_id` cycle short, or the ancestor row it names is absent from this workspace
+        // (`flow_objects_parent_workspace_fk` should make the latter impossible — treat a
+        // violated invariant as a denial, never as a licence to judge on a partial chain).
+        return Err(ApiError::Forbidden(
+            "object inheritance chain is incomplete".to_string(),
+        ));
+    }
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ChainNode {
             id: row.id,
             inherit_from_parent: row.inherit_from_parent,
-        });
-    }
-    Ok(chain)
+        })
+        .collect())
 }
 
 /// Explicit grants for one principal across a set of object ids, keyed by `object_id`.
@@ -154,7 +209,10 @@ async fn workspace_baseline<C: ConnectionTrait>(
 /// the workspace-admin override and the workspace baseline.
 ///
 /// # Errors
-/// Propagates a database read failure.
+/// `NotFound` when `object_id` has no row in `workspace_id`. `Forbidden` when the inheritance
+/// chain is over-deep, cyclic, or incomplete — see [`fetch_chain`], which fails closed instead of
+/// judging on a partial chain. Propagates a database read failure otherwise; every caller must
+/// treat any `Err` as a denial and must not fall back to a default level.
 pub async fn effective_permission<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
@@ -192,7 +250,10 @@ pub async fn effective_permission<C: ConnectionTrait>(
         // not apply (`ADR-0012` §3: "workspace 基线不再适用"). `chain[..=index]` is exactly
         // "the boundary node and everything below it" since `chain[0]` is the object itself.
         let Some(bounded) = chain.get(..=index) else {
-            return Ok(PermissionLevel::View);
+            // Unreachable: `index` came from `chain.iter().enumerate()`. Fail closed with an
+            // error rather than inventing a permission level if that ever stops holding.
+            tracing::error!(index, len = chain.len(), "authz: boundary index outside the chain");
+            return Err(ApiError::Internal);
         };
         Ok(best_grant_in(bounded).unwrap_or(PermissionLevel::View))
     } else {
@@ -319,5 +380,479 @@ mod tests {
             assert!(PermissionLevel::parse(raw).is_some(), "{raw} must parse");
         }
         assert!(PermissionLevel::parse("owner").is_none());
+    }
+
+    #[test]
+    fn chain_bounds_match_adr_0012_tree_depth_max() {
+        // Depth is counted with the root at 0 (`collab_core::limits::depth_of`), so a chain at
+        // exactly `tree_depth_max = 32` has 33 nodes. Getting this wrong in either direction is a
+        // security bug: one node short truncates legal depth-32 chains (and can hide an
+        // authorization boundary), one node long accepts a chain the limit forbids.
+        assert_eq!(super::TREE_DEPTH_MAX, 32);
+        assert_eq!(super::MAX_CHAIN_NODES, 33);
+    }
+}
+
+// ---- Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
+//
+// Same scratch-database convention as `super::write`'s database tests: a throwaway database per
+// test, migrated from `migrations/*.sql` on disk, dropped on the way out. These exercise the
+// `ADR-0012` §3 effective-permission rule against real `flow_objects.parent_id` chains, which is
+// the only way to cover the fail-closed cases `gates/gate-commands.md` requires (`depth=33`, a
+// `parent_id` cycle, an incomplete chain) — they are properties of the recursive walk, not of any
+// pure function.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::indexing_slicing,
+    clippy::too_many_lines
+)]
+mod database_tests {
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use uuid::Uuid;
+
+    use super::{PermissionLevel, effective_permission};
+    use crate::error::ApiError;
+
+    /// Nodes in the deepest chain `ADR-0012` §3 permits, written as a literal on purpose: these
+    /// tests must pin the *contract* (`limits-v1.md`'s `tree_depth_max = 32`, root at depth 0, so
+    /// depths `0..=32`), not whatever `super::MAX_CHAIN_NODES` currently happens to say. Deriving
+    /// the fixture sizes from the implementation constant would make the fixtures slide along with
+    /// an off-by-one and quietly keep passing.
+    const DEEPEST_LEGAL_CHAIN_NODES: usize = 33;
+
+    /// One node past the limit: depth 33, which `gate-commands.md` requires to fail closed.
+    const FIRST_ILLEGAL_CHAIN_NODES: usize = 34;
+
+    const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    struct Scratch {
+        db: DatabaseConnection,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        async fn drop_self(self) {
+            let Self { db, name, admin_url } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            let _ = admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await;
+        }
+    }
+
+    async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = Database::connect(&admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+        let name = format!("openpr_collab_authz_{label}");
+        let quoted = format!("\"{name}\"");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+            .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+            .await
+            .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        let db = Database::connect(&url)
+            .await
+            .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+        migrate(&db).await;
+
+        Some(Scratch { db, name, admin_url })
+    }
+
+    async fn migrate(db: &DatabaseConnection) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migration file was found in {dir}");
+        for path in files {
+            let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+            db.execute_unprepared(&sql)
+                .await
+                .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+        }
+    }
+
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!("skipped: {TEST_DATABASE_URL_ENV} is not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    async fn exec(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) {
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .unwrap_or_else(|err| panic!("setup statement failed: {err}"));
+    }
+
+    /// A workspace with `default_member_level = 'edit'` (the `ADR-0012` §3 migration-safety
+    /// default) plus an `owner` and a plain `member`.
+    struct Fixture {
+        workspace_id: Uuid,
+        member_id: Uuid,
+    }
+
+    async fn seed_workspace(db: &DatabaseConnection) -> Fixture {
+        let workspace_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        for user_id in [owner_id, member_id] {
+            exec(
+                db,
+                "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+                 VALUES ($1, $2, '!', 'test', 'user', true)",
+                vec![user_id.into(), format!("{user_id}@authz.test").into()],
+            )
+            .await;
+        }
+        exec(
+            db,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'authz test', $3)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+        for (user_id, role) in [(owner_id, "owner"), (member_id, "member")] {
+            exec(
+                db,
+                "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+                vec![workspace_id.into(), user_id.into(), role.into()],
+            )
+            .await;
+        }
+        exec(
+            db,
+            "INSERT INTO flow_workspace_settings (workspace_id, flow_enabled, default_member_level) \
+             VALUES ($1, true, 'edit')",
+            vec![workspace_id.into()],
+        )
+        .await;
+        Fixture {
+            workspace_id,
+            member_id,
+        }
+    }
+
+    async fn insert_object(
+        db: &DatabaseConnection,
+        workspace_id: Uuid,
+        parent_id: Option<Uuid>,
+        inherit_from_parent: bool,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        exec(
+            db,
+            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, inherit_from_parent) \
+             VALUES ($1, $2, 'page', $3, $4)",
+            vec![
+                id.into(),
+                workspace_id.into(),
+                parent_id.into(),
+                inherit_from_parent.into(),
+            ],
+        )
+        .await;
+        id
+    }
+
+    /// Builds a root-to-leaf chain of `nodes` objects (its leaf therefore sits at depth
+    /// `nodes - 1`) and returns the ids **leaf-first**, the same order `fetch_chain` must produce.
+    ///
+    /// `boundary_from_root`, when set, is the index *counted from the root* of the single node
+    /// whose `inherit_from_parent` is false.
+    async fn build_chain(
+        db: &DatabaseConnection,
+        workspace_id: Uuid,
+        nodes: usize,
+        boundary_from_root: Option<usize>,
+    ) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(nodes);
+        let mut parent = None;
+        for index in 0..nodes {
+            let inherit = boundary_from_root != Some(index);
+            let id = insert_object(db, workspace_id, parent, inherit).await;
+            ids.push(id);
+            parent = Some(id);
+        }
+        ids.reverse();
+        ids
+    }
+
+    async fn grant(db: &DatabaseConnection, workspace_id: Uuid, object_id: Uuid, principal_id: Uuid, level: &str) {
+        exec(
+            db,
+            "INSERT INTO flow_object_grants (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, $4)",
+            vec![workspace_id.into(), object_id.into(), principal_id.into(), level.into()],
+        )
+        .await;
+    }
+
+    async fn member_level(db: &DatabaseConnection, fx: &Fixture, object_id: Uuid) -> Result<PermissionLevel, ApiError> {
+        effective_permission(db, fx.workspace_id, object_id, "user", fx.member_id, "member").await
+    }
+
+    fn assert_forbidden(result: &Result<PermissionLevel, ApiError>, what: &str) {
+        match result {
+            Err(ApiError::Forbidden(_)) => {}
+            Err(other) => panic!("{what}: expected Forbidden, got {other:?}"),
+            Ok(level) => panic!("{what}: expected Forbidden, but permission resolved to {level:?} (fail-open)"),
+        }
+    }
+
+    // ---- the fail-open regressions ----
+
+    /// The core escalation: the authorization boundary sits *above* the depth the walk may reach.
+    /// Truncating the chain hides it, `boundary_index` comes back `None`, and the `else` branch
+    /// re-applies the workspace baseline (`edit`) — precisely the defect `ADR-0012` R16 was
+    /// revised to remove ("断开继承也切不断 baseline"). The only correct answer is a decidable
+    /// denial.
+    #[tokio::test]
+    async fn a_boundary_above_the_depth_limit_is_rejected_not_downgraded_to_the_baseline() {
+        let scratch = scratch_or_skip!("deep_boundary");
+        let fx = seed_workspace(&scratch.db).await;
+
+        // 40 nodes (leaf at depth 39) with the boundary 4 below the root — far above any cut.
+        let chain = build_chain(&scratch.db, fx.workspace_id, 40, Some(4)).await;
+
+        let result = member_level(&scratch.db, &fx, chain[0]).await;
+        assert_forbidden(&result, "over-deep chain hiding a boundary");
+
+        scratch.drop_self().await;
+    }
+
+    /// `flow_objects_parent_workspace_fk` normally makes a cross-workspace parent impossible, so
+    /// this drops the constraint to reproduce that invariant being violated. The point is what
+    /// the read path does when it *is* violated: `WHERE ... AND workspace_id = $2` finds no
+    /// ancestor row, and the old walk read that as "the chain ends here" — losing the boundary
+    /// above and falling back to the baseline.
+    #[tokio::test]
+    async fn a_parent_in_another_workspace_is_rejected_not_treated_as_a_root() {
+        let scratch = scratch_or_skip!("cross_workspace_parent");
+        let fx = seed_workspace(&scratch.db).await;
+        let other = seed_workspace(&scratch.db).await;
+
+        scratch
+            .db
+            .execute_unprepared("ALTER TABLE flow_objects DROP CONSTRAINT flow_objects_parent_workspace_fk")
+            .await
+            .expect("the composite parent FK can be dropped for this fixture");
+
+        // The boundary lives in the other workspace, so a walk that stops at the workspace edge
+        // never sees it and would hand back the `edit` baseline instead.
+        let foreign_root = insert_object(&scratch.db, other.workspace_id, None, false).await;
+        let child = insert_object(&scratch.db, fx.workspace_id, Some(foreign_root), true).await;
+
+        let result = member_level(&scratch.db, &fx, child).await;
+        assert_forbidden(&result, "parent in another workspace");
+
+        scratch.drop_self().await;
+    }
+
+    /// A `parent_id` cycle is blocked by no schema constraint (only self-parenting is) and never
+    /// reaches a root, so the old bounded loop returned its first 33 nodes as though they were a
+    /// complete chain — no boundary found, baseline applied.
+    #[tokio::test]
+    async fn a_parent_id_cycle_is_rejected() {
+        let scratch = scratch_or_skip!("parent_cycle");
+        let fx = seed_workspace(&scratch.db).await;
+
+        let a = insert_object(&scratch.db, fx.workspace_id, None, true).await;
+        let b = insert_object(&scratch.db, fx.workspace_id, Some(a), true).await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET parent_id = $1 WHERE id = $2",
+            vec![b.into(), a.into()],
+        )
+        .await;
+
+        let result = member_level(&scratch.db, &fx, b).await;
+        assert_forbidden(&result, "parent_id cycle");
+
+        scratch.drop_self().await;
+    }
+
+    // ---- the off-by-one, nailed from both sides ----
+
+    /// `tree_depth_max = 32` with the root at depth 0 means a legal chain spans depths `0..=32`:
+    /// 33 nodes joined by 32 hops. The boundary is placed on the *root* — the 33rd and last node
+    /// — so this fails if the walk stops even one node early, which would both deny a legitimate
+    /// object and, in the old code, hide the boundary.
+    #[tokio::test]
+    async fn a_boundary_on_the_deepest_legal_node_is_still_seen() {
+        let scratch = scratch_or_skip!("depth_32_boundary");
+        let fx = seed_workspace(&scratch.db).await;
+
+        let chain = build_chain(&scratch.db, fx.workspace_id, DEEPEST_LEGAL_CHAIN_NODES, Some(0)).await;
+        let leaf = chain[0];
+        let root = chain[DEEPEST_LEGAL_CHAIN_NODES - 1];
+
+        // No grant anywhere: the boundary must suppress the `edit` baseline entirely.
+        let level = member_level(&scratch.db, &fx, leaf)
+            .await
+            .expect("a chain at exactly tree_depth_max must evaluate, not be rejected");
+        assert_eq!(
+            level,
+            PermissionLevel::View,
+            "a boundary at depth 32 must still cut the workspace baseline"
+        );
+
+        // ...and a grant on that same boundary node must be reachable at that depth.
+        grant(&scratch.db, fx.workspace_id, root, fx.member_id, "full_access").await;
+        let level = member_level(&scratch.db, &fx, leaf).await.expect("still evaluates");
+        assert_eq!(
+            level,
+            PermissionLevel::FullAccess,
+            "the boundary node at depth 32 belongs to chain[..=index]"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// One node deeper than legal must fail closed (`gate-commands.md`: "`depth=33` … 必须 fail
+    /// closed"), even though nothing else about the chain is malformed.
+    #[tokio::test]
+    async fn a_chain_one_node_past_the_limit_is_rejected() {
+        let scratch = scratch_or_skip!("depth_33_rejected");
+        let fx = seed_workspace(&scratch.db).await;
+
+        let chain = build_chain(&scratch.db, fx.workspace_id, FIRST_ILLEGAL_CHAIN_NODES, None).await;
+        let result = member_level(&scratch.db, &fx, chain[0]).await;
+        assert_forbidden(&result, "a chain of 34 nodes (depth 33)");
+
+        // ...while its parent, sitting at exactly the limit, still resolves normally.
+        let at_limit = member_level(&scratch.db, &fx, chain[1])
+            .await
+            .expect("depth 32 is legal and must resolve");
+        assert_eq!(
+            at_limit,
+            PermissionLevel::Edit,
+            "no boundary ⇒ the edit baseline applies"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    // ---- no regression in the normal boundary semantics ----
+
+    #[tokio::test]
+    async fn boundary_and_baseline_semantics_are_unchanged() {
+        let scratch = scratch_or_skip!("boundary_semantics");
+        let fx = seed_workspace(&scratch.db).await;
+
+        // (1) No boundary, no grant ⇒ the workspace baseline (`edit`).
+        let plain = build_chain(&scratch.db, fx.workspace_id, 3, None).await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, plain[0]).await.expect("resolves"),
+            PermissionLevel::Edit
+        );
+
+        // (2) No boundary, a grant *below* the baseline ⇒ max(grant, baseline) = baseline.
+        grant(&scratch.db, fx.workspace_id, plain[0], fx.member_id, "view").await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, plain[0]).await.expect("resolves"),
+            PermissionLevel::Edit,
+            "max(view, edit) is edit"
+        );
+
+        // (3) No boundary, an ancestor grant *above* the baseline ⇒ that grant wins.
+        grant(&scratch.db, fx.workspace_id, plain[2], fx.member_id, "full_access").await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, plain[0]).await.expect("resolves"),
+            PermissionLevel::FullAccess
+        );
+
+        // (4) A boundary on the object itself ⇒ the baseline stops applying, and with no grant at
+        //     or under the boundary the member drops to `view`.
+        let restricted = build_chain(&scratch.db, fx.workspace_id, 3, Some(2)).await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, restricted[0]).await.expect("resolves"),
+            PermissionLevel::View,
+            "restrict-access must actually restrict"
+        );
+
+        // (5) `restricted[1]` is the root, which sits *above* the boundary at `restricted[0]`, so
+        //     its grant must not count; a grant on the object itself is at the boundary and does.
+        grant(&scratch.db, fx.workspace_id, restricted[1], fx.member_id, "full_access").await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, restricted[0]).await.expect("resolves"),
+            PermissionLevel::View,
+            "a grant above the boundary must not leak through it"
+        );
+        grant(&scratch.db, fx.workspace_id, restricted[0], fx.member_id, "comment").await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, restricted[0]).await.expect("resolves"),
+            PermissionLevel::Comment
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `ADR-0012` §3 keeps a workspace admin at `full_access` no matter what the chain says
+    /// ("可审计的管理员兜底") — including over a chain this module now refuses to evaluate for
+    /// anybody else.
+    #[tokio::test]
+    async fn a_workspace_admin_keeps_full_access_over_any_chain() {
+        let scratch = scratch_or_skip!("admin_fallback");
+        let fx = seed_workspace(&scratch.db).await;
+
+        let restricted = build_chain(&scratch.db, fx.workspace_id, 3, Some(2)).await;
+        let over_deep = build_chain(&scratch.db, fx.workspace_id, FIRST_ILLEGAL_CHAIN_NODES, None).await;
+
+        for role in ["owner", "admin"] {
+            for object_id in [restricted[0], over_deep[0]] {
+                let level = effective_permission(&scratch.db, fx.workspace_id, object_id, "user", fx.member_id, role)
+                    .await
+                    .expect("the admin fallback never depends on the chain");
+                assert_eq!(level, PermissionLevel::FullAccess, "role {role} must keep full_access");
+            }
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// A missing *starting* object is an ordinary 404, not a broken invariant — turning it into a
+    /// 500, or into a silent `view`, would both be wrong.
+    #[tokio::test]
+    async fn a_missing_object_is_not_found_rather_than_internal() {
+        let scratch = scratch_or_skip!("missing_object");
+        let fx = seed_workspace(&scratch.db).await;
+
+        match member_level(&scratch.db, &fx, Uuid::new_v4()).await {
+            Err(ApiError::NotFound(_)) => {}
+            other => panic!("expected NotFound for an absent object, got {other:?}"),
+        }
+
+        scratch.drop_self().await;
     }
 }
