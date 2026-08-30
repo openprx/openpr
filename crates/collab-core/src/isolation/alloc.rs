@@ -33,6 +33,23 @@ pub fn arm() {
     ARMED.store(true, Ordering::SeqCst);
 }
 
+/// Closes the metered window: allocations/frees from this point on pass straight through
+/// uncounted again, mirroring [`arm`]'s pre-window passthrough behavior. Matches
+/// `child_runtime::disarm_sigprof`'s closing of the CPU-ceiling window at the same point in
+/// `src/bin/isolated_apply_worker.rs`'s call sequence, so the memory ceiling covers exactly the
+/// same span (decode/apply/shape-validate) as the CPU ceiling, per `contracts/limits-v1.md`'s "从
+/// decode 前开始计,到 semantic diff/shape validation 完成结束" scope for both -- serializing the
+/// already-accepted result (`export_snapshot`) is not part of that scope, the same way loading the
+/// already-validated base document before [`arm`] is called is not.
+///
+/// Does not reset the active-byte counter: there is nothing left in this worker's lifecycle that
+/// reads it after this point (the process reports its outcome and exits), and leaving stale
+/// accounting in place is harmless since [`arm`] always resets it back to zero before it is ever
+/// consulted again.
+pub fn disarm() {
+    ARMED.store(false, Ordering::SeqCst);
+}
+
 /// A `GlobalAlloc` that enforces [`ISOLATED_APPLY_MEMORY_BYTES_MAX`] as the sole memory gate
 /// quantity (`ADR-0014` section 3), once [`arm`] has been called.
 ///

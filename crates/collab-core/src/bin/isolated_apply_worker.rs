@@ -16,8 +16,12 @@
 //!    `check_snapshot` against the frozen `contracts/limits-v1.md` structural ceilings -- decode +
 //!    shape validation, exactly the scope `limits-v1.md`'s "从 decode 前开始计,到 semantic
 //!    diff/shape validation 完成结束" describes.
-//! 5. Disarm the timer (closing the window) and report the outcome back over stdout as a
-//!    length/CRC32-framed payload.
+//! 5. Disarm the timer and the counting allocator (closing the window) as soon as step 4 has a
+//!    verdict, *before* serializing an accepted result: `export_snapshot` operates on already-
+//!    validated in-memory state (the same reasoning that keeps step 2's `load` outside the window),
+//!    not on the untrusted input step 4 just finished validating, so it is not part of the budget
+//!    that bounds processing that untrusted input.
+//! 6. Report the outcome back over stdout as a length/CRC32-framed payload.
 //!
 //! If the process is killed by `SIGPROF` (step 3/4 overran the CPU ceiling), aborts itself via the
 //! counting allocator's rejection path (overran the memory ceiling, `SIGABRT`), or is `SIGKILL`ed
@@ -72,48 +76,73 @@ fn main() {
         Err(err) => respond_and_exit(&wire::Outcome::Rejected(err)),
     };
 
-    respond_and_exit(&run_metered(base_engine, &update));
+    respond_and_exit(&decode_apply_check_and_export(base_engine, &update));
 }
 
 /// Everything between arming the metered window and closing it: `import_update`, deriving the
-/// semantic snapshot, `check_snapshot`, and (on success) exporting the resulting document. Timer
-/// disarm happens as the very first step after the last protected operation on every path, so a
-/// slow export/serialize afterwards can never be blamed on the CPU ceiling.
+/// semantic snapshot, and `check_snapshot`. Timer and allocator disarm happen as the very first
+/// step after this has a verdict, on every path -- see [`decode_apply_check_and_export`]'s doc
+/// comment for why `export_snapshot` itself runs after the window closes, not inside it.
 ///
-/// Split from [`decode_apply_and_validate`] so the actual `import_update`/`check_snapshot` logic
-/// is unit-testable without arming a real, process-wide `SIGPROF` timer with its default
+/// Returns the accepted, mutated `engine` (ready to export) on success, or the definitive
+/// `wire::Outcome::Rejected` to report otherwise.
+///
+/// Split from [`decode_apply_check_and_export`] so this actual `import_update`/`check_snapshot`
+/// logic is unit-testable without arming a real, process-wide `SIGPROF` timer with its default
 /// (process-terminating) disposition -- doing that inside a `cargo test` binary, which runs many
 /// tests concurrently in one process, would risk killing the entire test run under real CPU load,
 /// not just this one test's work. The real armed path is only ever exercised by spawning the
 /// actual compiled worker binary as a subprocess, which `isolation::host`'s own tests do.
-fn run_metered(engine: LoroCollabEngine, update: &[u8]) -> wire::Outcome {
+fn run_metered(engine: LoroCollabEngine, update: &[u8]) -> Result<LoroCollabEngine, wire::Outcome> {
     child_runtime::arm_sigprof();
     alloc::arm();
-    let outcome = decode_apply_and_validate(engine, update);
+    let outcome = decode_apply_and_check(engine, update);
     child_runtime::disarm_sigprof();
+    alloc::disarm();
     outcome
 }
 
-/// The pure decode/apply/shape-validate/export logic, with no timer or allocator side effects of
-/// its own -- safe to unit test directly (see [`run_metered`]'s doc comment for why that function
-/// itself is not).
-fn decode_apply_and_validate(mut engine: LoroCollabEngine, update: &[u8]) -> wire::Outcome {
+/// The pure decode/apply/shape-validate logic, with no timer or allocator side effects of its own
+/// -- safe to unit test directly (see [`run_metered`]'s doc comment for why that function itself
+/// is not).
+fn decode_apply_and_check(mut engine: LoroCollabEngine, update: &[u8]) -> Result<LoroCollabEngine, wire::Outcome> {
     if let Err(err) = engine.import_update(update) {
-        return wire::Outcome::Rejected(err);
+        return Err(wire::Outcome::Rejected(err));
     }
 
     let semantic = match engine.semantic_snapshot() {
         Ok(semantic) => semantic,
-        Err(err) => return wire::Outcome::Rejected(err),
+        Err(err) => return Err(wire::Outcome::Rejected(err)),
     };
 
     if let Err(violation) = check_snapshot(&semantic, &DocumentLimits::default()) {
-        return wire::Outcome::Rejected(CollabError::from(violation));
+        return Err(wire::Outcome::Rejected(CollabError::from(violation)));
     }
 
-    match engine.export_snapshot() {
-        Ok(snapshot) => wire::Outcome::Success { snapshot },
-        Err(err) => wire::Outcome::Rejected(err),
+    Ok(engine)
+}
+
+/// Composes [`run_metered`] with the unmetered `export_snapshot` step that follows it, producing
+/// the full `wire::Outcome` [`respond_and_exit`] reports.
+///
+/// `export_snapshot` serializes state this process already validated and committed to in-memory
+/// (the accepted, merged `engine`) -- not the untrusted `update` input `run_metered` just finished
+/// processing -- so, exactly like step 2's `LoroCollabEngine::load` of the base document, it runs
+/// after the CPU/memory metered window closes rather than inside it. `contracts/limits-v1.md`'s
+/// "从 decode 前开始计,到 semantic diff/shape validation 完成结束" scope for `decode_apply_cpu_ms_max`
+/// and `isolated_apply_memory_bytes_max` ends at shape validation (`check_snapshot`), not at
+/// "serialize the accepted result"; a release-mode measurement of this worker at the
+/// `container_count_max`/`document_block_count_max` boundary (10,000 nodes) found
+/// `export_snapshot` costing roughly as much CPU time as `import_update` itself, so leaving it
+/// inside the window (as an earlier version of this file did) was spending real budget on work the
+/// contract does not ask this ceiling to bound.
+fn decode_apply_check_and_export(engine: LoroCollabEngine, update: &[u8]) -> wire::Outcome {
+    match run_metered(engine, update) {
+        Ok(accepted) => match accepted.export_snapshot() {
+            Ok(snapshot) => wire::Outcome::Success { snapshot },
+            Err(err) => wire::Outcome::Rejected(err),
+        },
+        Err(outcome) => outcome,
     }
 }
 
@@ -171,7 +200,7 @@ mod tests {
         writer.set_title("hello").expect("set_title succeeds");
         let update = writer.export_from(&base_frontier).expect("export succeeds");
 
-        let outcome = decode_apply_and_validate(base, &update);
+        let outcome = decode_apply_check_and_export(base, &update);
         let wire::Outcome::Success { snapshot } = outcome else {
             panic!("expected Success, a title-only update stays well within every ceiling");
         };
@@ -228,7 +257,7 @@ mod tests {
             .expect("insert_text succeeds at the engine level (check_snapshot, not the engine, enforces this ceiling)");
         let update = writer.export_from(&base_frontier).expect("export succeeds");
 
-        let outcome = decode_apply_and_validate(base, &update);
+        let outcome = decode_apply_check_and_export(base, &update);
         let wire::Outcome::Rejected(CollabError::LimitExceeded { limit_kind, .. }) = outcome else {
             panic!("expected a document_text_chars rejection, got {outcome:?}");
         };

@@ -138,6 +138,32 @@ fn map_loro_error(err: &loro::LoroError, node_id: &str) -> CollabError {
     }
 }
 
+/// Zero-pads `position` to at least 8 digits (matching `format!("{position:08}")`'s exact output
+/// for every non-negative value, including the unpadded case where `position` already has 8+
+/// digits), without routing through `core::fmt`'s generic width/fill machinery
+/// (`Formatter::pad_integral`).
+///
+/// `semantic_snapshot` calls this once per node, so its cost multiplies by document size; a
+/// release-mode `perf` profile of the isolated-apply worker at the `container_count_max`/
+/// `document_block_count_max` boundary (10,000 nodes) showed `Formatter::pad_integral` and the
+/// `core::fmt::write` machinery it pulls in accounting for roughly a tenth of total samples,
+/// almost entirely attributable to this one call site -- the `{:08}` width specifier routes
+/// unsigned integer formatting through that generic, allocating-per-`write_str`-call path instead
+/// of `usize::to_string`'s specialized fast path. Using `to_string` (fast path) plus a manual
+/// left-pad keeps the identical output with meaningfully less per-call overhead.
+fn zero_padded_order_key(position: usize) -> String {
+    let digits = position.to_string();
+    if digits.len() >= 8 {
+        return digits;
+    }
+    let mut key = String::with_capacity(8);
+    for _ in 0..(8 - digits.len()) {
+        key.push('0');
+    }
+    key.push_str(&digits);
+    key
+}
+
 fn read_string_value(value_or_container: &ValueOrContainer) -> Option<String> {
     match value_or_container {
         ValueOrContainer::Value(LoroValue::String(s)) => Some(s.as_ref().to_string()),
@@ -412,7 +438,7 @@ impl LoroCollabEngine {
                     .map(|(index, id)| (id, index))
                     .collect()
             });
-            let order_key = format!("{:08}", positions.get(&tree_id).copied().unwrap_or(0));
+            let order_key = zero_padded_order_key(positions.get(&tree_id).copied().unwrap_or(0));
 
             let meta = self
                 .tree
@@ -519,6 +545,25 @@ impl CollabEngine for LoroCollabEngine {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_padded_order_key_matches_the_format_macro_it_replaced() {
+        for position in [
+            0usize,
+            1,
+            7,
+            8,
+            9,
+            99,
+            9_999,
+            10_000,
+            99_999_999,
+            100_000_000,
+            123_456_789,
+        ] {
+            assert_eq!(zero_padded_order_key(position), format!("{position:08}"));
+        }
+    }
 
     #[test]
     fn new_empty_has_no_title_and_empty_semantic_snapshot() {
