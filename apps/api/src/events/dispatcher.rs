@@ -24,6 +24,7 @@
 )]
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use chrono::{DateTime, Utc};
 use platform::app::AppState;
@@ -34,6 +35,30 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::outbound::validate_outbound_url;
 use crate::webhook_trigger::{WEBHOOK_SIGNATURE_HEADER, sign_payload};
+
+// ---------------------------------------------------------------------------------------------
+// Test-only fault injection (`events-v1.md` "展开是一个事务": the only way to prove step (b)'s
+// failure rolls back the *whole* transaction — including the step (a) reservation that already
+// ran on the same `tx` — is to make step (b) actually fail after (a) has already succeeded.
+// Gated entirely behind `cfg(test)`: the task-local key does not exist, and this call site is a
+// zero-cost `false` literal, in any non-test build (including `apps/worker`, which links this
+// crate as a dependency and therefore never sees this crate's own `cfg(test)`).
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+tokio::task_local! {
+    static FAIL_EXPANSION_STEP_B: std::cell::Cell<bool>;
+}
+
+#[cfg(test)]
+fn step_b_fault_armed() -> bool {
+    FAIL_EXPANSION_STEP_B.try_with(std::cell::Cell::get).unwrap_or(false)
+}
+
+#[cfg(not(test))]
+const fn step_b_fault_armed() -> bool {
+    false
+}
 
 // ---------------------------------------------------------------------------------------------
 // Budgets `limits-v1.md` marks `status: unset` ("`set_by`: v0.4 实现者", "冻结前不得填入自造数值"
@@ -112,6 +137,23 @@ const DISPATCH_FAILED_RETENTION_DAYS: i64 = 90;
 /// 位置"). `delivery.id` in the body is the same value; both are written together below.
 const DELIVERY_ID_HEADER: &str = "X-Sylvode-Delivery-Id";
 
+/// `dispatcher_liveness` readiness budget: how stale the last started tick may be before
+/// [`dispatcher_is_live`] reports the process not-live.
+///
+/// `limits-v1.md` freezes no numeric value for this signal (it only names the mechanism), so this
+/// follows the same "several multiples of the expected cadence" rule the rest of this file's
+/// `status: unset` budgets use — six times the worker's 5-second poll interval
+/// (`apps/worker/src/main.rs`) tolerates one slow tick without flapping, while still catching a
+/// genuinely wedged poll loop within half a minute.
+pub const DISPATCHER_LIVENESS_MAX_SILENCE_MS: i64 = 30_000;
+
+/// `oldest_pending_age` alert threshold.
+///
+/// Several multiples of the slowest *legitimate* resolution path in this file (FIFO head-of-queue
+/// wait plus the delivery backoff ladder's 300s cap), so this only fires once a backlog item has
+/// genuinely stalled rather than while it is merely waiting its turn behind a healthy predecessor.
+pub const OLDEST_PENDING_AGE_ALERT_MS: i64 = 15 * 60 * 1000;
+
 fn ms_interval(param_index: usize) -> String {
     format!("(${param_index}::bigint * interval '1 millisecond')")
 }
@@ -144,10 +186,67 @@ pub struct DispatchTickReport {
     pub delivery_leases_reclaimed: u64,
     pub dispatch_rows_reaped: u64,
     pub delivery_rows_reaped: u64,
+    /// `oldest_pending_age` (dispatch half): age in ms of the oldest still-`pending`
+    /// `event_dispatch` row after this pass, `None` when that backlog is empty. Anchored on
+    /// `created_at`, the only timestamp such a row has before it resolves.
+    pub oldest_pending_dispatch_age_ms: Option<i64>,
+    /// `oldest_pending_age` (delivery half): age in ms of the oldest still-undelivered
+    /// `event_deliveries` row (`pending`/`sealed`/`leased`) after this pass, `None` when empty.
+    pub oldest_pending_delivery_age_ms: Option<i64>,
 }
+
+/// `dispatcher_liveness` readiness probe: `true` iff this process has *started* a `run_tick` pass
+/// within `max_silence_ms` of `now`.
+///
+/// `false` before the first tick this process has ever run, or once the gap since the last started
+/// tick exceeds the budget — either one is exactly the signal `ADR-0011`'s "dispatcher 不在线即整体
+/// 告警" needs a caller (e.g. a `/readyz` route) to alert on.
+pub fn dispatcher_is_live(now: DateTime<Utc>, max_silence_ms: i64) -> bool {
+    let last = LAST_TICK_STARTED_AT_UNIX_MS.load(Ordering::Relaxed);
+    let last = if last == 0 {
+        None
+    } else {
+        DateTime::from_timestamp_millis(last)
+    };
+    dispatcher_is_live_since(last, now, max_silence_ms)
+}
+
+/// The pure core of [`dispatcher_is_live`], taking "when did the last tick start" as an explicit
+/// argument instead of reading the process-global clock.
+///
+/// Exists so tests can exercise arbitrary `(last_tick, now)` pairs — including "no tick has ever
+/// happened" — by advancing a virtual clock through the argument, without racing every *other* test
+/// in the same binary that calls [`run_tick`] and therefore mutates the one shared global this
+/// function's public wrapper reads.
+pub fn dispatcher_is_live_since(
+    last_tick_started_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    max_silence_ms: i64,
+) -> bool {
+    last_tick_started_at.is_some_and(|last| (now - last).num_milliseconds() <= max_silence_ms)
+}
+
+/// `oldest_pending_age` threshold check over a completed tick's report: `true` iff either half of
+/// the backlog (dispatch or delivery) is older than `threshold_ms`. A caller alerts on `true`.
+pub fn backlog_alert(report: &DispatchTickReport, threshold_ms: i64) -> bool {
+    report
+        .oldest_pending_dispatch_age_ms
+        .is_some_and(|age| age > threshold_ms)
+        || report
+            .oldest_pending_delivery_age_ms
+            .is_some_and(|age| age > threshold_ms)
+}
+
+/// Unix milliseconds of the last time [`run_tick`] *started* a pass in this process; `0` before
+/// the first ever tick. No persistence by design: a fresh process is correctly not-live until its
+/// own first tick, and a process whose poll loop wedges is correctly reported stale without any
+/// other process needing to notice.
+static LAST_TICK_STARTED_AT_UNIX_MS: AtomicI64 = AtomicI64::new(0);
 
 pub async fn run_tick(state: &AppState, client: &reqwest::Client, batch: usize) -> DispatchTickReport {
     let batch = batch.max(1);
+    let now = Utc::now();
+    LAST_TICK_STARTED_AT_UNIX_MS.store(now.timestamp_millis(), Ordering::Relaxed);
     let mut report = DispatchTickReport::default();
 
     match reclaim_expired_dispatch_leases(&state.db).await {
@@ -184,16 +283,61 @@ pub async fn run_tick(state: &AppState, client: &reqwest::Client, batch: usize) 
         }
     }
 
-    match reap_dispatch_retention(&state.db).await {
+    match reap_dispatch_retention(&state.db, now).await {
         Ok(n) => report.dispatch_rows_reaped = n,
         Err(err) => tracing::warn!(error = %err, "dispatcher: event_dispatch retention reaper failed"),
     }
-    match reap_delivery_retention(&state.db).await {
+    match reap_delivery_retention(&state.db, now).await {
         Ok(n) => report.delivery_rows_reaped = n,
         Err(err) => tracing::warn!(error = %err, "dispatcher: event_deliveries retention reaper failed"),
     }
 
+    match oldest_pending_dispatch_age_ms(&state.db, now).await {
+        Ok(age) => report.oldest_pending_dispatch_age_ms = age,
+        Err(err) => tracing::warn!(error = %err, "dispatcher: oldest_pending_dispatch_age query failed"),
+    }
+    match oldest_pending_delivery_age_ms(&state.db, now).await {
+        Ok(age) => report.oldest_pending_delivery_age_ms = age,
+        Err(err) => tracing::warn!(error = %err, "dispatcher: oldest_pending_delivery_age query failed"),
+    }
+
     report
+}
+
+#[derive(Debug, FromQueryResult)]
+struct OldestPendingRow {
+    oldest_created_at: Option<DateTime<Utc>>,
+}
+
+/// `oldest_pending_age`, dispatch half: age of the oldest still-unresolved (`status = 'pending'`)
+/// `event_dispatch` row. `None` when there is no such row.
+async fn oldest_pending_dispatch_age_ms(db: &DatabaseConnection, now: DateTime<Utc>) -> Result<Option<i64>, ApiError> {
+    let row = OldestPendingRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT MIN(created_at) AS oldest_created_at FROM event_dispatch WHERE status = 'pending'",
+        vec![],
+    ))
+    .one(db)
+    .await?;
+    Ok(row
+        .and_then(|r| r.oldest_created_at)
+        .map(|oldest| (now - oldest).num_milliseconds().max(0)))
+}
+
+/// `oldest_pending_age`, delivery half: age of the oldest still-undelivered `event_deliveries` row
+/// (`pending`/`sealed`/`leased` — everything short of a terminal state counts as "未投递"). `None`
+/// when there is no such row.
+async fn oldest_pending_delivery_age_ms(db: &DatabaseConnection, now: DateTime<Utc>) -> Result<Option<i64>, ApiError> {
+    let row = OldestPendingRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT MIN(created_at) AS oldest_created_at FROM event_deliveries WHERE status IN ('pending', 'sealed', 'leased')",
+        vec![],
+    ))
+    .one(db)
+    .await?;
+    Ok(row
+        .and_then(|r| r.oldest_created_at)
+        .map(|oldest| (now - oldest).num_milliseconds().max(0)))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -406,7 +550,8 @@ async fn expand_work(
         let affected = tx
             .execute(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "UPDATE event_dispatch SET status = 'no_subscribers', expanded_at = now() WHERE id = $1 AND lease_token = $2",
+                "UPDATE event_dispatch SET status = 'no_subscribers', expanded_at = now(), \
+                 lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2",
                 vec![work.id.into(), lease_token.into()],
             ))
             .await?
@@ -426,7 +571,8 @@ async fn expand_work(
     let affected = tx
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "UPDATE event_dispatch SET status = 'expanded', expanded_at = now() WHERE id = $1 AND lease_token = $2",
+            "UPDATE event_dispatch SET status = 'expanded', expanded_at = now(), \
+             lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2",
             vec![work.id.into(), lease_token.into()],
         ))
         .await?
@@ -468,6 +614,12 @@ async fn expand_one_subscriber<C: ConnectionTrait>(
     .await?;
 
     let Some(reserved) = reserved else { return Ok(()) };
+
+    if step_b_fault_armed() {
+        // Test-only: step (a) above already ran on `tx`; returning `Err` here forces the whole
+        // transaction to roll back without a `COMMIT`, exactly like a worker dying mid-expansion.
+        return Err(ApiError::Conflict("test_injected_expansion_step_b_failure".to_string()));
+    }
 
     let delivery_id = if let (Some(document_id), Some(accepted_seq)) = (work.document_id, work.accepted_seq) {
         bind_content_delivery(tx, work, subscriber_id, document_id, accepted_seq).await?
@@ -1003,7 +1155,13 @@ async fn build_delivery_body(db: &DatabaseConnection, delivery: &DeliveryLeaseRo
 // Retention reapers (`events-v1.md` "reaper 的谓词只能删终态" / "计时锚点")
 // ---------------------------------------------------------------------------------------------
 
-async fn reap_dispatch_retention(db: &DatabaseConnection) -> Result<u64, ApiError> {
+/// Takes `now` as an explicit argument (rather than letting the `DELETE` read Postgres's own
+/// `now()`) so callers — in particular exact-boundary tests — can pin the *one* reference instant
+/// used both to compute a backdated anchor column and to evaluate this predicate against it. Two
+/// independent `now()` calls (one in the test's `UPDATE`, one in this `DELETE`) would always have
+/// drifted apart by at least the round-trip between them, which makes "exactly at the boundary"
+/// unobservable. `run_tick` passes real wall-clock time; nothing else changes for production use.
+async fn reap_dispatch_retention(db: &DatabaseConnection, now: DateTime<Utc>) -> Result<u64, ApiError> {
     let result = db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1011,22 +1169,24 @@ async fn reap_dispatch_retention(db: &DatabaseConnection) -> Result<u64, ApiErro
                 DELETE FROM event_dispatch
                 WHERE lease_token IS NULL
                   AND (
-                    (status = 'no_subscribers' AND expanded_at < now() - ($1::bigint * interval '1 hour'))
-                    OR (status = 'expanded' AND expanded_at < now() - ($2::bigint * interval '1 day'))
-                    OR (status = 'failed' AND expanded_at < now() - ($3::bigint * interval '1 day'))
+                    (status = 'no_subscribers' AND expanded_at < $4::timestamptz - ($1::bigint * interval '1 hour'))
+                    OR (status = 'expanded' AND expanded_at < $4::timestamptz - ($2::bigint * interval '1 day'))
+                    OR (status = 'failed' AND expanded_at < $4::timestamptz - ($3::bigint * interval '1 day'))
                   )
             ",
             vec![
                 DISPATCH_NO_SUBSCRIBERS_RETENTION_HOURS.into(),
                 DISPATCH_EXPANDED_RETENTION_DAYS.into(),
                 DISPATCH_FAILED_RETENTION_DAYS.into(),
+                now.into(),
             ],
         ))
         .await?;
     Ok(result.rows_affected())
 }
 
-async fn reap_delivery_retention(db: &DatabaseConnection) -> Result<u64, ApiError> {
+/// See [`reap_dispatch_retention`]'s doc comment for why `now` is an explicit argument.
+async fn reap_delivery_retention(db: &DatabaseConnection, now: DateTime<Utc>) -> Result<u64, ApiError> {
     let result = db
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1034,9 +1194,9 @@ async fn reap_delivery_retention(db: &DatabaseConnection) -> Result<u64, ApiErro
                 DELETE FROM event_deliveries
                 WHERE lease_token IS NULL
                   AND status IN ('dispatched', 'failed', 'cancelled')
-                  AND terminated_at < now() - ($1::bigint * interval '1 day')
+                  AND terminated_at < $2::timestamptz - ($1::bigint * interval '1 day')
             ",
-            vec![DELIVERY_RETENTION_DAYS.into()],
+            vec![DELIVERY_RETENTION_DAYS.into(), now.into()],
         ))
         .await?;
     Ok(result.rows_affected())
@@ -1052,16 +1212,22 @@ async fn reap_delivery_retention(db: &DatabaseConnection) -> Result<u64, ApiErro
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod dispatcher_database_tests {
+    use chrono::Utc;
     use platform::{
         app::AppState,
         config::{AppConfig, Secret},
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
     use super::{
-        ExpansionOutcome, build_delivery_body, expand_one, reclaim_expired_dispatch_leases, run_tick, send_one,
+        DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B, OLDEST_PENDING_AGE_ALERT_MS,
+        backlog_alert, build_delivery_body, dispatcher_is_live, dispatcher_is_live_since, expand_one,
+        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reclaim_expired_delivery_leases,
+        reclaim_expired_dispatch_leases, run_tick, send_one,
     };
     use crate::events::{BusinessEventInput, insert_business_event};
 
@@ -1071,11 +1237,17 @@ mod dispatcher_database_tests {
         db: DatabaseConnection,
         name: String,
         admin_url: String,
+        url: String,
     }
 
     impl Scratch {
         async fn drop_self(self) {
-            let Self { db, name, admin_url } = self;
+            let Self {
+                db,
+                name,
+                admin_url,
+                url: _,
+            } = self;
             drop(db);
             let Ok(admin) = Database::connect(&admin_url).await else {
                 return;
@@ -1083,6 +1255,15 @@ mod dispatcher_database_tests {
             let _ = admin
                 .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
                 .await;
+        }
+
+        /// A second, independent connection to the same scratch database — needed to prove
+        /// something about cross-connection concurrency (a held lock, a simultaneous lease race)
+        /// that a single `DatabaseConnection`'s own pool cannot observe from the inside.
+        async fn second_connection(&self) -> DatabaseConnection {
+            Database::connect(&self.url)
+                .await
+                .unwrap_or_else(|err| panic!("could not open a second connection to {}: {err}", self.name))
         }
     }
 
@@ -1110,7 +1291,12 @@ mod dispatcher_database_tests {
             .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
 
         migrate(&db).await;
-        Some(Scratch { db, name, admin_url })
+        Some(Scratch {
+            db,
+            name,
+            admin_url,
+            url,
+        })
     }
 
     async fn migrate(db: &DatabaseConnection) {
@@ -1273,6 +1459,99 @@ mod dispatcher_database_tests {
             .expect("count query runs")
             .expect("count query returns a row");
         row.try_get("", "n").expect("n column reads")
+    }
+
+    /// Reads a single named column off the one row a query returns. Generic sibling of [`count`]
+    /// for everything that isn't a `count(*)`.
+    async fn get_col<T: sea_orm::TryGetable>(
+        db: &DatabaseConnection,
+        sql: &str,
+        values: Vec<sea_orm::Value>,
+        col: &str,
+    ) -> T {
+        db.query_one(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .expect("query runs")
+            .expect("row exists")
+            .try_get("", col)
+            .expect("column reads")
+    }
+
+    /// This suite's **clock-advancement primitive**: backdates one timestamp column on the row
+    /// matched by `id_column = id` by `offset` (positive moves it further into the past). Every
+    /// retention-boundary / backlog-age test below reaches its boundary by rewriting a row's own
+    /// timestamp this way — never by sleeping real wall-clock time. `table`/`timestamp_column`/
+    /// `id_column` are always `&'static str` literals fixed by the call site, never caller input.
+    async fn backdate(
+        db: &DatabaseConnection,
+        table: &'static str,
+        timestamp_column: &'static str,
+        id_column: &'static str,
+        id: Uuid,
+        offset: chrono::Duration,
+    ) {
+        exec(
+            db,
+            &format!(
+                "UPDATE {table} SET {timestamp_column} = now() - ($2::bigint * interval '1 millisecond') \
+                 WHERE {id_column} = $1"
+            ),
+            vec![id.into(), offset.num_milliseconds().into()],
+        )
+        .await;
+    }
+
+    /// [`backdate`]'s sibling for *exact*-boundary fixtures: sets a timestamp column to a literal
+    /// value computed on the Rust side, rather than relative to Postgres's own `now()`. Pair this
+    /// with the retention reapers' explicit `now` argument so the test's write and the reaper's
+    /// read share one frozen reference instant instead of two independent, always-slightly-drifted
+    /// `now()` calls — required for asserting "exactly at the boundary survives, one ms past it
+    /// does not" deterministically.
+    async fn set_timestamp(
+        db: &DatabaseConnection,
+        table: &'static str,
+        timestamp_column: &'static str,
+        id_column: &'static str,
+        id: Uuid,
+        value: chrono::DateTime<Utc>,
+    ) {
+        exec(
+            db,
+            &format!("UPDATE {table} SET {timestamp_column} = $2 WHERE {id_column} = $1"),
+            vec![id.into(), value.into()],
+        )
+        .await;
+    }
+
+    /// Deletes a webhook outright — the "subscriber deleted" half of the snapshot-semantics gate,
+    /// distinguished from the `active` toggle case, which is exercised separately.
+    async fn delete_webhook(db: &DatabaseConnection, webhook_id: Uuid) {
+        exec(db, "DELETE FROM webhooks WHERE id = $1", vec![webhook_id.into()]).await;
+    }
+
+    /// Drains `expand_one` against `db` until nothing is left to lease, counting how many work
+    /// items this task personally expanded. Used to run several simulated dispatcher instances
+    /// concurrently against one shared backlog.
+    async fn drain_expand_one(db: &DatabaseConnection) -> u32 {
+        let mut expanded = 0u32;
+        loop {
+            match expand_one(db).await {
+                Ok(Some(ExpansionOutcome::Expanded | ExpansionOutcome::NoSubscribers)) => expanded += 1,
+                Ok(Some(ExpansionOutcome::StaleLease)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        expanded
+    }
+
+    /// [`drain_expand_one`]'s sibling for the send side.
+    async fn drain_send_one(state: AppState) -> u32 {
+        let client = reqwest::Client::new();
+        let mut sent = 0u32;
+        while let Ok(Some(_)) = send_one(&state, &client).await {
+            sent += 1;
+        }
+        sent
     }
 
     #[tokio::test]
@@ -1693,6 +1972,2206 @@ mod dispatcher_database_tests {
         assert_eq!(row.status, "pending", "a first reclaim must not exhaust the budget");
         assert_eq!(row.lease_reclaims, 1);
         assert!(row.lease_token.is_none());
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Gate: business_event_dispatch_same_transaction
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn business_event_dispatch_same_transaction_touches_zero_subscription_queries() {
+        let scratch = scratch_or_skip!("zero-sub-query");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+
+        // A second connection holds an ACCESS EXCLUSIVE lock on `webhooks` for the whole test body.
+        // That lock blocks *every* statement against that table, not just writes -- including a
+        // plain unlocked SELECT, which a lighter lock (e.g. row-level FOR UPDATE) would not. If the
+        // domain transaction below queried the subscription directory even once, it would block
+        // here until the lock is released, and the timeout turns that into a failed assertion
+        // instead of a hang.
+        let locker = scratch.second_connection().await;
+        let lock_tx = locker.begin().await.expect("lock tx begins");
+        lock_tx
+            .execute_unprepared("LOCK TABLE webhooks IN ACCESS EXCLUSIVE MODE")
+            .await
+            .expect("lock acquired");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "the domain transaction blocked on a table lock held on `webhooks`: it must issue zero \
+             subscription-directory queries in the domain transaction (ADR-0011)"
+        );
+
+        lock_tx.rollback().await.expect("lock released");
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn business_event_dispatch_same_transaction_rollback_leaves_zero_residue() {
+        let scratch = scratch_or_skip!("rollback-residue");
+        let workspace_id = seed_workspace(&scratch.db).await;
+
+        let tx = scratch.db.begin().await.expect("tx begins");
+        let event_id = insert_business_event(
+            &tx,
+            BusinessEventInput {
+                workspace_id,
+                project_id: None,
+                event_type: "flow.object.created".to_string(),
+                aggregate_type: "flow_object".to_string(),
+                aggregate_id: Uuid::new_v4().to_string(),
+                actor_id: None,
+                source: json!({ "surface": "rest" }),
+                payload: json!({}),
+                metadata: json!({}),
+                correlation_id: None,
+                causation_id: None,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .expect("business event insert succeeds inside the open transaction");
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO event_dispatch (id, event_id, workspace_id, event_type, max_attempts) \
+             VALUES ($1, $2, $3, $4, 10)",
+            vec![
+                Uuid::new_v4().into(),
+                event_id.into(),
+                workspace_id.into(),
+                "flow.object.created".into(),
+            ],
+        ))
+        .await
+        .expect("event_dispatch insert succeeds inside the open transaction");
+
+        // Simulate the rest of the domain transaction failing after both rows above were written --
+        // e.g. a later step in the same transaction hit a constraint violation -- by rolling back
+        // explicitly. This has the identical server-visible effect as an error percolating up
+        // through `?` before `tx.commit()` is ever reached.
+        tx.rollback().await.expect("rollback succeeds");
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM business_events WHERE id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            0,
+            "a rolled-back domain transaction must leave zero business_events rows"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_dispatch WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            0,
+            "a rolled-back domain transaction must leave zero event_dispatch rows"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Gate: dispatch_expansion_snapshot_semantics
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn dispatch_expansion_delivers_to_a_subscriber_created_after_the_event_committed_but_before_expansion() {
+        let scratch = scratch_or_skip!("snapshot-late-subscriber");
+        let workspace_id = seed_workspace(&scratch.db).await;
+
+        // The event commits with zero subscribers registered yet.
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+
+        // A webhook is registered *after* that commit, but the dispatcher has not expanded the work
+        // item yet (nothing has called `expand_one` in between).
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("one work item was pending");
+        assert!(
+            matches!(outcome, ExpansionOutcome::Expanded),
+            "events-v1.md: the receiver set is whoever is active *at expansion time*, not at commit \
+             time -- a webhook registered after commit but before expansion must receive this event, \
+             which is defined-in-spec behavior, not a bug"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            1
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_expansion_skips_a_subscriber_deleted_after_commit_but_before_expansion() {
+        let scratch = scratch_or_skip!("snapshot-deleted-subscriber");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+
+        // The subscriber is deleted before the dispatcher ever expands the work item.
+        delete_webhook(&scratch.db, webhook_id).await;
+
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("one work item was pending");
+        assert!(
+            matches!(outcome, ExpansionOutcome::NoSubscribers),
+            "a subscriber deleted before expansion must not receive the event, and with no other \
+             subscriber left the work item must terminalize as no_subscribers"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            0
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_expansion_skips_a_subscriber_disabled_after_commit_but_before_expansion() {
+        let scratch = scratch_or_skip!("snapshot-disabled-subscriber");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+
+        // Disabled is judged the same as deleted (events-v1.md "订阅目录与 active 的判据").
+        exec(
+            &scratch.db,
+            "UPDATE webhooks SET active = false WHERE id = $1",
+            vec![webhook_id.into()],
+        )
+        .await;
+
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("one work item was pending");
+        assert!(matches!(outcome, ExpansionOutcome::NoSubscribers));
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            0
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_expansion_delivers_to_exactly_the_subscribers_active_at_expansion_moment() {
+        let scratch = scratch_or_skip!("snapshot-exact-set");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        // Three subscribers: one for the right event type, one for a different event type (must
+        // not receive), one disabled (must not receive).
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook-a",
+            &["flow.object.created"],
+        )
+        .await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook-b",
+            &["flow.object.archived"],
+        )
+        .await;
+        let disabled = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook-c",
+            &["flow.object.created"],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE webhooks SET active = false WHERE id = $1",
+            vec![disabled.into()],
+        )
+        .await;
+
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        let report = run_tick(&state_for(scratch.db.clone()), &reqwest::Client::new(), 4).await;
+        assert_eq!(report.expanded, 1, "{report:?}");
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            1,
+            "exactly one of the three registered webhooks matches both the event type and active=true"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Gate: no_subscribers_terminalized_and_reaped
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn no_subscribers_row_survives_exactly_at_the_retention_boundary_and_is_reaped_one_ms_past_it() {
+        let scratch = scratch_or_skip!("no-sub-retention-boundary");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.archived", None, None, json!({})).await;
+
+        let dispatch_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("one work item was pending");
+        assert!(matches!(outcome, ExpansionOutcome::NoSubscribers));
+
+        // `dispatch_no_subscribers_retention_hours` is frozen at 24h. Freeze one reference instant
+        // in Rust and use it for both the row's `expanded_at` and the reaper's `now` argument, so
+        // "exactly at the boundary" is not at the mercy of two independent Postgres `now()` calls
+        // drifting apart between the `UPDATE` and the `DELETE`.
+        let reference_now = Utc::now();
+        set_timestamp(
+            &scratch.db,
+            "event_dispatch",
+            "expanded_at",
+            "id",
+            dispatch_id,
+            reference_now - chrono::Duration::hours(24),
+        )
+        .await;
+        let reaped_at_boundary = super::reap_dispatch_retention(&scratch.db, reference_now)
+            .await
+            .expect("reaper runs");
+        assert_eq!(
+            reaped_at_boundary, 0,
+            "a row exactly at the retention boundary must survive"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_dispatch WHERE id = $1",
+                vec![dispatch_id.into()],
+            )
+            .await,
+            1
+        );
+
+        // One millisecond older crosses the boundary (same reference instant for the reaper call).
+        set_timestamp(
+            &scratch.db,
+            "event_dispatch",
+            "expanded_at",
+            "id",
+            dispatch_id,
+            reference_now - chrono::Duration::hours(24) - chrono::Duration::milliseconds(1),
+        )
+        .await;
+        let reaped_past_boundary = super::reap_dispatch_retention(&scratch.db, reference_now)
+            .await
+            .expect("reaper runs");
+        assert_eq!(
+            reaped_past_boundary, 1,
+            "one millisecond past the retention boundary the row must be reaped"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_dispatch WHERE id = $1",
+                vec![dispatch_id.into()],
+            )
+            .await,
+            0
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn no_subscribers_work_does_not_block_a_later_work_item_in_the_same_batch() {
+        let scratch = scratch_or_skip!("no-sub-non-blocking");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+
+        // A no-subscriber event (archived, nobody subscribes) followed by a real one.
+        commit_dispatch_work(&scratch.db, workspace_id, "flow.object.archived", None, None, json!({})).await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+
+        let report = run_tick(&state_for(scratch.db.clone()), &reqwest::Client::new(), 8).await;
+        assert_eq!(report.no_subscribers, 1, "{report:?}");
+        assert_eq!(report.expanded, 1, "{report:?}");
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            1
+        );
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Gate: dispatcher_liveness_and_backlog
+    // =============================================================================================
+
+    #[test]
+    fn dispatcher_liveness_pure_boundary_via_virtual_clock() {
+        let last_tick = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("fixed timestamp parses")
+            .with_timezone(&Utc);
+
+        assert!(
+            !dispatcher_is_live_since(None, last_tick, DISPATCHER_LIVENESS_MAX_SILENCE_MS),
+            "before any tick has ever happened, liveness must be false regardless of `now`"
+        );
+
+        let exactly_at_budget = last_tick + chrono::Duration::milliseconds(DISPATCHER_LIVENESS_MAX_SILENCE_MS);
+        assert!(
+            dispatcher_is_live_since(Some(last_tick), exactly_at_budget, DISPATCHER_LIVENESS_MAX_SILENCE_MS),
+            "exactly at the silence budget, the dispatcher must still be reported live"
+        );
+
+        let one_ms_past_budget = exactly_at_budget + chrono::Duration::milliseconds(1);
+        assert!(
+            !dispatcher_is_live_since(Some(last_tick), one_ms_past_budget, DISPATCHER_LIVENESS_MAX_SILENCE_MS),
+            "one millisecond past the silence budget, the dispatcher must be reported stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatcher_reports_live_immediately_after_a_real_tick() {
+        let scratch = scratch_or_skip!("liveness-integration");
+        let state = state_for(scratch.db.clone());
+        run_tick(&state, &reqwest::Client::new(), 1).await;
+        assert!(
+            dispatcher_is_live(Utc::now(), DISPATCHER_LIVENESS_MAX_SILENCE_MS),
+            "the process-global wrapper must report live immediately after any run_tick call in \
+             this process (this assertion only ever requires *some* recent tick, so it cannot be \
+             made to fail by other tests concurrently ticking the same process)"
+        );
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_dispatch_age_advances_with_a_backdated_created_at_not_a_sleep() {
+        let scratch = scratch_or_skip!("oldest-pending-age");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        let dispatch_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+
+        let fresh_age = oldest_pending_dispatch_age_ms(&scratch.db, Utc::now())
+            .await
+            .expect("query runs")
+            .expect("one pending row exists");
+        assert!(
+            fresh_age < 5_000,
+            "a freshly committed row must be reported as ~0ms old, got {fresh_age}ms"
+        );
+
+        // Advance the virtual clock by backdating the row's own `created_at`, not by sleeping.
+        backdate(
+            &scratch.db,
+            "event_dispatch",
+            "created_at",
+            "id",
+            dispatch_id,
+            chrono::Duration::milliseconds(OLDEST_PENDING_AGE_ALERT_MS + 1),
+        )
+        .await;
+
+        let aged = oldest_pending_dispatch_age_ms(&scratch.db, Utc::now())
+            .await
+            .expect("query runs")
+            .expect("still one pending row");
+        assert!(aged > OLDEST_PENDING_AGE_ALERT_MS, "aged={aged}ms");
+
+        let report = super::DispatchTickReport {
+            oldest_pending_dispatch_age_ms: Some(aged),
+            ..Default::default()
+        };
+        assert!(
+            backlog_alert(&report, OLDEST_PENDING_AGE_ALERT_MS),
+            "a backlog item older than the alert threshold must trip backlog_alert"
+        );
+        assert!(
+            !backlog_alert(&super::DispatchTickReport::default(), OLDEST_PENDING_AGE_ALERT_MS),
+            "an empty report (no known backlog) must never alert"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_delivery_age_counts_pending_sealed_and_leased_but_not_terminal_rows() {
+        let scratch = scratch_or_skip!("oldest-pending-delivery-age");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+        backdate(
+            &scratch.db,
+            "event_deliveries",
+            "created_at",
+            "id",
+            delivery_id,
+            chrono::Duration::milliseconds(OLDEST_PENDING_AGE_ALERT_MS + 1),
+        )
+        .await;
+
+        let age = oldest_pending_delivery_age_ms(&scratch.db, Utc::now())
+            .await
+            .expect("query runs")
+            .expect("one undelivered row exists");
+        assert!(age > OLDEST_PENDING_AGE_ALERT_MS, "age={age}ms");
+
+        // Once it reaches a terminal state, it must stop counting toward the backlog age at all.
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET status = 'dispatched', terminated_at = now(), \
+             lease_token = NULL, lease_expires_at = NULL WHERE id = $1",
+            vec![delivery_id.into()],
+        )
+        .await;
+        let age_after_terminal = oldest_pending_delivery_age_ms(&scratch.db, Utc::now())
+            .await
+            .expect("query runs");
+        assert_eq!(
+            age_after_terminal, None,
+            "a dispatched (terminal) row must not count toward oldest_pending_delivery_age"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn killed_dispatcher_backlog_is_drained_after_restart_with_zero_duplicate_delivery() {
+        let scratch = scratch_or_skip!("kill-restart-backlog");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+
+        let mut event_ids = Vec::new();
+        for _ in 0..5 {
+            let event_id =
+                commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+            event_ids.push(event_id);
+        }
+
+        // Simulate a worker that claimed every one of these leases and then vanished before
+        // completing expansion: replicate exactly the lease-claiming UPDATE `expand_one` issues,
+        // then never run the expansion transaction that would normally follow it in the same call.
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET lease_token = 'dead-worker', \
+             lease_expires_at = now() - interval '1 minute' WHERE workspace_id = $1 AND status = 'pending'",
+            vec![workspace_id.into()],
+        )
+        .await;
+
+        // "Restart": a fresh dispatcher process reclaims the abandoned leases, then works the
+        // backlog exactly as `run_tick`'s normal loop does.
+        let reclaimed = reclaim_expired_dispatch_leases(&scratch.db)
+            .await
+            .expect("reclaim runs");
+        assert_eq!(reclaimed, 5, "every abandoned lease must be reclaimed on restart");
+
+        let report = run_tick(&state_for(scratch.db.clone()), &reqwest::Client::new(), 16).await;
+        assert_eq!(report.expanded, 5, "{report:?}");
+
+        for event_id in &event_ids {
+            assert_eq!(
+                count(
+                    &scratch.db,
+                    "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                    vec![(*event_id).into()],
+                )
+                .await,
+                1,
+                "event {event_id} must have exactly one delivery row after drain, zero duplicates"
+            );
+            assert_eq!(
+                count(
+                    &scratch.db,
+                    "SELECT count(*) AS n FROM event_delivery_sources WHERE source_event_id = $1",
+                    vec![(*event_id).into()],
+                )
+                .await,
+                1,
+                "event {event_id} must have exactly one source-table row after drain"
+            );
+        }
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_dispatch WHERE workspace_id = $1 AND status = 'pending'",
+                vec![workspace_id.into()],
+            )
+            .await,
+            0,
+            "no work item may remain pending after the backlog is drained"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn a_true_mid_expansion_crash_via_injected_failure_recovers_cleanly_on_the_next_tick() {
+        let scratch = scratch_or_skip!("kill-mid-expansion-injected");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+
+        // "Kill" the worker exactly mid-expansion: step (a) (the source reservation) has already
+        // run on the open transaction, then step (b) fails and the whole transaction rolls back --
+        // the same server-visible effect as the process actually dying at that instant.
+        let crashed = FAIL_EXPANSION_STEP_B
+            .scope(std::cell::Cell::new(true), expand_one(&scratch.db))
+            .await;
+        assert!(
+            crashed.is_err(),
+            "the injected failure must propagate as an Err from expand_one"
+        );
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            0,
+            "the rolled-back transaction must leave zero delivery rows"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE source_event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            0,
+            "the rolled-back transaction must leave zero source-table rows -- step (a)'s reservation \
+             rolled back along with everything else in the same transaction"
+        );
+
+        let status: String = get_col(
+            &scratch.db,
+            "SELECT status FROM event_dispatch WHERE event_id = $1",
+            vec![event_id.into()],
+            "status",
+        )
+        .await;
+        assert_eq!(
+            status, "pending",
+            "a failed expansion must leave the work item back in pending"
+        );
+
+        // The failed attempt backed off `next_attempt_at` (`dispatch_backoff_ms`); advance the
+        // virtual clock past it by backdating that column directly, not by sleeping through the
+        // real backoff window.
+        let dispatch_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+        backdate(
+            &scratch.db,
+            "event_dispatch",
+            "next_attempt_at",
+            "id",
+            dispatch_id,
+            chrono::Duration::milliseconds(1),
+        )
+        .await;
+
+        // "Restart": the next tick, with the fault no longer armed, must expand cleanly with no
+        // leftover from the crashed attempt.
+        let report = run_tick(&state_for(scratch.db.clone()), &reqwest::Client::new(), 4).await;
+        assert_eq!(report.expanded, 1, "{report:?}");
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            1,
+            "exactly one delivery row after the crash-then-retry, no duplicate from the aborted attempt"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_dispatcher_instances_racing_the_same_backlog_never_double_expand_or_double_send() {
+        let scratch = scratch_or_skip!("concurrent-race");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://127.0.0.1:1/hook", // refused by the SSRF guard, so `send_one` reliably retries
+            &["flow.object.created"],
+        )
+        .await;
+
+        let mut event_ids = Vec::new();
+        for _ in 0..10 {
+            let event_id =
+                commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+            event_ids.push(event_id);
+        }
+
+        // Five simulated dispatcher instances race `expand_one` against the same ten-item backlog
+        // concurrently, sharing one `DatabaseConnection` (itself pool-backed, so this genuinely
+        // exercises concurrent connections, not just concurrent async tasks on one connection).
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let db = scratch.db.clone();
+                tokio::spawn(async move { drain_expand_one(&db).await })
+            })
+            .collect();
+
+        let mut total_expanded = 0u32;
+        for handle in handles {
+            total_expanded += handle.await.expect("worker task does not panic");
+        }
+        assert_eq!(
+            total_expanded, 10,
+            "every work item must be expanded exactly once across all racing workers"
+        );
+
+        for event_id in &event_ids {
+            assert_eq!(
+                count(
+                    &scratch.db,
+                    "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                    vec![(*event_id).into()],
+                )
+                .await,
+                1,
+                "event {event_id} must have exactly one delivery row despite five racing expanders"
+            );
+        }
+
+        // Now race `send_one` the same way; the coalescing/FIFO predicates that matter for content
+        // events are exercised separately elsewhere, this proves the plain fan-out lease query
+        // itself never double-leases a delivery row.
+        let send_handles: Vec<_> = (0..5)
+            .map(|_| {
+                let db = scratch.db.clone();
+                tokio::spawn(async move { drain_send_one(state_for(db)).await })
+            })
+            .collect();
+        let mut total_sent = 0u32;
+        for handle in send_handles {
+            total_sent += handle.await.expect("send task does not panic");
+        }
+        assert_eq!(
+            total_sent, 10,
+            "every delivery must be leased and attempted exactly once per pass"
+        );
+
+        for event_id in &event_ids {
+            let attempts: i32 = get_col(
+                &scratch.db,
+                "SELECT attempts FROM event_deliveries WHERE event_id = $1",
+                vec![(*event_id).into()],
+                "attempts",
+            )
+            .await;
+            assert_eq!(
+                attempts, 1,
+                "each delivery must have been attempted exactly once, not raced twice"
+            );
+        }
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Gate: flow_content_delivery_coalescing
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn coalescing_only_merges_into_a_pending_row_never_into_a_sealed_or_leased_one() {
+        let scratch = scratch_or_skip!("coalesce-pending-only");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("one work item was pending");
+        assert!(matches!(outcome, ExpansionOutcome::Expanded));
+
+        let first_delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE subscriber_kind = 'webhook' AND document_id = $1",
+            vec![document_id.into()],
+            "id",
+        )
+        .await;
+
+        // Seal it directly -- exactly the state a real row is in the instant `send_one` leases it
+        // (pending/sealed -> leased), or once it has hit the coalescing cap.
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET status = 'sealed' WHERE id = $1",
+            vec![first_delivery_id.into()],
+        )
+        .await;
+
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({}),
+        )
+        .await;
+        let outcome2 = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("the seq-2 work item is now head");
+        assert!(matches!(outcome2, ExpansionOutcome::Expanded));
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            id: Uuid,
+            status: String,
+            first_seq: Option<i64>,
+        }
+        let rows = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, status, first_seq FROM event_deliveries WHERE subscriber_kind = 'webhook' \
+             AND document_id = $1 ORDER BY first_seq",
+            vec![document_id.into()],
+        ))
+        .all(&scratch.db)
+        .await
+        .expect("query runs");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "a sealed row must not absorb the next event -- a new row opens"
+        );
+        assert_eq!(rows[0].id, first_delivery_id);
+        assert_eq!(rows[0].status, "sealed");
+        assert_eq!(rows[0].first_seq, Some(1));
+        assert_eq!(rows[1].status, "pending");
+        assert_eq!(rows[1].first_seq, Some(2));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn coalescing_freezes_the_range_and_source_set_the_instant_the_row_is_leased() {
+        let scratch = scratch_or_skip!("coalesce-freeze-on-lease");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://127.0.0.1:1/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({}),
+        )
+        .await;
+        let state = state_for(scratch.db.clone());
+        let client = reqwest::Client::new();
+        let report = run_tick(&state, &client, 8).await;
+        assert_eq!(report.expanded, 2, "{report:?}");
+
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE subscriber_kind = 'webhook' AND document_id = $1",
+            vec![document_id.into()],
+            "id",
+        )
+        .await;
+
+        // Force the debounce to have elapsed and lease it, exactly as `send_one` would.
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET next_attempt_at = now() WHERE id = $1",
+            vec![delivery_id.into()],
+        )
+        .await;
+        send_one(&state, &client).await.expect("send_one runs");
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct RangeRow {
+            status: String,
+            first_seq: Option<i64>,
+            latest_seq: Option<i64>,
+        }
+        let leased_before = RangeRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status, first_seq, latest_seq FROM event_deliveries WHERE id = $1",
+            vec![delivery_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        // A failed send against a refused endpoint retries a content delivery straight to
+        // `sealed` (never back to `pending`) -- either way it must not still be `leased` once
+        // `send_one` returns.
+        assert_ne!(leased_before.status, "pending", "{:?}", leased_before.status);
+        let source_count_before = count(
+            &scratch.db,
+            "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id = $1",
+            vec![delivery_id.into()],
+        )
+        .await;
+        assert_eq!(source_count_before, 2);
+
+        // A third accepted update on the same document must open a *new* pending row -- it must
+        // never be able to touch the row that was in flight, whose range and source set are frozen.
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(3),
+            json!({}),
+        )
+        .await;
+        let outcome3 = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("the seq-3 work item is head once seq 1/2's work items are already resolved");
+        assert!(matches!(outcome3, ExpansionOutcome::Expanded));
+
+        let rows = count(
+            &scratch.db,
+            "SELECT count(*) AS n FROM event_deliveries WHERE subscriber_kind = 'webhook' AND document_id = $1",
+            vec![document_id.into()],
+        )
+        .await;
+        assert_eq!(rows, 2, "the frozen row plus one fresh pending row for seq 3");
+
+        let after = RangeRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status, first_seq, latest_seq FROM event_deliveries WHERE id = $1",
+            vec![delivery_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("row still exists");
+        assert_eq!(
+            (after.first_seq, after.latest_seq),
+            (leased_before.first_seq, leased_before.latest_seq),
+            "the once-leased row's range must be unchanged by the later seq-3 event"
+        );
+        let source_count_after = count(
+            &scratch.db,
+            "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id = $1",
+            vec![delivery_id.into()],
+        )
+        .await;
+        assert_eq!(
+            source_count_after, source_count_before,
+            "the once-leased row's source-table entries must be unchanged by the later seq-3 event"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn build_delivery_body_reuses_the_same_delivery_id_across_retries_only_the_attempt_number_changes() {
+        let scratch = scratch_or_skip!("dedupe-delivery-id");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+
+        let row_attempt_0 = delivery_lease_row_for_test(delivery_id, event_id, None);
+        let mut row_attempt_2 = delivery_lease_row_for_test(delivery_id, event_id, None);
+        row_attempt_2.attempts = 2;
+
+        let body_first = build_delivery_body(&scratch.db, &row_attempt_0)
+            .await
+            .expect("body builds");
+        let body_retry = build_delivery_body(&scratch.db, &row_attempt_2)
+            .await
+            .expect("body builds");
+
+        assert_eq!(
+            body_first["delivery"]["id"], body_retry["delivery"]["id"],
+            "delivery_id must be immutable across retries"
+        );
+        assert_eq!(body_first["delivery"]["id"], json!(delivery_id));
+        assert_eq!(body_first["delivery"]["attempt"], 1);
+        assert_eq!(body_retry["delivery"]["attempt"], 3, "attempt is attempts+1");
+        assert_eq!(
+            body_first["event"]["event_id"], body_retry["event"]["event_id"],
+            "retries do not mint a new event_id"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn coalescing_cap_freezes_the_row_and_opens_a_new_one_with_exact_source_counts() {
+        let scratch = scratch_or_skip!("coalesce-cap");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+
+        // COALESCED_SOURCE_EVENTS_MAX is 64 (private to this module): committing and expanding 65
+        // sequential accepted updates on the same document must fill exactly one row to the cap and
+        // open a second one for the overflow event, never drop or summarize a source entry.
+        const CAP: i64 = super::COALESCED_SOURCE_EVENTS_MAX;
+        for seq in 1..=(CAP + 1) {
+            commit_dispatch_work(
+                &scratch.db,
+                workspace_id,
+                "flow.content.accepted",
+                Some(document_id),
+                Some(seq),
+                json!({}),
+            )
+            .await;
+            let outcome = expand_one(&scratch.db)
+                .await
+                .unwrap_or_else(|err| panic!("expansion of seq {seq} runs: {err}"))
+                .unwrap_or_else(|| panic!("seq {seq}'s work item is head"));
+            assert!(matches!(outcome, ExpansionOutcome::Expanded), "seq {seq}");
+        }
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            id: Uuid,
+            status: String,
+            first_seq: Option<i64>,
+            latest_seq: Option<i64>,
+        }
+        let rows = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, status, first_seq, latest_seq FROM event_deliveries WHERE subscriber_kind = 'webhook' \
+             AND document_id = $1 ORDER BY first_seq",
+            vec![document_id.into()],
+        ))
+        .all(&scratch.db)
+        .await
+        .expect("query runs");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the cap must open a second row instead of dropping or summarizing the overflow event"
+        );
+        assert_eq!(
+            rows[0].status, "sealed",
+            "the first row must be sealed once it reaches the cap"
+        );
+        assert_eq!(rows[0].first_seq, Some(1));
+        assert_eq!(rows[0].latest_seq, Some(CAP));
+        assert_eq!(rows[1].status, "pending");
+        assert_eq!(rows[1].first_seq, Some(CAP + 1));
+
+        let sources_first = count(
+            &scratch.db,
+            "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id = $1",
+            vec![rows[0].id.into()],
+        )
+        .await;
+        assert_eq!(
+            sources_first, CAP,
+            "the sealed row's source count must equal the cap exactly, no summary"
+        );
+        let sources_second = count(
+            &scratch.db,
+            "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id = $1",
+            vec![rows[1].id.into()],
+        )
+        .await;
+        assert_eq!(sources_second, 1);
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Gate: coalescing_seal_and_source_first_expansion
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn dispatch_fifo_barrier_blocks_a_newer_same_document_work_item_while_an_older_one_is_in_flight() {
+        let scratch = scratch_or_skip!("fifo-barrier-blocks");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({}),
+        )
+        .await;
+
+        // Simulate a concurrent worker holding an in-flight (not-yet-expired) lease on seq 1's
+        // dispatch row, without having committed the expansion transaction yet.
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET lease_token = 'in-flight', lease_expires_at = now() + interval '1 minute' \
+             WHERE workspace_id = $1 AND accepted_seq = 1",
+            vec![workspace_id.into()],
+        )
+        .await;
+
+        // Seq 2 must not be pickable: seq 1 (still `status = 'pending'`, only its lease is held) is
+        // an older eligible predecessor on the same document.
+        let outcome = expand_one(&scratch.db).await.expect("query runs");
+        assert!(
+            outcome.is_none(),
+            "seq 2 must not be selectable while seq 1 (its older same-document predecessor) is \
+             still pending, even though seq 1's own lease makes seq 1 itself unleasable right now \
+             -- SKIP LOCKED must not let a worker skip past a busy head to a newer sibling"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_head_definition_three_branches_release_the_queue_head() {
+        let scratch = scratch_or_skip!("head-three-branches");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let document_id = Uuid::new_v4();
+
+        // Branch 1: `no_subscribers` (a resolved-but-not-`expanded` terminal state) must release
+        // the head for its successor, even though it "was never expanded" in the literal sense.
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        // No webhook registered yet: seq 1 terminalizes as no_subscribers.
+        let outcome1 = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("seq 1 is head");
+        assert!(matches!(outcome1, ExpansionOutcome::NoSubscribers));
+
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({}),
+        )
+        .await;
+        let outcome2 = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("seq 2 must be head now that seq 1 has left status=pending");
+        assert!(
+            matches!(outcome2, ExpansionOutcome::Expanded),
+            "a no_subscribers predecessor must not permanently block its successor"
+        );
+
+        // Branch 2: `failed` (dispatch-side dead-letter, via exhausted lease reclaims) must also
+        // release the head, leaving a seq gap for the consumer's own connectivity checking.
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(3),
+            json!({}),
+        )
+        .await;
+        let dispatch3_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE document_id = $1 AND accepted_seq = 3",
+            vec![document_id.into()],
+            "id",
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET status = 'failed', expanded_at = now(), \
+             last_error_code = 'expansion_failed' WHERE id = $1",
+            vec![dispatch3_id.into()],
+        )
+        .await;
+
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(4),
+            json!({}),
+        )
+        .await;
+        let outcome4 = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("seq 4 must be head: failed predecessors release the head too");
+        assert!(matches!(outcome4, ExpansionOutcome::Expanded));
+
+        // Branch 3: a `pending` row that is merely *leased* (not yet resolved) does NOT release the
+        // head -- already covered by `dispatch_fifo_barrier_blocks_...` above; asserted here as a
+        // negative control against the same document to complete the three-way partition.
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(5),
+            json!({}),
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(6),
+            json!({}),
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET lease_token = 'in-flight', lease_expires_at = now() + interval '1 minute' \
+             WHERE document_id = $1 AND accepted_seq = 5",
+            vec![document_id.into()],
+        )
+        .await;
+        let outcome6 = expand_one(&scratch.db).await.expect("query runs");
+        assert!(
+            outcome6.is_none(),
+            "an in-flight (still pending) seq 5 must keep blocking seq 6"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn non_content_work_is_not_starved_while_a_content_documents_queue_head_is_blocked() {
+        let scratch = scratch_or_skip!("anti-starvation");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted", "flow.object.created"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+
+        // A content document whose head is permanently blocked (an in-flight lease on seq 1) sits
+        // in the backlog first...
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET lease_token = 'in-flight', lease_expires_at = now() + interval '5 minutes' \
+             WHERE document_id = $1 AND accepted_seq = 1",
+            vec![document_id.into()],
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({}),
+        )
+        .await;
+
+        // ...followed by an unrelated non-content event.
+        let non_content_event =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+
+        // The blocked document's seq 2 must never be selectable, but the non-content work item must
+        // still be picked up promptly -- the head-of-queue predicate only ever applies to content
+        // events (`events-v1.md`'s third "坑").
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion runs")
+            .expect("the unrelated non-content work item must be selectable");
+        assert!(matches!(outcome, ExpansionOutcome::Expanded));
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![non_content_event.into()],
+            )
+            .await,
+            1,
+            "the non-content event must not be starved by the blocked content document"
+        );
+
+        let still_none = count(
+            &scratch.db,
+            "SELECT count(*) AS n FROM event_deliveries WHERE document_id = $1",
+            vec![document_id.into()],
+        )
+        .await;
+        assert_eq!(still_none, 0, "seq 2 on the blocked document must remain unexpanded");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_retention_exact_boundary_and_never_deletes_a_non_terminal_row_regardless_of_age() {
+        let scratch = scratch_or_skip!("delivery-retention-boundary");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+
+        // A dispatched (terminal) delivery, backdated on `terminated_at` -- the frozen anchor for
+        // this retention window (never `created_at`/`updated_at`, both of which would let the
+        // boundary be gamed, per events-v1.md "计时锚点").
+        let dispatched_event =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let dispatched_delivery: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![dispatched_event.into()],
+            "id",
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET status = 'dispatched', terminated_at = now(), \
+             lease_token = NULL, lease_expires_at = NULL WHERE id = $1",
+            vec![dispatched_delivery.into()],
+        )
+        .await;
+
+        // A `pending` delivery, artificially aged far past the retention window -- the reaper must
+        // never touch a non-terminal row on age alone, regardless of which column looks old.
+        let stale_pending_event =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let stale_pending_delivery: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![stale_pending_event.into()],
+            "id",
+        )
+        .await;
+        backdate(
+            &scratch.db,
+            "event_deliveries",
+            "created_at",
+            "id",
+            stale_pending_delivery,
+            chrono::Duration::days(3650),
+        )
+        .await;
+
+        let reference_now = Utc::now();
+
+        // Exactly at the 30-day boundary: must survive.
+        set_timestamp(
+            &scratch.db,
+            "event_deliveries",
+            "terminated_at",
+            "id",
+            dispatched_delivery,
+            reference_now - chrono::Duration::days(30),
+        )
+        .await;
+        let reaped_at_boundary = super::reap_delivery_retention(&scratch.db, reference_now)
+            .await
+            .expect("reaper runs");
+        assert_eq!(reaped_at_boundary, 0);
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE id = $1",
+                vec![dispatched_delivery.into()],
+            )
+            .await,
+            1
+        );
+
+        // One millisecond past it: must be reaped.
+        set_timestamp(
+            &scratch.db,
+            "event_deliveries",
+            "terminated_at",
+            "id",
+            dispatched_delivery,
+            reference_now - chrono::Duration::days(30) - chrono::Duration::milliseconds(1),
+        )
+        .await;
+        let reaped_past_boundary = super::reap_delivery_retention(&scratch.db, reference_now)
+            .await
+            .expect("reaper runs");
+        assert_eq!(reaped_past_boundary, 1);
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE id = $1",
+                vec![dispatched_delivery.into()],
+            )
+            .await,
+            0
+        );
+
+        // The stale pending row must have survived both reaper passes above untouched.
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE id = $1",
+                vec![stale_pending_delivery.into()],
+            )
+            .await,
+            1,
+            "a non-terminal row must never be deleted by the retention reaper regardless of age"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_expanded_and_failed_retention_use_expanded_at_and_differ_from_each_other() {
+        let scratch = scratch_or_skip!("dispatch-expanded-failed-retention");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+
+        let expanded_event =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let expanded_dispatch: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![expanded_event.into()],
+            "id",
+        )
+        .await;
+
+        let failed_event =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.archived", None, None, json!({})).await;
+        let failed_dispatch: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![failed_event.into()],
+            "id",
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET status = 'failed', expanded_at = now(), \
+             last_error_code = 'expansion_failed' WHERE id = $1",
+            vec![failed_dispatch.into()],
+        )
+        .await;
+
+        let reference_now = Utc::now();
+
+        // `dispatch_expanded_retention_days` = 14: 14 days old survives, 15 is reaped. The `failed`
+        // row (still fresh at `reference_now`) must be unaffected by either pass.
+        set_timestamp(
+            &scratch.db,
+            "event_dispatch",
+            "expanded_at",
+            "id",
+            expanded_dispatch,
+            reference_now - chrono::Duration::days(14),
+        )
+        .await;
+        assert_eq!(
+            super::reap_dispatch_retention(&scratch.db, reference_now)
+                .await
+                .expect("reaper runs"),
+            0
+        );
+        set_timestamp(
+            &scratch.db,
+            "event_dispatch",
+            "expanded_at",
+            "id",
+            expanded_dispatch,
+            reference_now - chrono::Duration::days(15),
+        )
+        .await;
+        assert_eq!(
+            super::reap_dispatch_retention(&scratch.db, reference_now)
+                .await
+                .expect("reaper runs"),
+            1
+        );
+
+        // `dispatch_failed_retention_days` = 90, deliberately far longer -- dead-letter rows must
+        // stay visible long after an `expanded` row of the same age would already be gone.
+        set_timestamp(
+            &scratch.db,
+            "event_dispatch",
+            "expanded_at",
+            "id",
+            failed_dispatch,
+            reference_now - chrono::Duration::days(15),
+        )
+        .await;
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_dispatch WHERE id = $1",
+                vec![failed_dispatch.into()],
+            )
+            .await,
+            1,
+            "a failed (dead-letter) row must still be visible 15 days in, well past the expanded window"
+        );
+        set_timestamp(
+            &scratch.db,
+            "event_dispatch",
+            "expanded_at",
+            "id",
+            failed_dispatch,
+            reference_now - chrono::Duration::days(91),
+        )
+        .await;
+        assert_eq!(
+            super::reap_dispatch_retention(&scratch.db, reference_now)
+                .await
+                .expect("reaper runs"),
+            1
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn subscriber_deleted_mid_flight_cancels_the_delivery_as_a_terminal_state_distinct_from_failed() {
+        let scratch = scratch_or_skip!("cancelled-distinct-terminal");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+
+        // The subscriber is deleted after expansion but before the delivery is ever sent.
+        delete_webhook(&scratch.db, webhook_id).await;
+
+        let state = state_for(scratch.db.clone());
+        let client = reqwest::Client::new();
+        let outcome = send_one(&state, &client).await.expect("send_one runs");
+        assert_eq!(outcome, Some(false));
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            status: String,
+            last_error_code: Option<String>,
+            attempts: i32,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status, last_error_code, attempts FROM event_deliveries WHERE event_id = $1",
+            vec![event_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        assert_eq!(
+            row.status, "cancelled",
+            "a gone subscriber must terminate the row as cancelled, not failed"
+        );
+        assert_eq!(row.last_error_code.as_deref(), Some("subscriber_gone"));
+        assert_eq!(
+            row.attempts, 0,
+            "cancellation must not consume a retry attempt -- it is not a delivery failure"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_dead_letter_row_is_visible_immediately_and_survives_until_its_own_retention_window() {
+        let scratch = scratch_or_skip!("dead-letter-visibility");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://127.0.0.1:1/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+
+        let state = state_for(scratch.db.clone());
+        let client = reqwest::Client::new();
+
+        // Drive it through all 10 attempts (`delivery_max_attempts`) by repeatedly clearing the
+        // backoff and sending again -- clock-advancement via backdating `next_attempt_at`, not
+        // sleeping through the real backoff ladder.
+        for attempt in 1..=10 {
+            exec(
+                &scratch.db,
+                "UPDATE event_deliveries SET next_attempt_at = now() WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await;
+            let outcome = send_one(&state, &client)
+                .await
+                .expect("send_one runs")
+                .unwrap_or_else(|| panic!("a delivery was ready to lease on attempt {attempt}"));
+            assert!(!outcome, "the refused endpoint fails every attempt");
+        }
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            status: String,
+            attempts: i32,
+            last_error_code: Option<String>,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status, attempts, last_error_code FROM event_deliveries WHERE event_id = $1",
+            vec![event_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        assert_eq!(
+            row.status, "failed",
+            "attempts exhausted must land in the failed dead-letter terminal state"
+        );
+        assert_eq!(row.attempts, 10);
+        assert!(row.last_error_code.is_some());
+
+        // Dead-letter rows must remain queryable immediately, and are not touched by the reaper
+        // until their own (`delivery_retention_days`) window elapses.
+        assert_eq!(
+            super::reap_delivery_retention(&scratch.db, Utc::now())
+                .await
+                .expect("reaper runs"),
+            0
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            1
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_lease_expiry_is_reclaimed_by_its_own_reaper_content_to_sealed_plain_to_pending() {
+        let scratch = scratch_or_skip!("delivery-leased-reaper");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created", "flow.content.accepted"],
+        )
+        .await;
+
+        // A plain (non-content) delivery, stuck `leased` by a worker that vanished.
+        let plain_event =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let plain_delivery: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![plain_event.into()],
+            "id",
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET status = 'leased', lease_token = 'dead', \
+             lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+            vec![plain_delivery.into()],
+        )
+        .await;
+
+        // A content delivery, likewise stuck `leased`.
+        let document_id = Uuid::new_v4();
+        let content_event = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let content_delivery: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![content_event.into()],
+            "id",
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET status = 'leased', lease_token = 'dead', \
+             lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+            vec![content_delivery.into()],
+        )
+        .await;
+
+        // The plain lease-claim query (`status IN ('pending','sealed')`) cannot reach either row
+        // while they sit at `leased` -- only the dedicated reclaim reaper can.
+        let claimed_before_reclaim = send_one(&state_for(scratch.db.clone()), &reqwest::Client::new())
+            .await
+            .expect("send_one runs");
+        assert_eq!(
+            claimed_before_reclaim, None,
+            "a stuck leased row must not be reachable by the ordinary lease-claim query"
+        );
+
+        let reclaimed = reclaim_expired_delivery_leases(&scratch.db)
+            .await
+            .expect("reclaim runs");
+        assert_eq!(reclaimed, 2);
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            status: String,
+            attempts: i32,
+            lease_token: Option<String>,
+        }
+        let plain_row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status, attempts, lease_token FROM event_deliveries WHERE id = $1",
+            vec![plain_delivery.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        assert_eq!(
+            plain_row.status, "pending",
+            "a non-content row reclaims to pending, never sealed"
+        );
+        assert_eq!(
+            plain_row.attempts, 1,
+            "lease expiry counts toward attempts, same as a delivery failure"
+        );
+        assert!(plain_row.lease_token.is_none());
+
+        let content_row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status, attempts, lease_token FROM event_deliveries WHERE id = $1",
+            vec![content_delivery.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        assert_eq!(
+            content_row.status, "sealed",
+            "a content row's reclaim goes to sealed, never back to pending, \
+             per events-v1.md's 'sealed 是一个真状态'"
+        );
+        assert_eq!(content_row.attempts, 1);
+
+        scratch.drop_self().await;
+    }
+
+    // =============================================================================================
+    // Golden wire fixtures (`events-v1.md` "投递报文与 delivery_id 的位置"): plain / coalesced /
+    // retry. This crate does not own `testing/fixtures/flow-delivery-v1/` (outside apps/api and
+    // apps/worker), so the three frozen shapes are asserted inline here instead of as checked-in
+    // fixture files.
+    // =============================================================================================
+
+    #[tokio::test]
+    async fn golden_wire_fixture_plain_delivery_body_matches_the_frozen_shape() {
+        let scratch = scratch_or_skip!("golden-plain");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.object.created",
+            None,
+            None,
+            json!({ "object_id": "11111111-1111-1111-1111-111111111111" }),
+        )
+        .await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+
+        let body = build_delivery_body(&scratch.db, &delivery_lease_row_for_test(delivery_id, event_id, None))
+            .await
+            .expect("body builds");
+
+        // A non-coalesced delivery's body is frozen as exactly
+        // `{delivery:{id,attempt,coalesced:false}, event:{...openpr.event.v1}}` -- not just "some
+        // fields present".
+        assert_eq!(body["delivery"]["id"], json!(delivery_id));
+        assert_eq!(body["delivery"]["attempt"], json!(1));
+        assert_eq!(body["delivery"]["coalesced"], json!(false));
+        assert_eq!(
+            body["delivery"].as_object().expect("object").len(),
+            3,
+            "plain delivery must have exactly {{id,attempt,coalesced}}, no range/source_event_ids/block_ids_truncated"
+        );
+        assert_eq!(body["event"]["version"], json!("openpr.event.v1"));
+        assert_eq!(body["event"]["event_id"], json!(event_id));
+        assert_eq!(body["event"]["event_type"], json!("flow.object.created"));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn golden_wire_fixture_coalesced_delivery_body_matches_the_frozen_shape() {
+        let scratch = scratch_or_skip!("golden-coalesced");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+        let block_a = Uuid::new_v4();
+        let block_b = Uuid::new_v4();
+        let event_1 = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({ "changed_block_ids": [block_a] }),
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({ "changed_block_ids": [block_b] }),
+        )
+        .await;
+        let state = state_for(scratch.db.clone());
+        run_tick(&state, &reqwest::Client::new(), 8).await;
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            id: Uuid,
+            first_seq: Option<i64>,
+            latest_seq: Option<i64>,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, first_seq, latest_seq FROM event_deliveries WHERE subscriber_kind = 'webhook' \
+             AND document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("query runs")
+        .expect("coalesced delivery row exists");
+
+        // Built directly from the real row's own `first_seq`/`latest_seq` (not the always-`None`
+        // test constructor) so the golden `range` assertion below reflects DB truth.
+        let lease_row = super::DeliveryLeaseRow {
+            id: row.id,
+            event_id: event_1,
+            subscriber_id: Uuid::new_v4(),
+            document_id: Some(document_id),
+            attempts: 0,
+            max_attempts: 10,
+            first_seq: row.first_seq,
+            latest_seq: row.latest_seq,
+        };
+        let body = build_delivery_body(&scratch.db, &lease_row).await.expect("body builds");
+
+        assert_eq!(body["delivery"]["id"], json!(row.id));
+        assert_eq!(body["delivery"]["coalesced"], json!(true));
+        assert_eq!(body["delivery"]["range"]["first_seq"], json!(1));
+        assert_eq!(body["delivery"]["range"]["latest_seq"], json!(2));
+        assert_eq!(body["delivery"]["block_ids_truncated"], json!(false));
+        let source_ids = body["delivery"]["source_event_ids"].as_array().expect("array");
+        assert_eq!(source_ids.len(), 2);
+        assert!(source_ids.contains(&json!(event_1)));
+        assert_eq!(body["event"]["event_type"], json!("flow.content.accepted"));
+        assert_eq!(
+            body["event"]["event_id"],
+            json!(event_1),
+            "the envelope anchors on the first source event as lineage"
+        );
+        let block_ids = body["event"]["payload"]["changed_block_ids"].as_array().expect("array");
+        assert_eq!(block_ids.len(), 2);
+        assert!(block_ids.contains(&json!(block_a)));
+        assert!(block_ids.contains(&json!(block_b)));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn golden_wire_fixture_retry_reuses_delivery_id_and_only_advances_attempt() {
+        let scratch = scratch_or_skip!("golden-retry");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id = $1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+
+        let attempt_1 = delivery_lease_row_for_test(delivery_id, event_id, None);
+        let mut attempt_4 = delivery_lease_row_for_test(delivery_id, event_id, None);
+        attempt_4.attempts = 3;
+
+        let body_1 = build_delivery_body(&scratch.db, &attempt_1).await.expect("body builds");
+        let body_4 = build_delivery_body(&scratch.db, &attempt_4).await.expect("body builds");
+
+        assert_eq!(
+            body_1["delivery"]["id"], body_4["delivery"]["id"],
+            "retries must carry the same delivery_id header/body value -- the consumer's dedup key"
+        );
+        assert_eq!(body_1["delivery"]["attempt"], json!(1));
+        assert_eq!(body_4["delivery"]["attempt"], json!(4));
+        assert_eq!(
+            body_1["event"], body_4["event"],
+            "the event envelope itself is identical across retries"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The merged-row counterpart of `re_expanding_the_same_work_after_a_simulated_crash_...`
+    /// above: `ADR-0011` Â§2.1 requires the crash/re-expansion idempotency proof specifically for a
+    /// *coalesced* delivery (multiple source events bound to one row), not just a plain one-event
+    /// delivery -- the two have different code paths (`bind_content_delivery`'s merge branch vs.
+    /// `bind_plain_delivery`) and a bug could exist in either independently.
+    #[tokio::test]
+    async fn re_expanding_a_coalesced_delivery_after_a_simulated_crash_does_not_duplicate_source_rows() {
+        let scratch = scratch_or_skip!("reexpansion-idempotent-coalesced");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+        for seq in 1..=3 {
+            commit_dispatch_work(
+                &scratch.db,
+                workspace_id,
+                "flow.content.accepted",
+                Some(document_id),
+                Some(seq),
+                json!({}),
+            )
+            .await;
+        }
+        let report = run_tick(&state_for(scratch.db.clone()), &reqwest::Client::new(), 8).await;
+        assert_eq!(report.expanded, 3, "{report:?}");
+
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE subscriber_kind = 'webhook' AND document_id = $1",
+            vec![document_id.into()],
+            "id",
+        )
+        .await;
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id = $1",
+                vec![delivery_id.into()],
+            )
+            .await,
+            3,
+            "all 3 merged accepted updates must be registered as source rows before the simulated crash"
+        );
+
+        // Simulate the dispatcher crashing after all 3 work items were already expanded into the
+        // one merged delivery row: put all 3 dispatch rows back to pending, exactly what
+        // `reclaim_expired_dispatch_leases` does to abandoned leases.
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET status = 'pending', expanded_at = NULL, lease_token = NULL, \
+             lease_expires_at = NULL WHERE document_id = $1",
+            vec![document_id.into()],
+        )
+        .await;
+        let report2 = run_tick(&state_for(scratch.db.clone()), &reqwest::Client::new(), 8).await;
+        assert_eq!(report2.expanded, 3, "{report2:?}");
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id = $1",
+                vec![delivery_id.into()],
+            )
+            .await,
+            3,
+            "no source event may be counted twice across the crash + re-expansion (ADR-0011 Â§2.1)"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE subscriber_kind = 'webhook' AND document_id = $1",
+                vec![document_id.into()],
+            )
+            .await,
+            1,
+            "no second delivery row was minted by the re-expansion"
+        );
 
         scratch.drop_self().await;
     }

@@ -160,6 +160,16 @@ async fn main() -> anyhow::Result<()> {
         // run from several worker replicas at once, matching every other job here.
         let dispatch_report = api::events::dispatcher::run_tick(&state, &client, args.concurrency).await;
         tracing::debug!(?dispatch_report, "flow event dispatcher tick");
+        if api::events::dispatcher::backlog_alert(
+            &dispatch_report,
+            api::events::dispatcher::OLDEST_PENDING_AGE_ALERT_MS,
+        ) {
+            tracing::warn!(
+                ?dispatch_report,
+                threshold_ms = api::events::dispatcher::OLDEST_PENDING_AGE_ALERT_MS,
+                "flow event dispatcher backlog exceeds oldest_pending_age threshold"
+            );
+        }
 
         tokio::select! {
             () = &mut shutdown => {
