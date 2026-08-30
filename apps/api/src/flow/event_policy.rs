@@ -60,6 +60,10 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
     ),
     ("flow.feature.enabled", public_payload(&["workspace_id"])),
     ("flow.feature.disabled", public_payload(&["workspace_id"])),
+    (
+        "flow.command.rejected",
+        public_payload(&["action", "error_code", "object_id", "document_id"]),
+    ),
 ];
 
 /// Event type prefix owned by the Flow module, for the same completeness-scan role

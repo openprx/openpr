@@ -8,8 +8,12 @@
 //! turns a command payload into the same shape of CRDT update bytes a WebSocket client would have
 //! produced locally, then calls the identical function. `archive`/`restore` never advance a
 //! document head (`existing_document_cardinality = 0`, `rest-api-v1.md`'s `move_object`/`link`
-//! commentary on the same rule), so they take no document coordinator and no `authz_epoch` fence —
-//! a plain `flow_objects` row transaction, matching `create_object`'s own shape below.
+//! commentary on the same rule), so they take no document coordinator and no document row lock —
+//! a plain `flow_objects` row transaction, matching `create_object`'s own shape below. They *do*
+//! still take the commit-time `authz_epoch` fence (`ADR-0012` §3.1, `authz::fence_epoch_for_share`)
+//! inside that transaction: the fence's job is authorization freshness, not document-head
+//! consistency, so "no document head to advance" does not imply "no epoch to re-verify" — see
+//! `execute_lifecycle_command`'s own doc comment for the TOCTOU window this closes.
 
 #![allow(clippy::too_long_first_doc_paragraph)]
 
@@ -20,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
 use super::collab::{authz, bootstrap, frame, limits as collab_limits, runtime, write};
@@ -706,19 +710,89 @@ fn validate_execute_command_input(input: &ExecuteCommandInput) -> Result<(), Api
     Ok(())
 }
 
+/// Writes the audit-only `flow.command.rejected` event (`events-v1.md` "Event type registry":
+/// `aggregate_type=flow_command`, "命令在创建 job 前被拒绝时只产生 audit-only `flow.command.
+/// rejected`"). `insert_flow_event`'s `dispatch: None` is the `delivery_class=audit_only` half of
+/// that helper: the row is written but never gets an `event_dispatch` row, so it never reaches a
+/// webhook subscriber ("永不产生 dispatch work 与投递行、不触发 webhook").
+///
+/// Always called against `state.db` directly, never inside the rejected command's own
+/// transaction: `events-v1.md` — "失败的 domain transaction 不得留下 success event 与 dispatch
+/// work...；rejected/audit-only row 在失败 transaction 回滚后以安全摘要单独写入" — every caller
+/// below has already rolled back (or never opened) that transaction by the time this runs.
+///
+/// Only called once `workspace_id` is known, i.e. after the target object has been resolved: a
+/// rejection that happens before that point (malformed request shape, an unregistered
+/// `command.type`, or the object simply not existing) has no workspace to scope an audit row
+/// under, and the REST error response itself remains the caller's complete signal for those.
+///
+/// Never surfaces a failure to the caller — `events-v1.md` requires "写 audit 失败必须告警", not
+/// that a command's own (already-decided) rejection be replaced by a second, unrelated database
+/// error — so a failure here is only logged.
+async fn record_command_rejected(
+    state: &AppState,
+    workspace_id: Uuid,
+    actor_id: Uuid,
+    action: &str,
+    error: &ApiError,
+    object_id: Uuid,
+    document_id: Uuid,
+) {
+    let error_code = error.kind().stable_code();
+    let result = insert_flow_event(
+        &state.db,
+        BusinessEventInput {
+            workspace_id,
+            project_id: None,
+            event_type: "flow.command.rejected".to_string(),
+            aggregate_type: "flow_command".to_string(),
+            // `events-v1.md`: "aggregate id 是服务端 request_id 或 update_id" — this command never
+            // minted one before being rejected, so a fresh id is synthesized for this audit row
+            // (never the caller's `idempotency_key`, which stays reserved for a future successful
+            // retry of the same request).
+            aggregate_id: Uuid::new_v4().to_string(),
+            actor_id: Some(actor_id),
+            source: json!({ "surface": "rest" }),
+            payload: json!({
+                "action": action,
+                "error_code": error_code,
+                "object_id": object_id,
+                "document_id": document_id,
+            }),
+            metadata: json!({}),
+            correlation_id: None,
+            causation_id: None,
+            idempotency_key: None,
+        },
+        None,
+    )
+    .await;
+    if let Err(err) = result {
+        tracing::error!(
+            error = %err,
+            action,
+            error_code,
+            "failed to record flow.command.rejected audit event"
+        );
+    }
+}
+
 /// `POST /api/v1/flow/objects/{object_id}/commands`.
 ///
 /// # Errors
 /// `NotFound` if the object does not exist; `BadRequest` for an unregistered `command.type` or a
-/// malformed payload (`invalid_update` on the wire); `Forbidden` for insufficient permission
-/// (`policy_rejected`); `Conflict` for an `idempotency_key` reused with a different command, a
-/// redundant `archive`, or a `stale_frontier`/`resync_required`/`server_draining` rejection from
-/// the shared write path. Propagates a database failure otherwise.
+/// malformed payload (`invalid_update` on the wire); a typed `policy_rejected` for insufficient
+/// permission or a commit-time `authz_epoch` mismatch; `Conflict` for an `idempotency_key` reused
+/// with a different command or a redundant `archive`; a typed `stale_frontier`/`resync_required`/
+/// `server_draining`/`limit_exceeded`/`invalid_update` rejection from the shared write path.
+/// Propagates a database failure otherwise. Every rejection reached once `object_id` resolves to a
+/// real object also records an audit-only `flow.command.rejected` event (see
+/// [`record_command_rejected`]).
 pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Result<AcceptedChange, ApiError> {
     validate_execute_command_input(&input)?;
 
     let kind = CommandKind::parse(&input.command_type).ok_or_else(|| {
-        ApiError::BadRequest(format!(
+        ApiError::invalid_update(format!(
             "command.type '{}' is not a registered v0.4 command",
             input.command_type
         ))
@@ -731,6 +805,36 @@ pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Re
     let document_id = view_row.document_id;
     let object_type = view_row.object_type.clone();
 
+    match execute_command_authorized(state, &input, kind, workspace_id, document_id, &object_type).await {
+        Ok(change) => Ok(change),
+        Err(err) => {
+            record_command_rejected(
+                state,
+                workspace_id,
+                input.actor_id,
+                &input.command_type,
+                &err,
+                input.object_id,
+                document_id,
+            )
+            .await;
+            Err(err)
+        }
+    }
+}
+
+/// The idempotency-replay check, permission check, and command dispatch that make up
+/// `execute_command`'s body once `workspace_id`/`document_id`/`object_type` are known — split out
+/// so [`execute_command`] can wrap every `Err` this returns with [`record_command_rejected`]
+/// without duplicating that wrapping at each individual early return.
+async fn execute_command_authorized(
+    state: &AppState,
+    input: &ExecuteCommandInput,
+    kind: CommandKind,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    object_type: &str,
+) -> Result<AcceptedChange, ApiError> {
     if let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await? {
         if existing.event_type != kind.event_type() {
             return Err(ApiError::Conflict(
@@ -753,18 +857,16 @@ pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Re
         &input.role,
     )
     .await?;
-    if level < kind.required_permission_level(&object_type) {
-        return Err(ApiError::Forbidden(
-            "insufficient permission for this command".to_string(),
-        ));
+    if level < kind.required_permission_level(object_type) {
+        return Err(ApiError::policy_rejected("insufficient permission for this command"));
     }
 
     match kind {
         CommandKind::Content(content_kind) => {
-            execute_content_command(state, &input, workspace_id, document_id, content_kind).await
+            execute_content_command(state, input, workspace_id, document_id, content_kind).await
         }
         CommandKind::Lifecycle(lifecycle_kind) => {
-            execute_lifecycle_command(state, &input, workspace_id, lifecycle_kind).await
+            execute_lifecycle_command(state, input, workspace_id, lifecycle_kind).await
         }
     }
 }
@@ -823,24 +925,49 @@ fn parse_payload<T: serde::de::DeserializeOwned>(command_type: &str, payload: &V
         .map_err(|err| ApiError::BadRequest(format!("invalid payload for {command_type}: {err}")))
 }
 
-/// Maps a [`CollabError`] to the REST `invalid_update`/`limit_exceeded` class
-/// (`error-mapping-v1.md`: both `BadRequest`/400). Never a raw `{:?}` dump of engine internals —
-/// each arm produces a caller-safe message naming only the logical node id or limit kind.
+/// Maps a [`CollabError`] to the typed `invalid_update`/`limit_exceeded` [`ApiErrorKind`]s
+/// (`error-mapping-v1.md`: both REST `BadRequest`/400, but distinct stable codes — never folded
+/// into one string-typed `BadRequest` the caller would have to substring-match, which is exactly
+/// the anti-pattern this typed discriminant replaces). Never a raw `{:?}` dump of engine
+/// internals — each arm produces a caller-safe message naming only the logical node id or limit
+/// kind, and `limit_exceeded` carries its `limit_kind`/`limit`/`observed` as structured `details`
+/// instead of interpolated into the message text.
 fn map_collab_error(err: &CollabError) -> ApiError {
-    if let Some(limit_kind) = err.limit_kind() {
-        return ApiError::BadRequest(format!("limit_exceeded: {limit_kind}"));
-    }
     match err {
-        CollabError::UnknownNode { id } => ApiError::BadRequest(format!("unknown node id '{id}'")),
-        CollabError::DuplicateNode { id } => ApiError::BadRequest(format!("duplicate node id '{id}'")),
+        CollabError::UnknownNode { id } => ApiError::invalid_update(format!("unknown node id '{id}'")),
+        CollabError::DuplicateNode { id } => ApiError::invalid_update(format!("duplicate node id '{id}'")),
         CollabError::CycleRejected { id } => {
-            ApiError::BadRequest(format!("move of node '{id}' rejected: would create a cycle"))
+            ApiError::invalid_update(format!("move of node '{id}' rejected: would create a cycle"))
         }
+        // `CollabError::limit_kind()` special-cases this exact shape as the `update_bytes` limit
+        // (an oversized snapshot/update byte slice); every other `InputTooLarge`/`EmptyInput`/
+        // `DecodeFailed` shape falls through to the generic `invalid_update` arm below.
+        CollabError::InputTooLarge {
+            input: "update",
+            actual_bytes,
+            max_bytes,
+        } => ApiError::limit_exceeded(
+            "limit_exceeded: update_bytes",
+            "update_bytes",
+            Some(json!(max_bytes)),
+            Some(json!(actual_bytes)),
+            None,
+        ),
         CollabError::EmptyInput { .. } | CollabError::InputTooLarge { .. } | CollabError::DecodeFailed { .. } => {
-            ApiError::BadRequest("invalid_update".to_string())
+            ApiError::invalid_update("invalid_update")
         }
-        CollabError::OperationFailed { reason } => ApiError::BadRequest(format!("invalid_update: {reason}")),
-        CollabError::LimitExceeded { limit_kind, .. } => ApiError::BadRequest(format!("limit_exceeded: {limit_kind}")),
+        CollabError::OperationFailed { reason } => ApiError::invalid_update(format!("invalid_update: {reason}")),
+        CollabError::LimitExceeded {
+            limit_kind,
+            limit,
+            observed,
+        } => ApiError::limit_exceeded(
+            format!("limit_exceeded: {limit_kind}"),
+            limit_kind,
+            Some(json!(limit)),
+            Some(json!(observed)),
+            None,
+        ),
     }
 }
 
@@ -979,54 +1106,91 @@ fn apply_content_command(
 /// `error-mapping-v1.md`'s stable-code → REST mapping, applied to a rejection from the shared
 /// write path (`write::accept_update`) exactly the way the WebSocket layer would report it on the
 /// wire, just carried through `ApiError` instead of a `Frame::Rejected`.
+///
+/// Every arm now carries an exact [`ApiErrorKind`] discriminant instead of a plain `BadRequest`/
+/// `Conflict` string — the same class of gap the module's own doc comment on
+/// [`ApiError::Typed`]-style constructors calls out: a caller previously had to substring-match
+/// `"limit_exceeded: ..."`/`"server_draining"` out of the message text, which could not
+/// distinguish `server_draining`'s `drain` from `contention` reason at all (both collapsed into
+/// one `Conflict("server_draining")`). `rejected.details`' structured fields (`limit_kind`/
+/// `limit`/`observed`/`retry_after_ms`/`minimum_snapshot_seq`) are now carried through as typed
+/// `details` rather than interpolated into the message.
 fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
     use super::collab::frame::RejectedCode;
 
-    let detail = match rejected.code {
-        RejectedCode::Unauthenticated => "unauthenticated",
-        RejectedCode::Forbidden => "forbidden",
-        RejectedCode::FeatureDisabled => "feature_disabled",
-        RejectedCode::NotFound => "not_found",
-        RejectedCode::UnsupportedProtocol => "unsupported_protocol",
-        RejectedCode::StaleFrontier => "stale_frontier",
-        RejectedCode::InvalidUpdate => "invalid_update",
-        RejectedCode::PolicyRejected => "policy_rejected",
-        RejectedCode::LimitExceeded => "limit_exceeded",
-        RejectedCode::ResyncRequired => "resync_required",
-        RejectedCode::ServerDraining => "server_draining",
-    };
     match rejected.code {
-        RejectedCode::Unauthenticated => ApiError::Unauthorized(detail.to_string()),
-        RejectedCode::Forbidden | RejectedCode::PolicyRejected | RejectedCode::FeatureDisabled => {
-            ApiError::Forbidden(detail.to_string())
+        RejectedCode::Unauthenticated => ApiError::unauthenticated("unauthenticated"),
+        RejectedCode::Forbidden => ApiError::typed(ApiErrorKind::Forbidden, "forbidden"),
+        RejectedCode::FeatureDisabled => ApiError::feature_disabled("feature_disabled"),
+        RejectedCode::NotFound => ApiError::NotFound("not_found".to_string()),
+        RejectedCode::UnsupportedProtocol => ApiError::unsupported_protocol("unsupported_protocol"),
+        RejectedCode::InvalidUpdate => ApiError::invalid_update("invalid_update"),
+        RejectedCode::PolicyRejected => ApiError::policy_rejected("policy_rejected"),
+        RejectedCode::StaleFrontier => {
+            let current_frontier = rejected.current_frontier.as_deref().map(frame::encode_bytes);
+            ApiError::stale_frontier("stale_frontier", rejected.current_seq, current_frontier.as_deref())
         }
-        RejectedCode::NotFound => ApiError::NotFound(detail.to_string()),
-        RejectedCode::UnsupportedProtocol | RejectedCode::InvalidUpdate => ApiError::BadRequest(detail.to_string()),
-        // `error-mapping-v1.md`: `limit_exceeded` details are `{limit_kind,limit,observed?,...}`
-        // -- `apps/api/src/error.rs`'s `ApiError`/`ApiResponse` envelope has no structured
-        // `details` field to carry that JSON object to a REST caller (a pre-existing gap, not
-        // introduced here), so it is folded into the `BadRequest` message text instead, matching
-        // the sibling `map_collab_error`'s `"limit_exceeded: {limit_kind}"` shape rather than
-        // silently dropping `rejected.details` on the floor.
+        RejectedCode::ResyncRequired => {
+            let minimum_snapshot_seq = rejected
+                .details
+                .as_ref()
+                .and_then(|details| details.get("minimum_snapshot_seq"))
+                .and_then(Value::as_i64);
+            ApiError::resync_required("resync_required", minimum_snapshot_seq)
+        }
         RejectedCode::LimitExceeded => {
-            let message = rejected.details.as_ref().map_or_else(
-                || detail.to_string(),
-                |details| match (
-                    details.get("limit_kind").and_then(Value::as_str),
-                    details.get("limit"),
-                    details.get("observed"),
-                ) {
-                    (Some(limit_kind), Some(limit), Some(observed)) => {
-                        format!("limit_exceeded: {limit_kind} (limit={limit}, observed={observed})")
-                    }
-                    (Some(limit_kind), _, _) => format!("limit_exceeded: {limit_kind}"),
-                    _ => detail.to_string(),
-                },
-            );
-            ApiError::BadRequest(message)
+            let (limit_kind, limit, observed, retry_after_ms) =
+                rejected
+                    .details
+                    .as_ref()
+                    .map_or(("unknown", None, None, None), |details| {
+                        (
+                            details.get("limit_kind").and_then(Value::as_str).unwrap_or("unknown"),
+                            details.get("limit").cloned(),
+                            details.get("observed").cloned(),
+                            details.get("retry_after_ms").and_then(Value::as_u64),
+                        )
+                    });
+            ApiError::limit_exceeded(
+                format!("limit_exceeded: {limit_kind}"),
+                limit_kind,
+                limit,
+                observed,
+                retry_after_ms,
+            )
         }
-        RejectedCode::StaleFrontier | RejectedCode::ResyncRequired | RejectedCode::ServerDraining => {
-            ApiError::Conflict(detail.to_string())
+        RejectedCode::ServerDraining => {
+            let reason = rejected
+                .details
+                .as_ref()
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str);
+            let retry_after_ms = rejected
+                .details
+                .as_ref()
+                .and_then(|details| details.get("retry_after_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            match reason {
+                Some("drain") => {
+                    ApiError::server_draining(ServerDrainingReason::Drain, retry_after_ms, "server_draining")
+                }
+                Some("contention") => {
+                    ApiError::server_draining(ServerDrainingReason::Contention, retry_after_ms, "server_draining")
+                }
+                // `error-mapping-v1.md`: "缺失/未知 reason 是 producer contract violation... 不得
+                // 猜测为维护或竞争、不得用 message 补判" -- the write path never producing a
+                // recognized reason here is a bug in that path, not something to paper over with a
+                // guessed discriminant; the caller still gets a safe, generically-retryable
+                // rejection instead of a fabricated `ServerDraining` reason.
+                other => {
+                    tracing::error!(
+                        reason = ?other,
+                        "write path rejected with server_draining but no recognized reason; this is a producer contract violation"
+                    );
+                    ApiError::Conflict("server_draining".to_string())
+                }
+            }
         }
     }
 }
@@ -1122,11 +1286,18 @@ async fn execute_content_command(
 }
 
 /// `archive`/`restore`: a plain `flow_objects.lifecycle_status` transition, no document
-/// coordinator and no `authz_epoch` fence (this command's `existing_document_cardinality = 0` —
-/// see this module's own doc comment). `restore` is idempotent at the row level (setting an
-/// already-active object active again is a harmless no-op write, not an error); `archive` on an
-/// already-archived object is a real conflict — a caller retrying with a *new* `idempotency_key`
-/// after losing the original response should not silently succeed a second time.
+/// coordinator and no document row lock (this command's `existing_document_cardinality = 0` —
+/// see this module's own doc comment) — but it *does* take the commit-time `authz_epoch` fence
+/// (`ADR-0012` §3.1) below, on the same `flow_workspace_settings` row `execute_content_command`
+/// fences against, held to this transaction's own commit. Without it, the TOCTOU window
+/// `collab-protocol-v1.md` names for content writes applies here too: `execute_command`'s caller
+/// computes `authz::effective_permission` once, outside any transaction; a concurrent
+/// authorization change (a v0.5 grant revoke) that commits between that check and this
+/// transaction's own commit must not let this now-stale permission still land an
+/// archive/restore. `restore` is idempotent at the row level (setting an already-active object
+/// active again is a harmless no-op write, not an error); `archive` on an already-archived object
+/// is a real conflict — a caller retrying with a *new* `idempotency_key` after losing the
+/// original response should not silently succeed a second time.
 async fn execute_lifecycle_command(
     state: &AppState,
     input: &ExecuteCommandInput,
@@ -1145,7 +1316,40 @@ async fn execute_lifecycle_command(
         LifecycleCommandType::Restore => ("flow.object.restored", "active"),
     };
 
+    // The `authz_epoch` `execute_command`'s own `authz::effective_permission` check (the caller
+    // of this function) was computed against, re-read here immediately before opening the
+    // transaction that will commit this lifecycle change -- matches
+    // `execute_content_command`'s own `checked_epoch` read right before its write path.
+    let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
+
     let tx = state.db.begin().await?;
+
+    // Commit-time fencing barrier (`ADR-0012` §3.1), held to commit -- previously entirely
+    // missing for archive/restore (this package's own doc comment above used to justify that gap
+    // by "archive/restore never advance a document head, so they take no `authz_epoch` fence", but
+    // the fence's job is not document-head consistency, it is authorization freshness: without
+    // it, a `full_access` grant revoked by a concurrent authorization change after this
+    // function's caller already checked `effective_permission` could still land as a committed
+    // `archived`/`restored` transition). Reuses `fence_epoch_for_share` exactly as
+    // `write::run_locked_phase` does for content commands: only a genuine epoch mismatch
+    // (`ApiError::Conflict`) means the caller's permission is stale; any other error (a
+    // `lock_timeout` hit while waiting on the `FOR SHARE`, a dropped connection, ...) says
+    // nothing about authorization and must propagate as a real `Err` rather than being folded
+    // into a permanent, non-recoverable rejection -- the exact class of bug `12700c4` fixed for
+    // the content write path, which this lifecycle path must not reintroduce.
+    match authz::fence_epoch_for_share(&tx, workspace_id, checked_epoch).await {
+        Ok(()) => {}
+        Err(ApiError::Conflict(_)) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError::policy_rejected(
+                "authz_epoch advanced since permission was checked; command rejected",
+            ));
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    }
 
     let locked = repository::fetch_object_lifecycle_for_update(&tx, input.object_id)
         .await?
@@ -1250,5 +1454,157 @@ mod cardinality_gate_tests {
         assert_eq!(ExistingDocumentCardinality::Zero.count(), 0);
         assert_eq!(ExistingDocumentCardinality::One.count(), 1);
         assert_eq!(ExistingDocumentCardinality::BoundedMany(3).count(), 3);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod typed_error_mapping_tests {
+    use collab_core::CollabError;
+    use serde_json::{Value, json};
+
+    use super::{map_collab_error, map_write_rejection};
+    use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
+    use crate::flow::collab::frame::RejectedCode;
+    use crate::flow::collab::write::Rejected;
+
+    fn rejected(code: RejectedCode, details: Option<Value>) -> Rejected {
+        Rejected {
+            update_id: None,
+            code,
+            recoverable: false,
+            details,
+            current_seq: None,
+            current_frontier: None,
+        }
+    }
+
+    /// `error-mapping-v1.md`'s central invariant this package's typed discriminant exists to
+    /// enforce: `server_draining`'s two reasons must never collapse into the same `ApiErrorKind`
+    /// -- the exact regression `12700c4` fixed once for the epoch-fence path.
+    #[test]
+    fn server_draining_drain_and_contention_map_to_distinct_kinds() {
+        let drain = map_write_rejection(&rejected(
+            RejectedCode::ServerDraining,
+            Some(json!({ "reason": "drain", "retry_after_ms": 500 })),
+        ));
+        let contention = map_write_rejection(&rejected(
+            RejectedCode::ServerDraining,
+            Some(json!({ "reason": "contention", "retry_after_ms": 200 })),
+        ));
+
+        assert_eq!(drain.kind(), ApiErrorKind::ServerDraining(ServerDrainingReason::Drain));
+        assert_eq!(
+            contention.kind(),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention)
+        );
+        assert_ne!(drain.kind(), contention.kind());
+
+        // The two reasons share one CLI exit code (contract: "两种 reason 不拆退出码") but must
+        // use different WS close-code behavior: `drain` closes the connection (4410), `contention`
+        // never does (a `rejected` control frame keeps the connection open).
+        assert_eq!(drain.kind().cli_exit_code(), 9);
+        assert_eq!(contention.kind().cli_exit_code(), 9);
+        assert_eq!(drain.kind().ws_close_code(), Some(4410));
+        assert_eq!(contention.kind().ws_close_code(), None);
+        assert_ne!(drain.kind().ui_key(), contention.kind().ui_key());
+    }
+
+    /// `error-mapping-v1.md`: "缺失/未知 reason 是 producer contract violation... 不得猜测为维护或
+    /// 竞争". A missing/unrecognized `reason` must never be silently coerced into `Drain` or
+    /// `Contention` -- it must fall back to a generic, `Unclassified`-kind rejection instead of
+    /// fabricating a discriminant the producer never actually sent.
+    #[test]
+    fn server_draining_with_missing_reason_never_fabricates_a_discriminant() {
+        let missing_reason = map_write_rejection(&rejected(RejectedCode::ServerDraining, None));
+        let unknown_reason = map_write_rejection(&rejected(
+            RejectedCode::ServerDraining,
+            Some(json!({ "reason": "maintenance_window" })),
+        ));
+
+        assert!(matches!(missing_reason, ApiError::Conflict(_)));
+        assert!(matches!(unknown_reason, ApiError::Conflict(_)));
+        assert_eq!(missing_reason.kind(), ApiErrorKind::Unclassified);
+        assert_eq!(unknown_reason.kind(), ApiErrorKind::Unclassified);
+    }
+
+    #[test]
+    fn limit_exceeded_rejection_carries_structured_details() {
+        let err = map_write_rejection(&rejected(
+            RejectedCode::LimitExceeded,
+            Some(json!({ "limit_kind": "document_block_count", "limit": 5000, "observed": 5001 })),
+        ));
+        assert_eq!(err.kind(), ApiErrorKind::LimitExceeded);
+        let ApiError::Typed { details, .. } = err else {
+            panic!("expected a Typed limit_exceeded error");
+        };
+        let details = details.expect("limit_exceeded must carry details");
+        assert_eq!(details.get("limit_kind"), Some(&json!("document_block_count")));
+        assert_eq!(details.get("limit"), Some(&json!(5000)));
+        assert_eq!(details.get("observed"), Some(&json!(5001)));
+    }
+
+    #[test]
+    fn stale_frontier_rejection_carries_current_seq() {
+        let mut with_seq = rejected(RejectedCode::StaleFrontier, None);
+        with_seq.current_seq = Some(42);
+        let err = map_write_rejection(&with_seq);
+        assert_eq!(err.kind(), ApiErrorKind::StaleFrontier);
+        let ApiError::Typed { details, .. } = err else {
+            panic!("expected a Typed stale_frontier error");
+        };
+        assert_eq!(details.expect("details").get("current_seq"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn policy_rejected_from_write_path_is_distinguishable_from_forbidden() {
+        let policy = map_write_rejection(&rejected(RejectedCode::PolicyRejected, None));
+        let forbidden = map_write_rejection(&rejected(RejectedCode::Forbidden, None));
+        assert_eq!(policy.kind(), ApiErrorKind::PolicyRejected);
+        assert_eq!(forbidden.kind(), ApiErrorKind::Forbidden);
+        assert_ne!(policy.kind(), forbidden.kind());
+        // Both share the same HTTP/CLI bucket (403 / exit 4) but are still distinct stable codes.
+        assert_eq!(policy.kind().http_status_code(), forbidden.kind().http_status_code());
+        assert_ne!(policy.kind().stable_code(), forbidden.kind().stable_code());
+    }
+
+    #[test]
+    fn collab_limit_exceeded_maps_to_typed_limit_exceeded_with_numeric_details() {
+        let err = map_collab_error(&CollabError::LimitExceeded {
+            limit_kind: "tree_depth",
+            limit: 32,
+            observed: 33,
+        });
+        assert_eq!(err.kind(), ApiErrorKind::LimitExceeded);
+        let ApiError::Typed { details, .. } = err else {
+            panic!("expected a Typed limit_exceeded error");
+        };
+        let details = details.expect("details");
+        assert_eq!(details.get("limit_kind"), Some(&json!("tree_depth")));
+        assert_eq!(details.get("limit"), Some(&json!(32)));
+        assert_eq!(details.get("observed"), Some(&json!(33)));
+    }
+
+    #[test]
+    fn collab_oversized_update_maps_to_update_bytes_limit_kind() {
+        let err = map_collab_error(&CollabError::InputTooLarge {
+            input: "update",
+            actual_bytes: 999,
+            max_bytes: 512,
+        });
+        assert_eq!(err.kind(), ApiErrorKind::LimitExceeded);
+        let ApiError::Typed { details, .. } = err else {
+            panic!("expected a Typed limit_exceeded error");
+        };
+        assert_eq!(
+            details.expect("details").get("limit_kind"),
+            Some(&json!("update_bytes"))
+        );
+    }
+
+    #[test]
+    fn collab_unknown_node_maps_to_invalid_update() {
+        let err = map_collab_error(&CollabError::UnknownNode { id: "n1".to_string() });
+        assert_eq!(err.kind(), ApiErrorKind::InvalidUpdate);
     }
 }
