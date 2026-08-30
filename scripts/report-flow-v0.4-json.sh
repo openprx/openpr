@@ -218,6 +218,20 @@ run_step required.error_contract_verify "$ROOT_DIR/scripts/verify-flow-errors-v0
 
 echo "=== Sylvode Flow v0.4 report: forms regression (no degradation) ==="
 run_step required.forms_regression_verify "$ROOT_DIR/scripts/verify-flow-forms-regression-v0.4.sh" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
+echo "=== Sylvode Flow v0.4 report: migration forward/rollback verify ==="
+run_step required.migration_verify "$ROOT_DIR/scripts/verify-flow-migration-v0.4.sh" --migration migrations/0054_flow_data_layer.sql --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: document row lock / seq uniqueness verify ==="
+run_step required.document_seq_verify "$ROOT_DIR/scripts/verify-flow-document-seq-v0.4.sh" --concurrency 8 --rounds 3 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: MCP three-transport contract verify ==="
+run_step required.mcp_transport_verify "$ROOT_DIR/scripts/verify-flow-mcp-transports-v0.4.sh" --transports http,sse,stdio --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: MCP tool registry count verify ==="
+run_step required.tool_registry_verify "$ROOT_DIR/scripts/verify-flow-tool-registry-v0.4.sh" --baseline "$CONTRACTS_ROOT/contracts/tool-count-baseline.md" --release 0.4 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: CLI JSON/exit-code contract verify ==="
+run_step required.cli_contract_verify "$ROOT_DIR/scripts/verify-flow-cli-contract-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/error-mapping-v1.md" --release 0.4 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
 echo "=== Sylvode Flow v0.4 report: not-yet-implemented required_commands ==="
 run_missing_step required.deployed_chain_websocket_upgrade "scripts/verify-flow-deployed-websocket-v0.4.sh does not exist"
@@ -314,6 +328,11 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson authz_baseline_verify "$(get_check required.authz_baseline_verify)" \
   --argjson limits_verify "$(get_check required.limits_verify)" \
   --argjson events_verify "$(get_check required.events_verify)" \
+  --argjson migration_verify "$(get_check required.migration_verify)" \
+  --argjson document_seq_verify "$(get_check required.document_seq_verify)" \
+  --argjson mcp_transport_verify "$(get_check required.mcp_transport_verify)" \
+  --argjson tool_registry_verify "$(get_check required.tool_registry_verify)" \
+  --argjson cli_contract_verify "$(get_check required.cli_contract_verify)" \
   --arg zero_sha "$ZERO_SHA" \
   '{
     surface_parity:$surface_parity,
@@ -327,6 +346,11 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     authz_baseline_verify:$authz_baseline_verify,
     limits_verify:$limits_verify,
     events_verify:$events_verify,
+    migration_verify:$migration_verify,
+    document_seq_verify:$document_seq_verify,
+    mcp_transport_verify:$mcp_transport_verify,
+    tool_registry_verify:$tool_registry_verify,
+    cli_contract_verify:$cli_contract_verify,
     report:{command:"scripts/report-flow-v0.4-json.sh", status:"passed", exit_code:0, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},

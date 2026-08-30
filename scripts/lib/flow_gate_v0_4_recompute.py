@@ -413,6 +413,25 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     # at not_verified. Bridged verbatim -- see bridge_verifier_gates()
     # docstring; absent artifact still means not_verified, never passed.
     bridge_verifier_gates(evidence_root, "forms-regression-result.json", "sylvode.flow.forms-regression-result.v1", gates, reasons)
+    # ---- contract-surface verifier bridges (W8): 5 gates, one artifact each ----
+    # Each of these scripts recomputes its own hard gate's verdict from a live
+    # observation -- the shipped binary's registry, a real three-transport
+    # JSON-RPC conversation, a real concurrent write race, a real forward
+    # migration run, real CLI process exits -- and writes it under its own
+    # top-level `gates` object. Bridged verbatim by bridge_verifier_gates():
+    # a malformed artifact raises EvidenceFormatError, an absent one leaves the
+    # gate at not_verified, and a verifier-reported `failed` is never softened.
+    #
+    #   migration-result.json     -> migration_forward_and_rollback_strategy
+    #   document-seq-result.json  -> document_row_lock_seq_unique
+    #   mcp-contract-result.json  -> mcp_three_transport_contract
+    #   tool-registry-result.json -> tool_registry_expected_107_or_rebased
+    #   cli-contract-result.json  -> cli_json_and_exit_code_contract
+    bridge_verifier_gates(evidence_root, "migration-result.json", "sylvode.flow.migration-result.v1", gates, reasons)
+    bridge_verifier_gates(evidence_root, "document-seq-result.json", "sylvode.flow.document-seq-result.v1", gates, reasons)
+    bridge_verifier_gates(evidence_root, "mcp-contract-result.json", "sylvode.flow.mcp-contract-result.v1", gates, reasons)
+    bridge_verifier_gates(evidence_root, "tool-registry-result.json", "sylvode.flow.tool-registry-result.v1", gates, reasons)
+    bridge_verifier_gates(evidence_root, "cli-contract-result.json", "sylvode.flow.cli-contract-result.v1", gates, reasons)
 
     # ---- legacy_pages_drop_requires_separate_adr: static migration scan ----
     migrations_dir = os.path.join(repo_root, "migrations")

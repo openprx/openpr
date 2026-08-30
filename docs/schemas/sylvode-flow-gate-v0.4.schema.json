@@ -145,6 +145,11 @@
         "authz_baseline_verify",
         "limits_verify",
         "events_verify",
+        "migration_verify",
+        "document_seq_verify",
+        "mcp_transport_verify",
+        "tool_registry_verify",
+        "cli_contract_verify",
         "report",
         "verify",
         "gate",
@@ -182,6 +187,21 @@
           "$ref": "#/$defs/required_command_result"
         },
         "events_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "migration_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "document_seq_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "mcp_transport_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "tool_registry_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "cli_contract_verify": {
           "$ref": "#/$defs/required_command_result"
         },
         "report": {
