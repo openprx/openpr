@@ -114,6 +114,40 @@ pub struct WsQuery {
     pub client_id: String,
 }
 
+/// The path `GET /api/v1/collab/ws` is registered under -- kept as one constant so
+/// [`trace_span`]'s comparison can never silently drift from the route table in `main.rs`.
+const WS_UPGRADE_PATH: &str = "/api/v1/collab/ws";
+
+/// A `tower_http::trace::MakeSpan` that reproduces `tower_http::trace::DefaultMakeSpan`'s exact
+/// span (name `request`, level `DEBUG`, `method`/`uri`/`version` fields, no headers -- see
+/// `tower-http`'s own `DefaultMakeSpan::make_span`) for every route except this one.
+///
+/// `GET /api/v1/collab/ws?ticket=...&client_id=...` is the one route whose query string carries a
+/// secret: the one-time WebSocket ticket (`ADR-0007`). `CLAUDE.md`: "NEVER log tokens, API keys,
+/// passwords, auth headers" / "Sanitize URLs before logging" -- `axum::http::Request::uri()`
+/// includes the full query string, so the global `TraceLayer`'s default span (which this function
+/// replaces in `main.rs`) would otherwise write the raw ticket into every request-scoped log line
+/// for the lifetime of the request, not just a one-off `tracing::info!`. For that one path, `uri`
+/// is reported with its query string stripped; every other route keeps the exact default shape.
+pub fn trace_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    let uri = request.uri();
+    if uri.path() == WS_UPGRADE_PATH {
+        tracing::debug_span!(
+            "request",
+            method = %request.method(),
+            uri = %uri.path(),
+            version = ?request.version(),
+        )
+    } else {
+        tracing::debug_span!(
+            "request",
+            method = %request.method(),
+            uri = %uri,
+            version = ?request.version(),
+        )
+    }
+}
+
 /// `GET /api/v1/collab/ws?ticket=...&client_id=...`: WebSocket upgrade, ticket-only auth
 /// (`ADR-0007`) — no `bot_or_user_auth_middleware` on this route, matching the contract's "no
 /// long-lived JWT/bot token over WS" rule.
