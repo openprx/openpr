@@ -4,7 +4,7 @@
 // only ever from inside a dynamic `import()` so the engine chunk stays out of every non-Flow
 // route bundle (`contracts/ui-surface-v1.md` "engine chunk 只从 `(app)/flow` 动态 import").
 
-import type { FlowObjectType, FlowObjectView } from '$lib/api/flow';
+import type { FlowBootstrap, FlowObjectType, FlowObjectView } from '$lib/api/flow';
 import type { Readable } from 'svelte/store';
 
 /** One raw CRDT update, produced locally by an `EditorAdapter` or a navigator reorder. */
@@ -149,6 +149,16 @@ export interface ObjectRepositoryContract {
 	open(input: ObjectHandleInput): Promise<ObjectHandle>;
 	close(objectId: string): Promise<void>;
 	getProjection(objectId: string): Readable<ObjectProjection>;
+	/** `GET .../bootstrap` (`rest-api-v1.md`), now routed server-side at this baseline. Used by the
+	 * recovery flow to fetch a fresh snapshot+tail independent of the live WebSocket session. */
+	bootstrap(objectId: string, known?: { seq: number; frontier: string }): Promise<FlowBootstrap>;
+	/** Imports a bootstrap's snapshot+tail into the matching open document (keyed by
+	 * `bootstrap.object_id`), replacing local accepted state wholesale. */
+	replaceWithAccepted(bootstrap: FlowBootstrap): Promise<void>;
+	/** Best-effort local snapshot export for an intent that could not be replayed
+	 * (`ui-surface-v1.md` step 5: "policy_rejected/invalid_update...不能重放的 intent 进入
+	 * recovery draft"). */
+	exportRecoveryDraft(objectId: string): Blob;
 }
 
 export interface ObjectSessionContract {

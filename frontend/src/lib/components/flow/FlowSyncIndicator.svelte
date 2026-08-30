@@ -8,13 +8,16 @@
 
 	let { state }: Props = $props();
 
+	// `motion-reduce:animate-none` (`contracts/ui-surface-v1.md` a11y baseline, task brief item 10):
+	// `prefers-reduced-motion: reduce` must stop the pulsing dot -- the sync state is still
+	// conveyed by color and the text label next to it, never by motion alone.
 	const DOT_CLASS: Record<SyncState, string> = {
 		local: 'bg-slate-400',
-		saving: 'bg-amber-500 animate-pulse',
+		saving: 'bg-amber-500 animate-pulse motion-reduce:animate-none',
 		saved: 'bg-emerald-500',
 		offline: 'bg-slate-400',
-		reconnecting: 'bg-amber-500 animate-pulse',
-		resyncing: 'bg-amber-500 animate-pulse',
+		reconnecting: 'bg-amber-500 animate-pulse motion-reduce:animate-none',
+		resyncing: 'bg-amber-500 animate-pulse motion-reduce:animate-none',
 		auth_required: 'bg-red-500',
 		read_only: 'bg-slate-400',
 		error: 'bg-red-500'

@@ -37,10 +37,21 @@ openpr.example.com {
 		# entry module names, so any hash goes stale on the next build and the
 		# site goes blank again.
 		#
+		# `wasm-unsafe-eval` is added on top of that for the Flow route's `loro-crdt`
+		# WASM CRDT engine. There is no CSP-clean path around this: any `script-src`
+		# that omits `'wasm-unsafe-eval'`/`'unsafe-eval'` makes Chrome 97+, Firefox and
+		# Safari refuse `WebAssembly.compile/instantiate/instantiateStreaming` outright
+		# -- streaming instantiation is not an exemption (see
+		# `contracts/ui-surface-v1.md` "CSP-clean bundle 约束" R17 and `ADR-0006`). This
+		# token only widens what compiled *code* the page may execute (WASM module
+		# instantiation); it does not affect script *sources* -- do not read it as
+		# license to also add 'unsafe-inline' or a script hash, which the paragraph
+		# above already rules out for unrelated reasons.
+		#
 		# Cloudflare Web Analytics injects a beacon from
 		# static.cloudflareinsights.com, which this policy blocks. Turn the
 		# injection off in Cloudflare rather than allow-listing it.
-		Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
+		Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; font-src 'self' data:; frame-ancestors 'self'; base-uri 'self'; form-action 'self'"
 
 		Referrer-Policy "strict-origin-when-cross-origin"
 		X-Content-Type-Options "nosniff"

@@ -1,8 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { t } from 'svelte-i18n';
-	import { flowApi, type FlowHistoryEntry, type FlowObjectView } from '$lib/api/flow';
+	import type { FlowHistoryEntry, FlowObjectView } from '$lib/api/flow';
+	import { FlowCommandService } from '$lib/flow/command-service';
 	import { toast } from '$lib/stores/toast';
+
+	const commandService = new FlowCommandService();
 
 	interface Props {
 		object: FlowObjectView;
@@ -16,7 +19,7 @@
 
 	async function loadHistory(before?: number) {
 		historyLoading = true;
-		const result = await flowApi.getHistory(object.id, { before_seq: before, limit: 20 });
+		const result = await commandService.getHistory(object.id, { before_seq: before, limit: 20 });
 		if (result.code === 0 && result.data) {
 			history = before ? [...history, ...result.data.items] : result.data.items;
 			nextBeforeSeq = result.data.next_before_seq;
@@ -123,5 +126,14 @@
 				</button>
 			{/if}
 		{/if}
+	</section>
+
+	<!-- `flow.relations.*`: the right-panel Relations area is v0.5 scope
+		 (`ui-surface-v1.md` "后续版本 UI 派生" v0.5: "右 panel 增加 lazy-loaded Relations 区"). The
+		 section exists rather than the key sitting unused/hidden, honestly labelled unavailable
+		 instead of a placeholder that could be mistaken for real content. -->
+	<section>
+		<h2 class="mb-3 text-sm font-semibold text-slate-900 dark:text-slate-100">{$t('flow.relations.title')}</h2>
+		<p class="text-sm text-slate-500 dark:text-slate-400">{$t('flow.relations.comingSoon')}</p>
 	</section>
 </aside>

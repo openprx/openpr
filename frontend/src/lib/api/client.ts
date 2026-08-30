@@ -120,6 +120,19 @@ class ApiClient {
 		return this.token;
 	}
 
+	/**
+	 * Public single-flight access-token refresh (`contracts/ui-surface-v1.md` "连接、refresh 与
+	 * 恢复状态机" step 1/3: "`ApiClient` 暴露 public `ensureFreshAccessToken(): Promise<boolean>`,
+	 * 内部继续复用源码已有 single-flight `refreshInFlight`"). Callers outside this module -- e.g.
+	 * `ObjectSession` retrying a WebSocket collab ticket exactly once after a 401 -- use this
+	 * instead of duplicating refresh logic or racing `request()`'s own internal retry, since both
+	 * paths share the same `refreshInFlight` promise and never issue two concurrent refreshes.
+	 * Resolves `true` only when the refresh actually produced a new access token.
+	 */
+	async ensureFreshAccessToken(): Promise<boolean> {
+		return this.refreshAccessTokenOnce();
+	}
+
 	async request<T>(
 		method: string,
 		endpoint: string,

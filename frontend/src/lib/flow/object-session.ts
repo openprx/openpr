@@ -9,13 +9,17 @@
 // document apply并请求 resync/bootstrap") is implemented here as "close and reconnect", which gets
 // a fresh, consistent `snapshot` from the same loader REST `Bootstrap` would use
 // (`rest-api-v1.md`: "WS `open` 与 REST endpoint 使用同一 loader"). It does not attempt to splice a
-// partial tail into a live document. Given `POST .../bootstrap` is not yet routed server-side at
-// this repo's baseline, this is also the only bootstrap path Web v0.4 has.
+// partial tail into a live document. `GET .../bootstrap` IS routed server-side at this repo's
+// baseline now (`ObjectRepository.bootstrap`/`replaceWithAccepted` use it directly for the
+// recovery-draft flow), but reusing it here instead of a WS reconnect would only change which
+// transport re-delivers the same snapshot+tail -- the actually-missing piece for a true
+// `stale_frontier/resync_required` "persist intent -> bootstrap -> replaceWithAccepted -> replay"
+// flow is a local pending-update outbox to replay, which is explicitly out of scope this round:
 // Offline pending/outbox is out of scope (`ui-surface-v1.md` "v0.5：presence/cursor、offline
 // pending...").
 
-import { flowApi } from '$lib/api/flow';
-import { apiClient } from '$lib/api/client';
+import type { CollabTicket } from '$lib/api/flow';
+import { apiClient, type ApiResult } from '$lib/api/client';
 import { writable, type Readable } from 'svelte/store';
 import type {
 	EngineUpdate,
@@ -26,6 +30,7 @@ import type {
 	SemanticIntent,
 	SyncState
 } from './types';
+import { checkUpdateBytes } from './limits';
 
 export interface AcceptedNotice {
 	readonly headSeq: number;
@@ -79,8 +84,21 @@ function wsBaseUrl(): string {
 
 type PendingResolve = { resolve: () => void; reject: (error: FlowError) => void };
 
+/** The subset of `CommandService` `ObjectSession` needs for ticket issuance -- kept narrow so
+ * this module depends on an interface, not the concrete class, matching `types.ts`'s existing
+ * "narrowed to what this v0.4 delivery actually implements" convention. */
+export interface TicketIssuer {
+	createTicket(input: {
+		workspace_id: string;
+		document_id: string;
+		client_id: string;
+		origin: string;
+	}): Promise<ApiResult<CollabTicket>>;
+}
+
 export class LoroObjectSession implements ObjectSessionContract {
 	private readonly hooks: SessionHooks;
+	private readonly commandService: TicketIssuer;
 	private readonly clientId: string;
 	private socket: WebSocket | null = null;
 	private handle: ObjectHandle | null = null;
@@ -99,8 +117,9 @@ export class LoroObjectSession implements ObjectSessionContract {
 	 * not by inspection -- see the delivery report. */
 	private firstSync: { resolve: () => void; reject: (error: FlowError) => void } | null = null;
 
-	constructor(hooks: SessionHooks) {
+	constructor(hooks: SessionHooks, commandService: TicketIssuer) {
 		this.hooks = hooks;
+		this.commandService = commandService;
 		this.clientId =
 			typeof crypto !== 'undefined' && 'randomUUID' in crypto
 				? crypto.randomUUID()
@@ -143,12 +162,26 @@ export class LoroObjectSession implements ObjectSessionContract {
 			return;
 		}
 
-		const ticketResult = await flowApi.createTicket({
+		let ticketResult = await this.commandService.createTicket({
 			workspace_id: this.handle.workspaceId,
 			document_id: this.handle.documentId,
 			client_id: this.clientId,
 			origin: typeof window !== 'undefined' ? window.location.origin : 'sylvode-flow-web'
 		});
+
+		if (ticketResult.code === 401) {
+			// `ui-surface-v1.md` "连接、refresh 与恢复状态机" step 3: "ticket 401：最多一次
+			// `ensureFreshAccessToken` + 新 ticket；仍失败进入 `auth_required`，停止自动 loop."
+			const refreshed = await apiClient.ensureFreshAccessToken();
+			if (refreshed) {
+				ticketResult = await this.commandService.createTicket({
+					workspace_id: this.handle.workspaceId,
+					document_id: this.handle.documentId,
+					client_id: this.clientId,
+					origin: typeof window !== 'undefined' ? window.location.origin : 'sylvode-flow-web'
+				});
+			}
+		}
 
 		if (ticketResult.code === 401) {
 			this.setState('auth_required');
@@ -249,7 +282,14 @@ export class LoroObjectSession implements ObjectSessionContract {
 					headFrontier: frame.head_frontier as string
 				});
 				this.reconnectAttempt = 0;
-				this.setState('saved');
+				// `snapshot` establishes the baseline document state, not a save confirmation.
+				// `contracts/ui-surface-v1.md` "连接、refresh 与恢复状态机": "只有带 matching
+				// update id 和 events-v1.md event id 的 accepted frame 可进入 saved" -- entering
+				// `saved` here would tell the user an edit was durably persisted before this
+				// connection has ever received a matching `accepted` frame for one. `local`
+				// reflects "loaded and mirrors the server as of this snapshot, no in-flight or
+				// confirmed local edit" without making that false claim.
+				this.setState('local');
 				this.firstSync?.resolve();
 				break;
 			}
@@ -328,6 +368,18 @@ export class LoroObjectSession implements ObjectSessionContract {
 	async submit(update: EngineUpdate, _intent: SemanticIntent): Promise<void> {
 		if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.handle) {
 			throw { code: 'server_draining', recoverable: true, details: { reason: 'contention' } } satisfies FlowError;
+		}
+		// Client-side pre-check (`ui-surface-v1.md` "Session/CommandService 在编码前按
+		// limits-v1.md 检查 update/frame...超限不进入 IndexedDB outbox、不发网络请求"): reject an
+		// obviously over-budget update before spending a round trip. This does not replace the
+		// server's own re-validation of the same limit.
+		const violation = checkUpdateBytes(update.bytes);
+		if (violation) {
+			throw {
+				code: 'limit_exceeded',
+				recoverable: false,
+				details: { limit_kind: violation.limitKind, limit: violation.limit, observed: violation.observed }
+			} satisfies FlowError;
 		}
 		const updateId =
 			typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;

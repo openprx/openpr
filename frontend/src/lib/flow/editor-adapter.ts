@@ -16,6 +16,7 @@
 // (`contracts/ui-surface-v1.md` "engine chunk 只从 `(app)/flow` 动态 import").
 
 import type { EditorAdapterContract, EngineDiff, RelativeSelection } from './types';
+import { isRegisteredBlockType } from './renderer-registry';
 // Type-only import: erased at compile time, so this does not pull `loro-prosemirror` into the
 // module graph -- only its exported *type* `LoroDocType` (the specific `{doc, data}` container
 // shape it expects) is used here, to type the doc reference the caller constructs at runtime via
@@ -178,8 +179,21 @@ export class FlowEditorAdapter implements EditorAdapterContract {
 			state,
 			dispatchTransaction: (tr) => {
 				if (!this.view) return;
+				// Focus fallback (`contracts/ui-surface-v1.md` a11y baseline: "focus 不因 remote
+				// move/delete 丢到 body，使用最近合法 block fallback"): a remote import can delete
+				// or move the block the user's selection/DOM focus was in. `loro-prosemirror`
+				// already maps the existing selection through the resulting transaction to the
+				// nearest still-valid position, but if the specific DOM node that held focus was
+				// removed, the browser can drop focus to `document.body` even though the mapped
+				// ProseMirror selection itself is fine. Re-focusing the view after such a
+				// transaction lands focus back on that already-valid mapped selection instead of
+				// leaving it stranded on body.
+				const hadFocus = this.view.hasFocus();
 				const newState = this.view.state.apply(tr);
 				this.view.updateState(newState);
+				if (hadFocus && !this.view.hasFocus() && typeof document !== 'undefined' && document.activeElement === document.body) {
+					this.view.focus();
+				}
 				this.detectSlashMenu(newState);
 				this.hooks.onSelectionChange?.();
 			}
@@ -188,6 +202,14 @@ export class FlowEditorAdapter implements EditorAdapterContract {
 
 	private detectSlashMenu(state: import('prosemirror-state').EditorState): void {
 		if (!this.hooks.onSlashMenu || !this.view) return;
+		// IME guard (`contracts/ui-surface-v1.md` a11y/interaction baseline, task brief item 8):
+		// while an IME composition is in progress (e.g. typing Chinese/Japanese pinyin/kana before
+		// it resolves to committed characters), the intermediate, not-yet-committed text must never
+		// be scanned for a "/" trigger -- doing so can pop the slash menu mid-composition on
+		// perfectly ordinary text. `EditorView.composing` is ProseMirror's own tracking of the
+		// native `compositionstart`/`compositionend` window, so no separate DOM listeners are
+		// needed here.
+		if (this.view.composing) return;
 		const { $from } = state.selection;
 		const textBefore = $from.parent.textBetween(0, $from.parentOffset, undefined, '￼');
 		const match = /(?:^|\s)\/(\w*)$/.exec(textBefore);
@@ -199,9 +221,13 @@ export class FlowEditorAdapter implements EditorAdapterContract {
 		}
 	}
 
-	/** Called by the slash menu UI when the user picks a block type; replaces the current block. */
+	/** Called by the slash menu UI when the user picks a block type; replaces the current block.
+	 * Guarded by the renderer registry (`contracts/ui-surface-v1.md` "Renderer registry": "未注册
+	 * type 失败为 read-only unsupported，不把 arbitrary component path 写入 CRDT") -- defense in
+	 * depth alongside the caller's own `FlowBlockType`-typed union, since this is the one place a
+	 * block type string reaches a CRDT-mutating transaction. */
 	setBlockType(type: FlowBlockType, level?: number): void {
-		if (!this.view || !this.schema) return;
+		if (!this.view || !this.schema || !isRegisteredBlockType(type)) return;
 		const { state, dispatch } = this.view;
 		const { $from } = state.selection;
 		const pos = $from.before($from.depth);
