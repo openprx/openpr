@@ -89,6 +89,11 @@ if ! python3 -c 'import bcrypt' >/dev/null 2>&1; then
   echo "FAIL: python3 'bcrypt' module is required (the login fixture needs a real password hash)" >&2
   exit 2
 fi
+WS_PROBE="$ROOT_DIR/scripts/lib/flow_ws_probe.py"
+if [[ ! -f "$WS_PROBE" ]]; then
+  echo "FAIL: WebSocket probe helper not found: $WS_PROBE" >&2
+  exit 2
+fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
@@ -114,14 +119,29 @@ record() {
 }
 
 BIN_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-echo "=== building api binary (cargo build -p api --bin api) ===" >&2
+# `collab-isolated-apply-worker` is built alongside `api` deliberately: the
+# collab write path spawns it as a subprocess and looks for it *next to* the
+# api executable (`crates/collab-core/src/isolation/host.rs`). Without it every
+# accepted-update fixture below fails with an internal error, which would turn
+# the positive controls red for a reason that has nothing to do with security
+# -- and, worse, would make the negative fixtures pass vacuously.
+echo "=== building api + isolated-apply worker ===" >&2
 ( cd "$REPO_ROOT" && cargo build -q -p api --bin api ) || {
   echo "FAIL: api binary failed to build" >&2
   exit 2
 }
+( cd "$REPO_ROOT" && cargo build -q -p collab-core --bin collab-isolated-apply-worker ) || {
+  echo "FAIL: collab-isolated-apply-worker failed to build" >&2
+  exit 2
+}
 API_BIN="$BIN_TARGET_DIR/debug/api"
+WORKER_BIN="$BIN_TARGET_DIR/debug/collab-isolated-apply-worker"
 if [[ ! -x "$API_BIN" ]]; then
   echo "FAIL: built api binary not found at $API_BIN" >&2
+  exit 2
+fi
+if [[ ! -x "$WORKER_BIN" ]]; then
+  echo "FAIL: built collab-isolated-apply-worker not found at $WORKER_BIN" >&2
   exit 2
 fi
 
@@ -281,10 +301,14 @@ ws_object_count() { sql1 "SELECT count(*) FROM flow_objects WHERE workspace_id='
 A_RESP="$(create_object "$WS_A" "Bearer $TOKEN_A" "xws A page" null)"
 B_RESP="$(create_object "$WS_B" "Bearer $TOKEN_B" "xws B SECRET page" null)"
 C_RESP="$(create_object "$WS_C" "Bearer $TOKEN_A" "xws C page" null)"
+# A second document in B, used only as the source of real Loro update bytes
+# for the cross-workspace write attempt; never itself a target.
+B_SRC_RESP="$(create_object "$WS_B" "Bearer $TOKEN_B" "xws B byte source" null)"
 OBJ_A="$(jq -r '.data.object.id // empty' <<<"$A_RESP")"; DOC_A="$(jq -r '.data.object.document_id // empty' <<<"$A_RESP")"
 OBJ_B="$(jq -r '.data.object.id // empty' <<<"$B_RESP")"; DOC_B="$(jq -r '.data.object.document_id // empty' <<<"$B_RESP")"
 OBJ_C="$(jq -r '.data.object.id // empty' <<<"$C_RESP")"
-for v in "$OBJ_A" "$DOC_A" "$OBJ_B" "$DOC_B" "$OBJ_C"; do
+OBJ_B_SRC="$(jq -r '.data.object.id // empty' <<<"$B_SRC_RESP")"; DOC_B_SRC="$(jq -r '.data.object.document_id // empty' <<<"$B_SRC_RESP")"
+for v in "$OBJ_A" "$DOC_A" "$OBJ_B" "$DOC_B" "$OBJ_C" "$OBJ_B_SRC" "$DOC_B_SRC"; do
   if [[ -z "$v" ]]; then
     echo "FAIL: fixture object creation failed. A=$A_RESP B=$B_RESP C=$C_RESP" >&2
     exit 2
@@ -407,24 +431,91 @@ else
 fi
 
 # =========================================== CROSS-WORKSPACE COLLAB TICKET
-# A ticket is a direct grant onto one collab document. Asking for one with a
-# `workspace_id` the caller belongs to but a `document_id` that belongs to a
-# different workspace must fail closed -- otherwise the WebSocket session
-# built from it streams another workspace's snapshot.
+# A ticket is a direct grant onto one collab document, and `collab_documents`
+# carries no workspace of its own -- so if issuance trusts the caller-supplied
+# `workspace_id` without joining back through `flow_objects`, a member of A can
+# get a ticket for a document in B. That is not a read-only problem: the
+# WebSocket session built from such a ticket streams B's snapshot AND accepts
+# `update` frames against B's document. Both halves are asserted here.
+#
+# The bytes used for the write attempt are a real Loro update harvested from a
+# sibling document in B via B's own REST command path, so a refused write can
+# only be authorization -- the same bytes are known-good for this server.
+HARVEST_RESP="$(curl -sS -X POST "$BASE/api/v1/flow/objects/$OBJ_B_SRC/commands" \
+  -H "Authorization: Bearer $TOKEN_B" -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg k "$(uuid)" '{command:{type:"set_title", payload:{title:"cross-workspace byte source"}}, idempotency_key:$k}')")"
+if [[ "$(envelope_code "$HARVEST_RESP")" != "0" ]]; then
+  echo "FAIL: could not produce a real CRDT update to harvest bytes from: $HARVEST_RESP" >&2
+  cat "$API_LOG" >&2
+  exit 2
+fi
+XWS_BYTES="$(sql1 "SELECT encode(bytes,'base64') FROM collab_updates WHERE document_id='$DOC_B_SRC' ORDER BY seq DESC LIMIT 1" | tr -d '\n')"
+if [[ -z "$XWS_BYTES" ]]; then
+  echo "FAIL: the REST command produced no collab_updates row to harvest bytes from" >&2
+  exit 2
+fi
+
+XTICKET_CLIENT="xws-client-$RUN_ID"
 XTICKET="$(curl -sS -X POST "$BASE/api/v1/collab/tickets" \
   -H "Authorization: Bearer $TOKEN_A" -H 'Content-Type: application/json' \
-  -d "$(jq -n --arg w "$WS_A" --arg d "$DOC_B" --arg c "xws-client-$RUN_ID" --arg o "$ORIGIN_A" \
+  -d "$(jq -n --arg w "$WS_A" --arg d "$DOC_B" --arg c "$XTICKET_CLIENT" --arg o "$ORIGIN_A" \
     '{workspace_id:$w, document_id:$d, client_id:$c, origin:$o}')")"
 XTICKET_CODE="$(envelope_code "$XTICKET")"
+XTICKET_RAW="$(jq -r '.data.ticket // empty' <<<"$XTICKET")"
 XTICKET_ROWS="$(sql1 "SELECT count(*) FROM collab_tickets WHERE document_id='$DOC_B'")"
-if [[ "$XTICKET_CODE" != "0" && "$XTICKET_ROWS" == "0" ]]; then
-  record "cross_workspace_collab_ticket_rejected_zero_write" true \
-    "POST /collab/tickets with the caller's own workspace_id but another workspace's document_id => non-success envelope code and 0 collab_tickets rows" \
-    "code=$XTICKET_CODE rows=$XTICKET_ROWS"
+
+# If a ticket really was issued, follow it all the way through so the evidence
+# records how far the breach actually goes (snapshot bytes read, update rows
+# written) instead of stopping at "a ticket was issued".
+XWS_DOC_BEFORE="$(doc_write_counts "$DOC_B")"
+XWS_SNAPSHOT_LEN=0
+XWS_ACCEPTED=0
+if [[ -n "$XTICKET_RAW" ]]; then
+  XWS_SESSION="$(jq -n --arg t "$XTICKET_RAW" --arg c "$XTICKET_CLIENT" --arg d "$DOC_B" \
+    --arg bytes "$XWS_BYTES" --arg sid "$(uuid)" --arg uid "$(uuid)" \
+    --argjson p "$API_PORT" --arg o "$ORIGIN_A" \
+    '{host:"127.0.0.1", port:$p, origin:$o, read_timeout:12,
+      path:("/api/v1/collab/ws?ticket=" + ($t|@uri) + "&client_id=" + ($c|@uri)),
+      steps:[{op:"send", frame:{type:"hello", protocol_version:1, capabilities:[], client_id:$c, session_id:$sid}},
+             {op:"recv", count:1},
+             {op:"send", frame:{type:"open", protocol_version:1, document_id:$d, known_seq:null, known_frontier:null}},
+             {op:"recv", count:1},
+             {op:"send", frame:{type:"update", protocol_version:1, document_id:$d, update_id:$uid,
+                                base_frontier:"", bytes:$bytes, idempotency_key:null, origin:"web", message:null}},
+             {op:"recv", count:2}]}' | python3 "$WS_PROBE")"
+  XWS_SNAPSHOT_LEN="$(jq -r '[.events[] | select(.kind=="text") | .frame | select(.type=="snapshot") | .snapshot | length] | first // 0' <<<"$XWS_SESSION")"
+  XWS_ACCEPTED="$(jq -r '[.events[] | select(.kind=="text") | .frame | select(.type=="accepted")] | length' <<<"$XWS_SESSION")"
+fi
+XWS_DOC_AFTER="$(doc_write_counts "$DOC_B")"
+
+XTICKET_EXPECT="POST /collab/tickets with the caller's own workspace_id but another workspace's document_id => non-success envelope code, 0 collab_tickets rows, and (following any ticket through to a real WebSocket session) 0 snapshot bytes read, 0 accepted updates and the target document's updates/events/head_seq unchanged"
+if [[ "$XTICKET_CODE" != "0" && "$XTICKET_ROWS" == "0" && -z "$XTICKET_RAW" \
+      && "$XWS_SNAPSHOT_LEN" == "0" && "$XWS_ACCEPTED" == "0" && "$XWS_DOC_AFTER" == "$XWS_DOC_BEFORE" ]]; then
+  record "cross_workspace_collab_ticket_grants_no_read_or_write" true "$XTICKET_EXPECT" \
+    "code=$XTICKET_CODE rows=$XTICKET_ROWS snapshot_b64_len=$XWS_SNAPSHOT_LEN accepted=$XWS_ACCEPTED counts $XWS_DOC_BEFORE -> $XWS_DOC_AFTER"
 else
-  record "cross_workspace_collab_ticket_rejected_zero_write" false \
-    "POST /collab/tickets with the caller's own workspace_id but another workspace's document_id => non-success envelope code and 0 collab_tickets rows" \
-    "code=$XTICKET_CODE rows=$XTICKET_ROWS body=$(head -c 200 <<<"$XTICKET")"
+  record "cross_workspace_collab_ticket_grants_no_read_or_write" false "$XTICKET_EXPECT" \
+    "code=$XTICKET_CODE rows=$XTICKET_ROWS snapshot_b64_len=$XWS_SNAPSHOT_LEN accepted=$XWS_ACCEPTED counts $XWS_DOC_BEFORE -> $XWS_DOC_AFTER body=$(head -c 200 <<<"$XTICKET")"
+fi
+
+# The refusal must not double as an existence oracle: asking for a document
+# that belongs to another workspace and asking for one that does not exist at
+# all have to be indistinguishable on the wire, or the endpoint enumerates
+# other tenants' documents one UUID at a time.
+ABSENT_DOC="$(uuid)"
+XTICKET_ABSENT="$(curl -sS -X POST "$BASE/api/v1/collab/tickets" \
+  -H "Authorization: Bearer $TOKEN_A" -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg w "$WS_A" --arg d "$ABSENT_DOC" --arg c "$XTICKET_CLIENT" --arg o "$ORIGIN_A" \
+    '{workspace_id:$w, document_id:$d, client_id:$c, origin:$o}')")"
+FOREIGN_SIG="$(jq -rc '{code, message}' <<<"$XTICKET")"
+ABSENT_SIG="$(jq -rc '{code, message}' <<<"$XTICKET_ABSENT")"
+ORACLE_EXPECT="a ticket request for another workspace's document and one for a document that does not exist return the identical envelope {code, message}"
+if [[ "$FOREIGN_SIG" == "$ABSENT_SIG" && "$(jq -r '.code' <<<"$XTICKET_ABSENT")" != "0" ]]; then
+  record "cross_workspace_ticket_error_indistinguishable_from_absent_document" true "$ORACLE_EXPECT" \
+    "both responses are $FOREIGN_SIG"
+else
+  record "cross_workspace_ticket_error_indistinguishable_from_absent_document" false "$ORACLE_EXPECT" \
+    "foreign-workspace document => $FOREIGN_SIG ; absent document => $ABSENT_SIG"
 fi
 
 # ============================================= POLICY BYPASS: BOT SCOPING
@@ -531,7 +622,8 @@ REQUIRED_IDS=(
   cross_workspace_command_rejected_zero_write
   cross_workspace_link_rejected_zero_write
   same_workspace_link_control
-  cross_workspace_collab_ticket_rejected_zero_write
+  cross_workspace_collab_ticket_grants_no_read_or_write
+  cross_workspace_ticket_error_indistinguishable_from_absent_document
   bot_token_confined_to_its_own_workspace
   read_only_bot_cannot_write_zero_write
   bot_excluded_from_user_only_crdt_surfaces

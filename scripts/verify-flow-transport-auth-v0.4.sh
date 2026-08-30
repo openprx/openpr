@@ -145,14 +145,29 @@ assert_eq() {
 
 # --------------------------------------------------------------- build api
 BIN_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-echo "=== building api binary (cargo build -p api --bin api) ===" >&2
+# `collab-isolated-apply-worker` is built alongside `api` deliberately: the
+# collab write path spawns it as a subprocess and looks for it *next to* the
+# api executable (`crates/collab-core/src/isolation/host.rs`). Without it every
+# accepted-update fixture below fails with an internal error, which would turn
+# the positive controls red for a reason that has nothing to do with security
+# -- and, worse, would make the negative fixtures pass vacuously.
+echo "=== building api + isolated-apply worker ===" >&2
 ( cd "$REPO_ROOT" && cargo build -q -p api --bin api ) || {
   echo "FAIL: api binary failed to build" >&2
   exit 2
 }
+( cd "$REPO_ROOT" && cargo build -q -p collab-core --bin collab-isolated-apply-worker ) || {
+  echo "FAIL: collab-isolated-apply-worker failed to build" >&2
+  exit 2
+}
 API_BIN="$BIN_TARGET_DIR/debug/api"
+WORKER_BIN="$BIN_TARGET_DIR/debug/collab-isolated-apply-worker"
 if [[ ! -x "$API_BIN" ]]; then
   echo "FAIL: built api binary not found at $API_BIN" >&2
+  exit 2
+fi
+if [[ ! -x "$WORKER_BIN" ]]; then
+  echo "FAIL: built collab-isolated-apply-worker not found at $WORKER_BIN" >&2
   exit 2
 fi
 

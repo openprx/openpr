@@ -44,15 +44,24 @@ fn validate_client_id(client_id: &str) -> Result<(), ApiError> {
 }
 
 /// Issues a one-time ticket. Callers must already have rejected `BotAuthContext` (`ADR-0007`:
-/// "handler 在 `BotAuthContext` 存在时返回 forbidden") and validated `flow_enabled` + workspace
-/// membership before calling this — this function only does the checks specific to ticket
-/// issuance: the strict Origin allowlist and the document's effective permission.
+/// "handler 在 `BotAuthContext` 存在时返回 forbidden") and validated `flow_enabled` before calling
+/// this — this function does the checks specific to ticket issuance: the strict Origin allowlist,
+/// workspace membership, the document's membership *of that same workspace*, and its effective
+/// permission.
+///
+/// The checks run in that order on purpose. Membership in `workspace_id` is settled before the
+/// document is looked up at all, so a caller who is not a member learns nothing about which
+/// documents live there; and the document lookup itself is scoped to `workspace_id`, so a member
+/// asking about a document in some *other* workspace gets the same `NotFound` as one asking about
+/// a document that does not exist. Neither error can be used to enumerate another tenant's
+/// documents.
 ///
 /// # Errors
 /// `BadRequest` for a malformed `client_id`/`origin`; `Forbidden` when the origin is not
-/// allowlisted or the effective permission is below `edit` (`ADR-0007`: "document read+write
-/// ACL"); `NotFound` when `document_id` does not resolve to a `flow_objects` row in this
-/// workspace. Propagates a database failure otherwise.
+/// allowlisted, the caller is not a member of `workspace_id`, or the effective permission is
+/// below `edit` (`ADR-0007`: "document read+write ACL"); `NotFound` when `document_id` does not
+/// resolve to a `collab_documents` row whose object belongs to `workspace_id`. Propagates a
+/// database failure otherwise.
 pub async fn issue<C: ConnectionTrait>(
     conn: &C,
     input: IssueTicketInput,
@@ -68,19 +77,6 @@ pub async fn issue<C: ConnectionTrait>(
     }
 
     #[derive(FromQueryResult)]
-    struct DocRow {
-        object_id: Uuid,
-    }
-    let doc = DocRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "SELECT object_id FROM collab_documents WHERE id = $1",
-        vec![input.document_id.into()],
-    ))
-    .one(conn)
-    .await?
-    .ok_or_else(|| ApiError::NotFound("document not found".to_string()))?;
-
-    #[derive(FromQueryResult)]
     struct RoleRow {
         role: String,
     }
@@ -93,6 +89,34 @@ pub async fn issue<C: ConnectionTrait>(
     .await?
     .map(|r| r.role)
     .ok_or_else(|| ApiError::Forbidden("not a member of this workspace".to_string()))?;
+
+    // `collab_documents` has no `workspace_id` column of its own (migration
+    // `0054_flow_data_layer.sql`); a document's tenant is reachable only through
+    // `object_id -> flow_objects.workspace_id`. So the join below is the *only* place this
+    // request's `document_id` is ever tied back to a workspace, and without it the
+    // caller-supplied `workspace_id` was the only thing the remaining checks looked at —
+    // `effective_permission` returns `full_access` for a workspace owner/admin before it ever
+    // reads the object, so an owner of workspace A could obtain a ticket for a document in
+    // workspace B and then both read its snapshot and commit updates to it over the resulting
+    // WebSocket session.
+    //
+    // A document belonging to another workspace collapses into exactly the same
+    // `NotFound("document not found")` as a document that does not exist, so the response cannot
+    // be used to tell the two apart.
+    #[derive(FromQueryResult)]
+    struct DocRow {
+        object_id: Uuid,
+    }
+    let doc = DocRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT d.object_id FROM collab_documents d \
+         JOIN flow_objects o ON o.id = d.object_id \
+         WHERE d.id = $1 AND o.workspace_id = $2",
+        vec![input.document_id.into(), input.workspace_id.into()],
+    ))
+    .one(conn)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("document not found".to_string()))?;
 
     let level =
         super::authz::effective_permission(conn, input.workspace_id, doc.object_id, "user", input.user_id, &role)
