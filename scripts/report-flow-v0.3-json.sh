@@ -149,8 +149,8 @@ run_step generic.cargo_fmt cargo fmt --all -- --check || true
 run_step generic.cargo_check cargo check --workspace --all-targets || true
 run_step generic.cargo_clippy cargo clippy --workspace --all-targets -- -D warnings || true
 run_step generic.cargo_test cargo test --workspace || true
-run_step generic.bun_check bun --cwd frontend run check || true
-run_step generic.bun_build bun --cwd frontend run build || true
+run_step generic.bun_check bun run --cwd frontend check || true
+run_step generic.bun_build bun run --cwd frontend build || true
 run_step generic.ci_universal_forms_gates bash scripts/ci-universal-forms-gates.sh || true
 run_step generic.test_mcp bash scripts/test-mcp.sh || true
 
