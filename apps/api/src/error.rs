@@ -471,16 +471,18 @@ impl IntoResponse for ApiError {
                     }
                 }
 
-                let mut body = Map::new();
-                body.insert("code".to_string(), json!(code));
-                body.insert("message".to_string(), json!(message));
-                body.insert("data".to_string(), Value::Null);
-                body.insert("error_code".to_string(), json!(kind.stable_code()));
-                if let Some(details) = merged_details {
-                    body.insert("details".to_string(), Value::Object(details));
-                }
-
-                let mut response = (StatusCode::OK, Json(Value::Object(body))).into_response();
+                // Same envelope shape every other response uses (`ApiResponse`), not a parallel
+                // hand-built JSON body: `data` stays explicitly `null` (never omitted, unlike the
+                // legacy string-typed variants below, which skip it entirely on error) so this
+                // does not change the wire shape callers already depend on.
+                let body = ApiResponse::<Value> {
+                    code,
+                    message,
+                    data: Some(Value::Null),
+                    error_code: Some(kind.stable_code()),
+                    details: merged_details.map(Value::Object),
+                };
+                let mut response = (StatusCode::OK, Json(body)).into_response();
                 response.extensions_mut().insert(OperationResponseMeta {
                     business_code: code,
                     error_summary: Some(kind.error_summary()),

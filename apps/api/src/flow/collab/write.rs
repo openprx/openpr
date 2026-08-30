@@ -2252,4 +2252,155 @@ mod database_tests {
 
         scratch.drop_self().await;
     }
+
+    /// Builds a real, decodable update whose exported byte length is exactly `target_len` --
+    /// used below to prove `update_bytes_max`'s exact-boundary-*accepted* case with genuine CRDT
+    /// content (unlike the plus-one case, which uses an arbitrary buffer precisely because
+    /// `InputLimits::validate_update` rejects on length before any decode, so its content does
+    /// not need to be valid at all). A single `CreateNode` + `InsertText` of `n` plain ASCII
+    /// characters grows the exported update by exactly one byte per character (Loro's
+    /// column-oriented encoding stores the text content as a contiguous byte span, no
+    /// per-character framing), so starting from a conservative overhead estimate and correcting
+    /// by the exact remaining delta converges in at most a couple of iterations.
+    async fn build_update_of_exact_len(
+        state: &AppState,
+        document_id: Uuid,
+        block_id: &str,
+        target_len: usize,
+    ) -> Vec<u8> {
+        let mut text_len = target_len.saturating_sub(200);
+        for _ in 0..8 {
+            let bytes = build_update_from_current(state, document_id, |engine| {
+                engine
+                    .apply_operation(&Operation::CreateNode {
+                        id: NodeId::from(block_id.to_string()),
+                        parent: None,
+                        index: 0,
+                        kind: NodeKind::Block,
+                    })
+                    .expect("create must succeed locally");
+                engine
+                    .apply_operation(&Operation::InsertText {
+                        id: NodeId::from(block_id.to_string()),
+                        index: 0,
+                        text: "a".repeat(text_len),
+                    })
+                    .expect("insert must succeed locally");
+            })
+            .await;
+            match bytes.len().cmp(&target_len) {
+                std::cmp::Ordering::Equal => return bytes,
+                std::cmp::Ordering::Less => text_len += target_len - bytes.len(),
+                std::cmp::Ordering::Greater => text_len -= bytes.len() - target_len,
+            }
+        }
+        panic!("could not converge on an update of exactly {target_len} bytes (last attempt used {text_len} chars)");
+    }
+
+    /// `update_bytes_max` (65,536 bytes) is checked by `InputLimits::validate_update` -- the very
+    /// first thing `accept_update` does, before `find_prior_update`, the coordinator permit, or
+    /// any other database access (see this module's `accept_update` doc comment). Proven here
+    /// with a real, decodable CRDT update at exactly the ceiling (fully applied, committed, and
+    /// counted in `event_dispatch`), and an arbitrary 65,537-byte buffer one byte over it:
+    /// rejected on length alone before ever being decoded, and provably a total no-op against the
+    /// document (head unchanged, no new `event_dispatch` row).
+    #[tokio::test]
+    async fn ws_structural_limit_update_bytes_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+        let scratch = scratch_or_skip!("limit-update-bytes");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+
+        const UPDATE_BYTES_MAX: usize = 65_536;
+
+        let exact_bytes =
+            build_update_of_exact_len(&state, document_id, "update-bytes-boundary-block", UPDATE_BYTES_MAX).await;
+        assert_eq!(
+            exact_bytes.len(),
+            UPDATE_BYTES_MAX,
+            "the constructed fixture must hit the ceiling exactly"
+        );
+
+        let dispatch_before = count_event_dispatch(&state, document_id).await;
+        let accepted_exact = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            exact_bytes,
+            "update-bytes-exact",
+        )
+        .await
+        {
+            AcceptOutcome::Accepted(accepted) => accepted,
+            AcceptOutcome::Rejected(rejected) => {
+                panic!(
+                    "an update of exactly update_bytes_max ({UPDATE_BYTES_MAX} bytes) must be accepted: {rejected:?}"
+                )
+            }
+        };
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+        assert_eq!(
+            dispatch_after_exact,
+            dispatch_before + 1,
+            "the accepted exact-boundary update must produce exactly one new event_dispatch row"
+        );
+
+        // update_bytes_max + 1 = 65537 bytes: arbitrary content is fine here (unlike the exact
+        // boundary above) because `InputLimits::validate_update` rejects on length alone, before
+        // this buffer is ever decoded.
+        let plus_one_bytes = vec![0u8; UPDATE_BYTES_MAX + 1];
+        let rejected = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            plus_one_bytes,
+            "update-bytes-plus-one",
+        )
+        .await
+        {
+            AcceptOutcome::Rejected(rejected) => rejected,
+            AcceptOutcome::Accepted(_) => {
+                panic!(
+                    "a {}-byte update (one past update_bytes_max) must be rejected",
+                    UPDATE_BYTES_MAX + 1
+                )
+            }
+        };
+        assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+        let details = rejected.details.expect("a limit_exceeded rejection must carry details");
+        assert_eq!(details["limit_kind"], "update_bytes");
+        assert_eq!(details["limit"], UPDATE_BYTES_MAX as u64);
+        assert_eq!(details["observed"], (UPDATE_BYTES_MAX + 1) as u64);
+
+        let head_after_rejection = super::read_observed_head(&state.db, document_id)
+            .await
+            .expect("head reads")
+            .expect("document row exists");
+        assert_eq!(
+            head_after_rejection.head_seq, accepted_exact.head_seq,
+            "a rejected oversized update must never advance the document head"
+        );
+        assert_eq!(
+            count_event_dispatch(&state, document_id).await,
+            dispatch_after_exact,
+            "a rejected oversized update must never produce a new event_dispatch row"
+        );
+
+        scratch.drop_self().await;
+    }
 }

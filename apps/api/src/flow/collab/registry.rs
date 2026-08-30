@@ -463,7 +463,7 @@ mod tests {
     use super::{
         CONNECTIONS_PER_DOCUMENT_MAX, CONNECTIONS_PER_USER_MAX, CONNECTIONS_PER_WORKSPACE_MAX, ConnectionLimit,
         OutboundEvent, PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, PresenceLimit,
-        SLOW_CONSUMER_QUEUE_FRAMES_MAX, SessionRegistry,
+        SLOW_CONSUMER_QUEUE_BYTES_MAX, SLOW_CONSUMER_QUEUE_FRAMES_MAX, SessionRegistry,
     };
     use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION};
     use serde_json::json;
@@ -475,6 +475,19 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             nonce: nonce.to_string(),
         }
+    }
+
+    /// A `Frame::Ping` whose `serde_json::to_string` length is exactly `target_len` bytes --
+    /// achieved by padding `nonce` with plain ASCII (no JSON escaping, so every extra character
+    /// grows the encoded frame by exactly one byte with zero framing overhead beyond the base
+    /// frame's own fixed shape).
+    fn ping_of_exact_encoded_len(target_len: usize) -> Frame {
+        let base_len = serde_json::to_string(&ping("")).expect("ping serializes").len();
+        assert!(
+            target_len >= base_len,
+            "target_len ({target_len}) must be at least the frame's fixed overhead ({base_len} bytes)"
+        );
+        ping(&"a".repeat(target_len - base_len))
     }
 
     #[test]
@@ -644,6 +657,73 @@ mod tests {
         assert_eq!(
             frame_count, SLOW_CONSUMER_QUEUE_FRAMES_MAX,
             "the frame that pushed the queue over the ceiling must never itself be queued"
+        );
+
+        // Further broadcasts to the now-closing session must not queue anything else (and must not
+        // send a second Close).
+        registry.broadcast(document_id, &ping("after-close"), None);
+        assert!(
+            registered.receiver.try_recv().is_err(),
+            "a closing session receives nothing further"
+        );
+    }
+
+    /// The frame-count ceiling test above never drives `bytes` anywhere near
+    /// `SLOW_CONSUMER_QUEUE_BYTES_MAX` (256 small `Ping` frames total a few KB) -- this test
+    /// drives the *byte* ceiling to its own exact boundary independently, using few enough frames
+    /// (8, each exactly 1 MiB) that `SLOW_CONSUMER_QUEUE_FRAMES_MAX` (256) is nowhere close to
+    /// tripping first.
+    #[test]
+    fn a_slow_consumer_is_force_closed_once_the_queue_byte_ceiling_is_exceeded_independent_of_frame_count() {
+        const CHUNK_BYTES: usize = 1_048_576;
+
+        let registry = SessionRegistry::new();
+        let document_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut registered = registry
+            .try_register(document_id, Uuid::new_v4(), Uuid::new_v4(), session_id)
+            .expect("registers");
+
+        assert_eq!(
+            u64::try_from(CHUNK_BYTES).expect("fits u64") * 8,
+            SLOW_CONSUMER_QUEUE_BYTES_MAX,
+            "this fixture assumes SLOW_CONSUMER_QUEUE_BYTES_MAX is exactly 8 * 1 MiB"
+        );
+        let large_frame = ping_of_exact_encoded_len(CHUNK_BYTES);
+        assert_eq!(
+            serde_json::to_string(&large_frame).expect("frame serializes").len(),
+            CHUNK_BYTES
+        );
+
+        // Never drain `registered.receiver` -- simulates a consumer that has stopped reading.
+        // Eight exact-1-MiB frames sum to exactly the byte ceiling and must all be queued.
+        for _ in 0..8 {
+            registry.broadcast(document_id, &large_frame, None);
+        }
+        // One more frame of any size pushes the queue's byte total one byte past
+        // SLOW_CONSUMER_QUEUE_BYTES_MAX -- the frame count (9) stays far under
+        // SLOW_CONSUMER_QUEUE_FRAMES_MAX (256), proving this is the byte ceiling firing, not the
+        // frame ceiling.
+        registry.broadcast(document_id, &ping("over-byte-ceiling"), None);
+
+        let mut saw_close = false;
+        let mut frame_count = 0u64;
+        while let Ok(event) = registered.receiver.try_recv() {
+            match event {
+                OutboundEvent::Frame(..) => frame_count += 1,
+                OutboundEvent::Close { code, .. } => {
+                    saw_close = true;
+                    assert_eq!(code, 4408, "slow consumer must close at the frozen limit_exceeded code");
+                }
+            }
+        }
+        assert!(
+            saw_close,
+            "exceeding the queue byte ceiling must force-close the session"
+        );
+        assert_eq!(
+            frame_count, 8,
+            "the frame that pushed the byte queue over the ceiling must never itself be queued"
         );
 
         // Further broadcasts to the now-closing session must not queue anything else (and must not

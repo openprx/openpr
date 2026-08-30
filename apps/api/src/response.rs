@@ -3,6 +3,7 @@
 
 use axum::Json;
 use serde::Serialize;
+use serde_json::Value;
 
 /// Metadata the bot-operation middleware can inspect without buffering a response body.
 ///
@@ -20,6 +21,18 @@ pub struct ApiResponse<T: Serialize> {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    /// The stable `error-mapping-v1.md` discriminant for an [`crate::error::ApiError::Typed`]
+    /// rejection (its `error_code` wire field) -- carried on this one envelope shape instead of
+    /// [`crate::error::ApiError`]'s `Typed` arm hand-building a parallel JSON body. Always `None`
+    /// on a success response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
+    /// Structured, per-`error_code` extra fields (`error-mapping-v1.md`'s `details` column, e.g.
+    /// `limit_exceeded`'s `{limit_kind,limit,observed?}` or `stale_frontier`'s
+    /// `{current_seq,current_frontier}`). Always `None` on a success response and on any
+    /// rejection whose stable code carries no extra structure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
 }
 
 impl<T: Serialize> ApiResponse<T> {
@@ -28,6 +41,8 @@ impl<T: Serialize> ApiResponse<T> {
             code: 0,
             message: "success".into(),
             data: Some(data),
+            error_code: None,
+            details: None,
         })
     }
 }
@@ -38,6 +53,8 @@ impl ApiResponse<()> {
             code,
             message: msg.into(),
             data: None,
+            error_code: None,
+            details: None,
         })
     }
 
@@ -46,6 +63,8 @@ impl ApiResponse<()> {
             code: 0,
             message: "success".into(),
             data: None,
+            error_code: None,
+            details: None,
         })
     }
 }

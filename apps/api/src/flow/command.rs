@@ -1118,6 +1118,13 @@ fn apply_content_command(
 fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
     use super::collab::frame::RejectedCode;
 
+    // Hoisted once so every arm below reads the same `Option<&Value>` instead of each
+    // re-deriving `rejected.details.as_ref()` independently -- this is also the only real
+    // caller-facing REST site that ever inspects `Rejected::details` at all, so it is where
+    // `error-mapping-v1.md`'s "REST 必须能读出 limit_kind/limit/observed" requirement is either
+    // honored or silently dropped.
+    let details = rejected.details.as_ref();
+
     match rejected.code {
         RejectedCode::Unauthenticated => ApiError::unauthenticated("unauthenticated"),
         RejectedCode::Forbidden => ApiError::typed(ApiErrorKind::Forbidden, "forbidden"),
@@ -1131,26 +1138,21 @@ fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
             ApiError::stale_frontier("stale_frontier", rejected.current_seq, current_frontier.as_deref())
         }
         RejectedCode::ResyncRequired => {
-            let minimum_snapshot_seq = rejected
-                .details
-                .as_ref()
+            let minimum_snapshot_seq = details
                 .and_then(|details| details.get("minimum_snapshot_seq"))
                 .and_then(Value::as_i64);
             ApiError::resync_required("resync_required", minimum_snapshot_seq)
         }
         RejectedCode::LimitExceeded => {
             let (limit_kind, limit, observed, retry_after_ms) =
-                rejected
-                    .details
-                    .as_ref()
-                    .map_or(("unknown", None, None, None), |details| {
-                        (
-                            details.get("limit_kind").and_then(Value::as_str).unwrap_or("unknown"),
-                            details.get("limit").cloned(),
-                            details.get("observed").cloned(),
-                            details.get("retry_after_ms").and_then(Value::as_u64),
-                        )
-                    });
+                details.map_or(("unknown", None, None, None), |details| {
+                    (
+                        details.get("limit_kind").and_then(Value::as_str).unwrap_or("unknown"),
+                        details.get("limit").cloned(),
+                        details.get("observed").cloned(),
+                        details.get("retry_after_ms").and_then(Value::as_u64),
+                    )
+                });
             ApiError::limit_exceeded(
                 format!("limit_exceeded: {limit_kind}"),
                 limit_kind,
@@ -1160,14 +1162,10 @@ fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
             )
         }
         RejectedCode::ServerDraining => {
-            let reason = rejected
-                .details
-                .as_ref()
+            let reason = details
                 .and_then(|details| details.get("reason"))
                 .and_then(Value::as_str);
-            let retry_after_ms = rejected
-                .details
-                .as_ref()
+            let retry_after_ms = details
                 .and_then(|details| details.get("retry_after_ms"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);

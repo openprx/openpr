@@ -33,9 +33,13 @@ pub fn validate_limit(limit: Option<u64>) -> Result<u64, ApiError> {
     match limit {
         None => Ok(DEFAULT_LIST_LIMIT),
         Some(0) => Err(ApiError::BadRequest("limit must be at least 1".to_string())),
-        Some(value) if value > MAX_LIST_LIMIT => {
-            Err(ApiError::BadRequest(format!("limit must be at most {MAX_LIST_LIMIT}")))
-        }
+        Some(value) if value > MAX_LIST_LIMIT => Err(ApiError::limit_exceeded(
+            format!("limit must be at most {MAX_LIST_LIMIT}"),
+            "page_size",
+            Some(json!(MAX_LIST_LIMIT)),
+            Some(json!(value)),
+            None,
+        )),
         Some(value) => Ok(value),
     }
 }

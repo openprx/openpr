@@ -173,6 +173,8 @@ pub async fn list_bot_operation_logs(
         code: 0,
         message: "success".to_string(),
         data: Some(BotOperationLogPage { items, next_cursor }),
+        error_code: None,
+        details: None,
     }))
 }
 

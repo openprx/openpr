@@ -1798,4 +1798,78 @@ mod flow_database_tests {
 
         scratch.drop_self().await;
     }
+
+    /// `page_size` (`page_limit_max=100`): `list_flow_objects` -> `query::list_objects` ->
+    /// `query::validate_limit`. `limit=100` is accepted; `limit=101` is rejected through the
+    /// same `ApiError::limit_exceeded` typed path every other `limit_kind` uses, so the REST
+    /// envelope actually carries `error_code="limit_exceeded"` and
+    /// `details={limit_kind,limit,observed}` (`error.rs`'s `ApiResponse`-backed `Typed` arm),
+    /// not a bare message string. No document/`event_dispatch` side effect to check here: this
+    /// is a read-only list endpoint, not a write path.
+    #[tokio::test]
+    async fn list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary() {
+        const PAGE_LIMIT_MAX: u64 = 100;
+
+        let scratch = scratch_or_skip!("page-size-boundary");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+
+        let list_query = |limit: Option<u64>| ListFlowObjectsQuery {
+            project_id: None,
+            unprojected: false,
+            object_type: None,
+            parent_id: None,
+            q: None,
+            cursor: None,
+            limit,
+            include_archived: false,
+        };
+
+        // ---- exact boundary: limit=page_limit_max is accepted ----
+        let exact_response = to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Query(list_query(Some(PAGE_LIMIT_MAX))),
+            )
+            .await,
+        );
+        assert_eq!(exact_response.status(), axum::http::StatusCode::OK);
+        let exact_body = body_json(exact_response).await;
+        assert_eq!(
+            exact_body["code"], 0,
+            "limit=page_limit_max must be accepted: {exact_body}"
+        );
+
+        // ---- plus one: limit=page_limit_max+1 is rejected limit_kind=page_size ----
+        let plus_one_response = to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Query(list_query(Some(PAGE_LIMIT_MAX + 1))),
+            )
+            .await,
+        );
+        assert_eq!(
+            plus_one_response.status(),
+            axum::http::StatusCode::OK,
+            "REST is always a 200 envelope; business failure is in the body's `code`"
+        );
+        let plus_one_body = body_json(plus_one_response).await;
+        assert_ne!(
+            plus_one_body["code"], 0,
+            "limit=page_limit_max+1 must be rejected: {plus_one_body}"
+        );
+        assert_eq!(plus_one_body["error_code"], "limit_exceeded");
+        assert_eq!(plus_one_body["details"]["limit_kind"], "page_size");
+        assert_eq!(plus_one_body["details"]["limit"], PAGE_LIMIT_MAX);
+        assert_eq!(plus_one_body["details"]["observed"], PAGE_LIMIT_MAX + 1);
+
+        scratch.drop_self().await;
+    }
 }

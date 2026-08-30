@@ -1247,6 +1247,650 @@ mod tests {
             "a clean window must reset the consecutive-exceeded streak"
         );
     }
+
+    // -----------------------------------------------------------------------------------------
+    // Live-WebSocket boundary tests for `websocket_frame_bytes`/`presence_payload_bytes`/
+    // `presence_ttl_seconds` (opt-in via `OPENPR_TEST_DATABASE_URL`, matching every other
+    // real-database suite in this crate). Unlike `frame_rate`/`update_rate` above, these three
+    // checks have no lower-level entry point this file exposes to call directly: they live inside
+    // [`super::run`]'s live connection loop itself (the frame-length pre-decode gate, the presence
+    // payload/ttl gates in `handle_client_frame`), reachable only through a real WebSocket upgrade
+    // -- so this nested module spins up a real `axum::serve` listener and drives it with a real
+    // `tokio-tungstenite` client, mirroring `routes/collab.rs`'s own `collab_database_tests`
+    // harness (kept as an independent copy here rather than shared, the same way
+    // `super::database_tests` already keeps its own `Scratch`/`seed_workspace`/`create_page`
+    // instead of importing `routes::collab`'s private test-only copies).
+    #[cfg(test)]
+    #[allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::too_many_lines
+    )]
+    mod live_ws {
+        use axum::Router;
+        use axum::middleware as axum_middleware;
+        use axum::routing::get;
+        use futures_util::{SinkExt, StreamExt};
+        use platform::{
+            app::AppState,
+            auth::JwtManager,
+            config::{AppConfig, Secret},
+        };
+        use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message as TMessage;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use uuid::Uuid;
+
+        use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
+        use crate::routes::collab::{create_ticket, ws_upgrade};
+
+        const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+        const TEST_ORIGIN: &str = "http://session-live-ws-test.local";
+        const JWT_SECRET: &str = "session-live-ws-test-secret";
+
+        struct Scratch {
+            db: DatabaseConnection,
+            name: String,
+            admin_url: String,
+        }
+
+        impl Scratch {
+            async fn drop_self(self) {
+                let Self { db, name, admin_url } = self;
+                drop(db);
+                let Ok(admin) = Database::connect(&admin_url).await else {
+                    return;
+                };
+                let _ = admin
+                    .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                    .await;
+            }
+        }
+
+        async fn scratch(label: &str) -> Option<Scratch> {
+            let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+            let admin = Database::connect(&admin_url)
+                .await
+                .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+            let name = format!("openpr_session_live_ws_{label}");
+            let quoted = format!("\"{name}\"");
+            admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+                .await
+                .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+            admin
+                .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+                .await
+                .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+            let (prefix, _) = admin_url.rsplit_once('/')?;
+            let url = format!("{prefix}/{name}");
+            let db = Database::connect(&url)
+                .await
+                .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .expect("migrations directory is readable")
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+                .collect();
+            files.sort();
+            assert!(!files.is_empty(), "no migration file was found in {dir}");
+            for path in files {
+                let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+                db.execute_unprepared(&sql)
+                    .await
+                    .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+            }
+
+            Some(Scratch { db, name, admin_url })
+        }
+
+        macro_rules! scratch_or_skip {
+            ($label:expr) => {
+                match scratch($label).await {
+                    Some(scratch) => scratch,
+                    None => {
+                        eprintln!("skipped: {TEST_DATABASE_URL_ENV} is not set");
+                        return;
+                    }
+                }
+            };
+        }
+
+        fn state_for(db: DatabaseConnection) -> AppState {
+            AppState {
+                cfg: AppConfig {
+                    app_name: "session-live-ws-test".to_string(),
+                    bind_addr: "127.0.0.1:0".to_string(),
+                    database_url: Secret::new("postgres://unused/unused"),
+                    jwt_secret: Secret::new(JWT_SECRET),
+                    jwt_access_ttl_seconds: 900,
+                    jwt_refresh_ttl_seconds: 3600,
+                    default_author_id: None,
+                    allow_insecure_cookies: false,
+                    collab_allowed_origins: vec![TEST_ORIGIN.to_string()],
+                },
+                db,
+            }
+        }
+
+        async fn exec(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) {
+            state
+                .db
+                .execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+                .await
+                .unwrap_or_else(|err| panic!("setup statement failed: {err}"));
+        }
+
+        async fn seed_workspace(state: &AppState) -> (Uuid, Uuid) {
+            let workspace_id = Uuid::new_v4();
+            let owner_id = Uuid::new_v4();
+            exec(
+                state,
+                "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+                 VALUES ($1, $2, '!', 'test', 'user', true)",
+                vec![owner_id.into(), format!("{owner_id}@session-live-ws.test").into()],
+            )
+            .await;
+            exec(
+                state,
+                "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'session live ws test', $3)",
+                vec![
+                    workspace_id.into(),
+                    format!("ws-{workspace_id}").into(),
+                    owner_id.into(),
+                ],
+            )
+            .await;
+            exec(
+                state,
+                "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+                vec![workspace_id.into(), owner_id.into()],
+            )
+            .await;
+            exec(
+                state,
+                "INSERT INTO flow_workspace_settings (workspace_id, flow_enabled) VALUES ($1, true)",
+                vec![workspace_id.into()],
+            )
+            .await;
+            (workspace_id, owner_id)
+        }
+
+        async fn create_page(state: &AppState, workspace_id: Uuid, actor_id: Uuid) -> (Uuid, Uuid) {
+            use crate::flow::command::{CreateObjectInput, create_object};
+            let accepted = create_object(
+                state,
+                CreateObjectInput {
+                    workspace_id,
+                    actor_id,
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Session Live WS Test Page".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                },
+            )
+            .await
+            .expect("object creation succeeds");
+            (accepted.object.id, accepted.object.document_id)
+        }
+
+        fn jwt_for(user_id: Uuid) -> String {
+            let manager = JwtManager::new(JWT_SECRET, 900, 3600);
+            manager
+                .issue_access_token(&user_id.to_string(), &format!("{user_id}@session-live-ws.test"))
+                .expect("token issues")
+        }
+
+        /// Spins up a real listener serving only the two routes these tests need (ticket issuance
+        /// plus the WS upgrade itself) — a strict subset of `routes/collab.rs`'s own
+        /// `collab_database_tests::spawn_server`, which additionally wires diagnostics/verify/
+        /// bootstrap this module has no use for.
+        async fn spawn_server(state: AppState) -> SocketAddr {
+            let auth_state = state.clone();
+            let app = Router::new()
+                .route(
+                    "/api/v1/collab/tickets",
+                    axum::routing::post(create_ticket).route_layer(axum_middleware::from_fn_with_state(
+                        auth_state,
+                        crate::middleware::bot_auth::bot_or_user_auth_middleware,
+                    )),
+                )
+                .route("/api/v1/collab/ws", get(ws_upgrade))
+                .with_state(state);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("binds an ephemeral port");
+            let addr = listener.local_addr().expect("listener has a local address");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            addr
+        }
+
+        async fn issue_ticket(
+            addr: SocketAddr,
+            token: &str,
+            workspace_id: Uuid,
+            document_id: Uuid,
+            client_id: &str,
+        ) -> String {
+            let client = reqwest::Client::new();
+            let response = client
+                .post(format!("http://{addr}/api/v1/collab/tickets"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "document_id": document_id,
+                    "client_id": client_id,
+                    "origin": TEST_ORIGIN,
+                }))
+                .send()
+                .await
+                .expect("ticket request completes");
+            let body: serde_json::Value = response.json().await.expect("ticket response is JSON");
+            assert_eq!(body["code"], 0, "ticket issuance failed: {body}");
+            body["data"]["ticket"].as_str().expect("ticket is a string").to_string()
+        }
+
+        type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+        async fn connect(addr: SocketAddr, ticket: &str, client_id: &str) -> WsStream {
+            let url = format!("ws://{addr}/api/v1/collab/ws?ticket={ticket}&client_id={client_id}");
+            let mut request = url.into_client_request().expect("builds a client request");
+            request
+                .headers_mut()
+                .insert("Origin", TEST_ORIGIN.parse().expect("valid header value"));
+            let (stream, response) = tokio_tungstenite::connect_async(request)
+                .await
+                .expect("upgrade succeeds");
+            assert_eq!(response.status(), 101);
+            stream
+        }
+
+        async fn send_frame(ws: &mut WsStream, frame: &Frame) {
+            let text = serde_json::to_string(frame).expect("frame serializes");
+            ws.send(TMessage::Text(text.into())).await.expect("send succeeds");
+        }
+
+        /// Sends a raw text WS message that is not necessarily a valid `Frame` -- used by the
+        /// `websocket_frame_bytes` plus-one case, which must be rejected on length alone before
+        /// ever being JSON-parsed (`read_frame`'s `text.len() > WEBSOCKET_FRAME_BYTES_MAX` check
+        /// runs before `serde_json::from_str`).
+        async fn send_raw_text(ws: &mut WsStream, text: String) {
+            ws.send(TMessage::Text(text.into())).await.expect("send succeeds");
+        }
+
+        async fn recv_frame(ws: &mut WsStream) -> Frame {
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                    .await
+                    .expect("a frame arrives before the timeout")
+                    .expect("the stream is not closed")
+                    .expect("the frame is not a transport error");
+                match message {
+                    TMessage::Text(text) => return serde_json::from_str(text.as_str()).expect("frame deserializes"),
+                    TMessage::Ping(_) | TMessage::Pong(_) => {}
+                    other => panic!("unexpected non-text frame: {other:?}"),
+                }
+            }
+        }
+
+        /// Drives the real `hello`/`open`/`snapshot` handshake `super::run` requires before its
+        /// steady-state loop (where the frame-length/presence gates live) is ever reached, and
+        /// hands back the connected stream plus the document's starting `head_seq`.
+        async fn open_session(addr: SocketAddr, ticket: &str, client_id: &str, document_id: Uuid) -> (WsStream, i64) {
+            let mut ws = connect(addr, ticket, client_id).await;
+            send_frame(
+                &mut ws,
+                &Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: vec![],
+                    client_id: client_id.to_string(),
+                    session_id: Uuid::new_v4(),
+                },
+            )
+            .await;
+            let hello_reply = recv_frame(&mut ws).await;
+            assert!(
+                matches!(hello_reply, Frame::Hello { .. }),
+                "expected a hello reply, got {hello_reply:?}"
+            );
+
+            send_frame(
+                &mut ws,
+                &Frame::Open {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    known_seq: None,
+                    known_frontier: None,
+                },
+            )
+            .await;
+            let snapshot_frame = recv_frame(&mut ws).await;
+            let Frame::Snapshot { head_seq, .. } = snapshot_frame else {
+                panic!("expected a snapshot frame, got {snapshot_frame:?}");
+            };
+            (ws, head_seq)
+        }
+
+        async fn count_event_dispatch(state: &AppState, document_id: Uuid) -> i64 {
+            #[derive(sea_orm::FromQueryResult)]
+            struct Row {
+                n: i64,
+            }
+            Row::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM event_dispatch WHERE document_id = $1",
+                vec![document_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("count query runs")
+            .expect("count query returns a row")
+            .n
+        }
+
+        async fn read_head_seq(state: &AppState, document_id: Uuid) -> i64 {
+            #[derive(sea_orm::FromQueryResult)]
+            struct Row {
+                head_seq: i64,
+            }
+            Row::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT head_seq FROM collab_documents WHERE id = $1",
+                vec![document_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("head_seq query runs")
+            .expect("document row exists")
+            .head_seq
+        }
+
+        /// `websocket_frame_bytes_max` (131,072 bytes) is checked pre-decode in `read_frame`,
+        /// before the text is ever handed to `serde_json::from_str`. Proven with a real,
+        /// well-formed `Frame::Ping` whose encoded length is exactly the ceiling (accepted and
+        /// answered with a `pong`), and a 131,073-byte raw text message one byte over it
+        /// (rejected on length alone, so it need not even be valid JSON) — both against the same
+        /// still-open connection, and the oversized send provably advances neither the document
+        /// head nor `event_dispatch`.
+        #[tokio::test]
+        async fn websocket_frame_bytes_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+            let scratch = scratch_or_skip!("frame-bytes");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "frame-bytes-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+
+            const WEBSOCKET_FRAME_BYTES_MAX: usize = 131_072;
+
+            // ---- exact boundary: a real Frame::Ping padded to exactly the ceiling ----
+            let base_len = serde_json::to_string(&Frame::Ping {
+                protocol_version: PROTOCOL_VERSION,
+                nonce: String::new(),
+            })
+            .expect("ping serializes")
+            .len();
+            assert!(WEBSOCKET_FRAME_BYTES_MAX >= base_len);
+            let exact_ping = Frame::Ping {
+                protocol_version: PROTOCOL_VERSION,
+                nonce: "a".repeat(WEBSOCKET_FRAME_BYTES_MAX - base_len),
+            };
+            let exact_len = serde_json::to_string(&exact_ping).expect("ping serializes").len();
+            assert_eq!(exact_len, WEBSOCKET_FRAME_BYTES_MAX);
+            send_frame(&mut ws, &exact_ping).await;
+            let pong = recv_frame(&mut ws).await;
+            assert!(
+                matches!(pong, Frame::Pong { .. }),
+                "an exactly-at-ceiling frame must be processed normally, got {pong:?}"
+            );
+
+            let dispatch_before_plus_one = count_event_dispatch(&state, document_id).await;
+
+            // ---- plus one: an arbitrary 131,073-byte text message, rejected on length alone ----
+            send_raw_text(&mut ws, "a".repeat(WEBSOCKET_FRAME_BYTES_MAX + 1)).await;
+            let rejected = recv_frame(&mut ws).await;
+            let Frame::Rejected { code, details, .. } = rejected else {
+                panic!("expected a rejected frame, got {rejected:?}");
+            };
+            assert_eq!(code, RejectedCode::LimitExceeded);
+            let details = details.expect("a limit_exceeded rejection must carry details");
+            assert_eq!(details["limit_kind"], "websocket_frame_bytes");
+            assert_eq!(details["limit"], WEBSOCKET_FRAME_BYTES_MAX as u64);
+            assert_eq!(details["observed"], (WEBSOCKET_FRAME_BYTES_MAX + 1) as u64);
+
+            assert_eq!(
+                read_head_seq(&state, document_id).await,
+                head_seq_before,
+                "an over-ceiling frame must never advance the document head"
+            );
+            assert_eq!(
+                count_event_dispatch(&state, document_id).await,
+                dispatch_before_plus_one,
+                "an over-ceiling frame must never produce a new event_dispatch row"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// `presence_payload_bytes_max` (8,192 bytes): checked in `handle_client_frame`'s
+        /// `Frame::Presence` arm before the payload ever reaches `SessionRegistry::upsert_presence`.
+        /// Proven with a real presence payload whose JSON-encoded length is exactly the ceiling
+        /// (accepted and rebroadcast) and one byte over it (rejected).
+        ///
+        /// Two connections are needed, not one: `handle_client_frame`'s `Ok(())` arm broadcasts
+        /// the accepted presence with `exclude: Some(session_id)` (`registry.rs`'s own doc
+        /// comment on `broadcast`), i.e. the *sender* never sees its own accepted presence echoed
+        /// back to itself -- only a `limit_exceeded` rejection is ever sent directly to the
+        /// sender's own socket. `sender` proves the accept case indirectly too: reaching the
+        /// plus-one send at all (rather than the connection having been dropped) already shows
+        /// the exact-boundary send did not error out, but `observer` receiving the real broadcast
+        /// is the actual proof the payload was accepted and stored.
+        #[tokio::test]
+        async fn presence_payload_bytes_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+            let scratch = scratch_or_skip!("presence-bytes");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let (mut sender, head_seq_before) = open_session(
+                addr,
+                &issue_ticket(addr, &token, workspace_id, document_id, "presence-bytes-sender").await,
+                "presence-bytes-sender",
+                document_id,
+            )
+            .await;
+            let (mut observer, _) = open_session(
+                addr,
+                &issue_ticket(addr, &token, workspace_id, document_id, "presence-bytes-observer").await,
+                "presence-bytes-observer",
+                document_id,
+            )
+            .await;
+
+            const PRESENCE_PAYLOAD_BYTES_MAX: usize = 8_192;
+
+            // `encoded_payload = serde_json::to_vec(&payload)` in `handle_client_frame` re-encodes
+            // just the `payload` value on its own (not the whole `Frame::Presence` envelope), so
+            // the padding target is the payload's own encoded length, not the frame's.
+            let session_id = Uuid::new_v4();
+            let payload_of_len = |len: usize| {
+                let base = serde_json::to_vec(&serde_json::json!({"cursor": ""}))
+                    .expect("payload serializes")
+                    .len();
+                assert!(len >= base);
+                serde_json::json!({"cursor": "a".repeat(len - base)})
+            };
+            let exact_payload = payload_of_len(PRESENCE_PAYLOAD_BYTES_MAX);
+            assert_eq!(
+                serde_json::to_vec(&exact_payload).expect("payload serializes").len(),
+                PRESENCE_PAYLOAD_BYTES_MAX
+            );
+
+            send_frame(
+                &mut sender,
+                &Frame::Presence {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    session_id,
+                    payload: exact_payload.clone(),
+                    ttl_seconds: None,
+                },
+            )
+            .await;
+            let echoed = recv_frame(&mut observer).await;
+            let Frame::Presence { payload, .. } = echoed else {
+                panic!("an exactly-at-ceiling presence must be accepted and broadcast to peers, got {echoed:?}");
+            };
+            assert_eq!(payload, exact_payload);
+
+            let dispatch_before_plus_one = count_event_dispatch(&state, document_id).await;
+
+            // ---- plus one: one byte over the ceiling, rejected straight back to the sender ----
+            let plus_one_payload = payload_of_len(PRESENCE_PAYLOAD_BYTES_MAX + 1);
+            send_frame(
+                &mut sender,
+                &Frame::Presence {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    session_id,
+                    payload: plus_one_payload,
+                    ttl_seconds: None,
+                },
+            )
+            .await;
+            let rejected = recv_frame(&mut sender).await;
+            let Frame::Rejected { code, details, .. } = rejected else {
+                panic!("expected a rejected frame, got {rejected:?}");
+            };
+            assert_eq!(code, RejectedCode::LimitExceeded);
+            let details = details.expect("a limit_exceeded rejection must carry details");
+            assert_eq!(details["limit_kind"], "presence_payload_bytes");
+            assert_eq!(details["limit"], PRESENCE_PAYLOAD_BYTES_MAX as u64);
+            assert_eq!(details["observed"], (PRESENCE_PAYLOAD_BYTES_MAX + 1) as u64);
+
+            assert_eq!(
+                read_head_seq(&state, document_id).await,
+                head_seq_before,
+                "presence traffic must never touch the document head"
+            );
+            assert_eq!(
+                count_event_dispatch(&state, document_id).await,
+                dispatch_before_plus_one,
+                "a rejected presence payload must never produce a new event_dispatch row"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// `presence_ttl_seconds_max` (30): checked in `handle_client_frame`'s `Frame::Presence`
+        /// arm, right after the payload-bytes gate. Proven with `ttl_seconds=30` (accepted and
+        /// broadcast to a peer with the exact ttl echoed back) and `ttl_seconds=31` (rejected
+        /// `limit_kind=presence_ttl_seconds`, straight back to the sender). Two connections for
+        /// the same reason as the `presence_payload_bytes` test above: an accepted presence is
+        /// broadcast excluding its own sender.
+        #[tokio::test]
+        async fn presence_ttl_seconds_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+            let scratch = scratch_or_skip!("presence-ttl");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let (mut sender, head_seq_before) = open_session(
+                addr,
+                &issue_ticket(addr, &token, workspace_id, document_id, "presence-ttl-sender").await,
+                "presence-ttl-sender",
+                document_id,
+            )
+            .await;
+            let (mut observer, _) = open_session(
+                addr,
+                &issue_ticket(addr, &token, workspace_id, document_id, "presence-ttl-observer").await,
+                "presence-ttl-observer",
+                document_id,
+            )
+            .await;
+
+            const PRESENCE_TTL_SECONDS_MAX: u32 = 30;
+            let session_id = Uuid::new_v4();
+            let payload = serde_json::json!({"cursor": "boundary"});
+
+            send_frame(
+                &mut sender,
+                &Frame::Presence {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    session_id,
+                    payload: payload.clone(),
+                    ttl_seconds: Some(PRESENCE_TTL_SECONDS_MAX),
+                },
+            )
+            .await;
+            let echoed = recv_frame(&mut observer).await;
+            let Frame::Presence { ttl_seconds, .. } = echoed else {
+                panic!("a ttl_seconds exactly at the ceiling must be accepted and broadcast to peers, got {echoed:?}");
+            };
+            assert_eq!(ttl_seconds, Some(PRESENCE_TTL_SECONDS_MAX));
+
+            let dispatch_before_plus_one = count_event_dispatch(&state, document_id).await;
+
+            send_frame(
+                &mut sender,
+                &Frame::Presence {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    session_id,
+                    payload,
+                    ttl_seconds: Some(PRESENCE_TTL_SECONDS_MAX + 1),
+                },
+            )
+            .await;
+            let rejected = recv_frame(&mut sender).await;
+            let Frame::Rejected { code, details, .. } = rejected else {
+                panic!("expected a rejected frame, got {rejected:?}");
+            };
+            assert_eq!(code, RejectedCode::LimitExceeded);
+            let details = details.expect("a limit_exceeded rejection must carry details");
+            assert_eq!(details["limit_kind"], "presence_ttl_seconds");
+            assert_eq!(details["limit"], u64::from(PRESENCE_TTL_SECONDS_MAX));
+            assert_eq!(details["observed"], u64::from(PRESENCE_TTL_SECONDS_MAX + 1));
+
+            assert_eq!(
+                read_head_seq(&state, document_id).await,
+                head_seq_before,
+                "presence traffic must never touch the document head"
+            );
+            assert_eq!(
+                count_event_dispatch(&state, document_id).await,
+                dispatch_before_plus_one,
+                "a rejected presence ttl must never produce a new event_dispatch row"
+            );
+
+            scratch.drop_self().await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
