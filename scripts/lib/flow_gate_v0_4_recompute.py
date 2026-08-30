@@ -91,6 +91,96 @@ def load_json(path: str):
         return None
 
 
+class EvidenceFormatError(Exception):
+    """Raised when an evidence artifact exists but does not conform to the
+    shape this module's bridge for it requires. Per the "don't silently
+    ignore a malformed artifact" contract, a caller catching this must
+    exit non-zero -- never fall back to treating the gates it would have
+    backed as not_verified."""
+
+
+# The only three verdicts a per-gate verifier bridge may report for a hard
+# gate. `not_covered` ("this verifier explicitly determined the requirement
+# cannot be exercised in this repository, e.g. it needs a load-test harness
+# that does not exist") is distinct from the module-wide default
+# `not_verified` ("no verifier artifact is mapped/present for this gate at
+# all") -- the schema (docs/schemas/sylvode-flow-gate-v0.4.schema.json)
+# carries all four as valid `hard_gates.<gate>` values; a bridge must never
+# collapse one into another.
+BRIDGE_GATE_STATUSES = {"passed", "failed", "not_covered"}
+
+
+def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_version: str, gates: dict, reasons: dict) -> bool:
+    """Read a per-verifier evidence artifact (flow-events-result.json /
+    collab-architecture-result.json shaped: a top-level `gates` object
+    mapping hard_gate id -> {"status": "passed"|"failed"|"not_covered", ...})
+    and copy each hard gate's own verdict into `gates`/`reasons` verbatim --
+    never re-deriving or softening a verdict the verifier already computed.
+
+    Returns False (no-op) if the artifact file is simply absent -- the gates
+    it would have backed are left at whatever they already are (the
+    ALL_HARD_GATES default of "not_verified" unless another bridge already
+    set them), which is the correct "nobody verified this yet" state.
+
+    Raises EvidenceFormatError -- never silently ignored, never downgraded
+    to not_verified -- if the file exists but is not valid JSON, is not a
+    JSON object, has the wrong schema_version, lacks a `gates` object, or
+    any entry in that object that names a known hard gate is missing a
+    `status` field or reports a status outside BRIDGE_GATE_STATUSES.
+
+    Deliberately does NOT hardcode which hard gate ids this artifact backs:
+    it iterates whatever keys the artifact's own `gates` object contains,
+    so a future verifier revision that adds/drops a gate needs no change
+    here.
+    """
+    path = os.path.join(evidence_root, filename)
+    if not os.path.isfile(path):
+        return False
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        raise EvidenceFormatError(f"{path}: could not read file ({e})") from e
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise EvidenceFormatError(f"{path}: not valid JSON ({e})") from e
+    if not isinstance(data, dict):
+        raise EvidenceFormatError(f"{path}: top-level JSON value is not an object")
+
+    actual_schema_version = data.get("schema_version")
+    if actual_schema_version != expected_schema_version:
+        raise EvidenceFormatError(
+            f"{path}: schema_version={actual_schema_version!r}, expected {expected_schema_version!r}"
+        )
+
+    gates_obj = data.get("gates")
+    if not isinstance(gates_obj, dict):
+        raise EvidenceFormatError(f"{path}: 'gates' field is missing or not a JSON object")
+
+    for gate_name, gate_entry in gates_obj.items():
+        if gate_name not in ALL_HARD_GATES:
+            # Not one of the 52 hard_gates this contract tracks -- the
+            # artifact may legitimately carry auxiliary detail under
+            # `gates` that isn't itself a hard-gate id (none do today, but
+            # nothing here requires the artifact's gate set to be a subset
+            # of ALL_HARD_GATES a priori). Not an error; just not bridged.
+            continue
+        if not isinstance(gate_entry, dict) or "status" not in gate_entry:
+            raise EvidenceFormatError(f"{path}: gates.{gate_name} is missing a 'status' field")
+        status = gate_entry["status"]
+        if status not in BRIDGE_GATE_STATUSES:
+            raise EvidenceFormatError(
+                f"{path}: gates.{gate_name}.status={status!r} is not one of {sorted(BRIDGE_GATE_STATUSES)}"
+            )
+        gates[gate_name] = status
+        detail = gate_entry.get("reason") or gate_entry.get("note")
+        reasons[gate_name] = f"{filename}: gates.{gate_name}.status={status}" + (f" -- {detail}" if detail else "")
+
+    return True
+
+
 def recompute(evidence_root: str, repo_root: str) -> dict:
     gates: dict[str, str] = {g: "not_verified" for g in ALL_HARD_GATES}
     reasons: dict[str, str] = {}
@@ -230,6 +320,29 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         member_baseline = authz.get("member_baseline_no_behaviour_regression", {})
         reasons["member_baseline_no_behaviour_regression"] = member_baseline.get("reason", "not covered by any verifier this round")
 
+    # ---- events/dispatch verifier bridge: backs 8 gates ----
+    # scripts/verify-flow-events-v0.4.sh writes flow-events-result.json with
+    # its own independently-recomputed per-gate verdict (passed/failed) for
+    # business_event_dispatch_same_transaction, dispatch_expansion_snapshot_
+    # semantics, no_subscribers_terminalized_and_reaped, dispatcher_liveness_
+    # and_backlog, flow_content_delivery_coalescing, coalescing_seal_and_
+    # source_first_expansion, flow_event_registry_payload_policy_complete,
+    # event_idempotency_audit_and_redaction. Bridged verbatim -- see
+    # bridge_verifier_gates() docstring.
+    bridge_verifier_gates(evidence_root, "flow-events-result.json", "sylvode.flow.events-result.v1", gates, reasons)
+
+    # ---- collab-architecture verifier bridge: backs 6 gates ----
+    # scripts/verify-flow-collab-architecture.sh writes collab-architecture-
+    # result.json with its own independently-recomputed per-gate verdict
+    # (passed/failed/not_covered) for collab_architecture_adr_accepted,
+    # bounded_warm_cache_lock_hold_and_round_trip_budgets, minimal_snapshot_
+    # advancement_bounds_tail, snapshot_tail_restart_recovery, bootstrap_
+    # repeatable_read_and_ws_parity, accepted_egress_seq_monotonic_and_gap_
+    # resync (the last of which it itself reports not_covered -- bridged
+    # as not_covered here too, never rounded up to passed or down to
+    # not_verified). Bridged verbatim -- see bridge_verifier_gates() docstring.
+    bridge_verifier_gates(evidence_root, "collab-architecture-result.json", "sylvode.flow.collab-architecture-result.v1", gates, reasons)
+
     # ---- legacy_pages_drop_requires_separate_adr: static migration scan ----
     migrations_dir = os.path.join(repo_root, "migrations")
     drop_found = []
@@ -261,7 +374,13 @@ def main() -> int:
     ap.add_argument("--evidence-root", required=True)
     ap.add_argument("--repo-root", required=True)
     args = ap.parse_args()
-    result = recompute(args.evidence_root, args.repo_root)
+    try:
+        result = recompute(args.evidence_root, args.repo_root)
+    except EvidenceFormatError as e:
+        print(f"FAIL: evidence artifact does not conform to its expected shape: {e}", file=sys.stderr)
+        print("Fix: regenerate the artifact with its producing verify-flow-*.sh script, or correct it by hand; "
+              "this module refuses to guess a gate verdict from a malformed artifact.", file=sys.stderr)
+        return 2
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     print()
     return 0

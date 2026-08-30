@@ -143,6 +143,8 @@
         "cardinality_verify",
         "integrity_records_verify",
         "authz_baseline_verify",
+        "limits_verify",
+        "events_verify",
         "report",
         "verify",
         "gate",
@@ -174,6 +176,12 @@
           "$ref": "#/$defs/required_command_result"
         },
         "authz_baseline_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "limits_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "events_verify": {
           "$ref": "#/$defs/required_command_result"
         },
         "report": {
@@ -252,364 +260,416 @@
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "mcp_default_rest_coverage_three_adr_threat_exceptions_only": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "migration_forward_and_rollback_strategy": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "document_row_lock_seq_unique": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "collab_architecture_adr_accepted": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "bounded_warm_cache_lock_hold_and_round_trip_budgets": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "minimal_snapshot_advancement_bounds_tail": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "snapshot_tail_restart_recovery": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "bootstrap_repeatable_read_and_ws_parity": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "accepted_egress_seq_monotonic_and_gap_resync": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "rest_envelope_and_error_contract": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "server_draining_reason_cross_surface_error_coverage": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "ticket_single_use_origin_bot_exclusion": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "secure_cookie_and_local_dev_guard": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "cross_workspace_and_policy_bypass_negative": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "unauthorized_update_rejected": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "mcp_three_transport_contract": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "tool_registry_expected_107_or_rebased": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "cli_json_and_exit_code_contract": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "web_ime_undo_selection_and_sync_state": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "navigator_keyboard_drag_equivalence": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "i18n_zh_en_flow_key_parity": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "vite_wasm_static_build_and_deep_route": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "feature_flag_navigation_and_direct_url": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "feature_flag_mcp_read_admin_write_and_cli_equivalence": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "forms_regression_no_degradation": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "flow_limits_exact_boundary_and_plus_one_rejection": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "isolated_decode_apply_cpu_wall_memory": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "websocket_rate_connection_and_backpressure_limits": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "deployed_chain_websocket_upgrade": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "bootstrap_limits_web_server_parity": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "limit_exceeded_kind_coverage": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "flow_event_registry_payload_policy_complete": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "business_event_dispatch_same_transaction": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "dispatch_expansion_snapshot_semantics": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "no_subscribers_terminalized_and_reaped": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "dispatcher_liveness_and_backlog": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "flow_content_delivery_coalescing": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "coalescing_seal_and_source_first_expansion": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "dispatch_numeric_budgets_locked": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "command_contended_document_cardinality": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "integrity_record_on_fail_closed": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "flow_parent_authority_in_postgres": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "member_baseline_no_behaviour_regression": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "event_idempotency_audit_and_redaction": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_inventory_three_environments_complete": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_zero_or_importer_surface_available": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_mcp_admin_policy_and_semantic_equivalence": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_dry_run_and_rerun_idempotent": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_failure_source_immutable": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_lineage_complete": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         },
         "legacy_pages_drop_requires_separate_adr": {
           "enum": [
             "passed",
             "failed",
-            "not_verified"
+            "not_verified",
+            "not_covered"
           ]
         }
       }

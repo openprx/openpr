@@ -15,17 +15,19 @@ set -euo pipefail
 # fabricating a schema-shaped file with missing/placeholder artifacts is
 # exactly the fake-green pattern this v0.4 work exists to close.
 #
-# As of this script's authorship, only three of the thirteen
-# required_commands have a corresponding verify-flow-*-v0.4.sh script
-# implemented (surface_parity, legacy_pages_inventory +
-# legacy_pages_entry_verify, cardinality_verify); the remaining
-# (collab_architecture_verify, error_contract_verify,
-# deployed_chain_websocket_upgrade, integrity_records_verify,
-# authz_baseline_verify) do not exist yet. This script records each
-# missing script as a FAILED step with an explicit "script not
-# implemented" message rather than skipping it silently, so report
-# correctly and honestly exits 1 and does not write gate-result.json
-# until those scripts exist and pass.
+# v0.4-gate.yaml's required_commands list has 15 entries (bumped from 13
+# in `02e8cb7`, which added limits_verify/events_verify -- this script had
+# drifted behind that bump until it was synced back up here). As of this
+# sync, seven of the fifteen have a corresponding verify-flow-*-v0.4.sh
+# script implemented (surface_parity, legacy_pages_inventory +
+# legacy_pages_entry_verify, cardinality_verify, integrity_records_verify,
+# authz_baseline_verify, collab_architecture_verify, events_verify); the
+# remaining (error_contract_verify, deployed_chain_websocket_upgrade,
+# limits_verify) do not exist yet. This script records each missing
+# script as a FAILED step with an explicit "script not implemented"
+# message rather than skipping it silently, so report correctly and
+# honestly exits 1 and does not write gate-result.json until those
+# scripts exist and pass.
 #
 # Every invocation (pass or fail) also writes an atomic run log so a
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
@@ -197,10 +199,16 @@ echo "=== Sylvode Flow v0.4 report: integrity-records + authz-baseline (live api
 run_step required.integrity_records_verify "$ROOT_DIR/scripts/verify-flow-integrity-records-v0.4.sh" --adr "$CONTRACTS_ROOT/decisions/ADR-0013-multi-document-atomicity.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
 run_step required.authz_baseline_verify "$ROOT_DIR/scripts/verify-flow-authz-baseline-v0.4.sh" --adr "$CONTRACTS_ROOT/decisions/ADR-0012-object-authorization-and-sharing.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
 
+echo "=== Sylvode Flow v0.4 report: collab-architecture verify ==="
+run_step required.collab_architecture_verify "$ROOT_DIR/scripts/verify-flow-collab-architecture.sh" --release 0.4 --adr "$CONTRACTS_ROOT/decisions/ADR-0010-collab-server-architecture.md" --limits "$CONTRACTS_ROOT/contracts/limits-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: events/dispatch verify ==="
+run_step required.events_verify "$ROOT_DIR/scripts/verify-flow-events-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/events-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
 echo "=== Sylvode Flow v0.4 report: not-yet-implemented required_commands ==="
-run_missing_step required.collab_architecture_verify "scripts/verify-flow-collab-architecture.sh does not exist"
 run_missing_step required.error_contract_verify "scripts/verify-flow-errors-v0.4.sh does not exist"
 run_missing_step required.deployed_chain_websocket_upgrade "scripts/verify-flow-deployed-websocket-v0.4.sh does not exist"
+run_missing_step required.limits_verify "scripts/verify-flow-limits-v0.4.sh does not exist"
 
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
@@ -225,7 +233,7 @@ echo "Run log written: $EVIDENCE_ROOT/report-run-log.json"
 
 # ---- assemble gate-result.json only if every required artifact is real ----
 REQUIRED_ARTIFACTS=(
-  "migration:$REPO_ROOT/migrations/0054_flow_alpha.sql:migrations/0054_flow_alpha.sql"
+  "migration:$REPO_ROOT/migrations/0054_flow_data_layer.sql:migrations/0054_flow_data_layer.sql"
   "api_contract_fixture:$EVIDENCE_ROOT/rest-contract-result.json:evidence/v0.4/rest-contract-result.json"
   "error_contract_result:$EVIDENCE_ROOT/error-contract-result.json:evidence/v0.4/error-contract-result.json"
   "mcp_contract_fixture:$EVIDENCE_ROOT/mcp-contract-result.json:evidence/v0.4/mcp-contract-result.json"
@@ -292,6 +300,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson cardinality_verify "$(get_check required.cardinality_verify)" \
   --argjson integrity_records_verify "$(get_check required.integrity_records_verify)" \
   --argjson authz_baseline_verify "$(get_check required.authz_baseline_verify)" \
+  --argjson limits_verify "$(get_check required.limits_verify)" \
+  --argjson events_verify "$(get_check required.events_verify)" \
   --arg zero_sha "$ZERO_SHA" \
   '{
     surface_parity:$surface_parity,
@@ -303,6 +313,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     cardinality_verify:$cardinality_verify,
     integrity_records_verify:$integrity_records_verify,
     authz_baseline_verify:$authz_baseline_verify,
+    limits_verify:$limits_verify,
+    events_verify:$events_verify,
     report:{command:"scripts/report-flow-v0.4-json.sh", status:"passed", exit_code:0, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
