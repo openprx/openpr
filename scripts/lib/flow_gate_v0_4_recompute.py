@@ -337,7 +337,7 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             f"live cross_workspace_relation fixture: passed={ir.get('passed')} violations={len(ir.get('violations', []))}",
         )
 
-    # ---- authz-baseline: backs 1 of its 2 gates (member_baseline is explicitly not_covered by the artifact itself) ----
+    # ---- authz-baseline: backs both of its gates ----
     authz_path = os.path.join(evidence_root, "authz-baseline-result.json")
     authz = load_json(authz_path)
     if authz is None:
@@ -349,8 +349,27 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             parent_authority.get("passed") is True and len(parent_authority.get("violations", [])) == 0,
             f"static+live checks: passed={parent_authority.get('passed')} violations={len(parent_authority.get('violations', []))}",
         )
+        # The artifact carries its own verdict for this gate. Copying only its
+        # `reason` and leaving `gates` untouched silently collapsed an explicit
+        # `not_covered` into the module-wide `not_verified` default -- exactly
+        # what BRIDGE_GATE_STATUSES says a bridge must never do.
         member_baseline = authz.get("member_baseline_no_behaviour_regression", {})
-        reasons["member_baseline_no_behaviour_regression"] = member_baseline.get("reason", "not covered by any verifier this round")
+        if not isinstance(member_baseline, dict) or "status" not in member_baseline:
+            raise EvidenceFormatError(
+                f"{authz_path}: member_baseline_no_behaviour_regression is missing a 'status' field"
+            )
+        mb_status = member_baseline["status"]
+        if mb_status not in BRIDGE_GATE_STATUSES:
+            raise EvidenceFormatError(
+                f"{authz_path}: member_baseline_no_behaviour_regression status={mb_status!r} "
+                f"is not one of {sorted(BRIDGE_GATE_STATUSES)}"
+            )
+        gates["member_baseline_no_behaviour_regression"] = mb_status
+        mb_detail = member_baseline.get("reason")
+        reasons["member_baseline_no_behaviour_regression"] = (
+            f"authz-baseline-result.json: member_baseline_no_behaviour_regression={mb_status}"
+            + (f" -- {mb_detail}" if mb_detail else "")
+        )
 
     # ---- events/dispatch verifier bridge: backs 8 gates ----
     # scripts/verify-flow-events-v0.4.sh writes flow-events-result.json with
