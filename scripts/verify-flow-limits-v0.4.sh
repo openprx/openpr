@@ -254,6 +254,9 @@ for f in "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_CORE_ERROR_RS" "$REGISTR
 done
 
 mkdir -p "$EVIDENCE_ROOT" "$EVIDENCE_ROOT/logs"
+FLOW_LIMITS_TARGET="${CARGO_TARGET_DIR:-/opt/worker/.cache/flow-v04-limits-target}"
+mkdir -p "$FLOW_LIMITS_TARGET"
+export CARGO_TARGET_DIR="$FLOW_LIMITS_TARGET"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CONTRACT_SHA256="$(sha256sum "$CONTRACT_PATH" | awk '{print $1}')"
@@ -872,6 +875,13 @@ run_group() {
 }
 
 echo "=== dynamic: cargo test groups ===" >&2
+if [[ $SKIP_CARGO_TEST -ne 1 ]]; then
+  echo "  building collab-isolated-apply-worker for real isolation boundary tests" >&2
+  ( cd "$REPO_ROOT" && cargo build -q -p collab-core --bin collab-isolated-apply-worker ) || {
+    echo "FAIL: collab-isolated-apply-worker failed to build" >&2
+    exit 2
+  }
+fi
 # Broadened from the old "presence_ceiling" filter (which only matched the two presence-ceiling
 # tests) to the whole `flow::collab::registry::tests::` module, matching the convention already
 # used for `snapshot_pure` below. `registry.rs`'s `tests` module also holds the real per-user/
@@ -879,8 +889,8 @@ echo "=== dynamic: cargo test groups ===" >&2
 # test that `boundary_test_covering()` above can now name-match -- without running them here they
 # would never appear in `dtest()`'s pass/fail lookup and every case that requires one would stay
 # `failed` no matter how well the static name-matching works.
-run_group registry_tests api "flow::collab::registry::tests::"
-run_group snapshot_pure api "flow::collab::snapshot::tests::"
+run_group registry_tests api "flow::collab::registry::tests::" "--lib"
+run_group snapshot_pure api "flow::collab::snapshot::tests::" "--lib"
 run_group flow_command_tests api "flow::command::typed_error_mapping_tests::" "--lib"
 run_group collab_core_limits collab-core "limits::tests::"
 # The isolation boundary's own enforcement/test sites (crates/collab-core/src/isolation/{host,
@@ -903,15 +913,16 @@ run_group collab_core_isolation collab-core "isolation::"
 # The "isolation::" filter above cannot reach it; this dedicated group is required for that file's
 # two tests (already in the static scan list) to get any dynamic ok/FAILED status at all.
 run_group collab_core_isolated_worker_bin collab-core "tests::run_metered"
-run_group effective_limits_wire api "flow::collab::limits::tests::effective_limits_serializes_every_frozen_field_non_null"
+run_group effective_limits_wire api "flow::collab::limits::tests::effective_limits_serializes_every_frozen_field_non_null" "--lib"
 # Pure-logic (non-DB) unit tests for the WS rate limiter (frame_rate / update_rate token-bucket
 # boundary + 3-consecutive-window close), colocated in session.rs's own `tests` module (distinct
 # from `database_tests`, which stays DB-backed and is exercised separately below).
-run_group session_tests api "flow::collab::session::tests::"
+run_group session_tests api "flow::collab::session::tests::" "--lib"
+run_group isolation_wire api "flow::collab::write::isolation_rejection_tests::" "--lib"
 # scan_budget's enforcement (`check_scan_budget`) and its boundary tests both belong in
 # flow/query.rs, which the static scan reads but no filter above ran -- so dtest() could never
 # resolve those tests' status and the case failed no matter how well it was covered.
-run_group query_tests api "flow::query::tests::"
+run_group query_tests api "flow::query::tests::" "--lib"
 
 DB_SKIPPED=0
 DB_LOGS=(
@@ -920,6 +931,9 @@ DB_LOGS=(
   "$LOG_DIR/limits.dyn.rest_call_direction.log"
   "$LOG_DIR/limits.dyn.ws_structural_call_direction.log"
   "$LOG_DIR/limits.dyn.page_size_call_direction.log"
+  "$LOG_DIR/limits.dyn.session_observable_kinds.log"
+  "$LOG_DIR/limits.dyn.session_user_connections_kind.log"
+  "$LOG_DIR/limits.dyn.session_wire_boundaries.log"
 )
 if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
   for f in "${DB_LOGS[@]}"; do
@@ -928,11 +942,11 @@ if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
 else
   echo "  running: cargo test -p api routes::collab::...full_session_hello... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api "routes::collab::collab_database_tests::full_session_hello_open_snapshot_update_accepted_and_two_rejections" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.update_bytes_e2e.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::collab::collab_database_tests::full_session_hello_open_snapshot_update_accepted_and_two_rejections" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.update_bytes_e2e.log" 2>&1
   set -e
   echo "  running: cargo test -p api routes::flow::...bootstrap_endpoint... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api "routes::flow::flow_database_tests::bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.bootstrap_wire.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.bootstrap_wire.log" 2>&1
   set -e
   # Call-direction proofs for the structural limits (tree_depth, container_count,
   # document_block_count, text_block_chars, document_text_chars, semantic_patch_operations):
@@ -943,11 +957,11 @@ else
   # apart from "wired but only ever unit-tested in isolation".
   echo "  running: cargo test -p api routes::flow::...commands_endpoint_...tree_depth/batch_count... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api "routes::flow::flow_database_tests::commands_endpoint_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.rest_call_direction.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::commands_endpoint_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.rest_call_direction.log" 2>&1
   set -e
   echo "  running: cargo test -p api flow::collab::write::database_tests::ws_structural_limit_... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api "flow::collab::write::database_tests::ws_structural_limit_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.ws_structural_call_direction.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::write::database_tests::ws_structural_limit_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.ws_structural_call_direction.log" 2>&1
   set -e
   # `page_size`'s exact/+1 boundary test lives in routes/flow.rs::flow_database_tests (a real
   # REST list-endpoint call, not a query.rs-only unit test) -- see the ROUTES_FLOW_RS static scan
@@ -956,7 +970,16 @@ else
   # this test's name, so it needs its own dedicated run here.
   echo "  running: cargo test -p api routes::flow::...list_objects_endpoint_...page_size... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api "routes::flow::flow_database_tests::list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.page_size_call_direction.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.page_size_call_direction.log" 2>&1
+  echo "  running: cargo test -p api --lib session DB wire kind producers" >&2
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "ceiling_is_observable_as_limit_exceeded" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_observable_kinds.log" 2>&1
+  set -e
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "user_connections_ceiling_refuses_the_seventeenth_session_with_the_frozen_limit_kind" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_user_connections_kind.log" 2>&1
+  set -e
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::session::database_tests::" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_wire_boundaries.log" 2>&1
   set -e
   if grep -q "skipped: OPENPR_TEST_DATABASE_URL is not set" "${DB_LOGS[@]}" 2>/dev/null; then
     DB_SKIPPED=1
@@ -1704,9 +1727,85 @@ bootstrap_parity = {
     ),
 }
 
+WIRE_KIND_TESTS = {
+    "bootstrap_decoded_bytes": ["bootstrap_decoded_bytes_exact_boundary_is_accepted_and_plus_one_is_rejected"],
+    "bootstrap_response_bytes": ["bootstrap_response_bytes_exact_boundary_is_accepted_and_plus_one_is_rejected"],
+    "container_count": ["ws_structural_limit_container_count_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "decode_apply_cpu_ms": [
+        "decode_apply_cpu_ms_ceiling_accepts_just_under_and_kills_with_cpu_ceiling_just_over_the_boundary",
+        "every_isolated_apply_resource_ceiling_rejects_with_its_frozen_limit_kind_and_a_numeric_limit",
+    ],
+    "decode_apply_wall_ms": [
+        "decode_apply_wall_ms_ceiling_accepts_just_under_and_kills_with_wall_ceiling_just_over_the_boundary",
+        "every_isolated_apply_resource_ceiling_rejects_with_its_frozen_limit_kind_and_a_numeric_limit",
+    ],
+    "document_block_count": ["ws_structural_limit_document_block_count_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "document_connections": [
+        "per_document_connection_ceiling_is_enforced",
+        "every_connection_ceiling_renders_its_frozen_limit_kind_and_limit_into_the_rejection_frame",
+    ],
+    "document_text_chars": ["ws_structural_limit_document_text_chars_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "frame_rate": ["frame_rate_ceiling_is_observable_as_limit_exceeded_without_closing_the_connection"],
+    "isolated_apply_memory_bytes": [
+        "isolated_apply_memory_bytes_ceiling_accepts_the_exact_byte_and_rejects_the_next_byte_over",
+        "every_isolated_apply_resource_ceiling_rejects_with_its_frozen_limit_kind_and_a_numeric_limit",
+    ],
+    "open_documents": ["open_documents_ceiling_is_observable_as_limit_exceeded_on_the_ninth_attempt"],
+    "page_size": ["list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary"],
+    "presence_entries_per_connection": [
+        "per_connection_presence_ceiling_is_enforced",
+        "both_presence_ceilings_render_their_frozen_limit_kind_and_limit_into_the_rejection_frame",
+    ],
+    "presence_entries_per_document": [
+        "per_document_presence_ceiling_is_enforced_and_does_not_evict_others",
+        "both_presence_ceilings_render_their_frozen_limit_kind_and_limit_into_the_rejection_frame",
+    ],
+    "presence_payload_bytes": ["presence_payload_bytes_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "presence_ttl_seconds": ["presence_ttl_seconds_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "scan_budget": ["check_scan_budget_rejects_one_row_past_the_authorized_scan_rows_max_boundary"],
+    "semantic_patch_bytes": ["commands_endpoint_semantic_patch_bytes_exact_boundary_accepted_plus_one_rejected_zero_writes"],
+    "semantic_patch_operations": ["commands_endpoint_update_block_rejects_semantic_patch_operations_batch_plus_one_and_accepts_exact_boundary"],
+    "slow_consumer_queue_bytes": ["a_slow_consumer_is_force_closed_once_the_queue_byte_ceiling_is_exceeded_independent_of_frame_count"],
+    "slow_consumer_queue_frames": ["a_slow_consumer_is_force_closed_once_the_queue_frame_ceiling_is_exceeded"],
+    "text_block_chars": ["ws_structural_limit_text_block_chars_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "tree_depth": ["ws_structural_limit_tree_depth_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "update_bytes": ["ws_structural_limit_update_bytes_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "update_rate": ["update_rate_ceiling_is_observable_as_limit_exceeded_separately_from_the_frame_rate"],
+    "user_connections": [
+        "user_connections_ceiling_refuses_the_seventeenth_session_with_the_frozen_limit_kind",
+        "every_connection_ceiling_renders_its_frozen_limit_kind_and_limit_into_the_rejection_frame",
+    ],
+    "websocket_frame_bytes": ["websocket_frame_bytes_exact_boundary_accepted_plus_one_rejected_zero_side_effects"],
+    "workspace_connections": [
+        "per_workspace_connection_ceiling_is_enforced",
+        "every_connection_ceiling_renders_its_frozen_limit_kind_and_limit_into_the_rejection_frame",
+    ],
+}
+privacy_omits_observed = {
+    "user_connections",
+    "document_connections",
+    "workspace_connections",
+    "presence_entries_per_document",
+}
+producer_evidence_by_kind = {}
 observed = []
-if dtest("full_session_hello_open_snapshot_update_accepted_and_two_rejections") == "ok" and f["write_rs_limit_exceeded_details_has_limit_kind"]:
-    observed.append("update_bytes")
+for limit_kind, tests in WIRE_KIND_TESTS.items():
+    statuses = {name: dtest(name) for name in tests}
+    passed = all(status == "ok" for status in statuses.values())
+    producer_evidence_by_kind[limit_kind] = {
+        "tests": statuses,
+        "limit_kind_and_numeric_limit_required": True,
+        "observed_field_required": limit_kind not in privacy_omits_observed,
+        "observed_field_policy": (
+            "omitted_by_contract_to_avoid_disclosing_other_user_or_session_counts"
+            if limit_kind in privacy_omits_observed
+            else "optional_on_wire_but_present_where_the_producer_can_report_it_safely"
+        ),
+        "status": "passed" if passed else "failed",
+    }
+    if passed:
+        observed.append(limit_kind)
+observed.sort()
 expected = static["expected_limit_kinds"]
 missing = sorted(set(expected) - set(observed))
 unknown = sorted(set(observed) - set(expected))
@@ -1718,14 +1817,14 @@ error_kind_coverage = {
     "missing": missing,
     "unknown": unknown,
     "not_applicable": static["version_boundary_exemptions"],
+    "producer_evidence_by_kind": producer_evidence_by_kind,
     "note": (
-        "observed[] counts a limit_kind only where a real, currently-passing test proves some caller-"
-        "reachable transport actually emits that exact limit_kind string in a rejection; 'update_bytes' "
-        "qualifies via the WS layer (write.rs::reject_from_collab_error) even though its details object "
-        "is missing the required `limit` field and REST never carries details at all -- see "
-        "boundary_cases[key=update_bytes_max] for the full caveat. Every other expected kind is either "
-        "verified absent or verified wire-broken (details=None / no details field at all); none of them "
-        "count as observed."
+        "observed[] is derived only from currently-passing producer and wire-shape tests named in "
+        "producer_evidence_by_kind. Every counted rejection carries its exact limit_kind and a numeric "
+        "limit. Connection ceilings and presence_entries_per_document intentionally omit `observed` "
+        "because returning aggregate peer counts would disclose other users/sessions; that contract-"
+        "required omission is not treated as missing evidence. The four package-import kinds remain "
+        "outside expected[] under not_applicable_until_v0_8 and are not permanent exemptions."
     ),
 }
 

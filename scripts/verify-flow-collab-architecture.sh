@@ -13,8 +13,7 @@ set -euo pipefail
 # bootstrap_repeatable_read_and_ws_parity,
 # accepted_egress_seq_monotonic_and_gap_resync.
 #
-# HOW IT WORKS (calls what already exists; does not fabricate a load-test
-# harness):
+# HOW IT WORKS (calls what already exists and independently scores its output):
 #
 #   1. ADR status (collab_architecture_adr_accepted): reads the literal
 #      "- 状态：<word>" line from ADR-0010. It is currently "Proposed" (by
@@ -52,43 +51,24 @@ set -euo pipefail
 #      attributes to it exists, actually ran (not silently skipped -- see
 #      the OPENPR_TEST_DATABASE_URL skip-detection below) and passed.
 #
-# HONEST GAPS (recorded in the JSON, `passed` forced false while any of
-# these remain open):
+#   4. Load distributions and REST/WS parity: consumes the JSON emitted by
+#      apps/api/tests/flow_collab_load_harness.rs and independently rechecks
+#      every frozen budget, sample count, server-log reconstruction invariant,
+#      locked statement inventory, RR+RO transaction count, seq continuity,
+#      tail/frontier validity and same-head REST/WS identity. The official run
+#      is admissible only when it is release-built and its recorded PostgreSQL
+#      log container exactly matches --dedicated-pg-container. Shared-instance
+#      numbers are deliberately rejected because WAL/fsync contention changes
+#      both round-trip and transaction-hold distributions.
 #
-#   - bounded_warm_cache_lock_hold_and_round_trip_budgets: ADR-0010 §"量化
-#     接受与推翻门槛" freezes two numbers this script CANNOT check without
-#     a load-generation harness: "hold p95 不超过 25 ms" (a *distribution*
-#     statistic under concurrent load, not the DOCUMENT_LOCK_HOLD_MS_
-#     MAX=100ms hard rollback ceiling this script does verify) and "10 个
-#     并发 client 的 accepted round-trip p95 不超过 250 ms". This script
-#     extracts both numbers from ADR-0010's own text (`load_test_targets_
-#     not_covered`) AND, every run, re-greps apps/ and crates/ for any
-#     plausible load-harness marker (`load_harness_grep` -- patterns like
-#     `round_trip_p95`, `10_client`, `LoadHarness`) instead of assuming
-#     from memory that none exists. It never claims to have MEASURED the
-#     targets even if a harness turns up (running one and reading its
-#     output is still a human/CI job, not something this script fabricates)
-#     -- but the "nothing exists yet" half of the reason is now something
-#     this script re-proves every run rather than repeats verbatim.
-#   - bootstrap_repeatable_read_and_ws_parity: snapshot.rs's own doc
-#     comment on `advancement_stays_correct_when_racing_a_concurrent_
-#     write` literally says "Gate 9 groundwork ... Not the full gate 9
-#     fixture (gate-commands.md's REST/WS 10-client load harness is out
-#     of this task's scope)". This script takes that self-assessment at
-#     face value (it is source-code-adjacent, re-checked every run, not a
-#     one-off claim this script trusts blindly), reuses the same
-#     `load_harness_grep` re-search described above for the harness half
-#     of its reason, and keeps this gate "failed" even when the groundwork
-#     test passes.
-#   - accepted_egress_seq_monotonic_and_gap_resync: this script's own
+#   5. accepted_egress_seq_monotonic_and_gap_resync: this script's own
 #     "Gate <N> `<id>`" marker extraction (used identically for gates 7
 #     and 8 above) is what actually decides this gate's status -- if
 #     snapshot.rs ever grows a Gate 10 `accepted_egress_seq_monotonic_and_
 #     gap_resync` marker with attributed tests, this gate starts scoring
 #     "passed"/"failed" from those tests' real ok/FAILED results like any
-#     other gate. Today no such marker exists, so status is "not_covered"
-#     -- computed by checking the live marker map, not a value baked into
-#     this script.
+#     other gate. Its current markers are scored from their live test output;
+#     deleting or renaming either marker/test makes the gate red again.
 #
 # Exit codes: 0 = every one of the 6 gates recomputed to passed (does not
 # happen today -- see gaps above), 1 = ran to completion and wrote
@@ -110,6 +90,8 @@ ADR_PATH=""
 LIMITS_PATH=""
 JSON_MODE=0
 SKIP_CARGO_TEST=0
+LOAD_HARNESS_EVIDENCE="${OPENPR_FLOW_LOAD_HARNESS_EVIDENCE:-}"
+DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
 
 usage() {
   cat <<'EOF'
@@ -123,10 +105,10 @@ snapshot-advancement and restart-recovery Rust tests
 a hard gate using the "Gate <N> `<id>`" doc-comment markers snapshot.rs
 itself carries. Writes evidence/v0.4/collab-architecture-result.json.
 
-Explicitly does NOT attempt the p95 lock-hold / 10-client round-trip load
-test gate-commands.md also requires (no load-generation harness exists in
-this repository) -- that portion is recorded as not_covered, never as a
-placeholder pass.
+Consumes a separately generated release-mode load-harness artifact for the p95
+lock-hold / 10-client round-trip and REST/WS parity gates. The artifact must be
+from an explicitly declared dedicated PostgreSQL container; shared-instance
+measurements are not accepted as official evidence.
 
 Options:
   --release VER            Gate release identifier (recorded in output).
@@ -146,6 +128,13 @@ Options:
                           /opt/working/sylvode-flow/evidence/v0.4
   --repo-root DIR         Repository containing apps/api and the cargo
                           workspace. Default: this checkout.
+  --load-harness-evidence PATH
+                          JSON emitted by flow_collab_load_harness.rs.
+  --dedicated-pg-container NAME
+                          Required with harness evidence. Must exactly match
+                          environment.pg_log_container in that evidence; this
+                          makes the official no-shared-load prerequisite an
+                          explicit, audited input.
   --skip-cargo-test        Skip the snapshot database test run (fast
                           iteration only; the written evidence records
                           this and every gate that needed the dynamic
@@ -168,6 +157,8 @@ while [[ $# -gt 0 ]]; do
     --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
+    --load-harness-evidence) LOAD_HARNESS_EVIDENCE="${2:?--load-harness-evidence requires a PATH}"; shift 2 ;;
+    --dedicated-pg-container) DEDICATED_PG_CONTAINER="${2:?--dedicated-pg-container requires a NAME}"; shift 2 ;;
     --skip-cargo-test) SKIP_CARGO_TEST=1; shift ;;
     --json) JSON_MODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -227,6 +218,180 @@ mkdir -p "$EVIDENCE_ROOT" "$EVIDENCE_ROOT/logs"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# The load run is intentionally separate from the cheap architecture checks: it needs a release
+# build, PostgreSQL statement logging, and an uncontended dedicated database instance. This block
+# validates the harness artifact rather than trusting its top-level `passed` bit. The declared
+# dedicated container must match the server-log authority recorded by the artifact; omitting that
+# declaration keeps both load-dependent gates red.
+HARNESS_CHECK_JSON="$(python3 - "$LOAD_HARNESS_EVIDENCE" "$DEDICATED_PG_CONTAINER" <<'PY'
+import json
+import os
+import sys
+import hashlib
+from collections import defaultdict
+
+path, dedicated_container = sys.argv[1:3]
+if not path:
+    print(json.dumps({
+        "available": False,
+        "evidence_path": None,
+        "official_environment_ok": False,
+        "budget_gate_passed": False,
+        "parity_gate_passed": False,
+        "violations": ["no --load-harness-evidence was supplied"],
+    }))
+    raise SystemExit(0)
+if not os.path.isfile(path):
+    print(json.dumps({"error": f"load harness evidence does not exist: {path}"}))
+    raise SystemExit(0)
+try:
+    raw = json.load(open(path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    print(json.dumps({"error": f"load harness evidence is not valid JSON: {exc}"}))
+    raise SystemExit(0)
+if raw.get("schema_version") != "sylvode.flow.collab-load-harness.v1":
+    print(json.dumps({"error": "load harness evidence has the wrong schema_version"}))
+    raise SystemExit(0)
+
+env = raw.get("environment") or {}
+ten = raw.get("10_client") or {}
+lock = raw.get("lock") or {}
+parity = raw.get("bootstrap_parity") or {}
+budgets = raw.get("budgets") or {}
+round_trip = ten.get("round_trip_p95") or {}
+hold = lock.get("lock_hold_p95") or {}
+wait = lock.get("lock_wait") or {}
+gap = lock.get("intra_lock_app_gap") or {}
+reconstruction = lock.get("reconstruction") or {}
+observations = parity.get("observations") or []
+violations = []
+
+actual_container = env.get("pg_log_container")
+official_environment_ok = bool(
+    dedicated_container
+    and actual_container == dedicated_container
+    and env.get("build_profile") == "release"
+    and isinstance(env.get("postgres_version"), str)
+    and env.get("postgres_version")
+    and "postgresql server statement log" in str(env.get("measurement_authority", "")).lower()
+)
+if not dedicated_container:
+    violations.append("official run requires --dedicated-pg-container; shared PostgreSQL measurements are inadmissible")
+elif actual_container != dedicated_container:
+    violations.append(
+        f"declared dedicated PostgreSQL container {dedicated_container!r} does not match evidence {actual_container!r}"
+    )
+if env.get("build_profile") != "release":
+    violations.append("load harness evidence is not from a release build")
+if not official_environment_ok and dedicated_container and actual_container == dedicated_container:
+    violations.append("load harness environment lacks PostgreSQL version or server-log measurement authority")
+
+min_samples = budgets.get("min_samples")
+budget_checks = {
+    "ten_clients": ten.get("clients") == 10,
+    "round_trip_samples": isinstance(min_samples, (int, float)) and round_trip.get("samples", 0) >= min_samples,
+    "round_trip_p95": round_trip.get("p95_ms", float("inf")) <= budgets.get("round_trip_p95_ms_max", -1),
+    "lock_hold_samples": isinstance(min_samples, (int, float)) and hold.get("samples", 0) >= min_samples,
+    "lock_hold_p95": hold.get("p95_ms", float("inf")) <= budgets.get("lock_hold_p95_ms_max", -1),
+    "lock_hold_single": hold.get("max_ms", float("inf")) <= budgets.get("lock_hold_single_ms_max", -1),
+    "lock_wait_single": wait.get("max_ms", float("inf")) <= budgets.get("lock_wait_ms_max", -1),
+    "intra_lock_app_gap_p95": gap.get("p95_ms", float("inf")) <= budgets.get("intra_lock_app_gap_ms_max", -1),
+    "committed_write_coverage": lock.get("committed_write_transactions") == ten.get("accepted_total"),
+    "locked_phase_statement_allowlist_exact": len(lock.get("locked_phase_statement_inventory") or []) == 11,
+    "statement_log_resolved": reconstruction.get("unresolved_statements") == 0
+        and lock.get("unterminated_transactions") == 0,
+}
+
+identity_fields = ("wire_hash", "semantic_hash", "head_frontier", "snapshot_seq")
+by_head = defaultdict(list)
+observation_shapes_ok = True
+for item in observations:
+    if not isinstance(item, dict):
+        observation_shapes_ok = False
+        continue
+    if item.get("tail_contiguous") is not True or item.get("frontier_equivalent_to_replay") is not True:
+        observation_shapes_ok = False
+    by_head[item.get("head_seq")].append(item)
+surface_comparisons = 0
+divergent_heads = []
+for head, group in by_head.items():
+    surfaces = {item.get("surface") for item in group}
+    if {"rest_bootstrap", "ws_snapshot"}.issubset(surfaces):
+        surface_comparisons += 1
+        identities = {tuple(item.get(field) for field in identity_fields) for item in group}
+        if len(identities) != 1:
+            divergent_heads.append(head)
+
+parity_checks = {
+    "seq_contiguous": ten.get("seq_contiguous") is True,
+    "head_matches_accepted": ten.get("head_seq") == ten.get("accepted_total") and ten.get("accepted_total", 0) > 0,
+    "bootstrap_repeatable_read_read_only": parity.get("bootstrap_transactions", 0) > 0
+        and parity.get("bootstrap_transactions") == parity.get("repeatable_read_read_only_transactions"),
+    "observation_count": len(observations) >= 4,
+    "tail_frontier_observations": observation_shapes_ok,
+    "rest_ws_comparisons": surface_comparisons > 0,
+    "rest_ws_divergence_zero": not divergent_heads,
+}
+
+raw_integrity_ok = raw.get("passed") is True and raw.get("violations") == []
+budget_gate_passed = official_environment_ok and raw_integrity_ok and all(budget_checks.values())
+parity_gate_passed = official_environment_ok and raw_integrity_ok and all(parity_checks.values())
+for name, ok in {**budget_checks, **parity_checks}.items():
+    if not ok:
+        violations.append(f"harness check failed: {name}")
+if not raw_integrity_ok:
+    violations.append("harness self-verdict is not passed with an empty violations array")
+
+print(json.dumps({
+    "available": True,
+    "evidence_path": os.path.abspath(path),
+    "evidence_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+    "official_environment": {
+        "required": "release build on an explicitly declared dedicated PostgreSQL container",
+        "declared_dedicated_pg_container": dedicated_container or None,
+        "recorded_pg_log_container": actual_container,
+        "build_profile": env.get("build_profile"),
+        "postgres_version": env.get("postgres_version"),
+        "measurement_authority": env.get("measurement_authority"),
+        "shared_database_measurements_accepted": False,
+    },
+    "official_environment_ok": official_environment_ok,
+    "budget_checks": budget_checks,
+    "parity_checks": parity_checks,
+    "surface_comparisons": surface_comparisons,
+    "divergent_heads": divergent_heads,
+    "budget_gate_passed": budget_gate_passed,
+    "parity_gate_passed": parity_gate_passed,
+    "measurements": {
+        "round_trip": round_trip,
+        "lock_hold": hold,
+        "lock_wait": wait,
+        "intra_lock_app_gap": gap,
+        "commit_wal_flush": lock.get("commit_wal_flush"),
+        "accepted_total": ten.get("accepted_total"),
+        "head_seq": ten.get("head_seq"),
+        "committed_write_transactions": lock.get("committed_write_transactions"),
+        "locked_phase_statement_count": len(lock.get("locked_phase_statement_inventory") or []),
+        "bootstrap_transactions": parity.get("bootstrap_transactions"),
+        "repeatable_read_read_only_transactions": parity.get("repeatable_read_read_only_transactions"),
+        "parity_observations": len(observations),
+    },
+    "violations": violations,
+}))
+PY
+)"
+if ! jq -e . >/dev/null 2>&1 <<<"$HARNESS_CHECK_JSON"; then
+  echo "FAIL: load harness evidence parser did not produce valid JSON" >&2
+  exit 2
+fi
+if jq -e 'has("error")' >/dev/null 2>&1 <<<"$HARNESS_CHECK_JSON"; then
+  echo "FAIL: $(jq -r '.error' <<<"$HARNESS_CHECK_JSON")" >&2
+  exit 2
+fi
+echo "=== load harness evidence ===" >&2
+jq -r '"  available=\(.available) dedicated_environment=\(.official_environment_ok) budget_gate=\(.budget_gate_passed) parity_gate=\(.parity_gate_passed)"' <<<"$HARNESS_CHECK_JSON" >&2
+jq -r '.violations[] | "  VIOLATION: " + .' <<<"$HARNESS_CHECK_JSON" >&2
+
 # ---- 1+2. static checks: ADR status + frozen numeric budgets ----
 STATIC_JSON="$(python3 - "$ADR_PATH" "$LIMITS_RS" "$REPO_ROOT" <<'PY'
 import json
@@ -285,13 +450,8 @@ for name, val in warm_cache_constants.items():
         violations.append(f"expected warm-cache constant {name} not found in {limits_rs}")
 
 # ---- load-generation harness existence: re-grepped from the live tree every run, never assumed.
-# The p95 numbers above are distribution statistics under concurrent load -- this script cannot
-# derive "no harness exists" from memory; it has to keep re-searching the tree for one on every
-# run, exactly like the flow_event_payload_policy registry search in
-# verify-flow-events-v0.4.sh does for its own "not built yet" gap. If a harness plausibly matching
-# these patterns is ever added, this flips to True and the gates below stop asserting its absence
-# (they still cannot claim the numeric target is *met* without running it -- that remains a human
-# call -- but they stop repeating a now-false "nothing exists" claim).
+# This structural check binds the supplied artifact to a real harness source in the checkout. The
+# numeric verdict still comes only from HARNESS_CHECK_JSON above, never from this grep.
 LOAD_HARNESS_PATTERNS = [
     r"round_trip_p95",
     r"lock_hold_p95",
@@ -331,10 +491,10 @@ print(json.dumps({
         "max_rebase_attempts": {"adr": max_rebase_attempts_adr, "source_const": max_rebase_attempts_src},
         "warm_cache_constants_present": warm_cache_constants,
     },
-    "load_test_targets_not_covered": {
+    "load_test_targets": {
         "lock_hold_p95_ms": lock_hold_p95_ms_adr,
         "round_trip_p95_ms_10_clients": round_trip_p95_ms_adr,
-        "reason": "distribution statistics under concurrent load; see load_harness_grep for whether a harness now exists to measure them",
+        "reason": "frozen distribution targets independently re-evaluated from the supplied load-harness evidence",
     },
     "load_harness_grep": {
         "patterns_searched": LOAD_HARNESS_PATTERNS,
@@ -368,8 +528,8 @@ jq -r '.frozen_budgets | to_entries[] | select(.key != "warm_cache_constants_pre
 if [[ "$CONSTANT_VIOLATION_COUNT" -gt 0 ]]; then
   jq -r '.constant_cross_check_violations[] | "  VIOLATION: " + .' <<<"$STATIC_JSON" >&2
 fi
-echo "=== load-test targets this script cannot itself measure (distribution stats under concurrent load) ===" >&2
-jq -r '.load_test_targets_not_covered | "  lock_hold_p95_ms=\(.lock_hold_p95_ms) round_trip_p95_ms_10_clients=\(.round_trip_p95_ms_10_clients)"' <<<"$STATIC_JSON" >&2
+echo "=== frozen load-test distribution targets ===" >&2
+jq -r '.load_test_targets | "  lock_hold_p95_ms=\(.lock_hold_p95_ms) round_trip_p95_ms_10_clients=\(.round_trip_p95_ms_10_clients)"' <<<"$STATIC_JSON" >&2
 echo "=== load-generation harness existence (re-grepped from apps/ and crates/ every run, never assumed) ===" >&2
 echo "  patterns searched: $(jq -c '.load_harness_grep.patterns_searched' <<<"$STATIC_JSON")" >&2
 echo "  harness found: $LOAD_HARNESS_EXISTS" >&2
@@ -445,18 +605,17 @@ jq -r '.by_gate | to_entries[] | "  \(.key): \(.value | join(", "))"' <<<"$MARKE
 
 # ---- cross-check every mapped test exists in the LIVE test binary ----
 LIVE_LIST_LOG="$EVIDENCE_ROOT/logs/collab.snapshot_list.log"
-if ! ( cd "$REPO_ROOT" && cargo test -p api flow::collab::snapshot:: -- --list ) > "$LIVE_LIST_LOG" 2>&1; then
+if ! ( cd "$REPO_ROOT" && cargo test -p api --lib flow::collab::snapshot:: -- --list ) > "$LIVE_LIST_LOG" 2>&1; then
   echo "FAIL: 'cargo test ... -- --list' did not succeed; see $LIVE_LIST_LOG" >&2
   exit 2
 fi
 LOCK_TEST_LIST_LOG="$EVIDENCE_ROOT/logs/collab.write_lock_list.log"
-if ! ( cd "$REPO_ROOT" && cargo test -p api flow::collab::write::database_tests::lock_timeout_budgets_match_the_frozen_limits_v1_numbers -- --list ) > "$LOCK_TEST_LIST_LOG" 2>&1; then
+if ! ( cd "$REPO_ROOT" && cargo test -p api --lib flow::collab::write::database_tests::lock_timeout_budgets_match_the_frozen_limits_v1_numbers -- --list ) > "$LOCK_TEST_LIST_LOG" 2>&1; then
   echo "FAIL: 'cargo test ... -- --list' did not succeed for the write.rs lock-timeout test; see $LOCK_TEST_LIST_LOG" >&2
   exit 2
 fi
 
-MARKERS_JSON_FILE="$(mktemp)"
-trap 'rm -f "$MARKERS_JSON_FILE"' EXIT
+MARKERS_JSON_FILE="$EVIDENCE_ROOT/logs/collab.gate-markers.json"
 printf '%s' "$MARKERS_JSON" > "$MARKERS_JSON_FILE"
 
 MAPPING_VIOLATIONS_JSON="$(python3 - "$LIVE_LIST_LOG" "$MARKERS_JSON_FILE" <<'PY'
@@ -497,9 +656,9 @@ if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
 else
   echo "=== running: cargo test -p api flow::collab::snapshot:: (in $REPO_ROOT) ===" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api flow::collab::snapshot:: -- --test-threads=4 ) > "$RUN_LOG" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib flow::collab::snapshot:: -- --test-threads=4 ) > "$RUN_LOG" 2>&1
   SNAPSHOT_TEST_EXIT=$?
-  ( cd "$REPO_ROOT" && cargo test -p api flow::collab::write::database_tests::lock_timeout_budgets_match_the_frozen_limits_v1_numbers -- --test-threads=1 ) >> "$RUN_LOG" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib flow::collab::write::database_tests::lock_timeout_budgets_match_the_frozen_limits_v1_numbers -- --test-threads=1 ) >> "$RUN_LOG" 2>&1
   LOCK_TEST_EXIT=$?
   set -e
   echo "cargo test exit codes: snapshot=$SNAPSHOT_TEST_EXIT lock_timeout=$LOCK_TEST_EXIT (informational only -- pass/fail below is derived from parsing each test's own ok/FAILED line)" >&2
@@ -576,6 +735,7 @@ FINAL_JSON="$(jq -n \
   --argjson lock_test_passed "$LOCK_TEST_PASSED" \
   --argjson frozen_limits_test_passed "$FROZEN_LIMITS_TEST_PASSED" \
   --argjson load_harness_exists "$LOAD_HARNESS_EXISTS" \
+  --argjson harness "$HARNESS_CHECK_JSON" \
   --argjson snap "$RESULT_JSON" \
   '
   def gate($id): ($snap.gates[$id].dynamic_passed // false);
@@ -597,7 +757,7 @@ FINAL_JSON="$(jq -n \
       lock_timeout_budgets_match_the_frozen_limits_v1_numbers_test: $lock_test_passed,
       frozen_limits_v1_numbers_are_exactly_what_this_module_enforces_test: $frozen_limits_test_passed,
       verified_portion_passed: $numeric_budgets_verified_portion,
-      load_test_targets_not_covered: $static_check.load_test_targets_not_covered
+      load_harness: $harness
     },
     gates: {
       collab_architecture_adr_accepted: {
@@ -605,14 +765,13 @@ FINAL_JSON="$(jq -n \
         reason: (if $adr_accepted then null else ("ADR-0010 status is \"" + $static_check.adr_status + "\", not \"Accepted\"") end)
       },
       bounded_warm_cache_lock_hold_and_round_trip_budgets: {
-        status: "failed",
+        status: (if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed) then "passed" else "failed" end),
         reason: (
-          "hard-ceiling constants (lock wait/hold/rebase-attempts) verified against source and passing real tests, but the gate additionally requires p95 lock-hold <=25ms and 10-client accepted round-trip p95 <=250ms under concurrent load, which needs a load-generation harness to measure -- "
-          + (if $load_harness_exists then
-              "a possible harness now exists in this repository (see load_harness_grep.hit_files below) that this script cannot yet interpret; this gate needs MANUAL review to check whether it actually measures and meets the p95 targets, not a repeat of the old \"nothing exists\" claim"
-            else
-              "repo-wide grep for " + ($static_check.load_harness_grep.patterns_searched | join(", ")) + " found zero hits under apps/ and crates/ (re-checked every run) -- no such harness exists yet, this is a build gap, not a tooling limitation"
-            end)
+          if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed) then
+            "frozen constants and their tests pass; dedicated release PostgreSQL harness evidence meets lock hold p95/single, wait, in-lock gap, 10-client round-trip p95, sample-size, statement-inventory and reconstruction-coverage budgets"
+          else
+            "numeric constants or independently re-evaluated dedicated load-harness checks failed; see load_harness.violations and budget_checks"
+          end
         ),
         verified_portion: {
           constant_cross_check_passed: $constants_passed,
@@ -620,7 +779,7 @@ FINAL_JSON="$(jq -n \
           frozen_limits_test_passed: $frozen_limits_test_passed
         },
         load_harness_grep: $static_check.load_harness_grep,
-        not_covered: $static_check.load_test_targets_not_covered
+        load_harness: $harness
       },
       minimal_snapshot_advancement_bounds_tail: {
         status: (if (gate("minimal_snapshot_advancement_bounds_tail") and $frozen_limits_test_passed) then "passed" else "failed" end),
@@ -631,18 +790,18 @@ FINAL_JSON="$(jq -n \
         tests: gate_tests("snapshot_tail_restart_recovery")
       },
       bootstrap_repeatable_read_and_ws_parity: {
-        status: "failed",
+        status: (if ($load_harness_exists and $harness.parity_gate_passed) then "passed" else "failed" end),
         groundwork_test: ($snap.groundwork["9"] // null),
         reason: (
-          "gate-commands.md requires a REST/WS 10-client load harness proving the same REPEATABLE READ view and cross-surface seq/hash/frontier parity -- "
-          + (if $load_harness_exists then
-              "a possible harness now exists in this repository (see load_harness_grep.hit_files below) that this script cannot yet interpret; this gate needs MANUAL review, not a repeat of the old \"nothing exists\" claim"
-            else
-              "repo-wide grep for " + ($static_check.load_harness_grep.patterns_searched | join(", ")) + " found zero hits under apps/ and crates/ (re-checked every run) -- no such harness exists yet"
-            end)
+          if ($load_harness_exists and $harness.parity_gate_passed) then
+            "dedicated release PostgreSQL harness independently confirms REPEATABLE READ READ ONLY bootstrap transactions, contiguous accepted seq/tails, frontier equivalence and zero REST/WS identity divergence"
+          else
+            "dedicated load-harness parity checks failed; see load_harness.violations and parity_checks"
+          end
         ),
         load_harness_grep: $static_check.load_harness_grep,
-        note: "the source own doc comment on the groundwork test above explicitly disclaims full gate-9 coverage (\"Not the full gate 9 fixture ... out of this task scope\"); this script honors that disclaimer and never rounds the groundwork test pass up to gate passed, even when groundwork_test.status is ok"
+        load_harness: $harness,
+        note: "the snapshot groundwork test remains supplemental; only the full harness evidence can satisfy this gate"
       },
       accepted_egress_seq_monotonic_and_gap_resync: {
         status: (if ($snap.gates | has("accepted_egress_seq_monotonic_and_gap_resync")) then (if gate("accepted_egress_seq_monotonic_and_gap_resync") then "passed" else "failed" end) else "not_covered" end),
