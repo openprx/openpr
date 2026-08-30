@@ -1506,20 +1506,23 @@ mod database_tests {
         .n
     }
 
-    /// Submits `bytes` and retries, bounded, on `RejectedCode::ServerDraining` --
-    /// `error-mapping-v1.md`: that code is defined as recoverable, "客户端保留 intent 后重试", the
-    /// exact behavior a real caller is contractually expected to have. This module's own
-    /// `epoch_fence_lock_timeout_must_not_surface_as_policy_rejected` test already documents that
-    /// many scratch databases hammering one shared Postgres instance under `cargo test --workspace`
-    /// produces real, transient lock/rebase contention independent of any application bug; the
-    /// several structural-limit tests below submit many real transactions in a tight loop
-    /// (building up to `container_count_max`/`document_block_count_max` fixture state) and are
-    /// exactly the shape most likely to observe it. Retrying here changes nothing about what is
-    /// under test: a `limit_exceeded` rejection (the actual assertion every caller of this
-    /// function cares about) is never `ServerDraining` and is always returned on the first
-    /// attempt, unretried; only the recoverable, contract-defined transient code is retried, and
-    /// only a bounded number of times, so a genuine, persistent failure still surfaces as a test
-    /// failure rather than hanging.
+    /// Submits `bytes` and retries on `RejectedCode::ServerDraining` until either it stops
+    /// happening or a wall-clock deadline passes -- `error-mapping-v1.md`: that code is defined
+    /// as recoverable, "客户端保留 intent 后重试", the exact behavior a real caller is
+    /// contractually expected to have, with no contract-stated upper bound on how long a
+    /// compliant caller keeps trying (unlike `limit_exceeded`, which is final and never retried).
+    /// This module's own `epoch_fence_lock_timeout_must_not_surface_as_policy_rejected` test
+    /// already documents that many scratch databases hammering one shared Postgres instance under
+    /// `cargo test --workspace` produces real, transient lock/rebase contention independent of any
+    /// application bug; the several structural-limit tests below submit many real transactions in
+    /// a tight loop (building up to `container_count_max`/`document_block_count_max` fixture
+    /// state) and are exactly the shape most likely to observe it, including sustained multi-
+    /// second congestion windows a small fixed attempt count was observed not to outlast.
+    /// Retrying here changes nothing about what is under test: a `limit_exceeded` rejection (the
+    /// actual assertion every caller of this function cares about) is never `ServerDraining` and
+    /// is always returned on the first attempt, unretried; only the recoverable, contract-defined
+    /// transient code is retried, and only until `CONTENTION_RETRY_DEADLINE`, so a genuine,
+    /// persistent failure still surfaces as a test failure rather than hanging forever.
     #[allow(clippy::too_many_arguments)]
     async fn submit(
         state: &AppState,
@@ -1533,10 +1536,10 @@ mod database_tests {
         bytes: Vec<u8>,
         label: &str,
     ) -> AcceptOutcome {
-        const MAX_CONTENTION_ATTEMPTS: u32 = 100;
-        let mut attempt = 0u32;
+        const CONTENTION_RETRY_DEADLINE: Duration = Duration::from_mins(3);
+        const CONTENTION_RETRY_BACKOFF: Duration = Duration::from_millis(150);
+        let started = std::time::Instant::now();
         loop {
-            attempt += 1;
             let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
             let outcome = accept_update(
                 &state.db,
@@ -1563,8 +1566,8 @@ mod database_tests {
             .expect("accept_update does not hit a hard database error");
             let is_recoverable_contention =
                 matches!(&outcome, AcceptOutcome::Rejected(rejected) if rejected.code == RejectedCode::ServerDraining);
-            if is_recoverable_contention && attempt < MAX_CONTENTION_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            if is_recoverable_contention && started.elapsed() < CONTENTION_RETRY_DEADLINE {
+                tokio::time::sleep(CONTENTION_RETRY_BACKOFF).await;
                 continue;
             }
             return outcome;

@@ -1451,19 +1451,22 @@ mod flow_database_tests {
     // `flow::command` directly, and not the WebSocket path (`flow::collab::write::database_tests`
     // covers that separately via `check_snapshot`).
 
-    /// Runs one command through the real `post_flow_object_command` handler and retries, bounded,
-    /// on envelope `code=409`/`message="server_draining"` -- `error-mapping-v1.md`: that code is
-    /// recoverable, "客户端保留 intent 后重试", the exact behavior a real caller is contractually
-    /// expected to have. The tests below submit many real commands/transactions in a tight loop
-    /// against a real database shared with the rest of `cargo test --workspace`'s parallel run, so
-    /// they are exactly the shape most likely to observe transient lock/rebase contention
-    /// (`flow::collab::write::database_tests`'s own `submit` helper documents the same root
-    /// cause). Retrying here changes nothing about what is under test: `code=400` naming a
-    /// `limit_kind` (the actual assertion every caller of this function cares about) is never
-    /// `server_draining` and is always returned on the first attempt, unretried; only the
-    /// recoverable, contract-defined transient code is retried, and only a bounded number of
-    /// times, so a genuine, persistent failure still surfaces as a test failure rather than
-    /// hanging. Each retry uses a fresh `idempotency_key` (the prior attempt was never persisted).
+    /// Runs one command through the real `post_flow_object_command` handler and retries on
+    /// envelope `code=409`/`message="server_draining"` until either it stops happening or a
+    /// wall-clock deadline passes -- `error-mapping-v1.md`: that code is recoverable, "客户端保留
+    /// intent 后重试", the exact behavior a real caller is contractually expected to have, with no
+    /// contract-stated upper bound on how long a compliant caller keeps trying. The tests below
+    /// submit many real commands/transactions in a tight loop against a real database shared with
+    /// the rest of `cargo test --workspace`'s parallel run, so they are exactly the shape most
+    /// likely to observe transient lock/rebase contention (`flow::collab::write::database_tests`'s
+    /// own `submit` helper documents the same root cause, including sustained multi-second
+    /// congestion windows a small fixed attempt count was observed not to outlast). Retrying here
+    /// changes nothing about what is under test: `code=400` naming a `limit_kind` (the actual
+    /// assertion every caller of this function cares about) is never `server_draining` and is
+    /// always returned on the first attempt, unretried; only the recoverable, contract-defined
+    /// transient code is retried, and only until `CONTENTION_RETRY_DEADLINE`, so a genuine,
+    /// persistent failure still surfaces as a test failure rather than hanging forever. Each retry
+    /// uses a fresh `idempotency_key` (the prior attempt was never persisted).
     async fn run_command(
         state: &AppState,
         claims: &Extension<JwtClaims>,
@@ -1471,10 +1474,10 @@ mod flow_database_tests {
         command_type: &str,
         payload: Value,
     ) -> Value {
-        const MAX_CONTENTION_ATTEMPTS: u32 = 100;
-        let mut attempt = 0u32;
+        const CONTENTION_RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_mins(3);
+        const CONTENTION_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+        let started = std::time::Instant::now();
         loop {
-            attempt += 1;
             let response = to_response(
                 post_flow_object_command(
                     State(state.clone()),
@@ -1496,8 +1499,8 @@ mod flow_database_tests {
             assert_eq!(response.status(), axum::http::StatusCode::OK);
             let body = body_json(response).await;
             let is_recoverable_contention = body["code"] == 409 && body["message"] == "server_draining";
-            if is_recoverable_contention && attempt < MAX_CONTENTION_ATTEMPTS {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if is_recoverable_contention && started.elapsed() < CONTENTION_RETRY_DEADLINE {
+                tokio::time::sleep(CONTENTION_RETRY_BACKOFF).await;
                 continue;
             }
             return body;
