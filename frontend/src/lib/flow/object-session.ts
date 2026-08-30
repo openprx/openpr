@@ -24,7 +24,6 @@ import { writable, type Readable } from 'svelte/store';
 import type {
 	EngineUpdate,
 	FlowError,
-	FlowErrorCode,
 	FlowLimitsNegotiation,
 	FlowLimitsV1,
 	ObjectHandle,
@@ -33,6 +32,13 @@ import type {
 	SyncState
 } from './types';
 import { DEFAULT_FLOW_LIMITS, checkUpdateBytes } from './limits';
+import {
+	clientError,
+	drainDisposition,
+	flowErrorFromCloseCode,
+	flowErrorFromEnvelope,
+	flowErrorFromRejectedFrame
+} from './errors';
 
 export interface AcceptedNotice {
 	readonly headSeq: number;
@@ -60,6 +66,8 @@ interface SessionHooks {
 }
 
 const PROTOCOL_VERSION = 1;
+/** How long `connect()` waits for the first `snapshot` before giving up on this attempt. */
+const CONNECT_TIMEOUT_MS = 15_000;
 const BACKOFF_STEPS_MS = [250, 500, 1000, 2000, 5000];
 
 function toBase64(bytes: Uint8Array): string {
@@ -106,6 +114,8 @@ export class LoroObjectSession implements ObjectSessionContract {
 	private handle: ObjectHandle | null = null;
 	private readonly pending = new Map<string, PendingResolve>();
 	private reconnectAttempt = 0;
+	private lastReconnectDelayMs: number | null = null;
+	private connectTimeout: ReturnType<typeof setTimeout> | null = null;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	private disposed = false;
 	private manualClose = false;
@@ -116,7 +126,10 @@ export class LoroObjectSession implements ObjectSessionContract {
 	private limits: FlowLimitsV1 = DEFAULT_FLOW_LIMITS;
 	/** True once a `Bootstrap.limits` payload was rejected by version negotiation. Local writes
 	 * are blocked while set (`limits-v1.md`: "Client 不得自行放宽或缓存跨 `version` limits"). */
-	private unknownLimitsVersion: Extract<FlowLimitsNegotiation, { outcome: 'unknownVersion' }> | null = null;
+	private unknownLimitsVersion: Extract<
+		FlowLimitsNegotiation,
+		{ outcome: 'unknownVersion' }
+	> | null = null;
 	/** Resolved/rejected the first time this connection reaches `snapshot` or a terminal failure.
 	 * `connect()` awaits this so callers (`ObjectRepository.open`) never hand a doc to
 	 * `EditorAdapter`/a navigator reorder before the doc actually has server content imported --
@@ -177,13 +190,25 @@ export class LoroObjectSession implements ObjectSessionContract {
 			this.firstSync = { resolve, reject };
 		});
 		const timeout = new Promise<void>((_, reject) => {
-			setTimeout(() => reject({ code: 'server_draining', recoverable: true, details: { reason: 'contention' } }), 15_000);
+			// A connect that never completes is a LOCAL condition, so it is marked as such. It used
+			// to reject with a hand-built `server_draining{reason:'contention'}` -- a required,
+			// server-produced discriminator manufactured by the client, which would have shown a
+			// server-contention banner for what is really "this browser got no answer", and would
+			// have made every "the UI honoured the server's reason" assertion pass vacuously.
+			this.connectTimeout = setTimeout(
+				() => reject(clientError('resync_required')),
+				CONNECT_TIMEOUT_MS
+			);
 		});
 		await this.openSocket();
 		try {
 			await Promise.race([firstSync, timeout]);
 		} finally {
 			this.firstSync = null;
+			if (this.connectTimeout) {
+				clearTimeout(this.connectTimeout);
+				this.connectTimeout = null;
+			}
 		}
 	}
 
@@ -227,13 +252,27 @@ export class LoroObjectSession implements ObjectSessionContract {
 		if (ticketResult.code === 403) {
 			// `forbidden`/`feature_disabled`: not recoverable by retrying (`error-mapping-v1.md`
 			// UI invariant "auth/feature/forbidden 不自动无限重连"), unlike a transient failure.
+			// Both map to HTTP-equivalent 403, so the stable `error_code` -- not the status, and
+			// never the message -- decides which one this is.
 			this.setState('error');
-			const error: FlowError = { code: 'forbidden', recoverable: false };
+			const error: FlowError = flowErrorFromEnvelope(ticketResult) ?? {
+				code: 'forbidden',
+				recoverable: false
+			};
 			this.hooks.onFlowError(error);
 			this.firstSync?.reject(error);
 			return;
 		}
 		if (ticketResult.code !== 0 || !ticketResult.data) {
+			// A typed rejection on the ticket endpoint is the REST half of the same producer the
+			// WebSocket `rejected` frame carries -- most importantly `server_draining`, whose
+			// required `details.reason` decides whether this client waits out a drain or retries a
+			// contention. Reconnecting blindly here would discard that discriminator.
+			const rejection = flowErrorFromEnvelope(ticketResult);
+			if (rejection) {
+				this.applyFlowError(rejection);
+				return;
+			}
 			this.scheduleReconnect();
 			return;
 		}
@@ -279,19 +318,11 @@ export class LoroObjectSession implements ObjectSessionContract {
 		socket.addEventListener('close', (event) => {
 			this.socket = null;
 			if (this.manualClose || this.disposed) return;
-			if (event.code === 4401) {
-				this.setState('auth_required');
-				this.firstSync?.reject({ code: 'unauthenticated', recoverable: true });
-				return;
-			}
-			if (event.code === 4403 || event.code === 4404) {
-				this.setState('error');
-				const error: FlowError = {
-					code: event.code === 4403 ? 'forbidden' : 'feature_disabled',
-					recoverable: false
-				};
-				this.hooks.onFlowError(error);
-				this.firstSync?.reject(error);
+			// The frozen WS close codes (`error-mapping-v1.md`'s "WS close/control" column) are
+			// machine-readable discriminators in their own right, including 4410's drain payload.
+			const closed = flowErrorFromCloseCode(event.code, event.reason ?? '');
+			if (closed) {
+				this.applyFlowError(closed);
 				return;
 			}
 			this.scheduleReconnect();
@@ -358,9 +389,9 @@ export class LoroObjectSession implements ObjectSessionContract {
 				break;
 			}
 			case 'rejected': {
-				const code = frame.code as FlowErrorCode;
+				const error = flowErrorFromRejectedFrame(frame);
+				if (!error) break;
 				const updateId = frame.update_id as string | undefined;
-				const error: FlowError = { code, recoverable: Boolean(frame.recoverable), details: frame.details };
 				if (updateId) {
 					const waiter = this.pending.get(updateId);
 					if (waiter) {
@@ -368,18 +399,7 @@ export class LoroObjectSession implements ObjectSessionContract {
 						waiter.reject(error);
 					}
 				}
-				if (code === 'server_draining') {
-					const details = frame.details as { reason?: string } | undefined;
-					if (details?.reason === 'drain') {
-						this.setState('reconnecting');
-					}
-					// reason === "contention": connection stays open, caller can retry the write.
-				} else if (code === 'resync_required') {
-					this.setState('resyncing');
-					this.reconnect('stale_frontier');
-				} else {
-					this.hooks.onFlowError(error);
-				}
+				this.applyFlowError(error);
 				break;
 			}
 			case 'resync': {
@@ -396,6 +416,60 @@ export class LoroObjectSession implements ObjectSessionContract {
 		}
 	}
 
+	/** The single place a `FlowError` -- from a REST envelope, a `rejected` control frame or a
+	 * close code -- turns into a sync state and a user-visible report.
+	 *
+	 * `server_draining`'s two reasons share a stable code and MUST diverge here, in exactly the
+	 * ways `error-mapping-v1.md` freezes: `drain` gives up this connection and waits out the
+	 * advertised `retry_after_ms` before reconnecting; `contention` keeps the socket and the
+	 * accepted head untouched and lets the caller retry the write. A `server_draining` with a
+	 * missing or unknown `details.reason` is a protocol violation, not a third behaviour: it is
+	 * reported and NOT acted on, because both possible guesses are harmful (retrying into a
+	 * draining instance, or showing maintenance for a lock conflict). */
+	private applyFlowError(error: FlowError): void {
+		if (error.code === 'server_draining') {
+			const disposition = drainDisposition(error);
+			this.hooks.onFlowError(error);
+			// An error that arrives before this connection ever reached `snapshot` means the OPEN
+			// itself failed, whatever the reason says about retrying afterwards. Resolving that
+			// distinction here is what stops `connect()` from hanging until its timeout on a drain.
+			this.firstSync?.reject(error);
+			if (!disposition) return;
+			this.setState(disposition.syncState);
+			if (!disposition.keepConnection) this.closeCurrentSocket();
+			if (disposition.reconnects) this.scheduleReconnect(disposition.retryAfterMs);
+			return;
+		}
+		if (error.code === 'resync_required') {
+			this.setState('resyncing');
+			void this.reconnect('stale_frontier');
+			return;
+		}
+		if (error.code === 'unauthenticated') {
+			this.setState('auth_required');
+			this.firstSync?.reject(error);
+			return;
+		}
+		this.setState('error');
+		this.hooks.onFlowError(error);
+		this.firstSync?.reject(error);
+	}
+
+	/** Closes this connection on purpose.
+	 *
+	 * The resulting `close` event must NOT run the generic lost-connection path: that path
+	 * schedules a plain jittered backoff, and because `scheduleReconnect` is a no-op while a timer
+	 * is already pending, it would win the race against the drain's own `retry_after_ms` floor and
+	 * silently reconnect ~60 ms into a 1.5 s drain. Found by the UI state test, not by reading. */
+	private closeCurrentSocket(): void {
+		const socket = this.socket;
+		this.socket = null;
+		if (!socket) return;
+		this.manualClose = true;
+		socket.close();
+		this.manualClose = false;
+	}
+
 	private sendFrame(frame: Record<string, unknown>): void {
 		if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
 		this.socket.send(JSON.stringify(frame));
@@ -403,7 +477,8 @@ export class LoroObjectSession implements ObjectSessionContract {
 
 	async submit(update: EngineUpdate, _intent: SemanticIntent): Promise<void> {
 		if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.handle) {
-			throw { code: 'server_draining', recoverable: true, details: { reason: 'contention' } } satisfies FlowError;
+			// No socket is a local condition, not a server rejection -- see `clientError`.
+			throw clientError('resync_required');
 		}
 		// `Bootstrap.limits` failed version negotiation: this client cannot know the real
 		// ceilings, and `limits-v1.md` forbids writing under its own cached/compiled-in ones
@@ -429,11 +504,17 @@ export class LoroObjectSession implements ObjectSessionContract {
 			throw {
 				code: 'limit_exceeded',
 				recoverable: false,
-				details: { limit_kind: violation.limitKind, limit: violation.limit, observed: violation.observed }
+				details: {
+					limit_kind: violation.limitKind,
+					limit: violation.limit,
+					observed: violation.observed
+				}
 			} satisfies FlowError;
 		}
 		const updateId =
-			typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+			typeof crypto !== 'undefined' && 'randomUUID' in crypto
+				? crypto.randomUUID()
+				: `${Date.now()}-${Math.random()}`;
 
 		this.setState('saving');
 		return new Promise<void>((resolve, reject) => {
@@ -463,16 +544,28 @@ export class LoroObjectSession implements ObjectSessionContract {
 		await this.openSocket();
 	}
 
-	private scheduleReconnect(): void {
+	/** `ui-surface-v1.md` step 6: full-jitter exponential backoff 250ms->5s, with
+	 * `server_draining.details.retry_after_ms` acting as a LOWER bound when the server supplied
+	 * one -- reconnecting sooner than the server asked is exactly what a drain is trying to
+	 * prevent, so the advertised floor wins over a shorter jittered delay. */
+	private scheduleReconnect(retryAfterMs: number | null = null): void {
 		if (this.disposed || this.reconnectTimer) return;
 		this.setState('reconnecting');
 		const step = BACKOFF_STEPS_MS[Math.min(this.reconnectAttempt, BACKOFF_STEPS_MS.length - 1)];
 		const jitter = Math.random() * step;
+		const delay = Math.max(jitter, retryAfterMs ?? 0);
 		this.reconnectAttempt += 1;
+		this.lastReconnectDelayMs = delay;
 		this.reconnectTimer = setTimeout(() => {
 			this.reconnectTimer = null;
 			void this.openSocket();
-		}, jitter);
+		}, delay);
+	}
+
+	/** The delay the most recent reconnect was scheduled with. Read by the UI state tests to
+	 * prove `retry_after_ms` was honoured as a floor rather than silently dropped. */
+	get lastScheduledReconnectDelayMs(): number | null {
+		return this.lastReconnectDelayMs;
 	}
 
 	async dispose(): Promise<void> {
@@ -482,8 +575,13 @@ export class LoroObjectSession implements ObjectSessionContract {
 			clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
+		if (this.connectTimeout) {
+			clearTimeout(this.connectTimeout);
+			this.connectTimeout = null;
+		}
 		for (const waiter of this.pending.values()) {
-			waiter.reject({ code: 'server_draining', recoverable: true, details: { reason: 'drain' } });
+			// Teardown, not a server drain: the caller navigated away or the route was destroyed.
+			waiter.reject(clientError('resync_required'));
 		}
 		this.pending.clear();
 		this.socket?.close();

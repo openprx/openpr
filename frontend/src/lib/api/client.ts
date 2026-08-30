@@ -4,6 +4,18 @@ export interface ApiResult<T> {
 	code: number;
 	message: string;
 	data: T | null;
+	/** The stable, machine-readable business code for a typed rejection
+	 * (`apps/api/src/error.rs::ApiErrorKind::stable_code`; `contracts/error-mapping-v1.md`'s
+	 * "稳定错误的五层映射"). Present only on responses the API produced through `ApiError::Typed`;
+	 * absent on success and on the legacy string-typed errors. Callers MUST branch on this and
+	 * never on `message` -- `message` is localized prose and is explicitly not a discriminator
+	 * ("禁止用英文 message 分支"). */
+	error_code?: string;
+	/** The typed rejection's structured `details` (e.g. `server_draining`'s required
+	 * `{reason,retry_after_ms}`, `limit_exceeded`'s `{limit_kind,limit,observed}`). Carried
+	 * verbatim: dropping it here is what makes a required discriminator unreadable to every UI
+	 * surface downstream. */
+	details?: unknown;
 }
 
 export interface PaginatedData<T> {
@@ -158,7 +170,9 @@ class ApiClient {
 			const result: ApiResult<T> = {
 				code: typeof parsed.code === 'number' ? parsed.code : 500,
 				message: typeof parsed.message === 'string' ? parsed.message : 'Invalid response format',
-				data: (parsed.data as T | null) ?? null
+				data: (parsed.data as T | null) ?? null,
+				...(typeof parsed.error_code === 'string' ? { error_code: parsed.error_code } : {}),
+				...(parsed.details === undefined ? {} : { details: parsed.details })
 			};
 
 			if (result.code === 401) {

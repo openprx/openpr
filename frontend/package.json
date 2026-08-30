@@ -17,6 +17,11 @@
 		"smoke:forms-ui": "node scripts/smoke-forms-ui.mjs",
 		"test:record-values": "bun tests/record-values-roundtrip.test.ts",
 		"test:flow-limits": "bun tests/flow-limits-negotiation.test.ts",
+		"test:flow-v0.4": "bun tests/flow-v0.4.ts",
+		"test:flow-i18n-parity": "bun tests/flow-i18n-parity.test.ts",
+		"test:flow-navigator-equivalence": "bun tests/flow-navigator-equivalence.test.ts",
+		"test:flow-ui-state": "bun tests/flow-ui-state.test.ts",
+		"test:flow-static-build": "bun tests/flow-static-build-deep-route.test.ts",
 		"smoke:restaurant-ordering": "node scripts/smoke-restaurant-ordering.mjs",
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write ."

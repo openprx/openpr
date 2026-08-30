@@ -53,6 +53,20 @@ export interface FlowError {
 	readonly code: FlowErrorCode;
 	readonly recoverable: boolean;
 	readonly details?: unknown;
+	/** Who produced this error.
+	 *
+	 * `'server'` means it was read off a wire surface -- a REST envelope's `error_code`, a
+	 * WebSocket `rejected` frame, or a frozen close code -- and its `details` are the server's own
+	 * required discriminators. `'client'` means this build synthesised it locally (a connect
+	 * timeout, a teardown that had to reject in-flight waiters, a pre-flight limit check).
+	 *
+	 * The distinction is not cosmetic. `contracts/error-mapping-v1.md` freezes `server_draining`'s
+	 * `details.reason` as a REQUIRED, server-produced discriminator, and a client that can mint
+	 * the identical shape for its own local conditions makes "the UI honoured the server's
+	 * discriminator" untestable -- any test asserting it would also pass against a build that
+	 * ignores the wire entirely and fabricates the reason itself. Absent means `'server'` only
+	 * because the wire constructors set it explicitly; local constructors must not omit it. */
+	readonly origin?: 'server' | 'client';
 }
 
 /** `sylvode.flow.limits.v1` (`contracts/limits-v1.md` "Bootstrap.limits wire schema").

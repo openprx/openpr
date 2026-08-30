@@ -28,8 +28,22 @@
 	import { t } from 'svelte-i18n';
 	import type { FlowObjectView } from '$lib/api/flow';
 	import { FlowCommandService } from '$lib/flow/command-service';
-	import { getNamedMap, type FlowObjectRepository, type OpenFlowObjectResult } from '$lib/flow/object-repository';
-	import { keyBetween } from '$lib/flow/fractional-index';
+	import {
+		getNamedMap,
+		type FlowObjectRepository,
+		type OpenFlowObjectResult
+	} from '$lib/flow/object-repository';
+	import {
+		appendOrderKey,
+		applyDestination,
+		contextMenuDestination,
+		keyboardStepDestination,
+		orderKeyForDestination,
+		pointerDropDestination,
+		seedOrderKeys,
+		type DropSide,
+		type OrderedSibling
+	} from '$lib/flow/navigator-reorder';
 	import { FLOW_REPOSITORY_CONTEXT } from '$lib/flow/context-keys';
 	import { resolveRenderer } from '$lib/flow/renderer-registry';
 
@@ -80,7 +94,10 @@
 			byParent.set(parentKey, siblings);
 		}
 		for (const siblings of byParent.values()) {
-			siblings.sort((a, b) => orderOf(a.id).localeCompare(orderOf(b.id)) || a.created_at.localeCompare(b.created_at));
+			siblings.sort(
+				(a, b) =>
+					orderOf(a.id).localeCompare(orderOf(b.id)) || a.created_at.localeCompare(b.created_at)
+			);
 		}
 		function build(parentId: string | null, depth: number): TreeNode[] {
 			const siblings = byParent.get(parentId) ?? [];
@@ -105,7 +122,43 @@
 	function siblingsOf(objectId: string): FlowObjectView[] {
 		const object = objects.find((o) => o.id === objectId);
 		const parentId = object?.parent_id ?? null;
-		return objects.filter((o) => (o.parent_id ?? null) === parentId).sort((a, b) => orderOf(a.id).localeCompare(orderOf(b.id)));
+		return objects
+			.filter((o) => (o.parent_id ?? null) === parentId)
+			.sort((a, b) => orderOf(a.id).localeCompare(orderOf(b.id)));
+	}
+
+	/** The same sibling list in the shape `navigator-reorder` works in: committed order, each
+	 * entry carrying its current fractional-index key. Every gesture below builds its input with
+	 * this one function, so no gesture can be reasoning about a differently-sorted list. */
+	function orderedSiblingsOf(objectId: string): OrderedSibling[] {
+		return siblingsOf(objectId).map((o) => ({ id: o.id, orderKey: orderOf(o.id) }));
+	}
+
+	/** Writes one reorder. The destination always comes from `navigator-reorder`; this function
+	 * owns the CRDT write and the announcement, and never computes bounds itself.
+	 *
+	 * `destination === null` means the gesture could not express a move at all (end of list,
+	 * cross-parent drop, unknown id) -- that is the announced failure. A destination that resolves
+	 * to no key change means the object is already there: nothing is written and nothing is
+	 * announced as a failure, because landing where you started is a no-op, not an error. */
+	function commitReorder(objectId: string, destination: number | null): boolean {
+		if (!navEntry || destination === null) {
+			announce('flow.nav.liveRegion.reorderFailed');
+			return false;
+		}
+		const newKey = orderKeyForDestination(orderedSiblingsOf(objectId), objectId, destination);
+		if (newKey === null) return false;
+		try {
+			getNamedMap(navEntry.doc, 'order').set(objectId, newKey);
+			navEntry.doc.commit();
+			orderVersion += 1;
+		} catch {
+			announce('flow.nav.liveRegion.reorderFailed');
+			return false;
+		}
+		const object = objects.find((o) => o.id === objectId);
+		announce('flow.nav.liveRegion.dropped', { title: object?.title ?? '' });
+		return true;
 	}
 
 	async function ensureOrderEntries(): Promise<void> {
@@ -122,14 +175,15 @@
 		for (const siblings of byParent.values()) {
 			const missing = siblings.filter((o) => typeof map.get(o.id) !== 'string');
 			if (missing.length === 0) continue;
-			const existingKeys = siblings.map((o) => map.get(o.id)).filter((v): v is string => typeof v === 'string');
-			let previous = existingKeys.length > 0 ? existingKeys.sort().at(-1) : undefined;
-			for (const object of missing.sort((a, b) => a.created_at.localeCompare(b.created_at))) {
-				const key = keyBetween(previous, undefined);
-				map.set(object.id, key);
-				previous = key;
+			const existingKeys = siblings
+				.map((o) => map.get(o.id))
+				.filter((v): v is string => typeof v === 'string');
+			const ordered = missing.sort((a, b) => a.created_at.localeCompare(b.created_at));
+			const keys = seedOrderKeys(existingKeys, ordered.length);
+			ordered.forEach((object, index) => {
+				map.set(object.id, keys[index]);
 				wrote = true;
-			}
+			});
 		}
 		if (wrote) {
 			navEntry.doc.commit();
@@ -145,7 +199,10 @@
 	}
 
 	async function ensureNavigatorObject(): Promise<string> {
-		const existing = await commandService.listObjects(workspaceId, { object_type: 'navigator', limit: 1 });
+		const existing = await commandService.listObjects(workspaceId, {
+			object_type: 'navigator',
+			limit: 1
+		});
 		if (existing.code === 0 && existing.data && existing.data.items.length > 0) {
 			return existing.data.items[0].id;
 		}
@@ -162,7 +219,11 @@
 			try {
 				await loadObjects();
 				const navigatorObjectId = await ensureNavigatorObject();
-				navEntry = await repository.open({ workspaceId, objectId: navigatorObjectId, signal: controller.signal });
+				navEntry = await repository.open({
+					workspaceId,
+					objectId: navigatorObjectId,
+					signal: controller.signal
+				});
 				await ensureOrderEntries();
 			} finally {
 				loading = false;
@@ -200,13 +261,17 @@
 				case 'ArrowDown': {
 					event.preventDefault();
 					const delta = event.key === 'ArrowUp' ? -1 : 1;
-					const pos = draftSiblingOrder.indexOf(node.object.id);
-					const swapWith = pos + delta;
-					if (swapWith < 0 || swapWith >= draftSiblingOrder.length) return;
-					const next = [...draftSiblingOrder];
-					[next[pos], next[swapWith]] = [next[swapWith], next[pos]];
-					draftSiblingOrder = next;
-					announce('flow.nav.liveRegion.moved', { title: node.object.title, position: swapWith + 1 });
+					// The draft is a preview of the SAME destination the drop will commit -- both go
+					// through `navigator-reorder`, so what the live region announces during a lift
+					// cannot drift from what lands in the CRDT on Drop.
+					const draft = draftSiblingOrder.map((id) => ({ id, orderKey: orderOf(id) }));
+					const destination = keyboardStepDestination(draft, node.object.id, delta);
+					if (destination === null) return;
+					draftSiblingOrder = applyDestination(draftSiblingOrder, node.object.id, destination);
+					announce('flow.nav.liveRegion.moved', {
+						title: node.object.title,
+						position: destination + 1
+					});
 					return;
 				}
 				case 'ArrowLeft':
@@ -297,23 +362,11 @@
 	}
 
 	async function commitLift(objectId: string): Promise<void> {
-		if (!navEntry) return;
-		const map = getNamedMap(navEntry.doc, 'order');
-		const finalIndex = draftSiblingOrder.indexOf(objectId);
-		const before = draftSiblingOrder[finalIndex - 1];
-		const after = draftSiblingOrder[finalIndex + 1];
-		const beforeKey = before ? orderOf(before) : undefined;
-		const afterKey = after ? orderOf(after) : undefined;
-		try {
-			const newKey = keyBetween(beforeKey, afterKey);
-			map.set(objectId, newKey);
-			navEntry.doc.commit();
-			orderVersion += 1;
-			const object = objects.find((o) => o.id === objectId);
-			announce('flow.nav.liveRegion.dropped', { title: object?.title ?? '' });
-		} catch {
-			announce('flow.nav.liveRegion.reorderFailed');
-		}
+		// The draft already holds the object at its intended position, and `applyDestination` puts
+		// it at exactly index `destination` -- so the draft index IS the destination, in the same
+		// coordinate system every other gesture uses.
+		const index = draftSiblingOrder.indexOf(objectId);
+		commitReorder(objectId, index < 0 ? null : index);
 		liftedId = null;
 		draftSiblingOrder = [];
 	}
@@ -344,36 +397,12 @@
 		openContextMenu(objectId, event.clientX, event.clientY);
 	}
 
-	async function moveRelative(objectId: string, direction: 'before' | 'after'): Promise<void> {
+	async function moveRelative(objectId: string, direction: DropSide): Promise<void> {
 		closeContextMenu();
-		if (!navEntry) return;
-		const siblings = siblingsOf(objectId);
-		const index = siblings.findIndex((o) => o.id === objectId);
-		const swapWith = direction === 'before' ? index - 1 : index + 1;
-		if (swapWith < 0 || swapWith >= siblings.length) {
-			announce('flow.nav.liveRegion.reorderFailed');
-			return;
-		}
-		const map = getNamedMap(navEntry.doc, 'order');
-		// Moving before/after its immediate neighbour means the new bounds are that neighbour's
-		// OTHER neighbour on the far side, same math `onDrop`/`commitLift` use.
-		const beforeNeighbourIndex = direction === 'before' ? swapWith - 1 : index;
-		const afterNeighbourIndex = direction === 'before' ? index : swapWith + 1;
-		const beforeNeighbour = siblings[beforeNeighbourIndex];
-		const afterNeighbour = siblings[afterNeighbourIndex];
-		try {
-			const newKey = keyBetween(
-				beforeNeighbour ? orderOf(beforeNeighbour.id) : undefined,
-				afterNeighbour ? orderOf(afterNeighbour.id) : undefined
-			);
-			map.set(objectId, newKey);
-			navEntry.doc.commit();
-			orderVersion += 1;
-			const object = objects.find((o) => o.id === objectId);
-			announce('flow.nav.liveRegion.dropped', { title: object?.title ?? '' });
-		} catch {
-			announce('flow.nav.liveRegion.reorderFailed');
-		}
+		commitReorder(
+			objectId,
+			contextMenuDestination(orderedSiblingsOf(objectId), objectId, direction)
+		);
 	}
 
 	function moveUnavailable(): void {
@@ -404,19 +433,11 @@
 		dragSourceId = null;
 		if (!source || !target || (source.parent_id ?? null) !== (target.parent_id ?? null)) return;
 
-		const siblings = siblingsOf(targetId).filter((o) => o.id !== source.id);
-		const targetIndex = siblings.findIndex((o) => o.id === targetId);
-		const before = siblings[targetIndex - 1];
-		const after = siblings[targetIndex];
-		const map = getNamedMap(navEntry.doc, 'order');
-		try {
-			const newKey = keyBetween(before ? orderOf(before.id) : undefined, after ? orderOf(after.id) : undefined);
-			map.set(source.id, newKey);
-			navEntry.doc.commit();
-			orderVersion += 1;
-		} catch {
-			announce('flow.nav.liveRegion.reorderFailed');
-		}
+		// Pointer drag resolves to the same destination-then-key pipeline the keyboard and context
+		// menu use, and produces the same live-region announcement: the a11y baseline treats them
+		// as one operation with three input methods, not three operations.
+		const siblings = orderedSiblingsOf(source.id);
+		commitReorder(source.id, pointerDropDestination(siblings, source.id, targetId));
 	}
 
 	async function createPage(parentId?: string): Promise<void> {
@@ -430,9 +451,10 @@
 			});
 			objects = [...objects, created.object];
 			if (navEntry) {
-				const siblings = siblingsOf(created.object.id).filter((o) => o.id !== created.object.id);
-				const lastKey = siblings.length > 0 ? orderOf(siblings.at(-1)!.id) : undefined;
-				getNamedMap(navEntry.doc, 'order').set(created.object.id, keyBetween(lastKey, undefined));
+				const siblings = orderedSiblingsOf(created.object.id).filter(
+					(o) => o.id !== created.object.id
+				);
+				getNamedMap(navEntry.doc, 'order').set(created.object.id, appendOrderKey(siblings));
 				navEntry.doc.commit();
 				orderVersion += 1;
 			}
@@ -448,8 +470,12 @@
 	class="flex h-full w-64 shrink-0 flex-col border-r border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950"
 	aria-label={$t('flow.nav.title')}
 >
-	<div class="flex items-center justify-between border-b border-slate-200 p-3 dark:border-slate-800">
-		<span class="text-sm font-semibold text-slate-900 dark:text-slate-100">{$t('flow.nav.title')}</span>
+	<div
+		class="flex items-center justify-between border-b border-slate-200 p-3 dark:border-slate-800"
+	>
+		<span class="text-sm font-semibold text-slate-900 dark:text-slate-100"
+			>{$t('flow.nav.title')}</span
+		>
 		<div class="flex items-center gap-1">
 			<!-- `flow.search.*` (`i18n v0.4 基线`): Flow search is v0.5 scope
 				 (`ui-surface-v1.md` "后续版本 UI 派生" v0.5: "Navigator/command palette 增加 Flow
@@ -487,7 +513,11 @@
 		{:else if tree.length === 0}
 			<div class="p-3 text-sm text-slate-500 dark:text-slate-400">
 				<p class="mb-2">{$t('flow.nav.empty')}</p>
-				<button type="button" class="font-medium text-blue-600 hover:underline dark:text-blue-400" onclick={() => createPage()}>
+				<button
+					type="button"
+					class="font-medium text-blue-600 hover:underline dark:text-blue-400"
+					onclick={() => createPage()}
+				>
 					{$t('flow.nav.createFirst')}
 				</button>
 			</div>
@@ -496,7 +526,10 @@
 				<div role="none">
 					<div
 						role="treeitem"
-						tabindex={focusedId === node.object.id || (focusedId === null && node.depth === 0 && tree[0] === node) ? 0 : -1}
+						tabindex={focusedId === node.object.id ||
+						(focusedId === null && node.depth === 0 && tree[0] === node)
+							? 0
+							: -1}
 						aria-level={node.depth + 1}
 						aria-expanded={node.children.length > 0 || undefined}
 						aria-selected={selectedObjectId === node.object.id}
@@ -525,7 +558,9 @@
 									e.stopPropagation();
 									toggleExpand(node.object.id);
 								}}
-								aria-label={expanded.has(node.object.id) ? $t('flow.nav.collapse') : $t('flow.nav.expand')}
+								aria-label={expanded.has(node.object.id)
+									? $t('flow.nav.collapse')
+									: $t('flow.nav.expand')}
 							>
 								{expanded.has(node.object.id) ? '▾' : '▸'}
 							</button>

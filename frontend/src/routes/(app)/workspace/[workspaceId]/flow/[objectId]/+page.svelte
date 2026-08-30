@@ -16,6 +16,7 @@
 	import FlowContextPanel from '$lib/components/flow/FlowContextPanel.svelte';
 	import FlowSyncIndicator from '$lib/components/flow/FlowSyncIndicator.svelte';
 	import type { FlowError, SyncState } from '$lib/flow/types';
+	import { flowErrorI18nKey } from '$lib/flow/errors';
 
 	const repository = getContext<FlowObjectRepository>(FLOW_REPOSITORY_CONTEXT);
 
@@ -107,7 +108,9 @@
 	// intent 进入 recovery draft，并提供下载/复制动作").
 	const canDownloadDraft = $derived(
 		runtimeError !== null &&
-			(runtimeError.code === 'policy_rejected' || runtimeError.code === 'invalid_update' || runtimeError.code === 'stale_frontier')
+			(runtimeError.code === 'policy_rejected' ||
+				runtimeError.code === 'invalid_update' ||
+				runtimeError.code === 'stale_frontier')
 	);
 
 	function downloadRecoveryDraft(): void {
@@ -149,22 +152,30 @@
 
 	// `contracts/ui-surface-v1.md` "Renderer registry": an unregistered `${objectType}:${viewType}`
 	// must fail to read-only/unsupported, never reach the CRDT-backed canvas.
-	const canvasRenderer = $derived(entry ? resolveRenderer(entry.handle.objectType, 'canvas') : null);
+	const canvasRenderer = $derived(
+		entry ? resolveRenderer(entry.handle.objectType, 'canvas') : null
+	);
 </script>
 
 {#if loadError}
 	<div class="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center">
 		<h1 class="text-lg font-semibold text-slate-900 dark:text-slate-100">
-			{loadError.code === 'not_found' ? $t('flow.route.notFoundTitle') : $t('flow.route.disabledTitle')}
+			{loadError.code === 'not_found'
+				? $t('flow.route.notFoundTitle')
+				: $t('flow.route.disabledTitle')}
 		</h1>
-		<p class="max-w-md text-sm text-slate-500 dark:text-slate-400">{$t(`flow.error.${loadError.code}`)}</p>
+		<p class="max-w-md text-sm text-slate-500 dark:text-slate-400">
+			{$t(flowErrorI18nKey(loadError))}
+		</p>
 	</div>
 {:else if !entry}
 	<div class="flex flex-1 items-center justify-center p-8">
 		<p class="text-sm text-slate-500 dark:text-slate-400">{$t('common.loading')}</p>
 	</div>
 {:else}
-	<div class="flex items-center justify-between border-b border-slate-200 px-6 py-3 dark:border-slate-800">
+	<div
+		class="flex items-center justify-between border-b border-slate-200 px-6 py-3 dark:border-slate-800"
+	>
 		<input
 			bind:value={title}
 			oninput={onTitleInput}
@@ -180,11 +191,11 @@
 			class="flex flex-wrap items-center gap-3 border-b border-amber-200 bg-amber-50 px-6 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100"
 			role="alert"
 		>
-			<span class="flex-1">
-				{runtimeError.code === 'server_draining'
-					? $t(`flow.error.server_draining.${(runtimeError.details as { reason?: string } | undefined)?.reason === 'drain' ? 'drain' : 'contention'}`)
-					: $t(`flow.error.${runtimeError.code}`)}
-			</span>
+			<!-- Key selection lives in `$lib/flow/errors`, not in this template: the inline
+				 `reason === 'drain' ? drain : contention` ternary this replaced silently rendered a
+				 `server_draining` with a MISSING required discriminator as an ordinary contention
+				 retry, which `error-mapping-v1.md` forbids ("缺失/未知 reason 违反协议"). -->
+			<span class="flex-1">{$t(flowErrorI18nKey(runtimeError))}</span>
 			{#if canDownloadDraft}
 				<button
 					type="button"
@@ -202,7 +213,11 @@
 					{$t('flow.recovery.reload')}
 				</button>
 			{/if}
-			<button type="button" class="font-medium underline underline-offset-2 hover:no-underline" onclick={dismissRuntimeError}>
+			<button
+				type="button"
+				class="font-medium underline underline-offset-2 hover:no-underline"
+				onclick={dismissRuntimeError}
+			>
 				{$t('flow.recovery.dismiss')}
 			</button>
 		</div>
