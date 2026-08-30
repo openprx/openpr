@@ -390,6 +390,17 @@ findings["frontend_unknown_version_handling_found"] = bool(
 # Rust constant's name tokens (a test is very likely to be named after one or the other; requiring
 # only one of the two token sets, not literal substring equality, tolerates paraphrasing like
 # "per_connection_presence_ceiling" for `presence_entries_per_connection`).
+#
+# Matching is whole-word (both sides split on `_`, never raw substring) and singular/plural
+# insensitive (a trailing "s" is stripped before comparing), because Rust test names paraphrase
+# freely: `user_connections`'s own tokens are {user, connections} but the real test is named
+# `per_user_connection_ceiling_is_enforced_and_freed_on_unregister` (singular "connection"), and
+# `slow_consumer_queue_frames`'s tokens include "frames" while its test says "queue_frame_ceiling"
+# (singular "frame"). A required token set must be a SUBSET of the candidate test name's own token
+# set for a match -- every token has to land on some whole word in the test name, in any order.
+# This is intentionally not "any one token matches": that would let an unrelated test like
+# `connection_registry_smoke` match every *_connections limit_kind through the word "connection"
+# alone, without the specific "user"/"document"/"workspace" qualifier that makes it real coverage.
 TEST_FN_RE = re.compile(
     r"#\[(?:tokio::)?test\][^\n]*\n(?:\s*#\[[^\n]*\]\n)*\s*(?:pub(?:\([^)]*\))?\s+)?(?:async fn|fn) (\w+)\s*\("
 )
@@ -415,8 +426,30 @@ ALL_TEST_FN_NAMES = [
 ]
 
 
-def name_tokens(s: str) -> list:
-    return [t for t in s.lower().split("_") if t and t != "max"]
+def _singularize(word: str) -> str:
+    # Minimal, deliberately conservative stemmer: only strips a bare trailing "s" (never "ss"),
+    # and only on words long enough that the strip cannot hollow the word out entirely. This is
+    # enough to unify the plural/singular pairs that actually occur in limit_kind/const/test-name
+    # tokens here (connections/connection, frames/frame, bytes/byte, rates/rate) without the
+    # false-equivalence risk of a fuller stemmer (e.g. "status" must not become "statu").
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def name_tokens(s: str) -> set:
+    return {_singularize(t) for t in s.lower().split("_") if t and t != "max"}
+
+
+_FN_NAME_TOKENS_CACHE: dict = {}
+
+
+def _fn_name_tokens(fn_name: str) -> set:
+    cached = _FN_NAME_TOKENS_CACHE.get(fn_name)
+    if cached is None:
+        cached = name_tokens(fn_name)
+        _FN_NAME_TOKENS_CACHE[fn_name] = cached
+    return cached
 
 
 def boundary_test_covering(limit_kind: str, const: str | None = None):
@@ -424,8 +457,9 @@ def boundary_test_covering(limit_kind: str, const: str | None = None):
     if const:
         token_sets.append(name_tokens(const))
     for src_label, fn_name in ALL_TEST_FN_NAMES:
+        fn_tokens = _fn_name_tokens(fn_name)
         for tokens in token_sets:
-            if tokens and all(tok in fn_name for tok in tokens):
+            if tokens and tokens.issubset(fn_tokens):
                 return f"{src_label}::{fn_name}"
     return None
 
@@ -580,10 +614,21 @@ run_group() {
 }
 
 echo "=== dynamic: cargo test groups ===" >&2
-run_group registry_presence api "presence_ceiling"
+# Broadened from the old "presence_ceiling" filter (which only matched the two presence-ceiling
+# tests) to the whole `flow::collab::registry::tests::` module, matching the convention already
+# used for `snapshot_pure` below. `registry.rs`'s `tests` module also holds the real per-user/
+# per-document/per-workspace connection-ceiling tests and the slow-consumer queue-frame-ceiling
+# test that `boundary_test_covering()` above can now name-match -- without running them here they
+# would never appear in `dtest()`'s pass/fail lookup and every case that requires one would stay
+# `failed` no matter how well the static name-matching works.
+run_group registry_tests api "flow::collab::registry::tests::"
 run_group snapshot_pure api "flow::collab::snapshot::tests::"
 run_group collab_core_limits collab-core "limits::tests::"
 run_group effective_limits_wire api "flow::collab::limits::tests::effective_limits_serializes_every_frozen_field_non_null"
+# Pure-logic (non-DB) unit tests for the WS rate limiter (frame_rate / update_rate token-bucket
+# boundary + 3-consecutive-window close), colocated in session.rs's own `tests` module (distinct
+# from `database_tests`, which stays DB-backed and is exercised separately below).
+run_group session_tests api "flow::collab::session::tests::"
 
 DB_SKIPPED=0
 DB_LOGS=(

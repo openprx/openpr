@@ -181,7 +181,15 @@ impl RateLimiter {
     }
 
     fn take(&mut self) -> RateOutcome {
-        let now = Instant::now();
+        self.take_at(Instant::now())
+    }
+
+    /// Pure-logic core of [`take`](Self::take), parameterized on "now" instead of always reading
+    /// the real monotonic clock. `take()` delegates here with `Instant::now()`; tests call this
+    /// directly with deterministically-advanced `Instant`s (`t + Duration::from_secs(n)`, no real
+    /// waiting) so the token-bucket refill and the 1-second enforcement-window rollover are fully
+    /// controllable without `tokio::time::sleep` or any wall-clock dependency.
+    fn take_at(&mut self, now: Instant) -> RateOutcome {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
         self.tokens = elapsed.mul_add(self.refill_per_sec, self.tokens).min(self.capacity);
@@ -1059,6 +1067,186 @@ async fn read_frame(socket: &mut WebSocket, timeout: Duration) -> Option<Frame> 
         return None;
     }
     serde_json::from_str(text.as_str()).ok()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pure-logic unit tests for `RateLimiter` (no database, no real time). `limits-v1.md`'s
+// `frames_per_connection_per_second` (30, burst 60) and `updates_per_connection_per_second` (10,
+// burst 20): exact sustained-rate boundary accepted, boundary+1 rejected with the connection
+// still open, and the connection is only force-closed after 3 *consecutive* 1-second enforcement
+// windows are each over limit. Every test here drives `RateLimiter::take_at` with manually
+// advanced `Instant`s (`t + Duration::from_secs(n)`) instead of `Instant::now()` + real sleeping,
+// so window rollover is deterministic and the suite stays fast.
+// ---------------------------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{
+        FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND, RateLimiter, UPDATE_BURST_MAX,
+        UPDATES_PER_CONNECTION_PER_SECOND,
+    };
+
+    /// Shared scenario for the sustained-rate exact/+1 boundary: starts the bucket empty (bypasses
+    /// `RateLimiter::new`'s initial burst fill so this test isolates the *sustained* rate, not the
+    /// burst capacity) and advances the clock by exactly one enforcement window, so token-bucket
+    /// refill adds exactly `sustained` tokens (never more, since `sustained <= burst` for both
+    /// frame and update rate). That admits exactly `sustained` requests before the
+    /// `sustained + 1`-th is rejected, and the connection must stay open throughout -- a single
+    /// exceeded window alone never force-closes.
+    #[allow(clippy::cast_precision_loss)] // sustained/burst are small fixed contract constants
+    fn assert_sustained_rate_exact_boundary_accepted_and_plus_one_rejected(sustained: u64, burst: u64) {
+        let t0 = Instant::now();
+        let mut limiter = RateLimiter {
+            capacity: burst as f64,
+            tokens: 0.0,
+            refill_per_sec: sustained as f64,
+            last_refill: t0,
+            window_start: t0,
+            window_exceeded: false,
+            consecutive_exceeded_windows: 0,
+        };
+        let t1 = t0 + Duration::from_secs(1);
+
+        for n in 0..sustained {
+            let outcome = limiter.take_at(t1);
+            assert!(
+                outcome.admitted,
+                "request {n} within the exact sustained-rate boundary ({sustained}) must be admitted"
+            );
+            assert!(
+                !outcome.force_close,
+                "a single window at/under the sustained rate must never force-close"
+            );
+        }
+
+        let over = limiter.take_at(t1);
+        assert!(
+            !over.admitted,
+            "the request one past the sustained-rate boundary ({sustained}) must be rejected"
+        );
+        assert!(
+            !over.force_close,
+            "a single exceeded window must not force-close the connection"
+        );
+    }
+
+    #[test]
+    fn frame_rate_exact_sustained_boundary_is_accepted_and_plus_one_is_rejected_without_closing() {
+        assert_sustained_rate_exact_boundary_accepted_and_plus_one_rejected(
+            FRAMES_PER_CONNECTION_PER_SECOND,
+            FRAME_BURST_MAX,
+        );
+    }
+
+    #[test]
+    fn update_rate_exact_sustained_boundary_is_accepted_and_plus_one_is_rejected_without_closing() {
+        assert_sustained_rate_exact_boundary_accepted_and_plus_one_rejected(
+            UPDATES_PER_CONNECTION_PER_SECOND,
+            UPDATE_BURST_MAX,
+        );
+    }
+
+    /// The connection must be force-closed only once 3 *consecutive* 1-second enforcement windows
+    /// were each over limit -- never on the 1st or 2nd. Uses a minimal sustained=1/burst=1 limiter
+    /// (the escalation mechanism is shared by every rate `limit_kind`; the exact sustained/burst
+    /// numbers are irrelevant to it) and, each window, admits the single refilled token and then
+    /// gets rejected once (marking that window exceeded), before advancing exactly 1 second to
+    /// roll into the next window.
+    #[test]
+    fn rate_limiter_force_closes_only_after_three_consecutive_exceeded_windows() {
+        let t0 = Instant::now();
+        let mut limiter = RateLimiter {
+            capacity: 1.0,
+            tokens: 1.0,
+            refill_per_sec: 1.0,
+            last_refill: t0,
+            window_start: t0,
+            window_exceeded: false,
+            consecutive_exceeded_windows: 0,
+        };
+
+        // Window 0 [t0, t1): consume the only token, then get rejected -- marks window 0
+        // exceeded. Still inside window 0, so no rollover is evaluated yet.
+        assert!(limiter.take_at(t0).admitted);
+        let rejected0 = limiter.take_at(t0);
+        assert!(!rejected0.admitted);
+        assert!(!rejected0.force_close);
+
+        // Window 1 [t1, t2): resolves window 0 (exceeded) into the streak -> consecutive = 1.
+        let t1 = t0 + Duration::from_secs(1);
+        let rollover1 = limiter.take_at(t1);
+        assert!(rollover1.admitted);
+        assert!(
+            !rollover1.force_close,
+            "1st consecutive exceeded window alone must not close"
+        );
+        let rejected1 = limiter.take_at(t1);
+        assert!(!rejected1.admitted);
+        assert!(!rejected1.force_close);
+
+        // Window 2 [t2, t3): resolves window 1 (exceeded) -> consecutive = 2.
+        let t2 = t1 + Duration::from_secs(1);
+        let rollover2 = limiter.take_at(t2);
+        assert!(rollover2.admitted);
+        assert!(
+            !rollover2.force_close,
+            "2nd consecutive exceeded window alone must not close"
+        );
+        let rejected2 = limiter.take_at(t2);
+        assert!(!rejected2.admitted);
+        assert!(!rejected2.force_close);
+
+        // Window 3 [t3, ...): resolves window 2 (exceeded) -> consecutive = 3 -> force-close.
+        let t3 = t2 + Duration::from_secs(1);
+        let rollover3 = limiter.take_at(t3);
+        assert!(rollover3.admitted);
+        assert!(
+            rollover3.force_close,
+            "3rd consecutive exceeded window must force-close the connection (code 4408)"
+        );
+    }
+
+    /// The consecutive-exceeded-window streak must reset to 0 (never carry over) once a window
+    /// passes without being exceeded, so exceeding, recovering, and exceeding again never
+    /// force-closes on the 2nd post-recovery window.
+    #[test]
+    fn rate_limiter_consecutive_exceeded_window_streak_resets_after_a_clean_window() {
+        let t0 = Instant::now();
+        let mut limiter = RateLimiter {
+            capacity: 1.0,
+            tokens: 1.0,
+            refill_per_sec: 1.0,
+            last_refill: t0,
+            window_start: t0,
+            window_exceeded: false,
+            consecutive_exceeded_windows: 0,
+        };
+
+        // Window 0 [t0, t1): exceeded (consume the token, then get rejected).
+        assert!(limiter.take_at(t0).admitted);
+        assert!(!limiter.take_at(t0).admitted);
+
+        // Window 1 [t1, t2): resolves window 0 (exceeded) -> consecutive = 1. Only one request is
+        // made during window 1 itself (admitted, using the refilled token), so window 1 stays
+        // clean -- nothing marks it exceeded.
+        let t1 = t0 + Duration::from_secs(1);
+        let admit1 = limiter.take_at(t1);
+        assert!(admit1.admitted);
+        assert!(!admit1.force_close);
+        assert_eq!(limiter.consecutive_exceeded_windows, 1);
+
+        // Window 2 [t2, t3): resolves window 1 -- since window 1 was clean, the streak resets to
+        // 0 instead of continuing to 2.
+        let t2 = t1 + Duration::from_secs(1);
+        let admit2 = limiter.take_at(t2);
+        assert!(admit2.admitted);
+        assert!(!admit2.force_close, "a reset streak must never force-close");
+        assert_eq!(
+            limiter.consecutive_exceeded_windows, 0,
+            "a clean window must reset the consecutive-exceeded streak"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
