@@ -361,7 +361,7 @@ mod flow_database_tests {
         auth::{JwtClaims, TokenType},
         config::{AppConfig, Secret},
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
     use serde_json::{Value, json};
     use uuid::Uuid;
 
@@ -1440,6 +1440,358 @@ mod flow_database_tests {
         assert_eq!(row.subject_id, parent_id_in_a.to_string());
         assert_eq!(row.detected_by, "flow.command.create_object");
         assert_eq!(row.status, "open");
+
+        scratch.drop_self().await;
+    }
+
+    // ---- Call-direction proofs for `collab_core::limits::check_operation` /
+    // `check_operation_batch_count` on the REST content-command path
+    // (`flow::command::apply_content_command`), reached through the real
+    // `post_flow_object_command` handler these tests drive end to end -- not a unit call into
+    // `flow::command` directly, and not the WebSocket path (`flow::collab::write::database_tests`
+    // covers that separately via `check_snapshot`).
+
+    /// Runs one command through the real `post_flow_object_command` handler and retries, bounded,
+    /// on envelope `code=409`/`message="server_draining"` -- `error-mapping-v1.md`: that code is
+    /// recoverable, "客户端保留 intent 后重试", the exact behavior a real caller is contractually
+    /// expected to have. The tests below submit many real commands/transactions in a tight loop
+    /// against a real database shared with the rest of `cargo test --workspace`'s parallel run, so
+    /// they are exactly the shape most likely to observe transient lock/rebase contention
+    /// (`flow::collab::write::database_tests`'s own `submit` helper documents the same root
+    /// cause). Retrying here changes nothing about what is under test: `code=400` naming a
+    /// `limit_kind` (the actual assertion every caller of this function cares about) is never
+    /// `server_draining` and is always returned on the first attempt, unretried; only the
+    /// recoverable, contract-defined transient code is retried, and only a bounded number of
+    /// times, so a genuine, persistent failure still surfaces as a test failure rather than
+    /// hanging. Each retry uses a fresh `idempotency_key` (the prior attempt was never persisted).
+    async fn run_command(
+        state: &AppState,
+        claims: &Extension<JwtClaims>,
+        object_id: Uuid,
+        command_type: &str,
+        payload: Value,
+    ) -> Value {
+        const MAX_CONTENTION_ATTEMPTS: u32 = 100;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let response = to_response(
+                post_flow_object_command(
+                    State(state.clone()),
+                    claims.clone(),
+                    None,
+                    Path(object_id),
+                    Json(ExecuteFlowCommandRequest {
+                        command: FlowCommandEnvelope {
+                            command_type: command_type.to_string(),
+                            payload: payload.clone(),
+                        },
+                        expected_frontier: None,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        message: None,
+                    }),
+                )
+                .await,
+            );
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = body_json(response).await;
+            let is_recoverable_contention = body["code"] == 409 && body["message"] == "server_draining";
+            if is_recoverable_contention && attempt < MAX_CONTENTION_ATTEMPTS {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            return body;
+        }
+    }
+
+    async fn document_id_for(state: &AppState, object_id: Uuid) -> Uuid {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: Uuid,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM collab_documents WHERE object_id = $1",
+            vec![object_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists")
+        .id
+    }
+
+    async fn document_head_seq(state: &AppState, document_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            head_seq: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_seq FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists")
+        .head_seq
+    }
+
+    async fn count_event_dispatch(state: &AppState, document_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM event_dispatch WHERE document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("count query runs")
+        .expect("count query returns a row")
+        .n
+    }
+
+    /// Call-direction proof for `check_operation`'s `tree_depth` branch: a chain of `insert_block`
+    /// commands reaching exactly `tree_depth_max` is accepted one command at a time; the next one
+    /// is rejected via body code 400 naming `tree_depth`, and the rejection advances neither the
+    /// document head nor `event_dispatch`.
+    #[tokio::test]
+    async fn commands_endpoint_insert_block_rejects_tree_depth_plus_one_and_accepts_exact_boundary() {
+        let scratch = scratch_or_skip!("limit-rest-tree-depth");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let limits = crate::flow::collab::limits::document_limits();
+
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Tree Depth Limit Test".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(create_body["code"], 0, "{create_body}");
+        let object_id = Uuid::parse_str(
+            create_body["data"]["object"]["id"]
+                .as_str()
+                .expect("object id is a string"),
+        )
+        .expect("object id is a uuid");
+        let document_id = document_id_for(&state, object_id).await;
+
+        // A chain of `insert_block` commands, each parented on the previous one. The root block
+        // (no parent) is depth 0; `tree_depth_max` more commands after it reach exactly
+        // `tree_depth_max`, still within the boundary.
+        let mut parent_block_id: Option<String> = None;
+        let mut accepted_seq = 0i64;
+        for i in 0..=limits.tree_depth_max {
+            let block_id = format!("depth-{i}");
+            let mut payload = json!({ "block_id": block_id });
+            if let Some(parent) = &parent_block_id {
+                payload["parent_block_id"] = json!(parent);
+            }
+            let body = run_command(&state, &claims, object_id, "insert_block", payload).await;
+            assert_eq!(
+                body["code"], 0,
+                "creating block at depth {i} (within tree_depth_max={}) must be accepted: {body}",
+                limits.tree_depth_max
+            );
+            accepted_seq = body["data"]["accepted_seq"]
+                .as_i64()
+                .expect("accepted_seq is an integer");
+            parent_block_id = Some(block_id);
+        }
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+        let head_after_exact = document_head_seq(&state, document_id).await;
+        assert_eq!(head_after_exact, accepted_seq);
+
+        let one_too_deep = run_command(
+            &state,
+            &claims,
+            object_id,
+            "insert_block",
+            json!({
+                "block_id": "depth-one-too-many",
+                "parent_block_id": parent_block_id.expect("the chain above built at least one block"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            one_too_deep["code"], 400,
+            "one block past tree_depth_max must be rejected via body code 400: {one_too_deep}"
+        );
+        let message = one_too_deep["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("tree_depth"),
+            "the rejection message must name limit_kind=tree_depth: {one_too_deep}"
+        );
+        // The write path this same command also flows through (`write::accept_update`, shared
+        // with WebSocket) backstops every per-op structural ceiling with its own
+        // `check_snapshot` gate on the fully-merged candidate (`flow::collab::write::
+        // database_tests`'s own `ws_structural_limit_tree_depth_*` test covers that gate
+        // directly). A REST black-box assertion on `code`/`message` content alone cannot tell
+        // "caught early by `apply_content_command`'s `check_operation`" apart from "caught late
+        // by that backstop" -- both produce `code=400` naming `tree_depth` -- *unless* it also
+        // pins the exact message shape each layer produces: `map_collab_error` (the early,
+        // `check_operation` path) renders a bare `"limit_exceeded: tree_depth"`, while
+        // `map_write_rejection` (the late, `check_snapshot`-via-`accept_update` path) renders the
+        // richer `"limit_exceeded: tree_depth (limit=..., observed=...)"` this same file's
+        // `map_write_rejection` builds from `rejected.details`. Asserting the *absence* of that
+        // richer shape here is what actually proves this specific command took the early
+        // `check_operation` exit and never reached `write::accept_update` at all for this
+        // rejection -- not merely that *some* layer, anywhere in the shared write path, rejected.
+        assert!(
+            !message.contains("observed="),
+            "a `parent_block_id` chosen to violate tree_depth must be caught by \
+             `apply_content_command`'s own `check_operation` call, before `write::accept_update` \
+             is ever reached -- a message carrying '(limit=..., observed=...)' would mean this \
+             instead fell through to the shared `check_snapshot` backstop, i.e. that \
+             `apply_content_command`'s call site rejected nothing on its own: {one_too_deep}"
+        );
+
+        assert_eq!(
+            document_head_seq(&state, document_id).await,
+            head_after_exact,
+            "a rejected command must never advance the document head"
+        );
+        assert_eq!(
+            count_event_dispatch(&state, document_id).await,
+            dispatch_after_exact,
+            "a rejected command must never produce a new event_dispatch row"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    fn properties_payload(block_id: &str, count: usize) -> Value {
+        let mut properties = serde_json::Map::new();
+        for i in 0..count {
+            properties.insert(format!("p{i}"), json!(format!("v{i}")));
+        }
+        json!({ "block_id": block_id, "properties": Value::Object(properties) })
+    }
+
+    /// Call-direction proof for `check_operation_batch_count`'s `semantic_patch_operations`
+    /// branch -- the one boundary in this handler that `check_operation`'s per-op checks alone
+    /// cannot catch (an `update_block` with N `properties` produces N `SetProperty` operations,
+    /// and no single one of them, applied in isolation, ever exceeds any per-op structural
+    /// ceiling -- only the *batch count* does), and the one case where the WebSocket-shared
+    /// `check_snapshot` backstop in `hydrate_and_apply` genuinely cannot substitute for this
+    /// REST-path-only check: a final document with 101 properties on one block violates no
+    /// `check_snapshot` aggregate at all. `properties` at exactly `semantic_patch_operations_max`
+    /// is accepted in one call; one more is rejected, with zero effect on the document head or
+    /// `event_dispatch`.
+    #[tokio::test]
+    async fn commands_endpoint_update_block_rejects_semantic_patch_operations_batch_plus_one_and_accepts_exact_boundary()
+     {
+        let scratch = scratch_or_skip!("limit-rest-batch-count");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let limits = crate::flow::collab::limits::document_limits();
+
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Batch Count Limit Test".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(create_body["code"], 0, "{create_body}");
+        let object_id = Uuid::parse_str(
+            create_body["data"]["object"]["id"]
+                .as_str()
+                .expect("object id is a string"),
+        )
+        .expect("object id is a uuid");
+        let document_id = document_id_for(&state, object_id).await;
+
+        let insert_body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "insert_block",
+            json!({ "block_id": "batch-target" }),
+        )
+        .await;
+        assert_eq!(insert_body["code"], 0, "{insert_body}");
+
+        let exact_count = limits.semantic_patch_operations_max;
+        let exact_body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "update_block",
+            properties_payload("batch-target", exact_count),
+        )
+        .await;
+        assert_eq!(
+            exact_body["code"], 0,
+            "exactly semantic_patch_operations_max properties in one update_block call must be accepted: {exact_body}"
+        );
+        let accepted_seq = exact_body["data"]["accepted_seq"]
+            .as_i64()
+            .expect("accepted_seq is an integer");
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+        let head_after_exact = document_head_seq(&state, document_id).await;
+        assert_eq!(head_after_exact, accepted_seq);
+
+        let plus_one_body = run_command(
+            &state,
+            &claims,
+            object_id,
+            "update_block",
+            properties_payload("batch-target", exact_count + 1),
+        )
+        .await;
+        assert_eq!(
+            plus_one_body["code"], 400,
+            "one property past semantic_patch_operations_max must be rejected via body code 400: {plus_one_body}"
+        );
+        let message = plus_one_body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("semantic_patch_operations"),
+            "the rejection message must name limit_kind=semantic_patch_operations: {plus_one_body}"
+        );
+
+        assert_eq!(
+            document_head_seq(&state, document_id).await,
+            head_after_exact,
+            "a batch-count-rejected command must never advance the document head"
+        );
+        assert_eq!(
+            count_event_dispatch(&state, document_id).await,
+            dispatch_after_exact,
+            "a batch-count-rejected command must never produce a new event_dispatch row \
+             -- this is the atomicity proof: none of the 101 properties in the rejected call were \
+             ever applied, not even the first 100 that would individually have been fine"
+        );
 
         scratch.drop_self().await;
     }

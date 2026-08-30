@@ -58,3 +58,7 @@ Thumbs.db
 
 # Claude Code session state, including agent worktrees that are git repos of their own
 .claude/
+
+# Python bytecode caches: regenerated on every run, never a build input.
+__pycache__/
+*.py[cod]

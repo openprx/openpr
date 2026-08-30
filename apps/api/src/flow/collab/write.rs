@@ -157,12 +157,28 @@ impl TapReason for AcceptOutcome {
 }
 
 fn reject_from_collab_error(update_id: Option<Uuid>, err: &CollabError) -> AcceptOutcome {
-    if let Some(limit_kind) = err.limit_kind() {
+    // `error-mapping-v1.md`'s `limit_exceeded` row: `details={limit_kind,limit,observed?,...}` --
+    // `limit_kind` alone is not enough, `limit`/`observed` must also be recoverable from the
+    // caller-visible rejection, not just logged server-side.
+    let details = match err {
+        CollabError::LimitExceeded {
+            limit_kind,
+            limit,
+            observed,
+        } => Some(serde_json::json!({"limit_kind": limit_kind, "limit": limit, "observed": observed})),
+        CollabError::InputTooLarge {
+            input: "update",
+            actual_bytes,
+            max_bytes,
+        } => Some(serde_json::json!({"limit_kind": "update_bytes", "limit": max_bytes, "observed": actual_bytes})),
+        _ => None,
+    };
+    if let Some(details) = details {
         return AcceptOutcome::Rejected(Rejected {
             update_id,
             code: RejectedCode::LimitExceeded,
             recoverable: false,
-            details: Some(serde_json::json!({"limit_kind": limit_kind})),
+            details: Some(details),
             current_seq: None,
             current_frontier: None,
         });
@@ -364,6 +380,24 @@ async fn hydrate_and_apply(
         tracing::error!(error = %err, "collab write: semantic_snapshot failed after a successful import_update");
         ApiError::Internal
     })?;
+
+    // `ADR-0010`'s write algorithm: decode -> limit -> diff -> policy -> projection prepare, all
+    // outside any lock and before the DB transaction begins. `import_update` above only proves
+    // the update decodes and merges into a well-formed CRDT document; it enforces none of
+    // `limits-v1.md`'s structural ceilings (`tree_depth`/`container_count`/
+    // `document_block_count`/`text_block_chars`/`document_text_chars`) itself. Unlike the REST
+    // content-command path (`flow::command::apply_content_command`), this path never sees a
+    // discrete `Operation` list to check incrementally -- `bytes` is an opaque Loro update, so
+    // `collab_core::limits::check_snapshot` re-derives the same aggregates directly from the
+    // merged result and rejects under the identical `limit_kind` shape before any projection work
+    // (let alone a transaction) happens on a candidate that would only be discarded anyway.
+    if let Err(violation) = collab_core::limits::check_snapshot(&semantic, &super::limits::document_limits()) {
+        return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+            Some(update_id),
+            &CollabError::from(violation),
+        )));
+    }
+
     let title = candidate.title().map_err(|err| {
         tracing::error!(error = %err, "collab write: title read failed after a successful import_update");
         ApiError::Internal
@@ -741,7 +775,7 @@ fn broadcast_committed_update(
     clippy::too_many_lines
 )]
 mod database_tests {
-    use collab_core::{CollabEngine, LoroCollabEngine};
+    use collab_core::{CollabEngine, LoroCollabEngine, NodeId, NodeKind, Operation};
     use platform::{
         app::AppState,
         config::{AppConfig, Secret},
@@ -754,6 +788,7 @@ mod database_tests {
 
     use super::{AcceptOutcome, SnapshotAdvancer, UpdateRequest, accept_update};
     use crate::flow::collab::authz;
+    use crate::flow::collab::bootstrap;
     use crate::flow::collab::bootstrap::fetch_update_range;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
@@ -1419,6 +1454,737 @@ mod database_tests {
             .await
             .expect("range query runs for a range with no rows");
         assert!(empty_rows.is_empty());
+
+        scratch.drop_self().await;
+    }
+
+    // ---- Call-direction proofs for `collab_core::limits::check_snapshot` on the WebSocket write
+    // path, i.e. `hydrate_and_apply` reached through the exact `accept_update` a real WebSocket
+    // `update` frame (and a REST content command, which shares this same function) goes through.
+    // Every case here builds real CRDT update bytes with a locally-owned `LoroCollabEngine` (no
+    // discrete `Operation` list is ever handed to the server -- exactly the "opaque update" shape
+    // this module's own doc comment on `check_snapshot`'s call site describes) and submits them
+    // through the production `accept_update`, against a real Postgres-backed document.
+
+    /// Reconstructs the document's *current* full state exactly the way the production hydrate
+    /// path does (`bootstrap::load`'s snapshot + tail replay -- `collab_documents.snapshot` is
+    /// only advanced by background snapshot advancement, never on every accepted update, so
+    /// reading that column directly after a prior accepted write would silently reload a stale,
+    /// pre-write document), runs `mutate` against an isolated fork of it, and exports the
+    /// resulting update relative to the pre-mutation frontier -- the exact "isolated fork, mutate,
+    /// `export_from(base_frontier)`" shape a real client (or `flow::command`'s own REST relay)
+    /// produces, just built directly here instead of through a client SDK.
+    async fn build_update_from_current(
+        state: &AppState,
+        document_id: Uuid,
+        mutate: impl FnOnce(&mut LoroCollabEngine),
+    ) -> Vec<u8> {
+        let boot = bootstrap::load(&state.db, document_id).await.expect("bootstrap loads");
+        let mut engine = LoroCollabEngine::load(&boot.snapshot).expect("loads");
+        for tail in &boot.tail_updates {
+            engine.import_update(&tail.bytes).expect("tail update re-applies");
+        }
+        let base_frontier = engine.frontier();
+        mutate(&mut engine);
+        engine.export_from(&base_frontier).expect("export succeeds")
+    }
+
+    async fn count_event_dispatch(state: &AppState, document_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM event_dispatch WHERE document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("count query runs")
+        .expect("count query returns a row")
+        .n
+    }
+
+    /// Submits `bytes` and retries, bounded, on `RejectedCode::ServerDraining` --
+    /// `error-mapping-v1.md`: that code is defined as recoverable, "客户端保留 intent 后重试", the
+    /// exact behavior a real caller is contractually expected to have. This module's own
+    /// `epoch_fence_lock_timeout_must_not_surface_as_policy_rejected` test already documents that
+    /// many scratch databases hammering one shared Postgres instance under `cargo test --workspace`
+    /// produces real, transient lock/rebase contention independent of any application bug; the
+    /// several structural-limit tests below submit many real transactions in a tight loop
+    /// (building up to `container_count_max`/`document_block_count_max` fixture state) and are
+    /// exactly the shape most likely to observe it. Retrying here changes nothing about what is
+    /// under test: a `limit_exceeded` rejection (the actual assertion every caller of this
+    /// function cares about) is never `ServerDraining` and is always returned on the first
+    /// attempt, unretried; only the recoverable, contract-defined transient code is retried, and
+    /// only a bounded number of times, so a genuine, persistent failure still surfaces as a test
+    /// failure rather than hanging.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit(
+        state: &AppState,
+        cache: &WarmCache,
+        coordinator: &DocumentCoordinator,
+        registry: &SessionRegistry,
+        snapshot_advancer: &SnapshotAdvancer,
+        workspace_id: Uuid,
+        document_id: Uuid,
+        actor_id: Uuid,
+        bytes: Vec<u8>,
+        label: &str,
+    ) -> AcceptOutcome {
+        const MAX_CONTENTION_ATTEMPTS: u32 = 100;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+            let outcome = accept_update(
+                &state.db,
+                cache,
+                coordinator,
+                registry,
+                snapshot_advancer,
+                10,
+                None,
+                UpdateRequest {
+                    document_id,
+                    update_id: Uuid::new_v4(),
+                    bytes: bytes.clone(),
+                    idempotency_key: None,
+                    origin_client_id: Some(label.to_string()),
+                    message: None,
+                    actor_id,
+                    workspace_id,
+                    checked_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await
+            .expect("accept_update does not hit a hard database error");
+            let is_recoverable_contention =
+                matches!(&outcome, AcceptOutcome::Rejected(rejected) if rejected.code == RejectedCode::ServerDraining);
+            if is_recoverable_contention && attempt < MAX_CONTENTION_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            return outcome;
+        }
+    }
+
+    /// Call-direction proof for `check_snapshot`'s `tree_depth` branch: a chain reaching exactly
+    /// `tree_depth_max` is accepted; one node deeper is rejected `limit_kind="tree_depth"`, and
+    /// the rejection advances neither the document head nor `event_dispatch`.
+    #[tokio::test]
+    async fn ws_structural_limit_tree_depth_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+        let scratch = scratch_or_skip!("limit-tree-depth");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+        let limits = crate::flow::collab::limits::document_limits();
+
+        let exact_bytes = build_update_from_current(&state, document_id, |engine| {
+            let mut parent: Option<NodeId> = None;
+            for i in 0..=limits.tree_depth_max {
+                let id = NodeId::from(format!("depth-node-{i}"));
+                engine
+                    .apply_operation(&Operation::CreateNode {
+                        id: id.clone(),
+                        parent: parent.clone(),
+                        index: 0,
+                        kind: NodeKind::Block,
+                    })
+                    .expect("creating within the depth boundary must succeed locally");
+                parent = Some(id);
+            }
+        })
+        .await;
+
+        let accepted_exact = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            exact_bytes,
+            "depth-exact",
+        )
+        .await
+        {
+            AcceptOutcome::Accepted(accepted) => accepted,
+            AcceptOutcome::Rejected(rejected) => {
+                panic!("a chain reaching exactly tree_depth_max must be accepted, got {rejected:?}")
+            }
+        };
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+        assert_eq!(
+            dispatch_after_exact, 1,
+            "the accepted update must produce exactly one event_dispatch row"
+        );
+
+        let plus_one_bytes = build_update_from_current(&state, document_id, |engine| {
+            engine
+                .apply_operation(&Operation::CreateNode {
+                    id: NodeId::from("depth-node-one-too-many"),
+                    parent: Some(NodeId::from(format!("depth-node-{}", limits.tree_depth_max))),
+                    index: 0,
+                    kind: NodeKind::Block,
+                })
+                .expect("the local candidate applies the op -- the server-side gate must reject it");
+        })
+        .await;
+
+        let rejected = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            plus_one_bytes,
+            "depth-plus-one",
+        )
+        .await
+        {
+            AcceptOutcome::Rejected(rejected) => rejected,
+            AcceptOutcome::Accepted(_) => panic!("one node past tree_depth_max must be rejected"),
+        };
+        assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+        let details = rejected.details.expect("a limit_exceeded rejection must carry details");
+        assert_eq!(details["limit_kind"], "tree_depth");
+        assert_eq!(details["limit"], limits.tree_depth_max as u64);
+
+        let head_after_rejection = super::read_observed_head(&state.db, document_id)
+            .await
+            .expect("head reads")
+            .expect("document row exists");
+        assert_eq!(
+            head_after_rejection.head_seq, accepted_exact.head_seq,
+            "a rejected update must never advance the document head"
+        );
+        assert_eq!(
+            count_event_dispatch(&state, document_id).await,
+            dispatch_after_exact,
+            "a rejected update must never produce a new event_dispatch row"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// Submits `total` `CreateNode(kind)` operations against the document's *current* state,
+    /// split across as many `accept_update` calls as needed to stay well under `update_bytes_max`
+    /// per update (~51-54 measured bytes/op for a bare `CreateNode`, `chunk` is chosen with a
+    /// wide safety margin, not tuned to the exact ceiling) -- a single update carrying all
+    /// `container_count_max`/`document_block_count_max` (10,000) creates would itself be
+    /// rejected `limit_kind="update_bytes"` before ever reaching the check under test. Every
+    /// intermediate chunk must itself be `Accepted` (none of them are the case under test);
+    /// returns the final chunk's outcome, i.e. the one that reaches exactly `total`.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_create_nodes_in_chunks(
+        state: &AppState,
+        cache: &WarmCache,
+        coordinator: &DocumentCoordinator,
+        registry: &SessionRegistry,
+        snapshot_advancer: &SnapshotAdvancer,
+        workspace_id: Uuid,
+        document_id: Uuid,
+        actor_id: Uuid,
+        id_prefix: &str,
+        kind: NodeKind,
+        total: usize,
+        chunk: usize,
+        label: &str,
+    ) -> AcceptOutcome {
+        let mut created = 0usize;
+        loop {
+            let this_chunk = chunk.min(total - created);
+            let start = created;
+            let bytes = build_update_from_current(state, document_id, |engine| {
+                for i in 0..this_chunk {
+                    engine
+                        .apply_operation(&Operation::CreateNode {
+                            id: NodeId::from(format!("{id_prefix}-{}", start + i)),
+                            parent: None,
+                            index: 0,
+                            kind,
+                        })
+                        .expect("creating within the boundary must succeed locally");
+                }
+            })
+            .await;
+            created += this_chunk;
+            let outcome = submit(
+                state,
+                cache,
+                coordinator,
+                registry,
+                snapshot_advancer,
+                workspace_id,
+                document_id,
+                actor_id,
+                bytes,
+                label,
+            )
+            .await;
+            if created >= total {
+                return outcome;
+            }
+            match outcome {
+                AcceptOutcome::Accepted(_) => {}
+                AcceptOutcome::Rejected(rejected) => {
+                    panic!(
+                        "an intermediate chunk (created {created} of {total}) was unexpectedly rejected: {rejected:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    /// Submits `total_chars` of `InsertText` into one block, split across as many `accept_update`
+    /// calls as needed to stay well under `update_bytes_max` per update (a single update carrying
+    /// `text_block_chars_max` (100,000) chars is itself over the 65,536-byte `update_bytes_max`
+    /// ceiling, rejected `limit_kind="update_bytes"` before ever reaching the check under test).
+    /// `first_chunk_creates_block` controls whether the very first chunk also creates `block_id`
+    /// (`false` when appending to a block that already exists). Every intermediate chunk must
+    /// itself be `Accepted`; returns the final chunk's outcome, i.e. the one that reaches exactly
+    /// `total_chars`.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_block_text_in_chunks(
+        state: &AppState,
+        cache: &WarmCache,
+        coordinator: &DocumentCoordinator,
+        registry: &SessionRegistry,
+        snapshot_advancer: &SnapshotAdvancer,
+        workspace_id: Uuid,
+        document_id: Uuid,
+        actor_id: Uuid,
+        block_id: &str,
+        first_chunk_creates_block: bool,
+        total_chars: usize,
+        chunk_chars: usize,
+        label: &str,
+    ) -> AcceptOutcome {
+        let mut inserted = 0usize;
+        let mut create_this_chunk = first_chunk_creates_block;
+        loop {
+            let this_chunk = chunk_chars.min(total_chars - inserted);
+            let id = NodeId::from(block_id.to_string());
+            let start = inserted;
+            #[allow(clippy::cast_possible_truncation)]
+            let index = start as u32;
+            let bytes = build_update_from_current(state, document_id, |engine| {
+                if create_this_chunk {
+                    engine
+                        .apply_operation(&Operation::CreateNode {
+                            id: id.clone(),
+                            parent: None,
+                            index: 0,
+                            kind: NodeKind::Block,
+                        })
+                        .expect("create must succeed locally");
+                }
+                engine
+                    .apply_operation(&Operation::InsertText {
+                        id,
+                        index,
+                        text: "a".repeat(this_chunk),
+                    })
+                    .expect("inserting within the boundary must succeed locally");
+            })
+            .await;
+            create_this_chunk = false;
+            inserted += this_chunk;
+            let outcome = submit(
+                state,
+                cache,
+                coordinator,
+                registry,
+                snapshot_advancer,
+                workspace_id,
+                document_id,
+                actor_id,
+                bytes,
+                label,
+            )
+            .await;
+            if inserted >= total_chars {
+                return outcome;
+            }
+            match outcome {
+                AcceptOutcome::Accepted(_) => {}
+                AcceptOutcome::Rejected(rejected) => panic!(
+                    "an intermediate text chunk (inserted {inserted} of {total_chars}) was unexpectedly rejected: {rejected:?}"
+                ),
+            }
+        }
+    }
+
+    /// Chunk size for [`submit_create_nodes_in_chunks`]: 1,000 * ~54 bytes/op (measured, see this
+    /// module's calibration in `crates/collab-core`'s benchmark notes) is comfortably under the
+    /// frozen 65,536-byte `update_bytes_max`.
+    const CREATE_NODE_CHUNK: usize = 1_000;
+    /// Chunk size for [`submit_block_text_in_chunks`]: comfortably under `update_bytes_max` even
+    /// including the `CreateNode` overhead on a chunk that also creates the block.
+    const TEXT_CHUNK_CHARS: usize = 50_000;
+
+    /// Call-direction proof for `check_snapshot`'s `container_count` branch (independent of
+    /// `document_block_count` -- `NavigatorNode`, not `Block`).
+    #[tokio::test]
+    async fn ws_structural_limit_container_count_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+        let scratch = scratch_or_skip!("limit-container-count");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+        let limits = crate::flow::collab::limits::document_limits();
+
+        let accepted_exact = match submit_create_nodes_in_chunks(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            "nav",
+            NodeKind::NavigatorNode,
+            limits.container_count_max,
+            CREATE_NODE_CHUNK,
+            "container-exact",
+        )
+        .await
+        {
+            AcceptOutcome::Accepted(accepted) => accepted,
+            AcceptOutcome::Rejected(rejected) => {
+                panic!("exactly container_count_max navigator nodes must be accepted, got {rejected:?}")
+            }
+        };
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+
+        let plus_one_bytes = build_update_from_current(&state, document_id, |engine| {
+            engine
+                .apply_operation(&Operation::CreateNode {
+                    id: NodeId::from("nav-one-too-many"),
+                    parent: None,
+                    index: 0,
+                    kind: NodeKind::NavigatorNode,
+                })
+                .expect("the local candidate applies the op -- the server-side gate must reject it");
+        })
+        .await;
+
+        let rejected = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            plus_one_bytes,
+            "container-plus-one",
+        )
+        .await
+        {
+            AcceptOutcome::Rejected(rejected) => rejected,
+            AcceptOutcome::Accepted(_) => panic!("one navigator node past container_count_max must be rejected"),
+        };
+        assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+        let details = rejected.details.expect("a limit_exceeded rejection must carry details");
+        assert_eq!(details["limit_kind"], "container_count");
+        assert_eq!(details["limit"], limits.container_count_max as u64);
+
+        let head_after_rejection = super::read_observed_head(&state.db, document_id)
+            .await
+            .expect("head reads")
+            .expect("document row exists");
+        assert_eq!(head_after_rejection.head_seq, accepted_exact.head_seq);
+        assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_after_exact);
+
+        scratch.drop_self().await;
+    }
+
+    /// Call-direction proof for `check_snapshot`'s `document_block_count` branch (independent of
+    /// `container_count` -- `Block`, not `NavigatorNode`).
+    #[tokio::test]
+    async fn ws_structural_limit_document_block_count_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+        let scratch = scratch_or_skip!("limit-block-count");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+        let limits = crate::flow::collab::limits::document_limits();
+
+        let accepted_exact = match submit_create_nodes_in_chunks(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            "blk",
+            NodeKind::Block,
+            limits.document_block_count_max,
+            CREATE_NODE_CHUNK,
+            "block-count-exact",
+        )
+        .await
+        {
+            AcceptOutcome::Accepted(accepted) => accepted,
+            AcceptOutcome::Rejected(rejected) => {
+                panic!("exactly document_block_count_max blocks must be accepted, got {rejected:?}")
+            }
+        };
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+
+        let plus_one_bytes = build_update_from_current(&state, document_id, |engine| {
+            engine
+                .apply_operation(&Operation::CreateNode {
+                    id: NodeId::from("blk-one-too-many"),
+                    parent: None,
+                    index: 0,
+                    kind: NodeKind::Block,
+                })
+                .expect("the local candidate applies the op -- the server-side gate must reject it");
+        })
+        .await;
+
+        let rejected = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            plus_one_bytes,
+            "block-count-plus-one",
+        )
+        .await
+        {
+            AcceptOutcome::Rejected(rejected) => rejected,
+            AcceptOutcome::Accepted(_) => panic!("one block past document_block_count_max must be rejected"),
+        };
+        assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+        let details = rejected.details.expect("a limit_exceeded rejection must carry details");
+        assert_eq!(details["limit_kind"], "document_block_count");
+        assert_eq!(details["limit"], limits.document_block_count_max as u64);
+
+        let head_after_rejection = super::read_observed_head(&state.db, document_id)
+            .await
+            .expect("head reads")
+            .expect("document row exists");
+        assert_eq!(head_after_rejection.head_seq, accepted_exact.head_seq);
+        assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_after_exact);
+
+        scratch.drop_self().await;
+    }
+
+    /// Call-direction proof for `check_snapshot`'s `text_block_chars` branch: one block's text at
+    /// exactly `text_block_chars_max` chars is accepted; one char more is rejected.
+    #[tokio::test]
+    async fn ws_structural_limit_text_block_chars_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+        let scratch = scratch_or_skip!("limit-text-block-chars");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+        let limits = crate::flow::collab::limits::document_limits();
+
+        let accepted_exact = match submit_block_text_in_chunks(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            "blk-text",
+            true,
+            limits.text_block_chars_max,
+            TEXT_CHUNK_CHARS,
+            "text-chars-exact",
+        )
+        .await
+        {
+            AcceptOutcome::Accepted(accepted) => accepted,
+            AcceptOutcome::Rejected(rejected) => {
+                panic!("a block at exactly text_block_chars_max must be accepted, got {rejected:?}")
+            }
+        };
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+
+        let plus_one_bytes = build_update_from_current(&state, document_id, |engine| {
+            engine
+                .apply_operation(&Operation::InsertText {
+                    id: NodeId::from("blk-text"),
+                    index: 0,
+                    text: "b".to_string(),
+                })
+                .expect("the local candidate applies the op -- the server-side gate must reject it");
+        })
+        .await;
+
+        let rejected = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            plus_one_bytes,
+            "text-chars-plus-one",
+        )
+        .await
+        {
+            AcceptOutcome::Rejected(rejected) => rejected,
+            AcceptOutcome::Accepted(_) => panic!("one char past text_block_chars_max must be rejected"),
+        };
+        assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+        let details = rejected.details.expect("a limit_exceeded rejection must carry details");
+        assert_eq!(details["limit_kind"], "text_block_chars");
+        assert_eq!(details["limit"], limits.text_block_chars_max as u64);
+
+        let head_after_rejection = super::read_observed_head(&state.db, document_id)
+            .await
+            .expect("head reads")
+            .expect("document row exists");
+        assert_eq!(head_after_rejection.head_seq, accepted_exact.head_seq);
+        assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_after_exact);
+
+        scratch.drop_self().await;
+    }
+
+    /// Call-direction proof for `check_snapshot`'s `document_text_chars` branch: ten blocks each
+    /// holding exactly `text_block_chars_max` chars sum to exactly `document_text_chars_max` (no
+    /// individual block ever exceeds `text_block_chars_max`, so that check never fires first).
+    /// One char more, in an eleventh block, is rejected `document_text_chars`.
+    #[tokio::test]
+    async fn ws_structural_limit_document_text_chars_exact_boundary_accepted_plus_one_rejected_zero_side_effects() {
+        let scratch = scratch_or_skip!("limit-doc-text-chars");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+        let limits = crate::flow::collab::limits::document_limits();
+        assert_eq!(
+            limits.document_text_chars_max,
+            limits.text_block_chars_max * 10,
+            "this fixture assumes document_text_chars_max is exactly 10x text_block_chars_max"
+        );
+
+        let mut dispatch_after_exact = 0i64;
+        let mut accepted_exact = None;
+        for block_index in 0..10 {
+            let block_id = format!("blk-doc-{block_index}");
+            let outcome = submit_block_text_in_chunks(
+                &state,
+                &cache,
+                &coordinator,
+                &registry,
+                &snapshot_advancer,
+                workspace_id,
+                document_id,
+                owner_id,
+                &block_id,
+                true,
+                limits.text_block_chars_max,
+                TEXT_CHUNK_CHARS,
+                "doc-chars-exact",
+            )
+            .await;
+            match outcome {
+                AcceptOutcome::Accepted(accepted) => {
+                    dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+                    accepted_exact = Some(accepted);
+                }
+                AcceptOutcome::Rejected(rejected) => panic!(
+                    "block {block_index}/10 at exactly text_block_chars_max must be accepted                      (document total is exactly document_text_chars_max only after the 10th), got {rejected:?}"
+                ),
+            }
+        }
+        let accepted_exact = accepted_exact.expect("the loop above always assigns Some on success");
+
+        let plus_one_bytes = build_update_from_current(&state, document_id, |engine| {
+            engine
+                .apply_operation(&Operation::CreateNode {
+                    id: NodeId::from("blk-doc-one-too-many"),
+                    parent: None,
+                    index: 0,
+                    kind: NodeKind::Block,
+                })
+                .expect("create must succeed locally");
+            engine
+                .apply_operation(&Operation::InsertText {
+                    id: NodeId::from("blk-doc-one-too-many"),
+                    index: 0,
+                    text: "z".to_string(),
+                })
+                .expect("the local candidate applies the op -- the server-side gate must reject it");
+        })
+        .await;
+
+        let rejected = match submit(
+            &state,
+            &cache,
+            &coordinator,
+            &registry,
+            &snapshot_advancer,
+            workspace_id,
+            document_id,
+            owner_id,
+            plus_one_bytes,
+            "doc-chars-plus-one",
+        )
+        .await
+        {
+            AcceptOutcome::Rejected(rejected) => rejected,
+            AcceptOutcome::Accepted(_) => panic!("one char past document_text_chars_max must be rejected"),
+        };
+        assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+        let details = rejected.details.expect("a limit_exceeded rejection must carry details");
+        assert_eq!(details["limit_kind"], "document_text_chars");
+        assert_eq!(details["limit"], limits.document_text_chars_max as u64);
+
+        let head_after_rejection = super::read_observed_head(&state.db, document_id)
+            .await
+            .expect("head reads")
+            .expect("document row exists");
+        assert_eq!(head_after_rejection.head_seq, accepted_exact.head_seq);
+        assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_after_exact);
 
         scratch.drop_self().await;
     }

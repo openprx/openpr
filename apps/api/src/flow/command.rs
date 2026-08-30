@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
-use super::collab::{authz, bootstrap, frame, runtime, write};
+use super::collab::{authz, bootstrap, frame, limits as collab_limits, runtime, write};
 use super::model::{AcceptedChange, FlowFeatureUpdateView, FlowObjectView};
 use super::projection;
 use super::query::feature_view_from_row;
@@ -847,12 +847,28 @@ fn map_collab_error(err: &CollabError) -> ApiError {
 /// Applies one content command's payload to `engine` (already forked, mutated in place). Every
 /// operation this dispatches through is `apply_operation`'s shared vocabulary
 /// (`crates/collab-core/src/engine.rs`) — no command type invents a second mutation path.
+///
+/// `set_title` aside (which never goes through the `Operation` vocabulary at all —
+/// [`LoroCollabEngine::set_title`] is a document-level field, not a tree op, and `TITLE_MAX_CHARS`
+/// already bounds it), every other command type first materializes the *complete, ordered* list
+/// of [`Operation`]s the payload requires — `update_block`'s caller-supplied `properties` map is
+/// the one case in this handler whose operation count is not fixed by the command shape itself,
+/// so it is exactly the case `semantic_patch_operations_max` exists to bound. That full list is
+/// checked with [`collab_core::limits::check_operation_batch_count`] *before* a single operation
+/// is applied to `engine` — `limits-v1.md`'s "reject the whole patch atomically, never a partial
+/// prefix" — then each operation is checked with [`collab_core::limits::check_operation`] against
+/// the snapshot immediately before it (so a `create_node` that would make a second `create_node`
+/// in the same batch exceed `container_count`, for example, is still caught) right before it is
+/// applied. `engine` here is always a fresh, request-local fork (`hydrate_and_apply`'s caller in
+/// `execute_content_command`) that is simply dropped on any `Err` return — a batch-count or
+/// per-operation rejection therefore never reaches `engine.export_from`/`write::accept_update`, so
+/// it can never advance a document head or produce a business event/`event_dispatch` row.
 fn apply_content_command(
     engine: &mut LoroCollabEngine,
     kind: ContentCommandType,
     payload: &Value,
 ) -> Result<(), ApiError> {
-    match kind {
+    let ops: Vec<Operation> = match kind {
         ContentCommandType::SetTitle => {
             let payload: SetTitlePayload = parse_payload("set_title", payload)?;
             let title = payload.title.trim();
@@ -864,7 +880,7 @@ fn apply_content_command(
                     "title must be at most {TITLE_MAX_CHARS} characters"
                 )));
             }
-            engine.set_title(title).map_err(|err| map_collab_error(&err))
+            return engine.set_title(title).map_err(|err| map_collab_error(&err));
         }
         ContentCommandType::InsertBlock => {
             let payload: InsertBlockPayload = parse_payload("insert_block", payload)?;
@@ -874,20 +890,16 @@ fn apply_content_command(
                 .as_deref()
                 .map(|raw| parse_node_id(raw, "parent_block_id"))
                 .transpose()?;
-            engine
-                .apply_operation(&Operation::CreateNode {
-                    id: id.clone(),
-                    parent,
-                    index: payload.index,
-                    kind: NodeKind::Block,
-                })
-                .map_err(|err| map_collab_error(&err))?;
+            let mut ops = vec![Operation::CreateNode {
+                id: id.clone(),
+                parent,
+                index: payload.index,
+                kind: NodeKind::Block,
+            }];
             if let Some(text) = payload.text.filter(|text| !text.is_empty()) {
-                engine
-                    .apply_operation(&Operation::InsertText { id, index: 0, text })
-                    .map_err(|err| map_collab_error(&err))?;
+                ops.push(Operation::InsertText { id, index: 0, text });
             }
-            Ok(())
+            ops
         }
         ContentCommandType::UpdateBlock => {
             let payload: UpdateBlockPayload = parse_payload("update_block", payload)?;
@@ -897,6 +909,7 @@ fn apply_content_command(
                     "update_block requires at least one of text or properties".to_string(),
                 ));
             }
+            let mut ops = Vec::new();
             if let Some(text) = payload.text {
                 let existing = engine.semantic_snapshot().map_err(|err| map_collab_error(&err))?;
                 let node = existing
@@ -906,41 +919,33 @@ fn apply_content_command(
                 let old_len = u32::try_from(node.text.len())
                     .map_err(|_| ApiError::BadRequest("block text too large to update".to_string()))?;
                 if old_len > 0 {
-                    engine
-                        .apply_operation(&Operation::DeleteText {
-                            id: id.clone(),
-                            index: 0,
-                            len: old_len,
-                        })
-                        .map_err(|err| map_collab_error(&err))?;
+                    ops.push(Operation::DeleteText {
+                        id: id.clone(),
+                        index: 0,
+                        len: old_len,
+                    });
                 }
                 if !text.is_empty() {
-                    engine
-                        .apply_operation(&Operation::InsertText {
-                            id: id.clone(),
-                            index: 0,
-                            text,
-                        })
-                        .map_err(|err| map_collab_error(&err))?;
+                    ops.push(Operation::InsertText {
+                        id: id.clone(),
+                        index: 0,
+                        text,
+                    });
                 }
             }
             for (key, value) in payload.properties {
-                engine
-                    .apply_operation(&Operation::SetProperty {
-                        id: id.clone(),
-                        key,
-                        value,
-                    })
-                    .map_err(|err| map_collab_error(&err))?;
+                ops.push(Operation::SetProperty {
+                    id: id.clone(),
+                    key,
+                    value,
+                });
             }
-            Ok(())
+            ops
         }
         ContentCommandType::DeleteBlock => {
             let payload: DeleteBlockPayload = parse_payload("delete_block", payload)?;
             let id = parse_node_id(&payload.block_id, "block_id")?;
-            engine
-                .apply_operation(&Operation::DeleteNode { id })
-                .map_err(|err| map_collab_error(&err))
+            vec![Operation::DeleteNode { id }]
         }
         ContentCommandType::MoveBlock => {
             let payload: MoveBlockPayload = parse_payload("move_block", payload)?;
@@ -950,15 +955,25 @@ fn apply_content_command(
                 .as_deref()
                 .map(|raw| parse_node_id(raw, "parent_block_id"))
                 .transpose()?;
-            engine
-                .apply_operation(&Operation::MoveNode {
-                    id,
-                    new_parent,
-                    index: payload.index,
-                })
-                .map_err(|err| map_collab_error(&err))
+            vec![Operation::MoveNode {
+                id,
+                new_parent,
+                index: payload.index,
+            }]
         }
+    };
+
+    let limits = collab_limits::document_limits();
+    collab_core::limits::check_operation_batch_count(ops.len(), &limits)
+        .map_err(|violation| map_collab_error(&CollabError::from(violation)))?;
+
+    for op in ops {
+        let snapshot = engine.semantic_snapshot().map_err(|err| map_collab_error(&err))?;
+        collab_core::limits::check_operation(&snapshot, &op, &limits)
+            .map_err(|violation| map_collab_error(&CollabError::from(violation)))?;
+        engine.apply_operation(&op).map_err(|err| map_collab_error(&err))?;
     }
+    Ok(())
 }
 
 /// `error-mapping-v1.md`'s stable-code → REST mapping, applied to a rejection from the shared
@@ -986,8 +1001,29 @@ fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
             ApiError::Forbidden(detail.to_string())
         }
         RejectedCode::NotFound => ApiError::NotFound(detail.to_string()),
-        RejectedCode::UnsupportedProtocol | RejectedCode::InvalidUpdate | RejectedCode::LimitExceeded => {
-            ApiError::BadRequest(detail.to_string())
+        RejectedCode::UnsupportedProtocol | RejectedCode::InvalidUpdate => ApiError::BadRequest(detail.to_string()),
+        // `error-mapping-v1.md`: `limit_exceeded` details are `{limit_kind,limit,observed?,...}`
+        // -- `apps/api/src/error.rs`'s `ApiError`/`ApiResponse` envelope has no structured
+        // `details` field to carry that JSON object to a REST caller (a pre-existing gap, not
+        // introduced here), so it is folded into the `BadRequest` message text instead, matching
+        // the sibling `map_collab_error`'s `"limit_exceeded: {limit_kind}"` shape rather than
+        // silently dropping `rejected.details` on the floor.
+        RejectedCode::LimitExceeded => {
+            let message = rejected.details.as_ref().map_or_else(
+                || detail.to_string(),
+                |details| match (
+                    details.get("limit_kind").and_then(Value::as_str),
+                    details.get("limit"),
+                    details.get("observed"),
+                ) {
+                    (Some(limit_kind), Some(limit), Some(observed)) => {
+                        format!("limit_exceeded: {limit_kind} (limit={limit}, observed={observed})")
+                    }
+                    (Some(limit_kind), _, _) => format!("limit_exceeded: {limit_kind}"),
+                    _ => detail.to_string(),
+                },
+            );
+            ApiError::BadRequest(message)
         }
         RejectedCode::StaleFrontier | RejectedCode::ResyncRequired | RejectedCode::ServerDraining => {
             ApiError::Conflict(detail.to_string())

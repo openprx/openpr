@@ -185,6 +185,27 @@ pub struct FlowLimitsV1 {
     pub import_compression_ratio_max: u64,
 }
 
+/// Builds the [`collab_core::DocumentLimits`] structural ceiling set from this module's own
+/// frozen constants — the single source both the REST content-command path
+/// (`flow::command::apply_content_command`, via [`collab_core::limits::check_operation`] /
+/// [`collab_core::limits::check_operation_batch_count`]) and the WebSocket write path
+/// (`flow::collab::write::hydrate_and_apply`, via [`collab_core::limits::check_snapshot`]) use, so
+/// neither call site can silently drift from the other or from `Bootstrap.limits`'s own wire
+/// report above.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub const fn document_limits() -> collab_core::DocumentLimits {
+    collab_core::DocumentLimits {
+        update_bytes_max: UPDATE_BYTES_MAX as usize,
+        tree_depth_max: TREE_DEPTH_MAX as usize,
+        container_count_max: CONTAINER_COUNT_MAX as usize,
+        document_block_count_max: DOCUMENT_BLOCK_COUNT_MAX as usize,
+        text_block_chars_max: TEXT_BLOCK_CHARS_MAX as usize,
+        document_text_chars_max: DOCUMENT_TEXT_CHARS_MAX as usize,
+        semantic_patch_operations_max: SEMANTIC_PATCH_OPERATIONS_MAX as usize,
+    }
+}
+
 /// Builds the effective `FlowLimitsV1` from this module's own frozen constants — the single
 /// source `Bootstrap.limits` (and any future limits-reporting surface) must call, so the wire
 /// value can never drift from the constants this package actually enforces.

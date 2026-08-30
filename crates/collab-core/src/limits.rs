@@ -204,6 +204,88 @@ pub const fn check_operation_batch_count(op_count: usize, limits: &DocumentLimit
     Ok(())
 }
 
+/// Validates an entire, already-decoded [`SemanticSnapshot`] against every structural ceiling this
+/// module can check from shape alone, independent of which discrete [`Operation`]s (if any)
+/// produced it.
+///
+/// [`check_operation`] validates one about-to-be-applied operation against a *delta* off the
+/// snapshot immediately before it, which assumes the caller has that operation as a discrete,
+/// typed value. The WebSocket write path never does: what it receives off the wire is an opaque
+/// Loro CRDT update, decoded and merged into an isolated candidate document entirely inside the
+/// engine's own apply machinery (`LoroCollabEngine::import_update`) — by construction of the CRDT
+/// sync model there is no discrete `Operation` list to replay through `check_operation` at all.
+/// This function is that path's structural gate instead: it re-derives the same aggregate values
+/// `check_operation` incrementally maintains (max tree depth, live container/block counts, the
+/// longest live block's text length, and total live text length) directly from the resulting
+/// snapshot, and rejects under the identical `limit_kind`/`limit`/`observed` shape. Callers run
+/// this on the *candidate* document produced by an isolated `fork` + `import_update`, strictly
+/// before that candidate is ever committed (`ADR-0010`'s write algorithm: decode -> limit -> diff
+/// -> policy -> projection prepare, all before the DB transaction begins).
+///
+/// Checked in the same precedence order as [`check_operation`] (`tree_depth`, then
+/// `container_count`, then `document_block_count`, then `text_block_chars`, then
+/// `document_text_chars`) so two documents that violate more than one ceiling at once report the
+/// same `limit_kind` regardless of which check function observed them.
+pub fn check_snapshot(snapshot: &SemanticSnapshot, limits: &DocumentLimits) -> Result<(), LimitViolation> {
+    let max_depth = snapshot
+        .nodes
+        .keys()
+        .map(|id| depth_of(snapshot, id))
+        .max()
+        .unwrap_or(0);
+    if max_depth > limits.tree_depth_max {
+        return Err(LimitViolation {
+            limit_kind: "tree_depth",
+            limit: limits.tree_depth_max as u64,
+            observed: max_depth as u64,
+        });
+    }
+
+    let container_count = live_count(snapshot, NodeKind::NavigatorNode);
+    if container_count > limits.container_count_max {
+        return Err(LimitViolation {
+            limit_kind: "container_count",
+            limit: limits.container_count_max as u64,
+            observed: container_count as u64,
+        });
+    }
+
+    let block_count = live_count(snapshot, NodeKind::Block);
+    if block_count > limits.document_block_count_max {
+        return Err(LimitViolation {
+            limit_kind: "document_block_count",
+            limit: limits.document_block_count_max as u64,
+            observed: block_count as u64,
+        });
+    }
+
+    let longest_block_chars = snapshot
+        .nodes
+        .values()
+        .filter(|node| !node.deleted)
+        .map(|node| node.text.chars().count())
+        .max()
+        .unwrap_or(0);
+    if longest_block_chars > limits.text_block_chars_max {
+        return Err(LimitViolation {
+            limit_kind: "text_block_chars",
+            limit: limits.text_block_chars_max as u64,
+            observed: longest_block_chars as u64,
+        });
+    }
+
+    let document_chars = document_text_chars(snapshot);
+    if document_chars > limits.document_text_chars_max {
+        return Err(LimitViolation {
+            limit_kind: "document_text_chars",
+            limit: limits.document_text_chars_max as u64,
+            observed: document_chars as u64,
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,5 +446,84 @@ mod tests {
         assert_eq!(violation.limit_kind, "semantic_patch_operations");
         assert_eq!(violation.limit, 2);
         assert_eq!(violation.observed, 3);
+    }
+
+    #[test]
+    fn check_snapshot_tree_depth_exact_boundary_accepted_plus_one_rejected() {
+        let limits = DocumentLimits {
+            tree_depth_max: 2,
+            ..DocumentLimits::default()
+        };
+        let mut snapshot = SemanticSnapshot::default();
+        snapshot
+            .nodes
+            .insert(NodeId::from("root"), node(None, NodeKind::NavigatorNode, ""));
+        snapshot
+            .nodes
+            .insert(NodeId::from("depth1"), node(Some("root"), NodeKind::NavigatorNode, ""));
+        snapshot.nodes.insert(
+            NodeId::from("depth2"),
+            node(Some("depth1"), NodeKind::NavigatorNode, ""),
+        );
+        assert!(
+            check_snapshot(&snapshot, &limits).is_ok(),
+            "depth 2 is exactly the limit"
+        );
+
+        snapshot.nodes.insert(
+            NodeId::from("depth3"),
+            node(Some("depth2"), NodeKind::NavigatorNode, ""),
+        );
+        let violation = check_snapshot(&snapshot, &limits).expect_err("depth 3 exceeds max 2");
+        assert_eq!(violation.limit_kind, "tree_depth");
+        assert_eq!(violation.limit, 2);
+        assert_eq!(violation.observed, 3);
+    }
+
+    #[test]
+    fn check_snapshot_document_block_count_exact_boundary_accepted_plus_one_rejected() {
+        let limits = DocumentLimits {
+            document_block_count_max: 2,
+            ..DocumentLimits::default()
+        };
+        let mut snapshot = SemanticSnapshot::default();
+        snapshot
+            .nodes
+            .insert(NodeId::from("blk-1"), node(None, NodeKind::Block, ""));
+        snapshot
+            .nodes
+            .insert(NodeId::from("blk-2"), node(None, NodeKind::Block, ""));
+        assert!(
+            check_snapshot(&snapshot, &limits).is_ok(),
+            "2 blocks is exactly the limit"
+        );
+
+        snapshot
+            .nodes
+            .insert(NodeId::from("blk-3"), node(None, NodeKind::Block, ""));
+        let violation = check_snapshot(&snapshot, &limits).expect_err("3 blocks exceeds max 2");
+        assert_eq!(violation.limit_kind, "document_block_count");
+        assert_eq!(violation.limit, 2);
+        assert_eq!(violation.observed, 3);
+    }
+
+    #[test]
+    fn check_snapshot_ignores_deleted_nodes_for_counts_and_text() {
+        let limits = DocumentLimits {
+            document_block_count_max: 1,
+            text_block_chars_max: 1,
+            ..DocumentLimits::default()
+        };
+        let mut snapshot = SemanticSnapshot::default();
+        snapshot
+            .nodes
+            .insert(NodeId::from("blk-1"), node(None, NodeKind::Block, "x"));
+        let mut deleted = node(None, NodeKind::Block, "this text is long but deleted");
+        deleted.deleted = true;
+        snapshot.nodes.insert(NodeId::from("blk-2"), deleted);
+        assert!(
+            check_snapshot(&snapshot, &limits).is_ok(),
+            "a tombstoned node must not count against live block_count or text_block_chars"
+        );
     }
 }

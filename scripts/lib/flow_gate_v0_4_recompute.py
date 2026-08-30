@@ -111,11 +111,22 @@ BRIDGE_GATE_STATUSES = {"passed", "failed", "not_covered"}
 
 
 def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_version: str, gates: dict, reasons: dict) -> bool:
-    """Read a per-verifier evidence artifact (flow-events-result.json /
-    collab-architecture-result.json shaped: a top-level `gates` object
-    mapping hard_gate id -> {"status": "passed"|"failed"|"not_covered", ...})
-    and copy each hard gate's own verdict into `gates`/`reasons` verbatim --
-    never re-deriving or softening a verdict the verifier already computed.
+    """Read a per-verifier evidence artifact and copy each hard gate's own
+    verdict into `gates`/`reasons` verbatim -- never re-deriving or softening
+    a verdict the verifier already computed.
+
+    Two artifact shapes are accepted, because the verifiers were written
+    against two conventions and neither is wrong:
+
+    - `gates`: hard_gate id -> {"status": "passed"|"failed"|"not_covered", ...}
+      (flow-events-result.json, collab-architecture-result.json). An entry may
+      carry a `reason`/`note` used as the recorded detail.
+    - `hard_gates`: hard_gate id -> "passed"|"failed"|"not_covered"
+      (limits-result.json, error-contract-result.json). Detail, when present,
+      comes from a sibling `hard_gate_reasons` object keyed by the same ids.
+
+    Exactly one of the two keys must be present; an artifact carrying both is
+    rejected rather than silently preferring one, since the two could disagree.
 
     Returns False (no-op) if the artifact file is simply absent -- the gates
     it would have backed are left at whatever they already are (the
@@ -124,12 +135,13 @@ def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_ver
 
     Raises EvidenceFormatError -- never silently ignored, never downgraded
     to not_verified -- if the file exists but is not valid JSON, is not a
-    JSON object, has the wrong schema_version, lacks a `gates` object, or
-    any entry in that object that names a known hard gate is missing a
-    `status` field or reports a status outside BRIDGE_GATE_STATUSES.
+    JSON object, has the wrong schema_version, carries neither or both of
+    the `gates`/`hard_gates` objects, or any entry in that object that names
+    a known hard gate is missing a `status` field or reports a status outside
+    BRIDGE_GATE_STATUSES.
 
     Deliberately does NOT hardcode which hard gate ids this artifact backs:
-    it iterates whatever keys the artifact's own `gates` object contains,
+    it iterates whatever keys the artifact's own gate object contains,
     so a future verifier revision that adds/drops a gate needs no change
     here.
     """
@@ -155,9 +167,21 @@ def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_ver
             f"{path}: schema_version={actual_schema_version!r}, expected {expected_schema_version!r}"
         )
 
-    gates_obj = data.get("gates")
-    if not isinstance(gates_obj, dict):
-        raise EvidenceFormatError(f"{path}: 'gates' field is missing or not a JSON object")
+    has_gates = isinstance(data.get("gates"), dict)
+    has_hard_gates = isinstance(data.get("hard_gates"), dict)
+    if has_gates and has_hard_gates:
+        raise EvidenceFormatError(
+            f"{path}: carries both a 'gates' and a 'hard_gates' object; "
+            "which one is authoritative is undefined, so this is refused rather than guessed"
+        )
+    if not has_gates and not has_hard_gates:
+        raise EvidenceFormatError(f"{path}: neither a 'gates' nor a 'hard_gates' JSON object is present")
+
+    gate_key = "gates" if has_gates else "hard_gates"
+    gates_obj = data[gate_key]
+    sibling_reasons = data.get("hard_gate_reasons") if gate_key == "hard_gates" else None
+    if sibling_reasons is not None and not isinstance(sibling_reasons, dict):
+        raise EvidenceFormatError(f"{path}: 'hard_gate_reasons' is present but is not a JSON object")
 
     for gate_name, gate_entry in gates_obj.items():
         if gate_name not in ALL_HARD_GATES:
@@ -167,16 +191,24 @@ def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_ver
             # nothing here requires the artifact's gate set to be a subset
             # of ALL_HARD_GATES a priori). Not an error; just not bridged.
             continue
-        if not isinstance(gate_entry, dict) or "status" not in gate_entry:
-            raise EvidenceFormatError(f"{path}: gates.{gate_name} is missing a 'status' field")
-        status = gate_entry["status"]
+        if gate_key == "gates":
+            if not isinstance(gate_entry, dict) or "status" not in gate_entry:
+                raise EvidenceFormatError(f"{path}: gates.{gate_name} is missing a 'status' field")
+            status = gate_entry["status"]
+            detail = gate_entry.get("reason") or gate_entry.get("note")
+        else:
+            if not isinstance(gate_entry, str):
+                raise EvidenceFormatError(
+                    f"{path}: hard_gates.{gate_name} is {type(gate_entry).__name__}, expected a status string"
+                )
+            status = gate_entry
+            detail = sibling_reasons.get(gate_name) if sibling_reasons else None
         if status not in BRIDGE_GATE_STATUSES:
             raise EvidenceFormatError(
-                f"{path}: gates.{gate_name}.status={status!r} is not one of {sorted(BRIDGE_GATE_STATUSES)}"
+                f"{path}: {gate_key}.{gate_name} status={status!r} is not one of {sorted(BRIDGE_GATE_STATUSES)}"
             )
         gates[gate_name] = status
-        detail = gate_entry.get("reason") or gate_entry.get("note")
-        reasons[gate_name] = f"{filename}: gates.{gate_name}.status={status}" + (f" -- {detail}" if detail else "")
+        reasons[gate_name] = f"{filename}: {gate_key}.{gate_name}={status}" + (f" -- {detail}" if detail else "")
 
     return True
 
@@ -342,6 +374,14 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     # as not_covered here too, never rounded up to passed or down to
     # not_verified). Bridged verbatim -- see bridge_verifier_gates() docstring.
     bridge_verifier_gates(evidence_root, "collab-architecture-result.json", "sylvode.flow.collab-architecture-result.v1", gates, reasons)
+
+    # ---- limits / error-contract: both emit their verdicts under `hard_gates`
+    # (flat id -> status strings) rather than `gates`. They were previously
+    # unmapped here, so the 8 hard gates they decide sat at "not_verified"
+    # regardless of what the verifiers actually found. Bridged verbatim, same
+    # as the two above -- see bridge_verifier_gates() docstring.
+    bridge_verifier_gates(evidence_root, "limits-result.json", "sylvode.flow.limits-result.v1", gates, reasons)
+    bridge_verifier_gates(evidence_root, "error-contract-result.json", "sylvode.flow.error-contract-result.v1", gates, reasons)
 
     # ---- legacy_pages_drop_requires_separate_adr: static migration scan ----
     migrations_dir = os.path.join(repo_root, "migrations")
