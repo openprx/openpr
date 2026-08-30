@@ -493,7 +493,7 @@ mod tests {
         SLOW_CONSUMER_QUEUE_BYTES_MAX, SLOW_CONSUMER_QUEUE_FRAMES_MAX, SessionRegistry,
     };
     use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -672,9 +672,13 @@ mod tests {
             match event {
                 OutboundEvent::Frame(..) => frame_count += 1,
                 OutboundEvent::ControlFrame(_) => panic!("unexpected control frame"),
-                OutboundEvent::Close { code, .. } => {
+                OutboundEvent::Close { code, reason } => {
                     saw_close = true;
                     assert_eq!(code, 4408, "slow consumer must close at the frozen limit_exceeded code");
+                    let details: Value = serde_json::from_str(&reason).expect("close reason is structured JSON");
+                    assert_eq!(details["code"], "limit_exceeded");
+                    assert_eq!(details["limit_kind"], "slow_consumer_queue_frames");
+                    assert_eq!(details["limit"], SLOW_CONSUMER_QUEUE_FRAMES_MAX);
                 }
             }
         }
@@ -740,9 +744,13 @@ mod tests {
             match event {
                 OutboundEvent::Frame(..) => frame_count += 1,
                 OutboundEvent::ControlFrame(_) => panic!("unexpected control frame"),
-                OutboundEvent::Close { code, .. } => {
+                OutboundEvent::Close { code, reason } => {
                     saw_close = true;
                     assert_eq!(code, 4408, "slow consumer must close at the frozen limit_exceeded code");
+                    let details: Value = serde_json::from_str(&reason).expect("close reason is structured JSON");
+                    assert_eq!(details["code"], "limit_exceeded");
+                    assert_eq!(details["limit_kind"], "slow_consumer_queue_bytes");
+                    assert_eq!(details["limit"], SLOW_CONSUMER_QUEUE_BYTES_MAX);
                 }
             }
         }
