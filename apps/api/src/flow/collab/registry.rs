@@ -247,6 +247,27 @@ pub enum PresenceLimit {
     PerDocument,
 }
 
+impl PresenceLimit {
+    /// The exact `limit_kind` wire value (`limits-v1.md`'s table). Named here, next to the
+    /// enforcement, for the same reason [`ConnectionLimit::limit_kind`] is: the string a caller
+    /// branches on must not be re-spelled at the transport call site.
+    #[must_use]
+    pub const fn limit_kind(self) -> &'static str {
+        match self {
+            Self::PerConnection => "presence_entries_per_connection",
+            Self::PerDocument => "presence_entries_per_document",
+        }
+    }
+
+    #[must_use]
+    pub const fn limit(self) -> u64 {
+        match self {
+            Self::PerConnection => PRESENCE_ENTRIES_PER_CONNECTION_MAX as u64,
+            Self::PerDocument => PRESENCE_ENTRIES_PER_DOCUMENT_MAX as u64,
+        }
+    }
+}
+
 impl SessionRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -369,11 +390,11 @@ impl SessionRegistry {
     /// workspace) with `server_draining{reason:"drain"}` at [`DRAIN_CLOSE_CODE`]
     /// (`collab-protocol-v1.md`: "实例 ... 显式排空"). Returns how many sessions were closed.
     ///
-    /// No production caller exists yet: v0.4 has no instance-shutdown hook or workspace-admin
-    /// drain endpoint anywhere in this codebase (grepped clean) to call it from — the same
-    /// documented-gap shape this module's own [`Self::disconnect_document`] already carries for
-    /// its v0.5 subtree-revocation caller. This is the tested, callable primitive such a trigger
-    /// wires into; see this module's own doc comment.
+    /// Reached in production through [`super::runtime::CollabRuntime::begin_process_drain`], which
+    /// `apps/api/src/main.rs`'s graceful-shutdown hook calls on SIGTERM/Ctrl-C — so this is the
+    /// instance half of the drain that a real deploy/restart produces, not only a fixture. (A
+    /// workspace-admin drain endpoint is still absent; [`Self::drain_workspace`] remains reachable
+    /// only through the shared `begin_workspace_drain` producer.)
     pub fn drain_all(&self, retry_after_ms: u64) -> usize {
         let signal = DrainSignal::new(retry_after_ms);
         let reason = signal.close_reason();

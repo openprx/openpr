@@ -1,3 +1,4 @@
+use api::flow::collab::limits::{PROCESS_DRAIN_GRACE_MS, PROCESS_DRAIN_RETRY_AFTER_MS};
 use api::{middleware, response::ApiResponse, routes};
 use axum::{
     Json, Router,
@@ -17,6 +18,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 
 #[derive(Serialize)]
@@ -1785,8 +1787,64 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!(bind_addr = %cfg.bind_addr, "api server started");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(drain_then_shutdown())
+        .await?;
     Ok(())
+}
+
+/// Graceful shutdown: the production trigger for `server_draining` with
+/// `details.reason = "drain"` (`contracts/error-mapping-v1.md`: that reason is for "实例/workspace
+/// 正在停止接收或排空连接", as opposed to `contention`'s transient single-writer window).
+///
+/// On SIGTERM/Ctrl-C this marks the whole collab runtime draining *before* the listener is torn
+/// down, which does three things at once, all through the one shared producer
+/// (`flow::collab::runtime::CollabRuntime::begin_process_drain`) so no surface can invent its own
+/// shape: every live WebSocket session is sent the structured `rejected` frame and then closed at
+/// 4410, and every subsequent REST/MCP/CLI Flow call is refused with the `server_draining`
+/// business envelope carrying the same `reason`/`retry_after_ms`. It then keeps serving for
+/// [`PROCESS_DRAIN_GRACE_MS`] so those rejections and closes actually reach their clients instead
+/// of racing the process exit.
+async fn drain_then_shutdown() {
+    shutdown_signal().await;
+    let closed = api::flow::collab::runtime::runtime().begin_process_drain(PROCESS_DRAIN_RETRY_AFTER_MS);
+    tracing::info!(
+        closed_sessions = closed,
+        retry_after_ms = PROCESS_DRAIN_RETRY_AFTER_MS,
+        grace_ms = PROCESS_DRAIN_GRACE_MS,
+        "api server draining: refusing new Flow work and closing collab sessions before shutdown"
+    );
+    tokio::time::sleep(Duration::from_millis(PROCESS_DRAIN_GRACE_MS)).await;
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    res = tokio::signal::ctrl_c() => {
+                        if let Err(err) = res {
+                            tracing::warn!(error = %err, "ctrl_c signal error");
+                        }
+                    },
+                    _ = sigterm.recv() => {},
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to register SIGTERM handler, falling back to ctrl_c only");
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    tracing::warn!(error = %err, "ctrl_c signal error");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %err, "ctrl_c signal error");
+        }
+    }
 }
 
 async fn health(State(state): State<AppState>) -> Json<ApiResponse<HealthResponse>> {

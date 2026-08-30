@@ -20,11 +20,11 @@ use super::egress::{EgressSequencer, SeqDecision};
 use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate};
 use super::limits::{
     CONNECTION_LIMIT_RETRY_AFTER_MS, FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND,
-    OPEN_DOCUMENTS_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX,
-    PRESENCE_PAYLOAD_BYTES_MAX, PRESENCE_TTL_SECONDS_DEFAULT, PRESENCE_TTL_SECONDS_MAX, RATE_LIMIT_RETRY_AFTER_MS,
-    UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND, WEBSOCKET_FRAME_BYTES_MAX,
+    OPEN_DOCUMENTS_PER_CONNECTION_MAX, PRESENCE_PAYLOAD_BYTES_MAX, PRESENCE_TTL_SECONDS_DEFAULT,
+    PRESENCE_TTL_SECONDS_MAX, RATE_LIMIT_RETRY_AFTER_MS, UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND,
+    WEBSOCKET_FRAME_BYTES_MAX,
 };
-use super::registry::{OutboundEvent, PresenceLimit};
+use super::registry::{ConnectionLimit, OutboundEvent, PresenceLimit};
 use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
@@ -195,6 +195,31 @@ fn limit_exceeded_frame(
         current_frontier: None,
         audit_event_id: None,
     }
+}
+
+/// The `limit_exceeded` frame a [`SessionRegistry::try_register`] refusal becomes on the wire.
+///
+/// No `observed`: `limits-v1.md`'s `limit_exceeded` details rule says "`observed` 只允许安全数值,
+/// 不返回 content、bytes、**其他用户连接** 或过滤前结果" — `document_connections`/
+/// `workspace_connections` are counts of *other people's* sessions, so reporting them back to the
+/// refused client is exactly what that sentence forbids. `retry_after_ms` is what a connection
+/// ceiling gives a caller instead ("rate/connection/queue 可按 `retry_after_ms` 重试").
+fn connection_limit_frame(document_id: Uuid, limit: ConnectionLimit) -> Frame {
+    limit_exceeded_frame(
+        document_id,
+        limit.limit_kind(),
+        limit.limit(),
+        None,
+        Some(CONNECTION_LIMIT_RETRY_AFTER_MS),
+    )
+}
+
+/// The `limit_exceeded` frame a refused `presence` upsert becomes on the wire. `observed` is
+/// omitted for the same reason as [`connection_limit_frame`]: both presence ceilings count
+/// entries owned by other sessions. Neither is retryable on a timer — the client must drop a
+/// presence entry, not wait — so no `retry_after_ms` either.
+fn presence_limit_frame(document_id: Uuid, limit: PresenceLimit) -> Frame {
+    limit_exceeded_frame(document_id, limit.limit_kind(), limit.limit(), None, None)
 }
 
 /// A fixed sustained-rate token bucket with burst capacity (`limits-v1.md`: "Rate 使用 token
@@ -486,17 +511,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
         {
             Ok(registered) => registered,
             Err(limit) => {
-                send(
-                    &mut socket,
-                    &limit_exceeded_frame(
-                        document_id,
-                        limit.limit_kind(),
-                        limit.limit(),
-                        None,
-                        Some(CONNECTION_LIMIT_RETRY_AFTER_MS),
-                    ),
-                )
-                .await;
+                send(&mut socket, &connection_limit_frame(document_id, limit)).await;
                 close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
                 return;
             }
@@ -589,6 +604,20 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             continue;
                         };
                         if matches!(frame, Frame::Update { .. }) {
+                            // `error-mapping-v1.md`'s `drain` reason: "实例/workspace 正在停止接收
+                            // 或排空连接". `reverify_open` already refuses a *handshake* against a
+                            // draining workspace and `SessionRegistry::drain_workspace`/`drain_all`
+                            // close the sessions live at the instant a drain starts, but neither
+                            // covers the frame already in flight on this socket when that happened
+                            // -- without this check it would still be committed to the canonical
+                            // document by an instance that has announced it stopped accepting
+                            // work. Checked only for `update` frames: those are the "new work" a
+                            // drain refuses, and this is a process-global lock, not something to
+                            // take on every `ping`/`presence` frame at 30/s per connection.
+                            if let Some(signal) = collab.workspace_drain_signal(consumed.workspace_id) {
+                                reject_drain_and_close(&mut socket, document_id, signal).await;
+                                break;
+                            }
                             let update_outcome = update_limiter.take();
                             if !update_outcome.admitted {
                                 send(&mut socket, &limit_exceeded_frame(document_id, "update_rate", UPDATES_PER_CONNECTION_PER_SECOND, None, Some(RATE_LIMIT_RETRY_AFTER_MS))).await;
@@ -1109,31 +1138,8 @@ async fn handle_client_frame(
                     };
                     collab.registry.broadcast(document_id, &frame, Some(session_id));
                 }
-                Err(PresenceLimit::PerConnection) => {
-                    send(
-                        socket,
-                        &limit_exceeded_frame(
-                            document_id,
-                            "presence_entries_per_connection",
-                            PRESENCE_ENTRIES_PER_CONNECTION_MAX as u64,
-                            None,
-                            None,
-                        ),
-                    )
-                    .await;
-                }
-                Err(PresenceLimit::PerDocument) => {
-                    send(
-                        socket,
-                        &limit_exceeded_frame(
-                            document_id,
-                            "presence_entries_per_document",
-                            PRESENCE_ENTRIES_PER_DOCUMENT_MAX as u64,
-                            None,
-                            None,
-                        ),
-                    )
-                    .await;
+                Err(limit) => {
+                    send(socket, &presence_limit_frame(document_id, limit)).await;
                 }
             }
         }
@@ -1205,6 +1211,7 @@ async fn read_frame(socket: &mut WebSocket, timeout: Duration) -> Option<Frame> 
 // so window rollover is deterministic and the suite stays fast.
 // ---------------------------------------------------------------------------------------------
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -1217,6 +1224,164 @@ mod tests {
     use super::{
         FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND, UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND,
     };
+
+    /// The three `limits-v1.md` connection ceilings, each driven to refusal by the *real*
+    /// [`SessionRegistry::try_register`] admission path and then rendered through the *same*
+    /// [`connection_limit_frame`] the session loop uses, so the `limit_kind`/`limit` a refused
+    /// client actually reads is what this pins.
+    ///
+    /// Why the registry rather than 100/500 real sockets: `connections_per_document_max` (100) and
+    /// `connections_per_workspace_max` (500) are counted in the process-wide registry, and the
+    /// only way a WebSocket client reaches either is by holding that many sockets open at once —
+    /// a fixture whose cost is entirely in the transport, while the decision under test (which
+    /// ceiling was hit, and what it serializes to) is not in the transport at all.
+    /// `user_connections` *is* additionally proven over 17 real sockets end to end
+    /// (`live_ws::user_connections_ceiling_refuses_the_seventeenth_session_with_the_frozen_limit_kind`),
+    /// which is what shows this rendering really is the one that reaches the wire.
+    #[test]
+    fn every_connection_ceiling_renders_its_frozen_limit_kind_and_limit_into_the_rejection_frame() {
+        use crate::flow::collab::registry::{ConnectionLimit, SessionRegistry};
+
+        let document_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+
+        // `user_connections`: one user, one document -- the per-user check runs first.
+        let per_user = SessionRegistry::new();
+        let user_id = Uuid::new_v4();
+        for _ in 0..limits::CONNECTIONS_PER_USER_MAX {
+            per_user
+                .try_register(document_id, user_id, workspace_id, Uuid::new_v4())
+                .map_err(ConnectionLimit::limit_kind)
+                .expect("registrations within the per-user ceiling are admitted");
+        }
+        let Err(user_limit) = per_user.try_register(document_id, user_id, workspace_id, Uuid::new_v4()) else {
+            panic!("one past connections_per_user_max must be refused");
+        };
+
+        // `document_connections`: distinct users so the per-user ceiling is never the one hit.
+        let per_document = SessionRegistry::new();
+        for _ in 0..limits::CONNECTIONS_PER_DOCUMENT_MAX {
+            per_document
+                .try_register(document_id, Uuid::new_v4(), workspace_id, Uuid::new_v4())
+                .map_err(ConnectionLimit::limit_kind)
+                .expect("registrations within the per-document ceiling are admitted");
+        }
+        let Err(document_limit) = per_document.try_register(document_id, Uuid::new_v4(), workspace_id, Uuid::new_v4())
+        else {
+            panic!("one past connections_per_document_max must be refused");
+        };
+
+        // `workspace_connections`: distinct users *and* enough distinct documents that neither the
+        // per-user nor the per-document ceiling is reached first.
+        let per_workspace = SessionRegistry::new();
+        for _ in 0..limits::CONNECTIONS_PER_WORKSPACE_MAX {
+            per_workspace
+                .try_register(Uuid::new_v4(), Uuid::new_v4(), workspace_id, Uuid::new_v4())
+                .map_err(ConnectionLimit::limit_kind)
+                .expect("registrations within the per-workspace ceiling are admitted");
+        }
+        let Err(workspace_limit) =
+            per_workspace.try_register(Uuid::new_v4(), Uuid::new_v4(), workspace_id, Uuid::new_v4())
+        else {
+            panic!("one past connections_per_workspace_max must be refused");
+        };
+
+        let cases = [
+            (user_limit, "user_connections", limits::CONNECTIONS_PER_USER_MAX),
+            (
+                document_limit,
+                "document_connections",
+                limits::CONNECTIONS_PER_DOCUMENT_MAX,
+            ),
+            (
+                workspace_limit,
+                "workspace_connections",
+                limits::CONNECTIONS_PER_WORKSPACE_MAX,
+            ),
+        ];
+        for (limit, expected_kind, expected_limit) in cases {
+            let frame = super::connection_limit_frame(document_id, limit);
+            let Frame::Rejected { code, details, .. } = frame else {
+                panic!("{expected_kind} must render as a rejected frame");
+            };
+            assert_eq!(code, super::RejectedCode::LimitExceeded);
+            let details = details.unwrap_or_else(|| panic!("{expected_kind} must carry details"));
+            assert_eq!(details["limit_kind"], expected_kind);
+            assert_eq!(details["limit"], expected_limit);
+            assert_eq!(details["retry_after_ms"], limits::CONNECTION_LIMIT_RETRY_AFTER_MS);
+            assert!(
+                details.get("observed").is_none(),
+                "{expected_kind}: `observed` would report other users' connections back to the caller, \
+                 which limits-v1.md's details rule forbids"
+            );
+        }
+    }
+
+    /// The two presence ceilings, driven to refusal by the real
+    /// [`SessionRegistry::upsert_presence`] accounting and rendered through the same
+    /// [`presence_limit_frame`] `handle_client_frame` uses.
+    ///
+    /// Neither is reachable from a single v0.4 WebSocket connection: an entry is keyed
+    /// `(document_id, session_id)` with `session_id` taken from the *connection*, never from the
+    /// frame, so one connection owns exactly one entry — `presence_entries_per_connection` (8)
+    /// would need a multi-document connection (which `frame.rs` documents as post-v0.4) and
+    /// `presence_entries_per_document` (100) needs 100 simultaneous sockets. The enforcement and
+    /// its wire rendering still have to be right, which is what this covers; the reachability
+    /// caveat is recorded rather than papered over.
+    #[test]
+    fn both_presence_ceilings_render_their_frozen_limit_kind_and_limit_into_the_rejection_frame() {
+        use crate::flow::collab::registry::SessionRegistry;
+
+        let document_id = Uuid::new_v4();
+        let payload = serde_json::json!({"cursor": 1});
+        let ttl = Duration::from_secs(30);
+
+        // Per connection: one session, distinct documents.
+        let per_connection = SessionRegistry::new();
+        let session_id = Uuid::new_v4();
+        for _ in 0..limits::PRESENCE_ENTRIES_PER_CONNECTION_MAX {
+            per_connection
+                .upsert_presence(Uuid::new_v4(), session_id, payload.clone(), ttl)
+                .expect("entries within the per-connection ceiling are accepted");
+        }
+        let connection_limit = per_connection
+            .upsert_presence(Uuid::new_v4(), session_id, payload.clone(), ttl)
+            .expect_err("one past presence_entries_per_connection_max is refused");
+
+        // Per document: one document, distinct sessions.
+        let per_document = SessionRegistry::new();
+        for _ in 0..limits::PRESENCE_ENTRIES_PER_DOCUMENT_MAX {
+            per_document
+                .upsert_presence(document_id, Uuid::new_v4(), payload.clone(), ttl)
+                .expect("entries within the per-document ceiling are accepted");
+        }
+        let document_limit = per_document
+            .upsert_presence(document_id, Uuid::new_v4(), payload, ttl)
+            .expect_err("one past presence_entries_per_document_max is refused");
+
+        let cases = [
+            (
+                connection_limit,
+                "presence_entries_per_connection",
+                limits::PRESENCE_ENTRIES_PER_CONNECTION_MAX as u64,
+            ),
+            (
+                document_limit,
+                "presence_entries_per_document",
+                limits::PRESENCE_ENTRIES_PER_DOCUMENT_MAX as u64,
+            ),
+        ];
+        for (limit, expected_kind, expected_limit) in cases {
+            let frame = super::presence_limit_frame(document_id, limit);
+            let Frame::Rejected { code, details, .. } = frame else {
+                panic!("{expected_kind} must render as a rejected frame");
+            };
+            assert_eq!(code, super::RejectedCode::LimitExceeded);
+            let details = details.unwrap_or_else(|| panic!("{expected_kind} must carry details"));
+            assert_eq!(details["limit_kind"], expected_kind);
+            assert_eq!(details["limit"], expected_limit);
+        }
+    }
 
     /// Shared scenario for the sustained-rate exact/+1 boundary: starts the bucket empty (bypasses
     /// `RateLimiter::new`'s initial burst fill so this test isolates the *sustained* rate, not the
@@ -2247,6 +2412,293 @@ mod tests {
                 "the connection must remain usable after a rejected reopen, got {pong:?}"
             );
 
+            scratch.drop_self().await;
+        }
+
+        /// `open_documents` (`open_documents_per_connection_max` = 8), on the wire.
+        ///
+        /// The reopen test above proves the *structural* guarantee (a second `open` never opens a
+        /// second document); this proves the counted ceiling `handle_client_frame` maintains on
+        /// top of it, which is the only thing that makes the `open_documents` `limit_kind`
+        /// observable at all. The handshake itself is attempt 1, so reopens 2..=8 are each refused
+        /// `invalid_update` and the 8th reopen (attempt 9, the first past the ceiling) is refused
+        /// `limit_exceeded` carrying the frozen `limit_kind`/`limit`/`observed`.
+        #[tokio::test]
+        async fn open_documents_ceiling_is_observable_as_limit_exceeded_on_the_ninth_attempt() {
+            let scratch = scratch_or_skip!("open-documents-kind");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "open-documents-kind-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+
+            const OPEN_DOCUMENTS_PER_CONNECTION_MAX: u64 = 8;
+            let reopen = Frame::Open {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                known_seq: None,
+                known_frontier: None,
+            };
+
+            // Attempts 2..=OPEN_DOCUMENTS_PER_CONNECTION_MAX: still within the ceiling.
+            for attempt in 2..=OPEN_DOCUMENTS_PER_CONNECTION_MAX {
+                send_frame(&mut ws, &reopen).await;
+                let rejected = recv_frame(&mut ws).await;
+                let Frame::Rejected { code, .. } = rejected else {
+                    panic!("attempt {attempt} must be rejected, got {rejected:?}");
+                };
+                assert_eq!(
+                    code,
+                    RejectedCode::InvalidUpdate,
+                    "attempt {attempt} is within the ceiling and must stay invalid_update"
+                );
+            }
+
+            // Attempt OPEN_DOCUMENTS_PER_CONNECTION_MAX + 1: the first past the ceiling.
+            send_frame(&mut ws, &reopen).await;
+            let rejected = recv_frame(&mut ws).await;
+            let Frame::Rejected { code, details, .. } = rejected else {
+                panic!("the ninth attempt must be rejected, got {rejected:?}");
+            };
+            assert_eq!(code, RejectedCode::LimitExceeded);
+            let details = details.expect("a limit_exceeded rejection must carry details");
+            assert_eq!(details["limit_kind"], "open_documents");
+            assert_eq!(details["limit"], OPEN_DOCUMENTS_PER_CONNECTION_MAX);
+            assert_eq!(details["observed"], OPEN_DOCUMENTS_PER_CONNECTION_MAX + 1);
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+            assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_before);
+
+            scratch.drop_self().await;
+        }
+
+        /// `frame_rate` (`frames_per_connection_per_second` = 30, burst 60), on the wire.
+        ///
+        /// The bucket starts full (`RateLimiter::new`), so the rejection cannot land before frame
+        /// 61; local round trips are far faster than the 30 tokens/second refill, so it also
+        /// cannot be pushed out indefinitely. Both bounds are asserted rather than assuming an
+        /// exact frame number, which would depend on how much wall time the round trips consume.
+        /// A single exceeded window never closes the connection (the close needs 3 consecutive
+        /// exceeded 1-second windows), and a `ping`/`pong` after the rejection proves it.
+        #[tokio::test]
+        async fn frame_rate_ceiling_is_observable_as_limit_exceeded_without_closing_the_connection() {
+            let scratch = scratch_or_skip!("frame-rate-kind");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "frame-rate-kind-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+
+            const FRAMES_PER_CONNECTION_PER_SECOND: u64 = 30;
+            const FRAME_BURST_MAX: u64 = 60;
+            // Enough headroom that even a slow machine refilling tokens the whole time still runs
+            // out, without being unbounded.
+            const MAX_PINGS: u64 = 400;
+
+            let mut admitted = 0u64;
+            let mut rejection_details = None;
+            for n in 0..MAX_PINGS {
+                send_frame(
+                    &mut ws,
+                    &Frame::Ping {
+                        protocol_version: PROTOCOL_VERSION,
+                        nonce: format!("flood-{n}"),
+                    },
+                )
+                .await;
+                match recv_frame(&mut ws).await {
+                    Frame::Pong { .. } => admitted += 1,
+                    Frame::Rejected { code, details, .. } => {
+                        assert_eq!(code, RejectedCode::LimitExceeded);
+                        rejection_details = Some(details.expect("a limit_exceeded rejection must carry details"));
+                        break;
+                    }
+                    other => panic!("unexpected frame while flooding: {other:?}"),
+                }
+            }
+
+            let details = rejection_details.expect("flooding well past the burst must produce a frame_rate rejection");
+            assert_eq!(details["limit_kind"], "frame_rate");
+            assert_eq!(details["limit"], FRAMES_PER_CONNECTION_PER_SECOND);
+            assert_eq!(
+                details["retry_after_ms"], 1_000,
+                "a rate rejection must tell the caller when to retry (`limits-v1.md`: rate/connection/queue 可按 retry_after_ms 重试)"
+            );
+            assert!(
+                admitted >= FRAME_BURST_MAX,
+                "the burst capacity must be honored before the first rejection: only {admitted} frames were admitted"
+            );
+
+            // A single exceeded window must not close the connection.
+            send_frame(
+                &mut ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "still-open".to_string(),
+                },
+            )
+            .await;
+            let after = recv_frame(&mut ws).await;
+            assert!(
+                matches!(after, Frame::Pong { .. } | Frame::Rejected { .. }),
+                "the connection must stay open after one exceeded rate window, got {after:?}"
+            );
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+            assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_before);
+
+            scratch.drop_self().await;
+        }
+
+        /// `update_rate` (`updates_per_connection_per_second` = 10, burst 20), on the wire.
+        ///
+        /// The update frames deliberately name a *different* `document_id` than the one this
+        /// connection is scoped to: `handle_client_frame`'s `Frame::Update` arm rejects that
+        /// `invalid_update` before any decode, hydrate, or write happens, so this test exercises
+        /// the update-rate bucket (which `run`'s read loop charges *before* dispatching the frame
+        /// at all) without submitting real CRDT work. The distinct rejection codes are what tell
+        /// the two apart: `invalid_update` while tokens remain, `limit_exceeded`/`update_rate`
+        /// once they are gone.
+        #[tokio::test]
+        async fn update_rate_ceiling_is_observable_as_limit_exceeded_separately_from_the_frame_rate() {
+            let scratch = scratch_or_skip!("update-rate-kind");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "update-rate-kind-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+
+            const UPDATES_PER_CONNECTION_PER_SECOND: u64 = 10;
+            const UPDATE_BURST_MAX: u64 = 20;
+            // Must stay under the 60-frame burst so this can only ever trip `update_rate`.
+            const MAX_UPDATES: u64 = 55;
+
+            let mut admitted = 0u64;
+            let mut rejection_details = None;
+            for n in 0..MAX_UPDATES {
+                send_frame(
+                    &mut ws,
+                    &Frame::Update {
+                        protocol_version: PROTOCOL_VERSION,
+                        document_id: Uuid::new_v4(),
+                        update_id: Uuid::new_v4(),
+                        base_frontier: String::new(),
+                        bytes: String::new(),
+                        idempotency_key: None,
+                        origin: format!("update-flood-{n}"),
+                        message: None,
+                    },
+                )
+                .await;
+                let Frame::Rejected { code, details, .. } = recv_frame(&mut ws).await else {
+                    panic!("every frame in this flood must be rejected");
+                };
+                match code {
+                    RejectedCode::InvalidUpdate => admitted += 1,
+                    RejectedCode::LimitExceeded => {
+                        rejection_details = Some(details.expect("a limit_exceeded rejection must carry details"));
+                        break;
+                    }
+                    other => panic!("unexpected rejection code while flooding updates: {other:?}"),
+                }
+            }
+
+            let details =
+                rejection_details.expect("flooding well past the update burst must produce an update_rate rejection");
+            assert_eq!(details["limit_kind"], "update_rate");
+            assert_eq!(details["limit"], UPDATES_PER_CONNECTION_PER_SECOND);
+            assert_eq!(details["retry_after_ms"], 1_000);
+            assert!(
+                admitted >= UPDATE_BURST_MAX,
+                "the update burst capacity must be honored before the first rejection: only {admitted} were admitted"
+            );
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+            assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_before);
+
+            scratch.drop_self().await;
+        }
+
+        /// `user_connections` (`connections_per_user_max` = 16), on the wire and end to end.
+        ///
+        /// Sixteen real, simultaneously-open WebSocket sessions for one freshly-created user
+        /// exhaust that user's slot budget in the process-wide session registry; the seventeenth
+        /// handshake must be refused with the structured `limit_exceeded` frame and then closed at
+        /// 4408. A fresh `user_id`/`workspace_id`/`document_id` per run is what keeps this from
+        /// interacting with any other test sharing that registry -- the per-user ceiling is
+        /// counted per `user_id`, and 17 sessions stay far below the 100-per-document and
+        /// 500-per-workspace ceilings this same registration path also checks.
+        #[tokio::test]
+        async fn user_connections_ceiling_refuses_the_seventeenth_session_with_the_frozen_limit_kind() {
+            let scratch = scratch_or_skip!("user-connections-kind");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            const CONNECTIONS_PER_USER_MAX: u64 = 16;
+
+            // Held open for the whole test: dropping any of them would free a slot.
+            let mut open_sessions = Vec::new();
+            for n in 0..CONNECTIONS_PER_USER_MAX {
+                let client_id = format!("user-connections-{n}");
+                let ticket = issue_ticket(addr, &token, workspace_id, document_id, &client_id).await;
+                let (ws, _) = open_session(addr, &ticket, &client_id, document_id).await;
+                open_sessions.push(ws);
+            }
+
+            // The seventeenth completes the same `hello`/`open`/`snapshot` handshake: `run`
+            // reserves the connection slot only after the snapshot has been sent (the ceiling
+            // bounds *steady-state* sessions), so the refusal is the frame right after it.
+            let client_id = "user-connections-overflow";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, _) = open_session(addr, &ticket, client_id, document_id).await;
+
+            let rejected = recv_frame(&mut ws).await;
+            let Frame::Rejected { code, details, .. } = rejected else {
+                panic!("the seventeenth session must be refused, got {rejected:?}");
+            };
+            assert_eq!(code, RejectedCode::LimitExceeded);
+            let details = details.expect("a limit_exceeded rejection must carry details");
+            assert_eq!(details["limit_kind"], "user_connections");
+            assert_eq!(details["limit"], CONNECTIONS_PER_USER_MAX);
+            assert_eq!(details["retry_after_ms"], 5_000);
+            assert!(
+                details.get("observed").is_none(),
+                "`observed` must stay absent: limits-v1.md forbids reporting other connections back to the caller"
+            );
+
+            let close_message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("close arrives")
+                .expect("stream carries close")
+                .expect("close is not a transport error");
+            let TMessage::Close(Some(close)) = close_message else {
+                panic!("expected a close frame, got {close_message:?}");
+            };
+            assert_eq!(
+                u16::from(close.code),
+                4408,
+                "a refused connection ceiling closes at the frozen limit_exceeded close code"
+            );
+
+            drop(open_sessions);
             scratch.drop_self().await;
         }
     }

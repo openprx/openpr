@@ -42,6 +42,12 @@ struct DrainEntry {
 #[derive(Default)]
 struct WorkspaceDrains {
     entries: Mutex<HashMap<Uuid, DrainEntry>>,
+    /// The instance-wide half of `collab-protocol-v1.md`'s "实例/workspace 显式排空", set by
+    /// [`CollabRuntime::begin_process_drain`]. Deliberately *not* guard-scoped the way
+    /// [`WorkspaceDrainGuard`] is: an instance drain is terminal (the process is on its way out),
+    /// so there is no "the maintenance window ended" state to return to, and a value that could
+    /// be un-set would let a shutdown path be silently cancelled by an unrelated `Drop`.
+    process: Mutex<Option<u64>>,
 }
 
 /// A controlled, workspace-scoped drain producer.
@@ -99,13 +105,41 @@ impl CollabRuntime {
         }
     }
 
+    /// Marks this whole instance as draining and immediately closes every live WebSocket session
+    /// it holds, returning how many were closed.
+    ///
+    /// This is the production trigger `SessionRegistry::drain_all`'s doc comment used to record as
+    /// missing: `apps/api/src/main.rs`'s graceful-shutdown hook calls it on SIGTERM/Ctrl-C, so the
+    /// `drain` reason is produced by the server actually stopping, not only by a test fixture.
+    /// Unlike [`Self::begin_workspace_drain`] it takes no guard and applies to every workspace —
+    /// [`Self::workspace_drain_retry_after_ms`] reports it for any `workspace_id`, so every
+    /// non-WS Flow application service ([`Self::ensure_workspace_accepting`]) starts refusing
+    /// work in the same instant, with the same structured reason, on REST/MCP/CLI alike.
+    pub fn begin_process_drain(&self, retry_after_ms: u64) -> usize {
+        {
+            let mut process = self.drains.process.lock();
+            *process = Some(process.map_or(retry_after_ms, |current| current.max(retry_after_ms)));
+        }
+        self.registry.drain_all(retry_after_ms)
+    }
+
+    /// The effective drain hint for `workspace_id`: the larger of the instance-wide drain (if the
+    /// process is shutting down) and any workspace-scoped drain guard. Taking the maximum rather
+    /// than either one alone keeps the advice honest when both are live — the client must wait out
+    /// whichever condition lasts longer.
     #[must_use]
     pub fn workspace_drain_retry_after_ms(&self, workspace_id: Uuid) -> Option<u64> {
-        self.drains
+        let process = *self.drains.process.lock();
+        let scoped = self
+            .drains
             .entries
             .lock()
             .get(&workspace_id)
-            .and_then(|entry| entry.retry_holders.last_key_value().map(|(retry, _)| *retry))
+            .and_then(|entry| entry.retry_holders.last_key_value().map(|(retry, _)| *retry));
+        match (process, scoped) {
+            (Some(process), Some(scoped)) => Some(process.max(scoped)),
+            (only, None) | (None, only) => only,
+        }
     }
 
     #[must_use]
@@ -189,6 +223,83 @@ mod tests {
 
         drop(guard);
         assert!(runtime.ensure_workspace_accepting(workspace_id).is_ok());
+    }
+
+    /// The instance-wide producer (`begin_process_drain`, called by the API's graceful-shutdown
+    /// hook) must reach exactly the same three wire shapes the workspace-scoped fixture does —
+    /// the structured `rejected` frame, the 4410 close carrying `reason:"drain"`, and the REST
+    /// business envelope every MCP/CLI caller reads — for a workspace that never had a drain
+    /// guard of its own.
+    #[tokio::test]
+    async fn process_drain_produces_the_drain_reason_on_every_surface_for_every_workspace() {
+        let runtime = CollabRuntime::default();
+        let workspace_id = Uuid::new_v4();
+        let untouched_workspace_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let mut registered = runtime
+            .registry
+            .try_register(document_id, Uuid::new_v4(), workspace_id, Uuid::new_v4())
+            .expect("session registers");
+        assert!(runtime.ensure_workspace_accepting(workspace_id).is_ok());
+
+        let closed = runtime.begin_process_drain(9_000);
+        assert_eq!(closed, 1, "the live session must be closed by the instance drain");
+
+        let rejected = registered
+            .receiver
+            .recv()
+            .await
+            .expect("active session gets a rejection");
+        let OutboundEvent::ControlFrame(frame) = rejected else {
+            panic!("expected the structured drain rejection before the close");
+        };
+        let crate::flow::collab::frame::Frame::Rejected { code, details, .. } = *frame else {
+            panic!("expected rejected frame");
+        };
+        assert_eq!(code, crate::flow::collab::frame::RejectedCode::ServerDraining);
+        assert_eq!(details.expect("details")["reason"], "drain");
+
+        let event = registered.receiver.recv().await.expect("active session gets a close");
+        let OutboundEvent::Close { code, reason } = event else {
+            panic!("expected close");
+        };
+        assert_eq!(code, 4410);
+        let ws_details: Value = serde_json::from_str(&reason).expect("close reason JSON");
+        assert_eq!(ws_details["reason"], "drain");
+        assert_eq!(ws_details["retry_after_ms"], 9_000);
+
+        // Instance-wide: a workspace that never had a guard of its own is refused too.
+        for id in [workspace_id, untouched_workspace_id] {
+            let response = runtime
+                .ensure_workspace_accepting(id)
+                .expect_err("a draining instance refuses every workspace")
+                .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = to_bytes(response.into_body(), 32_768).await.expect("body reads");
+            let rest: Value = serde_json::from_slice(&body).expect("REST body JSON");
+            assert_eq!(rest["code"], 409);
+            assert_eq!(rest["error_code"], "server_draining");
+            assert_eq!(rest["details"]["reason"], "drain");
+            assert_eq!(rest["details"]["retry_after_ms"], 9_000);
+        }
+    }
+
+    /// A workspace guard and an instance drain in force at the same time must publish the longer
+    /// of the two hints, and dropping the guard must not clear the instance drain.
+    #[test]
+    fn an_instance_drain_outlives_a_workspace_guard_and_publishes_the_longer_hint() {
+        let runtime = CollabRuntime::default();
+        let workspace_id = Uuid::new_v4();
+        let guard = runtime.begin_workspace_drain(workspace_id, 250);
+        assert_eq!(runtime.workspace_drain_retry_after_ms(workspace_id), Some(250));
+        runtime.begin_process_drain(9_000);
+        assert_eq!(runtime.workspace_drain_retry_after_ms(workspace_id), Some(9_000));
+        drop(guard);
+        assert_eq!(
+            runtime.workspace_drain_retry_after_ms(workspace_id),
+            Some(9_000),
+            "dropping the workspace guard must not un-drain a shutting-down instance"
+        );
     }
 
     #[test]

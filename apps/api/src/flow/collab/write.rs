@@ -822,6 +822,65 @@ fn broadcast_committed_update(
     registry.broadcast(request.document_id, &accepted_frame, exclude_session_id);
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod isolation_rejection_tests {
+    use collab_core::CollabError;
+    use uuid::Uuid;
+
+    use super::{AcceptOutcome, reject_from_collab_error};
+    use crate::flow::collab::frame::RejectedCode;
+
+    /// `limits-v1.md`'s `limit_exceeded` details rule (`details={limit_kind,limit,observed?,
+    /// retry_after_ms?}`) applied to the three "Isolated decode/apply" ceilings.
+    ///
+    /// What this pins is the *wire shape* of the rejection `hydrate_and_apply` builds for each
+    /// `collab_core::isolation::IsolatedApplyError` resource outcome — that all three name a
+    /// `limit_kind` from the frozen table and carry a numeric `limit` equal to the constant
+    /// `collab_core::isolation` actually enforces, rather than an empty `details` a REST/MCP/CLI
+    /// caller could not branch on. It is deliberately *not* a claim that the ceilings fire:
+    /// that is proven against the real worker process (SIGPROF kill, wall watchdog, counting
+    /// allocator) by `collab-core`'s own
+    /// `decode_apply_cpu_ms_ceiling_accepts_just_under_and_kills_with_cpu_ceiling_just_over_the_boundary`
+    /// and its two siblings in `crates/collab-core/src/isolation/host.rs`.
+    #[test]
+    fn every_isolated_apply_resource_ceiling_rejects_with_its_frozen_limit_kind_and_a_numeric_limit() {
+        let cases = [
+            ("decode_apply_cpu_ms", collab_core::isolation::DECODE_APPLY_CPU_MS_MAX),
+            ("decode_apply_wall_ms", collab_core::isolation::DECODE_APPLY_WALL_MS_MAX),
+            (
+                "isolated_apply_memory_bytes",
+                collab_core::isolation::ISOLATED_APPLY_MEMORY_BYTES_MAX,
+            ),
+        ];
+        for (limit_kind, limit) in cases {
+            let update_id = Uuid::new_v4();
+            let outcome = reject_from_collab_error(
+                Some(update_id),
+                &CollabError::LimitExceeded {
+                    limit_kind,
+                    limit,
+                    observed: limit + 1,
+                },
+            );
+            let AcceptOutcome::Rejected(rejected) = outcome else {
+                panic!("{limit_kind} must reject, not accept");
+            };
+            assert_eq!(rejected.code, RejectedCode::LimitExceeded);
+            assert_eq!(rejected.update_id, Some(update_id));
+            let details = rejected
+                .details
+                .unwrap_or_else(|| panic!("{limit_kind} must carry limit_exceeded details"));
+            assert_eq!(details["limit_kind"], limit_kind);
+            assert_eq!(
+                details["limit"], limit,
+                "{limit_kind}'s `limit` must be the constant collab_core::isolation enforces"
+            );
+            assert_eq!(details["observed"], limit + 1);
+        }
+    }
+}
+
 // ---- Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
 //
 // Mirrors the scratch-database convention `apps/api/src/routes/flow.rs::flow_database_tests` and
@@ -844,6 +903,7 @@ mod database_tests {
     use sea_orm::{
         ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
     };
+    use serde_json::Value;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -1567,8 +1627,57 @@ mod database_tests {
         .n
     }
 
-    /// Submits `bytes` and retries on `RejectedCode::ServerDraining` until either it stops
-    /// happening or a wall-clock deadline passes -- `error-mapping-v1.md`: that code is defined
+    /// The `limit_kind`s of `limits-v1.md`'s "Isolated decode/apply" table — the three ceilings
+    /// that bound *how much machine* one apply may consume, not what shape the resulting document
+    /// may have.
+    ///
+    /// They are the only `limit_exceeded` kinds whose verdict depends on the host rather than on
+    /// the update under test: the same update that is applied in well under
+    /// `decode_apply_cpu_ms_max` on an idle machine really can cross it when 500 other tests are
+    /// saturating every core (observed: `{"limit":50,"limit_kind":"decode_apply_cpu_ms",
+    /// "observed":51}` rejecting an update that is accepted every time the test runs alone). The
+    /// enforcement is correct in both cases — the isolated worker was killed exactly as
+    /// `ADR-0014` requires — which is precisely why the boundary fixtures below must not read it
+    /// as their own verdict.
+    const LOAD_DEPENDENT_LIMIT_KINDS: [&str; 3] = [
+        "decode_apply_cpu_ms",
+        "decode_apply_wall_ms",
+        "isolated_apply_memory_bytes",
+    ];
+
+    /// Whether `outcome` is a rejection whose *verdict* depends on concurrent machine load rather
+    /// than on the submitted update, and which a contract-compliant caller therefore retries.
+    ///
+    /// Two families qualify, and nothing else:
+    /// * `server_draining` — `error-mapping-v1.md` defines it as recoverable ("客户端保留 intent
+    ///   后重试"), and `write::contention` raises it for coordinator/lock timeouts and rebase
+    ///   exhaustion, all of which are pure contention artifacts of many scratch databases sharing
+    ///   one Postgres.
+    /// * `limit_exceeded` with one of [`LOAD_DEPENDENT_LIMIT_KINDS`] — see that constant.
+    ///
+    /// A `limit_exceeded` naming any *shape* ceiling (`container_count`, `document_block_count`,
+    /// `text_block_chars`, `document_text_chars`, `tree_depth`, `update_bytes`, ...) is never
+    /// retried: those are the deterministic verdicts every caller of [`submit`] is actually
+    /// asserting on, and they are returned on the first attempt, unretried.
+    fn is_load_dependent(outcome: &AcceptOutcome) -> bool {
+        let AcceptOutcome::Rejected(rejected) = outcome else {
+            return false;
+        };
+        match rejected.code {
+            RejectedCode::ServerDraining => true,
+            RejectedCode::LimitExceeded => rejected
+                .details
+                .as_ref()
+                .and_then(|details| details.get("limit_kind"))
+                .and_then(Value::as_str)
+                .is_some_and(|kind| LOAD_DEPENDENT_LIMIT_KINDS.contains(&kind)),
+            _ => false,
+        }
+    }
+
+    /// Submits `bytes` and retries every [`is_load_dependent`] rejection (`server_draining`, and
+    /// `limit_exceeded` naming one of the three isolated decode/apply resource ceilings) until
+    /// either it stops happening or a wall-clock deadline passes -- `error-mapping-v1.md`: that code is defined
     /// as recoverable, "客户端保留 intent 后重试", the exact behavior a real caller is
     /// contractually expected to have, with no contract-stated upper bound on how long a
     /// compliant caller keeps trying (unlike `limit_exceeded`, which is final and never retried).
@@ -1625,9 +1734,7 @@ mod database_tests {
             )
             .await
             .expect("accept_update does not hit a hard database error");
-            let is_recoverable_contention =
-                matches!(&outcome, AcceptOutcome::Rejected(rejected) if rejected.code == RejectedCode::ServerDraining);
-            if is_recoverable_contention && started.elapsed() < CONTENTION_RETRY_DEADLINE {
+            if is_load_dependent(&outcome) && started.elapsed() < CONTENTION_RETRY_DEADLINE {
                 tokio::time::sleep(CONTENTION_RETRY_BACKOFF).await;
                 continue;
             }

@@ -1933,11 +1933,18 @@ mod flow_database_tests {
             plus_one_body["code"], 400,
             "one property past semantic_patch_operations_max must be rejected via body code 400: {plus_one_body}"
         );
-        let message = plus_one_body["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("semantic_patch_operations"),
-            "the rejection message must name limit_kind=semantic_patch_operations: {plus_one_body}"
+        // The structured envelope, not the message text: `error-mapping-v1.md` requires REST to
+        // carry `error_code` plus `details={limit_kind,limit,observed?}` so a caller branches on
+        // fields rather than substring-matching prose. Asserting only `message.contains(...)`
+        // (what this test did before) would still pass if `details` were dropped entirely.
+        assert_eq!(plus_one_body["error_code"], "limit_exceeded", "{plus_one_body}");
+        let details = &plus_one_body["details"];
+        assert_eq!(
+            details["limit_kind"], "semantic_patch_operations",
+            "the rejection must name limit_kind=semantic_patch_operations in structured details: {plus_one_body}"
         );
+        assert_eq!(details["limit"], exact_count as u64, "{plus_one_body}");
+        assert_eq!(details["observed"], (exact_count + 1) as u64, "{plus_one_body}");
 
         assert_eq!(
             document_head_seq(&state, document_id).await,

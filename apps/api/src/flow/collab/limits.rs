@@ -75,6 +75,28 @@ pub const CONNECTION_LIMIT_RETRY_AFTER_MS: u64 = 5_000;
 /// (30/s or 10/s) was exceeded: both buckets refill to at least one token within one second.
 pub const RATE_LIMIT_RETRY_AFTER_MS: u64 = 1_000;
 
+/// The `retry_after_ms` an instance-wide drain publishes (`flow::collab::runtime::CollabRuntime::
+/// begin_process_drain`, reached in production from the API's graceful-shutdown hook).
+///
+/// Not a frozen `limits-v1.md` row -- that contract has no instance-drain retry value, the same
+/// status [`CONNECTION_LIMIT_RETRY_AFTER_MS`] carries. Chosen as three times
+/// [`CONNECTION_LIMIT_RETRY_AFTER_MS`]: a drained instance is not coming back for this client, so
+/// the hint has to be long enough that a reconnect lands after the process is actually gone (and
+/// therefore on a different instance behind the proxy), not so long that a client that reconnects
+/// to a healthy peer sits idle waiting for it.
+pub const PROCESS_DRAIN_RETRY_AFTER_MS: u64 = 15_000;
+
+/// How long the graceful-shutdown hook keeps serving after it has marked the instance draining,
+/// before it lets the server task finish.
+///
+/// Also not a `limits-v1.md` row. It exists so the drain is *observable* rather than racing the
+/// process exit: the structured `server_draining{reason:"drain"}` rejections and the 4410 closes
+/// [`crate::flow::collab::registry::SessionRegistry::drain_all`] enqueues have to actually leave
+/// the socket, and in-flight REST/MCP/CLI requests have to receive their business envelope,
+/// before the listener is torn down. Kept well under a typical 30 s orchestrator SIGKILL grace so
+/// the process still exits on its own.
+pub const PROCESS_DRAIN_GRACE_MS: u64 = 5_000;
+
 /// Coordinator acquisition timeout.
 ///
 /// Not itself a frozen `limits-v1.md` row (the coordinator is explicitly "not part of the DB lock
