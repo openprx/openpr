@@ -586,3 +586,278 @@ pub async fn fetch_history<C: ConnectionTrait>(conn: &C, filter: &HistoryFilter)
             .await?,
     )
 }
+
+// ================================================================================================
+// flow_import_jobs / flow_import_lineage (`migrations/0055_flow_import_jobs.sql`).
+//
+// No command/query module in this package writes or reads these yet (the ADR-0003 inventory is
+// zero-row, so the importer surface itself is not required — see the migration file's header);
+// these functions exist so the table has a typed data-access layer ready for whichever package
+// wires the importer command up, matching how this file's other `insert_*`/`fetch_*` functions
+// predate their own command wiring in this codebase's history.
+// ================================================================================================
+
+/// A `flow_import_jobs` row (`model::ImportJobView`'s source shape).
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct ImportJobRow {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub kind: String,
+    pub source_workspace_id: Option<Uuid>,
+    pub mapping_hash: String,
+    pub package_sha256: Option<String>,
+    pub status: String,
+    pub report: Option<Value>,
+    pub error: Option<String>,
+    pub idempotency_key: String,
+    pub request_body_hash: String,
+    pub audit_event_id: Option<Uuid>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+const IMPORT_JOB_SELECT: &str = r"
+    SELECT
+        id, workspace_id, kind, source_workspace_id, mapping_hash, package_sha256, status, report,
+        error, idempotency_key, request_body_hash, audit_event_id, started_at, finished_at,
+        created_at, updated_at
+    FROM flow_import_jobs
+";
+
+/// Scoped by `workspace_id` so a job id from another workspace behaves like a nonexistent one
+/// (the same not-found-safe pattern `fetch_object_view`'s callers apply via `fetch_object_workspace`).
+pub async fn fetch_import_job<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    job_id: Uuid,
+) -> Result<Option<ImportJobRow>, ApiError> {
+    Ok(ImportJobRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!("{IMPORT_JOB_SELECT} WHERE id = $1 AND workspace_id = $2"),
+        vec![job_id.into(), workspace_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// The prior job for this `(workspace_id, kind, idempotency_key)`, if any
+/// (`flow_import_jobs_idempotency_key_key`). Callers compare `request_body_hash` against the new
+/// request to tell an exact replay (`export-package-v1.md`: "相同 key+body ... 返回原 job") apart
+/// from body drift, which is a conflict rather than a second job.
+pub async fn find_import_job_by_idempotency_key<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    kind: &str,
+    idempotency_key: &str,
+) -> Result<Option<ImportJobRow>, ApiError> {
+    Ok(ImportJobRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!("{IMPORT_JOB_SELECT} WHERE workspace_id = $1 AND kind = $2 AND idempotency_key = $3"),
+        vec![workspace_id.into(), kind.into(), idempotency_key.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// Fields needed to insert a new `flow_import_jobs` row at commit time. Preview never reaches this
+/// function (`domain-model-v1.md`: "preview/staging 不是 canonical Flow state").
+pub struct NewImportJob<'a> {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    /// `flow_import_jobs_kind_check`: `"legacy_pages"` or `"flow_package"`.
+    pub kind: &'a str,
+    pub source_workspace_id: Option<Uuid>,
+    pub mapping_hash: &'a str,
+    pub package_sha256: Option<&'a str>,
+    pub artifact_id: Option<Uuid>,
+    pub conflict_policy: Option<&'a str>,
+    pub external_reference_policy: Option<&'a str>,
+    pub request: Value,
+    pub idempotency_key: &'a str,
+    pub request_body_hash: &'a str,
+    pub actor_user_id: Option<Uuid>,
+}
+
+/// Inserts the job at `status = 'pending'`; callers move it to `'running'` and then to a terminal
+/// status with [`start_import_job`] / [`finish_import_job`] as the synchronous commit executes.
+pub async fn insert_import_job<C: ConnectionTrait>(conn: &C, job: &NewImportJob<'_>) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO flow_import_jobs (
+                id, workspace_id, kind, source_workspace_id, mapping_hash, package_sha256,
+                artifact_id, conflict_policy, external_reference_policy, request,
+                idempotency_key, request_body_hash, actor_user_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ",
+        vec![
+            job.id.into(),
+            job.workspace_id.into(),
+            job.kind.into(),
+            job.source_workspace_id.into(),
+            job.mapping_hash.into(),
+            job.package_sha256.into(),
+            job.artifact_id.into(),
+            job.conflict_policy.into(),
+            job.external_reference_policy.into(),
+            job.request.clone().into(),
+            job.idempotency_key.into(),
+            job.request_body_hash.into(),
+            job.actor_user_id.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Moves a `pending` job to `running` and stamps `started_at`.
+pub async fn start_import_job<C: ConnectionTrait>(conn: &C, job_id: Uuid) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_import_jobs SET status = 'running', started_at = now(), updated_at = now() WHERE id = $1",
+        vec![job_id.into()],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Moves a job to a terminal status (`'completed'` or `'failed'`), stamping `finished_at` and
+/// recording the outcome (`flow_import_jobs_terminal_status_check` requires `finished_at` for
+/// both). `report`/`error`/`audit_event_id` are mutually informative, not mutually exclusive at
+/// the schema level: a `'failed'` job may still carry a partial `report` for diagnostics.
+pub async fn finish_import_job<C: ConnectionTrait>(
+    conn: &C,
+    job_id: Uuid,
+    status: &str,
+    report: Option<Value>,
+    error: Option<&str>,
+    audit_event_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            UPDATE flow_import_jobs
+            SET status = $2, report = $3, error = $4, audit_event_id = $5,
+                finished_at = now(), updated_at = now()
+            WHERE id = $1
+        ",
+        vec![
+            job_id.into(),
+            status.into(),
+            report.into(),
+            error.into(),
+            audit_event_id.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
+
+/// A `flow_import_lineage` row (`model::ImportLineageView`'s source shape).
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct ImportLineageRow {
+    pub source_id: Uuid,
+    pub source_content_hash: String,
+    pub target_object_id: Uuid,
+    pub target_document_id: Uuid,
+    pub result: String,
+}
+
+/// A prior lineage row for this exact `(target_workspace_id,source_kind,source_id,
+/// source_content_hash)` (`flow_import_lineage_idempotency_key`), if any. The importer reuses its
+/// `target_object_id`/`target_document_id` instead of creating a duplicate when this is `Some`.
+pub async fn find_import_lineage<C: ConnectionTrait>(
+    conn: &C,
+    target_workspace_id: Uuid,
+    source_kind: &str,
+    source_id: Uuid,
+    source_content_hash: &str,
+) -> Result<Option<ImportLineageRow>, ApiError> {
+    Ok(ImportLineageRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            SELECT source_id, source_content_hash, target_object_id, target_document_id, result
+            FROM flow_import_lineage
+            WHERE target_workspace_id = $1 AND source_kind = $2 AND source_id = $3 AND source_content_hash = $4
+        ",
+        vec![
+            target_workspace_id.into(),
+            source_kind.into(),
+            source_id.into(),
+            source_content_hash.into(),
+        ],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// Every lineage row a job produced, in the order its items were imported (`imported_at`), for the
+/// status endpoints' `items[]`/`object_mapping[]`.
+pub async fn list_import_lineage_for_job<C: ConnectionTrait>(
+    conn: &C,
+    import_id: Uuid,
+) -> Result<Vec<ImportLineageRow>, ApiError> {
+    Ok(ImportLineageRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            SELECT source_id, source_content_hash, target_object_id, target_document_id, result
+            FROM flow_import_lineage
+            WHERE import_id = $1
+            ORDER BY imported_at ASC
+        ",
+        vec![import_id.into()],
+    ))
+    .all(conn)
+    .await?)
+}
+
+/// Fields needed to insert one `flow_import_lineage` row inside the importer's single commit
+/// transaction (`legacy-pages-import-v1.md`: "execute 对所选 source set 采用单一事务").
+pub struct NewImportLineage<'a> {
+    pub import_id: Uuid,
+    /// `flow_import_lineage_source_kind_check`: v0.4 only ever writes `"legacy_pages"`.
+    pub source_kind: &'a str,
+    /// `flow_import_lineage_source_table_check`: fixed to `"pages"` for `legacy_pages`.
+    pub source_table: &'a str,
+    pub source_id: Uuid,
+    pub source_workspace_id: Uuid,
+    pub target_workspace_id: Uuid,
+    pub source_content_hash: &'a str,
+    pub target_object_id: Uuid,
+    pub target_document_id: Uuid,
+    /// `flow_import_lineage_result_check`: `"created"` or `"reused"`.
+    pub result: &'a str,
+}
+
+pub async fn insert_import_lineage<C: ConnectionTrait>(
+    conn: &C,
+    lineage: &NewImportLineage<'_>,
+) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            INSERT INTO flow_import_lineage (
+                import_id, source_kind, source_table, source_id, source_workspace_id,
+                target_workspace_id, source_content_hash, target_object_id, target_document_id, result
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ",
+        vec![
+            lineage.import_id.into(),
+            lineage.source_kind.into(),
+            lineage.source_table.into(),
+            lineage.source_id.into(),
+            lineage.source_workspace_id.into(),
+            lineage.target_workspace_id.into(),
+            lineage.source_content_hash.into(),
+            lineage.target_object_id.into(),
+            lineage.target_document_id.into(),
+            lineage.result.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
+}
