@@ -619,21 +619,88 @@ result = {
         "frontend_test_files_mentioning_server_draining": frontend_test_hits,
     },
     "structural_findings": f,
+    # Both gates below are derived from the SAME booleans already computed above
+    # (rest_details_exists / mcp_flow_wired / cli_reads_reason / ws_drain_produced /
+    # ws_drain_close_4410_wired / variants_producible / cross_surface_ok) -- not re-asserted as a
+    # fixed literal. Until 2026-08-30 these two lines were hardcoded `"failed"` even though every
+    # one of those booleans was already computed and sitting unused right above them: the exact
+    # same "evidence computed, verdict hardcoded" bug as scripts/verify-flow-limits-v0.4.sh. Today
+    # every one of these booleans is genuinely False/empty (see structural_findings above), so the
+    # derived verdict is still "failed" -- but it is now `rest_details_exists`-shaped, so the day
+    # apps/api/src/response.rs grows a `details` field this flips on its own, instead of silently
+    # staying "failed" forever the way a literal would.
     "hard_gates": {
-        "rest_envelope_and_error_contract": "failed",
-        "server_draining_reason_cross_surface_error_coverage": "failed",
+        "rest_envelope_and_error_contract": (
+            "passed"
+            if (
+                rest_details_exists
+                and f["map_write_rejection_reads_details_field"]
+                and not f["map_write_rejection_maps_server_draining_to_conflict_string_only"]
+            )
+            else "failed"
+        ),
+        "server_draining_reason_cross_surface_error_coverage": (
+            "passed" if (variants_producible and cross_surface_ok) else "failed"
+        ),
     },
     "hard_gate_reasons": {
-        "rest_envelope_and_error_contract": REST_UNAVAILABLE_REASON,
+        "rest_envelope_and_error_contract": (
+            "apps/api/src/response.rs's ApiResponse carries a `details` field, "
+            "map_write_rejection reads rejected.details, and server_draining is not collapsed to a "
+            "plain conflict string"
+            if rest_details_exists and f["map_write_rejection_reads_details_field"]
+            and not f["map_write_rejection_maps_server_draining_to_conflict_string_only"]
+            else REST_UNAVAILABLE_REASON
+        ),
         "server_draining_reason_cross_surface_error_coverage": (
-            "drain is not producible on any transport; contention is producible and wire-correct on "
+            "both drain and contention are producible and cross-surface coverage (REST+MCP+CLI) is "
+            "confirmed"
+            if variants_producible and cross_surface_ok
+            else "drain is not producible on any transport; contention is producible and wire-correct on "
             "WS only (verified reject_keep_open) but gate-commands.md requires REST+MCP(x3)+CLI+UI "
             "coverage with a shared producer fixture, none of which exists"
         ),
     },
 }
-result["passed"] = False  # matches the two hard_gates above; kept explicit rather than derived so a
-                            # future edit to hard_gates cannot silently flip `passed` without review.
+# ---- self-consistency assertion: hard_gates must match the booleans that derived them ----
+#
+# Until 2026-08-30 both hard_gates entries above were hardcoded `"failed"` string literals, even
+# though rest_details_exists/mcp_flow_wired/cli_reads_reason/variants_producible/cross_surface_ok
+# were already computed and sitting unused right above them -- the exact same "evidence computed,
+# verdict hardcoded" bug as scripts/verify-flow-limits-v0.4.sh. Re-deriving the expected value from
+# those same booleans here and comparing catches any future edit that reintroduces a literal (by
+# editing the `hard_gates` dict directly without updating its derivation) before this script ever
+# writes evidence for it.
+expected_rest_gate = "passed" if (
+    rest_details_exists and f["map_write_rejection_reads_details_field"]
+    and not f["map_write_rejection_maps_server_draining_to_conflict_string_only"]
+) else "failed"
+expected_cross_surface_gate = "passed" if (variants_producible and cross_surface_ok) else "failed"
+self_consistency_problems = []
+if result["hard_gates"]["rest_envelope_and_error_contract"] != expected_rest_gate:
+    self_consistency_problems.append(
+        f"hard_gates.rest_envelope_and_error_contract={result['hard_gates']['rest_envelope_and_error_contract']!r} "
+        f"does not match its own derivation (expected {expected_rest_gate!r} from rest_details_exists="
+        f"{rest_details_exists}, map_write_rejection_reads_details_field="
+        f"{f['map_write_rejection_reads_details_field']}, "
+        "map_write_rejection_maps_server_draining_to_conflict_string_only="
+        f"{f['map_write_rejection_maps_server_draining_to_conflict_string_only']})"
+    )
+if result["hard_gates"]["server_draining_reason_cross_surface_error_coverage"] != expected_cross_surface_gate:
+    self_consistency_problems.append(
+        "hard_gates.server_draining_reason_cross_surface_error_coverage="
+        f"{result['hard_gates']['server_draining_reason_cross_surface_error_coverage']!r} does not match "
+        f"its own derivation (expected {expected_cross_surface_gate!r} from variants_producible="
+        f"{variants_producible}, cross_surface_ok={cross_surface_ok})"
+    )
+if self_consistency_problems:
+    print(json.dumps({
+        "error": "self-consistency check failed -- hard_gates disagrees with the booleans that derived "
+                  "it: " + "; ".join(self_consistency_problems)
+    }))
+    sys.exit(0)
+
+result["passed"] = all(v == "passed" for v in result["hard_gates"].values())
 
 with open(out_path, "w", encoding="utf-8") as fh:
     json.dump(result, fh, indent=2, sort_keys=False)

@@ -314,6 +314,7 @@ response_rs_text = read(response_rs)
 dispatcher_text = read(dispatcher_rs)
 migration_text = read(migration_sql)
 frontend_types_text = read(frontend_types_ts)
+frontend_limits_text = read(frontend_limits_ts)
 
 
 def count(pattern, text):
@@ -351,6 +352,109 @@ findings["query_rs_validate_limit_returns_plain_string"] = bool(
 )
 
 findings["presence_payload_bytes_max_enforcement_call_sites"] = count(r"PRESENCE_PAYLOAD_BYTES_MAX", session_text)
+
+# `update_bytes_max` is 65536; the contract's "exact boundary accepted, boundary+1 rejected"
+# requirement means a real test must exercise exactly 65537 bytes, not merely "some oversized
+# value". Grepped dynamically so this flips the moment such a test is added.
+findings["update_bytes_exact_boundary_test_exists"] = bool(re.search(r"\b65537\b", write_text))
+
+# `semantic_patch_bytes` (`semantic_patch_json_bytes_max`) has no REST/MCP endpoint anywhere in
+# this repo's apps/api sources that this script reads -- its wire constant exists only as a
+# reported number. Any real enforcement call site (not just the wire-report constant in
+# limits.rs, which is deliberately excluded here) would reference the field name outside
+# limits.rs in one of these caller-facing modules.
+findings["semantic_patch_bytes_enforcement_found"] = bool(
+    re.search(r"semantic_patch_json_bytes_max|SEMANTIC_PATCH_JSON_BYTES_MAX",
+              command_text + write_text + query_text + bootstrap_text + session_text)
+)
+
+# `unknown_version_read_only` (bootstrap_parity): whether the frontend has any version-negotiation
+# code at all for an unrecognized `FlowLimitsV1.version`. Zero hits today -- but grepped, not
+# asserted, so this stops being "not_covered" the moment such code is written.
+findings["frontend_unknown_version_handling_found"] = bool(
+    re.search(r"unknown_version|unknownVersion|version_negotiation|versionNegotiation",
+              frontend_types_text + frontend_limits_text)
+)
+
+
+# ---- generic "does a real boundary test exist for this limit_kind" scan ----
+#
+# Several `limit_kind`s below (isolation, connection/rate/queue, import/scan, websocket_frame_bytes,
+# presence_payload_bytes, presence_ttl_seconds, page_size) currently have ZERO enforcement call
+# sites at all, so their `status` is unambiguously `failed` regardless of test coverage. But a
+# `ref_count > 0` alone (call sites exist) must NEVER be sufficient for `passed` on its own -- that
+# would let a future PR wire the check without ever proving the exact/+1 boundary and still turn
+# this gate green. So every one of these cases additionally requires a real boundary test: scanned
+# by finding every `#[test]`/`#[tokio::test]`-attributed function name across the caller-facing
+# modules this script reads, and matching it against BOTH the limit_kind's own name tokens and its
+# Rust constant's name tokens (a test is very likely to be named after one or the other; requiring
+# only one of the two token sets, not literal substring equality, tolerates paraphrasing like
+# "per_connection_presence_ceiling" for `presence_entries_per_connection`).
+TEST_FN_RE = re.compile(
+    r"#\[(?:tokio::)?test\][^\n]*\n(?:\s*#\[[^\n]*\]\n)*\s*(?:pub(?:\([^)]*\))?\s+)?(?:async fn|fn) (\w+)\s*\("
+)
+
+
+def test_fn_names(text):
+    return TEST_FN_RE.findall(text)
+
+
+TEST_SOURCE_TEXT_PARTS = (
+    ("collab/session.rs", session_text),
+    ("collab/registry.rs", registry_text),
+    ("collab/write.rs", write_text),
+    ("flow/command.rs", command_text),
+    ("flow/query.rs", query_text),
+    ("collab/bootstrap.rs", bootstrap_text),
+    ("response.rs", response_rs_text),
+    ("error.rs", error_rs_text),
+    ("events/dispatcher.rs", dispatcher_text),
+)
+ALL_TEST_FN_NAMES = [
+    (src_label, name) for src_label, text in TEST_SOURCE_TEXT_PARTS for name in test_fn_names(text)
+]
+
+
+def name_tokens(s: str) -> list:
+    return [t for t in s.lower().split("_") if t and t != "max"]
+
+
+def boundary_test_covering(limit_kind: str, const: str | None = None):
+    token_sets = [name_tokens(limit_kind)]
+    if const:
+        token_sets.append(name_tokens(const))
+    for src_label, fn_name in ALL_TEST_FN_NAMES:
+        for tokens in token_sets:
+            if tokens and all(tok in fn_name for tok in tokens):
+                return f"{src_label}::{fn_name}"
+    return None
+
+
+findings["boundary_test_covering"] = {
+    limit_kind: boundary_test_covering(limit_kind, const)
+    for limit_kind, const in (
+        ("decode_apply_cpu_ms", "DECODE_APPLY_CPU_MS_MAX"),
+        ("decode_apply_wall_ms", "DECODE_APPLY_WALL_MS_MAX"),
+        ("isolated_apply_memory_bytes", "ISOLATED_APPLY_MEMORY_BYTES_MAX"),
+        ("open_documents", "OPEN_DOCUMENTS_PER_CONNECTION_MAX"),
+        ("user_connections", "CONNECTIONS_PER_USER_MAX"),
+        ("document_connections", "CONNECTIONS_PER_DOCUMENT_MAX"),
+        ("workspace_connections", "CONNECTIONS_PER_WORKSPACE_MAX"),
+        ("frame_rate", "FRAMES_PER_CONNECTION_PER_SECOND"),
+        ("update_rate", "UPDATES_PER_CONNECTION_PER_SECOND"),
+        ("slow_consumer_queue_frames", "SLOW_CONSUMER_QUEUE_FRAMES_MAX"),
+        ("slow_consumer_queue_bytes", "SLOW_CONSUMER_QUEUE_BYTES_MAX"),
+        ("scan_budget", "AUTHORIZED_SCAN_ROWS_MAX"),
+        ("import_archive_bytes", "IMPORT_ARCHIVE_BYTES_MAX"),
+        ("import_expanded_bytes", "IMPORT_EXPANDED_BYTES_MAX"),
+        ("import_entry_count", "IMPORT_ENTRY_COUNT_MAX"),
+        ("import_compression_ratio", "IMPORT_COMPRESSION_RATIO_MAX"),
+        ("websocket_frame_bytes", "WEBSOCKET_FRAME_BYTES_MAX"),
+        ("presence_payload_bytes", "PRESENCE_PAYLOAD_BYTES_MAX"),
+        ("presence_ttl_seconds", "PRESENCE_TTL_SECONDS_MAX"),
+        ("page_size", None),
+    )
+}
 
 findings["bootstrap_rs_mentions_limit_exceeded"] = "limit_exceeded" in bootstrap_text
 findings["bootstrap_rs_mentions_bootstrap_decoded_bytes"] = "bootstrap_decoded_bytes" in bootstrap_text
@@ -482,9 +586,16 @@ run_group collab_core_limits collab-core "limits::tests::"
 run_group effective_limits_wire api "flow::collab::limits::tests::effective_limits_serializes_every_frozen_field_non_null"
 
 DB_SKIPPED=0
+DB_LOGS=(
+  "$LOG_DIR/limits.dyn.update_bytes_e2e.log"
+  "$LOG_DIR/limits.dyn.bootstrap_wire.log"
+  "$LOG_DIR/limits.dyn.rest_call_direction.log"
+  "$LOG_DIR/limits.dyn.ws_structural_call_direction.log"
+)
 if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
-  echo "(skipped by --skip-cargo-test)" > "$LOG_DIR/limits.dyn.update_bytes_e2e.log"
-  echo "(skipped by --skip-cargo-test)" > "$LOG_DIR/limits.dyn.bootstrap_wire.log"
+  for f in "${DB_LOGS[@]}"; do
+    echo "(skipped by --skip-cargo-test)" > "$f"
+  done
 else
   echo "  running: cargo test -p api routes::collab::...full_session_hello... (DB-backed)" >&2
   set +e
@@ -494,7 +605,22 @@ else
   set +e
   ( cd "$REPO_ROOT" && cargo test -p api "routes::flow::flow_database_tests::bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.bootstrap_wire.log" 2>&1
   set -e
-  if grep -q "skipped: OPENPR_TEST_DATABASE_URL is not set" "$LOG_DIR/limits.dyn.update_bytes_e2e.log" "$LOG_DIR/limits.dyn.bootstrap_wire.log" 2>/dev/null; then
+  # Call-direction proofs for the structural limits (tree_depth, container_count,
+  # document_block_count, text_block_chars, document_text_chars, semantic_patch_operations):
+  # real e2e tests that go through the actual REST command handler
+  # (routes/flow.rs::flow_database_tests) and the actual WebSocket write path
+  # (flow/collab/write.rs::database_tests), not just collab-core's crate-internal unit tests.
+  # This is what lets boundary_cases below tell "wired AND proven by a caller-facing endpoint"
+  # apart from "wired but only ever unit-tested in isolation".
+  echo "  running: cargo test -p api routes::flow::...commands_endpoint_...tree_depth/batch_count... (DB-backed)" >&2
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api "routes::flow::flow_database_tests::commands_endpoint_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.rest_call_direction.log" 2>&1
+  set -e
+  echo "  running: cargo test -p api flow::collab::write::database_tests::ws_structural_limit_... (DB-backed)" >&2
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api "flow::collab::write::database_tests::ws_structural_limit_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.ws_structural_call_direction.log" 2>&1
+  set -e
+  if grep -q "skipped: OPENPR_TEST_DATABASE_URL is not set" "${DB_LOGS[@]}" 2>/dev/null; then
     DB_SKIPPED=1
   fi
 fi
@@ -539,6 +665,7 @@ FINAL_JSON="$(python3 - "$STATIC_JSON_FILE" "$DYNAMIC_JSON_FILE" "$COLLAB_ARCH_P
     "$SOURCE_HEAD" "$GENERATED_AT" "$CONTRACT_SHA256" "$OUT_TMP" <<'PY'
 import hashlib
 import json
+import re
 import sys
 
 static_path, dynamic_path, collab_arch_path, events_path, source_head, generated_at, contract_sha256, out_path = sys.argv[1:9]
@@ -585,48 +712,169 @@ def case(key, limit_kind, limit, status, reason, exact=None, plus_one=None, evid
 row_by_kind = {r["limit_kind"]: r for r in static["v0_4_rows"]}
 boundary_cases = []
 
-UNWIRED_REASON = (
-    "crates/collab-core/src/limits.rs's check_operation/check_operation_batch_count has "
-    f"{f['collab_core_check_operation_call_sites_in_command_rs']} call sites in "
-    "apps/api/src/flow/command.rs -- this exact/+1-tested logic is not wired into any "
-    "REST/MCP/CLI/WS endpoint, so passing unit tests do not prove caller-facing enforcement"
+# ---- structural limits: tree_depth, container_count, document_block_count, text_block_chars,
+# document_text_chars, semantic_patch_operations ----
+#
+# `status` here is derived from THREE independently-computed pieces of evidence, all re-checked
+# every run -- never a fixed verdict:
+#   1. `wired`: `collab_core::limits::check_operation`/`check_operation_batch_count` has a real,
+#      non-comment call site in apps/api/src/flow/command.rs (CALL_SITES, from the static regex
+#      count above -- doc-comment references like `[`check_operation`]` don't match it because
+#      they're never followed immediately by `(`).
+#   2. `crate_ok`: the crate-internal exact/+1 unit test for this limit_kind
+#      (crates/collab-core/src/limits.rs::tests) currently passes.
+#   3. `call_direction_ok`: at least one *call-direction* boundary test -- one that goes through
+#      an actual caller-facing endpoint (the REST command handler in routes/flow.rs, and/or the
+#      WebSocket write path via flow/collab/write.rs's `submit`/`accept_update`) rather than only
+#      exercising the limits module directly -- exists AND currently passes for this limit_kind.
+#      A passing crate-internal unit test alone is explicitly NOT sufficient for `passed`: that is
+#      exactly the gap this whole verifier exists to catch (a check that is correct in isolation
+#      but never reachable from any real request).
+# `passed` requires all three. Any one of them being false keeps the case `failed`, with the
+# reason built from whichever piece(s) actually failed -- so the prose can never describe a state
+# ("0 call sites" / "not wired") that contradicts what the case's own evidence just measured.
+CALL_SITES = f["collab_core_check_operation_call_sites_in_command_rs"]
+STRUCTURAL_LIMIT_CASES = (
+    ("tree_depth_max", "tree_depth",
+     "create_node_at_exact_depth_is_accepted_one_past_is_rejected",
+     "ws_structural_limit_tree_depth_exact_boundary_accepted_plus_one_rejected_zero_side_effects",
+     "commands_endpoint_insert_block_rejects_tree_depth_plus_one_and_accepts_exact_boundary"),
+    ("container_count_max", "container_count",
+     "container_count_and_document_block_count_are_independent_counters",
+     "ws_structural_limit_container_count_exact_boundary_accepted_plus_one_rejected_zero_side_effects",
+     None),
+    ("document_block_count_max", "document_block_count",
+     "container_count_and_document_block_count_are_independent_counters",
+     "ws_structural_limit_document_block_count_exact_boundary_accepted_plus_one_rejected_zero_side_effects",
+     None),
+    ("text_block_chars_max", "text_block_chars",
+     "text_block_chars_checked_before_document_text_chars",
+     "ws_structural_limit_text_block_chars_exact_boundary_accepted_plus_one_rejected_zero_side_effects",
+     None),
+    ("document_text_chars_max", "document_text_chars",
+     "document_text_chars_rejects_even_when_the_target_block_is_small",
+     "ws_structural_limit_document_text_chars_exact_boundary_accepted_plus_one_rejected_zero_side_effects",
+     None),
+    # semantic_patch_operations has no WS-layer equivalent: it bounds a REST-only concept (the
+    # operation count of one `update_block` command's `properties` batch), and write.rs's
+    # `check_snapshot` backstop -- which only re-derives tree/container/text aggregates from the
+    # merged document -- structurally cannot catch it (see the REST test's own doc comment).
+    ("semantic_patch_operations_max", "semantic_patch_operations",
+     "batch_count_exact_accepted_plus_one_rejected",
+     None,
+     "commands_endpoint_update_block_rejects_semantic_patch_operations_batch_plus_one_and_accepts_exact_boundary"),
 )
-for key, limit_kind, test_name in (
-    ("tree_depth_max", "tree_depth", "create_node_at_exact_depth_is_accepted_one_past_is_rejected"),
-    ("container_count_max", "container_count", "container_count_and_document_block_count_are_independent_counters"),
-    ("document_block_count_max", "document_block_count", "container_count_and_document_block_count_are_independent_counters"),
-    ("text_block_chars_max", "text_block_chars", "text_block_chars_checked_before_document_text_chars"),
-    ("document_text_chars_max", "document_text_chars", "document_text_chars_rejects_even_when_the_target_block_is_small"),
-    ("semantic_patch_operations_max", "semantic_patch_operations", "batch_count_exact_accepted_plus_one_rejected"),
-):
+for key, limit_kind, crate_test_name, ws_test_name, rest_test_name in STRUCTURAL_LIMIT_CASES:
     r = row_by_kind[limit_kind]
-    test_status = dtest(test_name)
+    crate_status = dtest(crate_test_name)
+    ws_status = dtest(ws_test_name) if ws_test_name else None
+    rest_status = dtest(rest_test_name) if rest_test_name else None
+
+    wired = CALL_SITES > 0
+    crate_ok = crate_status == "ok"
+    call_direction_results = [s for s in (ws_status, rest_status) if s is not None]
+    call_direction_ok = bool(call_direction_results) and all(s == "ok" for s in call_direction_results)
+    passed = wired and crate_ok and call_direction_ok
+
+    reason_bits = []
+    if wired:
+        reason_bits.append(
+            f"check_operation/check_operation_batch_count has {CALL_SITES} real call site(s) in "
+            "apps/api/src/flow/command.rs::apply_content_command (not a doc comment)"
+        )
+    else:
+        reason_bits.append(
+            f"crates/collab-core/src/limits.rs's check_operation/check_operation_batch_count has "
+            f"{CALL_SITES} call sites in apps/api/src/flow/command.rs -- not wired into any "
+            "REST/MCP/CLI/WS endpoint, so a passing unit test does not prove caller-facing enforcement"
+        )
+    reason_bits.append(f"crate-internal unit test limits::tests::{crate_test_name}: {crate_status}")
+    if ws_test_name:
+        reason_bits.append(
+            f"WS call-direction test flow::collab::write::database_tests::{ws_test_name}: {ws_status}"
+        )
+    if rest_test_name:
+        reason_bits.append(
+            f"REST call-direction test routes::flow::flow_database_tests::{rest_test_name}: {rest_status}"
+        )
+    if wired and crate_ok and not call_direction_ok:
+        reason_bits.append(
+            "wired and crate-internal-tested, but no call-direction (REST or WS) boundary test "
+            "currently passes for this limit_kind -- a crate-internal unit test alone does not prove "
+            "a real request can reach this check"
+        )
+
     boundary_cases.append(case(
-        key, limit_kind, r["value"], "failed", UNWIRED_REASON,
-        exact={"accepted": test_status == "ok" if test_status else None,
-               "head_after": "n/a: crate-local unit test, no collab_document exists"},
-        plus_one={"code": "n/a: unwired" if test_status else None, "limit_kind": None,
-                  "head_unchanged": None, "event_dispatch_zero": None},
-        evidence={"dynamic_test": {"crate": "collab-core", "test": f"limits::tests::{test_name}", "status": test_status},
-                  "call_sites_in_apps_api_command_rs": f["collab_core_check_operation_call_sites_in_command_rs"]},
+        key, limit_kind, r["value"], "passed" if passed else "failed", "; ".join(reason_bits),
+        exact={
+            "accepted": (
+                (ws_status == "ok" if ws_status is not None else None)
+                if ws_test_name is not None
+                else (rest_status == "ok" if rest_status is not None else None)
+            ),
+            "head_after": "unchanged (asserted by the call-direction test)" if call_direction_ok
+            else "n/a: no passing call-direction test to observe it from",
+        },
+        plus_one={
+            "code": "limit_exceeded" if call_direction_ok else None,
+            "limit_kind": limit_kind if call_direction_ok else None,
+            "head_unchanged": True if call_direction_ok else None,
+            "event_dispatch_zero": True if call_direction_ok else None,
+        },
+        evidence={
+            "call_sites_in_apps_api_command_rs": CALL_SITES,
+            "dynamic_test_crate_unit": {
+                "crate": "collab-core", "test": f"limits::tests::{crate_test_name}", "status": crate_status,
+            },
+            "dynamic_test_ws_call_direction": (
+                {"test": f"flow::collab::write::database_tests::{ws_test_name}", "status": ws_status}
+                if ws_test_name else None
+            ),
+            "dynamic_test_rest_call_direction": (
+                {"test": f"routes::flow::flow_database_tests::{rest_test_name}", "status": rest_status}
+                if rest_test_name else None
+            ),
+        },
     ))
 
 r = row_by_kind["semantic_patch_bytes"]
+spb_enforcement_found = f["semantic_patch_bytes_enforcement_found"]
+spb_test = f["boundary_test_covering"].get("semantic_patch_bytes")
+spb_passed = spb_enforcement_found and spb_test is not None and dtest(spb_test.rsplit("::", 1)[-1]) == "ok"
 boundary_cases.append(case(
-    "semantic_patch_json_bytes_max", "semantic_patch_bytes", r["value"], "failed",
-    "no semantic_patch REST/MCP endpoint or byte-length check exists anywhere in apps/api/src or "
-    "apps/mcp-server/src (grepped) -- the feature this ceiling would guard has not been built",
-    evidence={"grep": "semantic_patch (endpoint) -- zero hits outside contracts/collab/limits.rs wire constant"},
+    "semantic_patch_json_bytes_max", "semantic_patch_bytes", r["value"],
+    "passed" if spb_passed else "failed",
+    (
+        f"semantic_patch_json_bytes_max is referenced outside limits.rs (enforcement_found="
+        f"{spb_enforcement_found}) and a boundary test was found ({spb_test}), both required for passed"
+        if spb_enforcement_found
+        else "no semantic_patch REST/MCP endpoint or byte-length check exists anywhere in "
+        "apps/api/src (grepped for semantic_patch_json_bytes_max/SEMANTIC_PATCH_JSON_BYTES_MAX "
+        "outside limits.rs's own wire-report constant: zero hits) -- the feature this ceiling "
+        "would guard has not been built"
+    ),
+    evidence={"semantic_patch_bytes_enforcement_found": spb_enforcement_found,
+              "boundary_test_covering": spb_test},
 ))
 
 r = row_by_kind["update_bytes"]
 ub_test = dtest("full_session_hello_open_snapshot_update_accepted_and_two_rejections")
-ub_reason_parts = [
-    "real DB-backed e2e test (routes::collab::collab_database_tests::"
-    "full_session_hello_open_snapshot_update_accepted_and_two_rejections) sends a 70,000-byte "
-    "update and asserts LimitExceeded -- but 70000 is not the contract's exact 65536-accepted/"
-    "65537-rejected boundary, so it does not satisfy 'exact boundary accepted、boundary+1 rejected'",
-]
+ub_exact_boundary_test_exists = f["update_bytes_exact_boundary_test_exists"]
+ub_passed = (
+    ub_test == "ok"
+    and ub_exact_boundary_test_exists
+    and f["write_rs_limit_exceeded_details_has_limit_field"]
+    and f["map_write_rejection_reads_details_field"]
+)
+ub_reason_parts = []
+if not ub_exact_boundary_test_exists:
+    ub_reason_parts.append(
+        "real DB-backed e2e test (routes::collab::collab_database_tests::"
+        "full_session_hello_open_snapshot_update_accepted_and_two_rejections) sends a 70,000-byte "
+        "update and asserts LimitExceeded -- but no test in write.rs references the exact "
+        "65537-byte boundary+1 value, so the contract's exact-boundary requirement is not met "
+        "(the current test only proves 'some oversized update is rejected', not the boundary itself)"
+    )
 if not f["write_rs_limit_exceeded_details_has_limit_field"]:
     ub_reason_parts.append(
         "the WS-layer rejection (write.rs::reject_from_collab_error) sets details={\"limit_kind\":...} "
@@ -638,13 +886,22 @@ if not f["map_write_rejection_reads_details_field"]:
         "apps/api/src/error.rs's ApiError/ApiResponse carry no `details` field whatsoever, so a REST "
         "caller cannot receive limit_kind for this or any limit_exceeded rejection"
     )
+if ub_test != "ok":
+    ub_reason_parts.append(f"the DB-backed e2e test itself does not pass (status={ub_test})")
+if not ub_reason_parts:
+    ub_reason_parts.append(
+        "exact 65536-accepted/65537-rejected boundary test passes, WS details carry limit_kind and "
+        "limit, and REST reads rejected.details"
+    )
 boundary_cases.append(case(
-    "update_bytes_max", "update_bytes", r["value"], "failed", "; ".join(ub_reason_parts),
+    "update_bytes_max", "update_bytes", r["value"], "passed" if ub_passed else "failed",
+    "; ".join(ub_reason_parts),
     plus_one={"code": "limit_exceeded" if ub_test == "ok" else None,
               "limit_kind": "update_bytes" if ub_test == "ok" else None,
               "head_unchanged": True if ub_test == "ok" else None, "event_dispatch_zero": None},
     evidence={"dynamic_test": {"crate": "api", "test": "routes::collab::collab_database_tests::"
                                 "full_session_hello_open_snapshot_update_accepted_and_two_rejections", "status": ub_test},
+              "exact_boundary_test_exists": ub_exact_boundary_test_exists,
               "write_rs_details_has_limit_kind": f["write_rs_limit_exceeded_details_has_limit_kind"],
               "write_rs_details_has_limit_field": f["write_rs_limit_exceeded_details_has_limit_field"],
               "map_write_rejection_reads_details_field": f["map_write_rejection_reads_details_field"]},
@@ -656,13 +913,22 @@ for key, limit_kind, test_name in (
 ):
     r = row_by_kind[limit_kind]
     test_status = dtest(test_name)
-    boundary_cases.append(case(
-        key, limit_kind, r["value"], "failed",
+    details_is_none = f["session_rs_presence_limit_rejection_details_is_none"]
+    presence_passed = test_status == "ok" and not details_is_none
+    presence_reason = (
         "apps/api/src/flow/collab/registry.rs enforces this exactly (real exact-boundary/+1 unit test "
-        f"passes: {test_name}), but apps/api/src/flow/collab/session.rs's own match arm "
-        "(`Err(PresenceLimit::PerConnection | PresenceLimit::PerDocument) => rejected_frame(..., "
-        "RejectedCode::LimitExceeded, false, None)`) sends details=None for BOTH ceilings -- the wire "
-        "response carries no limit_kind at all and cannot distinguish the two ceilings",
+        f"{test_name}: {test_status})"
+        + (
+            ", and session.rs's rejection carries structured details naming the limit_kind"
+            if not details_is_none
+            else ", but apps/api/src/flow/collab/session.rs's own match arm "
+            "(`Err(PresenceLimit::PerConnection | PresenceLimit::PerDocument) => rejected_frame(..., "
+            "RejectedCode::LimitExceeded, false, None)`) sends details=None for BOTH ceilings -- the "
+            "wire response carries no limit_kind at all and cannot distinguish the two ceilings"
+        )
+    )
+    boundary_cases.append(case(
+        key, limit_kind, r["value"], "passed" if presence_passed else "failed", presence_reason,
         exact={"accepted": test_status == "ok" if test_status else None,
                "head_after": "n/a: presence never touches canonical head"},
         plus_one={"code": "limit_exceeded" if test_status == "ok" else None, "limit_kind": None,
@@ -673,30 +939,63 @@ for key, limit_kind, test_name in (
     ))
 
 r = row_by_kind["websocket_frame_bytes"]
+wfb_test = f["boundary_test_covering"].get("websocket_frame_bytes")
+wfb_passed = wfb_test is not None and dtest(wfb_test.rsplit("::", 1)[-1]) == "ok"
 boundary_cases.append(case(
-    "websocket_frame_bytes_max", "websocket_frame_bytes", r["value"], "failed",
-    "WEBSOCKET_FRAME_BYTES_MAX is checked pre-decode in apps/api/src/flow/collab/session.rs, but no "
-    "unit or e2e test exercises the exact 131072-accepted/131073-rejected boundary (grepped: zero "
-    "test function references the constant)",
+    "websocket_frame_bytes_max", "websocket_frame_bytes", r["value"],
+    "passed" if wfb_passed else "failed",
+    (
+        f"WEBSOCKET_FRAME_BYTES_MAX is checked pre-decode in apps/api/src/flow/collab/session.rs, "
+        f"and a boundary test was found: {wfb_test}"
+        if wfb_test
+        else "WEBSOCKET_FRAME_BYTES_MAX is checked pre-decode in apps/api/src/flow/collab/session.rs, "
+        "but no unit or e2e test exercises the exact 131072-accepted/131073-rejected boundary "
+        "(scanned every #[test]/#[tokio::test] function name in the caller-facing modules this "
+        "script reads: zero match)"
+    ),
+    evidence={"boundary_test_covering": wfb_test},
 ))
 
 r = row_by_kind["presence_payload_bytes"]
+ppb_call_sites = f["presence_payload_bytes_max_enforcement_call_sites"]
+ppb_test = f["boundary_test_covering"].get("presence_payload_bytes")
+ppb_passed = ppb_call_sites > 0 and ppb_test is not None and dtest(ppb_test.rsplit("::", 1)[-1]) == "ok"
 boundary_cases.append(case(
-    "presence_payload_bytes_max", "presence_payload_bytes", r["value"], "failed",
-    "verified absent: PRESENCE_PAYLOAD_BYTES_MAX has "
-    f"{f['presence_payload_bytes_max_enforcement_call_sites']} references in "
-    "apps/api/src/flow/collab/session.rs outside its own wire-report constant in limits.rs -- the "
-    "presence frame's payload byte length is never checked against it",
+    "presence_payload_bytes_max", "presence_payload_bytes", r["value"],
+    "passed" if ppb_passed else "failed",
+    (
+        f"PRESENCE_PAYLOAD_BYTES_MAX has {ppb_call_sites} enforcement reference(s) outside its own "
+        f"wire-report constant, and a boundary test was found: {ppb_test}"
+        if ppb_call_sites > 0
+        else "verified absent: PRESENCE_PAYLOAD_BYTES_MAX has "
+        f"{ppb_call_sites} references in apps/api/src/flow/collab/session.rs outside its own "
+        "wire-report constant in limits.rs -- the presence frame's payload byte length is never "
+        "checked against it"
+    ),
+    evidence={"presence_payload_bytes_max_enforcement_call_sites": ppb_call_sites,
+              "boundary_test_covering": ppb_test},
 ))
 
 r = row_by_kind["presence_ttl_seconds"]
+ttl_details_is_none = f["session_rs_presence_ttl_rejection_details_is_none"]
+ttl_test = f["boundary_test_covering"].get("presence_ttl_seconds")
+ttl_passed = (not ttl_details_is_none) and ttl_test is not None and dtest(ttl_test.rsplit("::", 1)[-1]) == "ok"
 boundary_cases.append(case(
-    "presence_ttl_seconds_max", "presence_ttl_seconds", r["value"], "failed",
-    "apps/api/src/flow/collab/session.rs:526-541 correctly implements 0->invalid_update, "
-    ">30->limit_exceeded, omitted->30 default, but the limit_exceeded rejected_frame call passes "
-    "details=None (no limit_kind), and no unit test exercises this branch (only reachable via a "
-    "live WS session, which this script does not drive)",
-    evidence={"session_rs_presence_ttl_rejection_details_is_none": f["session_rs_presence_ttl_rejection_details_is_none"]},
+    "presence_ttl_seconds_max", "presence_ttl_seconds", r["value"],
+    "passed" if ttl_passed else "failed",
+    (
+        "apps/api/src/flow/collab/session.rs correctly implements 0->invalid_update, "
+        ">30->limit_exceeded, omitted->30 default"
+        + (f", and a boundary test was found: {ttl_test}" if ttl_test
+           else ", but no unit or e2e test exercises this branch (only reachable via a live WS "
+           "session; scanned every #[test]/#[tokio::test] function name: zero match)")
+        + (
+            "; the limit_exceeded rejected_frame call passes details=None (no limit_kind)"
+            if ttl_details_is_none else ""
+        )
+    ),
+    evidence={"session_rs_presence_ttl_rejection_details_is_none": ttl_details_is_none,
+              "boundary_test_covering": ttl_test},
 ))
 
 for key, limit_kind, finding_key in (
@@ -704,14 +1003,22 @@ for key, limit_kind, finding_key in (
     ("bootstrap_response_bytes_max", "bootstrap_response_bytes", "bootstrap_rs_mentions_bootstrap_response_bytes"),
 ):
     r = row_by_kind[limit_kind]
+    mentions = f[finding_key]
+    bootstrap_test = f["boundary_test_covering"].get(limit_kind)
+    bootstrap_passed = mentions and bootstrap_test is not None and dtest(bootstrap_test.rsplit("::", 1)[-1]) == "ok"
     boundary_cases.append(case(
-        key, limit_kind, r["value"], "failed",
-        f"verified absent: apps/api/src/flow/collab/bootstrap.rs never mentions '{limit_kind}' or "
-        "constructs a limit_exceeded rejection for it -- the only place this number appears is the "
-        "wire-report test confirming the JSON *reports* the right number "
-        "(routes/flow.rs bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot), "
-        "which is reporting, not enforcement",
-        evidence={finding_key: f[finding_key]},
+        key, limit_kind, r["value"], "passed" if bootstrap_passed else "failed",
+        (
+            f"apps/api/src/flow/collab/bootstrap.rs mentions '{limit_kind}' and constructs a "
+            f"limit_exceeded rejection for it, with boundary test {bootstrap_test}"
+            if mentions
+            else f"verified absent: apps/api/src/flow/collab/bootstrap.rs never mentions '{limit_kind}' or "
+            "constructs a limit_exceeded rejection for it -- the only place this number appears is the "
+            "wire-report test confirming the JSON *reports* the right number "
+            "(routes/flow.rs bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot), "
+            "which is reporting, not enforcement"
+        ),
+        evidence={finding_key: mentions, "boundary_test_covering": bootstrap_test},
     ))
 
 for key, limit_kind, const in (
@@ -721,16 +1028,23 @@ for key, limit_kind, const in (
 ):
     r = row_by_kind[limit_kind]
     ref_count = f.get(f"{const.lower()}_referenced_outside_limits_rs", 0)
+    iso_test = f["boundary_test_covering"].get(limit_kind)
+    iso_passed = ref_count > 0 and iso_test is not None and dtest(iso_test.rsplit("::", 1)[-1]) == "ok"
     boundary_cases.append(case(
-        key, limit_kind, r["value"], "failed",
-        f"verified absent: no isolated/sandboxed apply execution path exists anywhere in "
-        "apps/api/src (no terminable engine instance, no CPU/allocation meter, no worker sandbox) "
-        f"or frontend/src (no Worker.terminate() usage found) -- {const} has {ref_count} "
-        "enforcement call sites outside its own wire-report declaration. Per ADR-0014, "
-        "decode_apply_cpu_ms and isolated_apply_memory_bytes are legitimately not_applicable_web/"
-        "diagnostic_only on the browser platform, but the native server-side path (apps/api) is "
-        "where they are required, and it has no such mechanism at all.",
-        evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count},
+        key, limit_kind, r["value"], "passed" if iso_passed else "failed",
+        (
+            f"{const} has {ref_count} enforcement call site(s) outside its own wire-report "
+            f"declaration, and a boundary test was found: {iso_test}"
+            if ref_count > 0
+            else f"verified absent: no isolated/sandboxed apply execution path exists anywhere in "
+            "apps/api/src (no terminable engine instance, no CPU/allocation meter, no worker sandbox) "
+            f"or frontend/src (no Worker.terminate() usage found) -- {const} has {ref_count} "
+            "enforcement call sites outside its own wire-report declaration. Per ADR-0014, "
+            "decode_apply_cpu_ms and isolated_apply_memory_bytes are legitimately not_applicable_web/"
+            "diagnostic_only on the browser platform, but the native server-side path (apps/api) is "
+            "where they are required, and it has no such mechanism at all."
+        ),
+        evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count, "boundary_test_covering": iso_test},
     ))
 
 for key, limit_kind, const in (
@@ -745,26 +1059,48 @@ for key, limit_kind, const in (
 ):
     r = row_by_kind[limit_kind]
     ref_count = f.get(f"{const.lower()}_referenced_outside_limits_rs", 0)
+    crq_test = f["boundary_test_covering"].get(limit_kind)
+    crq_passed = ref_count > 0 and crq_test is not None and dtest(crq_test.rsplit("::", 1)[-1]) == "ok"
     boundary_cases.append(case(
-        key, limit_kind, r["value"], "failed",
-        f"verified absent: {const} has {ref_count} enforcement call sites in apps/api/src outside "
-        "its own wire-report declaration in collab/limits.rs -- no connection/session-count "
-        "registry, token-bucket rate limiter, or slow-consumer queue exists. The contract also "
-        "requires a 'deterministic virtual clock' for the rate fixtures specifically; none exists "
-        "in this repository (grepped for VirtualClock/virtual_clock/FakeClock: zero hits).",
-        evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count},
+        key, limit_kind, r["value"], "passed" if crq_passed else "failed",
+        (
+            f"{const} has {ref_count} enforcement call site(s) outside its own wire-report "
+            f"declaration, and a boundary test was found: {crq_test}"
+            if ref_count > 0
+            else f"verified absent: {const} has {ref_count} enforcement call sites in apps/api/src outside "
+            "its own wire-report declaration in collab/limits.rs -- no connection/session-count "
+            "registry, token-bucket rate limiter, or slow-consumer queue exists. The contract also "
+            "requires a 'deterministic virtual clock' for the rate fixtures specifically; none exists "
+            "in this repository (grepped for VirtualClock/virtual_clock/FakeClock: zero hits)."
+        ),
+        evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count, "boundary_test_covering": crq_test},
     ))
 
 r = row_by_kind["page_size"]
+ps_plain_string = f["query_rs_validate_limit_returns_plain_string"]
+ps_test = f["boundary_test_covering"].get("page_size")
+ps_passed = (
+    not ps_plain_string
+    and f["rest_apiresponse_struct_has_details_field"]
+    and ps_test is not None
+    and dtest(ps_test.rsplit("::", 1)[-1]) == "ok"
+)
 boundary_cases.append(case(
-    "page_limit_default/page_limit_max", "page_size", r["value"], "failed",
-    "apps/api/src/flow/query.rs::validate_limit enforces MAX_LIST_LIMIT=100 for real, but returns "
-    "ApiError::BadRequest(format!(\"limit must be at most {MAX_LIST_LIMIT}\")) -- a plain message "
-    "string, not a structured details/limit_kind object (apps/api's REST envelope has no `details` "
-    "field at all, see rest_apiresponse_struct_has_details_field). No unit test exercises the exact "
-    "100-accepted/101-rejected boundary.",
-    evidence={"query_rs_validate_limit_returns_plain_string": f["query_rs_validate_limit_returns_plain_string"],
-              "rest_apiresponse_struct_has_details_field": f["rest_apiresponse_struct_has_details_field"]},
+    "page_limit_default/page_limit_max", "page_size", r["value"], "passed" if ps_passed else "failed",
+    (
+        "apps/api/src/flow/query.rs::validate_limit enforces MAX_LIST_LIMIT=100 for real, but returns "
+        "ApiError::BadRequest(format!(\"limit must be at most {MAX_LIST_LIMIT}\")) -- a plain message "
+        "string, not a structured details/limit_kind object (apps/api's REST envelope has no `details` "
+        "field at all, see rest_apiresponse_struct_has_details_field)"
+        if ps_plain_string
+        else "apps/api/src/flow/query.rs::validate_limit returns a structured details/limit_kind object"
+    )
+    + (f"; boundary test found: {ps_test}" if ps_test
+       else "; no unit or e2e test exercises the exact 100-accepted/101-rejected boundary (scanned "
+       "every #[test]/#[tokio::test] function name in apps/api/src/flow/query.rs: zero match)"),
+    evidence={"query_rs_validate_limit_returns_plain_string": ps_plain_string,
+              "rest_apiresponse_struct_has_details_field": f["rest_apiresponse_struct_has_details_field"],
+              "boundary_test_covering": ps_test},
 ))
 
 for key, limit_kind, const in (
@@ -776,12 +1112,19 @@ for key, limit_kind, const in (
 ):
     r = row_by_kind[limit_kind]
     ref_count = f.get(f"{const.lower()}_referenced_outside_limits_rs", 0)
+    scan_test = f["boundary_test_covering"].get(limit_kind)
+    scan_passed = ref_count > 0 and scan_test is not None and dtest(scan_test.rsplit("::", 1)[-1]) == "ok"
     boundary_cases.append(case(
-        key, limit_kind, r["value"], "failed",
-        f"verified absent: {const} has {ref_count} enforcement call sites outside its own "
-        "wire-report declaration -- no import/scan endpoint validates archive/expanded bytes, "
-        "entry count, compression ratio, or authorized-scan row budget anywhere in apps/api/src",
-        evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count},
+        key, limit_kind, r["value"], "passed" if scan_passed else "failed",
+        (
+            f"{const} has {ref_count} enforcement call site(s) outside its own wire-report "
+            f"declaration, and a boundary test was found: {scan_test}"
+            if ref_count > 0
+            else f"verified absent: {const} has {ref_count} enforcement call sites outside its own "
+            "wire-report declaration -- no import/scan endpoint validates archive/expanded bytes, "
+            "entry count, compression ratio, or authorized-scan row budget anywhere in apps/api/src"
+        ),
+        evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count, "boundary_test_covering": scan_test},
     ))
 
 if len(boundary_cases) != len(static["expected_limit_kinds"]):
@@ -789,20 +1132,34 @@ if len(boundary_cases) != len(static["expected_limit_kinds"]):
                                 f"v0.4 expected_limit_kinds ({len(static['expected_limit_kinds'])})"}))
     sys.exit(0)
 
+# `isolation` aggregates the three boundary_cases built in the isolation for-loop above
+# (decode_apply_cpu_ms_max/decode_apply_wall_ms_max/isolated_apply_memory_bytes_max) rather than
+# re-asserting its own separate verdict -- there must be exactly one place in this file that
+# decides whether each of those three ceilings is enforced, or the two could drift apart the same
+# way the old hardcoded "failed" literal drifted from its own evidence.
+ISOLATION_LIMIT_KINDS = ("decode_apply_cpu_ms", "decode_apply_wall_ms", "isolated_apply_memory_bytes")
+isolation_cases = [bc for bc in boundary_cases if bc["limit_kind"] in ISOLATION_LIMIT_KINDS]
+isolation_passed_count = sum(1 for bc in isolation_cases if bc["status"] == "passed")
 isolation = {
     "cpu_ms": None, "wall_ms": None, "peak_bytes": None, "terminated": None, "canonical_state_unchanged": None,
-    "status": "failed",
+    "call_sites_outside_limits_rs": {
+        bc["key"]: next(v for k, v in bc["evidence"].items() if k.endswith("_referenced_outside_limits_rs"))
+        for bc in isolation_cases
+    },
+    "status": "passed" if isolation_passed_count == len(isolation_cases) else "failed",
     "reason": (
-        "no isolated/sandboxed decode-apply execution path exists anywhere in apps/api/src (grepped: "
-        "zero call sites for DECODE_APPLY_CPU_MS_MAX/DECODE_APPLY_WALL_MS_MAX/"
-        "ISOLATED_APPLY_MEMORY_BYTES_MAX outside their own wire-report declaration) or frontend/src (no "
-        "Worker.terminate() usage found) -- nothing to measure or terminate"
+        f"{isolation_passed_count} of {len(isolation_cases)} isolation boundary_cases "
+        "(decode_apply_cpu_ms_max/decode_apply_wall_ms_max/isolated_apply_memory_bytes_max) pass; "
+        + "; ".join(f"{bc['key']}: {bc['reason']}" for bc in isolation_cases if bc["status"] != "passed")
+    ) if isolation_passed_count < len(isolation_cases) else (
+        f"all {len(isolation_cases)} isolation boundary_cases pass -- see boundary_cases for each "
+        "ceiling's individual call-site and test evidence"
     ),
     "platform_note": (
         "per ADR-0014, decode_apply_cpu_ms and isolated_apply_memory_bytes are not_applicable_web/"
         "diagnostic_only on the browser platform by design (no trustworthy per-worker CPU/allocation "
         "meter exists in browsers); decode_apply_wall_ms plus forced termination is required on both "
-        "platforms and exists on neither today"
+        "platforms regardless of this note"
     ),
 }
 
@@ -861,7 +1218,9 @@ delivery_path = {
     "retention_days": dcc["delivery_retention_days"]["source_value"],
     "no_subscribers_retention_hours": dcc["dispatch_no_subscribers_retention_hours"]["source_value"],
     "no_subscribers_reaped": None,
-    "coalesced_source_events_max": "unset",
+    "coalesced_source_events_max": (
+        "unset" if "coalesced_source_events_max" in static["unset_delivery_keys"] else "locked"
+    ),
     "coalesced_cap_starts_new_row": None,
     "constant_cross_check": dcc,
     "unset_dispatch_budget_keys": static["unset_delivery_keys"],
@@ -878,15 +1237,21 @@ delivery_path["all_passed"] = (
     len(delivery_constant_violations) == 0 and len(static["unset_delivery_keys"]) == 0
     and delivery_path["no_subscribers_reaped"] is True
 )
-delivery_path["status"] = "failed"
-delivery_path["reason"] = (
-    (f"{len(delivery_constant_violations)} frozen delivery-path constant mismatch(es): {delivery_constant_violations}; "
-     if delivery_constant_violations else "")
-    + f"{len(static['unset_delivery_keys'])} delivery-path budget key(s) still `status: unset` in "
-      f"contracts/limits-v1.md, cannot be 'locked' while undefined: {static['unset_delivery_keys']}; "
-    + ("no_subscribers reaping not independently confirmable (flow-events-result.json missing/stale)"
-       if events is None else f"no_subscribers reaping per flow-events-result.json: {delivery_path['no_subscribers_reaped']}")
-)
+delivery_path["status"] = "passed" if delivery_path["all_passed"] else "failed"
+if delivery_path["all_passed"]:
+    delivery_path["reason"] = (
+        "all frozen delivery-path constants match source, zero budget keys remain `status: unset` in "
+        "contracts/limits-v1.md, and no_subscribers reaping per flow-events-result.json is confirmed"
+    )
+else:
+    delivery_path["reason"] = (
+        (f"{len(delivery_constant_violations)} frozen delivery-path constant mismatch(es): {delivery_constant_violations}; "
+         if delivery_constant_violations else "")
+        + f"{len(static['unset_delivery_keys'])} delivery-path budget key(s) still `status: unset` in "
+          f"contracts/limits-v1.md, cannot be 'locked' while undefined: {static['unset_delivery_keys']}; "
+        + ("no_subscribers reaping not independently confirmable (flow-events-result.json missing/stale)"
+           if events is None else f"no_subscribers reaping per flow-events-result.json: {delivery_path['no_subscribers_reaped']}")
+    )
 
 dispatch_numeric_budgets_locked_status = (
     "passed" if len(static["unset_delivery_keys"]) == 0 and len(delivery_constant_violations) == 0 else "failed"
@@ -906,29 +1271,50 @@ if bootstrap_test_status is not None:
                     "bootstrap_decoded_bytes_max==8388608", "import_compression_ratio_max==100"],
     }
 
+bootstrap_parity_field_sets_match = (
+    len(fe_parity["missing_in_frontend"]) == 0 and len(fe_parity["extra_in_frontend"]) == 0
+)
+bootstrap_parity_unknown_version_found = f["frontend_unknown_version_handling_found"]
+bootstrap_parity_ok = bootstrap_parity_field_sets_match and bootstrap_parity_unknown_version_found
+
 bootstrap_parity = {
     "server_limits_sha256": server_limits_sha256,
     "server_limits_field_count": fe_parity["server_field_count"],
     "server_wire_spotcheck": wire_spotcheck,
     "web_limits_sha256": None,
     "web_limits_field_count": fe_parity["frontend_field_count"],
-    "unknown_version_read_only": "not_covered",
+    "unknown_version_read_only": "not_covered" if not bootstrap_parity_unknown_version_found else "found",
     "missing_in_frontend": fe_parity["missing_in_frontend"],
     "extra_in_frontend": fe_parity["extra_in_frontend"],
-    "status": "failed",
+    "status": "passed" if bootstrap_parity_ok else "failed",
     "reason": (
-        f"frontend/src/lib/flow/types.ts's FlowLimitsV1 interface declares only "
-        f"{fe_parity['frontend_field_count']} of the server's {fe_parity['server_field_count']} wire "
-        f"fields ({len(fe_parity['missing_in_frontend'])} missing entirely, including "
-        "bootstrap_decoded_bytes_max/isolated_apply_memory_bytes_max/all connection+rate+import "
-        f"fields), plus 2 fields under different names than the wire schema "
-        f"({fe_parity['extra_in_frontend']} vs the server's frame/presence byte field names); "
-        "frontend/src/lib/flow/limits.ts's DEFAULT_FLOW_LIMITS is a hand-maintained constant with zero "
-        "call sites fetching or diffing against a live Bootstrap response -- parity is never checked, "
-        "let alone enforced, and the field sets are structurally incompatible so no sha256 comparison "
-        "is meaningful without first fixing the field-set mismatch. `unknown_version_read_only` is "
-        "not_covered: no version-negotiation code for an unrecognized limits.version was found in "
-        "frontend/src."
+        "frontend/src/lib/flow/types.ts's FlowLimitsV1 interface field set matches the server's "
+        f"{fe_parity['server_field_count']} wire fields, and version-negotiation code for an "
+        "unrecognized limits.version was found in frontend/src"
+        if bootstrap_parity_ok
+        else (
+            f"frontend/src/lib/flow/types.ts's FlowLimitsV1 interface declares only "
+            f"{fe_parity['frontend_field_count']} of the server's {fe_parity['server_field_count']} wire "
+            f"fields ({len(fe_parity['missing_in_frontend'])} missing entirely, including "
+            "bootstrap_decoded_bytes_max/isolated_apply_memory_bytes_max/all connection+rate+import "
+            f"fields), plus {len(fe_parity['extra_in_frontend'])} field(s) under different names than "
+            f"the wire schema ({fe_parity['extra_in_frontend']} vs the server's frame/presence byte "
+            "field names); "
+            if not bootstrap_parity_field_sets_match else ""
+        )
+        + (
+            "frontend/src/lib/flow/limits.ts's DEFAULT_FLOW_LIMITS is a hand-maintained constant with "
+            "zero call sites fetching or diffing against a live Bootstrap response -- parity is never "
+            "checked, let alone enforced, and the field sets are structurally incompatible so no sha256 "
+            "comparison is meaningful without first fixing the field-set mismatch; "
+            if not bootstrap_parity_field_sets_match else ""
+        )
+        + (
+            "`unknown_version_read_only` is not_covered: no version-negotiation code for an "
+            "unrecognized limits.version was found in frontend/src (grepped types.ts + limits.ts)."
+            if not bootstrap_parity_unknown_version_found
+            else "version-negotiation code for an unrecognized limits.version was found in frontend/src."
+        )
     ),
 }
 
@@ -950,6 +1336,79 @@ error_kind_coverage = {
         "count as observed."
     ),
 }
+
+# ---- self-consistency assertion: a case's reason may never contradict its own evidence ----
+#
+# This is the exact bug this script shipped with until 2026-08-30: every boundary_case's `status`
+# was a hardcoded string literal (`"failed"`), so when `check_operation`/`check_operation_batch_count`
+# actually got wired into apps/api/src/flow/command.rs, the dynamically-computed
+# `call_sites_in_apps_api_command_rs` evidence field correctly flipped from 0 to a positive count --
+# but the hand-written prose right next to it, in the SAME case object, kept reading "has 0 call
+# sites ... not wired into any endpoint". A verifier able to assert those two things in the same
+# breath is not trustworthy input to a release decision, and no amount of fixing individual
+# `status` computations (above) rules out some future case, or some future edit to one of these
+# case()-building blocks, reintroducing the same drift by accident. So this check runs
+# unconditionally, on every run, on the actual objects this script is about to write out -- not on
+# the code that built them -- and refuses to write evidence at all if it ever finds one.
+#
+# It looks for two specific self-contradicting phrase families in `reason` text ("zero/0/never/
+# verified absent/not wired"-style claims of nonexistence, and "N of M pass"-style claims of a
+# subset), and cross-checks them against that same object's own positive-integer evidence. A
+# `reason` claiming "0 call sites" while `evidence.call_sites_in_apps_api_command_rs == 2` sits
+# right next to it is exactly the shape of contradiction this exists to catch.
+ZERO_CLAIM_RE = re.compile(
+    r"\b(?:has\s+)?0\s+(?:call\s+sites?|references?|enforcement\s+call\s+sites?)\b"
+    r"|\bzero\s+(?:call\s+sites?|references?|hits?)\b"
+    r"|\bverified\s+absent\b"
+    r"|\bnot\s+wired\b"
+    r"|\bnever\s+mentions\b"
+    r"|\bnever\s+reads\b",
+    re.I,
+)
+
+
+def _positive_ints(obj):
+    found = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, int):
+                    if v > 0:
+                        found.append(v)
+                elif isinstance(v, dict):
+                    walk(v)
+
+    walk(obj)
+    return found
+
+
+def assert_no_self_contradiction(named_objects):
+    problems = []
+    for name, obj in named_objects:
+        reason = obj.get("reason") or ""
+        if not ZERO_CLAIM_RE.search(reason):
+            continue
+        nonzero = _positive_ints(obj.get("evidence", {}))
+        if nonzero:
+            problems.append(
+                f"{name}: reason claims zero/absent/unwired/never ({reason[:160]!r}...) but its own "
+                f"evidence dict carries positive count(s) {nonzero}"
+            )
+    return problems
+
+
+self_consistency_problems = assert_no_self_contradiction(
+    [(f"boundary_cases[key={bc['key']}]", bc) for bc in boundary_cases]
+)
+if self_consistency_problems:
+    print(json.dumps({
+        "error": "self-consistency check failed -- refusing to write evidence with a case whose "
+                  "reason contradicts its own evidence: " + "; ".join(self_consistency_problems)
+    }))
+    sys.exit(0)
 
 result = {
     "schema_version": "sylvode.flow.limits-result.v1",
