@@ -432,6 +432,27 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     bridge_verifier_gates(evidence_root, "mcp-contract-result.json", "sylvode.flow.mcp-contract-result.v1", gates, reasons)
     bridge_verifier_gates(evidence_root, "tool-registry-result.json", "sylvode.flow.tool-registry-result.v1", gates, reasons)
     bridge_verifier_gates(evidence_root, "cli-contract-result.json", "sylvode.flow.cli-contract-result.v1", gates, reasons)
+    # ---- transport-auth verifier bridge: backs 3 gates ----
+    # scripts/verify-flow-transport-auth-v0.4.sh writes transport-auth-
+    # result.json with its own per-gate verdict for
+    # ticket_single_use_origin_bot_exclusion, secure_cookie_and_local_dev_
+    # guard and unauthorized_update_rejected. Every one of those verdicts is
+    # decided by live negative fixtures (bot issuance, replay, wrong Origin,
+    # wrong client_id, expiry, a mid-session revocation, a non-loopback
+    # insecure-cookie config) each paired with a positive control, so the
+    # artifact's `passed`/`failed` is a real observation, not a self-report
+    # about coverage. Bridged verbatim -- see bridge_verifier_gates().
+    bridge_verifier_gates(evidence_root, "transport-auth-result.json", "sylvode.flow.transport-auth-result.v1", gates, reasons)
+
+    # ---- cross-workspace / policy-bypass verifier bridge: backs 1 gate ----
+    # scripts/verify-flow-cross-workspace-v0.4.sh writes cross-workspace-
+    # negative-result.json with its verdict for
+    # cross_workspace_and_policy_bypass_negative, decided by live
+    # cross-workspace get/update/link/ticket refusals and the policy-bypass
+    # negatives (bot scoping, read-only bot, bot on user-only CRDT surfaces,
+    # disabled feature flag, absent/forged credentials), each with a
+    # same-workspace control. Bridged verbatim -- see bridge_verifier_gates().
+    bridge_verifier_gates(evidence_root, "cross-workspace-negative-result.json", "sylvode.flow.cross-workspace-result.v1", gates, reasons)
 
     # ---- legacy_pages_drop_requires_separate_adr: static migration scan ----
     migrations_dir = os.path.join(repo_root, "migrations")

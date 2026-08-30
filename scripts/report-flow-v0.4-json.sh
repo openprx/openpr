@@ -15,24 +15,22 @@ set -euo pipefail
 # fabricating a schema-shaped file with missing/placeholder artifacts is
 # exactly the fake-green pattern this v0.4 work exists to close.
 #
-# v0.4-gate.yaml's required_commands list has 15 entries (bumped from 13
-# in `02e8cb7`, which added limits_verify/events_verify -- this script had
-# drifted behind that bump until it was synced back up here). As of the
-# addition of scripts/verify-flow-limits-v0.4.sh and
-# scripts/verify-flow-errors-v0.4.sh, nine of the fifteen have a
-# corresponding verify-flow-*-v0.4.sh script implemented (surface_parity,
+# v0.4-gate.yaml's required_commands list has 17 entries (13 originally, 15
+# after `02e8cb7` added limits_verify/events_verify, 17 with the
+# transport_auth_verify and cross_workspace_verify keys the four collab
+# security hard gates need). Twelve of the seventeen now have a corresponding
+# verify-flow-*-v0.4.sh script implemented (surface_parity,
 # legacy_pages_inventory + legacy_pages_entry_verify, cardinality_verify,
-# integrity_records_verify, authz_baseline_verify,
-# collab_architecture_verify, events_verify, limits_verify,
-# error_contract_verify); the remaining one
-# (deployed_chain_websocket_upgrade) does not exist yet. This script
-# records that missing script as a FAILED step with an explicit "script
-# not implemented" message rather than skipping it silently, so report
-# correctly and honestly exits 1 and does not write gate-result.json
-# until that script exists and passes -- and, independently, until every
-# hard gate the now-implemented limits_verify/error_contract_verify
-# scripts themselves compute also passes (both currently fail honestly;
-# see their own file-header comments).
+# integrity_records_verify, authz_baseline_verify, collab_architecture_verify,
+# events_verify, limits_verify, error_contract_verify, transport_auth_verify,
+# cross_workspace_verify); the remaining one
+# (deployed_chain_websocket_upgrade) does not exist yet. This script records
+# that missing script as a FAILED step with an explicit "script not
+# implemented" message rather than skipping it silently, so report correctly
+# and honestly exits 1 and does not write gate-result.json until that script
+# exists and passes -- and, independently, until every hard gate the
+# now-implemented verifiers themselves compute also passes (several currently
+# fail honestly; see their own file-header comments).
 #
 # Every invocation (pass or fail) also writes an atomic run log so a
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
@@ -233,6 +231,12 @@ run_step required.tool_registry_verify "$ROOT_DIR/scripts/verify-flow-tool-regis
 echo "=== Sylvode Flow v0.4 report: CLI JSON/exit-code contract verify ==="
 run_step required.cli_contract_verify "$ROOT_DIR/scripts/verify-flow-cli-contract-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/error-mapping-v1.md" --release 0.4 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
+echo "=== Sylvode Flow v0.4 report: collab transport auth (ticket / cookie / unauthorized update) ==="
+run_step required.transport_auth_verify "$ROOT_DIR/scripts/verify-flow-transport-auth-v0.4.sh" --adr "$CONTRACTS_ROOT/decisions/ADR-0007-collab-transport-auth.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: cross-workspace / policy-bypass negatives ==="
+run_step required.cross_workspace_verify "$ROOT_DIR/scripts/verify-flow-cross-workspace-v0.4.sh" --threat-model "$CONTRACTS_ROOT/security/threat-model.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
+
 echo "=== Sylvode Flow v0.4 report: not-yet-implemented required_commands ==="
 run_missing_step required.deployed_chain_websocket_upgrade "scripts/verify-flow-deployed-websocket-v0.4.sh does not exist"
 
@@ -333,6 +337,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson mcp_transport_verify "$(get_check required.mcp_transport_verify)" \
   --argjson tool_registry_verify "$(get_check required.tool_registry_verify)" \
   --argjson cli_contract_verify "$(get_check required.cli_contract_verify)" \
+  --argjson transport_auth_verify "$(get_check required.transport_auth_verify)" \
+  --argjson cross_workspace_verify "$(get_check required.cross_workspace_verify)" \
   --arg zero_sha "$ZERO_SHA" \
   '{
     surface_parity:$surface_parity,
@@ -351,6 +357,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     mcp_transport_verify:$mcp_transport_verify,
     tool_registry_verify:$tool_registry_verify,
     cli_contract_verify:$cli_contract_verify,
+    transport_auth_verify:$transport_auth_verify,
+    cross_workspace_verify:$cross_workspace_verify,
     report:{command:"scripts/report-flow-v0.4-json.sh", status:"passed", exit_code:0, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
