@@ -41,17 +41,41 @@ pub struct DocumentLimits {
     pub semantic_patch_operations_max: usize,
 }
 
+// Single source of truth for the frozen v0.4 defaults (`contracts/limits-v1.md`) behind
+// `DocumentLimits::DEFAULT`/`Default`. Two independent enforcement sites read these: the isolated
+// worker (`src/bin/isolated_apply_worker.rs`'s `check_snapshot(&semantic, &DocumentLimits::default())`,
+// the real WS write-path shape validator) and `apps/api`'s `flow::collab::limits::document_limits()`
+// (the REST content-command path and the `Bootstrap.limits` wire report), which derives its own
+// `u64` copies from these named constants rather than declaring separate literals — so the two
+// paths cannot silently validate against different ceilings the way they would if each just wrote
+// its own numbers down.
+pub const UPDATE_BYTES_MAX: usize = 65_536;
+pub const TREE_DEPTH_MAX: usize = 32;
+pub const CONTAINER_COUNT_MAX: usize = 10_000;
+pub const DOCUMENT_BLOCK_COUNT_MAX: usize = 10_000;
+pub const TEXT_BLOCK_CHARS_MAX: usize = 100_000;
+pub const DOCUMENT_TEXT_CHARS_MAX: usize = 1_000_000;
+pub const SEMANTIC_PATCH_OPERATIONS_MAX: usize = 100;
+
+impl DocumentLimits {
+    /// The frozen v0.4 default ceiling set, as a `const` (not just via [`Default`]) so callers
+    /// that need `DocumentLimits` from a `const fn` -- `apps/api`'s
+    /// `flow::collab::limits::document_limits()` -- can use it without a runtime `Default::default()`
+    /// call.
+    pub const DEFAULT: Self = Self {
+        update_bytes_max: UPDATE_BYTES_MAX,
+        tree_depth_max: TREE_DEPTH_MAX,
+        container_count_max: CONTAINER_COUNT_MAX,
+        document_block_count_max: DOCUMENT_BLOCK_COUNT_MAX,
+        text_block_chars_max: TEXT_BLOCK_CHARS_MAX,
+        document_text_chars_max: DOCUMENT_TEXT_CHARS_MAX,
+        semantic_patch_operations_max: SEMANTIC_PATCH_OPERATIONS_MAX,
+    };
+}
+
 impl Default for DocumentLimits {
     fn default() -> Self {
-        Self {
-            update_bytes_max: 65_536,
-            tree_depth_max: 32,
-            container_count_max: 10_000,
-            document_block_count_max: 10_000,
-            text_block_chars_max: 100_000,
-            document_text_chars_max: 1_000_000,
-            semantic_patch_operations_max: 100,
-        }
+        Self::DEFAULT
     }
 }
 

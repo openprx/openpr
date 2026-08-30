@@ -15,8 +15,8 @@
 
 use std::mem::MaybeUninit;
 
-/// `decode_apply_cpu_ms_max` (`contracts/limits-v1.md`).
-pub const DECODE_APPLY_CPU_MS_MAX_MICROS: i64 = 50_000;
+use super::limits::DECODE_APPLY_CPU_MS_MAX_MICROS;
+
 /// `ADR-0014` section 3's `RLIMIT_AS` backstop -- independent of, and larger than, the
 /// counting-allocator-enforced `isolated_apply_memory_bytes_max` (128 MiB). Catches allocations
 /// that bypass the counting allocator entirely (a raw `mmap`, an FFI allocator, a JIT reservation).

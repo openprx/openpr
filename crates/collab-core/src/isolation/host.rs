@@ -50,15 +50,8 @@ use std::time::{Duration, Instant};
 
 use crate::error::CollabError;
 
+use super::limits::DECODE_APPLY_WALL_MS_MAX;
 use super::wire::{self, MAX_RESPONSE_PAYLOAD_BYTES, Outcome};
-
-/// `decode_apply_cpu_ms_max` (`contracts/limits-v1.md`); documented here for
-/// [`IsolatedApplyError::CpuCeiling`]'s reported `observed`/`limit` pair.
-pub const DECODE_APPLY_CPU_MS_MAX: u64 = 50;
-/// `decode_apply_wall_ms_max`; the independent watchdog deadline this module enforces itself.
-pub const DECODE_APPLY_WALL_MS_MAX: u64 = 100;
-/// `isolated_apply_memory_bytes_max`.
-pub const ISOLATED_APPLY_MEMORY_BYTES_MAX: u64 = 134_217_728;
 
 const RESPONSE_FRAME_HEADER_BYTES: usize = 8;
 

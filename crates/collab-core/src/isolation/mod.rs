@@ -29,9 +29,11 @@
 pub mod alloc;
 pub mod child_runtime;
 pub mod host;
+mod limits;
 pub mod wire;
 
-pub use host::{
-    DECODE_APPLY_CPU_MS_MAX, DECODE_APPLY_WALL_MS_MAX, ISOLATED_APPLY_MEMORY_BYTES_MAX, IsolatedApplyError,
-    IsolatedApplySuccess, WORKER_BINARY_PATH_ENV, isolated_apply,
-};
+pub use host::{IsolatedApplyError, IsolatedApplySuccess, WORKER_BINARY_PATH_ENV, isolated_apply};
+// Single source of truth for these three (`isolation::limits`'s own module doc explains why):
+// `host`, `alloc`, and `child_runtime` all `use` them from there rather than declaring their own
+// copies, so this re-export and every enforcement site name the identical constant.
+pub use limits::{DECODE_APPLY_CPU_MS_MAX, DECODE_APPLY_WALL_MS_MAX, ISOLATED_APPLY_MEMORY_BYTES_MAX};

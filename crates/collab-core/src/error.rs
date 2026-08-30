@@ -114,7 +114,7 @@ impl Default for InputLimits {
         // they carry full history, not a single change.
         Self {
             snapshot_bytes_max: 64 * 1024 * 1024,
-            update_bytes_max: 65_536,
+            update_bytes_max: crate::limits::UPDATE_BYTES_MAX,
         }
     }
 }

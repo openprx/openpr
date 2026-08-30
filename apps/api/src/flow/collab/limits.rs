@@ -91,9 +91,12 @@ pub const COORDINATOR_ACQUIRE_TIMEOUT_MS: u64 = 500;
 // so `Bootstrap.limits` can report the "effective、完整且不可空" `FlowLimitsV1` structure the
 // contract requires, not an endpoint-local partial reconstruction of it.
 
-/// `update_bytes_max` — mirrors `collab_core::error::InputLimits::default().update_bytes_max`
-/// (that crate cannot itself depend on this one), kept here only for `FlowLimitsV1`'s wire report.
-pub const UPDATE_BYTES_MAX: u64 = 65_536;
+/// `update_bytes_max` — derived from `collab_core::limits::UPDATE_BYTES_MAX`, the single source
+/// also behind `collab_core::error::InputLimits::default().update_bytes_max` (the real
+/// decode-time enforcement) and `collab_core::DocumentLimits::DEFAULT` (the isolated worker's
+/// structural check) — not a separate literal, so this wire-report value can never drift from
+/// what is actually enforced.
+pub const UPDATE_BYTES_MAX: u64 = collab_core::limits::UPDATE_BYTES_MAX as u64;
 /// `presence_payload_bytes_max`.
 pub const PRESENCE_PAYLOAD_BYTES_MAX: u64 = 8_192;
 /// `bootstrap_decoded_bytes_max` — checked against `snapshot.len() + sum(tail update bytes)`
@@ -101,26 +104,26 @@ pub const PRESENCE_PAYLOAD_BYTES_MAX: u64 = 8_192;
 pub const BOOTSTRAP_DECODED_BYTES_MAX: u64 = 8_388_608;
 /// `bootstrap_response_bytes_max`.
 pub const BOOTSTRAP_RESPONSE_BYTES_MAX: u64 = 12_582_912;
-/// `tree_depth_max`.
-pub const TREE_DEPTH_MAX: u64 = 32;
-/// `container_count_max`.
-pub const CONTAINER_COUNT_MAX: u64 = 10_000;
-/// `document_block_count_max`.
-pub const DOCUMENT_BLOCK_COUNT_MAX: u64 = 10_000;
-/// `text_block_chars_max`.
-pub const TEXT_BLOCK_CHARS_MAX: u64 = 100_000;
-/// `document_text_chars_max`.
-pub const DOCUMENT_TEXT_CHARS_MAX: u64 = 1_000_000;
-/// `semantic_patch_operations_max`.
-pub const SEMANTIC_PATCH_OPERATIONS_MAX: u64 = 100;
+// `tree_depth_max` / `container_count_max` / `document_block_count_max` / `text_block_chars_max`
+// / `document_text_chars_max` / `semantic_patch_operations_max` — derived from
+// `collab_core::DocumentLimits::DEFAULT`, the single source [`document_limits`] below also
+// returns directly and the isolated worker's `check_snapshot` enforces
+// (`crates/collab-core/src/bin/isolated_apply_worker.rs`), not separate literals.
+pub const TREE_DEPTH_MAX: u64 = collab_core::DocumentLimits::DEFAULT.tree_depth_max as u64;
+pub const CONTAINER_COUNT_MAX: u64 = collab_core::DocumentLimits::DEFAULT.container_count_max as u64;
+pub const DOCUMENT_BLOCK_COUNT_MAX: u64 = collab_core::DocumentLimits::DEFAULT.document_block_count_max as u64;
+pub const TEXT_BLOCK_CHARS_MAX: u64 = collab_core::DocumentLimits::DEFAULT.text_block_chars_max as u64;
+pub const DOCUMENT_TEXT_CHARS_MAX: u64 = collab_core::DocumentLimits::DEFAULT.document_text_chars_max as u64;
+pub const SEMANTIC_PATCH_OPERATIONS_MAX: u64 =
+    collab_core::DocumentLimits::DEFAULT.semantic_patch_operations_max as u64;
 /// `semantic_patch_json_bytes_max`.
 pub const SEMANTIC_PATCH_JSON_BYTES_MAX: u64 = 1_048_576;
-/// `decode_apply_cpu_ms_max`.
-pub const DECODE_APPLY_CPU_MS_MAX: u64 = 50;
-/// `decode_apply_wall_ms_max`.
-pub const DECODE_APPLY_WALL_MS_MAX: u64 = 100;
-/// `isolated_apply_memory_bytes_max`.
-pub const ISOLATED_APPLY_MEMORY_BYTES_MAX: u64 = 134_217_728;
+// `decode_apply_cpu_ms_max` / `decode_apply_wall_ms_max` / `isolated_apply_memory_bytes_max` —
+// re-exported from `collab_core::isolation` (`crates/collab-core/src/isolation/limits.rs` is the
+// single source: the isolated-apply worker's CPU timer, wall watchdog, and counting allocator all
+// enforce these same constants), so this wire-report value can never drift from what
+// `flow::collab::write::hydrate_and_apply`'s isolated-apply call path actually enforces.
+pub use collab_core::isolation::{DECODE_APPLY_CPU_MS_MAX, DECODE_APPLY_WALL_MS_MAX, ISOLATED_APPLY_MEMORY_BYTES_MAX};
 /// `open_documents_per_connection_max`.
 pub const OPEN_DOCUMENTS_PER_CONNECTION_MAX: u64 = 8;
 /// `connections_per_user_max`.
@@ -196,25 +199,18 @@ pub struct FlowLimitsV1 {
     pub import_compression_ratio_max: u64,
 }
 
-/// Builds the [`collab_core::DocumentLimits`] structural ceiling set from this module's own
-/// frozen constants — the single source both the REST content-command path
-/// (`flow::command::apply_content_command`, via [`collab_core::limits::check_operation`] /
-/// [`collab_core::limits::check_operation_batch_count`]) and the WebSocket write path
-/// (`flow::collab::write::hydrate_and_apply`, via [`collab_core::limits::check_snapshot`]) use, so
-/// neither call site can silently drift from the other or from `Bootstrap.limits`'s own wire
-/// report above.
+/// Returns [`collab_core::DocumentLimits::DEFAULT`] verbatim — the single source this crate's
+/// own REST content-command path (`flow::command::apply_content_command`, via
+/// [`collab_core::limits::check_operation`] / [`collab_core::limits::check_operation_batch_count`])
+/// reads. The WebSocket write path's shape validation (`flow::collab::write::hydrate_and_apply`)
+/// no longer calls this function at all: since the isolation boundary
+/// (`collab_core::isolation::isolated_apply`), that `check_snapshot` call happens inside the
+/// isolated worker process (`crates/collab-core/src/bin/isolated_apply_worker.rs`), which reads
+/// the identical `DocumentLimits::DEFAULT` directly — so this function existing only to fan the
+/// same constant out to a second caller, not because it independently defines these numbers.
 #[must_use]
-#[allow(clippy::cast_possible_truncation)]
 pub const fn document_limits() -> collab_core::DocumentLimits {
-    collab_core::DocumentLimits {
-        update_bytes_max: UPDATE_BYTES_MAX as usize,
-        tree_depth_max: TREE_DEPTH_MAX as usize,
-        container_count_max: CONTAINER_COUNT_MAX as usize,
-        document_block_count_max: DOCUMENT_BLOCK_COUNT_MAX as usize,
-        text_block_chars_max: TEXT_BLOCK_CHARS_MAX as usize,
-        document_text_chars_max: DOCUMENT_TEXT_CHARS_MAX as usize,
-        semantic_patch_operations_max: SEMANTIC_PATCH_OPERATIONS_MAX as usize,
-    }
+    collab_core::DocumentLimits::DEFAULT
 }
 
 /// Builds the effective `FlowLimitsV1` from this module's own frozen constants — the single
@@ -285,5 +281,46 @@ mod tests {
         assert_eq!(value["update_bytes_max"], 65_536);
         assert_eq!(value["bootstrap_decoded_bytes_max"], 8_388_608);
         assert_eq!(value["import_compression_ratio_max"], 100);
+    }
+
+    /// Ties the `Bootstrap.limits` wire report directly to `collab_core`'s canonical constants
+    /// (not to another locally-declared literal that merely happens to equal them today) — a
+    /// regression test for the exact defect this module used to have: `decode_apply_cpu_ms_max`
+    /// / `decode_apply_wall_ms_max` / `isolated_apply_memory_bytes_max` were once separate `pub
+    /// const`s in this file, independent of the values `collab_core::isolation` actually enforces
+    /// (the isolated worker's `SIGPROF` timer, wall watchdog, and counting allocator). If a future
+    /// edit reintroduces a local literal here that drifts from what is actually enforced, this
+    /// test fails even though both `cargo check` and `cargo clippy` would stay silent.
+    #[test]
+    fn wire_report_matches_collab_core_enforced_values() {
+        let value = serde_json::to_value(effective_limits()).expect("FlowLimitsV1 serializes");
+        assert_eq!(
+            value["decode_apply_cpu_ms_max"],
+            collab_core::isolation::DECODE_APPLY_CPU_MS_MAX
+        );
+        assert_eq!(
+            value["decode_apply_wall_ms_max"],
+            collab_core::isolation::DECODE_APPLY_WALL_MS_MAX
+        );
+        assert_eq!(
+            value["isolated_apply_memory_bytes_max"],
+            collab_core::isolation::ISOLATED_APPLY_MEMORY_BYTES_MAX
+        );
+
+        let limits = super::document_limits();
+        assert_eq!(limits, collab_core::DocumentLimits::DEFAULT);
+        assert_eq!(value["update_bytes_max"], limits.update_bytes_max as u64);
+        assert_eq!(value["tree_depth_max"], limits.tree_depth_max as u64);
+        assert_eq!(value["container_count_max"], limits.container_count_max as u64);
+        assert_eq!(
+            value["document_block_count_max"],
+            limits.document_block_count_max as u64
+        );
+        assert_eq!(value["text_block_chars_max"], limits.text_block_chars_max as u64);
+        assert_eq!(value["document_text_chars_max"], limits.document_text_chars_max as u64);
+        assert_eq!(
+            value["semantic_patch_operations_max"],
+            limits.semantic_patch_operations_max as u64
+        );
     }
 }

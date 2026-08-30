@@ -13,8 +13,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// `isolated_apply_memory_bytes_max` (`contracts/limits-v1.md`).
-pub const ISOLATED_APPLY_MEMORY_BYTES_MAX: u64 = 134_217_728;
+use super::limits::ISOLATED_APPLY_MEMORY_BYTES_MAX;
 
 /// Process-local running total of active (not-yet-freed) bytes allocated since [`arm`] was called.
 static ACTIVE_BYTES: AtomicU64 = AtomicU64::new(0);

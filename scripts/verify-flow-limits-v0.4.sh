@@ -78,16 +78,26 @@ set -euo pipefail
 #   entirely (apps/api/src/error.rs's ApiError only ever carries a plain
 #   String -- there is no `details` field in the REST envelope at all,
 #   for ANY limit_kind, which is why REST can never surface limit_kind
-#   for anything). The remaining 23 have zero enforcement call sites
-#   found anywhere outside their own wire-report constant -- verified
-#   absent, not merely untested. `isolation`, most of
-#   `connection_rate_queue`, `bootstrap_parity` (frontend's FlowLimitsV1
-#   only declares 10 of 36 fields, 2 of those under different names, and
-#   is never fetched from a live Bootstrap response at all) and most of
-#   `delivery_path` (most numeric budgets are still `status: unset` in
-#   the contract itself) are failed for the same class of reason: this
-#   script CAN check them (and did), and what it finds is either "does
-#   not exist" or "exists but is wire-broken" -- never a shrug.
+#   for anything). The 3 `isolation` kinds (decode_apply_cpu_ms,
+#   decode_apply_wall_ms, isolated_apply_memory_bytes) are wired, not
+#   absent: apps/api/src/flow/collab/write.rs's hydrate_and_apply calls
+#   collab_core::isolation::isolated_apply(...), whose real enforcement
+#   (a wall-clock watchdog, a counting-allocator memory ceiling, and a
+#   SIGPROF CPU timer) lives in crates/collab-core/src/isolation/ -- but
+#   no test anywhere proves the exact/+1 numeric boundary for any of the
+#   three, only a qualitative "eventually kills a pathological input and
+#   reports a ceiling" end-to-end test, so all 3 still fail this gate on
+#   missing boundary evidence rather than missing enforcement. The
+#   remaining 20 have zero enforcement call sites found anywhere outside
+#   their own wire-report constant -- verified absent, not merely
+#   untested. Most of `connection_rate_queue`, `bootstrap_parity`
+#   (frontend's FlowLimitsV1 only declares 10 of 36 fields, 2 of those
+#   under different names, and is never fetched from a live Bootstrap
+#   response at all) and most of `delivery_path` (most numeric budgets
+#   are still `status: unset` in the contract itself) are failed for the
+#   same class of reason as those 20: this script CAN check them (and
+#   did), and what it finds is either "does not exist" or "exists but is
+#   wire-broken" -- never a shrug.
 #
 # Exit codes: 0 = all 6 gates recomputed to passed (does not happen today
 # -- see above), 1 = ran to completion and wrote
@@ -201,9 +211,22 @@ DISPATCHER_RS="$REPO_ROOT/apps/api/src/events/dispatcher.rs"
 MIGRATION_SQL="$REPO_ROOT/migrations/0054_flow_data_layer.sql"
 FRONTEND_TYPES_TS="$REPO_ROOT/frontend/src/lib/flow/types.ts"
 FRONTEND_LIMITS_TS="$REPO_ROOT/frontend/src/lib/flow/limits.ts"
+# The isolated-apply enforcement boundary (`decode_apply_cpu_ms_max`/`decode_apply_wall_ms_max`/
+# `isolated_apply_memory_bytes_max`) lives in crates/collab-core/src/isolation/, not apps/api/src --
+# read those source files too so this script can see the cross-crate call path
+# (apps/api/src/flow/collab/write.rs's `collab_core::isolation::isolated_apply(...)` call, and the
+# single-source constants/CPU-timer/allocator/wall-watchdog that actually enforce them) instead of
+# concluding "does not exist" from an apps/api/src-only grep.
+COLLAB_CORE_ISOLATION_LIMITS_RS="$REPO_ROOT/crates/collab-core/src/isolation/limits.rs"
+COLLAB_CORE_ISOLATION_HOST_RS="$REPO_ROOT/crates/collab-core/src/isolation/host.rs"
+COLLAB_CORE_ISOLATION_ALLOC_RS="$REPO_ROOT/crates/collab-core/src/isolation/alloc.rs"
+COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS="$REPO_ROOT/crates/collab-core/src/isolation/child_runtime.rs"
+COLLAB_CORE_ISOLATED_APPLY_WORKER_RS="$REPO_ROOT/crates/collab-core/src/bin/isolated_apply_worker.rs"
 for f in "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_CORE_ERROR_RS" "$REGISTRY_RS" "$SESSION_RS" \
          "$WRITE_RS" "$COMMAND_RS" "$QUERY_RS" "$BOOTSTRAP_RS" "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" \
-         "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS"; do
+         "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" "$COLLAB_CORE_ISOLATION_LIMITS_RS" \
+         "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
+         "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS"; do
   if [[ ! -f "$f" ]]; then
     echo "FAIL: source file not found (nothing to statically verify): $f" >&2
     exit 2
@@ -220,6 +243,8 @@ STATIC_JSON_FILE="$EVIDENCE_ROOT/logs/limits.static.json"
 if ! python3 - "$CONTRACT_PATH" "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_CORE_ERROR_RS" \
       "$REGISTRY_RS" "$SESSION_RS" "$WRITE_RS" "$COMMAND_RS" "$QUERY_RS" "$BOOTSTRAP_RS" \
       "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" \
+      "$COLLAB_CORE_ISOLATION_LIMITS_RS" "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
+      "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS" \
       > "$STATIC_JSON_FILE" 2>"$EVIDENCE_ROOT/logs/limits.static.err.log" <<'PY'
 import json
 import re
@@ -227,7 +252,9 @@ import sys
 
 (contract_path, limits_rs, collab_core_limits_rs, collab_core_error_rs, registry_rs, session_rs,
  write_rs, command_rs, query_rs, bootstrap_rs, error_rs, response_rs, dispatcher_rs, migration_sql,
- frontend_types_ts, frontend_limits_ts) = sys.argv[1:17]
+ frontend_types_ts, frontend_limits_ts, collab_core_isolation_limits_rs, collab_core_isolation_host_rs,
+ collab_core_isolation_alloc_rs, collab_core_isolation_child_runtime_rs,
+ collab_core_isolated_apply_worker_rs) = sys.argv[1:22]
 
 
 def read(p):
@@ -269,8 +296,54 @@ if wire_m:
             wire_fields[name] = val if name == "version" else int(val)
 
 limits_rs_text = read(limits_rs)
+collab_core_limits_text = read(collab_core_limits_rs)
+registry_text = read(registry_rs)
+session_text = read(session_rs)
+write_text = read(write_rs)
+command_text = read(command_rs)
+query_text = read(query_rs)
+bootstrap_text = read(bootstrap_rs)
+error_rs_text = read(error_rs)
+response_rs_text = read(response_rs)
+dispatcher_text = read(dispatcher_rs)
+migration_text = read(migration_sql)
+frontend_types_text = read(frontend_types_ts)
+frontend_limits_text = read(frontend_limits_ts)
+collab_core_isolation_limits_text = read(collab_core_isolation_limits_rs)
+collab_core_isolation_host_text = read(collab_core_isolation_host_rs)
+collab_core_isolation_alloc_text = read(collab_core_isolation_alloc_rs)
+collab_core_isolation_child_runtime_text = read(collab_core_isolation_child_runtime_rs)
+collab_core_isolated_apply_worker_text = read(collab_core_isolated_apply_worker_rs)
+
 const_re = re.compile(r"pub const (\w+):\s*[\w<>&']+\s*=\s*([\d_]+)\s*;")
 rust_consts = {m.group(1): int(m.group(2).replace("_", "")) for m in const_re.finditer(limits_rs_text)}
+
+# `apps/api/src/flow/collab/limits.rs`'s own `pub const NAME = <literal>;` scan above is the
+# primary source for the row/wire cross-check below, but since the isolation-limits and
+# DocumentLimits-default single-source-of-truth fix, several of that file's constants are no
+# longer bare literals -- they `pub use collab_core::isolation::{...}` or derive from
+# `collab_core::DocumentLimits::DEFAULT`/`collab_core::limits::UPDATE_BYTES_MAX` instead (see that
+# file's own comments). `rust_consts` alone would report `source_value=None` for every one of
+# those and wrongly flag them as cross-check violations. Resolve those specific names against
+# collab-core's own literal `pub const` declarations instead (crates/collab-core/src/limits.rs and
+# crates/collab-core/src/isolation/limits.rs -- the two canonical single-source files), but only
+# when apps/api's own file actually references that name somewhere (a `pub use` or a `= ...NAME`
+# derivation) -- so a name apps/api's file never mentions at all still reports `source_value=None`
+# rather than silently trusting collab-core's copy for something apps/api never wired up.
+collab_core_const_re = re.compile(r"pub const (\w+):\s*[\w<>&']+\s*=\s*([\d_]+)\s*;")
+collab_core_literal_consts = {
+    m.group(1): int(m.group(2).replace("_", ""))
+    for text in (collab_core_limits_text, collab_core_isolation_limits_text)
+    for m in collab_core_const_re.finditer(text)
+}
+
+
+def resolve_const(const_name: str):
+    if const_name in rust_consts:
+        return rust_consts[const_name]
+    if const_name in collab_core_literal_consts and re.search(rf"\b{re.escape(const_name)}\b", limits_rs_text):
+        return collab_core_literal_consts[const_name]
+    return None
 
 
 def const_name_for_key(key: str) -> str:
@@ -281,7 +354,7 @@ row_violations = []
 row_cross_check = []
 for r in v0_4_rows:
     const_name = const_name_for_key(r["key"])
-    source_value = rust_consts.get(const_name)
+    source_value = resolve_const(const_name)
     ok = source_value is not None and source_value == r["value"]
     row_cross_check.append({"key": r["key"], "limit_kind": r["limit_kind"], "contract_value": r["value"],
                              "source_const": const_name, "source_value": source_value, "matches": ok})
@@ -296,25 +369,11 @@ for name, expected in wire_fields.items():
         wire_cross_check.append({"field": name, "contract_value": expected, "source_value": cn, "matches": expected == cn})
         continue
     const_name = const_name_for_key(name)
-    source_value = rust_consts.get(const_name)
+    source_value = resolve_const(const_name)
     ok = source_value == expected
     wire_cross_check.append({"field": name, "contract_value": expected, "source_const": const_name, "source_value": source_value, "matches": ok})
     if not ok:
         wire_violations.append(f"{name}: contract={expected} source {const_name}={source_value}")
-
-collab_core_limits_text = read(collab_core_limits_rs)
-registry_text = read(registry_rs)
-session_text = read(session_rs)
-write_text = read(write_rs)
-command_text = read(command_rs)
-query_text = read(query_rs)
-bootstrap_text = read(bootstrap_rs)
-error_rs_text = read(error_rs)
-response_rs_text = read(response_rs)
-dispatcher_text = read(dispatcher_rs)
-migration_text = read(migration_sql)
-frontend_types_text = read(frontend_types_ts)
-frontend_limits_text = read(frontend_limits_ts)
 
 
 def count(pattern, text):
@@ -420,6 +479,14 @@ TEST_SOURCE_TEXT_PARTS = (
     ("response.rs", response_rs_text),
     ("error.rs", error_rs_text),
     ("events/dispatcher.rs", dispatcher_text),
+    # The isolation boundary's own enforcement/test sites -- included so a real exact/+1 boundary
+    # test for decode_apply_cpu_ms_max/decode_apply_wall_ms_max/isolated_apply_memory_bytes_max
+    # would actually be found here if one existed, rather than this scan only ever looking at
+    # apps/api/src (where that test could not live, since the enforcement itself is in this crate).
+    ("collab-core/isolation/host.rs", collab_core_isolation_host_text),
+    ("collab-core/isolation/alloc.rs", collab_core_isolation_alloc_text),
+    ("collab-core/isolation/child_runtime.rs", collab_core_isolation_child_runtime_text),
+    ("collab-core/bin/isolated_apply_worker.rs", collab_core_isolated_apply_worker_text),
 )
 ALL_TEST_FN_NAMES = [
     (src_label, name) for src_label, text in TEST_SOURCE_TEXT_PARTS for name in test_fn_names(text)
@@ -497,14 +564,34 @@ findings["bootstrap_rs_mentions_bootstrap_response_bytes"] = "bootstrap_response
 for const in (
     "OPEN_DOCUMENTS_PER_CONNECTION_MAX", "CONNECTIONS_PER_USER_MAX", "CONNECTIONS_PER_DOCUMENT_MAX",
     "CONNECTIONS_PER_WORKSPACE_MAX", "FRAMES_PER_CONNECTION_PER_SECOND", "UPDATES_PER_CONNECTION_PER_SECOND",
-    "SLOW_CONSUMER_QUEUE_FRAMES_MAX", "SLOW_CONSUMER_QUEUE_BYTES_MAX", "DECODE_APPLY_CPU_MS_MAX",
-    "DECODE_APPLY_WALL_MS_MAX", "ISOLATED_APPLY_MEMORY_BYTES_MAX", "AUTHORIZED_SCAN_ROWS_MAX",
+    "SLOW_CONSUMER_QUEUE_FRAMES_MAX", "SLOW_CONSUMER_QUEUE_BYTES_MAX", "AUTHORIZED_SCAN_ROWS_MAX",
     "IMPORT_ARCHIVE_BYTES_MAX", "IMPORT_EXPANDED_BYTES_MAX", "IMPORT_ENTRY_COUNT_MAX", "IMPORT_COMPRESSION_RATIO_MAX",
 ):
     findings[f"{const.lower()}_referenced_outside_limits_rs"] = (
         count(re.escape(const), session_text) + count(re.escape(const), registry_text)
         + count(re.escape(const), command_text) + count(re.escape(const), bootstrap_text)
         + count(re.escape(const), query_text)
+    )
+
+# `decode_apply_cpu_ms_max`/`decode_apply_wall_ms_max`/`isolated_apply_memory_bytes_max`: the real
+# enforcement path is apps/api/src/flow/collab/write.rs's `collab_core::isolation::isolated_apply(...)`
+# call, which runs inside crates/collab-core/src/isolation/{host,alloc,child_runtime}.rs -- not
+# anywhere apps/api/src's own session/registry/command/bootstrap/query modules would ever mention
+# it. An apps/api/src-only scan (the loop above) always finds zero references for these three and
+# concludes "does not exist", which is wrong: it never looked at the crate that actually enforces
+# them. Count references in write.rs (the call site) plus the isolation module's own enforcement
+# files (host.rs's wall watchdog, alloc.rs's counting-allocator threshold, child_runtime.rs's
+# SIGPROF timer arm, and the worker binary that runs them) -- excluding
+# crates/collab-core/src/isolation/limits.rs itself, the single-source declaration, so this stays
+# "referenced outside its own declaration" the same way the loop above excludes apps/api's
+# limits.rs.
+for const in ("DECODE_APPLY_CPU_MS_MAX", "DECODE_APPLY_WALL_MS_MAX", "ISOLATED_APPLY_MEMORY_BYTES_MAX"):
+    findings[f"{const.lower()}_referenced_outside_limits_rs"] = (
+        count(re.escape(const), write_text)
+        + count(re.escape(const), collab_core_isolation_host_text)
+        + count(re.escape(const), collab_core_isolation_alloc_text)
+        + count(re.escape(const), collab_core_isolation_child_runtime_text)
+        + count(re.escape(const), collab_core_isolated_apply_worker_text)
     )
 
 delivery_const_re = re.compile(r"const (\w+):\s*i64\s*=\s*([\d_]+);")
@@ -1075,20 +1162,42 @@ for key, limit_kind, const in (
     ref_count = f.get(f"{const.lower()}_referenced_outside_limits_rs", 0)
     iso_test = f["boundary_test_covering"].get(limit_kind)
     iso_passed = ref_count > 0 and iso_test is not None and dtest(iso_test.rsplit("::", 1)[-1]) == "ok"
+    if ref_count > 0 and iso_test is not None:
+        iso_reason = (
+            f"{const} has {ref_count} enforcement call site(s) outside its own single-source "
+            "declaration (crates/collab-core/src/isolation/limits.rs), and a boundary test was "
+            f"found: {iso_test}"
+        )
+    elif ref_count > 0:
+        # Wired, but not verified at the numeric boundary: apps/api/src/flow/collab/write.rs calls
+        # collab_core::isolation::isolated_apply(...), whose real enforcement is
+        # crates/collab-core/src/isolation/host.rs's independent wall-clock watchdog, alloc.rs's
+        # counting-allocator threshold, and child_runtime.rs's SIGPROF CPU timer -- all real,
+        # reachable code, not "does not exist". What is still missing is a #[test]/#[tokio::test]
+        # whose name proves the exact/+1 boundary for this specific ceiling; the isolation module's
+        # own end-to-end tests (isolation::host::tests::isolated_apply_end_to_end_*) exercise
+        # qualitative kills (a pathologically deep chain, an oversized text block via
+        # check_snapshot) rather than a numeric CPU-ms/wall-ms/byte boundary, so none of their names
+        # match this limit_kind's or this constant's tokens.
+        iso_reason = (
+            f"wired but untested at the boundary: {const} has {ref_count} enforcement call site(s) "
+            "outside its own single-source declaration (crates/collab-core/src/isolation/limits.rs) "
+            "-- apps/api/src/flow/collab/write.rs's hydrate_and_apply calls "
+            "collab_core::isolation::isolated_apply(...), whose real enforcement lives in "
+            "crates/collab-core/src/isolation/{host,alloc,child_runtime}.rs -- but no "
+            "#[test]/#[tokio::test] function name found (scanned apps/api's caller-facing modules "
+            "plus crates/collab-core/src/isolation/ and its worker binary) proves the exact/+1 "
+            f"boundary for {limit_kind}"
+        )
+    else:
+        iso_reason = (
+            f"verified absent: {const} has {ref_count} enforcement call sites in "
+            "apps/api/src/flow/collab/write.rs or crates/collab-core/src/isolation outside its own "
+            "single-source declaration -- the isolated-apply call path itself is missing, not just "
+            "untested"
+        )
     boundary_cases.append(case(
-        key, limit_kind, r["value"], "passed" if iso_passed else "failed",
-        (
-            f"{const} has {ref_count} enforcement call site(s) outside its own wire-report "
-            f"declaration, and a boundary test was found: {iso_test}"
-            if ref_count > 0
-            else f"verified absent: no isolated/sandboxed apply execution path exists anywhere in "
-            "apps/api/src (no terminable engine instance, no CPU/allocation meter, no worker sandbox) "
-            f"or frontend/src (no Worker.terminate() usage found) -- {const} has {ref_count} "
-            "enforcement call sites outside its own wire-report declaration. Per ADR-0014, "
-            "decode_apply_cpu_ms and isolated_apply_memory_bytes are legitimately not_applicable_web/"
-            "diagnostic_only on the browser platform, but the native server-side path (apps/api) is "
-            "where they are required, and it has no such mechanism at all."
-        ),
+        key, limit_kind, r["value"], "passed" if iso_passed else "failed", iso_reason,
         evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count, "boundary_test_covering": iso_test},
     ))
 
