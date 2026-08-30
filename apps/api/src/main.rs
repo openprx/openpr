@@ -2016,6 +2016,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0054_flow_data_layer.sql",
         include_str!("../../../migrations/0054_flow_data_layer.sql"),
     ),
+    (
+        "0055_flow_import_jobs.sql",
+        include_str!("../../../migrations/0055_flow_import_jobs.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2290,6 +2294,7 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         SchemaProbe::RelationAbsent("event_outbox"),
     ),
     ("0054_flow_data_layer.sql", SchemaProbe::Relation("flow_objects")),
+    ("0055_flow_import_jobs.sql", SchemaProbe::Relation("flow_import_jobs")),
 ];
 
 /// One recorded migration outcome.
@@ -2797,7 +2802,8 @@ mod tests {
                 "0051_bot_operation_logs.sql",
                 "0052_drop_connectors_and_agent_invocations.sql",
                 "0053_drop_event_outbox.sql",
-                "0054_flow_data_layer.sql"
+                "0054_flow_data_layer.sql",
+                "0055_flow_import_jobs.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
