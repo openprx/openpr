@@ -1558,6 +1558,162 @@ mod flow_database_tests {
         .n
     }
 
+    async fn count_workspace_business_events(state: &AppState, workspace_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM business_events WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("count query runs")
+        .expect("count query returns a row")
+        .n
+    }
+
+    fn semantic_patch_payload_with_serialized_bytes(target: u64) -> Value {
+        let base = json!({
+            "operations": [{"op": "set_property", "id": "semantic-block", "key": "fixture", "value": "ok"}],
+            "padding": ""
+        });
+        let base_len = u64::try_from(serde_json::to_vec(&base).expect("serializes").len()).expect("fits");
+        let padding = usize::try_from(target - base_len).expect("target fits usize");
+        json!({
+            "operations": [{"op": "set_property", "id": "semantic-block", "key": "fixture", "value": "ok"}],
+            "padding": "x".repeat(padding)
+        })
+    }
+
+    /// The real REST semantic-patch producer enforces compact JSON bytes before any canonical or
+    /// audit write: exact 1 MiB is accepted through the shared CRDT write path, while 1 MiB + 1
+    /// returns typed `limit_exceeded(semantic_patch_bytes)` and leaves head/event/dispatch counts
+    /// exactly at the accepted boundary.
+    #[tokio::test]
+    async fn commands_endpoint_semantic_patch_bytes_exact_boundary_accepted_plus_one_rejected_zero_writes() {
+        let scratch = scratch_or_skip!("limit-rest-semantic-patch-bytes");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let limit = crate::flow::collab::limits::SEMANTIC_PATCH_JSON_BYTES_MAX;
+
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Semantic Patch Bytes Test".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let object_id =
+            Uuid::parse_str(create_body["data"]["object"]["id"].as_str().expect("object id")).expect("object UUID");
+        let document_id = document_id_for(&state, object_id).await;
+        let insert = run_command(
+            &state,
+            &claims,
+            object_id,
+            "insert_block",
+            json!({"block_id": "semantic-block"}),
+        )
+        .await;
+        assert_eq!(insert["code"], 0, "{insert}");
+
+        let exact_payload = semantic_patch_payload_with_serialized_bytes(limit);
+        assert_eq!(
+            u64::try_from(serde_json::to_vec(&exact_payload).expect("serializes").len()).expect("fits"),
+            limit
+        );
+        let exact = run_command(&state, &claims, object_id, "semantic_patch", exact_payload).await;
+        assert_eq!(exact["code"], 0, "{exact}");
+        let head_after_exact = document_head_seq(&state, document_id).await;
+        let events_after_exact = count_workspace_business_events(&state, workspace_id).await;
+        let dispatch_after_exact = count_event_dispatch(&state, document_id).await;
+
+        let plus_one_payload = semantic_patch_payload_with_serialized_bytes(limit + 1);
+        let plus_one = run_command(&state, &claims, object_id, "semantic_patch", plus_one_payload).await;
+        assert_eq!(plus_one["code"], 400, "{plus_one}");
+        assert_eq!(plus_one["error_code"], "limit_exceeded");
+        assert_eq!(plus_one["details"]["limit_kind"], "semantic_patch_bytes");
+        assert_eq!(plus_one["details"]["limit"], limit);
+        assert_eq!(plus_one["details"]["observed"], limit + 1);
+        assert_eq!(document_head_seq(&state, document_id).await, head_after_exact);
+        assert_eq!(
+            count_workspace_business_events(&state, workspace_id).await,
+            events_after_exact,
+            "pre-read semantic byte rejection must not even write an audit-only event"
+        );
+        assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_after_exact);
+
+        scratch.drop_self().await;
+    }
+
+    /// The shared workspace-drain producer reaches the real REST handler as HTTP 200 plus the
+    /// structured business envelope consumed unchanged by MCP/CLI and mirrored on WS/UI.
+    #[tokio::test]
+    async fn object_get_surfaces_shared_server_draining_drain_fixture_as_http_200_business_error() {
+        let scratch = scratch_or_skip!("rest-server-draining");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Drain Surface Test".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let object_id =
+            Uuid::parse_str(create_body["data"]["object"]["id"].as_str().expect("object id")).expect("object UUID");
+
+        let guard = crate::flow::collab::runtime::runtime().begin_workspace_drain(workspace_id, 2_000);
+        let response = to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims,
+                None,
+                Path(object_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 409, "{body}");
+        assert_eq!(body["error_code"], "server_draining");
+        assert_eq!(body["details"]["reason"], "drain");
+        assert_eq!(body["details"]["retry_after_ms"], 2_000);
+        drop(guard);
+
+        scratch.drop_self().await;
+    }
+
     /// Call-direction proof for `check_operation`'s `tree_depth` branch: a chain of `insert_block`
     /// commands reaching exactly `tree_depth_max` is accepted one command at a time; the next one
     /// is rejected via body code 400 naming `tree_depth`, and the rejection advances neither the

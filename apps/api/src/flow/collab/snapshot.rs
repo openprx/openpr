@@ -455,6 +455,7 @@ pub fn spawn_background(advancer: &SnapshotAdvancer, db: DatabaseConnection, doc
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    use super::super::egress::{EgressSequencer, SeqDecision};
     use super::super::limits::{
         BOOTSTRAP_DECODED_BYTES_MAX, SNAPSHOT_TAIL_BYTES_HARD_MAX, SNAPSHOT_TAIL_BYTES_SOFT_MAX,
         SNAPSHOT_TAIL_UPDATES_HARD_MAX, SNAPSHOT_TAIL_UPDATES_SOFT_MAX,
@@ -594,6 +595,46 @@ mod tests {
         assert_eq!(advancer.last_rebuild_wall_ms(id), None);
         advancer.record_rebuild_wall_ms(id, 42);
         assert_eq!(advancer.last_rebuild_wall_ms(id), Some(42));
+    }
+
+    /// Gate 10 `accepted_egress_seq_monotonic_and_gap_resync`: duplicate and out-of-order
+    /// accepted notices are filtered at the per-subscription sequencer. A complete persisted
+    /// backfill advances through the revealing notice only after the missing range is supplied.
+    #[test]
+    fn accepted_egress_is_strictly_monotonic_across_duplicates_and_reordering() {
+        let mut sequencer = EgressSequencer::after_snapshot(40);
+        assert_eq!(sequencer.evaluate(41), SeqDecision::InOrder);
+        assert_eq!(sequencer.evaluate(41), SeqDecision::Duplicate);
+        assert_eq!(
+            sequencer.evaluate(44),
+            SeqDecision::Gap {
+                missing_from: 42,
+                missing_to: 43,
+            }
+        );
+        assert_eq!(sequencer.next_expected_seq(), 42);
+        sequencer.resolve_gap(44);
+        assert_eq!(sequencer.evaluate(45), SeqDecision::InOrder);
+    }
+
+    /// Gate 10 `accepted_egress_seq_monotonic_and_gap_resync`: when persisted receipt backfill
+    /// cannot close a gap, resync freezes this subscription. No revealing or later accepted can
+    /// cross the gap and become a save acknowledgement before a new snapshot creates a fresh
+    /// sequencer.
+    #[test]
+    fn accepted_egress_gap_resync_never_advances_saved_state_across_the_gap() {
+        let mut sequencer = EgressSequencer::after_snapshot(7);
+        assert_eq!(
+            sequencer.evaluate(10),
+            SeqDecision::Gap {
+                missing_from: 8,
+                missing_to: 9,
+            }
+        );
+        sequencer.give_up_and_resync();
+        assert_eq!(sequencer.next_expected_seq(), 8);
+        assert_eq!(sequencer.evaluate(10), SeqDecision::ResyncPending);
+        assert_eq!(sequencer.evaluate(11), SeqDecision::ResyncPending);
     }
 }
 

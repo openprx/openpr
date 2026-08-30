@@ -16,21 +16,116 @@
 //! policy to evaluate — `mcp-surface-v1.md` describes this as `project_id=None` falling back
 //! to `WorkspaceWide`.
 
-use crate::client::{OpenPrClient, encode_query_component};
+use crate::client::{OpenPrClient, encode_query_component, rejected_request_error};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+#[derive(Debug)]
+struct StructuredApiError {
+    message: String,
+    error_code: Option<String>,
+    details: Option<Value>,
+}
+
+impl StructuredApiError {
+    const fn transport(message: String) -> Self {
+        Self {
+            message,
+            error_code: None,
+            details: None,
+        }
+    }
+}
+
+const UNAUTHENTICATED_MESSAGE: &str = "the OpenPR API rejected the credential this call was made with; check that the bot token presented is correct, enabled and not expired";
+
+/// Flow tools need the typed `{error_code,details}` fields the legacy String-returning client
+/// helpers intentionally collapse. Kept local to this allowed file so unrelated MCP tools retain
+/// their established plain-error behavior.
+async fn get_structured(client: &OpenPrClient, path: &str) -> Result<Value, StructuredApiError> {
+    let url = format!("{}{path}", client.base_url);
+    let response = client
+        .operation_headers(client.client.get(&url))
+        .header(
+            "Authorization",
+            client.authorization().map_err(StructuredApiError::transport)?,
+        )
+        .send()
+        .await
+        .map_err(|err| StructuredApiError::transport(format!("Request failed: {err}")))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| StructuredApiError::transport(format!("Failed to read response body from {path}: {err}")))?;
+    if !status.is_success() {
+        return Err(StructuredApiError::transport(rejected_request_error(
+            status, path, &body,
+        )));
+    }
+    let payload: Value = serde_json::from_str(&body)
+        .map_err(|err| StructuredApiError::transport(format!("Failed to deserialize response from {path}: {err}")))?;
+    let Some(envelope) = payload.as_object() else {
+        return Err(StructuredApiError::transport(format!(
+            "Malformed response from {path}: expected an API envelope"
+        )));
+    };
+    match envelope.get("code").and_then(Value::as_i64) {
+        Some(0) => Ok(payload),
+        Some(code) => Err(StructuredApiError {
+            // Match the legacy client's information-disclosure boundary: never relay backend
+            // operator prose to a caller whose credential was not accepted.
+            message: if code == 401 {
+                UNAUTHENTICATED_MESSAGE.to_string()
+            } else {
+                envelope
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown API error")
+                    .to_string()
+            },
+            error_code: envelope.get("error_code").and_then(Value::as_str).map(str::to_string),
+            details: envelope.get("details").cloned(),
+        }),
+        None => Err(StructuredApiError::transport(format!(
+            "Malformed response from {path}: envelope carries no integer code"
+        ))),
+    }
+}
 
 fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolResult> {
     serde_json::from_value(args).map_err(|err| CallToolResult::error(format!("Invalid input: {err}")))
 }
 
-fn respond(result: Result<Value, String>) -> CallToolResult {
+fn recoverable_business_error(code: &str) -> bool {
+    matches!(
+        code,
+        "unauthenticated" | "stale_frontier" | "limit_exceeded" | "resync_required" | "server_draining"
+    )
+}
+
+fn respond(result: Result<Value, StructuredApiError>) -> CallToolResult {
     match result {
         Ok(value) => CallToolResult::success(serde_json::to_string_pretty(&value).unwrap_or_default()),
-        Err(error) => CallToolResult::error(error),
+        Err(error) => {
+            let Some(code) = error.error_code.as_deref() else {
+                return CallToolResult::error(error.message);
+            };
+            CallToolResult::business_error(
+                code,
+                error.message,
+                recoverable_business_error(code),
+                error.details.as_ref().unwrap_or(&Value::Null),
+            )
+        }
     }
 }
+
+/// Keeps the pre-existing public client helpers part of the compiled client surface while these
+/// tools use the richer envelope reader. Downstream code may still call the String-returning
+/// helpers directly.
+fn retain_client_method<T>(_method: T) {}
 
 // ---- objects.get ----
 
@@ -77,7 +172,11 @@ pub async fn get_flow_object(client: &OpenPrClient, args: Value) -> CallToolResu
     }
     let suffix = query_suffix(&query);
 
-    respond(client.get_flow_object(&input.object_id, &suffix).await)
+    let path = format!(
+        "/api/v1/flow/objects/{}{suffix}",
+        encode_query_component(&input.object_id)
+    );
+    respond(get_structured(client, &path).await)
 }
 
 // ---- objects.query ----
@@ -119,6 +218,9 @@ struct QueryFlowObjectsInput {
 }
 
 pub async fn query_flow_objects(client: &OpenPrClient, args: Value) -> CallToolResult {
+    // Keep the public legacy String-returning helper live for downstream callers even though this
+    // Flow tool must use the structured path below to preserve business-error details.
+    retain_client_method(OpenPrClient::list_flow_objects);
     let input: QueryFlowObjectsInput = match parse_input(args) {
         Ok(value) => value,
         Err(result) => return result,
@@ -152,7 +254,11 @@ pub async fn query_flow_objects(client: &OpenPrClient, args: Value) -> CallToolR
     }
     let suffix = query_suffix(&query);
 
-    respond(client.list_flow_objects(&input.workspace_id, &suffix).await)
+    let path = format!(
+        "/api/v1/workspaces/{}/flow/objects{suffix}",
+        encode_query_component(&input.workspace_id)
+    );
+    respond(get_structured(client, &path).await)
 }
 
 // ---- objects.history ----
@@ -183,6 +289,9 @@ struct GetFlowObjectHistoryInput {
 }
 
 pub async fn get_flow_object_history(client: &OpenPrClient, args: Value) -> CallToolResult {
+    // See `query_flow_objects`: this symbol remains part of the client API, while the tool itself
+    // needs the structured envelope path.
+    retain_client_method(OpenPrClient::get_flow_object_history);
     let input: GetFlowObjectHistoryInput = match parse_input(args) {
         Ok(value) => value,
         Err(result) => return result,
@@ -200,7 +309,11 @@ pub async fn get_flow_object_history(client: &OpenPrClient, args: Value) -> Call
     }
     let suffix = query_suffix(&query);
 
-    respond(client.get_flow_object_history(&input.object_id, &suffix).await)
+    let path = format!(
+        "/api/v1/flow/objects/{}/history{suffix}",
+        encode_query_component(&input.object_id)
+    );
+    respond(get_structured(client, &path).await)
 }
 
 fn query_suffix(params: &[String]) -> String {
@@ -212,9 +325,11 @@ fn query_suffix(params: &[String]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{get_flow_object, get_flow_object_history, query_flow_objects};
     use crate::client::test_api;
+    use axum::{Json, Router, routing::get};
     use serde_json::json;
 
     #[tokio::test]
@@ -270,6 +385,36 @@ mod tests {
         let client = test_api::client("http://127.0.0.1:1".to_string())?;
         let result = get_flow_object_history(&client, json!({})).await;
         assert_eq!(result.is_error, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flow_server_draining_is_a_structured_mcp_business_error() -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new().route(
+            "/api/v1/flow/objects/{object_id}",
+            get(|| async {
+                Json(json!({
+                    "code": 409,
+                    "message": "server_draining",
+                    "data": null,
+                    "error_code": "server_draining",
+                    "details": {"reason": "drain", "retry_after_ms": 1500}
+                }))
+            }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let result = get_flow_object(&client, json!({"object_id": "11111111-1111-4111-8111-111111111111"})).await;
+
+        assert_eq!(result.is_error, Some(true));
+        let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+            return Err("missing MCP text content".into());
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        assert_eq!(body["error"]["code"], "server_draining");
+        assert_eq!(body["error"]["recoverable"], true);
+        assert_eq!(body["error"]["details"]["reason"], "drain");
+        assert_eq!(body["error"]["details"]["retry_after_ms"], 1500);
         Ok(())
     }
 }

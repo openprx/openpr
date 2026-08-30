@@ -16,7 +16,7 @@ use crate::error::ApiError;
 
 use super::collab::bootstrap;
 use super::collab::frame::TailUpdate;
-use super::collab::limits;
+use super::collab::{limits, runtime};
 use super::model::{Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
 use super::projection;
 use super::repository::{self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow};
@@ -208,6 +208,7 @@ pub async fn get_object(
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    runtime::runtime().ensure_workspace_accepting(row.workspace_id)?;
 
     // This package ships no content commands, so `document_seq` never advances past 0 for any
     // object it creates; `at_seq` can only ever be satisfied at the current head. A mismatch is
@@ -261,6 +262,7 @@ pub async fn get_bootstrap(
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    runtime::runtime().ensure_workspace_accepting(row.workspace_id)?;
     let document_id = row.document_id;
 
     // The exact loader the WebSocket `snapshot` frame uses (`flow::collab::session::run`) —
@@ -323,6 +325,7 @@ pub struct ListObjectsParams {
 }
 
 pub async fn list_objects(state: &AppState, params: ListObjectsParams) -> Result<FlowObjectListResponse, ApiError> {
+    runtime::runtime().ensure_workspace_accepting(params.workspace_id)?;
     if params.project_id.is_some() && params.unprojected {
         return Err(ApiError::BadRequest(
             "project_id and unprojected=true are mutually exclusive".to_string(),
@@ -370,6 +373,7 @@ pub async fn get_history(
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    runtime::runtime().ensure_workspace_accepting(row.workspace_id)?;
     let limit = validate_limit(limit)?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     // Fetch one extra row to know whether a further page exists without a second query.

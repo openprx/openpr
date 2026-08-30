@@ -21,13 +21,15 @@
 //! mechanism's single-instance slice, not the correctness guarantee.
 //!
 //! [`SessionRegistry::drain_all`]/[`SessionRegistry::drain_workspace`] carry the same
-//! documented-gap shape: they are the tested, callable `server_draining{reason:"drain"}` primitive
-//! (`collab-protocol-v1.md` "服务端主动排空"), but v0.4 has no instance-shutdown hook or
-//! workspace-admin drain endpoint anywhere in this codebase to call them from yet.
+//! documented drain shape: they are the tested, callable `server_draining{reason:"drain"}`
+//! primitive (`collab-protocol-v1.md` "服务端主动排空").
+//! [`super::runtime::CollabRuntime::begin_workspace_drain`] is the shared controlled producer used
+//! by REST admission, MCP/CLI (through REST), and WebSocket sessions. An instance-shutdown hook is
+//! still outside this v0.4 surface.
 
 #![allow(clippy::too_long_first_doc_paragraph, clippy::struct_field_names)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -37,7 +39,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::frame::Frame;
+use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
 use super::limits::{
     CONNECTIONS_PER_DOCUMENT_MAX, CONNECTIONS_PER_USER_MAX, CONNECTIONS_PER_WORKSPACE_MAX,
     PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, SLOW_CONSUMER_QUEUE_BYTES_MAX,
@@ -75,13 +77,33 @@ fn drain_close_reason(retry_after_ms: u64) -> String {
     format!(r#"{{"reason":"drain","retry_after_ms":{retry_after_ms}}}"#)
 }
 
+fn drain_rejected_frame(document_id: Uuid, retry_after_ms: u64) -> Frame {
+    Frame::Rejected {
+        protocol_version: PROTOCOL_VERSION,
+        document_id,
+        update_id: None,
+        code: RejectedCode::ServerDraining,
+        recoverable: true,
+        details: Some(serde_json::json!({"reason": "drain", "retry_after_ms": retry_after_ms})),
+        current_seq: None,
+        current_frontier: None,
+        audit_event_id: None,
+    }
+}
+
 /// What a session's outbound writer task actually receives; the writer decides how to encode each
 /// variant onto the socket. `Frame`'s `usize` is that frame's encoded byte length at send time —
 /// charged against [`QueueState`] by [`SessionHandle::deliver`] and released by the session loop's
 /// own [`RegisteredSession::record_dequeued`] once it has been taken off this channel.
 pub enum OutboundEvent {
     Frame(Box<Frame>, usize),
-    Close { code: u16, reason: String },
+    /// An unmetered server control frame that must get through even when the data queue is full
+    /// (currently the structured `server_draining{drain}` notice immediately before close).
+    ControlFrame(Box<Frame>),
+    Close {
+        code: u16,
+        reason: String,
+    },
 }
 
 /// The slow-consumer queue accounting for one session's outbound channel (`limits-v1.md`'s
@@ -127,16 +149,23 @@ impl SessionHandle {
         }
         let frames = self.queue.frames.fetch_add(1, Ordering::AcqRel) + 1;
         let bytes = self.queue.bytes.fetch_add(encoded_len, Ordering::AcqRel) + encoded_len;
-        if u64::try_from(frames).unwrap_or(u64::MAX) > SLOW_CONSUMER_QUEUE_FRAMES_MAX
-            || u64::try_from(bytes).unwrap_or(u64::MAX) > SLOW_CONSUMER_QUEUE_BYTES_MAX
-        {
+        let observed_frames = u64::try_from(frames).unwrap_or(u64::MAX);
+        let observed_bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let exceeded = if observed_frames > SLOW_CONSUMER_QUEUE_FRAMES_MAX {
+            Some(("slow_consumer_queue_frames", SLOW_CONSUMER_QUEUE_FRAMES_MAX))
+        } else if observed_bytes > SLOW_CONSUMER_QUEUE_BYTES_MAX {
+            Some(("slow_consumer_queue_bytes", SLOW_CONSUMER_QUEUE_BYTES_MAX))
+        } else {
+            None
+        };
+        if let Some((limit_kind, limit)) = exceeded {
             // Roll back this frame's own contribution — it is never actually sent — then close.
             self.queue.frames.fetch_sub(1, Ordering::AcqRel);
             self.queue.bytes.fetch_sub(encoded_len, Ordering::AcqRel);
             if !self.queue.close_sent.swap(true, Ordering::AcqRel) {
                 self.send(OutboundEvent::Close {
                     code: SLOW_CONSUMER_CLOSE_CODE,
-                    reason: "slow consumer: outbound queue limit exceeded".to_string(),
+                    reason: format!(r#"{{"code":"limit_exceeded","limit_kind":"{limit_kind}","limit":{limit}}}"#),
                 });
             }
             return;
@@ -357,8 +386,10 @@ impl SessionRegistry {
         let reason = drain_close_reason(retry_after_ms);
         let sessions = self.sessions.lock();
         let mut closed = 0usize;
-        for by_session in sessions.values() {
+        for (document_id, by_session) in sessions.iter() {
             for handle in by_session.values() {
+                let frame = drain_rejected_frame(*document_id, retry_after_ms);
+                handle.send(OutboundEvent::ControlFrame(Box::new(frame)));
                 handle.send(OutboundEvent::Close {
                     code: DRAIN_CLOSE_CODE,
                     reason: reason.clone(),
@@ -371,14 +402,14 @@ impl SessionRegistry {
     }
 
     /// The workspace-scoped half of [`Self::drain_all`] (`collab-protocol-v1.md`: "实例/workspace
-    /// 显式排空") — same no-production-caller status; see this module's own doc comment.
+    /// 显式排空"), called by [`super::runtime::CollabRuntime::begin_workspace_drain`].
     pub fn drain_workspace(&self, workspace_id: Uuid, retry_after_ms: u64) -> usize {
-        let member_sessions: HashSet<Uuid> = self
+        let member_sessions: HashMap<Uuid, Uuid> = self
             .connections
             .lock()
             .iter()
             .filter(|(_, meta)| meta.workspace_id == workspace_id)
-            .map(|(session_id, _)| *session_id)
+            .map(|(session_id, meta)| (*session_id, meta.document_id))
             .collect();
         if member_sessions.is_empty() {
             return 0;
@@ -388,7 +419,9 @@ impl SessionRegistry {
         let mut closed = 0usize;
         for by_session in sessions.values() {
             for (session_id, handle) in by_session {
-                if member_sessions.contains(session_id) {
+                if let Some(document_id) = member_sessions.get(session_id) {
+                    let frame = drain_rejected_frame(*document_id, retry_after_ms);
+                    handle.send(OutboundEvent::ControlFrame(Box::new(frame)));
                     handle.send(OutboundEvent::Close {
                         code: DRAIN_CLOSE_CODE,
                         reason: reason.clone(),
@@ -465,7 +498,7 @@ mod tests {
         OutboundEvent, PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, PresenceLimit,
         SLOW_CONSUMER_QUEUE_BYTES_MAX, SLOW_CONSUMER_QUEUE_FRAMES_MAX, SessionRegistry,
     };
-    use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION};
+    use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
     use serde_json::json;
     use std::time::Duration;
     use uuid::Uuid;
@@ -644,6 +677,7 @@ mod tests {
         while let Ok(event) = registered.receiver.try_recv() {
             match event {
                 OutboundEvent::Frame(..) => frame_count += 1,
+                OutboundEvent::ControlFrame(_) => panic!("unexpected control frame"),
                 OutboundEvent::Close { code, .. } => {
                     saw_close = true;
                     assert_eq!(code, 4408, "slow consumer must close at the frozen limit_exceeded code");
@@ -711,6 +745,7 @@ mod tests {
         while let Ok(event) = registered.receiver.try_recv() {
             match event {
                 OutboundEvent::Frame(..) => frame_count += 1,
+                OutboundEvent::ControlFrame(_) => panic!("unexpected control frame"),
                 OutboundEvent::Close { code, .. } => {
                     saw_close = true;
                     assert_eq!(code, 4408, "slow consumer must close at the frozen limit_exceeded code");
@@ -751,6 +786,18 @@ mod tests {
         assert_eq!(closed, 2);
 
         for receiver in [&mut a.receiver, &mut b.receiver] {
+            let rejected = receiver.try_recv().expect("a rejected control frame is queued");
+            let OutboundEvent::ControlFrame(frame) = rejected else {
+                panic!("expected a rejected frame before close");
+            };
+            let Frame::Rejected { code, details, .. } = *frame else {
+                panic!("expected a Rejected frame");
+            };
+            assert_eq!(code, RejectedCode::ServerDraining);
+            let details = details.expect("drain rejection carries details");
+            assert_eq!(details["reason"], "drain");
+            assert_eq!(details["retry_after_ms"], 1500);
+
             let event = receiver.try_recv().expect("a close event is queued");
             let OutboundEvent::Close { code, reason } = event else {
                 panic!("expected a Close event");
@@ -782,10 +829,14 @@ mod tests {
         let closed = registry.drain_workspace(target_workspace, 500);
         assert_eq!(closed, 1);
 
-        assert!(
-            matches!(target.receiver.try_recv(), Ok(OutboundEvent::Close { code: 4410, .. })),
-            "the target workspace's session must be closed"
-        );
+        assert!(matches!(
+            target.receiver.try_recv(),
+            Ok(OutboundEvent::ControlFrame(..))
+        ));
+        assert!(matches!(
+            target.receiver.try_recv(),
+            Ok(OutboundEvent::Close { code: 4410, .. })
+        ));
         assert!(
             other.receiver.try_recv().is_err(),
             "a different workspace's session must not be touched"

@@ -20,9 +20,9 @@ use super::egress::{EgressSequencer, SeqDecision};
 use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate};
 use super::limits::{
     CONNECTION_LIMIT_RETRY_AFTER_MS, FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND,
-    PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, PRESENCE_PAYLOAD_BYTES_MAX,
-    PRESENCE_TTL_SECONDS_DEFAULT, PRESENCE_TTL_SECONDS_MAX, RATE_LIMIT_RETRY_AFTER_MS, UPDATE_BURST_MAX,
-    UPDATES_PER_CONNECTION_PER_SECOND, WEBSOCKET_FRAME_BYTES_MAX,
+    OPEN_DOCUMENTS_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX,
+    PRESENCE_PAYLOAD_BYTES_MAX, PRESENCE_TTL_SECONDS_DEFAULT, PRESENCE_TTL_SECONDS_MAX, RATE_LIMIT_RETRY_AFTER_MS,
+    UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND, WEBSOCKET_FRAME_BYTES_MAX,
 };
 use super::registry::{OutboundEvent, PresenceLimit};
 use super::runtime;
@@ -489,6 +489,10 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     // between them (`SessionRegistry::broadcast` locks/unlocks per call, not across the pair), so
     // pairing is done by `update_id`, not "the very next frame".
     let mut pending_updates: HashMap<Uuid, Frame> = HashMap::new();
+    // The ticket-bound document is the first attempted open. v0.4 never admits a second document
+    // on this socket, but counting repeated `open` abuse still makes the frozen
+    // `open_documents` limit_kind observable on the ninth attempted subscription.
+    let mut open_attempts = 1u64;
 
     loop {
         tokio::select! {
@@ -502,6 +506,17 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                         // a stale duplicate below -- the ceiling bounds channel backlog, not any
                         // further in-process buffering.
                         registered.record_dequeued(encoded_len);
+                        handle_outbound_frame(
+                            &state.db,
+                            document_id,
+                            &mut socket,
+                            &mut sequencer,
+                            &mut pending_updates,
+                            *frame,
+                        )
+                        .await;
+                    }
+                    Some(OutboundEvent::ControlFrame(frame)) => {
                         handle_outbound_frame(
                             &state.db,
                             document_id,
@@ -570,6 +585,9 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             checked_epoch,
                             frame,
                             &mut socket,
+                            &mut sequencer,
+                            &mut pending_updates,
+                            &mut open_attempts,
                         )
                         .await;
                     }
@@ -630,7 +648,7 @@ async fn handle_outbound_frame(
         }
         // Already forwarded (or never will be, past a prior resync) -- drop silently.
         // `collab-protocol-v1.md`: "seq<=last_applied_seq 是幂等重复，忽略".
-        SeqDecision::Duplicate => {}
+        SeqDecision::Duplicate | SeqDecision::ResyncPending => {}
         SeqDecision::Gap {
             missing_from,
             missing_to,
@@ -652,8 +670,8 @@ async fn handle_outbound_frame(
                         send(socket, f).await;
                     }
                 }
-                GapResolution::Resync { frame, advance_to } => {
-                    sequencer.give_up_and_resync(advance_to);
+                GapResolution::Resync { frame } => {
+                    sequencer.give_up_and_resync();
                     send(socket, &frame).await;
                 }
             }
@@ -672,7 +690,7 @@ enum GapResolution {
     /// Backfill came up short (compacted rows, or a query failure): the one `resync` frame to
     /// send, and the seq [`EgressSequencer::give_up_and_resync`] should be called with. Per
     /// `collab-protocol-v1.md` ("禁止先发 N"), the notice that revealed the gap is never included.
-    Resync { frame: Frame, advance_to: i64 },
+    Resync { frame: Frame },
 }
 
 /// The `SeqDecision::Gap` branch of [`handle_outbound_frame`]: backfill `[missing_from,
@@ -711,7 +729,6 @@ async fn plan_gap_resolution(
                 reason: "outbound_gap".to_string(),
                 minimum_snapshot_seq: Some(missing_from.saturating_sub(1)),
             },
-            advance_to: revealing_seq,
         };
     };
 
@@ -753,6 +770,11 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         reject_and_close(socket, document_id, RejectedCode::NotFound, "document not found").await;
         return None;
     };
+    if let Some(retry_after_ms) = runtime::runtime().workspace_drain_retry_after_ms(consumed.workspace_id) {
+        let reason = format!(r#"{{"reason":"drain","retry_after_ms":{retry_after_ms}}}"#);
+        close(socket, ws_close_code_for(RejectedCode::ServerDraining), &reason).await;
+        return None;
+    }
     let Ok(flow_enabled) = crate::flow::repository::fetch_flow_enabled(&state.db, consumed.workspace_id).await else {
         reject_and_close(
             socket,
@@ -816,6 +838,9 @@ async fn handle_client_frame(
     checked_epoch: i64,
     frame: Frame,
     socket: &mut WebSocket,
+    sequencer: &mut EgressSequencer,
+    pending_updates: &mut HashMap<Uuid, Frame>,
+    open_attempts: &mut u64,
 ) {
     // `open_documents_per_connection_max`'s structural guarantee (see [`is_reopen_attempt`]): a
     // client sending `open` again after the handshake must never be treated as opening a second
@@ -824,6 +849,21 @@ async fn handle_client_frame(
     // way -- it only isolates the one decision that makes the ceiling structural into something
     // independently unit-testable.
     if is_reopen_attempt(&frame) {
+        *open_attempts = open_attempts.saturating_add(1);
+        if *open_attempts > OPEN_DOCUMENTS_PER_CONNECTION_MAX {
+            send(
+                socket,
+                &limit_exceeded_frame(
+                    document_id,
+                    "open_documents",
+                    OPEN_DOCUMENTS_PER_CONNECTION_MAX,
+                    Some(*open_attempts),
+                    None,
+                ),
+            )
+            .await;
+            return;
+        }
         send(
             socket,
             &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
@@ -900,10 +940,9 @@ async fn handle_client_frame(
                     }
                     // Peers other than the committer already received the `update`+`accepted`
                     // pair from `write::accept_update` itself (this instance's single broadcast
-                    // call site, still inside the coordinator permit — see that module's doc
-                    // comment) with this session excluded; only the committer's own ack is left to
-                    // send, directly on its own socket, bypassing the registry entirely (it is not
-                    // registered as its own frame's recipient).
+                    // call site, still inside the coordinator permit). The committer is excluded
+                    // from that registry broadcast, so its receipt enters the same sequencer below
+                    // directly; it still never bypasses sequence validation.
                     let frame = Frame::Accepted {
                         protocol_version: PROTOCOL_VERSION,
                         document_id,
@@ -913,7 +952,11 @@ async fn handle_client_frame(
                         projection_seq: accepted.projection_seq,
                         event_id: accepted.event_id,
                     };
-                    send(socket, &frame).await;
+                    // No accepted path may bypass the per-subscription sequencer. A peer commit
+                    // can land while this write is waiting for the document coordinator/row lock;
+                    // routing the submitter's own receipt through the same path preserves strict
+                    // seq order and backfills that peer commit before acknowledging this one.
+                    handle_outbound_frame(&state.db, document_id, socket, sequencer, pending_updates, frame).await;
                 }
                 Ok(AcceptOutcome::Rejected(rejected)) => {
                     send(
@@ -2508,10 +2551,9 @@ mod database_tests {
 
         let plan = plan_gap_resolution(&state.db, document_id, 1, 5, 6, None, revealing_frame).await;
 
-        let GapResolution::Resync { frame, advance_to } = plan else {
+        let GapResolution::Resync { frame } = plan else {
             panic!("expected a resync -- only 1 of 5 requested rows exists");
         };
-        assert_eq!(advance_to, 6);
         let Frame::Resync {
             reason,
             minimum_snapshot_seq,

@@ -32,6 +32,10 @@ pub enum SeqDecision {
     /// success call [`EgressSequencer::resolve_gap`], on failure call
     /// [`EgressSequencer::give_up_and_resync`].
     Gap { missing_from: i64, missing_to: i64 },
+    /// This subscription already emitted `resync(reason="outbound_gap")`. Until the client
+    /// reconnects and establishes a fresh snapshot baseline, no later `accepted` may cross that
+    /// gap. The caller drops the notice without forwarding it.
+    ResyncPending,
 }
 
 /// One WebSocket session's outbound sequencing state. Lives for the lifetime of one connection
@@ -42,6 +46,7 @@ pub enum SeqDecision {
 #[derive(Debug, Clone, Copy)]
 pub struct EgressSequencer {
     next_expected_seq: i64,
+    resync_pending: bool,
 }
 
 impl EgressSequencer {
@@ -50,6 +55,7 @@ impl EgressSequencer {
     pub const fn after_snapshot(head_seq: i64) -> Self {
         Self {
             next_expected_seq: head_seq + 1,
+            resync_pending: false,
         }
     }
 
@@ -63,6 +69,9 @@ impl EgressSequencer {
     /// via [`Self::resolve_gap`] or [`Self::give_up_and_resync`], exactly once per gap, so a
     /// caller cannot accidentally skip that step and silently advance past missing data.
     pub fn evaluate(&mut self, seq: i64) -> SeqDecision {
+        if self.resync_pending {
+            return SeqDecision::ResyncPending;
+        }
         match seq.cmp(&self.next_expected_seq) {
             Ordering::Less => SeqDecision::Duplicate,
             Ordering::Equal => {
@@ -87,12 +96,12 @@ impl EgressSequencer {
 
     /// The caller could not backfill the gap (missing/compacted rows, or a query failure) and is
     /// about to send `resync(reason="outbound_gap")` instead. `collab-protocol-v1.md` forbids
-    /// forwarding the notice that revealed the gap in this case ("禁止先发 N"), so this does not
-    /// take that seq at all -- it only stops this sequencer from re-flagging the same already-
-    /// reported gap on every subsequent notice while the client reconnects, by trusting the
-    /// resync itself (not a forwarded frame) to be the client's cue to re-bootstrap.
-    pub const fn give_up_and_resync(&mut self, seq_that_revealed_the_gap: i64) {
-        self.next_expected_seq = seq_that_revealed_the_gap + 1;
+    /// forwarding the notice that revealed the gap and requires the client to stop applying this
+    /// document until bootstrap. Freeze this subscription rather than advancing across the gap:
+    /// every later notice is [`SeqDecision::ResyncPending`] until the connection is replaced by a
+    /// fresh subscription seeded from a new snapshot.
+    pub const fn give_up_and_resync(&mut self) {
+        self.resync_pending = true;
     }
 }
 
@@ -181,30 +190,24 @@ mod tests {
     }
 
     #[test]
-    fn giving_up_on_a_gap_advances_past_it_without_ever_forwarding_it() {
+    fn giving_up_on_a_gap_freezes_the_subscription_until_a_new_snapshot() {
         let mut sequencer = EgressSequencer::after_snapshot(10);
         let SeqDecision::Gap { .. } = sequencer.evaluate(20) else {
             panic!("expected a gap");
         };
-        sequencer.give_up_and_resync(20);
-        assert_eq!(sequencer.next_expected_seq(), 21);
-        // The stream continuing normally from 21 onward must not re-flag the resync'd gap.
-        assert_eq!(sequencer.evaluate(21), SeqDecision::InOrder);
+        sequencer.give_up_and_resync();
+        assert_eq!(sequencer.next_expected_seq(), 11);
+        assert_eq!(sequencer.evaluate(20), SeqDecision::ResyncPending);
+        assert_eq!(sequencer.evaluate(21), SeqDecision::ResyncPending);
     }
 
     #[test]
-    fn a_gap_immediately_followed_by_a_second_larger_gap_reports_the_new_missing_range() {
+    fn a_resync_pending_subscription_never_reports_or_forwards_a_second_gap() {
         let mut sequencer = EgressSequencer::after_snapshot(0);
         let SeqDecision::Gap { .. } = sequencer.evaluate(5) else {
             panic!("expected first gap");
         };
-        sequencer.give_up_and_resync(5);
-        assert_eq!(
-            sequencer.evaluate(9),
-            SeqDecision::Gap {
-                missing_from: 6,
-                missing_to: 8
-            }
-        );
+        sequencer.give_up_and_resync();
+        assert_eq!(sequencer.evaluate(9), SeqDecision::ResyncPending);
     }
 }
