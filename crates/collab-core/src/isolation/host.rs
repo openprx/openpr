@@ -145,12 +145,33 @@ fn worker_binary_path() -> Result<std::path::PathBuf, IsolatedApplyError> {
 /// # Errors
 /// See [`IsolatedApplyError`].
 pub fn isolated_apply(base_snapshot: &[u8], update: &[u8]) -> Result<IsolatedApplySuccess, IsolatedApplyError> {
+    run_isolated_apply(base_snapshot, update, &[])
+}
+
+/// Same as [`isolated_apply`], but additionally sets `extra_env` on the *spawned child's own*
+/// environment before it runs (never this process's own environment). [`isolated_apply`] always
+/// calls this with an empty slice, so passing environment variables through here has no effect on
+/// the production call path -- it exists so this module's own tests can drive
+/// `src/bin/isolated_apply_worker.rs`'s `cfg(debug_assertions)`-gated synthetic workloads (see
+/// that file's `test_injection` module) by setting `COLLAB_ISOLATION_TEST_INJECT` on the one child
+/// process a test spawns, without mutating this whole test binary's process-wide environment the
+/// way `WORKER_BINARY_PATH_ENV` (necessarily) does.
+fn run_isolated_apply(
+    base_snapshot: &[u8],
+    update: &[u8],
+    extra_env: &[(&str, &str)],
+) -> Result<IsolatedApplySuccess, IsolatedApplyError> {
     let worker_path = worker_binary_path()?;
 
-    let mut child = Command::new(&worker_path)
+    let mut command = Command::new(&worker_path);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command
         .spawn()
         .map_err(|err| IsolatedApplyError::HostFailure(format!("spawn of isolated-apply worker failed: {err}")))?;
 
@@ -515,6 +536,177 @@ mod tests {
         }
         drop(guard);
         Some(result)
+    }
+
+    // ---- Boundary tests: `decode_apply_cpu_ms_max` / `decode_apply_wall_ms_max` /
+    // `isolated_apply_memory_bytes_max`, and their correct signal classification.
+    //
+    // These do NOT reuse `isolated_apply_with_real_worker`'s self-skip-when-missing pattern above:
+    // a boundary test that silently skips when the worker binary is absent is a false green, not
+    // a partial one. They instead panic via `required_debug_worker_binary_for_tests` when the
+    // binary is missing.
+    //
+    // They also cannot use real Loro CRDT content to land on these three boundaries -- see
+    // `src/bin/isolated_apply_worker.rs`'s `test_injection` module doc comment for why (real
+    // content is machine-speed-dependent for CPU/wall, and the memory ceiling is not reachable at
+    // all with legitimate content: anything over 128 MiB of decode-time working memory is already
+    // well past the 10,000-node structural ceilings and gets rejected by `check_snapshot` first).
+    // Instead, they drive that module's `cfg(debug_assertions)`-gated synthetic workloads through
+    // `COLLAB_ISOLATION_TEST_INJECT`, set on the spawned child's own environment only (via
+    // `run_isolated_apply`'s `extra_env`) -- never on this test process's own environment, and
+    // never reachable from a `--release` build (see that module's doc comment for the full
+    // guarantee this cannot leak into production).
+
+    /// Mirrors `src/bin/isolated_apply_worker.rs`'s `test_injection::ENV_VAR`. That module lives
+    /// in a separate binary crate target (`[[bin]] collab-isolated-apply-worker`), not something
+    /// this library crate can `use` directly, so the literal name is duplicated here -- both sides
+    /// are commented as the shared contract between them.
+    const TEST_INJECT_ENV_VAR: &str = "COLLAB_ISOLATION_TEST_INJECT";
+
+    /// Resolves the debug-profile worker binary specifically -- unlike
+    /// [`real_worker_binary_for_tests`]'s debug-then-release fallback above, the synthetic
+    /// workloads these boundary tests inject only exist in a `cfg(debug_assertions)` build (see
+    /// `src/bin/isolated_apply_worker.rs`'s `test_injection` module doc for why); falling back to
+    /// a release binary would silently run the real decode/apply/validate pipeline against
+    /// meaningless trivial input instead of the intended synthetic workload, which these tests
+    /// could not tell apart from a real ceiling-enforcement failure. Panics (does not skip) when
+    /// the debug binary is missing -- `cargo test -p collab-core --all-features` builds it by
+    /// default, and this workspace's own `scripts/verify-flow-limits-v0.4.sh` explicitly runs
+    /// `cargo build -p collab-core --bin collab-isolated-apply-worker` before this test group, so
+    /// a silent skip here would hide a real regression rather than report one.
+    fn required_debug_worker_binary_for_tests() -> std::path::PathBuf {
+        let candidate = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../target"))
+            .join("debug")
+            .join(WORKER_BINARY_NAME);
+        assert!(
+            candidate.is_file(),
+            "collab-isolated-apply-worker debug binary not found at {candidate:?} -- build it \
+             first with `cargo build -p collab-core --bin collab-isolated-apply-worker` (a \
+             --release build will not do: this test's synthetic workload injection only exists in \
+             a cfg(debug_assertions) build) before running this boundary test"
+        );
+        candidate
+    }
+
+    /// Runs [`run_isolated_apply`] against the real debug-profile worker binary with
+    /// `COLLAB_ISOLATION_TEST_INJECT=<env_value>` set on the *child's* environment only, so the
+    /// worker's `test_injection` module substitutes a controllable synthetic workload for the real
+    /// decode/apply/validate pipeline. `base_snapshot`/`update` content is irrelevant to every one
+    /// of these workloads (none of them ever call `import_update`), so this always uses a fresh
+    /// empty document and an empty update.
+    fn isolated_apply_injected(env_value: &str) -> Result<IsolatedApplySuccess, IsolatedApplyError> {
+        let worker_path = required_debug_worker_binary_for_tests();
+        let guard = env_lock().lock();
+        // SAFETY: held under `env_lock()`, so no other test in this module reads or writes
+        // `WORKER_BINARY_PATH_ENV` while this is set.
+        unsafe {
+            std::env::set_var(WORKER_BINARY_PATH_ENV, &worker_path);
+        }
+        let base_snapshot = crate::LoroCollabEngine::new_empty(1)
+            .export_snapshot()
+            .expect("a fresh empty document always exports");
+        let result = run_isolated_apply(&base_snapshot, &[], &[(TEST_INJECT_ENV_VAR, env_value)]);
+        // SAFETY: same reasoning as the `set_var` call above; still held under `env_lock()`.
+        unsafe {
+            std::env::remove_var(WORKER_BINARY_PATH_ENV);
+        }
+        drop(guard);
+        result
+    }
+
+    #[test]
+    fn decode_apply_cpu_ms_ceiling_accepts_just_under_and_kills_with_cpu_ceiling_just_over_the_boundary() {
+        let ceiling_micros = super::super::DECODE_APPLY_CPU_MS_MAX * 1_000;
+        // Comfortably on each side of the ceiling rather than at a literal +/-1us edge: `SIGPROF`
+        // delivery/scheduling latency and the polling busy-loop's own check granularity (see
+        // `test_injection::burn_cpu_micros`) both add real-world slack, so a margin narrow enough
+        // to be flaky under CI contention would not actually prove anything a wider one -- which
+        // still stays strictly on the correct side of `DECODE_APPLY_CPU_MS_MAX` on every real run
+        // -- does not already prove.
+        let under_micros = ceiling_micros - ceiling_micros / 3; // ~33ms: comfortably under 50ms.
+        let over_micros = ceiling_micros * 3; // ~150ms: comfortably over 50ms, and still well
+        // under what a broken (non-firing) SIGPROF would need to reach before the independent
+        // 100ms wall watchdog caught it instead -- see the panic message below for why that
+        // distinction matters.
+
+        let accepted = isolated_apply_injected(&format!("cpu_burn_micros={under_micros}"));
+        assert!(
+            accepted.is_ok(),
+            "a {under_micros}us CPU burn (under the {ceiling_micros}us decode_apply_cpu_ms_max \
+             ceiling) must succeed, got {accepted:?}"
+        );
+
+        let rejected = isolated_apply_injected(&format!("cpu_burn_micros={over_micros}"));
+        match rejected {
+            Err(IsolatedApplyError::CpuCeiling) => {}
+            other => panic!(
+                "a {over_micros}us-targeted CPU burn (over the {ceiling_micros}us \
+                 decode_apply_cpu_ms_max ceiling) must be killed by SIGPROF and classified as \
+                 CpuCeiling specifically -- not WallCeiling (which would mean SIGPROF never fired \
+                 and the independent 100ms wall watchdog caught it instead, a different \
+                 mechanism entirely), not MemoryCeiling, not HostFailure -- got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn decode_apply_wall_ms_ceiling_accepts_just_under_and_kills_with_wall_ceiling_just_over_the_boundary() {
+        let ceiling_millis = super::super::DECODE_APPLY_WALL_MS_MAX;
+        let under_millis = ceiling_millis - ceiling_millis / 3; // ~67ms: comfortably under 100ms.
+        let over_millis = ceiling_millis * 3; // ~300ms: comfortably over 100ms.
+
+        let accepted = isolated_apply_injected(&format!("wall_sleep_millis={under_millis}"));
+        assert!(
+            accepted.is_ok(),
+            "a {under_millis}ms sleep (under the {ceiling_millis}ms decode_apply_wall_ms_max \
+             ceiling, and consuming effectively no CPU, so it cannot trip the CPU ceiling either) \
+             must succeed, got {accepted:?}"
+        );
+
+        let rejected = isolated_apply_injected(&format!("wall_sleep_millis={over_millis}"));
+        match rejected {
+            Err(IsolatedApplyError::WallCeiling) => {}
+            other => panic!(
+                "a {over_millis}ms sleep (over the {ceiling_millis}ms decode_apply_wall_ms_max \
+                 ceiling) must be SIGKILLed by the parent's independent wall watchdog and \
+                 classified as WallCeiling specifically -- not CpuCeiling (a sleep consumes \
+                 effectively no process CPU time, so SIGPROF has no budget to ever fire here), \
+                 not MemoryCeiling, not HostFailure -- got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn isolated_apply_memory_bytes_ceiling_accepts_the_exact_byte_and_rejects_the_next_byte_over() {
+        let ceiling = super::super::ISOLATED_APPLY_MEMORY_BYTES_MAX;
+        let Ok(ceiling_usize) = usize::try_from(ceiling) else {
+            panic!("ISOLATED_APPLY_MEMORY_BYTES_MAX ({ceiling}) does not fit usize on this target");
+        };
+
+        // Exact boundary, no timing involved at all: a single allocation request of precisely
+        // `ceiling` bytes must succeed (the counting allocator's own check is `prospective >
+        // ceiling`, strictly greater -- see `isolation::alloc::CountingAllocator::alloc`), and one
+        // byte more must fail on that exact same allocation attempt.
+        let accepted = isolated_apply_injected(&format!("alloc_bytes={ceiling_usize}"));
+        assert!(
+            accepted.is_ok(),
+            "a single {ceiling_usize}-byte allocation (exactly isolated_apply_memory_bytes_max) \
+             must succeed, got {accepted:?}"
+        );
+
+        let over_usize = ceiling_usize + 1;
+        let rejected = isolated_apply_injected(&format!("alloc_bytes={over_usize}"));
+        match rejected {
+            Err(IsolatedApplyError::MemoryCeiling) => {}
+            other => panic!(
+                "a single {over_usize}-byte allocation (one byte over \
+                 isolated_apply_memory_bytes_max) must make the counting allocator return null, \
+                 aborting the process (SIGABRT) via Rust's own handle_alloc_error, and must be \
+                 classified as MemoryCeiling specifically -- not CpuCeiling, not WallCeiling (a \
+                 single allocation attempt takes negligible CPU or wall time either way), not \
+                 HostFailure -- got {other:?}"
+            ),
+        }
     }
 
     #[test]

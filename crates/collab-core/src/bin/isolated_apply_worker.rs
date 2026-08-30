@@ -10,20 +10,27 @@
 //! 2. Load the base document -- also unmetered: it is already-validated state this process is
 //!    only rehydrating, analogous to how the calibration host excludes `fork()` itself from its
 //!    window.
-//! 3. Arm the CPU-ceiling timer (`SIGPROF`/`ITIMER_PROF`) and the counting allocator. This opens
+//! 3. Write `host::RESPONSE_MARKER_BYTE` to stdout and flush -- the unmetered setup phase is now
+//!    over. This is the signal `isolation::host::read_response_two_phase` uses to start its own
+//!    independent `decode_apply_wall_ms_max` watchdog from the *right* moment (the metered window
+//!    is about to open), not from whenever the full response happens to be ready. See
+//!    [`write_marker_or_exit`]'s doc comment for why this must happen here and not folded into the
+//!    final response write.
+//! 4. Arm the CPU-ceiling timer (`SIGPROF`/`ITIMER_PROF`) and the counting allocator. This opens
 //!    the metered window.
-//! 4. `import_update` the untrusted update, compute the resulting `semantic_snapshot`, and run
+//! 5. `import_update` the untrusted update, compute the resulting `semantic_snapshot`, and run
 //!    `check_snapshot` against the frozen `contracts/limits-v1.md` structural ceilings -- decode +
 //!    shape validation, exactly the scope `limits-v1.md`'s "从 decode 前开始计,到 semantic
 //!    diff/shape validation 完成结束" describes.
-//! 5. Disarm the timer and the counting allocator (closing the window) as soon as step 4 has a
+//! 6. Disarm the timer and the counting allocator (closing the window) as soon as step 5 has a
 //!    verdict, *before* serializing an accepted result: `export_snapshot` operates on already-
 //!    validated in-memory state (the same reasoning that keeps step 2's `load` outside the window),
-//!    not on the untrusted input step 4 just finished validating, so it is not part of the budget
+//!    not on the untrusted input step 5 just finished validating, so it is not part of the budget
 //!    that bounds processing that untrusted input.
-//! 6. Report the outcome back over stdout as a length/CRC32-framed payload.
+//! 7. Report the outcome back over stdout as a length/CRC32-framed payload (the marker byte was
+//!    already sent in step 3, so this is just the framed payload itself).
 //!
-//! If the process is killed by `SIGPROF` (step 3/4 overran the CPU ceiling), aborts itself via the
+//! If the process is killed by `SIGPROF` (step 4/5 overran the CPU ceiling), aborts itself via the
 //! counting allocator's rejection path (overran the memory ceiling, `SIGABRT`), or is `SIGKILL`ed
 //! by the parent's wall watchdog (overran the wall ceiling), no response frame is ever written --
 //! the parent classifies those cases from the exit signal alone (`isolation::host::classify_signal`).
@@ -73,10 +80,39 @@ fn main() {
     #[allow(clippy::manual_let_else)]
     let base_engine = match LoroCollabEngine::load(&base_snapshot) {
         Ok(engine) => engine,
-        Err(err) => respond_and_exit(&wire::Outcome::Rejected(err)),
+        Err(err) => {
+            write_marker_or_exit();
+            respond_and_exit(&wire::Outcome::Rejected(err));
+        }
     };
 
+    write_marker_or_exit();
     respond_and_exit(&decode_apply_check_and_export(base_engine, &update));
+}
+
+/// Writes [`host::RESPONSE_MARKER_BYTE`] and flushes, marking the exact moment this process's
+/// unmetered setup (reading the request, loading the base document) is over. Split out from
+/// [`respond_and_exit`] -- an earlier version of this file wrote the marker together with the
+/// final framed response, which made `isolation::host::read_response_two_phase`'s
+/// `decode_apply_wall_ms_max` watchdog measure only the time to flush an *already-finished*
+/// result, not the metered window's own duration: a worker that spends, say, 300ms blocked
+/// (not burning CPU) inside step 4 and then completes normally would have produced its marker and
+/// full response back-to-back at the very end, and the watchdog's own 100ms deadline -- started
+/// only once the marker arrives -- would never have had anything left to time. Writing the marker
+/// here instead, right as the metered window is about to open, makes the watchdog actually bound
+/// step 4's wall-clock duration, matching `contracts/limits-v1.md`'s "从 decode 前开始计" scope for
+/// `decode_apply_wall_ms_max`.
+///
+/// Exits (without a further response) on any I/O failure, the same way every other setup-phase
+/// failure in `main` does -- a write failure this early means the parent cannot receive a useful
+/// response of any shape.
+fn write_marker_or_exit() {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    if lock.write_all(&[host::RESPONSE_MARKER_BYTE]).is_err() || lock.flush().is_err() {
+        drop(lock);
+        exit_without_response(1);
+    }
 }
 
 /// Everything between arming the metered window and closing it: `import_update`, deriving the
@@ -96,10 +132,24 @@ fn main() {
 fn run_metered(engine: LoroCollabEngine, update: &[u8]) -> Result<LoroCollabEngine, wire::Outcome> {
     child_runtime::arm_sigprof();
     alloc::arm();
-    let outcome = decode_apply_and_check(engine, update);
+    let outcome = metered_workload(engine, update);
     child_runtime::disarm_sigprof();
     alloc::disarm();
     outcome
+}
+
+/// The work that actually runs inside the armed metered window. In every `--release` build (this
+/// workspace's only production build shape -- see the `test_injection` module doc below) this is
+/// nothing more than a direct call to [`decode_apply_and_check`]; the `cfg(debug_assertions)`
+/// branch exists only so `isolation::host`'s own boundary tests can substitute a precisely
+/// controllable synthetic workload for the real decode/apply/validate pipeline, still inside this
+/// exact arm/disarm pair.
+fn metered_workload(engine: LoroCollabEngine, update: &[u8]) -> Result<LoroCollabEngine, wire::Outcome> {
+    #[cfg(debug_assertions)]
+    if let Some(workload) = test_injection::workload_from_env() {
+        return Ok(test_injection::run(&workload, engine));
+    }
+    decode_apply_and_check(engine, update)
 }
 
 /// The pure decode/apply/shape-validate logic, with no timer or allocator side effects of its own
@@ -149,11 +199,10 @@ fn decode_apply_check_and_export(engine: LoroCollabEngine, update: &[u8]) -> wir
 /// Encodes and writes `outcome` as a length/CRC32-framed payload to stdout, flushes, and exits
 /// `0`. Never returns.
 ///
-/// Always writes `host::RESPONSE_MARKER_BYTE` first, before the framed response -- the parent's
-/// `isolation::host::read_response_two_phase` uses it to tell "still doing unmetered setup" apart
-/// from "response is now being written", so its strict `decode_apply_wall_ms_max` watchdog can
-/// start counting from the right moment instead of from process spawn. See that function's doc
-/// comment for the full reasoning.
+/// Does *not* write `host::RESPONSE_MARKER_BYTE` -- every caller already sent it via
+/// [`write_marker_or_exit`] the moment unmetered setup finished, before entering (or definitively
+/// skipping) the metered window. See that function's doc comment for why the marker must be sent
+/// there and not here.
 fn respond_and_exit(outcome: &wire::Outcome) -> ! {
     let payload = wire::encode_outcome(outcome).unwrap_or_default();
     let Ok(framed) = host::encode_response_frame(&payload) else {
@@ -162,7 +211,6 @@ fn respond_and_exit(outcome: &wire::Outcome) -> ! {
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = lock.write_all(&[host::RESPONSE_MARKER_BYTE]);
     let _ = lock.write_all(&framed);
     let _ = lock.flush();
 
@@ -181,6 +229,157 @@ fn exit_without_response(status: i32) -> ! {
     // SAFETY: `_exit` takes a plain `c_int` status code and has no preconditions.
     unsafe {
         libc::_exit(status);
+    }
+}
+
+/// Test-only synthetic workloads that let `isolation::host`'s own boundary tests drive this
+/// worker's *real* enforcement primitives (the exact `child_runtime::arm_sigprof`/`alloc::arm`
+/// calls [`run_metered`] uses in production, via [`metered_workload`]'s `cfg(debug_assertions)`
+/// branch) against a precisely controllable amount of CPU time, wall-clock blocking, or a single
+/// allocation size -- rather than hunting for real Loro CRDT content that happens to land near a
+/// millisecond/byte boundary. That is fragile and machine-speed-dependent for the CPU/wall
+/// ceilings, and not reliably reachable at all for the memory ceiling with legitimate content: a
+/// document large enough to need over 128 MiB of *decode-time* working memory is already well
+/// past `container_count_max`/`document_block_count_max` (10,000 nodes) and gets rejected by
+/// `check_snapshot` on structural grounds long before it could ever pressure the allocator (see
+/// `crates/collab-core/examples/decode_apply_budget.rs`'s measurements at that boundary).
+///
+/// # Why this cannot run in production
+/// Gated on `cfg(debug_assertions)`, which is `false` for every `--release` build -- this
+/// workspace's standard production build (`cargo build --release --all-features`, per this
+/// repository's `CLAUDE.md`) does not compile this module in at all. There is no environment
+/// variable, flag, or other runtime toggle that can make a `--release` compile of
+/// `collab-isolated-apply-worker` execute a single line of this module; it is not merely inert,
+/// its code does not exist in that binary. It is *additionally* gated on [`ENV_VAR`]'s presence,
+/// so even a debug build behaves identically to the production shape unless a test deliberately
+/// sets that variable on the *child's own* environment before spawning it --
+/// `isolation::host::isolated_apply` (the production call site) never sets it, and never forwards
+/// it from its own caller (`apps/api`) either.
+#[cfg(debug_assertions)]
+mod test_injection {
+    use std::time::Duration;
+
+    use super::LoroCollabEngine;
+
+    /// Read by [`workload_from_env`]. Format: `<kind>=<value>`, one of `cpu_burn_micros=<u64>`,
+    /// `wall_sleep_millis=<u64>`, `alloc_bytes=<usize>`.
+    pub const ENV_VAR: &str = "COLLAB_ISOLATION_TEST_INJECT";
+
+    pub enum Workload {
+        /// Busy-loops, polling `CLOCK_PROCESS_CPUTIME_ID`, until this process has consumed at
+        /// least this many microseconds of its own CPU time -- for boundary-testing
+        /// `decode_apply_cpu_ms_max`'s `SIGPROF` ceiling with a duration that does not depend on
+        /// document shape or machine speed.
+        CpuBurnMicros(u64),
+        /// Sleeps (consuming effectively no CPU) for this many milliseconds -- for
+        /// boundary-testing `decode_apply_wall_ms_max`'s independent wall watchdog without also
+        /// risking the CPU ceiling firing first.
+        WallSleepMillis(u64),
+        /// Attempts one single allocation of exactly this many bytes through the process's real
+        /// global allocator (`alloc::CountingAllocator`, installed by this binary's `main` as
+        /// `#[global_allocator]`) -- for boundary-testing `isolated_apply_memory_bytes_max` at the
+        /// exact byte, which real document content cannot reach (see this module's own doc
+        /// comment).
+        AllocBytes(usize),
+    }
+
+    /// Parses [`ENV_VAR`] into a [`Workload`], if set and well-formed. Any absence or parse
+    /// failure returns `None`, falling `metered_workload` through to the real
+    /// decode/apply/validate pipeline -- this is a test-only convenience with no caller-facing
+    /// error reporting of its own.
+    pub fn workload_from_env() -> Option<Workload> {
+        let raw = std::env::var(ENV_VAR).ok()?;
+        let (kind, value) = raw.split_once('=')?;
+        match kind {
+            "cpu_burn_micros" => value.parse().ok().map(Workload::CpuBurnMicros),
+            "wall_sleep_millis" => value.parse().ok().map(Workload::WallSleepMillis),
+            "alloc_bytes" => value.parse().ok().map(Workload::AllocBytes),
+            _ => None,
+        }
+    }
+
+    /// Reads `CLOCK_PROCESS_CPUTIME_ID` -- the same POSIX clock `contracts/limits-v1.md`'s
+    /// `decode_apply_cpu_ms_max` and `ITIMER_PROF` (`child_runtime::arm_sigprof`) both track (user
+    /// and system CPU time combined, not wall clock). `None` only if the kernel does not support
+    /// this clock id, which does not happen on any Linux this workspace targets.
+    fn cpu_time_now() -> Option<Duration> {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `&raw mut ts` is a valid, properly aligned out-pointer for a `timespec`;
+        // `CLOCK_PROCESS_CPUTIME_ID` is a clock id always supported by the Linux kernels this
+        // workspace targets. No precondition beyond the pointer's validity.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &raw mut ts) };
+        if rc != 0 {
+            return None;
+        }
+        let secs = u64::try_from(ts.tv_sec).ok()?;
+        let nanos = u32::try_from(ts.tv_nsec).ok()?;
+        Some(Duration::new(secs, nanos))
+    }
+
+    /// Spins until this process has burned at least `target_micros` of its own CPU time (or until
+    /// `cpu_time_now` cannot be read at all, in which case this returns early rather than looping
+    /// forever on an unreadable clock -- the calling test still gets a definitive ceiling verdict
+    /// either way, just possibly under-shooting the intended burn). `std::hint::black_box` keeps
+    /// the loop body from being optimized away entirely.
+    fn burn_cpu_micros(target_micros: u64) {
+        let Some(start) = cpu_time_now() else { return };
+        let target = Duration::from_micros(target_micros);
+        loop {
+            for spin in 0..10_000u64 {
+                std::hint::black_box(spin);
+            }
+            let Some(now) = cpu_time_now() else { return };
+            if now.saturating_sub(start) >= target {
+                return;
+            }
+        }
+    }
+
+    /// Runs `workload` inside the caller's already-armed metered window ([`super::run_metered`]
+    /// calls this, via [`super::metered_workload`], between `arm_sigprof`/`alloc::arm` and
+    /// `disarm_sigprof`/`alloc::disarm` -- exactly where it would otherwise call
+    /// `super::decode_apply_and_check`), and hands back the untouched input `engine` unmodified if
+    /// it returns at all -- [`super::metered_workload`]'s caller then exports and reports it as a
+    /// trivial `Success`. The point of every one of these workloads is that the *ceiling itself*
+    /// (`SIGPROF`, the wall watchdog, or the counting allocator's
+    /// null return -> `handle_alloc_error` -> abort) decides whether this function ever returns --
+    /// a workload sized to stay under its ceiling returns normally; one sized to exceed it does
+    /// not return at all, and the parent classifies the kill from the child's exit signal (or, for
+    /// the wall ceiling, from its own independent watchdog) exactly as it would for real content.
+    ///
+    /// Returns plain `LoroCollabEngine`, not a `Result` -- none of the three arms below ever
+    /// produce a business rejection; the only way this function does not eventually return is the
+    /// process being killed out from under it (`SIGPROF`/`SIGKILL`/`SIGABRT`), which by
+    /// construction never reaches a `return` statement at all.
+    pub fn run(workload: &Workload, engine: LoroCollabEngine) -> LoroCollabEngine {
+        match *workload {
+            Workload::CpuBurnMicros(micros) => {
+                burn_cpu_micros(micros);
+                engine
+            }
+            Workload::WallSleepMillis(millis) => {
+                std::thread::sleep(Duration::from_millis(millis));
+                engine
+            }
+            Workload::AllocBytes(bytes) => {
+                // A single allocation request of exactly `bytes`: `Vec::<u8>::with_capacity`
+                // computes `Layout::array::<u8>(bytes)` (size = bytes, align = 1, no rounding for
+                // a byte-sized element) and hands it to the process's installed global allocator
+                // unchanged -- the identical `CountingAllocator::alloc` path a real oversized
+                // decode/apply would hit, just with a size this test controls exactly instead of
+                // whatever a real update happened to need. Returning null from `GlobalAlloc::alloc`
+                // routes through Rust's `handle_alloc_error`, which aborts the process (`SIGABRT`)
+                // -- this function never returns in that case, by design.
+                let mut buffer: Vec<u8> = Vec::with_capacity(bytes);
+                // Writes one byte so the allocation cannot be optimized away as dead, without
+                // paying the cost of zeroing the whole buffer the way `vec![0u8; bytes]` would.
+                if bytes > 0 {
+                    buffer.push(0);
+                }
+                drop(buffer);
+                engine
+            }
+        }
     }
 }
 
