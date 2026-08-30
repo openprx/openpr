@@ -2,7 +2,7 @@
 //! `POST .../flow/objects/{id}/commands` (`set_title|insert_block|update_block|delete_block|
 //! move_block|archive|restore`, `rest-api-v1.md` "v0.4 Flow Alpha").
 //!
-//! The five content types share the *exact* write path `flow::collab::write::accept_update` and
+//! The six content types share the *exact* write path `flow::collab::write::accept_update` and
 //! the WebSocket `update` frame use (hydrate/isolated-apply outside any lock, the per-document
 //! coordinator, the commit-time `authz_epoch` fence, the document row lock) — this module only
 //! turns a command payload into the same shape of CRDT update bytes a WebSocket client would have
@@ -115,6 +115,7 @@ pub fn v0_4_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
         ContentCommandType::UpdateBlock,
         ContentCommandType::DeleteBlock,
         ContentCommandType::MoveBlock,
+        ContentCommandType::SemanticPatch,
     ] {
         registry.push((content.wire_name(), content.existing_document_cardinality()));
     }
@@ -204,6 +205,7 @@ async fn record_cross_workspace_relation_and_fail_closed(
 }
 
 pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result<AcceptedChange, ApiError> {
+    runtime::runtime().ensure_workspace_accepting(input.workspace_id)?;
     validate(&input)?;
     let title = input.title.trim().to_string();
 
@@ -557,6 +559,7 @@ enum ContentCommandType {
     UpdateBlock,
     DeleteBlock,
     MoveBlock,
+    SemanticPatch,
 }
 
 impl ContentCommandType {
@@ -567,6 +570,7 @@ impl ContentCommandType {
             "update_block" => Some(Self::UpdateBlock),
             "delete_block" => Some(Self::DeleteBlock),
             "move_block" => Some(Self::MoveBlock),
+            "semantic_patch" => Some(Self::SemanticPatch),
             _ => None,
         }
     }
@@ -578,6 +582,7 @@ impl ContentCommandType {
             Self::UpdateBlock => "update_block",
             Self::DeleteBlock => "delete_block",
             Self::MoveBlock => "move_block",
+            Self::SemanticPatch => "semantic_patch",
         }
     }
 
@@ -589,9 +594,12 @@ impl ContentCommandType {
     /// cardinality must edit this match, not silently inherit `One`.
     const fn existing_document_cardinality(self) -> ExistingDocumentCardinality {
         match self {
-            Self::SetTitle | Self::InsertBlock | Self::UpdateBlock | Self::DeleteBlock | Self::MoveBlock => {
-                ExistingDocumentCardinality::One
-            }
+            Self::SetTitle
+            | Self::InsertBlock
+            | Self::UpdateBlock
+            | Self::DeleteBlock
+            | Self::MoveBlock
+            | Self::SemanticPatch => ExistingDocumentCardinality::One,
         }
     }
 }
@@ -681,7 +689,7 @@ pub struct ExecuteCommandInput {
     pub payload: Value,
     /// Base64 `Frontier` bytes, when the caller wants strict optimistic-concurrency locking
     /// instead of the CRDT's default commutative merge (`write::UpdateRequest::expected_frontier`).
-    /// Only valid for the five content command types; `archive`/`restore` reject a non-`None` value
+    /// Only valid for the six content command types; `archive`/`restore` reject a non-`None` value
     /// (they never advance a document head, so it could never be honored).
     pub expected_frontier: Option<String>,
     pub idempotency_key: String,
@@ -797,6 +805,9 @@ pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Re
             input.command_type
         ))
     })?;
+    if matches!(kind, CommandKind::Content(ContentCommandType::SemanticPatch)) {
+        check_semantic_patch_json_bytes(&input.payload)?;
+    }
 
     let view_row = repository::fetch_object_view(&state.db, input.object_id)
         .await?
@@ -804,6 +815,7 @@ pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Re
     let workspace_id = view_row.workspace_id;
     let document_id = view_row.document_id;
     let object_type = view_row.object_type.clone();
+    runtime::runtime().ensure_workspace_accepting(workspace_id)?;
 
     match execute_command_authorized(state, &input, kind, workspace_id, document_id, &object_type).await {
         Ok(change) => Ok(change),
@@ -908,6 +920,31 @@ struct MoveBlockPayload {
     parent_block_id: Option<String>,
     #[serde(default)]
     index: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SemanticPatchPayload {
+    operations: Vec<Operation>,
+}
+
+/// Enforces the serialized semantic-patch payload ceiling before the target object is read and,
+/// crucially, before any canonical/audit/event row can be written. The parsed JSON value is
+/// re-serialized compactly because every REST/MCP/CLI/Web producer reaches this application
+/// service after JSON decoding; insignificant transport whitespace is not semantic patch data.
+fn check_semantic_patch_json_bytes(payload: &Value) -> Result<(), ApiError> {
+    let bytes =
+        serde_json::to_vec(payload).map_err(|_| ApiError::invalid_update("semantic_patch is not valid JSON"))?;
+    let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if observed > collab_limits::SEMANTIC_PATCH_JSON_BYTES_MAX {
+        return Err(ApiError::limit_exceeded(
+            "semantic patch JSON exceeds the fixed byte ceiling",
+            "semantic_patch_bytes",
+            Some(json!(collab_limits::SEMANTIC_PATCH_JSON_BYTES_MAX)),
+            Some(json!(observed)),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn parse_node_id(raw: &str, field: &str) -> Result<NodeId, ApiError> {
@@ -1087,6 +1124,15 @@ fn apply_content_command(
                 new_parent,
                 index: payload.index,
             }]
+        }
+        ContentCommandType::SemanticPatch => {
+            let payload: SemanticPatchPayload = parse_payload("semantic_patch", payload)?;
+            if payload.operations.is_empty() {
+                return Err(ApiError::invalid_update(
+                    "semantic_patch requires at least one operation",
+                ));
+            }
+            payload.operations
         }
     };
 
@@ -1436,6 +1482,7 @@ mod cardinality_gate_tests {
             "update_block",
             "delete_block",
             "move_block",
+            "semantic_patch",
             "archive",
             "restore",
         ] {
@@ -1444,7 +1491,7 @@ mod cardinality_gate_tests {
                 "command '{expected}' is missing from the cardinality registry"
             );
         }
-        assert_eq!(names.len(), 9, "registry must not silently gain or lose commands");
+        assert_eq!(names.len(), 10, "registry must not silently gain or lose commands");
     }
 
     #[test]
@@ -1456,12 +1503,12 @@ mod cardinality_gate_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod typed_error_mapping_tests {
     use collab_core::CollabError;
     use serde_json::{Value, json};
 
-    use super::{map_collab_error, map_write_rejection};
+    use super::{check_semantic_patch_json_bytes, map_collab_error, map_write_rejection};
     use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
     use crate::flow::collab::frame::RejectedCode;
     use crate::flow::collab::write::Rejected;
@@ -1475,6 +1522,35 @@ mod typed_error_mapping_tests {
             current_seq: None,
             current_frontier: None,
         }
+    }
+
+    fn semantic_patch_payload_with_serialized_bytes(target: u64) -> Value {
+        let empty = json!({"operations": [], "padding": ""});
+        let base = u64::try_from(serde_json::to_vec(&empty).expect("serializes").len()).expect("fits");
+        let padding = usize::try_from(target - base).expect("target fits usize");
+        json!({"operations": [], "padding": "x".repeat(padding)})
+    }
+
+    #[test]
+    fn semantic_patch_bytes_exact_boundary_is_accepted_and_plus_one_is_rejected_before_writes() {
+        let limit = crate::flow::collab::limits::SEMANTIC_PATCH_JSON_BYTES_MAX;
+        let exact = semantic_patch_payload_with_serialized_bytes(limit);
+        assert_eq!(
+            u64::try_from(serde_json::to_vec(&exact).expect("serializes").len()).expect("fits"),
+            limit
+        );
+        assert!(check_semantic_patch_json_bytes(&exact).is_ok());
+
+        let plus_one = semantic_patch_payload_with_serialized_bytes(limit + 1);
+        let err = check_semantic_patch_json_bytes(&plus_one).expect_err("one byte over must reject");
+        assert_eq!(err.kind(), ApiErrorKind::LimitExceeded);
+        let ApiError::Typed { details, .. } = err else {
+            panic!("limit rejection must be typed");
+        };
+        let details = details.expect("limit rejection carries details");
+        assert_eq!(details["limit_kind"], "semantic_patch_bytes");
+        assert_eq!(details["limit"], limit);
+        assert_eq!(details["observed"], limit + 1);
     }
 
     /// `error-mapping-v1.md`'s central invariant this package's typed discriminant exists to

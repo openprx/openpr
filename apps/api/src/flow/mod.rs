@@ -20,6 +20,7 @@
 pub mod collab;
 pub mod command;
 pub mod event_policy;
+pub mod import;
 pub mod model;
 pub mod policy;
 pub mod projection;
