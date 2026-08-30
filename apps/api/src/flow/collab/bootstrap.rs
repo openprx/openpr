@@ -11,9 +11,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::limits;
 use crate::error::ApiError;
 use crate::flow::repository::{self, IntegrityRecordInput};
 
+#[derive(Debug)]
 pub struct TailUpdateRow {
     pub seq: i64,
     pub update_id: Uuid,
@@ -22,6 +24,7 @@ pub struct TailUpdateRow {
     pub after_frontier: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct BootstrapResult {
     pub document_id: Uuid,
     pub engine: String,
@@ -37,6 +40,80 @@ pub fn content_hash(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+/// `bootstrap_decoded_bytes_max` (`limits-v1.md`): "snapshot+tail 上限约占 v0.3 256 MiB browser
+/// peak budget的 3%；超出要求 compaction/resync". Checked against `snapshot.len() + sum(tail
+/// update bytes)` -- [`limits::BOOTSTRAP_DECODED_BYTES_MAX`]'s own doc comment names this exact
+/// formula as the single definition of "decoded bytes" for this ceiling.
+///
+/// # Errors
+/// `ApiError::limit_exceeded` with `limit_kind = "bootstrap_decoded_bytes"` when `observed`
+/// exceeds the fixed ceiling (`error-mapping-v1.md`: `limit_exceeded` -> 400, not
+/// `resync_required` -- a document merely being large is not a corrupted tail).
+pub fn check_bootstrap_decoded_bytes(observed: u64) -> Result<(), ApiError> {
+    if observed > limits::BOOTSTRAP_DECODED_BYTES_MAX {
+        return Err(ApiError::limit_exceeded(
+            "limit_exceeded: bootstrap_decoded_bytes",
+            "bootstrap_decoded_bytes",
+            Some(json!(limits::BOOTSTRAP_DECODED_BYTES_MAX)),
+            Some(json!(observed)),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// The exact byte length base64 (`base64::engine::general_purpose::STANDARD`, the encoding every
+/// bootstrap wire response in this package uses -- `session.rs`'s `Frame::Snapshot` and
+/// `query.rs::get_bootstrap`'s `Bootstrap` both encode the identical fields this function sums)
+/// produces for `n` raw bytes: `4 * ceil(n / 3)`, with no padding-dependent branching needed since
+/// that formula already accounts for it.
+const fn base64_len(n: usize) -> u64 {
+    (n as u64).div_ceil(3).saturating_mul(4)
+}
+
+/// A real, purely length-derived worst-case upper bound on the serialized (base64 + JSON
+/// envelope) bytes a bootstrap response built from `snapshot`/`tail_updates`/`head_frontier` would
+/// produce -- summing the deterministic base64 expansion of every byte field the wire response
+/// actually carries, plus a conservative fixed per-record JSON-structure allowance
+/// (`BOOTSTRAP_TAIL_UPDATE_JSON_OVERHEAD_BYTES`) so this stays a real second constraint even when
+/// many small tail updates keep `bootstrap_decoded_bytes` low but multiply per-record envelope
+/// overhead.
+fn estimated_response_bytes(snapshot_len: usize, tail_updates: &[TailUpdateRow], head_frontier_len: usize) -> u64 {
+    /// Generous on purpose (JSON keys, punctuation, `seq`/`update_id` fields per tail-update
+    /// record): this only needs to keep `bootstrap_response_bytes_max` meaningful, not reproduce
+    /// `serde_json`'s exact byte count.
+    const BOOTSTRAP_TAIL_UPDATE_JSON_OVERHEAD_BYTES: u64 = 256;
+
+    let mut total = base64_len(snapshot_len).saturating_add(base64_len(head_frontier_len));
+    for update in tail_updates {
+        total = total
+            .saturating_add(base64_len(update.bytes.len()))
+            .saturating_add(base64_len(update.before_frontier.len()))
+            .saturating_add(base64_len(update.after_frontier.len()))
+            .saturating_add(BOOTSTRAP_TAIL_UPDATE_JSON_OVERHEAD_BYTES);
+    }
+    total
+}
+
+/// `bootstrap_response_bytes_max` (`limits-v1.md`): "覆盖 8 MiB binary 的 base64 4/3 膨胀和 JSON
+/// envelope，仍远低于全局 200 MiB body ceiling".
+///
+/// # Errors
+/// `ApiError::limit_exceeded` with `limit_kind = "bootstrap_response_bytes"` when `observed`
+/// exceeds the fixed ceiling.
+pub fn check_bootstrap_response_bytes(observed: u64) -> Result<(), ApiError> {
+    if observed > limits::BOOTSTRAP_RESPONSE_BYTES_MAX {
+        return Err(ApiError::limit_exceeded(
+            "limit_exceeded: bootstrap_response_bytes",
+            "bootstrap_response_bytes",
+            Some(json!(limits::BOOTSTRAP_RESPONSE_BYTES_MAX)),
+            Some(json!(observed)),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// Loads a document's snapshot + exact tail inside one MVCC snapshot, and verifies it before
@@ -141,6 +218,16 @@ pub async fn load(db: &DatabaseConnection, document_id: Uuid) -> Result<Bootstra
     if running_frontier != doc.head_frontier {
         return Err(resync_required(db, workspace_id, document_id, "tail does not chain to head_frontier").await);
     }
+
+    // `bootstrap_decoded_bytes_max` / `bootstrap_response_bytes_max` (`limits-v1.md`): checked
+    // here, inside the one loader every caller (WS `snapshot`, REST `Bootstrap`, and every
+    // internal re-hydration path) shares, so a document too large to safely bootstrap fails closed
+    // for all of them alike rather than only for whichever caller happened to add its own check.
+    let decoded_bytes = (doc.snapshot.len() as u64)
+        .saturating_add(tail_updates.iter().map(|update| update.bytes.len() as u64).sum::<u64>());
+    check_bootstrap_decoded_bytes(decoded_bytes)?;
+    let response_bytes = estimated_response_bytes(doc.snapshot.len(), &tail_updates, doc.head_frontier.len());
+    check_bootstrap_response_bytes(response_bytes)?;
 
     Ok(BootstrapResult {
         document_id,
