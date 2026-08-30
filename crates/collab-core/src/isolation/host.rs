@@ -698,22 +698,31 @@ mod tests {
 
     #[test]
     fn isolated_apply_end_to_end_kills_a_pathologically_deep_chain_and_reports_a_ceiling() {
-        // `LoroCollabEngine::semantic_snapshot`'s `order_key_for` recomputes a child's sibling
-        // position by re-listing *all* of its parent's children and linearly searching for it
-        // (`engine.rs`: "let position = siblings.iter().position(...)") -- for one parent with N
-        // children, building the semantic snapshot is O(n^2) in the sibling count, not O(n). A
-        // base document built as one very wide, shallow "star" (one root, many direct children)
+        // A base document built as one very wide, shallow "star" (one root, many direct children)
         // is legitimate CRDT content (no limit stops its *construction*; `check_snapshot`'s
-        // sibling-of-limits checks are only enforced downstream inside the isolated worker, which
-        // is the whole point of this isolation host existing) and forces the worker's metered
-        // window to spend real CPU proportional to that O(n^2) cost during `semantic_snapshot`,
-        // regardless of what the trivial update on top of it contains. Deliberately wide/shallow
-        // (depth 1), not a long chain: an earlier version of this fixture built a long linear
-        // chain instead and reliably crashed the *test* process itself with a native stack
-        // overflow well before reaching a large enough N -- `LoroDoc`'s own tree bookkeeping
-        // (unrelated to this crate's code) recurses per level for a linear chain's construction
-        // and/or drop. A wide star has no such depth to recurse through.
-        const SIBLING_COUNT: usize = 20_000;
+        // sibling-count limits are only enforced downstream inside the isolated worker, which is
+        // the whole point of this isolation host existing) and forces the worker's metered window
+        // to spend real CPU reconstructing the whole thing in `semantic_snapshot`, regardless of
+        // what the trivial update on top of it contains. Deliberately wide/shallow (depth 1), not
+        // a long chain: an earlier version of this fixture built a long linear chain instead and
+        // reliably crashed the *test* process itself with a native stack overflow well before
+        // reaching a large enough N -- `LoroDoc`'s own tree bookkeeping (unrelated to this crate's
+        // code) recurses per level for a linear chain's construction and/or drop. A wide star has
+        // no such depth to recurse through.
+        //
+        // `SIBLING_COUNT` needs real headroom above `container_count_max`/`document_block_count_max`
+        // (10,000): `semantic_snapshot`'s per-parent sibling lookup is already O(n) (not O(n^2), a
+        // prior fix -- see `engine.rs::semantic_snapshot`'s doc comment), and `export_snapshot` no
+        // longer runs inside the metered window at all (`src/bin/isolated_apply_worker.rs`'s
+        // `decode_apply_check_and_export`), so a document merely *at* the structural ceiling now
+        // finishes well under `decode_apply_cpu_ms_max` and would just be rejected by
+        // `check_snapshot`'s own `container_count` check -- not by this CPU/wall ceiling test.
+        // 35,000 keeps a real-machine measured margin (this repository's isolated-apply CPU-budget
+        // investigation found the real worker subprocess's `SIGPROF` kill point for this shape
+        // around ~29,000 nodes on the machine that measurement ran on) while staying fast enough
+        // for `cargo test` to build the base document in-process (debug-mode `apply_operation` is
+        // the dominant cost of this fixture, not the metered call itself).
+        const SIBLING_COUNT: usize = 35_000;
         let mut base = LoroCollabEngine::new_empty(1);
         base.apply_operation(&Operation::CreateNode {
             id: NodeId::from("root"),
