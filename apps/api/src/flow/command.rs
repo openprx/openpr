@@ -1,6 +1,6 @@
 //! The write paths this package ships: `POST .../flow/objects` (object creation) and
 //! `POST .../flow/objects/{id}/commands` (`set_title|insert_block|update_block|delete_block|
-//! move_block|archive|restore`, `rest-api-v1.md` "v0.4 Flow Alpha").
+//! move_block|semantic_patch|archive|restore`, `rest-api-v1.md` "v0.4 Flow Alpha").
 //!
 //! The six content types share the *exact* write path `flow::collab::write::accept_update` and
 //! the WebSocket `update` frame use (hydrate/isolated-apply outside any lock, the per-document

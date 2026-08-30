@@ -417,4 +417,30 @@ mod tests {
         assert_eq!(body["error"]["details"]["retry_after_ms"], 1500);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn structured_flow_errors_do_not_relay_unauthenticated_backend_prose()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new().route(
+            "/api/v1/flow/objects/{object_id}",
+            get(|| async {
+                Json(json!({
+                    "code": 401,
+                    "message": "credential lookup failed at pg-primary.internal",
+                    "data": null,
+                    "error_code": "unauthenticated",
+                    "details": null
+                }))
+            }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let result = get_flow_object(&client, json!({"object_id": "11111111-1111-4111-8111-111111111111"})).await;
+        let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+            return Err("missing MCP text content".into());
+        };
+        assert!(text.contains("rejected the credential"));
+        assert!(!text.contains("pg-primary.internal"));
+        Ok(())
+    }
 }

@@ -68,6 +68,34 @@ pub enum DrainReason {
     Contention,
 }
 
+/// The one shared producer value for an instance/workspace drain. REST admission, active and
+/// handshake-phase WebSocket sessions, MCP/CLI (through REST), and UI consumers all derive their wire
+/// payload from this value, so `reason`, retry advice, and close metadata cannot drift by surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainSignal {
+    pub retry_after_ms: u64,
+}
+
+impl DrainSignal {
+    #[must_use]
+    pub const fn new(retry_after_ms: u64) -> Self {
+        Self { retry_after_ms }
+    }
+
+    #[must_use]
+    pub fn details(self) -> Value {
+        serde_json::json!({
+            "reason": "drain",
+            "retry_after_ms": self.retry_after_ms,
+        })
+    }
+
+    #[must_use]
+    pub fn close_reason(self) -> String {
+        format!(r#"{{"reason":"drain","retry_after_ms":{}}}"#, self.retry_after_ms)
+    }
+}
+
 // `Presence.payload`/`Rejected.details` are `serde_json::Value`, which has no `Eq` impl, so this
 // enum can only be `PartialEq`, not `Eq` -- test-only equality assertions (`session::database_tests`'
 // backfilled-frame ordering checks) are all this derive exists for.
@@ -196,7 +224,7 @@ pub fn decode_bytes(raw: &str) -> Result<Vec<u8>, base64::DecodeError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    use super::{DrainReason, Frame, PROTOCOL_VERSION, RejectedCode, decode_bytes, encode_bytes};
+    use super::{DrainReason, DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, decode_bytes, encode_bytes};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -228,6 +256,9 @@ mod tests {
             serde_json::to_value(DrainReason::Contention).unwrap(),
             json!("contention")
         );
+        let signal = DrainSignal::new(1_500);
+        assert_eq!(signal.details(), json!({"reason": "drain", "retry_after_ms": 1_500}));
+        assert_eq!(signal.close_reason(), r#"{"reason":"drain","retry_after_ms":1500}"#);
     }
 
     #[test]

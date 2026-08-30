@@ -39,7 +39,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
+use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode};
 use super::limits::{
     CONNECTIONS_PER_DOCUMENT_MAX, CONNECTIONS_PER_USER_MAX, CONNECTIONS_PER_WORKSPACE_MAX,
     PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, SLOW_CONSUMER_QUEUE_BYTES_MAX,
@@ -67,24 +67,16 @@ const DRAIN_CLOSE_CODE: u16 = match ApiErrorKind::ServerDraining(ServerDrainingR
     None => 1008,
 };
 
-/// Builds the drain close reason (`collab-protocol-v1.md`: "UTF-8 close reason 是只含这两个安全字段
-/// 的 JSON且 reason=drain"). Deliberately hand-built rather than `serde_json::json!` + `to_string`:
-/// this is the one place in the whole package where a value gets serialized directly into a
-/// user-visible wire field with no schema type to statically guarantee it stays limited to these
-/// two safe fields, so the shape is spelled out here rather than assembled from a `Value` that a
-/// future edit could accidentally grow.
-fn drain_close_reason(retry_after_ms: u64) -> String {
-    format!(r#"{{"reason":"drain","retry_after_ms":{retry_after_ms}}}"#)
-}
-
-fn drain_rejected_frame(document_id: Uuid, retry_after_ms: u64) -> Frame {
+/// Builds the structured control frame from the same [`DrainSignal`] that supplies the safe close
+/// reason, keeping the active-session and handshake wire shapes identical.
+fn drain_rejected_frame(document_id: Uuid, signal: DrainSignal) -> Frame {
     Frame::Rejected {
         protocol_version: PROTOCOL_VERSION,
         document_id,
         update_id: None,
         code: RejectedCode::ServerDraining,
         recoverable: true,
-        details: Some(serde_json::json!({"reason": "drain", "retry_after_ms": retry_after_ms})),
+        details: Some(signal.details()),
         current_seq: None,
         current_frontier: None,
         audit_event_id: None,
@@ -383,12 +375,13 @@ impl SessionRegistry {
     /// its v0.5 subtree-revocation caller. This is the tested, callable primitive such a trigger
     /// wires into; see this module's own doc comment.
     pub fn drain_all(&self, retry_after_ms: u64) -> usize {
-        let reason = drain_close_reason(retry_after_ms);
+        let signal = DrainSignal::new(retry_after_ms);
+        let reason = signal.close_reason();
         let sessions = self.sessions.lock();
         let mut closed = 0usize;
         for (document_id, by_session) in sessions.iter() {
             for handle in by_session.values() {
-                let frame = drain_rejected_frame(*document_id, retry_after_ms);
+                let frame = drain_rejected_frame(*document_id, signal);
                 handle.send(OutboundEvent::ControlFrame(Box::new(frame)));
                 handle.send(OutboundEvent::Close {
                     code: DRAIN_CLOSE_CODE,
@@ -414,13 +407,14 @@ impl SessionRegistry {
         if member_sessions.is_empty() {
             return 0;
         }
-        let reason = drain_close_reason(retry_after_ms);
+        let signal = DrainSignal::new(retry_after_ms);
+        let reason = signal.close_reason();
         let sessions = self.sessions.lock();
         let mut closed = 0usize;
         for by_session in sessions.values() {
             for (session_id, handle) in by_session {
                 if let Some(document_id) = member_sessions.get(session_id) {
-                    let frame = drain_rejected_frame(*document_id, retry_after_ms);
+                    let frame = drain_rejected_frame(*document_id, signal);
                     handle.send(OutboundEvent::ControlFrame(Box::new(frame)));
                     handle.send(OutboundEvent::Close {
                         code: DRAIN_CLOSE_CODE,

@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::authz::{self, PermissionLevel};
 use super::bootstrap;
 use super::egress::{EgressSequencer, SeqDecision};
-use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate};
+use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate};
 use super::limits::{
     CONNECTION_LIMIT_RETRY_AFTER_MS, FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND,
     OPEN_DOCUMENTS_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX,
@@ -135,6 +135,33 @@ async fn reject_and_close(socket: &mut WebSocket, document_id: Uuid, code: Rejec
     let recoverable = rejected_code_to_api_kind(code).recoverable();
     send(socket, &rejected_frame(document_id, code, recoverable, None)).await;
     close(socket, ws_close_code_for(code), reason).await;
+}
+
+/// Sends the structured drain discriminator before the frozen 4410 close. Active sessions receive
+/// the same frame through [`super::registry::SessionRegistry::drain_workspace`]; using it during
+/// handshake too ensures a UI never has to infer maintenance from close prose.
+async fn reject_drain_and_close(socket: &mut WebSocket, document_id: Uuid, signal: DrainSignal) {
+    send(
+        socket,
+        &Frame::Rejected {
+            protocol_version: PROTOCOL_VERSION,
+            document_id,
+            update_id: None,
+            code: RejectedCode::ServerDraining,
+            recoverable: true,
+            details: Some(signal.details()),
+            current_seq: None,
+            current_frontier: None,
+            audit_event_id: None,
+        },
+    )
+    .await;
+    close(
+        socket,
+        ws_close_code_for(RejectedCode::ServerDraining),
+        &signal.close_reason(),
+    )
+    .await;
 }
 
 /// Builds a `limit_exceeded` `rejected` frame carrying the contract-mandated `details.limit_kind`
@@ -770,9 +797,8 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         reject_and_close(socket, document_id, RejectedCode::NotFound, "document not found").await;
         return None;
     };
-    if let Some(retry_after_ms) = runtime::runtime().workspace_drain_retry_after_ms(consumed.workspace_id) {
-        let reason = format!(r#"{{"reason":"drain","retry_after_ms":{retry_after_ms}}}"#);
-        close(socket, ws_close_code_for(RejectedCode::ServerDraining), &reason).await;
+    if let Some(signal) = runtime::runtime().workspace_drain_signal(consumed.workspace_id) {
+        reject_drain_and_close(socket, document_id, signal).await;
         return None;
     }
     let Ok(flow_enabled) = crate::flow::repository::fetch_flow_enabled(&state.db, consumed.workspace_id).await else {
@@ -1804,6 +1830,73 @@ mod tests {
             .expect("head_seq query runs")
             .expect("document row exists")
             .head_seq
+        }
+
+        #[tokio::test]
+        async fn draining_workspace_handshake_emits_structured_rejection_before_4410_close() {
+            let scratch = scratch_or_skip!("drain-handshake");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state).await;
+            let client_id = "drain-handshake-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let guard = crate::flow::collab::runtime::runtime().begin_workspace_drain(workspace_id, 1_750);
+
+            let mut ws = connect(addr, &ticket, client_id).await;
+            send_frame(
+                &mut ws,
+                &Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: vec![],
+                    client_id: client_id.to_string(),
+                    session_id: Uuid::new_v4(),
+                },
+            )
+            .await;
+            assert!(matches!(recv_frame(&mut ws).await, Frame::Hello { .. }));
+            send_frame(
+                &mut ws,
+                &Frame::Open {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    known_seq: None,
+                    known_frontier: None,
+                },
+            )
+            .await;
+
+            let Frame::Rejected {
+                code,
+                recoverable,
+                details,
+                ..
+            } = recv_frame(&mut ws).await
+            else {
+                panic!("expected a structured drain rejection");
+            };
+            assert_eq!(code, RejectedCode::ServerDraining);
+            assert!(recoverable);
+            let details = details.expect("drain details");
+            assert_eq!(details["reason"], "drain");
+            assert_eq!(details["retry_after_ms"], 1_750);
+
+            let close_message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("close arrives")
+                .expect("stream carries close")
+                .expect("close is not a transport error");
+            let TMessage::Close(Some(close)) = close_message else {
+                panic!("expected a close frame, got {close_message:?}");
+            };
+            assert_eq!(u16::from(close.code), 4410);
+            let close_reason: serde_json::Value = serde_json::from_str(&close.reason).expect("close reason JSON");
+            assert_eq!(close_reason["reason"], "drain");
+            assert_eq!(close_reason["retry_after_ms"], 1_750);
+
+            drop(guard);
+            scratch.drop_self().await;
         }
 
         /// `websocket_frame_bytes_max` (131,072 bytes) is checked pre-decode in `read_frame`,

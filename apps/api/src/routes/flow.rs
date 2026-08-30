@@ -213,7 +213,7 @@ pub struct ExecuteFlowCommandRequest {
 }
 
 /// `POST /api/v1/flow/objects/{object_id}/commands` (`rest-api-v1.md`: `set_title|insert_block|
-/// update_block|delete_block|move_block|archive|restore`).
+/// update_block|delete_block|move_block|semantic_patch|archive|restore`).
 ///
 /// `command::execute_command` re-runs the object-level `edit`/`full_access` permission check
 /// itself (`authz::effective_permission`) on top of the workspace-membership gate here — the same
@@ -1053,7 +1053,7 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
-    /// `POST /api/v1/flow/objects/{object_id}/commands`: all seven v0.4 command types, each
+    /// `POST /api/v1/flow/objects/{object_id}/commands`: all eight v0.4 command types, each
     /// exercised at least once against a real database and the real shared write path
     /// (`flow::command::execute_content_command` calls the identical `write::accept_update`
     /// `flow::collab::session` uses), plus two independent error paths — an `expected_frontier`
