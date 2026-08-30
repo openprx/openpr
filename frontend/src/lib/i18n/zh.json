@@ -2283,7 +2283,14 @@
         "reorderFailed": "重新排序失败，已还原"
       },
       "expand": "展开",
-      "collapse": "折叠"
+      "collapse": "折叠",
+      "contextMenu": {
+        "label": "移动操作",
+        "moveBefore": "移动到前一个之前",
+        "moveAfter": "移动到后一个之后",
+        "moveInside": "移动到内部（此版本不可用）",
+        "moveOutside": "移动到外部（此版本不可用）"
+      }
     },
     "canvas": {
       "emptyTitle": "无标题页面",
@@ -2296,7 +2303,8 @@
         "bullet": "项目符号列表",
         "code": "代码块",
         "empty": "没有匹配的区块类型"
-      }
+      },
+      "unsupported": "该视图暂不可用。"
     },
     "block": {
       "handleLabel": "拖动手柄",
@@ -2351,6 +2359,22 @@
       "notFoundTitle": "未找到",
       "notFoundBody": "该页面不存在，或你没有访问权限。"
     },
-    "titlePlaceholder": "无标题"
+    "titlePlaceholder": "无标题",
+    "relations": {
+      "title": "关联",
+      "comingSoon": "关联功能在此版本中尚不可用。"
+    },
+    "search": {
+      "title": "搜索",
+      "comingSoon": "Flow 搜索在此版本中尚不可用。"
+    },
+    "recovery": {
+      "download": "下载恢复草稿",
+      "downloaded": "已下载恢复草稿",
+      "downloadFailed": "恢复草稿下载失败",
+      "reload": "从服务器重新加载",
+      "reloaded": "已重新加载最新的服务器内容",
+      "dismiss": "关闭"
+    }
   }
 }

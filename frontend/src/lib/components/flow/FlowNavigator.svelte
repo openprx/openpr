@@ -26,11 +26,16 @@
 	import { get } from 'svelte/store';
 	import { goto } from '$app/navigation';
 	import { t } from 'svelte-i18n';
-	import { flowApi, type FlowObjectView } from '$lib/api/flow';
+	import type { FlowObjectView } from '$lib/api/flow';
 	import { FlowCommandService } from '$lib/flow/command-service';
 	import { getNamedMap, type FlowObjectRepository, type OpenFlowObjectResult } from '$lib/flow/object-repository';
 	import { keyBetween } from '$lib/flow/fractional-index';
 	import { FLOW_REPOSITORY_CONTEXT } from '$lib/flow/context-keys';
+	import { resolveRenderer } from '$lib/flow/renderer-registry';
+
+	// `contracts/ui-surface-v1.md` "Renderer registry": an unregistered `${objectType}:${viewType}`
+	// must fail to read-only/unsupported rather than the route always assuming a tree renders.
+	const navRenderer = resolveRenderer('navigator', 'tree');
 
 	interface Props {
 		workspaceId: string;
@@ -133,14 +138,14 @@
 	}
 
 	async function loadObjects(): Promise<void> {
-		const result = await flowApi.listObjects(workspaceId, { limit: 100 });
+		const result = await commandService.listObjects(workspaceId, { limit: 100 });
 		if (result.code === 0 && result.data) {
 			objects = result.data.items.filter((o) => o.object_type === 'page');
 		}
 	}
 
 	async function ensureNavigatorObject(): Promise<string> {
-		const existing = await flowApi.listObjects(workspaceId, { object_type: 'navigator', limit: 1 });
+		const existing = await commandService.listObjects(workspaceId, { object_type: 'navigator', limit: 1 });
 		if (existing.code === 0 && existing.data && existing.data.items.length > 0) {
 			return existing.data.items[0].id;
 		}
@@ -224,6 +229,19 @@
 		}
 
 		switch (event.key) {
+			case 'ContextMenu': {
+				event.preventDefault();
+				const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+				openContextMenu(node.object.id, rect.left, rect.bottom);
+				return;
+			}
+			case 'F10': {
+				if (!event.shiftKey) return;
+				event.preventDefault();
+				const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+				openContextMenu(node.object.id, rect.left, rect.bottom);
+				return;
+			}
 			case 'ArrowDown': {
 				event.preventDefault();
 				const next = visible[index + 1];
@@ -300,6 +318,69 @@
 		draftSiblingOrder = [];
 	}
 
+	// Context menu (`contracts/ui-surface-v1.md` a11y baseline: "context menu 提供 Move before/
+	// after/inside/outside，功能与 pointer drag 相同"). "before"/"after" reuse the exact
+	// same-parent CRDT order write the lift/drop and pointer-drag paths already use above -- there
+	// is still only one write path for a reorder. "inside"/"outside" would nest under a different
+	// parent, which -- matching the same documented v0.4 scope note at the top of this file for
+	// ArrowLeft/ArrowRight while lifted -- is a governance `move_object` command that does not
+	// exist until v0.5, so those two items announce "not available this version" and touch no
+	// state, exactly like the keyboard path already does.
+	let contextMenuFor = $state<string | null>(null);
+	let contextMenuPos = $state<{ x: number; y: number } | null>(null);
+
+	function openContextMenu(objectId: string, x: number, y: number): void {
+		contextMenuFor = objectId;
+		contextMenuPos = { x, y };
+	}
+
+	function closeContextMenu(): void {
+		contextMenuFor = null;
+		contextMenuPos = null;
+	}
+
+	function onTreeContextMenu(event: MouseEvent, objectId: string): void {
+		event.preventDefault();
+		openContextMenu(objectId, event.clientX, event.clientY);
+	}
+
+	async function moveRelative(objectId: string, direction: 'before' | 'after'): Promise<void> {
+		closeContextMenu();
+		if (!navEntry) return;
+		const siblings = siblingsOf(objectId);
+		const index = siblings.findIndex((o) => o.id === objectId);
+		const swapWith = direction === 'before' ? index - 1 : index + 1;
+		if (swapWith < 0 || swapWith >= siblings.length) {
+			announce('flow.nav.liveRegion.reorderFailed');
+			return;
+		}
+		const map = getNamedMap(navEntry.doc, 'order');
+		// Moving before/after its immediate neighbour means the new bounds are that neighbour's
+		// OTHER neighbour on the far side, same math `onDrop`/`commitLift` use.
+		const beforeNeighbourIndex = direction === 'before' ? swapWith - 1 : index;
+		const afterNeighbourIndex = direction === 'before' ? index : swapWith + 1;
+		const beforeNeighbour = siblings[beforeNeighbourIndex];
+		const afterNeighbour = siblings[afterNeighbourIndex];
+		try {
+			const newKey = keyBetween(
+				beforeNeighbour ? orderOf(beforeNeighbour.id) : undefined,
+				afterNeighbour ? orderOf(afterNeighbour.id) : undefined
+			);
+			map.set(objectId, newKey);
+			navEntry.doc.commit();
+			orderVersion += 1;
+			const object = objects.find((o) => o.id === objectId);
+			announce('flow.nav.liveRegion.dropped', { title: object?.title ?? '' });
+		} catch {
+			announce('flow.nav.liveRegion.reorderFailed');
+		}
+	}
+
+	function moveUnavailable(): void {
+		closeContextMenu();
+		announce('flow.nav.liveRegion.reorderFailed');
+	}
+
 	// Pointer drag: same-parent-only, matching the keyboard equivalent's scope exactly.
 	let dragSourceId: string | null = null;
 
@@ -369,20 +450,39 @@
 >
 	<div class="flex items-center justify-between border-b border-slate-200 p-3 dark:border-slate-800">
 		<span class="text-sm font-semibold text-slate-900 dark:text-slate-100">{$t('flow.nav.title')}</span>
-		<button
-			type="button"
-			class="rounded p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
-			onclick={() => createPage()}
-			disabled={creatingParentId !== undefined}
-			aria-label={$t('flow.nav.newPage')}
-			title={$t('flow.nav.newPage')}
-		>
-			+
-		</button>
+		<div class="flex items-center gap-1">
+			<!-- `flow.search.*` (`i18n v0.4 基线`): Flow search is v0.5 scope
+				 (`ui-surface-v1.md` "后续版本 UI 派生" v0.5: "Navigator/command palette 增加 Flow
+				 search"). The entry point exists and is disabled/announced rather than the key
+				 sitting unused, matching the "禁止...缺 key 时把 key string 当发布文案" rule by
+				 never rendering the key as anything other than real, honest UI copy. -->
+			<button
+				type="button"
+				class="rounded p-1 text-slate-400 dark:text-slate-500"
+				disabled
+				aria-disabled="true"
+				aria-label={$t('flow.search.comingSoon')}
+				title={$t('flow.search.comingSoon')}
+			>
+				🔍
+			</button>
+			<button
+				type="button"
+				class="rounded p-1 text-slate-500 hover:bg-slate-200 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+				onclick={() => createPage()}
+				disabled={creatingParentId !== undefined}
+				aria-label={$t('flow.nav.newPage')}
+				title={$t('flow.nav.newPage')}
+			>
+				+
+			</button>
+		</div>
 	</div>
 
 	<div class="flex-1 overflow-y-auto p-2">
-		{#if loading}
+		{#if !navRenderer}
+			<p class="p-2 text-sm text-slate-500 dark:text-slate-400">{$t('flow.canvas.unsupported')}</p>
+		{:else if loading}
 			<p class="p-2 text-sm text-slate-500 dark:text-slate-400">{$t('flow.nav.loading')}</p>
 		{:else if tree.length === 0}
 			<div class="p-3 text-sm text-slate-500 dark:text-slate-400">
@@ -412,6 +512,7 @@
 						onclick={() => select(node.object.id)}
 						onkeydown={(e) => onTreeKeydown(e, node)}
 						onfocus={() => (focusedId = node.object.id)}
+						oncontextmenu={(e) => onTreeContextMenu(e, node.object.id)}
 						ondragstart={() => onDragStart(node.object.id)}
 						ondragover={(e) => onDragOver(e, node.object.id)}
 						ondrop={(e) => onDrop(e, node.object.id)}
@@ -453,3 +554,63 @@
 
 	<div aria-live="polite" class="sr-only" role="status">{announcement}</div>
 </nav>
+
+{#if contextMenuFor && contextMenuPos}
+	<div
+		class="fixed inset-0 z-40"
+		role="presentation"
+		onclick={closeContextMenu}
+		oncontextmenu={(e) => {
+			e.preventDefault();
+			closeContextMenu();
+		}}
+	></div>
+	<div
+		class="fixed z-50 w-48 rounded-md border border-slate-200 bg-white py-1 text-sm shadow-lg dark:border-slate-700 dark:bg-slate-900"
+		style={`left: ${contextMenuPos.x}px; top: ${contextMenuPos.y}px`}
+		role="menu"
+		tabindex="-1"
+		aria-label={$t('flow.nav.contextMenu.label')}
+		onkeydown={(e) => {
+			if (e.key === 'Escape') {
+				e.preventDefault();
+				closeContextMenu();
+			}
+		}}
+	>
+		<button
+			type="button"
+			role="menuitem"
+			class="block w-full px-3 py-1.5 text-left text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+			onclick={() => moveRelative(contextMenuFor!, 'before')}
+		>
+			{$t('flow.nav.contextMenu.moveBefore')}
+		</button>
+		<button
+			type="button"
+			role="menuitem"
+			class="block w-full px-3 py-1.5 text-left text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
+			onclick={() => moveRelative(contextMenuFor!, 'after')}
+		>
+			{$t('flow.nav.contextMenu.moveAfter')}
+		</button>
+		<!-- v0.4 scope note: "inside"/"outside" need the `move_object` governance command, which
+			 does not exist until v0.5 -- see the block comment above `contextMenuFor`'s declaration. -->
+		<button
+			type="button"
+			role="menuitem"
+			class="block w-full px-3 py-1.5 text-left text-slate-400 hover:bg-slate-100 dark:text-slate-500 dark:hover:bg-slate-800"
+			onclick={moveUnavailable}
+		>
+			{$t('flow.nav.contextMenu.moveInside')}
+		</button>
+		<button
+			type="button"
+			role="menuitem"
+			class="block w-full px-3 py-1.5 text-left text-slate-400 hover:bg-slate-100 dark:text-slate-500 dark:hover:bg-slate-800"
+			onclick={moveUnavailable}
+		>
+			{$t('flow.nav.contextMenu.moveOutside')}
+		</button>
+	</div>
+{/if}

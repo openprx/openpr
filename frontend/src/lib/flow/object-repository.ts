@@ -14,7 +14,8 @@
 // chunk out of every route that isn't Flow.
 
 import { writable, type Readable } from 'svelte/store';
-import { flowApi, type FlowObjectView } from '$lib/api/flow';
+import { flowApi, type FlowBootstrap, type FlowObjectView } from '$lib/api/flow';
+import { FlowCommandService } from './command-service';
 import { LoroObjectSession, type AcceptedNotice, type SnapshotPayload } from './object-session';
 import { LiveProjectionStore } from './projection-store';
 import type { EngineDiff, FlowError, ObjectHandle, ObjectProjection, SyncState } from './types';
@@ -107,8 +108,26 @@ async function loadLoro(): Promise<typeof import('loro-crdt')> {
 	return import('loro-crdt');
 }
 
+function fromBase64(value: string): Uint8Array {
+	const binary = atob(value);
+	const out = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+	return out;
+}
+
+// Deliberately NOT `implements ObjectRepositoryContract`: `open()` here returns the richer
+// `OpenFlowObjectResult` (handle + session + projection + doc + flowError), not the frozen
+// interface's bare `ObjectHandle` -- callers (`FlowNavigator`/route pages) need the session and
+// projection in the same call, not a second lookup. Every OTHER member below matches the contract
+// signature exactly (`bootstrap`/`replaceWithAccepted`/`exportRecoveryDraft`/`close`/
+// `getProjection`), so the shape is still the frozen one, just not a formal `implements` given
+// TypeScript's structural typing would reject `open`'s covariant return.
 export class FlowObjectRepository {
 	private readonly open_ = new Map<string, OpenEntry>();
+	// Ticket issuance is the only thing `ObjectSession` needs from `CommandService`
+	// (`command-service.ts`'s `TicketIssuer`); owned here since `CommandService` has no
+	// per-request state of its own and every open session shares one workspace-agnostic instance.
+	private readonly commandService = new FlowCommandService();
 
 	async open(input: { workspaceId: string; objectId: string; signal: AbortSignal }): Promise<OpenFlowObjectResult> {
 		const existing = this.open_.get(input.objectId);
@@ -159,7 +178,7 @@ export class FlowObjectRepository {
 			onFlowError: (error: FlowError) => {
 				flowErrorStore.set(error);
 			}
-		});
+		}, this.commandService);
 
 		// Every local mutation of `doc` -- whether from `EditorAdapter`'s ProseMirror binding, a
 		// navigator reorder, or a title edit -- funnels through this single subscription, so there
@@ -237,6 +256,35 @@ export class FlowObjectRepository {
 		if (!entry) throw new Error(`FlowObjectRepository.exportRecoveryDraft: ${objectId} is not open`);
 		const bytes = entry.doc.export({ mode: 'snapshot' });
 		return new Blob([new Uint8Array(bytes)], { type: 'application/octet-stream' });
+	}
+
+	/** `GET .../bootstrap` (`ObjectRepositoryContract.bootstrap`). Independent of the live
+	 * WebSocket session -- callers that need a fresh snapshot without tearing down the current
+	 * connection (e.g. a manual "reload from server" recovery action) use this instead of
+	 * `ObjectSession.reconnect`. */
+	async bootstrap(objectId: string, known?: { seq: number; frontier: string }): Promise<FlowBootstrap> {
+		const result = await flowApi.getBootstrap(objectId, known ? { known_seq: known.seq, known_frontier: known.frontier } : {});
+		if (result.code !== 0 || !result.data) {
+			throw {
+				code: result.code === 404 ? 'not_found' : result.code === 409 ? 'resync_required' : 'forbidden',
+				recoverable: result.code === 409
+			} satisfies FlowError;
+		}
+		return result.data;
+	}
+
+	/** `ObjectRepositoryContract.replaceWithAccepted`: imports a bootstrap's snapshot+tail into the
+	 * matching open document (`bootstrap.object_id`), wholesale. Loro's `import` is CRDT-merge, not
+	 * destructive replace, so this only ever advances the doc toward the server's accepted state --
+	 * it never rolls back content the doc already has that the server has since superseded. */
+	async replaceWithAccepted(bootstrap: FlowBootstrap): Promise<void> {
+		const entry = this.open_.get(bootstrap.object_id);
+		if (!entry) return;
+		entry.doc.import(fromBase64(bootstrap.snapshot_base64));
+		for (const update of bootstrap.tail_updates) {
+			entry.doc.import(fromBase64(update.bytes));
+		}
+		entry.projection.applyEngineDiff({ documentId: entry.handle.documentId } satisfies EngineDiff, bootstrap.head_seq);
 	}
 }
 

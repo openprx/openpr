@@ -4,14 +4,18 @@
 // (`contracts/ui-surface-v1.md` "五个 adapter"). `ObjectRepository`/`CommandService` compose it;
 // components never import it directly.
 //
-// v0.4 baseline note: `POST /flow/objects/{object_id}/commands` and
-// `GET /flow/objects/{object_id}/bootstrap` are in the frozen contract table but are not wired
-// into the server router at this repo's baseline (`e8f335c`) -- only create/list/get/history,
-// collab ticket/ws/diagnostics/verify, and (not yet) `features/flow` exist server-side. This file
-// still exposes typed methods for the full v0.4 table (so callers compile against the frozen
-// contract and the gap is a single well-known TODO, not silent), but the Web v0.4 delivery in
-// this package only calls the methods the server actually serves: content edits go over
-// `ObjectSession`/WebSocket `update` frames, not `commands`/`bootstrap`.
+// v0.4 baseline note: this repo's baseline now routes `POST /flow/objects/{object_id}/commands`
+// and `GET /flow/objects/{object_id}/bootstrap` server-side (`apps/api/src/routes/flow.rs`'s
+// `post_flow_object_command`/`get_flow_object_bootstrap`, wired in `main.rs`) -- both are exposed
+// below as `executeCommand`/`getBootstrap`. Content edits during an open session still go over
+// `ObjectSession`/WebSocket `update` frames, not `commands`; `executeCommand` backs the
+// server-governed lifecycle actions (`set_title|insert_block|update_block|delete_block|
+// move_block|archive|restore`) `CommandService.execute` needs, and `getBootstrap` backs recovery
+// (`ObjectRepository.bootstrap`/`replaceWithAccepted`). `GET /flow/objects/{object_id}/diff` is
+// still in the frozen contract table but is NOT wired into the server router at this baseline --
+// `getDiff` below is a typed-but-unrouted method (same documented-gap pattern this file already
+// uses elsewhere): it compiles against the frozen contract and will 404 until the server routes
+// it, which is a normal `ApiResult` error a caller can already handle, not a silent wrong result.
 
 import { apiClient, type ApiResult } from './client';
 
@@ -125,6 +129,65 @@ export interface FlowFeatureFlags {
 	updated_by: string | null;
 }
 
+/** v0.4 command types (`rest-api-v1.md`'s `POST .../commands` row). */
+export type FlowCommandType =
+	| 'set_title'
+	| 'insert_block'
+	| 'update_block'
+	| 'delete_block'
+	| 'move_block'
+	| 'archive'
+	| 'restore';
+
+export interface FlowCommandInput {
+	type: FlowCommandType;
+	payload?: unknown;
+}
+
+export interface ExecuteFlowCommandInput {
+	command: FlowCommandInput;
+	expected_frontier?: string;
+	idempotency_key: string;
+	message?: string;
+}
+
+export interface TailUpdateEntry {
+	seq: number;
+	update_id: string;
+	/** Base64 of the raw CRDT update bytes. */
+	bytes: string;
+	before_frontier: string;
+	after_frontier: string;
+}
+
+/** `GET .../bootstrap` response (`apps/api/src/flow/model.rs::Bootstrap`). */
+export interface FlowBootstrap {
+	object_id: string;
+	document_id: string;
+	engine: string;
+	format_version: string;
+	snapshot_seq: number;
+	head_seq: number;
+	/** Base64 of the full document snapshot bytes. */
+	snapshot_base64: string;
+	tail_updates: TailUpdateEntry[];
+	head_frontier: string;
+	limits: unknown;
+	websocket_path: string;
+}
+
+/** `GET .../diff` response (`rest-api-v1.md`row 148) -- typed, but NOT routed server-side at this
+ * baseline; see this file's header comment. */
+export interface FlowDiffResponse {
+	object_id: string;
+	from_seq: number;
+	to_seq: number;
+	from_frontier: string;
+	to_frontier: string;
+	semantic_diff: unknown;
+	rendered?: string;
+}
+
 function buildQuery(params: Record<string, string | number | boolean | undefined>): string {
 	const search = new URLSearchParams();
 	for (const [key, value] of Object.entries(params)) {
@@ -188,5 +251,26 @@ export const flowApi = {
 	 */
 	getFeatureFlags(workspaceId: string): Promise<ApiResult<FlowFeatureFlags>> {
 		return apiClient.get<FlowFeatureFlags>(`/api/v1/workspaces/${workspaceId}/features/flow`);
+	},
+
+	executeCommand(objectId: string, input: ExecuteFlowCommandInput): Promise<ApiResult<AcceptedChange>> {
+		return apiClient.post<AcceptedChange>(`/api/v1/flow/objects/${objectId}/commands`, input);
+	},
+
+	getBootstrap(
+		objectId: string,
+		known: { known_seq?: number; known_frontier?: string } = {}
+	): Promise<ApiResult<FlowBootstrap>> {
+		const qs = buildQuery({ known_seq: known.known_seq, known_frontier: known.known_frontier });
+		return apiClient.get<FlowBootstrap>(`/api/v1/flow/objects/${objectId}/bootstrap${qs}`);
+	},
+
+	/** Typed but unrouted server-side at this baseline -- see this file's header comment. */
+	getDiff(
+		objectId: string,
+		query: { from_seq: number; to_seq: number; render?: 'semantic_json' | 'markdown' }
+	): Promise<ApiResult<FlowDiffResponse>> {
+		const qs = buildQuery({ from_seq: query.from_seq, to_seq: query.to_seq, render: query.render });
+		return apiClient.get<FlowDiffResponse>(`/api/v1/flow/objects/${objectId}/diff${qs}`);
 	}
 };
