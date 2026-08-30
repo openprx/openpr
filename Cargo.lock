@@ -618,7 +618,10 @@ dependencies = [
 name = "collab-core"
 version = "0.2.39"
 dependencies = [
+ "crc32fast",
+ "libc",
  "loro",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2",
