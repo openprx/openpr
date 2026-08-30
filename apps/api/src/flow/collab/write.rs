@@ -391,13 +391,25 @@ async fn run_locked_phase(
     ))
     .await?;
 
-    // [layer 1] the commit-time epoch fence, held to commit.
-    if fence_epoch_for_share(&tx, request.workspace_id, request.checked_epoch)
-        .await
-        .is_err()
-    {
-        let _ = tx.rollback().await;
-        return Ok(LockedOutcome::EpochMismatch);
+    // [layer 1] the commit-time epoch fence, held to commit. Only a genuine epoch mismatch
+    // (`ApiError::Conflict` -- `authz_epoch` really did move past `checked_epoch`) means the
+    // caller's permission is stale and must come back as a permanent, non-recoverable
+    // `PolicyRejected`. Any other error here (a `lock_timeout`/`statement_timeout` hit while
+    // waiting on the `FOR SHARE`, a dropped connection, ...) says nothing about authorization at
+    // all -- it must propagate as a real `Err` so the caller's existing rebase/contention retry
+    // handles it, exactly like every other database error in this function already does.
+    // Conflating the two used to report ordinary transient contention as a false, permanent
+    // policy rejection (never retried, since `EpochMismatch` is a terminal branch below).
+    match fence_epoch_for_share(&tx, request.workspace_id, request.checked_epoch).await {
+        Ok(()) => {}
+        Err(ApiError::Conflict(_)) => {
+            let _ = tx.rollback().await;
+            return Ok(LockedOutcome::EpochMismatch);
+        }
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
     }
 
     #[derive(FromQueryResult)]
@@ -1094,6 +1106,143 @@ mod database_tests {
             final_epoch,
             original_epoch + 1,
             "B's revocation must still have taken effect"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// Root-cause reproduction for the full-suite flake: `fence_epoch_for_share`'s `SELECT ...
+    /// FOR SHARE` can fail for reasons that have nothing to do with `authz_epoch` ever moving --
+    /// most concretely, Postgres's own `lock_timeout` (`DOCUMENT_LOCK_WAIT_MS_MAX`, 100ms) firing
+    /// while it waits on a row lock some *other* transaction happens to be holding a moment too
+    /// long (exactly what many scratch databases hammering one shared Postgres instance under
+    /// `cargo test --workspace` produce). `B` here holds a real `FOR UPDATE` on the same row for
+    /// 150ms -- past `A`'s 100ms `lock_timeout` -- then rolls back having never touched
+    /// `authz_epoch` at all. No authorization ever changed; this is pure transient contention.
+    ///
+    /// Before the fix this reads as `LockedOutcome::EpochMismatch` (any `Err` from the fence
+    /// check was treated as a real mismatch) and surfaces as a permanent, non-recoverable
+    /// `PolicyRejected` on `A`'s very first attempt, with no retry. After the fix, only a genuine
+    /// `ApiError::Conflict` may do that; every other error (this lock timeout included)
+    /// propagates as a real `Err`, which `accept_update`'s existing rebase loop already retries --
+    /// so once B's lock is gone, the exact same write goes on to commit normally.
+    #[tokio::test]
+    async fn epoch_fence_lock_timeout_must_not_surface_as_policy_rejected() {
+        let scratch = scratch_or_skip!("epoch-lock-timeout");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct SnapshotRow {
+            snapshot: Vec<u8>,
+        }
+        let snapshot_row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        let (update_bytes, _engine) = a_valid_update_against(&snapshot_row.snapshot);
+
+        let original_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).expect("checked by scratch_or_skip! above");
+        let db_url = admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("db url");
+        let db_b = Database::connect(&db_url).await.expect("B connects independently");
+
+        let (b_holding_tx, b_holding_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let b_task = tokio::spawn(async move {
+            let tx = db_b.begin().await.expect("B begins");
+            // The exact row `fence_epoch_for_share` takes `FOR SHARE` on -- but B here stands in
+            // for *any* transient holder of this lock, not an authorization change.
+            tx.query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("B locks the epoch row");
+            b_holding_tx.send(()).expect("A is still waiting to receive this");
+
+            // Held well past A's 100ms `lock_timeout` so A's own `FOR SHARE` is guaranteed to be
+            // cancelled by Postgres (`55P03 lock_not_available`), not merely to block and then
+            // succeed once granted.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+
+            // B never advances `authz_epoch` and rolls back: nothing about authorization ever
+            // changed here, only the row was momentarily locked.
+            tx.rollback()
+                .await
+                .expect("B rolls back, releasing the row lock without changing authz_epoch");
+        });
+
+        b_holding_rx.await.expect("B signals it holds the lock");
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+        let update_id = Uuid::new_v4();
+        let db_for_a = state.db.clone();
+        let a_task = tokio::spawn(async move {
+            accept_update(
+                &db_for_a,
+                &cache,
+                &coordinator,
+                &snapshot_advancer,
+                10,
+                UpdateRequest {
+                    document_id,
+                    update_id,
+                    bytes: update_bytes,
+                    idempotency_key: None,
+                    origin_client_id: Some("test-client-a".to_string()),
+                    message: None,
+                    actor_id: owner_id,
+                    workspace_id,
+                    checked_epoch: original_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await
+        });
+
+        let (a_joined, b_joined) = tokio::join!(a_task, b_task);
+        b_joined.expect("B task joins");
+        let a_result = a_joined.expect("A task joins").expect("no hard database error");
+
+        match a_result {
+            AcceptOutcome::Accepted(accepted) => {
+                assert_eq!(
+                    accepted.update_id, update_id,
+                    "A's own write must be the one that landed"
+                );
+            }
+            AcceptOutcome::Rejected(rejected) => {
+                panic!(
+                    "a transient lock_timeout on the epoch fence must never surface as a rejection -- \
+                     B never changed authz_epoch, this must retry until B's lock clears instead of \
+                     reporting a false permanent rejection, got {rejected:?}"
+                );
+            }
+        }
+
+        let final_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+        assert_eq!(
+            final_epoch, original_epoch,
+            "B never touched authz_epoch -- it must be exactly what it started as"
+        );
+        assert_eq!(
+            count_collab_updates(&state, document_id, update_id).await,
+            1,
+            "A's update must have been persisted exactly once, after B's lock cleared"
         );
 
         scratch.drop_self().await;
