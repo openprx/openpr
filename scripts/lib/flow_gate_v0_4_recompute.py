@@ -402,6 +402,30 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     bridge_verifier_gates(evidence_root, "limits-result.json", "sylvode.flow.limits-result.v1", gates, reasons)
     bridge_verifier_gates(evidence_root, "error-contract-result.json", "sylvode.flow.error-contract-result.v1", gates, reasons)
 
+    # ---- deployed three-hop WebSocket verifier: backs 1 gate ----
+    # A missing/unreachable real deployment is written as an explicit failed
+    # verdict. The bridge copies it verbatim; wiring can never make the gate
+    # green without all 13 live checks passing.
+    bridge_verifier_gates(
+        evidence_root,
+        "deployed-chain-websocket-result.json",
+        "sylvode.flow.deployed-chain-websocket-result.v1",
+        gates,
+        reasons,
+    )
+
+    # ---- frontend v0.4 aggregate: backs 4 web gates ----
+    # Per-gate status is based only on failed automated checks. Named skips
+    # remain in the artifact as manual-signoff work and are never counted as
+    # passed checks by the producer.
+    bridge_verifier_gates(
+        evidence_root,
+        "ui-e2e-result.json",
+        "sylvode.flow.ui-e2e-result.v1",
+        gates,
+        reasons,
+    )
+
     # ---- forms regression: backs 1 gate ----
     # scripts/verify-flow-forms-regression-v0.4.sh runs the repository's
     # existing Universal Forms CI gate bundle (scripts/ci-universal-forms-

@@ -395,6 +395,102 @@ if [[ ! -f "$UI_RESULT_FILE" ]] || ! jq -e . "$UI_RESULT_FILE" >/dev/null 2>&1; 
   exit 2
 fi
 
+# Promote the frontend aggregate from a private log-sidecar into the artifact
+# named by v0.4-gate.yaml. Passed, failed and deferred-to-human checks remain
+# three disjoint counters: a skipped check is preserved verbatim and is never
+# added to checks_passed.
+UI_EVIDENCE_PATH="$EVIDENCE_ROOT/ui-e2e-result.json"
+UI_EVIDENCE_TMP="$UI_EVIDENCE_PATH.tmp"
+python3 - "$UI_RESULT_FILE" "$UI_EVIDENCE_TMP" "$SOURCE_HEAD" "$GENERATED_AT" "$UI_LOG_FILE" "$UI_EXIT_CODE" <<'PY'
+import json
+import sys
+
+raw_path, out_path, source_head, generated_at, log_path, exit_code = sys.argv[1:7]
+command_exit_code = int(exit_code)
+raw = json.load(open(raw_path, encoding="utf-8"))
+expected = {
+    "i18n_zh_en_flow_key_parity",
+    "vite_wasm_static_build_and_deep_route",
+    "web_ime_undo_selection_and_sync_state",
+    "navigator_keyboard_drag_equivalence",
+}
+rows = raw.get("gates")
+if not isinstance(rows, list):
+    raise SystemExit("frontend result has no gates array")
+by_name = {}
+for row in rows:
+    if not isinstance(row, dict) or not isinstance(row.get("gate"), str):
+        raise SystemExit("frontend result contains a malformed gate row")
+    name = row["gate"]
+    if name in by_name:
+        raise SystemExit(f"frontend result contains duplicate gate {name}")
+    by_name[name] = row
+if set(by_name) != expected:
+    raise SystemExit(
+        f"frontend result gate set differs: missing={sorted(expected - set(by_name))}, "
+        f"extra={sorted(set(by_name) - expected)}"
+    )
+
+gates = {}
+for name in sorted(expected):
+    row = by_name[name]
+    passed_count = row.get("checks_passed")
+    failed_count = row.get("checks_failed")
+    skipped_count = row.get("checks_skipped")
+    skipped_checks = row.get("skipped_checks")
+    if not all(isinstance(value, int) and value >= 0 for value in (passed_count, failed_count, skipped_count)):
+        raise SystemExit(f"frontend result {name} has invalid check counters")
+    if not isinstance(skipped_checks, list) or len(skipped_checks) != skipped_count:
+        raise SystemExit(f"frontend result {name} skipped count/list disagree")
+    gate_passed = command_exit_code == 0 and row.get("passed") is True and failed_count == 0
+    gates[name] = {
+        "status": "passed" if gate_passed else "failed",
+        "reason": (
+            f"command exit {command_exit_code}; {passed_count} automated checks passed, {failed_count} failed, "
+            f"{skipped_count} deferred to manual sign-off"
+        ),
+        "coverage": row.get("coverage"),
+        "automation": row.get("automation"),
+        "manual_keys": row.get("manual_keys", []),
+        "checks_passed": passed_count,
+        "checks_failed": failed_count,
+        "checks_skipped": skipped_count,
+        "failures": row.get("failures", []),
+        "skipped_checks": skipped_checks,
+        "duration_ms": row.get("duration_ms", 0),
+    }
+
+totals = raw.get("totals")
+computed_totals = {
+    "passed": sum(row["checks_passed"] for row in gates.values()),
+    "failed": sum(row["checks_failed"] for row in gates.values()),
+    "skipped": sum(row["checks_skipped"] for row in gates.values()),
+}
+if totals != computed_totals:
+    raise SystemExit(f"frontend result totals disagree: raw={totals}, computed={computed_totals}")
+
+result = {
+    "schema_version": "sylvode.flow.ui-e2e-result.v1",
+    "schema_path": "docs/schemas/sylvode-flow-ui-e2e-result-v1.schema.json",
+    "release": "0.4",
+    "source_head": source_head,
+    "generated_at": generated_at,
+    "command": "bun run --cwd frontend test:flow-v0.4",
+    "command_exit_code": command_exit_code,
+    "raw_result": raw_path,
+    "log": log_path,
+    "totals": computed_totals,
+    "gates": gates,
+    "passed": all(row["status"] == "passed" for row in gates.values()),
+}
+with open(out_path, "w", encoding="utf-8") as handle:
+    json.dump(result, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+sync "$UI_EVIDENCE_TMP" 2>/dev/null || true
+mv -f "$UI_EVIDENCE_TMP" "$UI_EVIDENCE_PATH"
+echo "  wrote $UI_EVIDENCE_PATH" >&2
+
 DYNAMIC_JSON_FILE="$LOG_DIR/errors.dynamic.json"
 python3 - "$LOG_DIR" <<'PY' > "$DYNAMIC_JSON_FILE"
 import glob

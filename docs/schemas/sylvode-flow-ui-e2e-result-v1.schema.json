@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-ui-e2e-result-v1.schema.json",
+  "title": "Sylvode Flow UI E2E Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "schema_path",
+    "release",
+    "source_head",
+    "generated_at",
+    "command",
+    "command_exit_code",
+    "raw_result",
+    "log",
+    "totals",
+    "gates",
+    "passed"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "sylvode.flow.ui-e2e-result.v1"
+    },
+    "schema_path": {
+      "const": "docs/schemas/sylvode-flow-ui-e2e-result-v1.schema.json"
+    },
+    "release": {
+      "const": "0.4"
+    },
+    "source_head": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "command": {
+      "const": "bun run --cwd frontend test:flow-v0.4"
+    },
+    "command_exit_code": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "raw_result": {
+      "type": "string",
+      "minLength": 1
+    },
+    "log": {
+      "type": "string",
+      "minLength": 1
+    },
+    "totals": {
+      "$ref": "#/$defs/check_counts"
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "i18n_zh_en_flow_key_parity",
+        "vite_wasm_static_build_and_deep_route",
+        "web_ime_undo_selection_and_sync_state",
+        "navigator_keyboard_drag_equivalence"
+      ],
+      "properties": {
+        "i18n_zh_en_flow_key_parity": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "vite_wasm_static_build_and_deep_route": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "web_ime_undo_selection_and_sync_state": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "navigator_keyboard_drag_equivalence": {
+          "$ref": "#/$defs/gate_result"
+        }
+      }
+    },
+    "passed": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "check_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "failed", "skipped"],
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "gate_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reason",
+        "coverage",
+        "automation",
+        "manual_keys",
+        "checks_passed",
+        "checks_failed",
+        "checks_skipped",
+        "failures",
+        "skipped_checks",
+        "duration_ms"
+      ],
+      "properties": {
+        "status": {
+          "enum": ["passed", "failed"]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "coverage": {
+          "enum": ["full", "partial"]
+        },
+        "automation": {
+          "enum": ["automation_complete", "automation_partial"]
+        },
+        "manual_keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "checks_passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checks_failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "checks_skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "skipped_checks": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

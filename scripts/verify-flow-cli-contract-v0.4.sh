@@ -51,9 +51,11 @@ set -euo pipefail
 # 2 = usage/tool/environment error.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 REPO_ROOT="$ROOT_DIR"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 CONTRACT_PATH=""
 RELEASE="0.4"
 DATABASE_URL="${OPENPR_TEST_DATABASE_URL:-}"
@@ -77,7 +79,7 @@ Options:
                          Default: $OPENPR_TEST_DATABASE_URL
   --repo-root DIR        Default: this checkout.
   --contracts-root DIR   Default: /opt/working/sylvode-flow
-  --evidence-root DIR    Default: /opt/working/sylvode-flow/evidence/v0.4
+  --evidence-root DIR    Required. Evidence output directory.
   --json                 Required for CLI-contract compatibility.
   -h, --help             Show this help and exit 0.
 
@@ -108,6 +110,13 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  echo "FAIL: --evidence-root is required; evidence must never default into the contract repository" >&2
+  exit 2
+fi
+if ! CONTRACT_PATH="$(flow_resolve_contract_path --contract "$CONTRACT_PATH" "$CONTRACTS_ROOT")"; then
+  exit 2
+fi
 if [[ -z "$DATABASE_URL" ]]; then
   echo "FAIL: no database URL configured (set --database-url or OPENPR_TEST_DATABASE_URL)" >&2
   exit 2
@@ -115,7 +124,6 @@ fi
 for tool in jq git python3 psql curl cargo sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: missing required command: $tool" >&2; exit 2; }
 done
-[[ -f "$CONTRACT_PATH" ]] || { echo "FAIL: contract not found: $CONTRACT_PATH" >&2; exit 2; }
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
@@ -134,6 +142,7 @@ VIOLATIONS=()
 
 # ================= static: contract table vs compiled constants =================
 echo "=== static: error-mapping-v1.md exit-code table vs cli_app::error::exit ===" >&2
+# shellcheck disable=SC2016
 STATIC_JSON="$(python3 -c '
 import json, re, sys
 

@@ -15,22 +15,10 @@ set -euo pipefail
 # fabricating a schema-shaped file with missing/placeholder artifacts is
 # exactly the fake-green pattern this v0.4 work exists to close.
 #
-# v0.4-gate.yaml's required_commands list has 17 entries (13 originally, 15
-# after `02e8cb7` added limits_verify/events_verify, 17 with the
-# transport_auth_verify and cross_workspace_verify keys the four collab
-# security hard gates need). Twelve of the seventeen now have a corresponding
-# verify-flow-*-v0.4.sh script implemented (surface_parity,
-# legacy_pages_inventory + legacy_pages_entry_verify, cardinality_verify,
-# integrity_records_verify, authz_baseline_verify, collab_architecture_verify,
-# events_verify, limits_verify, error_contract_verify, transport_auth_verify,
-# cross_workspace_verify); the remaining one
-# (deployed_chain_websocket_upgrade) does not exist yet. This script records
-# that missing script as a FAILED step with an explicit "script not
-# implemented" message rather than skipping it silently, so report correctly
-# and honestly exits 1 and does not write gate-result.json until that script
-# exists and passes -- and, independently, until every hard gate the
-# now-implemented verifiers themselves compute also passes (several currently
-# fail honestly; see their own file-header comments).
+# Every required verification command that has a repository producer is run
+# here. The deployed verifier reports an explicit failed gate when its real
+# three-hop environment is unavailable; report invokes it instead of pretending
+# its script is absent.
 #
 # Every invocation (pass or fail) also writes an atomic run log so a
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
@@ -42,7 +30,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 REPO_ROOT="$ROOT_DIR"
 SKIP_GENERIC=0
 
@@ -58,15 +46,11 @@ with a real checksum -- atomically writes <evidence-root>/gate-result.json.
 A run log is always written to <evidence-root>/report-run-log.json, pass
 or fail, so a failed report is never silently lost.
 
-This script never invents an artifact. Steps whose verify-flow-*-v0.4.sh
-script does not exist yet are recorded as failed with an explicit
-"script not implemented" message; report exits 1 with a clear list of
-what is missing.
+This script never invents an artifact. Missing required artifacts remain
+explicit blockers and make report exit 1.
 
 Options:
-  --evidence-root DIR    Where evidence/v0.4/<name> artifacts are written
-                          and read from. Default:
-                          /opt/working/sylvode-flow/evidence/v0.4
+  --evidence-root DIR    Required. Where evidence artifacts are written and read.
   --contracts-root DIR   Root for decisions/, contracts/, security/
                           artifact paths. Default: /opt/working/sylvode-flow
   --repo-root DIR         Repository the cargo/bun commands run in and
@@ -96,6 +80,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unexpected argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  echo "FAIL: --evidence-root is required; evidence must never default into the contract repository" >&2
+  exit 2
+fi
 
 for tool in jq sha256sum git; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -154,24 +143,6 @@ run_step() {
   return $exit_code
 }
 
-# A step whose backing script does not exist: record a failed check
-# without invoking anything.
-run_missing_step() {
-  local id="$1" reason="$2"
-  OVERALL_FAILED=1
-  local log_file="$EVIDENCE_ROOT/logs/${id}.log"
-  mkdir -p "$(dirname "$log_file")"
-  printf 'NOT IMPLEMENTED: %s\n' "$reason" > "$log_file"
-  local log_sha
-  log_sha="$(sha256_of "$log_file")"
-  CHECKS_JSON="$(jq -c \
-    --arg id "$id" --arg reason "$reason" \
-    --arg evidence "evidence/v0.4/logs/${id}.log" --arg sha256 "$log_sha" \
-    '. + [{id:$id, status:"failed", command:("NOT IMPLEMENTED: " + $reason), exit_code:2, duration_ms:0, evidence:$evidence, sha256:$sha256}]' \
-    <<<"$CHECKS_JSON")"
-  echo "[failed] $id: NOT IMPLEMENTED -- $reason"
-}
-
 cd "$REPO_ROOT"
 
 if [[ $SKIP_GENERIC -eq 1 ]]; then
@@ -182,8 +153,8 @@ else
   run_step generic.cargo_check cargo check --workspace --all-targets || true
   run_step generic.cargo_clippy cargo clippy --workspace --all-targets -- -D warnings || true
   run_step generic.cargo_test cargo test --workspace || true
-  run_step generic.bun_check bun --cwd frontend run check || true
-  run_step generic.bun_build bun --cwd frontend run build || true
+  run_step generic.bun_check bun run --cwd frontend check || true
+  run_step generic.bun_build bun run --cwd frontend build || true
   run_step generic.ci_universal_forms_gates bash scripts/ci-universal-forms-gates.sh || true
   run_step generic.test_mcp bash scripts/test-mcp.sh || true
 fi
@@ -220,7 +191,7 @@ echo "=== Sylvode Flow v0.4 report: migration forward/rollback verify ==="
 run_step required.migration_verify "$ROOT_DIR/scripts/verify-flow-migration-v0.4.sh" --migration migrations/0054_flow_data_layer.sql --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
 echo "=== Sylvode Flow v0.4 report: document row lock / seq uniqueness verify ==="
-run_step required.document_seq_verify "$ROOT_DIR/scripts/verify-flow-document-seq-v0.4.sh" --concurrency 8 --rounds 3 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+run_step required.document_seq_verify "$ROOT_DIR/scripts/verify-flow-document-seq-v0.4.sh" --concurrency 8 --rounds 3 --instances 3 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
 echo "=== Sylvode Flow v0.4 report: MCP three-transport contract verify ==="
 run_step required.mcp_transport_verify "$ROOT_DIR/scripts/verify-flow-mcp-transports-v0.4.sh" --transports http,sse,stdio --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
@@ -237,8 +208,8 @@ run_step required.transport_auth_verify "$ROOT_DIR/scripts/verify-flow-transport
 echo "=== Sylvode Flow v0.4 report: cross-workspace / policy-bypass negatives ==="
 run_step required.cross_workspace_verify "$ROOT_DIR/scripts/verify-flow-cross-workspace-v0.4.sh" --threat-model "$CONTRACTS_ROOT/security/threat-model.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
 
-echo "=== Sylvode Flow v0.4 report: not-yet-implemented required_commands ==="
-run_missing_step required.deployed_chain_websocket_upgrade "scripts/verify-flow-deployed-websocket-v0.4.sh does not exist"
+echo "=== Sylvode Flow v0.4 report: deployed three-hop WebSocket verify ==="
+run_step required.deployed_chain_websocket_upgrade "$ROOT_DIR/scripts/verify-flow-deployed-websocket-v0.4.sh" --chain caddy,nginx,api --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then

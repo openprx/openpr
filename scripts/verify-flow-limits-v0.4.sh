@@ -858,14 +858,16 @@ jq -r '.wire_violations[] | "    VIOLATION(wire): " + .' "$STATIC_JSON_FILE" >&2
 LOG_DIR="$EVIDENCE_ROOT/logs"
 run_group() {
   local name="$1" pkg="$2" filter="$3"
+  local extra_args="${4:-}"
   local log="$LOG_DIR/limits.dyn.${name}.log"
   if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
     echo "(skipped by --skip-cargo-test)" > "$log"
     return
   fi
-  echo "  running: cargo test -p $pkg '$filter'" >&2
+  echo "  running: cargo test -p $pkg $extra_args '$filter'" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p "$pkg" "$filter" -- --test-threads=4 ) > "$log" 2>&1
+  # shellcheck disable=SC2086
+  ( cd "$REPO_ROOT" && cargo test -p "$pkg" $extra_args "$filter" -- --test-threads=4 ) > "$log" 2>&1
   set -e
 }
 
@@ -879,6 +881,7 @@ echo "=== dynamic: cargo test groups ===" >&2
 # `failed` no matter how well the static name-matching works.
 run_group registry_tests api "flow::collab::registry::tests::"
 run_group snapshot_pure api "flow::collab::snapshot::tests::"
+run_group flow_command_tests api "flow::command::typed_error_mapping_tests::" "--lib"
 run_group collab_core_limits collab-core "limits::tests::"
 # The isolation boundary's own enforcement/test sites (crates/collab-core/src/isolation/{host,
 # alloc,child_runtime,limits}.rs -- see TEST_SOURCE_TEXT_PARTS above) live under the `isolation::`
@@ -1175,13 +1178,17 @@ for key, limit_kind, crate_test_name, ws_test_name, rest_test_name in STRUCTURAL
 r = row_by_kind["semantic_patch_bytes"]
 spb_enforcement_found = f["semantic_patch_bytes_enforcement_found"]
 spb_test = f["boundary_test_covering"].get("semantic_patch_bytes")
-spb_passed = spb_enforcement_found and spb_test is not None and dtest(spb_test.rsplit("::", 1)[-1]) == "ok"
+spb_required_test_name = "semantic_patch_bytes_exact_boundary_is_accepted_and_plus_one_is_rejected_before_writes"
+spb_exact_test_found = spb_test is not None and spb_test.rsplit("::", 1)[-1] == spb_required_test_name
+spb_test_status = dtest(spb_required_test_name)
+spb_passed = spb_enforcement_found and spb_exact_test_found and spb_test_status == "ok"
 boundary_cases.append(case(
     "semantic_patch_json_bytes_max", "semantic_patch_bytes", r["value"],
     "passed" if spb_passed else "failed",
     (
         f"semantic_patch_json_bytes_max is referenced outside limits.rs (enforcement_found="
-        f"{spb_enforcement_found}) and a boundary test was found ({spb_test}), both required for passed"
+        f"{spb_enforcement_found}); required boundary test {spb_required_test_name} found="
+        f"{spb_exact_test_found}, dynamic status={spb_test_status}"
         if spb_enforcement_found
         else "no semantic_patch REST/MCP endpoint or byte-length check exists anywhere in "
         "apps/api/src (grepped for semantic_patch_json_bytes_max/SEMANTIC_PATCH_JSON_BYTES_MAX "
@@ -1189,7 +1196,10 @@ boundary_cases.append(case(
         "would guard has not been built"
     ),
     evidence={"semantic_patch_bytes_enforcement_found": spb_enforcement_found,
-              "boundary_test_covering": spb_test},
+              "boundary_test_covering": spb_test,
+              "required_test": spb_required_test_name,
+              "required_test_found": spb_exact_test_found,
+              "dynamic_test_status": spb_test_status},
 ))
 
 r = row_by_kind["update_bytes"]

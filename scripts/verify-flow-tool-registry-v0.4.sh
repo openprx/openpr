@@ -42,9 +42,11 @@ set -euo pipefail
 # error.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 REPO_ROOT="$ROOT_DIR"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 BASELINE_PATH=""
 RELEASE="0.4"
 JSON_MODE=0
@@ -65,7 +67,7 @@ Options:
   --release X.Y          Row of the baseline's "版本预期" table to read.
                          Default: 0.4
   --contracts-root DIR   Default: /opt/working/sylvode-flow
-  --evidence-root DIR    Default: /opt/working/sylvode-flow/evidence/v0.4
+  --evidence-root DIR    Required. Evidence output directory.
   --repo-root DIR        Repository containing apps/mcp-server. Default:
                          this checkout.
   --json                 Required for CLI-contract compatibility.
@@ -96,11 +98,14 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  echo "FAIL: --evidence-root is required; evidence must never default into the contract repository" >&2
+  exit 2
+fi
 for tool in jq git python3 cargo sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: missing required command: $tool" >&2; exit 2; }
 done
-if [[ ! -f "$BASELINE_PATH" ]]; then
-  echo "FAIL: baseline contract not found: $BASELINE_PATH" >&2
+if ! BASELINE_PATH="$(flow_resolve_contract_path --baseline "$BASELINE_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -224,6 +229,7 @@ EXTRA_SCOPES="$(jq -c -n --argjson live "$LIVE_JSON" --argjson pol "$POLICY_JSON
 
 # ---- the hardcoded touchpoints tool-count-baseline.md names ----
 # Each entry: id|relative path|python regex with one capturing group holding the count.
+# shellcheck disable=SC2016
 TOUCHPOINTS=(
   'registry_assertion|apps/mcp-server/src/tools/mod.rs|tools\.len\(\),\s*(\d+),'
   'policy_scopes_array|apps/mcp-server/src/server.rs|const TOOL_POLICY_SCOPES: \[\(&str, PolicyScope\); (\d+)\]'

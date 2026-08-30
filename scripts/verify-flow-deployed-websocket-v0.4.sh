@@ -134,7 +134,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$ROOT_DIR"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 DEPLOYMENT_PATH="${FLOW_DEPLOYMENT_DESCRIPTOR:-}"
 CHAIN=""
 JSON_MODE=0
@@ -158,8 +158,7 @@ Options:
   --deployment PATH    Deployment descriptor (see the header comment). Default:
                        $FLOW_DEPLOYMENT_DESCRIPTOR, else
                        <repo-root>/deploy/flow-deployed-websocket.json.
-  --evidence-root DIR  Where deployed-chain-websocket-result.json is written.
-                       Default: /opt/working/sylvode-flow/evidence/v0.4
+  --evidence-root DIR  Required. Where deployed-chain-websocket-result.json is written.
   --repo-root DIR      Repository whose HEAD is recorded as source head.
   --idle-seconds N     Quiet-socket duration. Must be > 120. Default 130.
   -h, --help           Show this help and exit 0.
@@ -192,6 +191,10 @@ fi
 if [[ -z "$CHAIN" ]]; then
   echo "FAIL: --chain is required" >&2
   usage >&2
+  exit 2
+fi
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  echo "FAIL: --evidence-root is required; evidence must never default into the contract repository" >&2
   exit 2
 fi
 if ! [[ "$IDLE_SECONDS" =~ ^[0-9]+$ ]] || (( IDLE_SECONDS <= 120 )); then
@@ -244,6 +247,17 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def write_evidence(payload, ok):
+    failed_checks = [row["name"] for row in payload.get("checks", []) if not row.get("passed")]
+    payload["schema_version"] = "sylvode.flow.deployed-chain-websocket-result.v1"
+    payload["gates"] = {
+        "deployed_chain_websocket_upgrade": {
+            "status": "passed" if ok else "failed",
+            "reason": (
+                "all 13 deployed-chain WebSocket checks passed"
+                if ok else "failed checks: %s" % (", ".join(failed_checks) or "verifier did not complete")
+            ),
+        }
+    }
     blob = json.dumps(payload, indent=2, sort_keys=True) + "\n"
     for secret in secrets:
         if secret and len(secret) >= 8 and secret in blob:
