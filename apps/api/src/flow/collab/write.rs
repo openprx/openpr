@@ -45,6 +45,7 @@ use super::cache::WarmCache;
 use super::coordinator::DocumentCoordinator;
 use super::frame::RejectedCode;
 use super::limits::{DOCUMENT_LOCK_HOLD_MS_MAX, DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS};
+use super::snapshot::{self, SnapshotAdvancer, Trigger};
 
 pub struct UpdateRequest {
     pub document_id: Uuid,
@@ -80,6 +81,13 @@ pub struct Accepted {
     /// sessions (`collab-protocol-v1.md`'s `update` frame) need it for that frame's
     /// `base_frontier` field.
     pub before_frontier: Vec<u8>,
+    /// `true` when this document's tail crossed a soft snapshot-advancement threshold
+    /// (`flow::collab::snapshot::Trigger::Soft`) as observed *before* this write was applied —
+    /// callers that hold a `'static`-reachable [`SnapshotAdvancer`] (`flow::collab::session`,
+    /// `flow::command`) should call [`snapshot::spawn_background`] when this is `true`. Always
+    /// `false` on an idempotent replay ([`find_prior_update`]): replaying an already-accepted
+    /// update observes nothing new about the tail.
+    pub should_advance_snapshot: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +218,7 @@ async fn find_prior_update<C: ConnectionTrait>(
         projection_seq: r.projection_seq,
         event_id: r.event_id,
         before_frontier: r.before_frontier,
+        should_advance_snapshot: false,
     }))
 }
 
@@ -513,6 +522,10 @@ async fn run_locked_phase(
         projection_seq: new_head_seq,
         event_id,
         before_frontier: prepared.observed.head_frontier.clone(),
+        // Overwritten by `accept_update` from the tail-trigger reading it took before this
+        // locked phase ever ran; `run_locked_phase` has no business computing this itself (it
+        // would mean an extra query inside the lock, which lock discipline forbids).
+        should_advance_snapshot: false,
     }))
 }
 
@@ -561,6 +574,7 @@ pub async fn accept_update(
     db: &DatabaseConnection,
     cache: &WarmCache,
     coordinator: &DocumentCoordinator,
+    snapshot_advancer: &SnapshotAdvancer,
     dispatch_max_attempts: i32,
     request: UpdateRequest,
 ) -> Result<AcceptOutcome, ApiError> {
@@ -575,6 +589,41 @@ pub async fn accept_update(
     let Ok(_permit) = coordinator.acquire(request.document_id).await else {
         return Ok(contention(Some(request.update_id), "coordinator acquisition timed out"));
     };
+
+    // Gate 7 `minimal_snapshot_advancement_bounds_tail`: a single, unlocked tail-shape read taken
+    // once per accept attempt (not once per rebase iteration below) — never inside a transaction,
+    // never blocking a concurrent writer for a *different* document. `limits-v1.md`'s hard
+    // trigger ("接受下一 update 前必须先成功推进 snapshot,不能继续扩大 tail") is enforced
+    // synchronously right here, before this update is even hydrated: if the document is already
+    // at/over a hard boundary, this write waits for a real advancement to succeed (or gives up as
+    // recoverable contention) rather than growing the tail further. The soft trigger only marks
+    // `should_advance_snapshot` on the eventual `Accepted` result — it must never block this
+    // write; `flow::collab::session`/`flow::command` spawn the actual background advancement
+    // after they see that flag, once this function has already returned.
+    let mut should_advance_snapshot = false;
+    if let Some(stats) = snapshot::read_tail_stats(db, request.document_id).await? {
+        match snapshot::evaluate(&stats, snapshot_advancer.last_rebuild_wall_ms(request.document_id)) {
+            Trigger::Hard => match snapshot::advance(db, request.document_id, snapshot_advancer).await {
+                Ok(snapshot::AdvanceOutcome::Advanced | snapshot::AdvanceOutcome::NothingToAdvance) => {}
+                Ok(snapshot::AdvanceOutcome::Contended) => {
+                    return Ok(contention(
+                        Some(request.update_id),
+                        "snapshot checkpoint required before this document's tail can grow further",
+                    ));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        document_id = %request.document_id,
+                        "collab write: forced snapshot checkpoint failed, treating as recoverable contention"
+                    );
+                    return Ok(contention(Some(request.update_id), "forced snapshot checkpoint failed"));
+                }
+            },
+            Trigger::Soft => should_advance_snapshot = true,
+            Trigger::None => {}
+        }
+    }
 
     let mut attempts = 0u32;
     loop {
@@ -600,7 +649,7 @@ pub async fn accept_update(
         .await;
 
         match locked {
-            Ok(Ok(LockedOutcome::Committed(accepted))) => {
+            Ok(Ok(LockedOutcome::Committed(mut accepted))) => {
                 let format_version = prepared.observed.format_version.clone();
                 cache.put(
                     request.document_id,
@@ -610,6 +659,7 @@ pub async fn accept_update(
                     accepted.head_frontier.clone(),
                     prepared.decoded_bytes_hint,
                 );
+                accepted.should_advance_snapshot = should_advance_snapshot;
                 return Ok(AcceptOutcome::Accepted(accepted));
             }
             Ok(Ok(LockedOutcome::EpochMismatch)) => {
@@ -655,7 +705,7 @@ mod database_tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    use super::{AcceptOutcome, UpdateRequest, accept_update};
+    use super::{AcceptOutcome, SnapshotAdvancer, UpdateRequest, accept_update};
     use crate::flow::collab::authz;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
@@ -871,11 +921,13 @@ mod database_tests {
 
         let cache = WarmCache::new();
         let coordinator = DocumentCoordinator::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
         let update_id = Uuid::new_v4();
         let outcome = accept_update(
             &state.db,
             &cache,
             &coordinator,
+            &snapshot_advancer,
             10,
             UpdateRequest {
                 document_id,
@@ -979,6 +1031,7 @@ mod database_tests {
 
         let cache = WarmCache::new();
         let coordinator = DocumentCoordinator::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
         let update_id = Uuid::new_v4();
         let db_for_a = state.db.clone();
         let a_task = tokio::spawn(async move {
@@ -986,6 +1039,7 @@ mod database_tests {
                 &db_for_a,
                 &cache,
                 &coordinator,
+                &snapshot_advancer,
                 10,
                 UpdateRequest {
                     document_id,

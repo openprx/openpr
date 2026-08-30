@@ -1037,6 +1037,7 @@ async fn execute_content_command(
         &state.db,
         &collab.cache,
         &collab.coordinator,
+        &collab.snapshot,
         crate::config::runtime().flow.dispatch_max_attempts,
         write::UpdateRequest {
             document_id,
@@ -1057,6 +1058,9 @@ async fn execute_content_command(
         write::AcceptOutcome::Accepted(accepted) => accepted,
         write::AcceptOutcome::Rejected(rejected) => return Err(map_write_rejection(&rejected)),
     };
+    if accepted.should_advance_snapshot {
+        crate::flow::collab::snapshot::spawn_background(&collab.snapshot, state.db.clone(), document_id);
+    }
 
     let relay_frame = frame::Frame::Update {
         protocol_version: frame::PROTOCOL_VERSION,

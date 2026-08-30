@@ -18,6 +18,9 @@
 //!   "服务端写入顺序"), including the commit-time epoch fencing barrier and the document row lock.
 //! - [`registry`]: the single-instance session registry presence/broadcast use.
 //! - [`session`]: the per-connection WebSocket actor loop.
+//! - [`snapshot`]: snapshot advancement (gate 7 `minimal_snapshot_advancement_bounds_tail`) —
+//!   candidate build/validation outside any lock, a short fixed-write locked commit, and the
+//!   soft/hard trigger policy from `limits-v1.md`'s "Server persistence path budgets".
 
 pub mod authz;
 pub mod bootstrap;
@@ -29,5 +32,6 @@ pub mod origin;
 pub mod registry;
 pub mod runtime;
 pub mod session;
+pub mod snapshot;
 pub mod ticket;
 pub mod write;

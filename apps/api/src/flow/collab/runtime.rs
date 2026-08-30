@@ -14,12 +14,16 @@ use std::sync::OnceLock;
 use super::cache::WarmCache;
 use super::coordinator::DocumentCoordinator;
 use super::registry::SessionRegistry;
+use super::snapshot::SnapshotAdvancer;
 
 #[derive(Default)]
 pub struct CollabRuntime {
     pub cache: WarmCache,
     pub coordinator: DocumentCoordinator,
     pub registry: SessionRegistry,
+    /// Gate 7 `minimal_snapshot_advancement_bounds_tail` bookkeeping (in-flight background
+    /// advancements, last measured rebuild wall time per document). See [`super::snapshot`].
+    pub snapshot: SnapshotAdvancer,
 }
 
 static RUNTIME: OnceLock<CollabRuntime> = OnceLock::new();

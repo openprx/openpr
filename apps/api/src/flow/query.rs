@@ -115,10 +115,16 @@ pub async fn get_object(
 /// read/write；flag").
 ///
 /// `known_seq`/`known_frontier` are accepted and shape-validated (a malformed `known_frontier` is
-/// `invalid_update`) but do not change the response: v0.4 keeps the full, un-compacted history
-/// for every document (no compaction path exists before v0.8), so there is never a "resume from
-/// partial tail" case to compute — exactly the same no-op treatment the WebSocket `Open` frame's
-/// identical fields already get in `flow::collab::session::run`. `known_seq` beyond the current
+/// `invalid_update`) but do not change the response: this endpoint always returns the *current*
+/// `snapshot` + its exact `(snapshot_seq,head_seq]` tail, never a delta computed from the
+/// caller's `known_seq`. Two different things are true here and must not be conflated: v0.4
+/// **does** advance the snapshot pointer on the write path (`flow::collab::snapshot`, gate 7
+/// `minimal_snapshot_advancement_bounds_tail`) precisely to keep that tail bounded by
+/// `limits-v1.md`'s soft/hard triggers — but it still keeps every accepted `collab_updates` row
+/// forever (no `DELETE`/retention compaction before v0.8, `versions/v0.4-flow-alpha.md:29`), and
+/// it still has no "resume from partial tail" computed from `known_seq` either way — exactly the
+/// same no-op treatment the WebSocket `Open` frame's identical fields already get in
+/// `flow::collab::session::run`. `known_seq` beyond the current
 /// `head_seq` is not an error either: a caller racing a concurrent write may legitimately observe
 /// a `known_seq` the server has not caught up to broadcasting yet, and the full bootstrap it gets
 /// back is still a correct, current view.
@@ -150,9 +156,13 @@ pub async fn get_bootstrap(
         .len()
         .saturating_add(boot.tail_updates.iter().map(|update| update.bytes.len()).sum::<usize>());
     if decoded_bytes as u64 > limits::BOOTSTRAP_DECODED_BYTES_MAX {
-        // `limits-v1.md`: "超出保留边界返回 resync_required" — v0.4 has no compaction path to
-        // shrink the tail, so the only fail-closed response available is the same one the loader
-        // itself already uses for a corrupted tail.
+        // `limits-v1.md`: "超出保留边界返回 resync_required" — `flow::collab::snapshot` advances
+        // the snapshot on the write path precisely to keep this bounded (a hard trigger forces a
+        // checkpoint before the tail can grow past it), but that only covers documents that are
+        // still being written to; a document nobody has written to since this bound shipped (or
+        // whose advancement is mid-retry) can still land here. v0.4 has no delete/retention
+        // compaction path before v0.8 to fall back on either way, so the only fail-closed response
+        // available is the same one the loader itself already uses for a corrupted tail.
         return Err(ApiError::Conflict("resync_required".to_string()));
     }
 

@@ -407,6 +407,7 @@ async fn handle_client_frame(
                 &state.db,
                 &collab.cache,
                 &collab.coordinator,
+                &collab.snapshot,
                 crate::config::runtime().flow.dispatch_max_attempts,
                 UpdateRequest {
                     document_id,
@@ -434,6 +435,13 @@ async fn handle_client_frame(
 
             match outcome {
                 Ok(AcceptOutcome::Accepted(accepted)) => {
+                    if accepted.should_advance_snapshot {
+                        crate::flow::collab::snapshot::spawn_background(
+                            &collab.snapshot,
+                            state.db.clone(),
+                            document_id,
+                        );
+                    }
                     let frame = Frame::Accepted {
                         protocol_version: PROTOCOL_VERSION,
                         document_id,

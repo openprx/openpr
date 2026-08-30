@@ -32,8 +32,34 @@ pub const DOCUMENT_LOCK_WAIT_MS_MAX: u64 = 100;
 /// budget for the locked portion of the write transaction).
 pub const DOCUMENT_LOCK_HOLD_MS_MAX: u64 = 100;
 
-/// Bounded rebase retry count (`collab-protocol-v1.md`: "最多 3 次锁外 rebase").
+/// Bounded rebase retry count (`collab-protocol-v1.md`: "最多 3 次锁外 rebase"). Also the
+/// `document_prepare_rebase_attempts_max` budget snapshot advancement's own boundary/head-mismatch
+/// retry reuses (`flow::collab::snapshot::advance`) — both are the identical "head mismatch 后在
+/// 锁外重建...三次仍竞争则临时退避" shape.
 pub const MAX_REBASE_ATTEMPTS: u32 = 3;
+
+// ---- Snapshot advancement (gate 7 `minimal_snapshot_advancement_bounds_tail`) ----
+//
+// `snapshot_tail_updates_soft_max` / `snapshot_tail_bytes_soft_max` /
+// `snapshot_rebuild_wall_ms_p95_soft_max` / `snapshot_tail_updates_hard_max` /
+// `snapshot_tail_bytes_hard_max` — server persistence path budgets, not part of the
+// `FlowLimitsV1` wire schema (`limits-v1.md`: "这些是 ADR-0010 的内部架构预算,不是 caller
+// payload validity"). `flow::collab::snapshot` is the only module that reads these.
+
+/// `snapshot_tail_updates_soft_max`.
+pub const SNAPSHOT_TAIL_UPDATES_SOFT_MAX: i64 = 256;
+/// `snapshot_tail_bytes_soft_max` (1 MiB).
+pub const SNAPSHOT_TAIL_BYTES_SOFT_MAX: i64 = 1_048_576;
+/// `snapshot_rebuild_wall_ms_p95_soft_max` — here applied per-measurement (the most recent
+/// [`crate::flow::collab::snapshot::Candidate::rebuild_wall_ms`] for a document), not as a
+/// computed p95 series; `flow::collab::snapshot::evaluate`'s doc comment explains why a single
+/// slow rebuild is treated as sufficient signal to schedule the next one.
+pub const SNAPSHOT_REBUILD_WALL_MS_SOFT_MAX: u64 = 100;
+/// `snapshot_tail_updates_hard_max` — "接受下一 update 前必须先成功推进 snapshot,不能继续扩大
+/// tail".
+pub const SNAPSHOT_TAIL_UPDATES_HARD_MAX: i64 = 1_024;
+/// `snapshot_tail_bytes_hard_max` (4 MiB).
+pub const SNAPSHOT_TAIL_BYTES_HARD_MAX: i64 = 4_194_304;
 
 /// `collab_tickets` TTL (`ADR-0007`: "TTL 固定 60 秒,不可续期").
 pub const TICKET_TTL_SECONDS: i64 = 60;
