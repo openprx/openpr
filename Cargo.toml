@@ -15,7 +15,7 @@ members = [
 authors = ["g1e2x87"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.2.40"
+version = "0.2.41"
 description = "Open-source project management platform"
 repository = "https://github.com/openprx/openpr"
 
@@ -84,3 +84,34 @@ cast_sign_loss = "warn"
 cast_precision_loss = "warn"
 cast_lossless = "warn"
 too_many_lines = "allow"
+
+# The isolated-apply worker enforces `decode_apply_cpu_ms_max`, a budget calibrated
+# against production release builds. The whole metered window runs inside
+# collab-core (decode, apply, semantic snapshot, shape validation), so an
+# unoptimized build of this one crate makes a legitimate document exceed a
+# production budget: at opt-level 0 the ceiling fires around 3,000 nodes, while
+# release measures ~14ms for the full 10,000-node structural boundary. Optimize
+# collab-core even in dev profiles so the metered work runs at production speed
+# and the rest of the workspace stays debuggable.
+[profile.dev.package.collab-core]
+opt-level = 3
+
+# Same reason, one level down: most of the metered window's real work happens
+# inside Loro itself, so optimizing only collab-core moves the ceiling from
+# ~3,000 to ~4,000 nodes and still rejects a legitimate 10,000-node document.
+[profile.dev.package.loro]
+opt-level = 3
+[profile.dev.package.loro-internal]
+opt-level = 3
+[profile.dev.package.loro-common]
+opt-level = 3
+[profile.dev.package.loro-delta]
+opt-level = 3
+[profile.dev.package.loro-rle]
+opt-level = 3
+[profile.dev.package.loro-kv-store]
+opt-level = 3
+[profile.dev.package.loro_fractional_index]
+opt-level = 3
+[profile.dev.package.loro-thunderdome]
+opt-level = 3
