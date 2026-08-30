@@ -222,11 +222,17 @@ COLLAB_CORE_ISOLATION_HOST_RS="$REPO_ROOT/crates/collab-core/src/isolation/host.
 COLLAB_CORE_ISOLATION_ALLOC_RS="$REPO_ROOT/crates/collab-core/src/isolation/alloc.rs"
 COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS="$REPO_ROOT/crates/collab-core/src/isolation/child_runtime.rs"
 COLLAB_CORE_ISOLATED_APPLY_WORKER_RS="$REPO_ROOT/crates/collab-core/src/bin/isolated_apply_worker.rs"
+# `page_size`'s real REST enforcement (`query::validate_limit`, called from `list_flow_objects`)
+# and its exact/+1 boundary test both live in the REST route handler file itself, not in
+# flow/query.rs alone -- read it too so a real boundary test written here (rather than in
+# query.rs, which has none) can actually be found.
+ROUTES_FLOW_RS="$REPO_ROOT/apps/api/src/routes/flow.rs"
 for f in "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_CORE_ERROR_RS" "$REGISTRY_RS" "$SESSION_RS" \
          "$WRITE_RS" "$COMMAND_RS" "$QUERY_RS" "$BOOTSTRAP_RS" "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" \
          "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" "$COLLAB_CORE_ISOLATION_LIMITS_RS" \
          "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
-         "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS"; do
+         "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS" \
+         "$ROUTES_FLOW_RS"; do
   if [[ ! -f "$f" ]]; then
     echo "FAIL: source file not found (nothing to statically verify): $f" >&2
     exit 2
@@ -245,6 +251,7 @@ if ! python3 - "$CONTRACT_PATH" "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_C
       "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" \
       "$COLLAB_CORE_ISOLATION_LIMITS_RS" "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
       "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS" \
+      "$ROUTES_FLOW_RS" \
       > "$STATIC_JSON_FILE" 2>"$EVIDENCE_ROOT/logs/limits.static.err.log" <<'PY'
 import json
 import re
@@ -254,7 +261,7 @@ import sys
  write_rs, command_rs, query_rs, bootstrap_rs, error_rs, response_rs, dispatcher_rs, migration_sql,
  frontend_types_ts, frontend_limits_ts, collab_core_isolation_limits_rs, collab_core_isolation_host_rs,
  collab_core_isolation_alloc_rs, collab_core_isolation_child_runtime_rs,
- collab_core_isolated_apply_worker_rs) = sys.argv[1:22]
+ collab_core_isolated_apply_worker_rs, routes_flow_rs) = sys.argv[1:23]
 
 
 def read(p):
@@ -314,6 +321,7 @@ collab_core_isolation_host_text = read(collab_core_isolation_host_rs)
 collab_core_isolation_alloc_text = read(collab_core_isolation_alloc_rs)
 collab_core_isolation_child_runtime_text = read(collab_core_isolation_child_runtime_rs)
 collab_core_isolated_apply_worker_text = read(collab_core_isolated_apply_worker_rs)
+routes_flow_rs_text = read(routes_flow_rs)
 
 const_re = re.compile(r"pub const (\w+):\s*[\w<>&']+\s*=\s*([\d_]+)\s*;")
 rust_consts = {m.group(1): int(m.group(2).replace("_", "")) for m in const_re.finditer(limits_rs_text)}
@@ -487,6 +495,17 @@ TEST_SOURCE_TEXT_PARTS = (
     ("collab-core/isolation/alloc.rs", collab_core_isolation_alloc_text),
     ("collab-core/isolation/child_runtime.rs", collab_core_isolation_child_runtime_text),
     ("collab-core/bin/isolated_apply_worker.rs", collab_core_isolated_apply_worker_text),
+    # The isolation boundary's own single-source ceiling declaration: its own module test
+    # (`frozen_values_match_contracts_limits_v1`) pins the three frozen values but is not itself
+    # an exact/+1 boundary test, so including it here does not by itself make any isolation
+    # limit_kind pass -- it just makes this scan consistent with the fact that this module is
+    # dynamically covered (the `limits::tests::` cargo filter's substring match already runs it;
+    # see the isolation run_group below).
+    ("collab-core/isolation/limits.rs", collab_core_isolation_limits_text),
+    # `page_size`'s real boundary test (`list_objects_endpoint_rejects_page_size_over_...`) lives
+    # in the REST route handler file, not in flow/query.rs (which has no #[test] at all for this
+    # limit_kind) -- see the ROUTES_FLOW_RS read above.
+    ("routes/flow.rs", routes_flow_rs_text),
 )
 ALL_TEST_FN_NAMES = [
     (src_label, name) for src_label, text in TEST_SOURCE_TEXT_PARTS for name in test_fn_names(text)
@@ -711,6 +730,26 @@ echo "=== dynamic: cargo test groups ===" >&2
 run_group registry_tests api "flow::collab::registry::tests::"
 run_group snapshot_pure api "flow::collab::snapshot::tests::"
 run_group collab_core_limits collab-core "limits::tests::"
+# The isolation boundary's own enforcement/test sites (crates/collab-core/src/isolation/{host,
+# alloc,child_runtime,limits}.rs -- see TEST_SOURCE_TEXT_PARTS above) live under the `isolation::`
+# module path, which the "limits::tests::" filter above only reaches for isolation/limits.rs
+# itself (its full path, `isolation::limits::tests::...`, happens to contain that substring) --
+# host.rs/alloc.rs/child_runtime.rs's own `isolation::{host,alloc,child_runtime}::tests::` paths do
+# not. Without this, every one of those files' tests would be statically visible (in the scan
+# list) but never actually run, so dtest() could never resolve their ok/FAILED status no matter
+# how well boundary_test_covering() name-matches them. host.rs's end-to-end tests spawn the real
+# `collab-isolated-apply-worker` subprocess, so it must be built first
+# (`cargo build -p collab-core --bin collab-isolated-apply-worker`); a missing binary makes those
+# specific tests skip themselves (see host.rs's own `isolated_apply_with_real_worker` early-return)
+# rather than fail, which is a pre-existing property of those tests, not something this run_group
+# changes.
+run_group collab_core_isolation collab-core "isolation::"
+# crates/collab-core/src/bin/isolated_apply_worker.rs is a separate binary target (its own crate
+# root, per Cargo.toml's `[[bin]]`), so its `#[cfg(test)] mod tests` is NOT nested under
+# `isolation::` like the lib's modules are -- its test paths are bare `tests::run_metered_...`.
+# The "isolation::" filter above cannot reach it; this dedicated group is required for that file's
+# two tests (already in the static scan list) to get any dynamic ok/FAILED status at all.
+run_group collab_core_isolated_worker_bin collab-core "tests::run_metered"
 run_group effective_limits_wire api "flow::collab::limits::tests::effective_limits_serializes_every_frozen_field_non_null"
 # Pure-logic (non-DB) unit tests for the WS rate limiter (frame_rate / update_rate token-bucket
 # boundary + 3-consecutive-window close), colocated in session.rs's own `tests` module (distinct
@@ -723,6 +762,7 @@ DB_LOGS=(
   "$LOG_DIR/limits.dyn.bootstrap_wire.log"
   "$LOG_DIR/limits.dyn.rest_call_direction.log"
   "$LOG_DIR/limits.dyn.ws_structural_call_direction.log"
+  "$LOG_DIR/limits.dyn.page_size_call_direction.log"
 )
 if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
   for f in "${DB_LOGS[@]}"; do
@@ -751,6 +791,15 @@ else
   echo "  running: cargo test -p api flow::collab::write::database_tests::ws_structural_limit_... (DB-backed)" >&2
   set +e
   ( cd "$REPO_ROOT" && cargo test -p api "flow::collab::write::database_tests::ws_structural_limit_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.ws_structural_call_direction.log" 2>&1
+  set -e
+  # `page_size`'s exact/+1 boundary test lives in routes/flow.rs::flow_database_tests (a real
+  # REST list-endpoint call, not a query.rs-only unit test) -- see the ROUTES_FLOW_RS static scan
+  # entry above. Neither of the two existing routes::flow::flow_database_tests filters (
+  # bootstrap_wire's exact-name match, rest_call_direction's "commands_endpoint_" prefix) reaches
+  # this test's name, so it needs its own dedicated run here.
+  echo "  running: cargo test -p api routes::flow::...list_objects_endpoint_...page_size... (DB-backed)" >&2
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api "routes::flow::flow_database_tests::list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.page_size_call_direction.log" 2>&1
   set -e
   if grep -q "skipped: OPENPR_TEST_DATABASE_URL is not set" "${DB_LOGS[@]}" 2>/dev/null; then
     DB_SKIPPED=1
@@ -1251,7 +1300,8 @@ boundary_cases.append(case(
     )
     + (f"; boundary test found: {ps_test}" if ps_test
        else "; no unit or e2e test exercises the exact 100-accepted/101-rejected boundary (scanned "
-       "every #[test]/#[tokio::test] function name in apps/api/src/flow/query.rs: zero match)"),
+       "every #[test]/#[tokio::test] function name in apps/api/src/flow/query.rs and "
+       "apps/api/src/routes/flow.rs: zero match)"),
     evidence={"query_rs_validate_limit_returns_plain_string": ps_plain_string,
               "rest_apiresponse_struct_has_details_field": f["rest_apiresponse_struct_has_details_field"],
               "boundary_test_covering": ps_test},
