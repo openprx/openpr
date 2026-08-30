@@ -14,10 +14,21 @@
 //!   `export_from`/`frontier`) plus [`engine::LoroCollabEngine`], the concrete Loro adapter.
 //!
 //! What deliberately did *not* move: `spikes/collab-shared`'s `corpus`, `benchmark`, `fixture`,
-//! `rng`, `order` and `isolation` modules, and `spikes/collab-loro`'s process-isolation harness.
-//! Those exist to let the convergence corpus fuzz and time two candidates fairly against each
-//! other; now that selection is final there is exactly one adapter, so that comparison machinery
-//! has no job left to do here. `spikes/` is left untouched as the evaluation evidence trail.
+//! `rng`, and `order` modules, and `spikes/collab-loro`'s process-isolation harness. Those exist to
+//! let the convergence corpus fuzz and time two candidates fairly against each other; now that
+//! selection is final there is exactly one adapter, so that comparison machinery has no job left
+//! to do here. `spikes/` is left untouched as the evaluation evidence trail.
+//!
+//! [`isolation`] is a distinct, new module -- not a port of `spikes/collab-shared::isolation`. That
+//! spike module is `ADR-0014`'s v0.3 *calibration* host (explicitly scoped, by that ADR's own
+//! section 8, as "a selection/acceptance facility, not a v0.4 production safety boundary"); this
+//! crate's `isolation` is the real, production-facing enforcement of `contracts/limits-v1.md`'s
+//! "Isolated decode/apply" ceilings for `apps/api`'s collab write path, spawning a fresh worker
+//! process per call rather than reusing the spike's fork-no-exec zygote (see
+//! `isolation::host`'s module doc for why that specific mechanism does not fit a live,
+//! multi-threaded async server). It reuses that ADR's online-enforcement *mechanisms*
+//! (`SIGPROF`/`setitimer`, a counting `GlobalAlloc`, an independent wall watchdog) over a
+//! different process-creation primitive, not its code.
 //!
 //! `CorpusEngine` (the spike's second, harness-only trait providing `new_empty`/`apply_operation`/
 //! `semantic_snapshot`) is likewise not carried over as a generic trait: with a single production
@@ -27,6 +38,8 @@
 pub mod engine;
 pub mod error;
 pub mod frontier;
+#[cfg(target_os = "linux")]
+pub mod isolation;
 pub mod limits;
 pub mod operation;
 pub mod semantic;

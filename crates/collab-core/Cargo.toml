@@ -11,6 +11,27 @@ loro = "=1.13.9"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+# Isolated-apply host (`src/isolation`, `contracts/limits-v1.md`'s "Isolated decode/apply"):
+# `SIGPROF`/`setitimer`/`RLIMIT_AS`/`wait`-family syscalls and the response frame's CRC32
+# checksum. Both already resolve in the workspace lockfile as transitive dependencies (see
+# `spikes/collab-shared/Cargo.toml`'s identical dependency for the same reasoning), so promoting
+# them to direct dependencies here adds no new supply-chain surface.
+libc = "0.2"
+crc32fast = "1"
+
+[dev-dependencies]
+# Test-only: `isolation::host`'s tests serialize access to a shared env var across parallel
+# `cargo test` threads (`disallowed_types` bans `std::sync::Mutex` even in test code; matches
+# `apps/api`'s existing pin).
+parking_lot = "0.12"
+
+[[bin]]
+# The isolated-apply worker process `isolation::host` spawns per call (`ADR-0014`'s online CPU/
+# wall/memory enforcement, adapted to a subprocess-per-call model -- see `src/isolation/host.rs`'s
+# module doc for why). A separate binary target, not folded into `apps/api`, so this crate alone
+# fully owns and ships its own isolation boundary.
+name = "collab-isolated-apply-worker"
+path = "src/bin/isolated_apply_worker.rs"
 
 [lints]
 workspace = true

@@ -215,12 +215,6 @@ impl LoroCollabEngine {
         (requested as usize).min(children_count)
     }
 
-    fn order_key_for(&self, tree_id: TreeID, parent: TreeParentId) -> String {
-        let siblings = self.tree.children(parent).unwrap_or_default();
-        let position = siblings.iter().position(|candidate| *candidate == tree_id).unwrap_or(0);
-        format!("{position:08}")
-    }
-
     /// A deep, independent copy of this engine (Loro's `LoroDoc::fork`, not `Clone`: `Clone` on a
     /// `LoroDoc` is a *reference* clone that shares the same underlying document, which would let
     /// a caller that mutates the copy also mutate `self`).
@@ -381,6 +375,19 @@ impl LoroCollabEngine {
     /// Propagates the underlying engine's read failure, if any.
     pub fn semantic_snapshot(&self) -> Result<SemanticSnapshot, CollabError> {
         let mut snapshot = SemanticSnapshot::default();
+        // Every node's `order_key` needs its position among its parent's children. The
+        // straightforward per-node `siblings.iter().position(...)` (this method's shape before
+        // this fix) is O(sibling count) *per node*, so a parent with many children makes building
+        // the whole snapshot O(n^2) in that group's size -- this package's isolated-apply
+        // delivery report has the measured before/after (a document approaching
+        // `document_block_count_max`/`container_count_max` was taking longer than
+        // `decode_apply_cpu_ms_max` to snapshot on its own, well before reaching the ceiling that
+        // is supposed to bound it). Memoizing each distinct parent's children into a `TreeID ->
+        // position` index the first time it is needed, and reusing that index for every other
+        // node under the same parent, makes this O(n) overall instead: `self.tree.children` is
+        // still called once per distinct parent (not once per node), and each lookup afterwards
+        // is O(1).
+        let mut position_cache: HashMap<TreeParentId, HashMap<TreeID, usize>> = HashMap::new();
         for tree_id in self.tree.nodes() {
             let Some(logical_id) = self.tree_to_id.get(&tree_id).cloned() else {
                 // A node this replica has never resolved to a logical id (shouldn't happen once
@@ -396,7 +403,16 @@ impl LoroCollabEngine {
                 TreeParentId::Node(parent_tree_id) => self.tree_to_id.get(&parent_tree_id).cloned(),
                 _ => None,
             };
-            let order_key = self.order_key_for(tree_id, parent_tp);
+            let positions = position_cache.entry(parent_tp).or_insert_with(|| {
+                self.tree
+                    .children(parent_tp)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| (id, index))
+                    .collect()
+            });
+            let order_key = format!("{:08}", positions.get(&tree_id).copied().unwrap_or(0));
 
             let meta = self
                 .tree

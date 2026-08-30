@@ -88,6 +88,45 @@ fn depth_of(snapshot: &SemanticSnapshot, id: &NodeId) -> usize {
     depth
 }
 
+/// Height of the subtree rooted at `id`, counted as hops down to its deepest live-or-deleted
+/// descendant (0 if `id` has no children). [`check_operation`]'s `MoveNode` branch needs this: a
+/// move changes not only `id`'s own depth but every descendant's depth by the same delta, so the
+/// descendant that ends up deepest after the move — not `id` itself — is the one that can push the
+/// document over `tree_depth_max`.
+///
+/// Iterative (not recursive) and bounds total node visits at `snapshot.nodes.len() + 1`, mirroring
+/// [`depth_of`]'s identical defensive fallback: the moveable-tree CRDT itself rejects cyclic moves
+/// (`engine::map_loro_error`'s `CyclicMoveError` handling), so a real snapshot is always acyclic,
+/// but this helper does not assume that invariant holds for every possible caller.
+fn subtree_height(snapshot: &SemanticSnapshot, id: &NodeId) -> usize {
+    let mut children_of: std::collections::HashMap<&NodeId, Vec<&NodeId>> = std::collections::HashMap::new();
+    for (child_id, node) in &snapshot.nodes {
+        if let Some(parent_id) = &node.parent {
+            children_of.entry(parent_id).or_default().push(child_id);
+        }
+    }
+
+    let max_visits = snapshot.nodes.len().saturating_add(1);
+    let mut stack: Vec<(&NodeId, usize)> = vec![(id, 0)];
+    let mut visited = 0usize;
+    let mut max_height = 0usize;
+    while let Some((current, depth_below_root)) = stack.pop() {
+        visited += 1;
+        if visited > max_visits {
+            // A cycle would otherwise loop forever; treat it as "as deep as the whole document"
+            // rather than hang, the same safe over-restrictive fallback `depth_of` uses.
+            return snapshot.nodes.len();
+        }
+        max_height = max_height.max(depth_below_root);
+        if let Some(children) = children_of.get(current) {
+            for child in children {
+                stack.push((child, depth_below_root + 1));
+            }
+        }
+    }
+    max_height
+}
+
 fn live_count(snapshot: &SemanticSnapshot, kind: NodeKind) -> usize {
     snapshot
         .nodes
@@ -181,10 +220,28 @@ pub fn check_operation(
             }
             Ok(())
         }
-        Operation::MoveNode { .. }
-        | Operation::DeleteNode { .. }
-        | Operation::DeleteText { .. }
-        | Operation::SetProperty { .. } => Ok(()),
+        Operation::MoveNode { id, new_parent, .. } => {
+            // A move changes `id`'s own depth *and* every descendant's depth by the same delta
+            // (the whole subtree moves with it) — so the node that ends up deepest after the move
+            // is whichever live-or-deleted descendant sits at `subtree_height(id)` hops below
+            // `id`, not necessarily `id` itself. Checking only `id`'s own new depth (the way
+            // `CreateNode` above only has itself to check, since a freshly created node has no
+            // descendants yet) would silently accept a move that pushes an existing subtree's
+            // deepest member past `tree_depth_max`.
+            let new_own_depth = new_parent
+                .as_ref()
+                .map_or(0, |parent_id| depth_of(snapshot, parent_id) + 1);
+            let deepest_after_move = new_own_depth + subtree_height(snapshot, id);
+            if deepest_after_move > limits.tree_depth_max {
+                return Err(LimitViolation {
+                    limit_kind: "tree_depth",
+                    limit: limits.tree_depth_max as u64,
+                    observed: deepest_after_move as u64,
+                });
+            }
+            Ok(())
+        }
+        Operation::DeleteNode { .. } | Operation::DeleteText { .. } | Operation::SetProperty { .. } => Ok(()),
     }
 }
 
@@ -524,6 +581,144 @@ mod tests {
         assert!(
             check_snapshot(&snapshot, &limits).is_ok(),
             "a tombstoned node must not count against live block_count or text_block_chars"
+        );
+    }
+
+    /// Regression for the `MoveNode` coverage gap `check_snapshot`'s equivalence audit found:
+    /// before this fix, `check_operation` accepted every `MoveNode` unconditionally, even though
+    /// a move can push an existing subtree past `tree_depth_max` exactly like a `CreateNode`
+    /// can. The moved node's own new depth stays inside the limit here (2, exactly
+    /// `tree_depth_max`); it is the one descendant it carries along that must be caught.
+    #[test]
+    fn move_node_exact_boundary_accepted_plus_one_rejected_via_subtree_height() {
+        let limits = DocumentLimits {
+            tree_depth_max: 3,
+            ..DocumentLimits::default()
+        };
+        let mut snapshot = SemanticSnapshot::default();
+        snapshot
+            .nodes
+            .insert(NodeId::from("root"), node(None, NodeKind::NavigatorNode, ""));
+        snapshot
+            .nodes
+            .insert(NodeId::from("a"), node(Some("root"), NodeKind::NavigatorNode, ""));
+        snapshot
+            .nodes
+            .insert(NodeId::from("moved"), node(None, NodeKind::NavigatorNode, ""));
+        snapshot.nodes.insert(
+            NodeId::from("moved-child"),
+            node(Some("moved"), NodeKind::NavigatorNode, ""),
+        );
+
+        let move_to_limit = Operation::MoveNode {
+            id: NodeId::from("moved"),
+            new_parent: Some(NodeId::from("a")),
+            index: 0,
+        };
+        assert!(
+            check_operation(&snapshot, &move_to_limit, &limits).is_ok(),
+            "moved node's own depth 2 plus its one descendant reaches exactly depth 3"
+        );
+
+        snapshot
+            .nodes
+            .insert(NodeId::from("b"), node(Some("a"), NodeKind::NavigatorNode, ""));
+        let move_over_limit = Operation::MoveNode {
+            id: NodeId::from("moved"),
+            new_parent: Some(NodeId::from("b")),
+            index: 0,
+        };
+        let violation =
+            check_operation(&snapshot, &move_over_limit, &limits).expect_err("moved-child would reach depth 4");
+        assert_eq!(violation.limit_kind, "tree_depth");
+        assert_eq!(violation.limit, 3);
+        assert_eq!(violation.observed, 4);
+    }
+
+    /// The equivalence proof task 3 requires: build the identical final document two ways —
+    /// (a) `check_operation` evaluated against the pre-move snapshot plus the `MoveNode` op that
+    /// describes the transition (the REST content-command path's shape), and (b) `check_snapshot`
+    /// evaluated against the already-merged post-move snapshot (the WebSocket path's shape, which
+    /// only ever sees the result of an opaque `import_update`, never a discrete op). For the same
+    /// over-limit document, both paths must report the identical `limit_kind`/`limit`/`observed`.
+    #[test]
+    fn check_operation_move_node_and_check_snapshot_agree_on_the_same_final_document() {
+        let limits = DocumentLimits {
+            tree_depth_max: 2,
+            ..DocumentLimits::default()
+        };
+
+        let mut before = SemanticSnapshot::default();
+        before
+            .nodes
+            .insert(NodeId::from("root"), node(None, NodeKind::NavigatorNode, ""));
+        before
+            .nodes
+            .insert(NodeId::from("a"), node(Some("root"), NodeKind::NavigatorNode, ""));
+        before
+            .nodes
+            .insert(NodeId::from("moved"), node(None, NodeKind::NavigatorNode, ""));
+        before.nodes.insert(
+            NodeId::from("moved-child"),
+            node(Some("moved"), NodeKind::NavigatorNode, ""),
+        );
+
+        let move_op = Operation::MoveNode {
+            id: NodeId::from("moved"),
+            new_parent: Some(NodeId::from("a")),
+            index: 0,
+        };
+        let op_violation = check_operation(&before, &move_op, &limits)
+            .expect_err("check_operation must catch moved-child's resulting depth");
+
+        // Apply the same move to build the actual post-move snapshot `check_snapshot` would see
+        // coming out of `LoroCollabEngine::import_update` on the WebSocket path.
+        let mut after = before.clone();
+        if let Some(moved) = after.nodes.get_mut(&NodeId::from("moved")) {
+            moved.parent = Some(NodeId::from("a"));
+        }
+        let snapshot_violation =
+            check_snapshot(&after, &limits).expect_err("check_snapshot must catch the same violation");
+
+        assert_eq!(op_violation.limit_kind, snapshot_violation.limit_kind);
+        assert_eq!(op_violation.limit, snapshot_violation.limit);
+        assert_eq!(op_violation.observed, snapshot_violation.observed);
+        assert_eq!(op_violation.limit_kind, "tree_depth");
+        assert_eq!(op_violation.observed, 3);
+    }
+
+    /// Documents the one deliberate, non-equivalent case rather than leaving it implicit:
+    /// `semantic_patch_operations` (the REST batch's *operation count*) has no `check_snapshot`
+    /// counterpart, and cannot have one — it bounds the size of a request payload, not any
+    /// property of the resulting document shape. Two different-length operation batches can
+    /// converge on byte-for-byte the same final snapshot, so no aggregate over that snapshot could
+    /// ever recover "how many operations built it". The WebSocket transport does not have this
+    /// concept at all (`websocket_frame_bytes_max` is its analogous request-shape ceiling, checked
+    /// before decode, not from snapshot shape) — so this is a scope difference between what the
+    /// two transports validate, not a coverage gap in `check_snapshot`.
+    #[test]
+    fn semantic_patch_operations_has_no_snapshot_shape_equivalent_by_construction() {
+        let limits = DocumentLimits {
+            semantic_patch_operations_max: 1,
+            ..DocumentLimits::default()
+        };
+        // A two-operation batch (rejected by `check_operation_batch_count`) and a one-operation
+        // batch can both end up producing the exact same final document -- e.g. create a block,
+        // then rename it, versus creating it with the final name directly. `check_snapshot` has no
+        // way to observe how many operations were involved, and must not: it must accept this
+        // exact snapshot as long as every *shape* ceiling is respected, unconditional on how many
+        // operations built it.
+        assert!(check_operation_batch_count(1, &limits).is_ok());
+        let violation = check_operation_batch_count(2, &limits).expect_err("2 exceeds max 1");
+        assert_eq!(violation.limit_kind, "semantic_patch_operations");
+
+        let mut snapshot = SemanticSnapshot::default();
+        snapshot
+            .nodes
+            .insert(NodeId::from("blk-1"), node(None, NodeKind::Block, "final text"));
+        assert!(
+            check_snapshot(&snapshot, &DocumentLimits::default()).is_ok(),
+            "check_snapshot has no operation-count concept to reject this snapshot under"
         );
     }
 }

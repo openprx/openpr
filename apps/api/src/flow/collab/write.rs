@@ -6,7 +6,8 @@
 //! validate update bytes under limits (before any engine state is allocated)
 //!   -> [layer 0] acquire the instance-local document coordinator
 //!   -> hydrate/rebase the warm cache to the observed DB head, outside any lock
-//!   -> isolated apply (fork + import_update) + projection prepare, outside any lock
+//!   -> isolated apply (spawned worker: import_update + semantic_snapshot + check_snapshot,
+//!      `collab_core::isolation::isolated_apply`) + projection prepare, outside any lock
 //!   -> begin transaction, SET LOCAL lock_timeout/statement_timeout
 //!   -> [layer 1] SELECT authz_epoch ... FOR SHARE, held to commit; CAS against checked_epoch
 //!   -> SELECT collab_documents ... FOR UPDATE
@@ -17,12 +18,16 @@
 //! ```
 //!
 //! Lock-content discipline (`collab-protocol-v1.md`: "锁内严禁 snapshot/tail load、CRDT apply、
-//! semantic diff、projection compute、网络 I/O 或等待 async mutex"): every decode, `fork`,
-//! `import_update`, `semantic_snapshot`, and projection JSON/plain-text render happens in
-//! [`hydrate_and_apply`], which returns *before* [`run_locked_phase`] ever calls `db.begin()`. The
-//! only work [`run_locked_phase`] does is the epoch fence, the row lock, the head-match recheck,
-//! and the five fixed, parameterized inserts/updates — no engine call, no cache call, and no
-//! broadcast happen inside it or between its `begin`/`commit`.
+//! semantic diff、projection compute、网络 I/O 或等待 async mutex"): every decode, isolated apply,
+//! `semantic_snapshot`, and projection JSON/plain-text render happens in [`hydrate_and_apply`],
+//! which returns *before* [`run_locked_phase`] ever calls `db.begin()`. The decode/apply/shape-
+//! validate step itself (`import_update` + `semantic_snapshot` + `collab_core::limits::
+//! check_snapshot`) runs inside a resource-ceilinged worker process spawned by
+//! `collab_core::isolation::isolated_apply` (`ADR-0014`; see `crates/collab-core/src/isolation/
+//! host.rs`'s module doc), not in this process at all. The only work [`run_locked_phase`] does is
+//! the epoch fence, the row lock, the head-match recheck, and the five fixed, parameterized
+//! inserts/updates — no engine call, no cache call, and no broadcast happen inside it or between
+//! its `begin`/`commit`.
 //!
 //! Broadcasting `accepted` happens in [`accept_update`] itself, strictly after commit but still
 //! before this function returns — i.e. still while the caller's [`DocumentCoordinator`] permit is
@@ -343,11 +348,14 @@ async fn hydrate_and_apply(
         }
     };
 
-    // Seed the observed-head base back into the cache (a fork of it, not the mutated candidate
+    // Seed the observed-head base back into the cache (the base, not the post-update candidate
     // below) so a hot document's next write hits cache even after this one started from a miss.
-    let decoded_bytes_hint = base_engine.export_snapshot().map_or(0, |s| s.len());
+    let base_snapshot_bytes = base_engine.export_snapshot().map_err(|err| {
+        tracing::error!(error = %err, "collab write: base engine export_snapshot failed before isolated apply");
+        ApiError::Internal
+    })?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let decoded_bytes_hint = decoded_bytes_hint as u64;
+    let decoded_bytes_hint = base_snapshot_bytes.len() as u64;
     if let Ok(seed) = base_engine.fork() {
         cache.put(
             document_id,
@@ -359,47 +367,100 @@ async fn hydrate_and_apply(
         );
     }
 
-    let mut candidate = match base_engine.fork() {
-        Ok(candidate) => candidate,
-        Err(err) => {
+    // `ADR-0010`'s write algorithm: decode -> limit -> diff -> policy -> projection prepare, all
+    // outside any lock and before the DB transaction begins. Unlike `hydrate_and_apply`'s
+    // predecessor (which called `LoroCollabEngine::import_update`/`semantic_snapshot`/
+    // `collab_core::limits::check_snapshot` directly, in-process, with no resource ceiling
+    // enforced at all), decode, apply, and shape validation now happen inside
+    // [`collab_core::isolation::isolated_apply`] -- a freshly spawned, CPU/wall/memory-ceilinged
+    // worker process (`ADR-0014`, `contracts/limits-v1.md`'s "Isolated decode/apply" table; see
+    // `crates/collab-core/src/isolation/host.rs`'s module doc for the full design). It performs
+    // the identical `import_update` + `semantic_snapshot` + `check_snapshot` sequence this
+    // function used to run directly, and returns either the resulting document snapshot or the
+    // same `CollabError` shape a direct in-process call would have produced; only the resource
+    // ceilings (CPU/wall/memory) are new outcomes, mapped below to the matching `limit_kind`.
+    //
+    // `spawn_blocking`: `isolated_apply` performs blocking process spawn/pipe I/O/`wait`
+    // synchronously, which must never run directly on a Tokio worker thread.
+    let update_bytes_owned = bytes.to_vec();
+    let isolated_result = tokio::task::spawn_blocking(move || {
+        collab_core::isolation::isolated_apply(&base_snapshot_bytes, &update_bytes_owned)
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "collab write: isolated apply task panicked or was cancelled");
+        ApiError::Internal
+    })?;
+
+    let candidate_snapshot = match isolated_result {
+        Ok(success) => success.snapshot,
+        Err(collab_core::isolation::IsolatedApplyError::Collab(err)) => {
             return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
                 Some(update_id),
                 &err,
             )));
         }
+        Err(collab_core::isolation::IsolatedApplyError::CpuCeiling) => {
+            let err = CollabError::LimitExceeded {
+                limit_kind: "decode_apply_cpu_ms",
+                limit: collab_core::isolation::DECODE_APPLY_CPU_MS_MAX,
+                observed: collab_core::isolation::DECODE_APPLY_CPU_MS_MAX + 1,
+            };
+            return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+                Some(update_id),
+                &err,
+            )));
+        }
+        Err(collab_core::isolation::IsolatedApplyError::WallCeiling) => {
+            let err = CollabError::LimitExceeded {
+                limit_kind: "decode_apply_wall_ms",
+                limit: collab_core::isolation::DECODE_APPLY_WALL_MS_MAX,
+                observed: collab_core::isolation::DECODE_APPLY_WALL_MS_MAX + 1,
+            };
+            return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+                Some(update_id),
+                &err,
+            )));
+        }
+        Err(collab_core::isolation::IsolatedApplyError::MemoryCeiling) => {
+            let err = CollabError::LimitExceeded {
+                limit_kind: "isolated_apply_memory_bytes",
+                limit: collab_core::isolation::ISOLATED_APPLY_MEMORY_BYTES_MAX,
+                observed: collab_core::isolation::ISOLATED_APPLY_MEMORY_BYTES_MAX + 1,
+            };
+            return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
+                Some(update_id),
+                &err,
+            )));
+        }
+        Err(collab_core::isolation::IsolatedApplyError::HostFailure(reason)) => {
+            tracing::error!(
+                reason,
+                document_id = %document_id,
+                "collab write: isolated apply host failure"
+            );
+            return Err(ApiError::Internal);
+        }
     };
-    if let Err(err) = candidate.import_update(bytes) {
-        return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
-            Some(update_id),
-            &err,
-        )));
-    }
+
+    // Reconstructing `LoroCollabEngine` from the isolated worker's already-shape-validated result
+    // is cheap and safe: `check_snapshot` already bounded this document's tree depth/container
+    // count/block count/text volume inside the metered window above, so this load and the
+    // `semantic_snapshot`/`title` reads below operate on state with a known worst-case size, not
+    // on attacker-controlled input directly.
+    let candidate = LoroCollabEngine::load(&candidate_snapshot).map_err(|err| {
+        tracing::error!(error = %err, "collab write: reload of isolated-apply result snapshot failed");
+        ApiError::Internal
+    })?;
     let after_frontier = candidate.frontier().as_bytes().to_vec();
 
     let semantic = candidate.semantic_snapshot().map_err(|err| {
-        tracing::error!(error = %err, "collab write: semantic_snapshot failed after a successful import_update");
+        tracing::error!(error = %err, "collab write: semantic_snapshot failed after a successful isolated apply");
         ApiError::Internal
     })?;
 
-    // `ADR-0010`'s write algorithm: decode -> limit -> diff -> policy -> projection prepare, all
-    // outside any lock and before the DB transaction begins. `import_update` above only proves
-    // the update decodes and merges into a well-formed CRDT document; it enforces none of
-    // `limits-v1.md`'s structural ceilings (`tree_depth`/`container_count`/
-    // `document_block_count`/`text_block_chars`/`document_text_chars`) itself. Unlike the REST
-    // content-command path (`flow::command::apply_content_command`), this path never sees a
-    // discrete `Operation` list to check incrementally -- `bytes` is an opaque Loro update, so
-    // `collab_core::limits::check_snapshot` re-derives the same aggregates directly from the
-    // merged result and rejects under the identical `limit_kind` shape before any projection work
-    // (let alone a transaction) happens on a candidate that would only be discarded anyway.
-    if let Err(violation) = collab_core::limits::check_snapshot(&semantic, &super::limits::document_limits()) {
-        return Ok(HydrateOutcome::Rejected(reject_from_collab_error(
-            Some(update_id),
-            &CollabError::from(violation),
-        )));
-    }
-
     let title = candidate.title().map_err(|err| {
-        tracing::error!(error = %err, "collab write: title read failed after a successful import_update");
+        tracing::error!(error = %err, "collab write: title read failed after a successful isolated apply");
         ApiError::Internal
     })?;
     let state_json = projection::state_json(&semantic).map_err(|_| ApiError::Internal)?;
