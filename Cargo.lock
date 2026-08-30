@@ -2389,6 +2389,7 @@ name = "mcp-server"
 version = "0.2.39"
 dependencies = [
  "anyhow",
+ "api",
  "axum",
  "base64",
  "clap",

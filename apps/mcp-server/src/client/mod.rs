@@ -72,7 +72,7 @@ const fn refusal_reason(code: i64) -> Option<&'static str> {
 /// balancer — whose error page is not written for this caller at all. The same reasoning as
 /// [`refusal_reason`] therefore applies to the same status, and to a body rather than to an
 /// envelope message.
-fn rejected_request_error(status: reqwest::StatusCode, path: &str, body: &str) -> String {
+pub fn rejected_request_error(status: reqwest::StatusCode, path: &str, body: &str) -> String {
     refusal_reason(i64::from(status.as_u16())).map_or_else(
         || format!("HTTP {status} from {path}: {body}"),
         |reason| format!("HTTP {status} from {path}: {reason}"),
@@ -145,8 +145,11 @@ pub struct ClientConfig {
 
 #[derive(Clone)]
 pub struct OpenPrClient {
-    client: Client,
-    base_url: String,
+    // `pub(crate)`, not private: `cli_app::api_client`'s `send_structured` builds requests the
+    // same way `Self::send` does, and lives outside this dually-compiled module (see that
+    // module's doc comment) so it cannot reach a private field here.
+    pub(crate) client: Client,
+    pub(crate) base_url: String,
     /// The bearer credential every outbound request carries. See [`ClientConfig::credential`].
     credential: Option<Secret>,
     pub workspace_id: String,
@@ -294,14 +297,14 @@ impl OpenPrClient {
 
     /// The `Authorization` header value for one outbound request, or the refusal that stands
     /// in for a credential this client does not have.
-    fn authorization(&self) -> Result<String, String> {
+    pub(crate) fn authorization(&self) -> Result<String, String> {
         self.credential
             .as_ref()
             .map(|credential| format!("Bearer {}", credential.expose()))
             .ok_or_else(|| NO_OUTBOUND_CREDENTIAL.to_string())
     }
 
-    fn operation_headers(&self, request: RequestBuilder) -> RequestBuilder {
+    pub(crate) fn operation_headers(&self, request: RequestBuilder) -> RequestBuilder {
         let request = request.header(MCP_SURFACE_HEADER, self.transport_label);
         match self.operation_tool_name.as_deref() {
             Some(tool_name) => request.header(MCP_TOOL_HEADER, tool_name),
@@ -1345,6 +1348,25 @@ impl OpenPrClient {
         self.get(&format!(
             "/api/v1/workspaces/{}/bot-operation-logs{query}",
             urlencoding::encode(&self.workspace_id)
+        ))
+        .await
+    }
+
+    /// `GET /api/v1/workspaces/{workspace_id}/bots` — real, already-shipped, admin-only
+    /// surface (`apps/api/src/routes/bot.rs`'s `list_bots`: "only workspace owners and admins
+    /// can list bots"). `server.rs`'s `enforce_flow_admin_capability` calls this as a
+    /// genuine, independent pre-flight probe for the "Flow admin capability" leg of
+    /// `WorkspaceWide(admin)` (`mcp-surface-v1.md:17`) ahead of a Flow admin write — there is
+    /// no Flow-specific admin capability distinct from generic workspace admin in today's
+    /// data model (see that function's doc comment), so this is the closest real,
+    /// already-admin-gated endpoint rather than a fabricated check. Takes `workspace_id` as
+    /// an explicit argument, deliberately never `self.workspace_id`, because the caller's own
+    /// declared workspace — not this process's configured default — is what must be checked
+    /// (`mcp-surface-v1.md`: "不得从配置默认 workspace...推导 admin scope").
+    pub async fn list_workspace_bots(&self, workspace_id: &str) -> Result<Value, String> {
+        self.get(&format!(
+            "/api/v1/workspaces/{}/bots",
+            urlencoding::encode(workspace_id)
         ))
         .await
     }
