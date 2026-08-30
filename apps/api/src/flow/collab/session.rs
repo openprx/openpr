@@ -64,6 +64,35 @@ fn first_unknown_capability(capabilities: &[String]) -> Option<&str> {
         .find(|capability| !KNOWN_CAPABILITIES.contains(capability))
 }
 
+/// `limits-v1.md`'s `open_documents_per_connection_max` (8) is met **structurally** in v0.4, not
+/// by counting: `ADR-0007`'s `collab_tickets` row -- and therefore this connection's
+/// `ConsumedTicket` -- already carries exactly one `document_id`; [`run`] consumes exactly one
+/// ticket per socket and binds `document_id` once from it (`run`'s own `document_id =
+/// consumed.document_id`, never reassigned for the life of the connection); `run`'s handshake
+/// itself rejects an `open.document_id` that disagrees with the ticket's
+/// (`RejectedCode::Forbidden`, before this function ever runs); and this function rejects every
+/// `Frame::Open` a client sends afterward, in the steady-state loop, as `invalid_update` instead of
+/// letting it register a second document. The real, enforced open-document count for any v0.4
+/// connection is therefore always exactly `1` -- never approaching, let alone exceeding,
+/// `OPEN_DOCUMENTS_PER_CONNECTION_MAX` -- so there is no runtime scenario a counter could reject
+/// that this structural bound does not already foreclose (`limits-v1.md`'s own row: "v0.4 UI 主路径
+/// 一次一个 object,保留少量 tab/prefetch 余量但禁止一连接扫描 workspace"; `frame.rs`'s doc comment:
+/// "v0.4...scopes one WebSocket connection to exactly the one `document_id` its ticket was issued
+/// for"). `open_documents_per_connection_is_bounded_to_one_by_rejecting_a_client_reopen` (below) is
+/// this invariant's regression test: it goes red the moment a future change stops classifying a
+/// steady-state `Frame::Open` as a reopen attempt.
+const fn is_reopen_attempt(frame: &Frame) -> bool {
+    matches!(frame, Frame::Open { .. })
+}
+
+/// A v0.4 connection's structural open-document bound (see [`is_reopen_attempt`]) can never exceed
+/// the contract's counted ceiling -- checked once, at compile time, so this module would fail to
+/// build before ever silently drifting past it.
+const _: () = assert!(
+    1 <= super::limits::OPEN_DOCUMENTS_PER_CONNECTION_MAX,
+    "the structural open-document bound must never exceed OPEN_DOCUMENTS_PER_CONNECTION_MAX"
+);
+
 /// Maps this module's own wire [`RejectedCode`] to the richer [`ApiErrorKind`] so a close can use
 /// [`ApiErrorKind::ws_close_code`] instead of a second, hand-maintained close-code table
 /// (`error-mapping-v1.md`'s frozen mapping lives in exactly one place: `error.rs`).
@@ -788,6 +817,21 @@ async fn handle_client_frame(
     frame: Frame,
     socket: &mut WebSocket,
 ) {
+    // `open_documents_per_connection_max`'s structural guarantee (see [`is_reopen_attempt`]): a
+    // client sending `open` again after the handshake must never be treated as opening a second
+    // document. This does not change behavior from before this function was refactored to name it
+    // -- `Frame::Open` landed in the same `invalid_update`-and-stay-open catch-all below either
+    // way -- it only isolates the one decision that makes the ceiling structural into something
+    // independently unit-testable.
+    if is_reopen_attempt(&frame) {
+        send(
+            socket,
+            &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
+        )
+        .await;
+        return;
+    }
+
     match frame {
         Frame::Update {
             document_id: frame_document_id,
@@ -1027,6 +1071,11 @@ async fn handle_client_frame(
             .await;
         }
         Frame::Ack { .. } => {}
+        // `Frame::Open` is already handled by the early `is_reopen_attempt` return above, before
+        // this match ever runs -- this arm can never actually observe one at runtime, but stays
+        // listed here (rather than behind a `_` wildcard) so the compiler's own exhaustiveness
+        // check still forces every future `Frame` variant to be an explicit decision somewhere in
+        // this function, the same guarantee this match provided before the early return existed.
         Frame::Hello { .. }
         | Frame::Open { .. }
         | Frame::Snapshot { .. }
@@ -1082,9 +1131,14 @@ async fn read_frame(socket: &mut WebSocket, timeout: Duration) -> Option<Frame> 
 mod tests {
     use std::time::{Duration, Instant};
 
+    use uuid::Uuid;
+
+    use super::{Frame, RateLimiter, bootstrap, is_reopen_attempt};
+    use crate::error::{ApiError, ApiErrorKind};
+    use crate::flow::collab::limits;
+
     use super::{
-        FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND, RateLimiter, UPDATE_BURST_MAX,
-        UPDATES_PER_CONNECTION_PER_SECOND,
+        FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND, UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND,
     };
 
     /// Shared scenario for the sustained-rate exact/+1 boundary: starts the bucket empty (bypasses
@@ -1246,6 +1300,95 @@ mod tests {
             limiter.consecutive_exceeded_windows, 0,
             "a clean window must reset the consecutive-exceeded streak"
         );
+    }
+
+    /// `open_documents_per_connection_max`'s structural guarantee (`is_reopen_attempt`'s own doc
+    /// comment): a client re-sending `open` after the handshake must be classified as a reopen
+    /// attempt (and therefore rejected without ever registering a second document), while every
+    /// other frame type -- including the update/presence/ping frames a real steady-state
+    /// connection actually processes -- must not be misclassified as one.
+    #[test]
+    fn open_documents_per_connection_is_bounded_to_one_by_rejecting_a_client_reopen() {
+        let document_id = Uuid::new_v4();
+        let reopen = Frame::Open {
+            protocol_version: super::PROTOCOL_VERSION,
+            document_id,
+            known_seq: None,
+            known_frontier: None,
+        };
+        assert!(
+            is_reopen_attempt(&reopen),
+            "a steady-state `open` frame must be classified as a reopen attempt"
+        );
+
+        let ping = Frame::Ping {
+            protocol_version: super::PROTOCOL_VERSION,
+            nonce: "n".to_string(),
+        };
+        assert!(
+            !is_reopen_attempt(&ping),
+            "frame types other than `open` must never be misclassified as a reopen attempt"
+        );
+
+        let update = Frame::Update {
+            protocol_version: super::PROTOCOL_VERSION,
+            document_id,
+            update_id: Uuid::new_v4(),
+            base_frontier: String::new(),
+            bytes: String::new(),
+            idempotency_key: None,
+            origin: "test".to_string(),
+            message: None,
+        };
+        assert!(
+            !is_reopen_attempt(&update),
+            "an `update` frame must never be misclassified as a reopen attempt"
+        );
+    }
+
+    /// `check_bootstrap_decoded_bytes`'s exact/`+1` boundary: `BOOTSTRAP_DECODED_BYTES_MAX` itself
+    /// is accepted; one byte over it is rejected `limit_exceeded` with `limit_kind =
+    /// "bootstrap_decoded_bytes"` and the exact `limit`/`observed` values -- no document head or
+    /// `event_dispatch` row exists on this read-only loader's path, so there is nothing further to
+    /// assert unchanged (`bootstrap::load` never writes on this branch either).
+    #[test]
+    #[allow(clippy::panic, clippy::indexing_slicing)] // test-only: serde_json::Value field checks + the match's fallback arm; CLAUDE.md's ban is production-code-scoped
+    fn bootstrap_decoded_bytes_exact_boundary_is_accepted_and_plus_one_is_rejected() {
+        assert!(bootstrap::check_bootstrap_decoded_bytes(limits::BOOTSTRAP_DECODED_BYTES_MAX).is_ok());
+
+        match bootstrap::check_bootstrap_decoded_bytes(limits::BOOTSTRAP_DECODED_BYTES_MAX + 1) {
+            Err(ApiError::Typed {
+                kind: ApiErrorKind::LimitExceeded,
+                details: Some(details),
+                ..
+            }) => {
+                assert_eq!(details["limit_kind"], "bootstrap_decoded_bytes");
+                assert_eq!(details["limit"], limits::BOOTSTRAP_DECODED_BYTES_MAX);
+                assert_eq!(details["observed"], limits::BOOTSTRAP_DECODED_BYTES_MAX + 1);
+            }
+            other => panic!("expected a limit_exceeded(bootstrap_decoded_bytes) error, got {other:?}"),
+        }
+    }
+
+    /// `check_bootstrap_response_bytes`'s exact/`+1` boundary, mirroring the decoded-bytes test
+    /// above.
+    #[test]
+    #[allow(clippy::panic, clippy::indexing_slicing)] // test-only: serde_json::Value field checks + the match's fallback arm; CLAUDE.md's ban is production-code-scoped
+    fn bootstrap_response_bytes_exact_boundary_is_accepted_and_plus_one_is_rejected() {
+        assert!(bootstrap::check_bootstrap_response_bytes(limits::BOOTSTRAP_RESPONSE_BYTES_MAX).is_ok());
+
+        match bootstrap::check_bootstrap_response_bytes(limits::BOOTSTRAP_RESPONSE_BYTES_MAX + 1) {
+            Err(ApiError::Typed {
+                kind: ApiErrorKind::LimitExceeded,
+                details: Some(details),
+                ..
+            }) => {
+                assert_eq!(details["limit_kind"], "bootstrap_response_bytes");
+                assert_eq!(details["limit"], limits::BOOTSTRAP_RESPONSE_BYTES_MAX);
+                assert_eq!(details["observed"], limits::BOOTSTRAP_RESPONSE_BYTES_MAX + 1);
+            }
+            other => panic!("expected a limit_exceeded(bootstrap_response_bytes) error, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1890,6 +2033,78 @@ mod tests {
 
             scratch.drop_self().await;
         }
+
+        /// `open_documents_per_connection_max`'s structural guarantee (`session.rs`'s
+        /// `is_reopen_attempt`), proven end to end rather than only against the pure classifier: a
+        /// real connection that already completed its handshake sends a second `open` for the
+        /// *same* document over the same socket. It must be rejected `invalid_update` (never
+        /// treated as opening a second document), the connection must stay open (a still-usable
+        /// `ping`/`pong` round trip proves it), and neither the document head nor `event_dispatch`
+        /// may advance.
+        #[tokio::test]
+        async fn open_documents_per_connection_rejects_a_client_reopen_over_a_real_connection() {
+            let scratch = scratch_or_skip!("reopen-attempt");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "reopen-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+
+            send_frame(
+                &mut ws,
+                &Frame::Open {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    known_seq: None,
+                    known_frontier: None,
+                },
+            )
+            .await;
+            let rejected = recv_frame(&mut ws).await;
+            let Frame::Rejected { code, .. } = rejected else {
+                panic!("expected a rejected frame for a steady-state reopen, got {rejected:?}");
+            };
+            assert_eq!(
+                code,
+                RejectedCode::InvalidUpdate,
+                "a second open on an already-open connection must never be treated as opening a document"
+            );
+
+            assert_eq!(
+                read_head_seq(&state, document_id).await,
+                head_seq_before,
+                "a rejected reopen attempt must never advance the document head"
+            );
+            assert_eq!(
+                count_event_dispatch(&state, document_id).await,
+                dispatch_before,
+                "a rejected reopen attempt must never produce a new event_dispatch row"
+            );
+
+            // The connection itself must stay open (`invalid_update` never closes at steady state)
+            // -- proven with a real ping/pong round trip after the rejection.
+            send_frame(
+                &mut ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "still-open".to_string(),
+                },
+            )
+            .await;
+            let pong = recv_frame(&mut ws).await;
+            assert!(
+                matches!(pong, Frame::Pong { .. }),
+                "the connection must remain usable after a rejected reopen, got {pong:?}"
+            );
+
+            scratch.drop_self().await;
+        }
     }
 }
 
@@ -1915,12 +2130,14 @@ mod database_tests {
     use uuid::Uuid;
 
     use super::{Frame, GapResolution, PROTOCOL_VERSION, plan_gap_resolution};
+    use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::authz;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
     use crate::flow::collab::registry::SessionRegistry;
     use crate::flow::collab::snapshot::SnapshotAdvancer;
     use crate::flow::collab::write::{self, AcceptOutcome, UpdateRequest};
+    use crate::flow::collab::{bootstrap, limits};
     use crate::flow::command::{CreateObjectInput, create_object};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -2305,6 +2522,123 @@ mod database_tests {
         };
         assert_eq!(reason, "outbound_gap");
         assert_eq!(minimum_snapshot_seq, Some(0));
+
+        scratch.drop_self().await;
+    }
+
+    /// Proves `bootstrap_decoded_bytes_max` is wired into the real `bootstrap::load` call path,
+    /// not only into `check_bootstrap_decoded_bytes` in isolation (`session::tests`'s own
+    /// `bootstrap_decoded_bytes_exact_boundary_...` only calls that pure function directly, so it
+    /// alone could not detect the wiring itself being removed from `load`). Writes the document's
+    /// `snapshot` bytes directly (bypassing the real CRDT write path entirely -- `load` never
+    /// hashes or otherwise validates `snapshot` bytes, only the tail's `content_hash` chain, and
+    /// this document has zero tail rows) at the exact ceiling (accepted) and one byte over
+    /// (rejected `limit_exceeded`), against the real `collab_documents` row through a real
+    /// database.
+    #[tokio::test]
+    async fn bootstrap_load_enforces_the_decoded_bytes_ceiling_against_a_real_document_row() {
+        let scratch = scratch_or_skip!("bootstrap-decoded-bytes-ceiling");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let at_ceiling = vec![0u8; usize::try_from(limits::BOOTSTRAP_DECODED_BYTES_MAX).expect("fits usize")];
+        exec(
+            &state,
+            "UPDATE collab_documents SET snapshot = $1 WHERE id = $2",
+            vec![at_ceiling.into(), document_id.into()],
+        )
+        .await;
+        let accepted = bootstrap::load(&state.db, document_id).await;
+        assert!(
+            accepted.is_ok(),
+            "a document with exactly BOOTSTRAP_DECODED_BYTES_MAX decoded bytes must be accepted, got {accepted:?}"
+        );
+
+        let over_ceiling = vec![0u8; usize::try_from(limits::BOOTSTRAP_DECODED_BYTES_MAX).expect("fits usize") + 1];
+        exec(
+            &state,
+            "UPDATE collab_documents SET snapshot = $1 WHERE id = $2",
+            vec![over_ceiling.into(), document_id.into()],
+        )
+        .await;
+        match bootstrap::load(&state.db, document_id).await {
+            Err(ApiError::Typed {
+                kind: ApiErrorKind::LimitExceeded,
+                details: Some(details),
+                ..
+            }) => {
+                assert_eq!(details["limit_kind"], "bootstrap_decoded_bytes");
+                assert_eq!(details["limit"], limits::BOOTSTRAP_DECODED_BYTES_MAX);
+                assert_eq!(details["observed"], limits::BOOTSTRAP_DECODED_BYTES_MAX + 1);
+            }
+            other => panic!(
+                "expected a real bootstrap::load call to reject with limit_exceeded(bootstrap_decoded_bytes), got {other:?}"
+            ),
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// Proves `bootstrap_response_bytes_max` is wired into the real `bootstrap::load` call path,
+    /// the same way the decoded-bytes test above does. `bootstrap_decoded_bytes` (snapshot + tail
+    /// update bytes only, per its own definition) does not count `head_frontier`, so an oversized
+    /// `head_frontier` pushes `estimated_response_bytes` over its ceiling while
+    /// `check_bootstrap_decoded_bytes` still passes -- exercising `check_bootstrap_response_bytes`
+    /// specifically, not `check_bootstrap_decoded_bytes` a second time. Zero tail rows means the
+    /// only integrity requirement `load` imposes on the frontier is
+    /// `snapshot_frontier == head_frontier` (`running_frontier` never advances past
+    /// `doc.snapshot_frontier` when there is nothing to fold in), which setting both columns to
+    /// the identical oversized value satisfies without needing a real CRDT frontier.
+    #[tokio::test]
+    async fn bootstrap_load_enforces_the_response_bytes_ceiling_against_a_real_document_row() {
+        let scratch = scratch_or_skip!("bootstrap-response-bytes-ceiling");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        // Comfortably under `bootstrap_decoded_bytes_max` on its own (well under 1 MiB); large
+        // enough that a genuinely wired response-bytes check, not merely luck, is what accepts it.
+        let modest_frontier = vec![7u8; 4096];
+        exec(
+            &state,
+            "UPDATE collab_documents SET snapshot_frontier = $1, head_frontier = $1 WHERE id = $2",
+            vec![modest_frontier.into(), document_id.into()],
+        )
+        .await;
+        let accepted = bootstrap::load(&state.db, document_id).await;
+        assert!(
+            accepted.is_ok(),
+            "a modest head_frontier must not trip bootstrap_response_bytes, got {accepted:?}"
+        );
+
+        // `estimated_response_bytes` ~= base64_len(snapshot) + base64_len(head_frontier) + a fixed
+        // per-tail-update allowance (zero tail rows here, so that term is zero). This document's
+        // `snapshot` is a real but tiny CRDT export (well under 1 KiB), so an oversized
+        // `head_frontier` alone must decide this: `BOOTSTRAP_DECODED_BYTES_MAX` never even sees
+        // `head_frontier`'s length (its own definition is `snapshot.len() + sum(tail bytes)`), so
+        // this exercises `check_bootstrap_response_bytes` without `check_bootstrap_decoded_bytes`
+        // ever objecting first.
+        let oversized_frontier = vec![7u8; 9_500_000];
+        exec(
+            &state,
+            "UPDATE collab_documents SET snapshot_frontier = $1, head_frontier = $1 WHERE id = $2",
+            vec![oversized_frontier.into(), document_id.into()],
+        )
+        .await;
+        match bootstrap::load(&state.db, document_id).await {
+            Err(ApiError::Typed {
+                kind: ApiErrorKind::LimitExceeded,
+                details: Some(details),
+                ..
+            }) => {
+                assert_eq!(details["limit_kind"], "bootstrap_response_bytes");
+                assert_eq!(details["limit"], limits::BOOTSTRAP_RESPONSE_BYTES_MAX);
+            }
+            other => panic!(
+                "expected a real bootstrap::load call to reject with limit_exceeded(bootstrap_response_bytes), got {other:?}"
+            ),
+        }
 
         scratch.drop_self().await;
     }
