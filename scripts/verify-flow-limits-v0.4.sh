@@ -469,7 +469,11 @@ findings["frontend_unknown_version_handling_found"] = bool(
 # `connection_registry_smoke` match every *_connections limit_kind through the word "connection"
 # alone, without the specific "user"/"document"/"workspace" qualifier that makes it real coverage.
 TEST_FN_RE = re.compile(
-    r"#\[(?:tokio::)?test\][^\n]*\n(?:\s*#\[[^\n]*\]\n)*\s*(?:pub(?:\([^)]*\))?\s+)?(?:async fn|fn) (\w+)\s*\("
+    # An attribute line may carry a trailing `// ...` comment after its closing `]` (common for
+    # justifying a test-only `#[allow]`), so anything up to the newline is allowed after the
+    # bracket -- requiring `]` to be followed immediately by a newline silently dropped such tests
+    # from this scan and reported their limit_kind as having no boundary test at all.
+    r"#\[(?:tokio::)?test\][^\n]*\n(?:\s*#\[[^\n]*\][^\n]*\n)*\s*(?:pub(?:\([^)]*\))?\s+)?(?:async fn|fn) (\w+)\s*\("
 )
 
 
@@ -573,6 +577,11 @@ findings["boundary_test_covering"] = {
         ("presence_payload_bytes", "PRESENCE_PAYLOAD_BYTES_MAX"),
         ("presence_ttl_seconds", "PRESENCE_TTL_SECONDS_MAX"),
         ("page_size", None),
+        # The two bootstrap ceilings were absent from this map, so their `.get()` below always
+        # returned None and their case could never pass no matter what test was written -- the
+        # same shape as a hardcoded "failed", just one indirection further away.
+        ("bootstrap_decoded_bytes", "BOOTSTRAP_DECODED_BYTES_MAX"),
+        ("bootstrap_response_bytes", "BOOTSTRAP_RESPONSE_BYTES_MAX"),
     )
 }
 
