@@ -511,6 +511,7 @@ TEST_SOURCE_TEXT_PARTS = (
     # limit_kind) -- see the ROUTES_FLOW_RS read above.
     ("routes/flow.rs", routes_flow_rs_text),
 )
+TEST_SOURCE_BY_LABEL = {label: text for label, text in TEST_SOURCE_TEXT_PARTS}
 ALL_TEST_FN_NAMES = [
     (src_label, name) for src_label, text in TEST_SOURCE_TEXT_PARTS for name in test_fn_names(text)
 ]
@@ -542,15 +543,58 @@ def _fn_name_tokens(fn_name: str) -> set:
     return cached
 
 
+# This gate is named `flow_limits_exact_boundary_and_plus_one_rejection`, so a name match alone is
+# not enough: the matched test has to actually prove the rejection half. `scan_budget` was passing
+# on `check_scan_budget_accepts_the_exact_..._boundary`, a test that only asserts the ceiling
+# itself is accepted -- renaming its sibling `..._rejects_one_row_past_...` left the case green,
+# which means nothing here was checking that going over the limit is refused.
+#
+# So: collect every name match, then keep only those whose body asserts a rejection. A test that
+# merely accepts the boundary cannot satisfy a gate that promises +1 is refused.
+REJECTION_IN_NAME_RE = re.compile(r"reject|refus|denie|plus_one|exceed|over_|_over\\b|too_(?:many|large|big)")
+REJECTION_ASSERTION_RE = re.compile(
+    r"\bis_err\(\)|\bexpect_err\(|\bunwrap_err\(|\.err\(\)|\bErr\(|Rejected|limit_exceeded|LimitExceeded|Exceeded|Refused|Denied"
+)
+
+
+def _test_body(src_text: str, fn_name: str) -> str:
+    """The source between this test's `fn` line and whatever attribute starts the next item.
+
+    Deliberately coarse -- it only feeds a substring search for rejection assertions, so
+    overshooting into a following non-test item costs nothing that a false *negative* would not
+    cost more.
+    """
+    match = re.search(r"(?:async fn|fn)\s+" + re.escape(fn_name) + r"\s*\(", src_text)
+    if not match:
+        return ""
+    rest = src_text[match.end():]
+    # Stop at the next item's FIRST line, doc comment included -- stopping only at its `#[test]`
+    # swept the following test's `///` lines into this one's body, and those lines name the very
+    # rejection this scan looks for. That is how `check_scan_budget_accepts_the_exact_...` kept
+    # qualifying: its own body only asserts `is_ok()`, but its neighbour's doc comment says
+    # "rejects one row past ...".
+    next_item = re.search(r"\n\s*(?:///|#\[)", rest)
+    return rest[: next_item.start()] if next_item else rest
+
+
 def boundary_test_covering(limit_kind: str, const: str | None = None):
     token_sets = [name_tokens(limit_kind)]
     if const:
         token_sets.append(name_tokens(const))
     for src_label, fn_name in ALL_TEST_FN_NAMES:
         fn_tokens = _fn_name_tokens(fn_name)
-        for tokens in token_sets:
-            if tokens and tokens.issubset(fn_tokens):
-                return f"{src_label}::{fn_name}"
+        if not any(tokens and tokens.issubset(fn_tokens) for tokens in token_sets):
+            continue
+        # Either half is enough, because neither alone is reliable: a rejection can be asserted
+        # through a plain enum variant (`RateOutcome::Exceeded`) that no Result-shaped pattern
+        # matches, and a test can prove rejection without saying so in its name
+        # (`per_workspace_connection_ceiling_is_enforced` asserts on `.err()`). What both halves
+        # do exclude is the case this check exists for: a test that only asserts the ceiling
+        # itself is accepted, named accordingly and asserting `is_ok()`.
+        if REJECTION_IN_NAME_RE.search(fn_name) or REJECTION_ASSERTION_RE.search(
+            _test_body(TEST_SOURCE_BY_LABEL[src_label], fn_name)
+        ):
+            return f"{src_label}::{fn_name}"
     return None
 
 
@@ -764,6 +808,10 @@ run_group effective_limits_wire api "flow::collab::limits::tests::effective_limi
 # boundary + 3-consecutive-window close), colocated in session.rs's own `tests` module (distinct
 # from `database_tests`, which stays DB-backed and is exercised separately below).
 run_group session_tests api "flow::collab::session::tests::"
+# scan_budget's enforcement (`check_scan_budget`) and its boundary tests both belong in
+# flow/query.rs, which the static scan reads but no filter above ran -- so dtest() could never
+# resolve those tests' status and the case failed no matter how well it was covered.
+run_group query_tests api "flow::query::tests::"
 
 DB_SKIPPED=0
 DB_LOGS=(
