@@ -17,17 +17,22 @@ set -euo pipefail
 #
 # v0.4-gate.yaml's required_commands list has 15 entries (bumped from 13
 # in `02e8cb7`, which added limits_verify/events_verify -- this script had
-# drifted behind that bump until it was synced back up here). As of this
-# sync, seven of the fifteen have a corresponding verify-flow-*-v0.4.sh
-# script implemented (surface_parity, legacy_pages_inventory +
-# legacy_pages_entry_verify, cardinality_verify, integrity_records_verify,
-# authz_baseline_verify, collab_architecture_verify, events_verify); the
-# remaining (error_contract_verify, deployed_chain_websocket_upgrade,
-# limits_verify) do not exist yet. This script records each missing
-# script as a FAILED step with an explicit "script not implemented"
-# message rather than skipping it silently, so report correctly and
-# honestly exits 1 and does not write gate-result.json until those
-# scripts exist and pass.
+# drifted behind that bump until it was synced back up here). As of the
+# addition of scripts/verify-flow-limits-v0.4.sh and
+# scripts/verify-flow-errors-v0.4.sh, nine of the fifteen have a
+# corresponding verify-flow-*-v0.4.sh script implemented (surface_parity,
+# legacy_pages_inventory + legacy_pages_entry_verify, cardinality_verify,
+# integrity_records_verify, authz_baseline_verify,
+# collab_architecture_verify, events_verify, limits_verify,
+# error_contract_verify); the remaining one
+# (deployed_chain_websocket_upgrade) does not exist yet. This script
+# records that missing script as a FAILED step with an explicit "script
+# not implemented" message rather than skipping it silently, so report
+# correctly and honestly exits 1 and does not write gate-result.json
+# until that script exists and passes -- and, independently, until every
+# hard gate the now-implemented limits_verify/error_contract_verify
+# scripts themselves compute also passes (both currently fail honestly;
+# see their own file-header comments).
 #
 # Every invocation (pass or fail) also writes an atomic run log so a
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
@@ -205,10 +210,14 @@ run_step required.collab_architecture_verify "$ROOT_DIR/scripts/verify-flow-coll
 echo "=== Sylvode Flow v0.4 report: events/dispatch verify ==="
 run_step required.events_verify "$ROOT_DIR/scripts/verify-flow-events-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/events-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
+echo "=== Sylvode Flow v0.4 report: limits verify ==="
+run_step required.limits_verify "$ROOT_DIR/scripts/verify-flow-limits-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/limits-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+echo "=== Sylvode Flow v0.4 report: error-contract verify ==="
+run_step required.error_contract_verify "$ROOT_DIR/scripts/verify-flow-errors-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/error-mapping-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
 echo "=== Sylvode Flow v0.4 report: not-yet-implemented required_commands ==="
-run_missing_step required.error_contract_verify "scripts/verify-flow-errors-v0.4.sh does not exist"
 run_missing_step required.deployed_chain_websocket_upgrade "scripts/verify-flow-deployed-websocket-v0.4.sh does not exist"
-run_missing_step required.limits_verify "scripts/verify-flow-limits-v0.4.sh does not exist"
 
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then

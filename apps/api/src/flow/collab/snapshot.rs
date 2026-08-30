@@ -845,12 +845,18 @@ mod database_tests {
         engine.set_title(label).expect("set_title succeeds");
         let bytes = engine.export_from(&base_frontier).expect("export succeeds");
         let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+        // A throwaway registry: this helper's callers assert on the returned `Accepted` value and
+        // on database state, never on WebSocket fan-out, so there is nothing for a real session to
+        // observe here.
+        let registry = crate::flow::collab::registry::SessionRegistry::new();
         let outcome = write::accept_update(
             &state.db,
             cache,
             coordinator,
+            &registry,
             advancer,
             10,
+            None,
             UpdateRequest {
                 document_id,
                 update_id: Uuid::new_v4(),
@@ -1355,14 +1361,17 @@ mod database_tests {
             let write_task = tokio::spawn({
                 let cache = WarmCache::new();
                 let coordinator = DocumentCoordinator::new();
+                let registry = crate::flow::collab::registry::SessionRegistry::new();
                 let advancer_for_write = advancer.clone();
                 async move {
                     write::accept_update(
                         &state_for_write.db,
                         &cache,
                         &coordinator,
+                        &registry,
                         &advancer_for_write,
                         10,
+                        None,
                         UpdateRequest {
                             document_id,
                             update_id: Uuid::new_v4(),

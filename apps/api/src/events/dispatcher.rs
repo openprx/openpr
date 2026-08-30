@@ -133,6 +133,18 @@ const DISPATCH_EXPANDED_RETENTION_DAYS: i64 = 14;
 /// operator needs to still find weeks after the fact.
 const DISPATCH_FAILED_RETENTION_DAYS: i64 = 90;
 
+/// `delivery_source_retention_days` (`limits-v1.md`, `status: unset`): how long an
+/// `event_delivery_sources` tombstone (`delivery_id IS NULL`, left behind once
+/// [`reap_delivery_retention`] deletes the delivery row it named) survives before this file's own
+/// tombstone reaper deletes it too. Rule: "取 replay 窗口上限并留一个清理周期的余量", and "必须严格
+/// 大于 `replay_max_window_days`" and "必须 ≥ `delivery_retention_days`" -- v0.4 has no replay
+/// feature yet (that lands v0.8, per `events-v1.md` "Replay 与 `event_delivery_sources`"), so
+/// there is no frozen `replay_max_window_days` to measure against; matching
+/// `DISPATCH_FAILED_RETENTION_DAYS`'s own "one duty-rotation quarter" reasoning both satisfies the
+/// documented `>= delivery_retention_days` floor with 3x headroom and leaves an operator a full
+/// quarter to look up what a dead-lettered delivery covered before its dedup evidence disappears.
+const DELIVERY_SOURCE_RETENTION_DAYS: i64 = 90;
+
 /// Header carrying the immutable consumer dedup key (`events-v1.md` "投递报文与 `delivery_id` 的
 /// 位置"). `delivery.id` in the body is the same value; both are written together below.
 const DELIVERY_ID_HEADER: &str = "X-Sylvode-Delivery-Id";
@@ -186,6 +198,9 @@ pub struct DispatchTickReport {
     pub delivery_leases_reclaimed: u64,
     pub dispatch_rows_reaped: u64,
     pub delivery_rows_reaped: u64,
+    /// `event_delivery_sources` tombstone reaper: rows deleted by the `delivery_id IS NULL`
+    /// predicate (`events-v1.md` "来源表的保留期与外键语义").
+    pub delivery_source_tombstones_reaped: u64,
     /// `oldest_pending_age` (dispatch half): age in ms of the oldest still-`pending`
     /// `event_dispatch` row after this pass, `None` when that backlog is empty. Anchored on
     /// `created_at`, the only timestamp such a row has before it resolves.
@@ -290,6 +305,10 @@ pub async fn run_tick(state: &AppState, client: &reqwest::Client, batch: usize) 
     match reap_delivery_retention(&state.db, now).await {
         Ok(n) => report.delivery_rows_reaped = n,
         Err(err) => tracing::warn!(error = %err, "dispatcher: event_deliveries retention reaper failed"),
+    }
+    match reap_delivery_source_tombstones(&state.db, now).await {
+        Ok(n) => report.delivery_source_tombstones_reaped = n,
+        Err(err) => tracing::warn!(error = %err, "dispatcher: event_delivery_sources tombstone reaper failed"),
     }
 
     match oldest_pending_dispatch_age_ms(&state.db, now).await {
@@ -1043,12 +1062,21 @@ async fn fetch_business_event<C: ConnectionTrait>(
     .await?)
 }
 
+/// `events-v1.md` "每个 Flow event type 必须在 payload policy registry 中显式声明；未声明的
+/// producer 测试失败，未知 payload 在 delivery 时整体 withheld": every payload reaching a webhook
+/// body goes through `flow::event_policy` here, not just events whose type happens to start with
+/// `flow.` -- a non-Flow producer's event type simply has no registry entry and is withheld the
+/// same fail-closed way, which is the intended behavior (this dispatcher is a shared platform
+/// component; `flow::event_policy` documents its policies are Flow's v0.4 registry, not the only
+/// one that will ever exist here).
 fn envelope_json(
     event: &BusinessEventRow,
     event_id_override: Option<Uuid>,
     created_at_override: Option<DateTime<Utc>>,
     payload_override: Option<Value>,
 ) -> Value {
+    let raw_payload = payload_override.unwrap_or_else(|| event.payload.clone());
+    let payload = crate::flow::event_policy::redact_flow_event_payload_for_delivery(&event.event_type, &raw_payload);
     json!({
         "version": "openpr.event.v1",
         "event_id": event_id_override.unwrap_or(event.id),
@@ -1058,7 +1086,7 @@ fn envelope_json(
         "aggregate": { "type": event.aggregate_type, "id": event.aggregate_id },
         "actor_id": event.actor_id,
         "source": event.source,
-        "payload": payload_override.unwrap_or_else(|| event.payload.clone()),
+        "payload": payload,
         "metadata": event.metadata,
         "correlation_id": event.correlation_id,
         "causation_id": event.causation_id,
@@ -1202,6 +1230,79 @@ async fn reap_delivery_retention(db: &DatabaseConnection, now: DateTime<Utc>) ->
     Ok(result.rows_affected())
 }
 
+/// `event_delivery_sources` has no `status`/`lease_token` (`events-v1.md` "reaper 的谓词只能删
+/// 终态": "`event_delivery_sources` 无 status，用它自己的 `delivery_id IS NULL` 谓词"), so its
+/// reaper's predicate is not the `WHERE status IN (...) AND <anchor> < now() - retention` shape
+/// [`reap_dispatch_retention`]/[`reap_delivery_retention`] share -- it is the tombstone-specific
+/// one the contract writes out verbatim: `WHERE created_at < now() - delivery_source_retention_days
+/// AND delivery_id IS NULL`. A row whose `delivery_id` is still non-NULL is not a tombstone yet --
+/// the delivery it names has not been retention-reaped -- and deleting it here would destroy the
+/// `(subscriber_kind, subscriber_id, source_event_id)` dedup evidence a still-live delivery
+/// depends on, so `delivery_id IS NULL` is not an optimization, it is the entire safety property.
+async fn reap_delivery_source_tombstones(db: &DatabaseConnection, now: DateTime<Utc>) -> Result<u64, ApiError> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
+                DELETE FROM event_delivery_sources
+                WHERE delivery_id IS NULL
+                  AND created_at < $2::timestamptz - ($1::bigint * interval '1 day')
+            ",
+            vec![DELIVERY_SOURCE_RETENTION_DAYS.into(), now.into()],
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Revives dead-lettered (`status='failed'`) `event_deliveries` rows for a workspace back into the
+/// live queue, `events-v1.md`/`gate-commands.md`'s `requeue_failed` mode.
+///
+/// Clears `document_id` on every revived row -- content or not -- per the schema's own comment on
+/// `event_deliveries.document_id` ("NULL ... for replay/requeue_failed-revived rows (deliberately,
+/// so the partial coalescing unique index never applies to them)") and `gate-commands.md`'s
+/// negative fixture: reviving a content delivery *without* clearing `document_id` lets it re-enter
+/// `idx_event_deliveries_coalesce_pending`'s `(subscriber_kind, subscriber_id, document_id) WHERE
+/// status='pending'` partial unique index under its original `document_id`, where it can collide
+/// with a live pending row for the same document, or -- if there is none yet -- squat that
+/// document's FIFO coalescing slot with a resurrected retry ahead of genuinely new real-time
+/// updates.
+///
+/// Never revives `cancelled` rows: that status is `subscriber_gone`'s deliberate terminal state
+/// (the subscription itself was deleted), not a retryable failure, and `events-v1.md` requires it
+/// stays that way -- reviving a cancelled row would resurrect deliveries for a subscriber that no
+/// longer exists.
+///
+/// Clears `terminated_at` back to `NULL`: the schema's own comment on that column says "只有
+/// `requeue_failed` 可以清空它（复活即离开终态），其余路径不得改写" -- required for
+/// `event_deliveries_terminated_at_check` (`status IN ('dispatched','failed','cancelled') =
+/// (terminated_at IS NOT NULL)`) to still hold once `status` becomes `pending`.
+///
+/// `pub`: the v0.4 scope this module ships is the dispatcher primitive itself, proven against a
+/// real database below; wiring it to an operator-facing REST/CLI surface is `events-v1.md`'s
+/// fuller v0.8 `mode=requeue_failed` admin replay feature (`"v0.8 的 admin replay ... 全程不经过
+/// event_dispatch"`), out of this task's scope.
+pub async fn requeue_failed(db: &DatabaseConnection, workspace_id: Uuid, now: DateTime<Utc>) -> Result<u64, ApiError> {
+    let result = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
+                UPDATE event_deliveries
+                SET status = 'pending',
+                    document_id = NULL,
+                    terminated_at = NULL,
+                    attempts = 0,
+                    next_attempt_at = $2,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    last_error_code = NULL
+                WHERE workspace_id = $1 AND status = 'failed'
+            ",
+            vec![workspace_id.into(), now.into()],
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`, matching
 // `apps/api/src/routes/flow.rs`'s `flow_database_tests` — own throwaway database per run,
@@ -1212,7 +1313,7 @@ async fn reap_delivery_retention(db: &DatabaseConnection, now: DateTime<Utc>) ->
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod dispatcher_database_tests {
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use platform::{
         app::AppState,
         config::{AppConfig, Secret},
@@ -1226,8 +1327,8 @@ mod dispatcher_database_tests {
     use super::{
         DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B, OLDEST_PENDING_AGE_ALERT_MS,
         backlog_alert, build_delivery_body, dispatcher_is_live, dispatcher_is_live_since, expand_one,
-        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reclaim_expired_delivery_leases,
-        reclaim_expired_dispatch_leases, run_tick, send_one,
+        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_source_tombstones,
+        reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases, requeue_failed, run_tick, send_one,
     };
     use crate::events::{BusinessEventInput, insert_business_event};
 
@@ -3194,25 +3295,458 @@ mod dispatcher_database_tests {
             json!({}),
         )
         .await;
-
-        // Simulate a concurrent worker holding an in-flight (not-yet-expired) lease on seq 1's
-        // dispatch row, without having committed the expansion transaction yet.
-        exec(
+        let seq1_id: Uuid = get_col(
             &scratch.db,
-            "UPDATE event_dispatch SET lease_token = 'in-flight', lease_expires_at = now() + interval '1 minute' \
-             WHERE workspace_id = $1 AND accepted_seq = 1",
+            "SELECT id FROM event_dispatch WHERE workspace_id = $1 AND accepted_seq = 1",
             vec![workspace_id.into()],
+            "id",
         )
         .await;
 
-        // Seq 2 must not be pickable: seq 1 (still `status = 'pending'`, only its lease is held) is
-        // an older eligible predecessor on the same document.
+        // A genuine second, still-open transaction on an independent connection takes the exact
+        // `FOR UPDATE` row lock `expand_one`'s own candidate-selection subquery's `FOR UPDATE SKIP
+        // LOCKED` would contend on -- not a fabricated `lease_token`/`lease_expires_at` stamp on
+        // the same connection. `gate-commands.md`'s literal requirement: "把旧 sealed 行锁在另一个
+        // 事务里再启动第二个 worker" -- a materially stronger proof than an UPDATE, because it
+        // exercises the real Postgres row-lock contention `SKIP LOCKED` must respect, not just the
+        // lease columns `expand_one`'s WHERE clause also happens to check.
+        let locker = scratch.second_connection().await;
+        let locker_tx = locker.begin().await.expect("locker transaction begins");
+        locker_tx
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM event_dispatch WHERE id = $1 FOR UPDATE",
+                vec![seq1_id.into()],
+            ))
+            .await
+            .expect("lock query runs")
+            .expect("seq 1's row exists to be locked");
+
+        // Seq 2 must not be pickable while seq 1 -- still `status = 'pending'`, merely row-locked
+        // by the still-open second transaction above -- is an older eligible predecessor on the
+        // same document.
         let outcome = expand_one(&scratch.db).await.expect("query runs");
         assert!(
             outcome.is_none(),
             "seq 2 must not be selectable while seq 1 (its older same-document predecessor) is \
-             still pending, even though seq 1's own lease makes seq 1 itself unleasable right now \
-             -- SKIP LOCKED must not let a worker skip past a busy head to a newer sibling"
+             still pending and genuinely row-locked by a real, held second transaction -- SKIP \
+             LOCKED must not let a worker skip past a busy head to a newer sibling"
+        );
+
+        // Release the real lock and confirm the head is now genuinely leasable -- proves the
+        // negative result above came from the held lock, not from some other reason expand_one
+        // returned nothing.
+        locker_tx
+            .rollback()
+            .await
+            .expect("locker transaction releases its lock");
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("query runs")
+            .expect("seq 1 becomes leasable the instant the real row lock is released");
+        assert!(matches!(
+            outcome,
+            ExpansionOutcome::NoSubscribers | ExpansionOutcome::Expanded
+        ));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_fifo_barrier_orders_by_accepted_seq_not_created_at_when_both_rows_share_a_timestamp() {
+        // `gate-commands.md`'s literal requirement: "并补一组 created_at 相同、first_seq 不同的固定
+        // fixture" -- an implementation that orders the head-of-queue candidate by `created_at`
+        // (or insertion order) instead of `accepted_seq` would pass every other FIFO fixture in
+        // this file (they all insert in seq order) but silently misorder this one.
+        let scratch = scratch_or_skip!("fifo-barrier-same-created-at");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let document_id = Uuid::new_v4();
+
+        let event_2 = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({}),
+        )
+        .await;
+        let dispatch_2_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![event_2.into()],
+            "id",
+        )
+        .await;
+        let same_created_at: DateTime<Utc> = get_col(
+            &scratch.db,
+            "SELECT created_at FROM event_dispatch WHERE event_id = $1",
+            vec![event_2.into()],
+            "created_at",
+        )
+        .await;
+
+        let event_1 = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({}),
+        )
+        .await;
+        let dispatch_1_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id = $1",
+            vec![event_1.into()],
+            "id",
+        )
+        .await;
+        // Pin the seq-1 row's `created_at` to exactly the seq-2 row's own -- two independent
+        // `commit_dispatch_work` calls would each stamp their own `now()` and could never
+        // reproduce an exact tie deterministically otherwise.
+        exec(
+            &scratch.db,
+            "UPDATE event_dispatch SET created_at = $2 WHERE id = $1",
+            vec![dispatch_1_id.into(), same_created_at.into()],
+        )
+        .await;
+
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+
+        // Real `expand_one` call (not a hand-duplicated copy of its candidate-selection SQL): the
+        // seq-2 row must still be `pending` afterwards, and the seq-1 row must be the one that
+        // actually got expanded, even though both share the exact same `created_at`.
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion query runs")
+            .expect("one of the two same-created_at rows is head");
+        assert!(matches!(outcome, ExpansionOutcome::Expanded));
+
+        let dispatch_1_status: String = get_col(
+            &scratch.db,
+            "SELECT status FROM event_dispatch WHERE id = $1",
+            vec![dispatch_1_id.into()],
+            "status",
+        )
+        .await;
+        let dispatch_2_status: String = get_col(
+            &scratch.db,
+            "SELECT status FROM event_dispatch WHERE id = $1",
+            vec![dispatch_2_id.into()],
+            "status",
+        )
+        .await;
+        assert_eq!(
+            dispatch_1_status, "expanded",
+            "accepted_seq=1 must be the row expand_one picked, even though created_at ties with seq=2"
+        );
+        assert_eq!(
+            dispatch_2_status, "pending",
+            "accepted_seq=2 must still be blocked behind its older same-document sibling"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `events-v1.md` "reaper 的谓词" / "来源表的保留期与外键语义": `event_delivery_sources` has no
+    /// `status`, so its reaper cannot use the `WHERE status IN (...)` shape the other two reapers
+    /// share -- its safety property is entirely the `delivery_id IS NULL` predicate. This proves
+    /// the three-way partition literally: a tombstone (`delivery_id IS NULL`) past retention is
+    /// reaped; a tombstone not yet past retention survives; and a row whose `delivery_id` is still
+    /// non-NULL survives *regardless of age*, because deleting it would destroy the
+    /// `(subscriber_kind, subscriber_id, source_event_id)` dedup evidence a still-referenced
+    /// delivery depends on.
+    #[tokio::test]
+    async fn tombstone_reaper_deletes_only_delivery_id_null_rows_past_retention_and_never_a_still_referenced_row() {
+        let scratch = scratch_or_skip!("tombstone-reaper");
+        let workspace_id = seed_workspace(&scratch.db).await;
+
+        async fn source_event(db: &DatabaseConnection, workspace_id: Uuid) -> Uuid {
+            insert_business_event(
+                db,
+                BusinessEventInput {
+                    workspace_id,
+                    project_id: None,
+                    event_type: "flow.content.accepted".to_string(),
+                    aggregate_type: "flow_document".to_string(),
+                    aggregate_id: Uuid::new_v4().to_string(),
+                    actor_id: None,
+                    source: json!({ "surface": "system" }),
+                    payload: json!({}),
+                    metadata: json!({}),
+                    correlation_id: None,
+                    causation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .expect("source business event inserts")
+        }
+
+        let live_delivery_id = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO event_deliveries (id, event_id, workspace_id, subscriber_kind, subscriber_id) \
+             VALUES ($1, $2, $3, 'webhook', $4)",
+            vec![
+                live_delivery_id.into(),
+                source_event(&scratch.db, workspace_id).await.into(),
+                workspace_id.into(),
+                Uuid::new_v4().into(),
+            ],
+        )
+        .await;
+
+        let now = Utc::now();
+        let old_created_at = now - chrono::Duration::days(super::DELIVERY_SOURCE_RETENTION_DAYS + 1);
+        let fresh_created_at = now - chrono::Duration::days(super::DELIVERY_SOURCE_RETENTION_DAYS - 1);
+
+        async fn insert_source_row(
+            db: &DatabaseConnection,
+            workspace_id: Uuid,
+            delivery_id: Option<Uuid>,
+            source_event_id: Uuid,
+            created_at: DateTime<Utc>,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            exec(
+                db,
+                "INSERT INTO event_delivery_sources \
+                 (id, workspace_id, delivery_id, subscriber_kind, subscriber_id, source_event_id, created_at) \
+                 VALUES ($1, $2, $3, 'webhook', $4, $5, $6)",
+                vec![
+                    id.into(),
+                    workspace_id.into(),
+                    delivery_id.into(),
+                    Uuid::new_v4().into(),
+                    source_event_id.into(),
+                    created_at.into(),
+                ],
+            )
+            .await;
+            id
+        }
+
+        let old_tombstone = insert_source_row(
+            &scratch.db,
+            workspace_id,
+            None,
+            source_event(&scratch.db, workspace_id).await,
+            old_created_at,
+        )
+        .await;
+        let fresh_tombstone = insert_source_row(
+            &scratch.db,
+            workspace_id,
+            None,
+            source_event(&scratch.db, workspace_id).await,
+            fresh_created_at,
+        )
+        .await;
+        let old_but_still_referenced = insert_source_row(
+            &scratch.db,
+            workspace_id,
+            Some(live_delivery_id),
+            source_event(&scratch.db, workspace_id).await,
+            old_created_at,
+        )
+        .await;
+
+        let reaped = reap_delivery_source_tombstones(&scratch.db, now)
+            .await
+            .expect("tombstone reaper runs");
+        assert_eq!(reaped, 1, "exactly one row -- the old tombstone -- must be reaped");
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE id = $1",
+                vec![old_tombstone.into()],
+            )
+            .await,
+            0,
+            "a delivery_id=NULL row past retention must be deleted"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE id = $1",
+                vec![fresh_tombstone.into()],
+            )
+            .await,
+            1,
+            "a delivery_id=NULL row not yet past retention must survive"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE id = $1",
+                vec![old_but_still_referenced.into()],
+            )
+            .await,
+            1,
+            "a row whose delivery_id is still non-NULL must survive regardless of age -- deleting \
+             it would destroy dedup evidence a still-live delivery depends on"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `events-v1.md`/`gate-commands.md` `requeue_failed`: revives `event_deliveries` rows stuck
+    /// at `status='failed'` back into the live queue, clearing `document_id` on every revived row
+    /// (content or not) so a revived content delivery cannot collide with -- or jump the FIFO
+    /// queue ahead of -- a live `pending` row for the same document via the partial coalescing
+    /// unique index, and never revives `cancelled` rows (`subscriber_gone`'s deliberate terminal
+    /// state, not a retryable failure).
+    #[tokio::test]
+    async fn requeue_failed_revives_failed_content_rows_clears_document_id_and_never_revives_cancelled() {
+        let scratch = scratch_or_skip!("requeue-failed");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let other_workspace_id = seed_workspace(&scratch.db).await;
+        let document_id = Uuid::new_v4();
+
+        async fn source_event(db: &DatabaseConnection, workspace_id: Uuid) -> Uuid {
+            insert_business_event(
+                db,
+                BusinessEventInput {
+                    workspace_id,
+                    project_id: None,
+                    event_type: "flow.content.accepted".to_string(),
+                    aggregate_type: "flow_document".to_string(),
+                    aggregate_id: Uuid::new_v4().to_string(),
+                    actor_id: None,
+                    source: json!({ "surface": "system" }),
+                    payload: json!({}),
+                    metadata: json!({}),
+                    correlation_id: None,
+                    causation_id: None,
+                    idempotency_key: None,
+                },
+            )
+            .await
+            .expect("source business event inserts")
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn insert_delivery(
+            db: &DatabaseConnection,
+            workspace_id: Uuid,
+            event_id: Uuid,
+            document_id: Option<Uuid>,
+            status: &str,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            exec(
+                db,
+                "INSERT INTO event_deliveries \
+                 (id, event_id, workspace_id, subscriber_kind, subscriber_id, document_id, status, \
+                  attempts, terminated_at, last_error_code) \
+                 VALUES ($1, $2, $3, 'webhook', $4, $5, $6, 3, now(), 'webhook_5xx')",
+                vec![
+                    id.into(),
+                    event_id.into(),
+                    workspace_id.into(),
+                    Uuid::new_v4().into(),
+                    document_id.into(),
+                    status.into(),
+                ],
+            )
+            .await;
+            id
+        }
+
+        let failed_content = insert_delivery(
+            &scratch.db,
+            workspace_id,
+            source_event(&scratch.db, workspace_id).await,
+            Some(document_id),
+            "failed",
+        )
+        .await;
+        let failed_non_content = insert_delivery(
+            &scratch.db,
+            workspace_id,
+            source_event(&scratch.db, workspace_id).await,
+            None,
+            "failed",
+        )
+        .await;
+        let cancelled = insert_delivery(
+            &scratch.db,
+            workspace_id,
+            source_event(&scratch.db, workspace_id).await,
+            Some(document_id),
+            "cancelled",
+        )
+        .await;
+        // A `failed` row in a *different* workspace must not be touched by this call.
+        let other_workspace_failed = insert_delivery(
+            &scratch.db,
+            other_workspace_id,
+            source_event(&scratch.db, other_workspace_id).await,
+            None,
+            "failed",
+        )
+        .await;
+
+        let revived = requeue_failed(&scratch.db, workspace_id, Utc::now())
+            .await
+            .expect("requeue_failed runs");
+        assert_eq!(
+            revived, 2,
+            "exactly the two failed rows in this workspace must be revived"
+        );
+
+        #[derive(sea_orm::FromQueryResult)]
+        struct Row {
+            status: String,
+            document_id: Option<Uuid>,
+            attempts: i32,
+            terminated_at: Option<DateTime<Utc>>,
+        }
+        async fn fetch(db: &DatabaseConnection, id: Uuid) -> Row {
+            Row::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT status, document_id, attempts, terminated_at FROM event_deliveries WHERE id = $1",
+                vec![id.into()],
+            ))
+            .one(db)
+            .await
+            .expect("query runs")
+            .expect("row exists")
+        }
+
+        let revived_content = fetch(&scratch.db, failed_content).await;
+        assert_eq!(revived_content.status, "pending");
+        assert_eq!(
+            revived_content.document_id, None,
+            "document_id must be cleared on revival so this row cannot collide with -- or jump \
+             the FIFO queue ahead of -- a live pending row for the same document"
+        );
+        assert_eq!(revived_content.attempts, 0);
+        assert_eq!(revived_content.terminated_at, None);
+
+        let revived_non_content = fetch(&scratch.db, failed_non_content).await;
+        assert_eq!(revived_non_content.status, "pending");
+        assert_eq!(revived_non_content.document_id, None);
+
+        let cancelled_row = fetch(&scratch.db, cancelled).await;
+        assert_eq!(
+            cancelled_row.status, "cancelled",
+            "cancelled is subscriber_gone's deliberate terminal state and must never be revived"
+        );
+
+        let other_row = fetch(&scratch.db, other_workspace_failed).await;
+        assert_eq!(
+            other_row.status, "failed",
+            "requeue_failed must be scoped to the requested workspace only"
         );
 
         scratch.drop_self().await;

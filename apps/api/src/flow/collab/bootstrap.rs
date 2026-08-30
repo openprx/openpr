@@ -183,6 +183,77 @@ async fn resync_required(db: &DatabaseConnection, workspace_id: Uuid, document_i
     ApiError::Conflict("resync_required".to_string())
 }
 
+/// One `collab_updates` row shaped for [`fetch_update_range`]'s egress-gap backfill use: every
+/// field a synthesized `update`+`accepted` frame pair needs, read from already-persisted receipt
+/// metadata rather than recomputed (`collab-protocol-v1.md` "禁止 ... 重新 apply update 拼
+/// receipt").
+pub struct EgressBackfillRow {
+    pub seq: i64,
+    pub update_id: Uuid,
+    pub bytes: Vec<u8>,
+    pub before_frontier: Vec<u8>,
+    pub after_frontier: Vec<u8>,
+    pub projection_seq: i64,
+    pub event_id: Uuid,
+    pub origin_client_id: Option<String>,
+}
+
+/// Reads the `[from_seq, to_seq]` slice of `collab_updates` a per-session
+/// `egress::EgressSequencer` gap needs to backfill.
+///
+/// A plain, unlocked, non-transactional read: this runs on a live connection well after the
+/// commit(s) that produced these rows, needs no MVCC snapshot consistency with anything else (each
+/// row is independently a finished, immutable fact), and must never itself block a concurrent
+/// writer the way `bootstrap::load`'s `REPEATABLE READ` transaction briefly can.
+///
+/// Returns fewer rows than the requested range when part of it no longer exists (compacted away,
+/// or otherwise missing) — the caller, never this function, decides that a short read means "give
+/// up and resync" (`egress::EgressSequencer::give_up_and_resync`) rather than forwarding a partial
+/// catch-up.
+///
+/// # Errors
+/// A database failure.
+pub async fn fetch_update_range(
+    db: &DatabaseConnection,
+    document_id: Uuid,
+    from_seq: i64,
+    to_seq: i64,
+) -> Result<Vec<EgressBackfillRow>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        seq: i64,
+        update_id: Uuid,
+        bytes: Vec<u8>,
+        before_frontier: Vec<u8>,
+        after_frontier: Vec<u8>,
+        projection_seq: i64,
+        event_id: Uuid,
+        origin_client_id: Option<String>,
+    }
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        sea_orm::DbBackend::Postgres,
+        "SELECT seq, update_id, bytes, before_frontier, after_frontier, projection_seq, event_id, \
+                origin_client_id \
+         FROM collab_updates WHERE document_id = $1 AND seq >= $2 AND seq <= $3 ORDER BY seq ASC",
+        vec![document_id.into(), from_seq.into(), to_seq.into()],
+    ))
+    .all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| EgressBackfillRow {
+            seq: row.seq,
+            update_id: row.update_id,
+            bytes: row.bytes,
+            before_frontier: row.before_frontier,
+            after_frontier: row.after_frontier,
+            projection_seq: row.projection_seq,
+            event_id: row.event_id,
+            origin_client_id: row.origin_client_id,
+        })
+        .collect())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {

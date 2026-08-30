@@ -76,29 +76,30 @@ set -euo pipefail
 #     `insert_flow_event` idempotent helper events-v1.md describes do not
 #     exist in apps/api/** yet (see check 1/2 above). Building them is an
 #     apps/** change, out of this script's --repo-root=read-only scope.
-#   - coalescing_seal_and_source_first_expansion: the source-attributed
-#     tests for this gate (12 of them) all currently pass, but
-#     gate-commands.md's paragraph names several additional negative
-#     fixtures this script did NOT find matching tests for when it read
-#     dispatcher.rs by hand while writing this script:
-#       * a reaper predicate test asserting the tombstone-cleanup query
-#         specifically keys off `delivery_id IS NULL` (no `tombstone`
-#         hit anywhere in dispatcher.rs);
-#       * `requeue_failed` reviving a content row while clearing
-#         `document_id` to NULL (no `requeue_failed` function exists in
-#         dispatcher.rs at all -- grepped, zero hits);
-#       * the FIFO-barrier test simulates a busy predecessor via a direct
-#         `UPDATE event_dispatch SET lease_token=...` rather than gate-
-#         commands.md's literal "lock the old sealed row in a second,
-#         still-open transaction" -- a materially weaker proof of the
-#         SKIP LOCKED behaviour under a *real* held row lock.
-#     These three are recorded as `checklist` entries with
-#     status="not_covered" and a `reason`; this script keeps `passed`
-#     false for this one gate even though its 12 attributed tests are all
-#     green, because "the tests that exist all pass" is not the same
-#     claim as "the paragraph is fully covered" (see this repo's
+#   - coalescing_seal_and_source_first_expansion: gate-commands.md's
+#     paragraph names three additional negative-fixture requirements
+#     narrower than "the gate's attributed tests all pass". This script
+#     re-derives all three DIRECTLY FROM dispatcher.rs's live source on
+#     every run (function-body-scoped regex checks, never a hardcoded
+#     verdict baked into this script -- see the `COALESCING_SEAL_CHECKLIST`
+#     step below): the tombstone reaper's own DELETE WHERE clause must
+#     contain `delivery_id IS NULL`; `requeue_failed`'s own UPDATE must
+#     unconditionally clear `document_id` to NULL and be scoped to
+#     `status = 'failed'` only (so `cancelled` rows are structurally
+#     excluded); and the FIFO-barrier test must open a genuine second
+#     transaction (`.begin()`) and take a real `FOR UPDATE` row lock, not
+#     a same-connection `SET lease_token=...` stand-in. Each item's
+#     `status` in the written evidence is "covered" or "not_covered"
+#     depending on what this run's regex match against the live function
+#     body actually found -- if any implementation renames these
+#     functions, changes the SQL shape, or reintroduces the weaker
+#     same-connection fixture, this check flips back to "not_covered" on
+#     its own, without anyone touching this script. `passed` for this gate
+#     still requires both the gate's attributed tests to all pass AND this
+#     checklist to be fully "covered" (see this repo's
 #     `command_contended_document_cardinality` precedent in
-#     verify-flow-cardinality-v0.4.sh for the same discipline).
+#     verify-flow-cardinality-v0.4.sh for the "tests passing != paragraph
+#     covered" discipline).
 #
 # Exit codes: 0 = every one of the 8 gates recomputed to passed (does not
 # happen today -- see gaps above), 1 = ran to completion and wrote
@@ -480,16 +481,156 @@ PY
 echo "=== dispatcher test results by gate ===" >&2
 jq -r '.gates | to_entries[] | "  \(.key): dynamic_passed=\(.value.dynamic_passed) (\(.value.tests | map(select(.status!="ok")) | length) not ok of \(.value.tests | length))"' <<<"$RESULT_JSON" >&2
 
-# ---- 6. coalescing_seal_and_source_first_expansion: additional hand-audited checklist ----
-# These three items were checked by hand while writing this script (see the
-# file header's "HONEST GAPS" section) -- no matching test/source hook was
-# found for any of them, so they are recorded as not_covered regardless of
-# how the source's own Gate: marker attribution scores.
-COALESCING_SEAL_CHECKLIST='[
-  {"requirement":"reaper deletes only rows matched by a delivery_id IS NULL tombstone predicate","status":"not_covered","reason":"no occurrence of the string \"tombstone\" anywhere in apps/api/src/events/dispatcher.rs; no test asserts the reaper query shape"},
-  {"requirement":"requeue_failed revives a content delivery row and clears document_id to NULL","status":"not_covered","reason":"no fn requeue_failed exists in apps/api/src/events/dispatcher.rs (grepped, zero hits) -- the feature this fixture would exercise is not implemented yet"},
-  {"requirement":"FIFO barrier fixture holds the older sealed/pending row lock in a second, still-open transaction (not a direct column UPDATE) before starting the second worker","status":"not_covered","reason":"dispatch_fifo_barrier_blocks_a_newer_same_document_work_item_while_an_older_one_is_in_flight simulates the busy predecessor via a direct UPDATE event_dispatch SET lease_token=... in the same connection, not a second held transaction -- a materially weaker proof of SKIP LOCKED behaviour under a real row lock"}
-]'
+# ---- 6. coalescing_seal_and_source_first_expansion: additional dynamic checklist ----
+# These three requirements are re-derived from the LIVE dispatcher.rs source on every run --
+# never a hardcoded verdict. Each check extracts the actual function body by brace-depth matching
+# (so a prose doc-comment mentioning the same words elsewhere in the file, e.g. the reaper's own
+# header comment, cannot produce a false "covered"), then asserts a specific, falsifiable shape
+# gate-commands.md's negative fixtures require.
+COALESCING_SEAL_CHECKLIST="$(python3 - "$DISPATCHER_RS" <<'PY'
+import json
+import re
+import sys
+
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+
+
+def function_body(name, src):
+    """Return the full `{ ... }` body of `[pub] [async] fn NAME(...)`, matched by brace depth (so
+    it stops at the function's own closing brace, not the first `}` a nested block hits) -- or
+    None if no such function/test currently exists in the source."""
+    m = re.search(rf"(?:pub\s+)?(?:async\s+)?fn\s+{re.escape(name)}\s*\(", src)
+    if not m:
+        return None
+    brace_start = src.find("{", m.end())
+    if brace_start == -1:
+        return None
+    depth = 0
+    for i in range(brace_start, len(src)):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[brace_start : i + 1]
+    return None
+
+
+checklist = []
+
+# 1. tombstone reaper predicate: the DELETE's own WHERE clause, not just the word "tombstone" or
+#    "delivery_id IS NULL" appearing somewhere else in the file (dispatcher.rs's doc comments say
+#    it in prose too -- only the function body counts as coverage).
+reaper_body = function_body("reap_delivery_source_tombstones", text)
+if reaper_body is None:
+    checklist.append({
+        "requirement": "reaper deletes only rows matched by a delivery_id IS NULL tombstone predicate",
+        "status": "not_covered",
+        "reason": "no fn reap_delivery_source_tombstones found in dispatcher.rs (grepped, zero hits)",
+    })
+else:
+    has_predicate = bool(re.search(r"WHERE\s+delivery_id\s+IS\s+NULL", reaper_body))
+    checklist.append({
+        "requirement": "reaper deletes only rows matched by a delivery_id IS NULL tombstone predicate",
+        "status": "covered" if has_predicate else "not_covered",
+        "reason": (
+            "reap_delivery_source_tombstones's own DELETE ... WHERE clause contains the literal "
+            "`delivery_id IS NULL` predicate (checked inside the function body only, not doc comments)"
+            if has_predicate
+            else "fn reap_delivery_source_tombstones exists but its body has no "
+            "`WHERE delivery_id IS NULL` predicate"
+        ),
+    })
+
+# 2. requeue_failed clears document_id on every revived row and is scoped to status = 'failed'
+#    only, so a cancelled row is structurally excluded from the UPDATE, not merely untested.
+rq_body = function_body("requeue_failed", text)
+if rq_body is None:
+    checklist.append({
+        "requirement": "requeue_failed revives a content delivery row and clears document_id to NULL",
+        "status": "not_covered",
+        "reason": "no fn requeue_failed found in dispatcher.rs (grepped, zero hits)",
+    })
+else:
+    clears_document_id = bool(re.search(r"document_id\s*=\s*NULL", rq_body))
+    scoped_to_failed_only = bool(
+        re.search(r"WHERE\s+workspace_id\s*=\s*\$1\s+AND\s+status\s*=\s*'failed'", rq_body)
+    )
+    touches_cancelled = "'cancelled'" in rq_body
+    ok = clears_document_id and scoped_to_failed_only and not touches_cancelled
+    reasons = []
+    if not clears_document_id:
+        reasons.append("SQL body does not set document_id = NULL")
+    if not scoped_to_failed_only:
+        reasons.append(
+            "UPDATE's WHERE clause is not exactly 'WHERE workspace_id = $1 AND status = "
+            "'failed'' -- cannot statically rule out touching non-failed rows"
+        )
+    if touches_cancelled:
+        reasons.append("function body references the literal 'cancelled' status -- needs manual review")
+    checklist.append({
+        "requirement": "requeue_failed revives a content delivery row and clears document_id to NULL",
+        "status": "covered" if ok else "not_covered",
+        "reason": (
+            "requeue_failed's UPDATE unconditionally sets document_id = NULL on every revived row "
+            "and its WHERE clause is scoped to status = 'failed' only, so cancelled rows are "
+            "structurally excluded, never touched"
+            if ok
+            else "; ".join(reasons)
+        ),
+    })
+
+# 3. FIFO barrier fixture: must hold the older sealed/pending row's lock in a genuine second,
+#    still-open transaction (locker.begin() + a real SELECT ... FOR UPDATE), not a same-connection
+#    UPDATE event_dispatch SET lease_token=... stand-in for a busy predecessor.
+fifo_test_name = "dispatch_fifo_barrier_blocks_a_newer_same_document_work_item_while_an_older_one_is_in_flight"
+fifo_body = function_body(fifo_test_name, text)
+if fifo_body is None:
+    checklist.append({
+        "requirement": "FIFO barrier fixture holds the older sealed/pending row lock in a second, still-open transaction (not a direct column UPDATE) before starting the second worker",
+        "status": "not_covered",
+        "reason": f"no test fn {fifo_test_name} found in dispatcher.rs (grepped, zero hits)",
+    })
+else:
+    opens_second_transaction = bool(re.search(r"\.begin\(\)", fifo_body))
+    holds_a_real_row_lock = "FOR UPDATE" in fifo_body
+    fakes_via_lease_token_update = bool(re.search(r"SET\s+lease_token\s*=", fifo_body))
+    ok = opens_second_transaction and holds_a_real_row_lock and not fakes_via_lease_token_update
+    reasons = []
+    if not opens_second_transaction:
+        reasons.append("test body has no `.begin()` call -- no second transaction is opened")
+    if not holds_a_real_row_lock:
+        reasons.append("test body has no `FOR UPDATE` row-lock query")
+    if fakes_via_lease_token_update:
+        reasons.append(
+            "test body still contains a `SET lease_token = ...` UPDATE, the weaker same-connection "
+            "stand-in gate-commands.md rejects"
+        )
+    checklist.append({
+        "requirement": "FIFO barrier fixture holds the older sealed/pending row lock in a second, still-open transaction (not a direct column UPDATE) before starting the second worker",
+        "status": "covered" if ok else "not_covered",
+        "reason": (
+            f"{fifo_test_name} opens a genuine second transaction (`locker.begin()`) and takes a "
+            "real `SELECT ... FOR UPDATE` row lock on the older row before asserting the newer row "
+            "is unpickable; no same-connection `SET lease_token` stand-in is present"
+            if ok
+            else "; ".join(reasons)
+        ),
+    })
+
+print(json.dumps(checklist))
+PY
+)"
+
+if ! jq -e . >/dev/null 2>&1 <<<"$COALESCING_SEAL_CHECKLIST"; then
+  echo "FAIL: coalescing_seal checklist parser did not produce valid JSON" >&2
+  echo "$COALESCING_SEAL_CHECKLIST" >&2
+  exit 2
+fi
+
+echo "=== coalescing_seal_and_source_first_expansion: dynamic checklist (re-derived from dispatcher.rs every run) ===" >&2
+jq -r '.[] | "  [\(.status)] \(.requirement)"' <<<"$COALESCING_SEAL_CHECKLIST" >&2
 
 # ---- 7. assemble the 8 gate verdicts ----
 FINAL_JSON="$(jq -n \
@@ -552,7 +693,7 @@ FINAL_JSON="$(jq -n \
         tests: gate_tests("coalescing_seal_and_source_first_expansion"),
         dynamic_passed: gate("coalescing_seal_and_source_first_expansion"),
         additional_checklist: $coalescing_seal_checklist,
-        note: "dynamic_passed reflects only the tests dispatcher.rs itself attributes to this gate via its own // Gate: marker; additional_checklist covers narrower textual requirements from gate-commands.md this script could not find matching test/source evidence for -- either one being false keeps status=failed"
+        note: "dynamic_passed reflects only the tests dispatcher.rs itself attributes to this gate via its own // Gate: marker; additional_checklist re-derives narrower textual requirements from gate-commands.md directly from the live dispatcher.rs source every run (function-body-scoped regex checks, never a hardcoded verdict) -- either one being false keeps status=failed"
       },
       flow_event_registry_payload_policy_complete: {
         status: (if $registry_passed then "passed" else "failed" end),

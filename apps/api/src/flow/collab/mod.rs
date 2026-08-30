@@ -13,6 +13,9 @@
 //!   `snapshot` frame (`collab-protocol-v1.md` "一致性 bootstrap/snapshot").
 //! - [`cache`]: the bounded per-document warm cache (`ADR-0010`, decision B).
 //! - [`coordinator`]: the instance-local, per-document coordinator (`ADR-0010`'s "第 0 层").
+//! - [`egress`]: the per-session outbound `accepted` sequencer (`collab-protocol-v1.md` "accepted
+//!   出站顺序") — strict per-subscription seq monotonicity, gap backfill from `collab_updates`,
+//!   `resync(reason="outbound_gap")` when it cannot.
 //! - [`frame`]: the wire shapes of every Collab Protocol v1 frame.
 //! - [`write`]: the server write algorithm (`ADR-0010`'s "写入算法" / `collab-protocol-v1.md`'s
 //!   "服务端写入顺序"), including the commit-time epoch fencing barrier and the document row lock.
@@ -26,6 +29,7 @@ pub mod authz;
 pub mod bootstrap;
 pub mod cache;
 pub mod coordinator;
+pub mod egress;
 pub mod frame;
 pub mod limits;
 pub mod origin;

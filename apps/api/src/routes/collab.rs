@@ -955,7 +955,7 @@ mod collab_database_tests {
         scratch.drop_self().await;
     }
 
-    /// ★ The multi-tab gap this module's `session::broadcast_content_update` closes: a second,
+    /// ★ The multi-tab gap `write::accept_update`'s own broadcast closes: a second,
     /// already-`open` WebSocket session on the *same* document must receive a real `update` frame
     /// carrying bytes it can incrementally apply — not just an `accepted` ack it cannot act on, and
     /// not a forced reconnect/re-bootstrap. `B` never calls `bootstrap`/`snapshot` a second time

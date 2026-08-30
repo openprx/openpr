@@ -21,9 +21,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::events::{BusinessEventInput, insert_business_event};
+use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
-use super::collab::{authz, bootstrap, frame, runtime, session, write};
+use super::collab::{authz, bootstrap, frame, runtime, write};
 use super::model::{AcceptedChange, FlowFeatureUpdateView, FlowObjectView};
 use super::projection;
 use super::query::feature_view_from_row;
@@ -326,7 +326,8 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     )
     .await?;
 
-    let event_id = insert_business_event(
+    let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
+    let event_id = insert_flow_event(
         &tx,
         BusinessEventInput {
             workspace_id: input.workspace_id,
@@ -346,18 +347,14 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             causation_id: None,
             idempotency_key: Some(input.idempotency_key.clone()),
         },
+        Some(FlowDispatchSpec {
+            max_attempts: dispatch_max_attempts,
+            document_id: None,
+            accepted_seq: None,
+        }),
     )
-    .await?;
-
-    let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
-    repository::insert_event_dispatch(
-        &tx,
-        event_id,
-        input.workspace_id,
-        "flow.object.created",
-        dispatch_max_attempts,
-    )
-    .await?;
+    .await?
+    .event_id;
 
     tx.commit().await?;
 
@@ -481,7 +478,8 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
         } else {
             "flow.feature.disabled"
         };
-        let id = insert_business_event(
+        let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
+        let id = insert_flow_event(
             &tx,
             BusinessEventInput {
                 workspace_id: input.workspace_id,
@@ -497,11 +495,14 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
                 causation_id: None,
                 idempotency_key: Some(input.idempotency_key.clone()),
             },
+            Some(FlowDispatchSpec {
+                max_attempts: dispatch_max_attempts,
+                document_id: None,
+                accepted_seq: None,
+            }),
         )
-        .await?;
-
-        let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
-        repository::insert_event_dispatch(&tx, id, input.workspace_id, event_type, dispatch_max_attempts).await?;
+        .await?
+        .event_id;
         Some(id)
     } else {
         None
@@ -997,11 +998,11 @@ fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
 /// Builds the CRDT update bytes for one content command (isolated fork, outside any lock — matches
 /// `write::hydrate_and_apply`'s own discipline for exactly this reason: neither path may hold a
 /// lock across a CRDT apply), then submits them through [`write::accept_update`] — the identical
-/// function `flow::collab::session::handle_client_frame` calls for a WebSocket `update` frame. On
-/// success, relays the same `update`+`accepted` frame pair to this document's other WebSocket
-/// sessions via [`session::broadcast_content_update`] (`collab-protocol-v1.md`: "复用 ADR-0010 的
-/// ordered egress / invalidation 通道，不另起一套" — this is the same call site the WebSocket path
-/// uses, not a second one).
+/// function `flow::collab::session::handle_client_frame` calls for a WebSocket `update` frame.
+/// `accept_update` itself broadcasts the resulting `update`+`accepted` frame pair to this
+/// document's WebSocket sessions (`collab-protocol-v1.md`: "复用 ADR-0010 的 ordered egress /
+/// invalidation 通道，不另起一套" — this call and the WebSocket path share that one broadcast call
+/// site inside `accept_update`, not a second one here).
 async fn execute_content_command(
     state: &AppState,
     input: &ExecuteCommandInput,
@@ -1037,12 +1038,14 @@ async fn execute_content_command(
         &state.db,
         &collab.cache,
         &collab.coordinator,
+        &collab.registry,
         &collab.snapshot,
         crate::config::runtime().flow.dispatch_max_attempts,
+        None,
         write::UpdateRequest {
             document_id,
             update_id,
-            bytes: update_bytes.clone(),
+            bytes: update_bytes,
             idempotency_key: Some(input.idempotency_key.clone()),
             origin_client_id: Some(input.origin_client_id.clone()),
             message: input.message.clone(),
@@ -1061,27 +1064,10 @@ async fn execute_content_command(
     if accepted.should_advance_snapshot {
         crate::flow::collab::snapshot::spawn_background(&collab.snapshot, state.db.clone(), document_id);
     }
-
-    let relay_frame = frame::Frame::Update {
-        protocol_version: frame::PROTOCOL_VERSION,
-        document_id,
-        update_id: accepted.update_id,
-        base_frontier: frame::encode_bytes(&accepted.before_frontier),
-        bytes: frame::encode_bytes(&update_bytes),
-        idempotency_key: Some(input.idempotency_key.clone()),
-        origin: input.origin_client_id.clone(),
-        message: input.message.clone(),
-    };
-    let accepted_frame = frame::Frame::Accepted {
-        protocol_version: frame::PROTOCOL_VERSION,
-        document_id,
-        update_id: accepted.update_id,
-        head_seq: accepted.head_seq,
-        head_frontier: frame::encode_bytes(&accepted.head_frontier),
-        projection_seq: accepted.projection_seq,
-        event_id: accepted.event_id,
-    };
-    session::broadcast_content_update(collab, document_id, None, &relay_frame, &accepted_frame);
+    // `write::accept_update` already broadcast the `update`+`accepted` frame pair to every
+    // WebSocket session with `document_id` open (this REST caller has no session_id of its own to
+    // exclude, so `None` above means every open session receives it) -- see that function's doc
+    // comment for why this is its one broadcast call site, not a second one here.
 
     let view = repository::fetch_object_view(&state.db, input.object_id)
         .await?
@@ -1141,7 +1127,8 @@ async fn execute_lifecycle_command(
     };
     repository::set_object_lifecycle(&tx, input.object_id, target_status, archived_at, input.actor_id).await?;
 
-    let event_id = insert_business_event(
+    let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
+    let event_id = insert_flow_event(
         &tx,
         BusinessEventInput {
             workspace_id,
@@ -1157,11 +1144,14 @@ async fn execute_lifecycle_command(
             causation_id: None,
             idempotency_key: Some(input.idempotency_key.clone()),
         },
+        Some(FlowDispatchSpec {
+            max_attempts: dispatch_max_attempts,
+            document_id: None,
+            accepted_seq: None,
+        }),
     )
-    .await?;
-
-    let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
-    repository::insert_event_dispatch(&tx, event_id, workspace_id, event_type, dispatch_max_attempts).await?;
+    .await?
+    .event_id;
 
     tx.commit().await?;
 

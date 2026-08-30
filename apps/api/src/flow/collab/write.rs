@@ -22,9 +22,24 @@
 //! [`hydrate_and_apply`], which returns *before* [`run_locked_phase`] ever calls `db.begin()`. The
 //! only work [`run_locked_phase`] does is the epoch fence, the row lock, the head-match recheck,
 //! and the five fixed, parameterized inserts/updates — no engine call, no cache call, and no
-//! broadcast happen inside it or between its `begin`/`commit`. Broadcasting `accepted` to other
-//! sessions happens in [`super::session`], strictly after [`accept_update`] returns `Ok`, i.e.
-//! strictly after commit.
+//! broadcast happen inside it or between its `begin`/`commit`.
+//!
+//! Broadcasting `accepted` happens in [`accept_update`] itself, strictly after commit but still
+//! before this function returns — i.e. still while the caller's [`DocumentCoordinator`] permit is
+//! held (`accept_update`'s own doc comment on why `_permit` stays alive for its whole body). This
+//! is deliberate, not incidental: `collab-protocol-v1.md`'s "accepted 出站顺序" requires broadcasts
+//! for one document to reach [`super::registry::SessionRegistry`] in commit order, and the
+//! coordinator permit is the only thing in this instance that actually serializes writers for one
+//! `document_id`. Broadcasting *after* `accept_update` returns — the shape this module shipped
+//! with through v0.4's early builds — drops that serialization exactly where it matters: two
+//! commits for the same document can each finish (commit + release the permit) before either one
+//! reaches the registry, and normal async scheduling gives no guarantee the one that committed
+//! first also broadcasts first. Enqueuing to [`super::registry::SessionRegistry`]'s
+//! `mpsc::UnboundedSender` is a fast, synchronous, in-memory operation, not the network I/O or
+//! blocking work the lock-content discipline above forbids inside the *database* row lock — the
+//! coordinator permit is a separate, lighter-weight admission gate `coordinator.rs`'s own doc
+//! comment already says exists "purely to serialize same-instance writers", so extending its hold
+//! this far is within its documented purpose.
 
 #![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
 
@@ -36,15 +51,16 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::events::{BusinessEventInput, insert_business_event};
+use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 use crate::flow::projection;
 
 use super::authz::fence_epoch_for_share;
 use super::bootstrap::{self, content_hash};
 use super::cache::WarmCache;
 use super::coordinator::DocumentCoordinator;
-use super::frame::RejectedCode;
+use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, encode_bytes};
 use super::limits::{DOCUMENT_LOCK_HOLD_MS_MAX, DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS};
+use super::registry::SessionRegistry;
 use super::snapshot::{self, SnapshotAdvancer, Trigger};
 
 pub struct UpdateRequest {
@@ -436,7 +452,7 @@ async fn run_locked_phase(
     let before_frontier = prepared.observed.head_frontier.clone();
     let after_frontier = prepared.after_frontier.clone();
 
-    let event_id = insert_business_event(
+    let event_id = insert_flow_event(
         &tx,
         BusinessEventInput {
             workspace_id: request.workspace_id,
@@ -458,8 +474,14 @@ async fn run_locked_phase(
             causation_id: None,
             idempotency_key: None,
         },
+        Some(FlowDispatchSpec {
+            max_attempts: dispatch_max_attempts,
+            document_id: Some(request.document_id),
+            accepted_seq: Some(new_head_seq),
+        }),
     )
-    .await?;
+    .await?
+    .event_id;
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -523,8 +545,6 @@ async fn run_locked_phase(
     ))
     .await?;
 
-    insert_event_dispatch_content(&tx, event_id, request, new_head_seq, dispatch_max_attempts).await?;
-
     tx.commit().await?;
 
     Ok(LockedOutcome::Committed(Accepted {
@@ -539,36 +559,6 @@ async fn run_locked_phase(
         // would mean an extra query inside the lock, which lock discipline forbids).
         should_advance_snapshot: false,
     }))
-}
-
-/// `event_dispatch` needs `document_id`/`accepted_seq` filled for `flow.content.accepted`
-/// (`event_dispatch_document_id_fill_check`/`event_dispatch_accepted_seq_fill_check`), which
-/// `crate::flow::repository::insert_event_dispatch` (written for the create-object path, where
-/// both stay `NULL`) does not support — this is the content-write-specific insert.
-async fn insert_event_dispatch_content<C: ConnectionTrait>(
-    conn: &C,
-    event_id: Uuid,
-    request: &UpdateRequest,
-    accepted_seq: i64,
-    max_attempts: i32,
-) -> Result<(), ApiError> {
-    conn.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            INSERT INTO event_dispatch (id, event_id, workspace_id, event_type, document_id, accepted_seq, max_attempts)
-            VALUES ($1, $2, $3, 'flow.content.accepted', $4, $5, $6)
-        ",
-        vec![
-            Uuid::new_v4().into(),
-            event_id.into(),
-            request.workspace_id.into(),
-            request.document_id.into(),
-            accepted_seq.into(),
-            max_attempts.into(),
-        ],
-    ))
-    .await?;
-    Ok(())
 }
 
 /// Runs [`hydrate_and_apply`] + [`run_locked_phase`] with bounded rebase, inside one coordinator
@@ -586,14 +576,21 @@ pub async fn accept_update(
     db: &DatabaseConnection,
     cache: &WarmCache,
     coordinator: &DocumentCoordinator,
+    registry: &SessionRegistry,
     snapshot_advancer: &SnapshotAdvancer,
     dispatch_max_attempts: i32,
+    exclude_session_id: Option<Uuid>,
     request: UpdateRequest,
 ) -> Result<AcceptOutcome, ApiError> {
     if let Err(err) = InputLimits::default().validate_update(&request.bytes) {
         return Ok(reject_from_collab_error(Some(request.update_id), &err));
     }
 
+    // No broadcast on this path: `prior` is an already-committed, already-broadcast seq (this is
+    // exactly the request-retried-after-a-lost-response case), so re-broadcasting it would only
+    // ever produce a `SeqDecision::Duplicate` a receiving session's `egress::EgressSequencer`
+    // drops anyway (`collab-protocol-v1.md`: "seq<=last_applied_seq 是幂等重复,忽略") — wasted work
+    // on every other open session's channel for no observable effect.
     if let Some(prior) = find_prior_update(db, request.document_id, request.update_id).await? {
         return Ok(AcceptOutcome::Accepted(prior));
     }
@@ -672,6 +669,9 @@ pub async fn accept_update(
                     prepared.decoded_bytes_hint,
                 );
                 accepted.should_advance_snapshot = should_advance_snapshot;
+                // Still inside the coordinator permit acquired above -- see this module's doc
+                // comment on why that is what makes this broadcast's order match commit order.
+                broadcast_committed_update(registry, exclude_session_id, &request, &accepted);
                 return Ok(AcceptOutcome::Accepted(accepted));
             }
             Ok(Ok(LockedOutcome::EpochMismatch)) => {
@@ -690,6 +690,41 @@ pub async fn accept_update(
             }
         }
     }
+}
+
+/// Sends the `update`+`accepted` frame pair `collab-protocol-v1.md` requires for one committed
+/// content write, to every other session with `request.document_id` open. The single call site
+/// both `flow::collab::session`'s WebSocket path and `flow::command::execute_content_command`'s
+/// REST path route through (via [`accept_update`]) — see this module's top doc comment for why
+/// this runs here, still inside the caller's coordinator permit, rather than after
+/// [`accept_update`] returns as earlier builds of this module did.
+fn broadcast_committed_update(
+    registry: &SessionRegistry,
+    exclude_session_id: Option<Uuid>,
+    request: &UpdateRequest,
+    accepted: &Accepted,
+) {
+    let update_frame = Frame::Update {
+        protocol_version: PROTOCOL_VERSION,
+        document_id: request.document_id,
+        update_id: accepted.update_id,
+        base_frontier: encode_bytes(&accepted.before_frontier),
+        bytes: encode_bytes(&request.bytes),
+        idempotency_key: request.idempotency_key.clone(),
+        origin: request.origin_client_id.clone().unwrap_or_default(),
+        message: request.message.clone(),
+    };
+    let accepted_frame = Frame::Accepted {
+        protocol_version: PROTOCOL_VERSION,
+        document_id: request.document_id,
+        update_id: accepted.update_id,
+        head_seq: accepted.head_seq,
+        head_frontier: encode_bytes(&accepted.head_frontier),
+        projection_seq: accepted.projection_seq,
+        event_id: accepted.event_id,
+    };
+    registry.broadcast(request.document_id, &update_frame, exclude_session_id);
+    registry.broadcast(request.document_id, &accepted_frame, exclude_session_id);
 }
 
 // ---- Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
@@ -719,9 +754,11 @@ mod database_tests {
 
     use super::{AcceptOutcome, SnapshotAdvancer, UpdateRequest, accept_update};
     use crate::flow::collab::authz;
+    use crate::flow::collab::bootstrap::fetch_update_range;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
     use crate::flow::collab::frame::RejectedCode;
+    use crate::flow::collab::registry::SessionRegistry;
     use crate::flow::command::{CreateObjectInput, create_object};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -933,14 +970,17 @@ mod database_tests {
 
         let cache = WarmCache::new();
         let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
         let snapshot_advancer = SnapshotAdvancer::new();
         let update_id = Uuid::new_v4();
         let outcome = accept_update(
             &state.db,
             &cache,
             &coordinator,
+            &registry,
             &snapshot_advancer,
             10,
+            None,
             UpdateRequest {
                 document_id,
                 update_id,
@@ -1043,6 +1083,7 @@ mod database_tests {
 
         let cache = WarmCache::new();
         let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
         let snapshot_advancer = SnapshotAdvancer::new();
         let update_id = Uuid::new_v4();
         let db_for_a = state.db.clone();
@@ -1051,8 +1092,10 @@ mod database_tests {
                 &db_for_a,
                 &cache,
                 &coordinator,
+                &registry,
                 &snapshot_advancer,
                 10,
+                None,
                 UpdateRequest {
                     document_id,
                     update_id,
@@ -1188,6 +1231,7 @@ mod database_tests {
 
         let cache = WarmCache::new();
         let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
         let snapshot_advancer = SnapshotAdvancer::new();
         let update_id = Uuid::new_v4();
         let db_for_a = state.db.clone();
@@ -1196,8 +1240,10 @@ mod database_tests {
                 &db_for_a,
                 &cache,
                 &coordinator,
+                &registry,
                 &snapshot_advancer,
                 10,
+                None,
                 UpdateRequest {
                     document_id,
                     update_id,
@@ -1265,5 +1311,115 @@ mod database_tests {
     fn lock_timeout_budgets_match_the_frozen_limits_v1_numbers() {
         assert_eq!(super::DOCUMENT_LOCK_WAIT_MS_MAX, 100);
         assert_eq!(super::DOCUMENT_LOCK_HOLD_MS_MAX, 100);
+    }
+
+    /// `flow::collab::egress::EgressSequencer`'s `SeqDecision::Gap` backfill query
+    /// (`collab-protocol-v1.md` "accepted 出站顺序"): proves `fetch_update_range` reads back the
+    /// exact `[from_seq, to_seq]` slice of real `collab_updates` rows a gap needs -- same
+    /// `before_frontier`/`after_frontier`/`bytes`/`event_id`/`projection_seq` the production write
+    /// path (`accept_update`, exercised above) actually committed, not recomputed -- and returns a
+    /// short read (not an error, not padding) when part of the requested range does not exist, so
+    /// `flow::collab::session::resolve_egress_gap` can tell "fully backfillable" from "must resync"
+    /// by row count alone.
+    #[tokio::test]
+    async fn fetch_update_range_returns_the_exact_persisted_slice_and_a_short_read_past_head() {
+        let scratch = scratch_or_skip!("fetch-update-range");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct SnapshotRow {
+            snapshot: Vec<u8>,
+        }
+        let snapshot_row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        let mut engine = LoroCollabEngine::load(&snapshot_row.snapshot).expect("loads");
+
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = SessionRegistry::new();
+        let snapshot_advancer = SnapshotAdvancer::new();
+
+        // Commit 3 real updates (head_seq 1..=3) through the exact production write path.
+        let mut committed = Vec::new();
+        for label in ["seq-1", "seq-2", "seq-3"] {
+            let base_frontier = engine.frontier();
+            engine.set_title(label).expect("set_title succeeds");
+            let bytes = engine.export_from(&base_frontier).expect("export succeeds");
+            let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+            let outcome = accept_update(
+                &state.db,
+                &cache,
+                &coordinator,
+                &registry,
+                &snapshot_advancer,
+                10,
+                None,
+                UpdateRequest {
+                    document_id,
+                    update_id: Uuid::new_v4(),
+                    bytes,
+                    idempotency_key: None,
+                    origin_client_id: Some("range-test".to_string()),
+                    message: None,
+                    actor_id: owner_id,
+                    workspace_id,
+                    checked_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await
+            .expect("accept_update does not hit a hard database error");
+            let AcceptOutcome::Accepted(accepted) = outcome else {
+                panic!("expected Accepted for {label}");
+            };
+            committed.push(accepted);
+        }
+
+        // Exact contiguous slice covering the middle two commits (seq 2..=3).
+        let rows = fetch_update_range(&state.db, document_id, 2, 3)
+            .await
+            .expect("range query runs");
+        assert_eq!(rows.len(), 2, "must return exactly the two rows in [2,3]");
+        assert_eq!(rows[0].seq, 2);
+        assert_eq!(rows[1].seq, 3);
+        assert_eq!(rows[0].update_id, committed[1].update_id);
+        assert_eq!(rows[1].update_id, committed[2].update_id);
+        assert_eq!(
+            rows[0].before_frontier, committed[0].head_frontier,
+            "before_frontier of seq 2 must chain from seq 1's committed head_frontier"
+        );
+        assert_eq!(rows[0].after_frontier, committed[1].head_frontier);
+        assert_eq!(rows[0].event_id, committed[1].event_id);
+        assert_eq!(rows[0].projection_seq, committed[1].projection_seq);
+        assert_eq!(rows[0].origin_client_id.as_deref(), Some("range-test"));
+
+        // A range extending past the real head (only 3 updates exist) must come back short, not
+        // padded and not an error -- this is exactly the signal `resolve_egress_gap` uses to
+        // decide "give up and resync" instead of forwarding a partial catch-up.
+        let short_rows = fetch_update_range(&state.db, document_id, 2, 10)
+            .await
+            .expect("range query runs even past head");
+        assert_eq!(
+            short_rows.len(),
+            2,
+            "only seq 2 and 3 exist -- a short read, not padding and not an error"
+        );
+
+        // A range entirely past head returns empty, not an error.
+        let empty_rows = fetch_update_range(&state.db, document_id, 50, 60)
+            .await
+            .expect("range query runs for a range with no rows");
+        assert!(empty_rows.is_empty());
+
+        scratch.drop_self().await;
     }
 }

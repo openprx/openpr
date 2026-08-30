@@ -33,7 +33,7 @@ use uuid::Uuid;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// One accepted update, as embedded in a `snapshot` frame's `tail_updates`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TailUpdate {
     pub seq: i64,
     pub update_id: Uuid,
@@ -68,7 +68,11 @@ pub enum DrainReason {
     Contention,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `Presence.payload`/`Rejected.details` are `serde_json::Value`, which has no `Eq` impl, so this
+// enum can only be `PartialEq`, not `Eq` -- test-only equality assertions (`session::database_tests`'
+// backfilled-frame ordering checks) are all this derive exists for.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Frame {
     Hello {

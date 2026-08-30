@@ -57,28 +57,38 @@ set -euo pipefail
 #
 #   - bounded_warm_cache_lock_hold_and_round_trip_budgets: ADR-0010 §"量化
 #     接受与推翻门槛" freezes two numbers this script CANNOT check without
-#     a load-generation harness that does not exist anywhere in this
-#     repository: "hold p95 不超过 25 ms" (a *distribution* statistic under
-#     concurrent load, not the DOCUMENT_LOCK_HOLD_MS_MAX=100ms hard
-#     rollback ceiling this script does verify) and "10 个并发 client 的
-#     accepted round-trip p95 不超过 250 ms". This script extracts both
-#     numbers from ADR-0010's own text and records them verbatim as
-#     `load_test_targets_not_covered` -- it never claims to have measured
-#     them, and this gate's `status` stays "failed" for exactly that
-#     reason regardless of how the constant cross-check and the two real
-#     unit tests score.
+#     a load-generation harness: "hold p95 不超过 25 ms" (a *distribution*
+#     statistic under concurrent load, not the DOCUMENT_LOCK_HOLD_MS_
+#     MAX=100ms hard rollback ceiling this script does verify) and "10 个
+#     并发 client 的 accepted round-trip p95 不超过 250 ms". This script
+#     extracts both numbers from ADR-0010's own text (`load_test_targets_
+#     not_covered`) AND, every run, re-greps apps/ and crates/ for any
+#     plausible load-harness marker (`load_harness_grep` -- patterns like
+#     `round_trip_p95`, `10_client`, `LoadHarness`) instead of assuming
+#     from memory that none exists. It never claims to have MEASURED the
+#     targets even if a harness turns up (running one and reading its
+#     output is still a human/CI job, not something this script fabricates)
+#     -- but the "nothing exists yet" half of the reason is now something
+#     this script re-proves every run rather than repeats verbatim.
 #   - bootstrap_repeatable_read_and_ws_parity: snapshot.rs's own doc
 #     comment on `advancement_stays_correct_when_racing_a_concurrent_
 #     write` literally says "Gate 9 groundwork ... Not the full gate 9
 #     fixture (gate-commands.md's REST/WS 10-client load harness is out
 #     of this task's scope)". This script takes that self-assessment at
 #     face value (it is source-code-adjacent, re-checked every run, not a
-#     one-off claim this script trusts blindly) and keeps this gate
-#     "failed" even when the groundwork test passes.
-#   - accepted_egress_seq_monotonic_and_gap_resync: no test or `Gate 10`
-#     marker for this exists anywhere in apps/api/** (grepped for "Gate
-#     10", "egress", "gap_resync" -- zero hits outside contracts/docs).
-#     Recorded as not_covered; nothing to run.
+#     one-off claim this script trusts blindly), reuses the same
+#     `load_harness_grep` re-search described above for the harness half
+#     of its reason, and keeps this gate "failed" even when the groundwork
+#     test passes.
+#   - accepted_egress_seq_monotonic_and_gap_resync: this script's own
+#     "Gate <N> `<id>`" marker extraction (used identically for gates 7
+#     and 8 above) is what actually decides this gate's status -- if
+#     snapshot.rs ever grows a Gate 10 `accepted_egress_seq_monotonic_and_
+#     gap_resync` marker with attributed tests, this gate starts scoring
+#     "passed"/"failed" from those tests' real ok/FAILED results like any
+#     other gate. Today no such marker exists, so status is "not_covered"
+#     -- computed by checking the live marker map, not a value baked into
+#     this script.
 #
 # Exit codes: 0 = every one of the 6 gates recomputed to passed (does not
 # happen today -- see gaps above), 1 = ran to completion and wrote
@@ -218,12 +228,13 @@ SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # ---- 1+2. static checks: ADR status + frozen numeric budgets ----
-STATIC_JSON="$(python3 - "$ADR_PATH" "$LIMITS_RS" <<'PY'
+STATIC_JSON="$(python3 - "$ADR_PATH" "$LIMITS_RS" "$REPO_ROOT" <<'PY'
 import json
 import re
+import subprocess
 import sys
 
-adr_path, limits_rs = sys.argv[1], sys.argv[2]
+adr_path, limits_rs, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 adr_text = open(adr_path, encoding="utf-8").read()
 
 sm = re.search(r"^-\s*状态：\s*(\S+)\s*$", adr_text, re.M)
@@ -273,6 +284,43 @@ for name, val in warm_cache_constants.items():
     if val is None:
         violations.append(f"expected warm-cache constant {name} not found in {limits_rs}")
 
+# ---- load-generation harness existence: re-grepped from the live tree every run, never assumed.
+# The p95 numbers above are distribution statistics under concurrent load -- this script cannot
+# derive "no harness exists" from memory; it has to keep re-searching the tree for one on every
+# run, exactly like the flow_event_payload_policy registry search in
+# verify-flow-events-v0.4.sh does for its own "not built yet" gap. If a harness plausibly matching
+# these patterns is ever added, this flips to True and the gates below stop asserting its absence
+# (they still cannot claim the numeric target is *met* without running it -- that remains a human
+# call -- but they stop repeating a now-false "nothing exists" claim).
+LOAD_HARNESS_PATTERNS = [
+    r"round_trip_p95",
+    r"lock_hold_p95",
+    r"p95_ms",
+    r"LoadHarness",
+    r"load_generat",
+    r"ten_client",
+    r"10_client",
+    r"concurrent_client",
+]
+
+
+def grep_repo_for_load_harness(root, patterns):
+    hits = []
+    for sub in ("apps", "crates"):
+        d = f"{root}/{sub}"
+        try:
+            out = subprocess.run(
+                ["grep", "-rlE", "--include=*.rs", "|".join(patterns), d],
+                capture_output=True, text=True, check=False,
+            ).stdout
+        except FileNotFoundError:
+            out = ""
+        hits.extend(line for line in out.splitlines() if "/target/" not in line)
+    return sorted(set(hits))
+
+
+load_harness_hits = grep_repo_for_load_harness(repo_root, LOAD_HARNESS_PATTERNS)
+
 print(json.dumps({
     "adr_status": adr_status,
     "adr_status_required_for_candidate": "Accepted",
@@ -286,7 +334,12 @@ print(json.dumps({
     "load_test_targets_not_covered": {
         "lock_hold_p95_ms": lock_hold_p95_ms_adr,
         "round_trip_p95_ms_10_clients": round_trip_p95_ms_adr,
-        "reason": "distribution statistics under concurrent load; no load-generation harness exists in this repository to measure them",
+        "reason": "distribution statistics under concurrent load; see load_harness_grep for whether a harness now exists to measure them",
+    },
+    "load_harness_grep": {
+        "patterns_searched": LOAD_HARNESS_PATTERNS,
+        "hit_files": load_harness_hits,
+        "exists": len(load_harness_hits) > 0,
     },
     "constant_cross_check_violations": violations,
 }))
@@ -307,6 +360,7 @@ ADR_STATUS="$(jq -r '.adr_status' <<<"$STATIC_JSON")"
 ADR_ACCEPTED="$(jq -r '.adr_accepted' <<<"$STATIC_JSON")"
 CONSTANT_VIOLATION_COUNT="$(jq '.constant_cross_check_violations | length' <<<"$STATIC_JSON")"
 CONSTANTS_PASSED=$([[ "$CONSTANT_VIOLATION_COUNT" -eq 0 ]] && echo true || echo false)
+LOAD_HARNESS_EXISTS="$(jq -r '.load_harness_grep.exists' <<<"$STATIC_JSON")"
 
 echo "=== ADR-0010 status: $ADR_STATUS (required for candidate: Accepted) ===" >&2
 echo "=== frozen numeric budgets: ADR-0010 text vs apps/api/src/flow/collab/limits.rs ===" >&2
@@ -314,8 +368,14 @@ jq -r '.frozen_budgets | to_entries[] | select(.key != "warm_cache_constants_pre
 if [[ "$CONSTANT_VIOLATION_COUNT" -gt 0 ]]; then
   jq -r '.constant_cross_check_violations[] | "  VIOLATION: " + .' <<<"$STATIC_JSON" >&2
 fi
-echo "=== load-test targets this script does NOT and cannot measure (no harness) ===" >&2
+echo "=== load-test targets this script cannot itself measure (distribution stats under concurrent load) ===" >&2
 jq -r '.load_test_targets_not_covered | "  lock_hold_p95_ms=\(.lock_hold_p95_ms) round_trip_p95_ms_10_clients=\(.round_trip_p95_ms_10_clients)"' <<<"$STATIC_JSON" >&2
+echo "=== load-generation harness existence (re-grepped from apps/ and crates/ every run, never assumed) ===" >&2
+echo "  patterns searched: $(jq -c '.load_harness_grep.patterns_searched' <<<"$STATIC_JSON")" >&2
+echo "  harness found: $LOAD_HARNESS_EXISTS" >&2
+if [[ "$LOAD_HARNESS_EXISTS" == "true" ]]; then
+  jq -r '.load_harness_grep.hit_files[] | "  hit: " + .' <<<"$STATIC_JSON" >&2
+fi
 
 # ---- 3. "Gate <N> `<id>`" marker extraction from snapshot.rs (dynamic, re-parsed every run) ----
 MARKERS_JSON="$(python3 - "$SNAPSHOT_RS" <<'PY'
@@ -509,12 +569,13 @@ FROZEN_LIMITS_TEST_PASSED="$(jq -r '.frozen_limits_test_status == "ok"' <<<"$RES
 # ---- 6. assemble the 6 gate verdicts ----
 FINAL_JSON="$(jq -n \
   --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" --arg release "$RELEASE" \
-  --arg adr "$ADR_PATH" --arg limits "$LIMITS_PATH" \
+  --arg adr "$ADR_PATH" --arg limits "$LIMITS_PATH" --arg snapshot_rs "$SNAPSHOT_RS" \
   --argjson static_check "$STATIC_JSON" \
   --argjson adr_accepted "$ADR_ACCEPTED" \
   --argjson constants_passed "$CONSTANTS_PASSED" \
   --argjson lock_test_passed "$LOCK_TEST_PASSED" \
   --argjson frozen_limits_test_passed "$FROZEN_LIMITS_TEST_PASSED" \
+  --argjson load_harness_exists "$LOAD_HARNESS_EXISTS" \
   --argjson snap "$RESULT_JSON" \
   '
   def gate($id): ($snap.gates[$id].dynamic_passed // false);
@@ -545,12 +606,20 @@ FINAL_JSON="$(jq -n \
       },
       bounded_warm_cache_lock_hold_and_round_trip_budgets: {
         status: "failed",
-        reason: "hard-ceiling constants (lock wait/hold/rebase-attempts) verified against source and passing real tests, but the gate additionally requires p95 lock-hold <=25ms and 10-client accepted round-trip p95 <=250ms under concurrent load -- no load-generation harness exists in this repository to measure those, see load_test_targets_not_covered",
+        reason: (
+          "hard-ceiling constants (lock wait/hold/rebase-attempts) verified against source and passing real tests, but the gate additionally requires p95 lock-hold <=25ms and 10-client accepted round-trip p95 <=250ms under concurrent load, which needs a load-generation harness to measure -- "
+          + (if $load_harness_exists then
+              "a possible harness now exists in this repository (see load_harness_grep.hit_files below) that this script cannot yet interpret; this gate needs MANUAL review to check whether it actually measures and meets the p95 targets, not a repeat of the old \"nothing exists\" claim"
+            else
+              "repo-wide grep for " + ($static_check.load_harness_grep.patterns_searched | join(", ")) + " found zero hits under apps/ and crates/ (re-checked every run) -- no such harness exists yet, this is a build gap, not a tooling limitation"
+            end)
+        ),
         verified_portion: {
           constant_cross_check_passed: $constants_passed,
           lock_timeout_test_passed: $lock_test_passed,
           frozen_limits_test_passed: $frozen_limits_test_passed
         },
+        load_harness_grep: $static_check.load_harness_grep,
         not_covered: $static_check.load_test_targets_not_covered
       },
       minimal_snapshot_advancement_bounds_tail: {
@@ -564,12 +633,21 @@ FINAL_JSON="$(jq -n \
       bootstrap_repeatable_read_and_ws_parity: {
         status: "failed",
         groundwork_test: ($snap.groundwork["9"] // null),
-        reason: "gate-commands.md requires a REST/WS 10-client load harness proving the same REPEATABLE READ view and cross-surface seq/hash/frontier parity; no such harness exists in this repository",
+        reason: (
+          "gate-commands.md requires a REST/WS 10-client load harness proving the same REPEATABLE READ view and cross-surface seq/hash/frontier parity -- "
+          + (if $load_harness_exists then
+              "a possible harness now exists in this repository (see load_harness_grep.hit_files below) that this script cannot yet interpret; this gate needs MANUAL review, not a repeat of the old \"nothing exists\" claim"
+            else
+              "repo-wide grep for " + ($static_check.load_harness_grep.patterns_searched | join(", ")) + " found zero hits under apps/ and crates/ (re-checked every run) -- no such harness exists yet"
+            end)
+        ),
+        load_harness_grep: $static_check.load_harness_grep,
         note: "the source own doc comment on the groundwork test above explicitly disclaims full gate-9 coverage (\"Not the full gate 9 fixture ... out of this task scope\"); this script honors that disclaimer and never rounds the groundwork test pass up to gate passed, even when groundwork_test.status is ok"
       },
       accepted_egress_seq_monotonic_and_gap_resync: {
-        status: "not_covered",
-        reason: "no Gate-10 marker, egress-sequencing test, or gap-resync test found anywhere in apps/api/** -- nothing exists yet for this script to run"
+        status: (if ($snap.gates | has("accepted_egress_seq_monotonic_and_gap_resync")) then (if gate("accepted_egress_seq_monotonic_and_gap_resync") then "passed" else "failed" end) else "not_covered" end),
+        tests: gate_tests("accepted_egress_seq_monotonic_and_gap_resync"),
+        reason: (if ($snap.gates | has("accepted_egress_seq_monotonic_and_gap_resync")) then null else ("no \"Gate 10 `accepted_egress_seq_monotonic_and_gap_resync`\" doc-comment marker found in " + $snapshot_rs + " (re-parsed from the live source every run, see the \"Gate <N> `<id>`\" marker extraction step above) -- nothing exists yet for this script to run") end)
       }
     }
   }
