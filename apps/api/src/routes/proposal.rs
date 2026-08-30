@@ -432,7 +432,7 @@ pub(crate) enum ProposalScope {
 }
 
 impl ProposalScope {
-    fn allows(&self, workspace_id: Option<Uuid>) -> bool {
+    pub(crate) fn allows(&self, workspace_id: Option<Uuid>) -> bool {
         match self {
             Self::Unrestricted => true,
             // An unattributed proposal belongs to no tenant, so no tenant may read it.
@@ -453,13 +453,21 @@ struct WorkspaceIdRow {
 /// `workspace_bots` row id. An identity that matches neither sees nothing rather than everything.
 pub(crate) async fn proposal_scope(state: &AppState, claims: &JwtClaims) -> Result<ProposalScope, ApiError> {
     let subject = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid subject".to_string()))?;
+    proposal_scope_for_subject(&state.db, subject).await
+}
 
+/// The connection-level half of [`proposal_scope`], so every proposal route can resolve the same
+/// scope from a subject id without needing an `AppState`.
+pub(crate) async fn proposal_scope_for_subject(
+    db: &impl ConnectionTrait,
+    subject: Uuid,
+) -> Result<ProposalScope, ApiError> {
     let user = ActorRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT role, COALESCE(entity_type, 'human') AS entity_type FROM users WHERE id = $1",
         vec![subject.into()],
     ))
-    .one(&state.db)
+    .one(db)
     .await?;
 
     if let Some(user) = user {
@@ -471,7 +479,7 @@ pub(crate) async fn proposal_scope(state: &AppState, claims: &JwtClaims) -> Resu
             "SELECT workspace_id FROM workspace_members WHERE user_id = $1",
             vec![subject.into()],
         ))
-        .all(&state.db)
+        .all(db)
         .await?;
         return Ok(ProposalScope::Workspaces(
             rows.into_iter().map(|row| row.workspace_id).collect(),
@@ -483,7 +491,7 @@ pub(crate) async fn proposal_scope(state: &AppState, claims: &JwtClaims) -> Resu
         "SELECT workspace_id FROM workspace_bots WHERE id = $1 AND is_active = TRUE",
         vec![subject.into()],
     ))
-    .one(&state.db)
+    .one(db)
     .await?;
 
     Ok(ProposalScope::Workspaces(
@@ -2680,6 +2688,67 @@ pub async fn delete_proposal_comment_under_proposal(
     Ok(ApiResponse::ok())
 }
 
+/// Records a proposal -> work item link, refusing any work item outside the proposal's workspace.
+///
+/// The proposal's tenant is known by the time this runs, but the old existence check was a bare
+/// `SELECT 1 FROM work_items WHERE id = $1`, so an id from any other tenant was accepted: the link
+/// row landed, and `GET /proposals/{id}/issues` then read that work item's title and state back out
+/// through its `INNER JOIN`. `work_items` carries no `workspace_id` of its own, so the tenant is
+/// reached through `project_id -> projects.workspace_id`.
+///
+/// The check runs before the insert, so a refusal writes nothing. A work item in another tenant and
+/// a work item that does not exist both answer `NotFound`, which also closes the instance-wide
+/// existence oracle the old check exposed.
+async fn link_issue_to_proposal(
+    db: &impl ConnectionTrait,
+    proposal_id: &str,
+    proposal_workspace_id: Option<Uuid>,
+    issue_id: Uuid,
+) -> Result<(), ApiError> {
+    // An unattributed proposal belongs to no tenant, so nothing may be linked into it.
+    let Some(workspace_id) = proposal_workspace_id else {
+        return Err(ApiError::NotFound("issue not found".to_string()));
+    };
+
+    let issue_exists = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            r"
+                SELECT 1
+                FROM work_items wi
+                INNER JOIN projects p ON p.id = wi.project_id
+                WHERE wi.id = $1 AND p.workspace_id = $2
+            ",
+            vec![issue_id.into(), workspace_id.into()],
+        ))
+        .await?
+        .is_some();
+
+    if !issue_exists {
+        return Err(ApiError::NotFound("issue not found".to_string()));
+    }
+
+    let res = db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO proposal_issue_links (proposal_id, issue_id, created_at) VALUES ($1, $2, $3)",
+            vec![proposal_id.to_string().into(), issue_id.into(), Utc::now().into()],
+        ))
+        .await;
+
+    if let Err(err) = res {
+        let message = err.to_string();
+        if message.contains("uq_proposal_issue_link") {
+            return Err(ApiError::Conflict(
+                "issue is already linked to this proposal".to_string(),
+            ));
+        }
+        return Err(ApiError::Database(err));
+    }
+
+    Ok(())
+}
+
 pub async fn link_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -2696,38 +2765,7 @@ pub async fn link_issue(
         ));
     }
 
-    let issue_exists = state
-        .db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT 1 FROM work_items WHERE id = $1",
-            vec![req.issue_id.into()],
-        ))
-        .await?
-        .is_some();
-
-    if !issue_exists {
-        return Err(ApiError::NotFound("issue not found".to_string()));
-    }
-
-    let res = state
-        .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO proposal_issue_links (proposal_id, issue_id, created_at) VALUES ($1, $2, $3)",
-            vec![id.clone().into(), req.issue_id.into(), Utc::now().into()],
-        ))
-        .await;
-
-    if let Err(err) = res {
-        let message = err.to_string();
-        if message.contains("uq_proposal_issue_link") {
-            return Err(ApiError::Conflict(
-                "issue is already linked to this proposal".to_string(),
-            ));
-        }
-        return Err(ApiError::Database(err));
-    }
+    link_issue_to_proposal(&state.db, &id, proposal.workspace_id, req.issue_id).await?;
 
     write_proposal_audit_log(
         &state,
@@ -2931,5 +2969,101 @@ mod tests {
         assert!(from_prefixed.contains(&uuid));
 
         assert_eq!(proposal_lookup_candidates("abc"), vec!["abc".to_string()]);
+    }
+
+    mod tenant_scoping {
+        use super::super::link_issue_to_proposal;
+        use crate::error::ApiError;
+        use crate::routes::context::tenant_fixture::{count, seed_proposal, seed_tenant, seed_work_item};
+        use crate::scratch_or_skip;
+
+        /// V3. The proposal's workspace was already known here, but the existence check was a bare
+        /// `SELECT 1 FROM work_items WHERE id = $1`, so `POST /proposals/{id}/issues` accepted a
+        /// work item from any tenant: the link row landed and `GET /proposals/{id}/issues` then
+        /// read that item's title and state back out. Same shape as the `5ca6845` collab-ticket
+        /// hole. The refusal must also leave `proposal_issue_links` untouched.
+        #[tokio::test]
+        async fn a_work_item_from_another_workspace_cannot_be_linked() {
+            let scratch = scratch_or_skip!("v3_link_issue");
+            let a = seed_tenant(&scratch.db, "a").await;
+            let b = seed_tenant(&scratch.db, "b").await;
+
+            let mine = seed_proposal(&scratch.db, Some(a.workspace_id), a.member_id).await;
+            let their_issue = seed_work_item(&scratch.db, &b, "their secret issue title").await;
+
+            let result = link_issue_to_proposal(&scratch.db, &mine, Some(a.workspace_id), their_issue).await;
+            match &result {
+                Err(ApiError::NotFound(_)) => {}
+                other => panic!("linking another tenant's work item should answer NotFound, got {other:?}"),
+            }
+
+            assert_eq!(
+                count(
+                    &scratch.db,
+                    "SELECT COUNT(*)::bigint AS count FROM proposal_issue_links",
+                    vec![],
+                )
+                .await,
+                0,
+                "a refused link must write no row"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// An unattributed proposal belongs to no tenant, so nothing may be linked into it either.
+        #[tokio::test]
+        async fn an_unattributed_proposal_accepts_no_link() {
+            let scratch = scratch_or_skip!("v3_unattributed_proposal");
+            let a = seed_tenant(&scratch.db, "a").await;
+
+            let orphan = seed_proposal(&scratch.db, None, a.member_id).await;
+            let my_issue = seed_work_item(&scratch.db, &a, "my issue").await;
+
+            let result = link_issue_to_proposal(&scratch.db, &orphan, None, my_issue).await;
+            match &result {
+                Err(ApiError::NotFound(_)) => {}
+                other => panic!("an unattributed proposal should answer NotFound, got {other:?}"),
+            }
+
+            assert_eq!(
+                count(
+                    &scratch.db,
+                    "SELECT COUNT(*)::bigint AS count FROM proposal_issue_links",
+                    vec![],
+                )
+                .await,
+                0,
+                "a refused link must write no row"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// Linking a work item from the proposal's own workspace still works.
+        #[tokio::test]
+        async fn a_work_item_in_the_same_workspace_still_links() {
+            let scratch = scratch_or_skip!("v3_same_workspace_link");
+            let a = seed_tenant(&scratch.db, "a").await;
+
+            let mine = seed_proposal(&scratch.db, Some(a.workspace_id), a.member_id).await;
+            let my_issue = seed_work_item(&scratch.db, &a, "my issue").await;
+
+            link_issue_to_proposal(&scratch.db, &mine, Some(a.workspace_id), my_issue)
+                .await
+                .expect("a work item in the proposal's own workspace links");
+
+            assert_eq!(
+                count(
+                    &scratch.db,
+                    "SELECT COUNT(*)::bigint AS count FROM proposal_issue_links",
+                    vec![],
+                )
+                .await,
+                1
+            );
+
+            scratch.drop_self().await;
+        }
     }
 }

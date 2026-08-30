@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::{
     error::ApiError,
     response::{ApiResponse, PaginatedData},
+    routes::proposal::{ProposalScope, proposal_scope_for_subject},
     services::trust_score_service::{is_project_admin_or_owner, is_project_member, is_system_admin},
 };
 
@@ -206,12 +207,8 @@ struct ProjectIdRow {
 }
 
 #[derive(Debug, FromQueryResult)]
-struct NullableProjectIdRow {
-    project_id: Option<Uuid>,
-}
-
-struct ProposalProjectScope {
-    project_ids: Vec<Uuid>,
+struct ProposalWorkspaceRow {
+    workspace_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -249,79 +246,43 @@ async fn ensure_project_visible(state: &AppState, project_id: Uuid, user_id: Uui
     Ok(())
 }
 
-async fn get_project_id_for_proposal(
-    db: &impl ConnectionTrait,
-    proposal_id: &str,
-) -> Result<ProposalProjectScope, ApiError> {
-    let proposal_count = CountRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "SELECT COUNT(*)::bigint AS count FROM proposals WHERE id = $1",
-        vec![proposal_id.to_string().into()],
-    ))
-    .one(db)
-    .await?
-    .unwrap_or(CountRow { count: 0 });
-
-    if proposal_count.count == 0 {
-        return Err(ApiError::NotFound("proposal not found".to_string()));
-    }
-
-    let has_direct_project_id_column = CountRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            SELECT COUNT(*)::bigint AS count
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name = 'proposals'
-              AND column_name = 'project_id'
-        ",
-        vec![],
-    ))
-    .one(db)
-    .await?
-    .is_some_and(|row| row.count > 0);
-
-    if has_direct_project_id_column {
-        let row = NullableProjectIdRow::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT project_id FROM proposals WHERE id = $1",
-            vec![proposal_id.to_string().into()],
-        ))
-        .one(db)
-        .await?;
-        if let Some(row) = row
-            && let Some(project_id) = row.project_id
-        {
-            return Ok(ProposalProjectScope {
-                project_ids: vec![project_id],
-            });
-        }
-    }
-
-    let rows = ProjectIdRow::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            SELECT DISTINCT wi.project_id
-            FROM proposal_issue_links pil
-            INNER JOIN work_items wi ON wi.id = pil.issue_id
-            WHERE pil.proposal_id = $1
-        ",
-        vec![proposal_id.to_string().into()],
-    ))
-    .all(db)
-    .await?;
-
-    Ok(ProposalProjectScope {
-        project_ids: rows.into_iter().map(|row| row.project_id).collect(),
-    })
+/// Decides whether the caller may read a proposal at all.
+///
+/// This is the same rule `GET /api/v1/proposals/{id}` enforces, and it is deliberately the same
+/// code: the caller's [`ProposalScope`] is compared against `proposals.workspace_id`. The previous
+/// implementation derived a scope from `proposal_issue_links` and returned `Ok(())` when that scope
+/// came back empty, which is every proposal that has not reached `approved` yet, so the chain and
+/// timeline routes were readable across tenants. Anything that cannot be attributed to a workspace
+/// the caller belongs to is now refused.
+///
+/// A proposal in another tenant and a proposal that does not exist both answer `NotFound`, so the
+/// route does not confirm that an id exists somewhere else in the instance.
+async fn ensure_proposal_visible(state: &AppState, proposal_id: &str, user_id: Uuid) -> Result<(), ApiError> {
+    let scope = proposal_scope_for_subject(&state.db, user_id).await?;
+    ensure_proposal_in_scope(&state.db, proposal_id, &scope).await
 }
 
-async fn ensure_proposal_visible(state: &AppState, proposal_id: &str, user_id: Uuid) -> Result<(), ApiError> {
-    let scope = get_project_id_for_proposal(&state.db, proposal_id).await?;
-    for project_id in scope.project_ids {
-        ensure_project_visible(state, project_id, user_id).await?;
+/// The connection-level half of [`ensure_proposal_visible`].
+pub(crate) async fn ensure_proposal_in_scope(
+    db: &impl ConnectionTrait,
+    proposal_id: &str,
+    scope: &ProposalScope,
+) -> Result<(), ApiError> {
+    let row = ProposalWorkspaceRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT workspace_id FROM proposals WHERE id = $1",
+        vec![proposal_id.to_string().into()],
+    ))
+    .one(db)
+    .await?;
+
+    // `is_some_and` keeps this fail-closed twice over: a missing row is refused, and so is a row
+    // whose `workspace_id` is NULL, because an unattributed proposal belongs to no tenant.
+    if row.is_some_and(|row| scope.allows(row.workspace_id)) {
+        return Ok(());
     }
-    Ok(())
+
+    Err(ApiError::NotFound("proposal not found".to_string()))
 }
 
 fn filter_clause(
@@ -1585,4 +1546,105 @@ pub async fn get_ai_participant_alignment_stats(
         "recent_alignment_rate": recent_alignment_rate,
         "improvement_trend": recent_alignment_rate - overall_alignment_rate
     })))
+}
+
+#[cfg(test)]
+mod tenant_scoping_tests {
+    use super::ensure_proposal_in_scope;
+    use crate::error::ApiError;
+    use crate::routes::context::tenant_fixture::{seed_proposal, seed_tenant};
+    use crate::routes::proposal::proposal_scope_for_subject;
+    use crate::scratch_or_skip;
+
+    fn assert_not_found(result: &Result<(), ApiError>, what: &str) {
+        match result {
+            Err(ApiError::NotFound(_)) => {}
+            other => panic!("{what} should answer NotFound, got {other:?}"),
+        }
+    }
+
+    /// V1. `ensure_proposal_visible` derived a scope from `proposal_issue_links` and returned
+    /// `Ok(())` when the resulting list was empty. `proposals` has no `project_id` column and
+    /// `link_issue` refuses to build a link before a proposal is `approved`, so that list was
+    /// empty for every draft/open/voting/rejected proposal in the instance — the chain and
+    /// timeline routes were readable by any authenticated user. Visibility now runs through the
+    /// same `ProposalScope` vs `proposals.workspace_id` comparison `GET /proposals/{id}` uses.
+    #[tokio::test]
+    async fn a_proposal_in_another_workspace_is_not_visible() {
+        let scratch = scratch_or_skip!("v1_proposal_visibility");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let theirs = seed_proposal(&scratch.db, Some(b.workspace_id), b.member_id).await;
+        let scope = proposal_scope_for_subject(&scratch.db, a.member_id)
+            .await
+            .expect("a plain member resolves to a workspace scope");
+
+        let result = ensure_proposal_in_scope(&scratch.db, &theirs, &scope).await;
+        assert_not_found(&result, "a draft proposal owned by another workspace");
+
+        scratch.drop_self().await;
+    }
+
+    /// The empty-scope case that made V1 exploitable, now stated directly: a proposal that
+    /// migration 0050 could not attribute belongs to no tenant, so no tenant may read it. This is
+    /// still the shape `check_result::create_proposal_from_result` writes.
+    #[tokio::test]
+    async fn an_unattributed_proposal_is_not_visible_to_anyone() {
+        let scratch = scratch_or_skip!("v1_unattributed_proposal");
+        let a = seed_tenant(&scratch.db, "a").await;
+
+        let orphan = seed_proposal(&scratch.db, None, a.member_id).await;
+        let scope = proposal_scope_for_subject(&scratch.db, a.member_id)
+            .await
+            .expect("a plain member resolves to a workspace scope");
+
+        let result = ensure_proposal_in_scope(&scratch.db, &orphan, &scope).await;
+        assert_not_found(&result, "a proposal with no workspace");
+
+        scratch.drop_self().await;
+    }
+
+    /// A proposal id that does not exist answers exactly what a proposal in someone else's tenant
+    /// answers, so the route is not an existence oracle over the instance.
+    #[tokio::test]
+    async fn a_missing_proposal_is_indistinguishable_from_a_foreign_one() {
+        let scratch = scratch_or_skip!("v1_no_oracle");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let theirs = seed_proposal(&scratch.db, Some(b.workspace_id), b.member_id).await;
+        let scope = proposal_scope_for_subject(&scratch.db, a.member_id)
+            .await
+            .expect("a plain member resolves to a workspace scope");
+
+        let foreign = ensure_proposal_in_scope(&scratch.db, &theirs, &scope).await;
+        let missing = ensure_proposal_in_scope(&scratch.db, "PROP-does-not-exist", &scope).await;
+
+        assert_eq!(
+            format!("{foreign:?}"),
+            format!("{missing:?}"),
+            "a foreign proposal and a missing one must answer identically"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The route still works for the tenant that owns the proposal.
+    #[tokio::test]
+    async fn a_proposal_in_the_callers_workspace_stays_visible() {
+        let scratch = scratch_or_skip!("v1_own_proposal");
+        let a = seed_tenant(&scratch.db, "a").await;
+
+        let mine = seed_proposal(&scratch.db, Some(a.workspace_id), a.member_id).await;
+        let scope = proposal_scope_for_subject(&scratch.db, a.member_id)
+            .await
+            .expect("a plain member resolves to a workspace scope");
+
+        ensure_proposal_in_scope(&scratch.db, &mine, &scope)
+            .await
+            .expect("a member sees their own workspace's draft proposal");
+
+        scratch.drop_self().await;
+    }
 }

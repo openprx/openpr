@@ -106,7 +106,7 @@ pub async fn get_project_context(
     let resources = load_resources(&state, project_id).await?;
     let governance = load_governance(&state, project_id).await?;
     let workflow = load_workflow(&state, project_id).await?;
-    let decisions = load_recent_decisions(&state).await?;
+    let decisions = load_recent_decisions(&state.db, project.workspace_id).await?;
     let agent_policy = build_agent_policy(&project, project_type.as_ref(), governance.as_ref());
 
     Ok(ApiResponse::success(json!({
@@ -130,7 +130,7 @@ pub async fn get_project_governance_context(
     ensure_project_context_access(&state, &claims, bot.as_ref().map(|b| &b.0), &project).await?;
     let governance = load_governance(&state, project_id).await?;
     let workflow = load_workflow(&state, project_id).await?;
-    let decisions = load_recent_decisions(&state).await?;
+    let decisions = load_recent_decisions(&state.db, project.workspace_id).await?;
 
     Ok(ApiResponse::success(json!({
         "project_id": project_id,
@@ -263,18 +263,31 @@ async fn load_workflow(state: &AppState, project_id: Uuid) -> Result<Value, ApiE
     }))
 }
 
-async fn load_recent_decisions(state: &AppState) -> Result<Vec<ProjectContextDecision>, ApiError> {
+/// Recent governance decisions **of one workspace**.
+///
+/// `decisions` has no tenant column of its own, so the tenant can only be reached through
+/// `proposal_id -> proposals.workspace_id` (the column migration 0050 added). The join is an
+/// `INNER JOIN` and the predicate is an equality, so a decision whose proposal is unattributed
+/// (`workspace_id IS NULL`) is excluded as well: an unattributed proposal belongs to no tenant,
+/// so no tenant may read its decision.
+pub(crate) async fn load_recent_decisions(
+    db: &impl ConnectionTrait,
+    workspace_id: Uuid,
+) -> Result<Vec<ProjectContextDecision>, ApiError> {
     ProjectContextDecision::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            SELECT id, proposal_id, result::text AS result, approval_rate, total_votes, decided_at
-            FROM decisions
-            ORDER BY decided_at DESC
+            SELECT d.id, d.proposal_id, d.result::text AS result, d.approval_rate,
+                   d.total_votes, d.decided_at
+            FROM decisions d
+            INNER JOIN proposals p ON p.id = d.proposal_id
+            WHERE p.workspace_id = $1
+            ORDER BY d.decided_at DESC
             LIMIT 10
         ",
-        vec![],
+        vec![workspace_id.into()],
     ))
-    .all(&state.db)
+    .all(db)
     .await
     .map_err(ApiError::from)
 }
@@ -563,7 +576,9 @@ fn tool_set(tools: &[&'static str]) -> BTreeSet<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_mcp_tool_registry;
+    use super::tenant_fixture::{count, seed_decision, seed_proposal, seed_tenant};
+    use super::{build_mcp_tool_registry, load_recent_decisions};
+    use crate::scratch_or_skip;
     use serde_json::json;
 
     fn enabled_tools(registry: &serde_json::Value) -> Vec<String> {
@@ -626,5 +641,297 @@ mod tests {
         assert!(!tools.iter().any(|tool| tool.starts_with("invocations.")));
         assert!(!tools.contains(&"sprints.create".to_string()));
         assert!(!tools.contains(&"proposals.create".to_string()));
+    }
+
+    /// V2. `GET /projects/{id}/context` exposes `recent_decisions`, and the query behind it used
+    /// to be `SELECT ... FROM decisions ORDER BY decided_at DESC LIMIT 10` with no tenant
+    /// predicate at all, so any authenticated member of any workspace read the whole instance's
+    /// ten most recent governance decisions — including the `proposal_id` that turns V1 from
+    /// "guess a UUID" into an enumeration.
+    #[tokio::test]
+    async fn recent_decisions_never_leave_the_asking_workspace() {
+        let scratch = scratch_or_skip!("v2_recent_decisions");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let mine = seed_proposal(&scratch.db, Some(a.workspace_id), a.member_id).await;
+        let theirs = seed_proposal(&scratch.db, Some(b.workspace_id), b.member_id).await;
+        // The shape `check_result::create_proposal_from_result` still writes: no workspace at all.
+        let orphan = seed_proposal(&scratch.db, None, b.member_id).await;
+
+        seed_decision(&scratch.db, &mine).await;
+        seed_decision(&scratch.db, &theirs).await;
+        seed_decision(&scratch.db, &orphan).await;
+
+        let seen = load_recent_decisions(&scratch.db, a.workspace_id)
+            .await
+            .expect("recent decisions load for a workspace the caller belongs to");
+
+        let proposal_ids: Vec<&str> = seen.iter().map(|row| row.proposal_id.as_str()).collect();
+        assert_eq!(
+            proposal_ids,
+            vec![mine.as_str()],
+            "a workspace must see its own decision and nothing else, got {proposal_ids:?}"
+        );
+
+        // All three decisions really are in the database, so the assertion above is the predicate
+        // working rather than an empty table.
+        assert_eq!(
+            count(&scratch.db, "SELECT COUNT(*)::bigint AS count FROM decisions", vec![]).await,
+            3
+        );
+
+        scratch.drop_self().await;
+    }
+}
+
+/// Shared scratch-database fixture for the cross-tenant scoping regression tests.
+///
+/// Every test in this group needs the same thing: a throwaway database with the real migrations
+/// applied, and two fully separate tenants in it, so a helper can be called with tenant A's
+/// identity and tenant B's resource id. It lives here rather than in a file of its own so the six
+/// sibling route modules can share one copy instead of each growing its own.
+#[cfg(test)]
+pub mod tenant_fixture {
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use uuid::Uuid;
+
+    pub const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    pub struct Scratch {
+        pub db: DatabaseConnection,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        pub async fn drop_self(self) {
+            let Self { db, name, admin_url } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            let _ = admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await;
+        }
+    }
+
+    /// A scratch database with every migration applied, or `None` when the test database is not
+    /// configured. Callers must report the skip themselves so a skipped run is visible.
+    pub async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = Database::connect(&admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+        let name = format!("openpr_tenant_{label}");
+        let quoted = format!("\"{name}\"");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+            .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+            .await
+            .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        let db = Database::connect(&url)
+            .await
+            .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+        migrate(&db).await;
+
+        Some(Scratch { db, name, admin_url })
+    }
+
+    async fn migrate(db: &DatabaseConnection) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migration file was found in {dir}");
+        for path in files {
+            let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+            db.execute_unprepared(&sql)
+                .await
+                .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+        }
+    }
+
+    /// Announces a skip on stdout so a "passed" line with no work behind it is still visible.
+    #[macro_export]
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match $crate::routes::context::tenant_fixture::scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!(
+                        "SKIPPED (no database): set {} to run this test",
+                        $crate::routes::context::tenant_fixture::TEST_DATABASE_URL_ENV
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    pub async fn exec(db: &impl ConnectionTrait, sql: &str, values: Vec<sea_orm::Value>) {
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .unwrap_or_else(|err| panic!("setup statement failed: {err}"));
+    }
+
+    /// One tenant: a workspace, a plain member of it, and a project inside it.
+    #[allow(clippy::struct_field_names, reason = "every field really is an id")]
+    pub struct Tenant {
+        pub workspace_id: Uuid,
+        pub member_id: Uuid,
+        pub project_id: Uuid,
+    }
+
+    pub async fn seed_tenant(db: &impl ConnectionTrait, tag: &str) -> Tenant {
+        let workspace_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        exec(
+            db,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'tenant test', 'user', true)",
+            vec![member_id.into(), format!("{member_id}@tenant.test").into()],
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, $3, $4)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                format!("tenant {tag}").into(),
+                member_id.into(),
+            ],
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+            vec![workspace_id.into(), member_id.into()],
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) VALUES ($1, $2, $3, $4, $5)",
+            vec![
+                project_id.into(),
+                workspace_id.into(),
+                format!("P{tag}").into(),
+                format!("project {tag}").into(),
+                member_id.into(),
+            ],
+        )
+        .await;
+
+        Tenant {
+            workspace_id,
+            member_id,
+            project_id,
+        }
+    }
+
+    pub async fn seed_work_item(db: &impl ConnectionTrait, tenant: &Tenant, title: &str) -> Uuid {
+        let issue_id = Uuid::new_v4();
+        exec(
+            db,
+            "INSERT INTO work_items (id, project_id, title, state, created_by) VALUES ($1, $2, $3, 'todo', $4)",
+            vec![
+                issue_id.into(),
+                tenant.project_id.into(),
+                title.to_string().into(),
+                tenant.member_id.into(),
+            ],
+        )
+        .await;
+        issue_id
+    }
+
+    pub async fn seed_label(db: &impl ConnectionTrait, tenant: &Tenant, name: &str) -> Uuid {
+        let label_id = Uuid::new_v4();
+        exec(
+            db,
+            "INSERT INTO labels (id, workspace_id, name) VALUES ($1, $2, $3)",
+            vec![label_id.into(), tenant.workspace_id.into(), name.to_string().into()],
+        )
+        .await;
+        label_id
+    }
+
+    /// A proposal owned by `workspace_id`, or an unattributed one when that is `None` — the shape
+    /// `check_result::create_proposal_from_result` still writes.
+    pub async fn seed_proposal(db: &impl ConnectionTrait, workspace_id: Option<Uuid>, author: Uuid) -> String {
+        let proposal_id = format!("PROP-{}", Uuid::new_v4());
+        exec(
+            db,
+            "INSERT INTO proposals (id, title, proposal_type, status, author_id, author_type, content, workspace_id) \
+             VALUES ($1, 'secret proposal', 'feature', 'draft', $2, 'human', 'secret body', $3)",
+            vec![
+                proposal_id.clone().into(),
+                author.to_string().into(),
+                workspace_id.into(),
+            ],
+        )
+        .await;
+        proposal_id
+    }
+
+    pub async fn seed_decision(db: &impl ConnectionTrait, proposal_id: &str) -> String {
+        let decision_id = format!("DEC-{}", Uuid::new_v4());
+        exec(
+            db,
+            "INSERT INTO decisions (id, proposal_id, result, approval_rate, total_votes) \
+             VALUES ($1, $2, 'approved', 1.0, 3)",
+            vec![decision_id.clone().into(), proposal_id.to_string().into()],
+        )
+        .await;
+        decision_id
+    }
+
+    /// A bot user that is a member of `tenant`'s workspace, the shape `bot::create` produces
+    /// except for `entity_type`, which the mention path matches on exactly.
+    pub async fn seed_bot_user(db: &impl ConnectionTrait, tenant: &Tenant) -> Uuid {
+        let bot_id = Uuid::new_v4();
+        exec(
+            db,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active, entity_type) \
+             VALUES ($1, $2, '!', 'tenant bot', 'user', true, 'bot')",
+            vec![bot_id.into(), format!("{bot_id}@bot.test").into()],
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+            vec![tenant.workspace_id.into(), bot_id.into()],
+        )
+        .await;
+        bot_id
+    }
+
+    #[derive(Debug, FromQueryResult)]
+    struct CountRow {
+        count: i64,
+    }
+
+    pub async fn count(db: &impl ConnectionTrait, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
+        CountRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .one(db)
+            .await
+            .expect("count query runs")
+            .map_or(0, |row| row.count)
     }
 }

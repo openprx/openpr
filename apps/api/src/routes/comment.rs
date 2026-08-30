@@ -137,14 +137,30 @@ async fn create_mention_notifications<C: ConnectionTrait>(
     Ok(())
 }
 
-async fn mentioned_bot_ids<C: ConnectionTrait>(db: &C, mention_user_ids: &[Uuid]) -> Result<Vec<Uuid>, ApiError> {
+/// Which of the mentioned ids are bots **of this workspace**.
+///
+/// The lookup used to be a bare `SELECT 1 FROM users WHERE id = $1 AND entity_type = 'bot'`, with
+/// no tenant predicate, so an `@` of another tenant's bot id queued an `ai_tasks` row for that bot
+/// carrying attacker-controlled comment text. The mention-notification path directly above already
+/// filters every mentioned id through `workspace_members`; this applies the same membership test,
+/// so a mention can only reach a bot that belongs to the workspace the comment was written in.
+async fn mentioned_bot_ids<C: ConnectionTrait>(
+    db: &C,
+    mention_user_ids: &[Uuid],
+    workspace_id: Uuid,
+) -> Result<Vec<Uuid>, ApiError> {
     let mut bot_ids = Vec::new();
     for mention_user_id in mention_user_ids {
         let is_bot = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT 1 FROM users WHERE id = $1 AND entity_type = 'bot'",
-                vec![(*mention_user_id).into()],
+                r"
+                    SELECT 1
+                    FROM users u
+                    INNER JOIN workspace_members wm ON wm.user_id = u.id
+                    WHERE u.id = $1 AND u.entity_type = 'bot' AND wm.workspace_id = $2
+                ",
+                vec![(*mention_user_id).into(), workspace_id.into()],
             ))
             .await?
             .is_some();
@@ -246,7 +262,7 @@ pub async fn create_comment(
 
     tx.commit().await?;
 
-    for bot_id in mentioned_bot_ids(&state.db, &mention_user_ids).await? {
+    for bot_id in mentioned_bot_ids(&state.db, &mention_user_ids, issue_context.workspace_id).await? {
         let _ = create_ai_task(
             &state.db,
             CreateAiTaskInput {
@@ -678,4 +694,53 @@ pub async fn delete_comment(
     );
 
     Ok(ApiResponse::ok())
+}
+
+#[cfg(test)]
+mod tenant_scoping_tests {
+    use super::mentioned_bot_ids;
+    use crate::routes::context::tenant_fixture::{seed_bot_user, seed_tenant};
+    use crate::scratch_or_skip;
+
+    /// V6. The bot lookup behind an `@` mention was a bare
+    /// `SELECT 1 FROM users WHERE id = $1 AND entity_type = 'bot'` with no tenant predicate, so
+    /// mentioning another tenant's bot id queued an `ai_tasks` row for that bot carrying
+    /// attacker-controlled comment text. The mention-notification path in the same file already
+    /// filtered every mentioned id through `workspace_members`.
+    #[tokio::test]
+    async fn a_bot_from_another_workspace_is_not_a_mention_target() {
+        let scratch = scratch_or_skip!("v6_mentioned_bots");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let my_bot = seed_bot_user(&scratch.db, &a).await;
+        let their_bot = seed_bot_user(&scratch.db, &b).await;
+
+        let reachable = mentioned_bot_ids(&scratch.db, &[my_bot, their_bot], a.workspace_id)
+            .await
+            .expect("the mention lookup runs");
+
+        assert_eq!(
+            reachable,
+            vec![my_bot],
+            "only a bot of the comment's own workspace may be reached, got {reachable:?}"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// A human member of the same workspace is still not treated as a bot.
+    #[tokio::test]
+    async fn a_human_member_is_not_a_mention_target() {
+        let scratch = scratch_or_skip!("v6_human_not_bot");
+        let a = seed_tenant(&scratch.db, "a").await;
+
+        let reachable = mentioned_bot_ids(&scratch.db, &[a.member_id], a.workspace_id)
+            .await
+            .expect("the mention lookup runs");
+
+        assert!(reachable.is_empty(), "a human member is not a bot, got {reachable:?}");
+
+        scratch.drop_self().await;
+    }
 }

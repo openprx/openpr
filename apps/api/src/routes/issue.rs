@@ -120,6 +120,37 @@ fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext
 }
 
 /// POST /`api/v1/projects/:project_id/issues` - Create a new issue
+/// Refuses a `sprint_id` that does not belong to the work item's own project.
+///
+/// `work_items.sprint_id` is a single-column foreign key to `sprints(id)`, and neither create nor
+/// update used to look at it, so an issue could be filed into another tenant's sprint: a dangling
+/// cross-tenant reference, an existence oracle on `sprints` ids (foreign-key violation vs success)
+/// and a row that the other tenant can silently mutate through `ON DELETE SET NULL`. The sibling
+/// field `assignee_id` has always been checked this way, against `workspace_members`.
+///
+/// Sprints belong to a project, so the containment checked here is the project, which is strictly
+/// inside the workspace. A sprint in another project and a sprint that does not exist produce the
+/// same `BadRequest`, so this does not become an oracle of its own.
+async fn ensure_sprint_in_project(
+    db: &impl ConnectionTrait,
+    sprint_id: Uuid,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let exists = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 FROM sprints WHERE id = $1 AND project_id = $2",
+            vec![sprint_id.into(), project_id.into()],
+        ))
+        .await?;
+
+    if exists.is_none() {
+        return Err(ApiError::BadRequest("sprint must belong to this project".to_string()));
+    }
+
+    Ok(())
+}
+
 pub async fn create_issue(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -180,6 +211,11 @@ pub async fn create_issue(
         if member_exists.is_none() {
             return Err(ApiError::BadRequest("assignee must be a workspace member".to_string()));
         }
+    }
+
+    // If a sprint is specified, verify it belongs to this project (and therefore this workspace)
+    if let Some(sprint_id) = req.sprint_id {
+        ensure_sprint_in_project(&state.db, sprint_id, project_id).await?;
     }
 
     let issue_id = Uuid::new_v4();
@@ -720,6 +756,11 @@ pub async fn update_issue(
         if member_exists.is_none() {
             return Err(ApiError::BadRequest("assignee must be a workspace member".to_string()));
         }
+    }
+
+    // Verify the sprint belongs to this issue's project (and therefore this workspace)
+    if let Some(sprint_id) = req.sprint_id {
+        ensure_sprint_in_project(&state.db, sprint_id, current_issue.project_id).await?;
     }
 
     // Build update query
@@ -1304,9 +1345,29 @@ pub async fn add_labels_to_issue(
         return Err(ApiError::BadRequest("label_ids must not be empty".to_string()));
     }
 
-    // Verify issue belongs to bot's workspace
-    let exists = state
-        .db
+    attach_labels_to_issue(&state.db, issue_id, bot.workspace_id, &payload.label_ids).await?;
+
+    Ok(ApiResponse::ok())
+}
+
+/// Attaches labels to a work item, refusing any label outside the caller's workspace.
+///
+/// The single-label sibling, `label::add_label_to_issue`, already checks
+/// `SELECT 1 FROM labels WHERE id = $1 AND workspace_id = $2`; the batch path checked only the work
+/// item and inserted every `label_id` unchecked, so a bot token could pull another tenant's label
+/// onto its own issue and then read that label's name, colour and description back out through
+/// `GET /issues/{id}/labels`. This applies the same predicate to every id in the batch.
+///
+/// Every label is validated before any row is written, and the writes then run inside one
+/// transaction, so a rejected batch leaves `work_item_labels` untouched.
+async fn attach_labels_to_issue(
+    db: &sea_orm::DatabaseConnection,
+    issue_id: Uuid,
+    workspace_id: Uuid,
+    label_ids: &[Uuid],
+) -> Result<(), ApiError> {
+    // Verify issue belongs to the caller's workspace
+    let exists = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
             r"
@@ -1315,24 +1376,187 @@ pub async fn add_labels_to_issue(
                 INNER JOIN projects p ON wi.project_id = p.id
                 WHERE wi.id = $1 AND p.workspace_id = $2
             ",
-            vec![issue_id.into(), bot.workspace_id.into()],
+            vec![issue_id.into(), workspace_id.into()],
         ))
         .await?;
     if exists.is_none() {
         return Err(ApiError::NotFound("work item not found or access denied".to_string()));
     }
 
-    // Insert all label associations (ignore conflicts)
-    for label_id in &payload.label_ids {
-        state
-            .db
-            .execute(Statement::from_sql_and_values(
+    // Verify every label belongs to the same workspace, before anything is written.
+    for label_id in label_ids {
+        let label_exists = db
+            .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "INSERT INTO work_item_labels (work_item_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                vec![issue_id.into(), (*label_id).into()],
+                "SELECT 1 FROM labels WHERE id = $1 AND workspace_id = $2",
+                vec![(*label_id).into(), workspace_id.into()],
             ))
             .await?;
+        if label_exists.is_none() {
+            return Err(ApiError::NotFound("label not found in workspace".to_string()));
+        }
     }
 
-    Ok(ApiResponse::ok())
+    // Insert all label associations (ignore conflicts)
+    let tx = db.begin().await?;
+    for label_id in label_ids {
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO work_item_labels (work_item_id, label_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            vec![issue_id.into(), (*label_id).into()],
+        ))
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tenant_scoping_tests {
+    use super::{attach_labels_to_issue, ensure_sprint_in_project};
+    use crate::error::ApiError;
+    use crate::routes::context::tenant_fixture::{count, exec, seed_label, seed_tenant, seed_work_item};
+    use crate::scratch_or_skip;
+    use uuid::Uuid;
+
+    /// V4. The batch label route checked that the work item belonged to the bot's workspace and
+    /// then inserted every `label_id` unchecked, so a bot token could pull another tenant's label
+    /// onto its own issue and read that label's name, colour and description back through
+    /// `GET /issues/{id}/labels`. The single-label sibling in `label.rs` always had the predicate.
+    ///
+    /// The batch here mixes a legitimate label with a foreign one: a rejected batch must write
+    /// neither, so the check has to happen before any insert rather than per row.
+    #[tokio::test]
+    async fn a_label_from_another_workspace_cannot_be_batch_attached() {
+        let scratch = scratch_or_skip!("v4_batch_labels");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let my_issue = seed_work_item(&scratch.db, &a, "my issue").await;
+        let my_label = seed_label(&scratch.db, &a, "mine").await;
+        let their_label = seed_label(&scratch.db, &b, "their secret label").await;
+
+        let result = attach_labels_to_issue(&scratch.db, my_issue, a.workspace_id, &[my_label, their_label]).await;
+        match &result {
+            Err(ApiError::NotFound(_)) => {}
+            other => panic!("a foreign label in the batch should answer NotFound, got {other:?}"),
+        }
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT COUNT(*)::bigint AS count FROM work_item_labels",
+                vec![],
+            )
+            .await,
+            0,
+            "a rejected batch must write no association at all, not even the legitimate label"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// A batch of the caller's own labels still applies.
+    #[tokio::test]
+    async fn labels_from_the_same_workspace_still_batch_attach() {
+        let scratch = scratch_or_skip!("v4_batch_labels_ok");
+        let a = seed_tenant(&scratch.db, "a").await;
+
+        let my_issue = seed_work_item(&scratch.db, &a, "my issue").await;
+        let first = seed_label(&scratch.db, &a, "first").await;
+        let second = seed_label(&scratch.db, &a, "second").await;
+
+        attach_labels_to_issue(&scratch.db, my_issue, a.workspace_id, &[first, second])
+            .await
+            .expect("labels of the caller's own workspace attach");
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT COUNT(*)::bigint AS count FROM work_item_labels WHERE work_item_id = $1",
+                vec![my_issue.into()],
+            )
+            .await,
+            2
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// V5. Neither `create_issue` nor `update_issue` looked at `sprint_id`, while the sibling
+    /// field `assignee_id` has always been checked against `workspace_members`. An unchecked
+    /// `sprint_id` leaves a cross-tenant dangling reference that the other tenant can rewrite
+    /// through `ON DELETE SET NULL`, and turns the route into an existence oracle over `sprints`.
+    #[tokio::test]
+    async fn a_sprint_from_another_workspace_is_refused() {
+        let scratch = scratch_or_skip!("v5_sprint_scope");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let their_sprint = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO sprints (id, project_id, name) VALUES ($1, $2, 'their sprint')",
+            vec![their_sprint.into(), b.project_id.into()],
+        )
+        .await;
+
+        let result = ensure_sprint_in_project(&scratch.db, their_sprint, a.project_id).await;
+        match &result {
+            Err(ApiError::BadRequest(_)) => {}
+            other => panic!("another tenant's sprint should be refused, got {other:?}"),
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// A sprint that does not exist answers exactly what a sprint in another tenant answers, so
+    /// the check does not become an oracle of its own.
+    #[tokio::test]
+    async fn a_missing_sprint_is_indistinguishable_from_a_foreign_one() {
+        let scratch = scratch_or_skip!("v5_sprint_no_oracle");
+        let a = seed_tenant(&scratch.db, "a").await;
+        let b = seed_tenant(&scratch.db, "b").await;
+
+        let their_sprint = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO sprints (id, project_id, name) VALUES ($1, $2, 'their sprint')",
+            vec![their_sprint.into(), b.project_id.into()],
+        )
+        .await;
+
+        let foreign = ensure_sprint_in_project(&scratch.db, their_sprint, a.project_id).await;
+        let missing = ensure_sprint_in_project(&scratch.db, Uuid::new_v4(), a.project_id).await;
+
+        assert_eq!(
+            format!("{foreign:?}"),
+            format!("{missing:?}"),
+            "a foreign sprint and a missing one must answer identically"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// A sprint of the issue's own project still passes.
+    #[tokio::test]
+    async fn a_sprint_in_the_same_project_is_accepted() {
+        let scratch = scratch_or_skip!("v5_sprint_ok");
+        let a = seed_tenant(&scratch.db, "a").await;
+
+        let my_sprint = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO sprints (id, project_id, name) VALUES ($1, $2, 'my sprint')",
+            vec![my_sprint.into(), a.project_id.into()],
+        )
+        .await;
+
+        ensure_sprint_in_project(&scratch.db, my_sprint, a.project_id)
+            .await
+            .expect("a sprint of the issue's own project is accepted");
+
+        scratch.drop_self().await;
+    }
 }
