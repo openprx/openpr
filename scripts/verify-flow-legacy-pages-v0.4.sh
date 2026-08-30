@@ -33,6 +33,12 @@ set -euo pipefail
 # importer artifact), 2 = usage/tool/evidence malformed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared contract/evidence path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
+CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 JSON_MODE=0
 INVENTORY_PATH=""
@@ -50,8 +56,15 @@ but evidence/v0.4/legacy-pages-import-result.json is missing.
 Arguments:
   INVENTORY_JSON     Path to legacy-pages-inventory.json. Default:
                       <evidence-root>/legacy-pages-inventory.json
+                      A relative path is resolved against the current
+                      directory first, then against --contracts-root (so
+                      v0.4-gate.yaml's literal
+                      "evidence/v0.4/legacy-pages-inventory.json" works
+                      when run from the source repository).
 
 Options:
+  --contracts-root DIR  Root the relative INVENTORY_JSON falls back to.
+                        Default: /opt/working/sylvode-flow
   --evidence-root DIR   Used for the default INVENTORY_JSON path and to
                         look for legacy-pages-import-result.json in the
                         nonzero branch. Default:
@@ -67,6 +80,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
     --json) JSON_MODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -78,7 +92,6 @@ while [[ $# -gt 0 ]]; do
       INVENTORY_PATH="$1"; shift ;;
   esac
 done
-: "$ROOT_DIR"
 
 if [[ -z "$INVENTORY_PATH" ]]; then
   INVENTORY_PATH="$EVIDENCE_ROOT/legacy-pages-inventory.json"
@@ -94,8 +107,7 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
-if [[ ! -f "$INVENTORY_PATH" ]]; then
-  echo "FAIL: inventory file not found: $INVENTORY_PATH" >&2
+if ! INVENTORY_PATH="$(flow_resolve_contract_path INVENTORY_JSON "$INVENTORY_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if ! jq empty "$INVENTORY_PATH" >/dev/null 2>&1; then

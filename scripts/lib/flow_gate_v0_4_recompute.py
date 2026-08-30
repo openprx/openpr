@@ -402,6 +402,18 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     bridge_verifier_gates(evidence_root, "limits-result.json", "sylvode.flow.limits-result.v1", gates, reasons)
     bridge_verifier_gates(evidence_root, "error-contract-result.json", "sylvode.flow.error-contract-result.v1", gates, reasons)
 
+    # ---- forms regression: backs 1 gate ----
+    # scripts/verify-flow-forms-regression-v0.4.sh runs the repository's
+    # existing Universal Forms CI gate bundle (scripts/ci-universal-forms-
+    # gates.sh -- the same entrypoint CI uses) and writes forms-regression-
+    # result.json carrying that run's exact command, exit code, duration,
+    # assertion counts, log checksum and its own passed/failed verdict for
+    # forms_regression_no_degradation under `hard_gates`. The bundle had been
+    # passing every round while nobody recorded it, which is why this gate sat
+    # at not_verified. Bridged verbatim -- see bridge_verifier_gates()
+    # docstring; absent artifact still means not_verified, never passed.
+    bridge_verifier_gates(evidence_root, "forms-regression-result.json", "sylvode.flow.forms-regression-result.v1", gates, reasons)
+
     # ---- legacy_pages_drop_requires_separate_adr: static migration scan ----
     migrations_dir = os.path.join(repo_root, "migrations")
     drop_found = []

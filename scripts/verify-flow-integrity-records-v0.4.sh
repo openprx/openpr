@@ -44,6 +44,11 @@ set -euo pipefail
 # environment error (binary would not build/boot, database unreachable).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared --adr/--contract/--limits path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 REPO_ROOT="$ROOT_DIR"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
@@ -63,6 +68,10 @@ evidence/v0.4/integrity-records-result.json.
 
 Options:
   --adr PATH              Path to ADR-0013. Required (recorded in output).
+                          A relative path is resolved against the current
+                          directory first, then against --contracts-root.
+  --contracts-root DIR     Root containing decisions/. Default:
+                          /opt/working/sylvode-flow
   --database-url URL       Postgres DSN the api binary and this script's
                           own assertions connect to. Default:
                           $OPENPR_TEST_DATABASE_URL
@@ -91,15 +100,13 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unexpected argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
-: "$CONTRACTS_ROOT"
 
 if [[ -z "$ADR_PATH" ]]; then
   echo "FAIL: --adr is required" >&2
   usage >&2
   exit 2
 fi
-if [[ ! -f "$ADR_PATH" ]]; then
-  echo "FAIL: --adr file not found: $ADR_PATH" >&2
+if ! ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ $JSON_MODE -ne 1 ]]; then

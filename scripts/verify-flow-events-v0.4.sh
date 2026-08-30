@@ -111,6 +111,11 @@ set -euo pipefail
 # partial-pass path at exit 1).
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared --adr/--contract/--limits path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 REPO_ROOT="$ROOT_DIR"
@@ -132,6 +137,9 @@ evidence/v0.4/flow-events-result.json.
 Options:
   --contract PATH          Path to contracts/events-v1.md. Default:
                           <contracts-root>/contracts/events-v1.md
+                          A relative path is resolved against the
+                          current directory first, then against
+                          --contracts-root.
   --contracts-root DIR     Root containing contracts/. Default:
                           /opt/working/sylvode-flow
   --evidence-root DIR     Where flow-events-result.json is written.
@@ -181,8 +189,7 @@ done
 if [[ -z "$CONTRACT_PATH" ]]; then
   CONTRACT_PATH="$CONTRACTS_ROOT/contracts/events-v1.md"
 fi
-if [[ ! -f "$CONTRACT_PATH" ]]; then
-  echo "FAIL: missing contract file: $CONTRACT_PATH" >&2
+if ! CONTRACT_PATH="$(flow_resolve_contract_path --contract "$CONTRACT_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then

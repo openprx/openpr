@@ -216,6 +216,9 @@ run_step required.limits_verify "$ROOT_DIR/scripts/verify-flow-limits-v0.4.sh" -
 echo "=== Sylvode Flow v0.4 report: error-contract verify ==="
 run_step required.error_contract_verify "$ROOT_DIR/scripts/verify-flow-errors-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/error-mapping-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
+echo "=== Sylvode Flow v0.4 report: forms regression (no degradation) ==="
+run_step required.forms_regression_verify "$ROOT_DIR/scripts/verify-flow-forms-regression-v0.4.sh" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
+
 echo "=== Sylvode Flow v0.4 report: not-yet-implemented required_commands ==="
 run_missing_step required.deployed_chain_websocket_upgrade "scripts/verify-flow-deployed-websocket-v0.4.sh does not exist"
 

@@ -97,6 +97,11 @@ set -euo pipefail
 # were silently skipped because OPENPR_TEST_DATABASE_URL is not set.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared --adr/--contract/--limits path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 REPO_ROOT="$ROOT_DIR"
@@ -126,7 +131,10 @@ placeholder pass.
 Options:
   --release VER            Gate release identifier (recorded in output).
                           Default: 0.4
-  --adr PATH               Path to ADR-0010. Required.
+  --adr PATH               Path to ADR-0010. Required. A relative path is
+                          resolved against the current directory first,
+                          then against --contracts-root (same for
+                          --limits).
   --limits PATH            Path to contracts/limits-v1.md (recorded in
                           output; only frozen numbers embedded in the ADR
                           text itself are cross-checked against source
@@ -192,21 +200,13 @@ if [[ -z "$LIMITS_PATH" ]]; then
 fi
 # v0.4-gate.yaml's required_commands invocation passes --adr/--limits as
 # paths relative to the contracts root (e.g. "decisions/ADR-0010-...md",
-# "contracts/limits-v1.md"); resolve non-absolute paths against
-# --contracts-root so this script accepts that exact invocation as well
-# as a caller-supplied absolute path.
-if [[ "$ADR_PATH" != /* && -f "$CONTRACTS_ROOT/$ADR_PATH" ]]; then
-  ADR_PATH="$CONTRACTS_ROOT/$ADR_PATH"
-fi
-if [[ "$LIMITS_PATH" != /* && -f "$CONTRACTS_ROOT/$LIMITS_PATH" ]]; then
-  LIMITS_PATH="$CONTRACTS_ROOT/$LIMITS_PATH"
-fi
-if [[ ! -f "$ADR_PATH" ]]; then
-  echo "FAIL: --adr file not found: $ADR_PATH" >&2
+# "contracts/limits-v1.md"); flow_resolve_contract_path accepts that exact
+# invocation as well as a caller-supplied absolute path or a path relative
+# to the current directory.
+if ! ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
-if [[ ! -f "$LIMITS_PATH" ]]; then
-  echo "FAIL: --limits file not found: $LIMITS_PATH" >&2
+if ! LIMITS_PATH="$(flow_resolve_contract_path --limits "$LIMITS_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then

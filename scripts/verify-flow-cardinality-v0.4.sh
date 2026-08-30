@@ -40,6 +40,11 @@ set -euo pipefail
 # 2 = usage/tool/evidence malformed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared --adr/--contract/--limits path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 REPO_ROOT="$ROOT_DIR"
@@ -65,7 +70,9 @@ Options:
   --adr PATH              Path to ADR-0013. Required (recorded in the
                           output; content is not further parsed here --
                           the cardinality bound itself comes from
-                          --max-cardinality).
+                          --max-cardinality). A relative path is resolved
+                          against the current directory first, then
+                          against --contracts-root.
   --max-cardinality N     The ADR-0013 §1 bound (v0.4: 1). Required.
   --contracts-root DIR     Root containing contracts/. Default:
                           /opt/working/sylvode-flow
@@ -123,8 +130,7 @@ if [[ ! -f "$REST_API_MD" ]]; then
   echo "FAIL: missing contract file: $REST_API_MD" >&2
   exit 2
 fi
-if [[ ! -f "$ADR_PATH" ]]; then
-  echo "FAIL: --adr file not found: $ADR_PATH" >&2
+if ! ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ ! -f "$COMMAND_RS" ]]; then

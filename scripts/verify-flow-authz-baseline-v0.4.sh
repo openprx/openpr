@@ -44,7 +44,13 @@ set -euo pipefail
 # failed, 2 = usage/tool/environment error.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared --adr/--contract/--limits path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 REPO_ROOT="$ROOT_DIR"
+CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 ADR_PATH=""
 DATABASE_URL="${OPENPR_TEST_DATABASE_URL:-}"
@@ -61,7 +67,11 @@ not_covered (needs MCP 3-transport + CLI equivalence testing not built
 this round). Writes evidence/v0.4/authz-baseline-result.json.
 
 Options:
-  --adr PATH              Path to ADR-0012. Required.
+  --adr PATH              Path to ADR-0012. Required. Relative paths
+                          are resolved against the current directory
+                          first, then against --contracts-root.
+  --contracts-root DIR     Root containing decisions/. Default:
+                          /opt/working/sylvode-flow
   --database-url URL       Postgres DSN. Default: $OPENPR_TEST_DATABASE_URL
   --repo-root DIR         Repository containing apps/api. Default: this
                           checkout.
@@ -78,6 +88,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --adr) ADR_PATH="${2:?--adr requires a PATH argument}"; shift 2 ;;
+    --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --database-url) DATABASE_URL="${2:?--database-url requires a value}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
@@ -93,8 +104,7 @@ if [[ -z "$ADR_PATH" ]]; then
   usage >&2
   exit 2
 fi
-if [[ ! -f "$ADR_PATH" ]]; then
-  echo "FAIL: --adr file not found: $ADR_PATH" >&2
+if ! ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ $JSON_MODE -ne 1 ]]; then

@@ -87,6 +87,11 @@ set -euo pipefail
 # passed, 2 = usage/tool/environment error.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Shared --adr/--contract/--limits path resolution (absolute -> as-is;
+# relative-to-CWD -> as-is; otherwise resolved against --contracts-root;
+# unresolvable -> FAIL naming both attempted paths).
+# shellcheck source=scripts/lib/flow_contract_path.sh
+source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 REPO_ROOT="$ROOT_DIR"
@@ -109,6 +114,9 @@ evidence/v0.4/error-contract-result.json.
 Options:
   --contract PATH          Path to contracts/error-mapping-v1.md. Default:
                           <contracts-root>/contracts/error-mapping-v1.md
+                          A relative path is resolved against the
+                          current directory first, then against
+                          --contracts-root.
   --contracts-root DIR     Root containing contracts/. Default:
                           /opt/working/sylvode-flow
   --evidence-root DIR     Where error-contract-result.json is written.
@@ -156,11 +164,7 @@ done
 if [[ -z "$CONTRACT_PATH" ]]; then
   CONTRACT_PATH="$CONTRACTS_ROOT/contracts/error-mapping-v1.md"
 fi
-if [[ "$CONTRACT_PATH" != /* && -f "$CONTRACTS_ROOT/$CONTRACT_PATH" ]]; then
-  CONTRACT_PATH="$CONTRACTS_ROOT/$CONTRACT_PATH"
-fi
-if [[ ! -f "$CONTRACT_PATH" ]]; then
-  echo "FAIL: missing contract file: $CONTRACT_PATH" >&2
+if ! CONTRACT_PATH="$(flow_resolve_contract_path --contract "$CONTRACT_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
