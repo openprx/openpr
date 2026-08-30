@@ -63,7 +63,13 @@ set -euo pipefail
 # below remains open -- this script never rounds a partial result up to a
 # pass):
 #
-#   Of the 32 v0.4 `limit_kind` values, this run finds: 6 have a real
+#   The contract defines 32 fixed `limit_kind` values, but four package-import
+#   kinds have no v0.4 surface and are recorded with the mandatory reason code
+#   `not_applicable_until_v0_8`. The other 28 keep the full boundary and
+#   caller-reachable wire criteria below; the exemption is an exact allowlist,
+#   never an `import_*` wildcard.
+#
+#   Of the 28 applicable v0.4 `limit_kind` values, this run finds: 6 have a real
 #   exact/+1 unit test but the enforcing code
 #   (crates/collab-core/src/limits.rs::check_operation*) has ZERO call
 #   sites in apps/api/src -- not wired into any endpoint. 2 (presence
@@ -112,7 +118,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/flow_contract_path.sh
 source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 REPO_ROOT="$ROOT_DIR"
 CONTRACT_PATH=""
 JSON_MODE=0
@@ -141,10 +147,9 @@ Options:
                           --contracts-root.
   --contracts-root DIR     Root containing contracts/. Default:
                           /opt/working/sylvode-flow
-  --evidence-root DIR     Where limits-result.json is written, and where
+  --evidence-root DIR     Required. Where limits-result.json is written, and where
                           the sibling collab-architecture-result.json /
-                          flow-events-result.json are read from. Default:
-                          /opt/working/sylvode-flow/evidence/v0.4
+                          flow-events-result.json are read from.
   --repo-root DIR         Repository containing apps/api, crates/,
                           frontend/ and the cargo workspace. Default: this
                           checkout.
@@ -179,6 +184,11 @@ done
 
 if [[ $JSON_MODE -ne 1 ]]; then
   echo "FAIL: --json is required" >&2
+  usage >&2
+  exit 2
+fi
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  echo "FAIL: --evidence-root is required; evidence must never default into the contract repository" >&2
   usage >&2
   exit 2
 fi
@@ -292,10 +302,50 @@ for m in row_re.finditer(contract):
 # concrete number in its table row; excluded here by name per that prose,
 # not derivable from the row's own cell.
 V05_DEFERRED_LIMIT_KINDS = {"grants_per_request", "object_grants"}
+V08_IMPORT_LIMIT_KIND_ALLOWLIST = {
+    "import_archive_bytes",
+    "import_expanded_bytes",
+    "import_entry_count",
+    "import_compression_ratio",
+}
+VERSION_BOUNDARY_REASON_CODE = "not_applicable_until_v0_8"
 
-v0_4_rows = [r for r in rows if not r["unset"] and r["limit_kind"] not in V05_DEFERRED_LIMIT_KINDS]
+fixed_limit_rows = [
+    r for r in rows if not r["unset"] and r["limit_kind"] not in V05_DEFERRED_LIMIT_KINDS
+]
+version_boundary_exemptions = {
+    r["limit_kind"]: {
+        "limit_kind": r["limit_kind"],
+        "status": VERSION_BOUNDARY_REASON_CODE,
+        "reason_code": VERSION_BOUNDARY_REASON_CODE,
+        "surface_version": "v0.8",
+    }
+    for r in fixed_limit_rows
+    if r["limit_kind"] in V08_IMPORT_LIMIT_KIND_ALLOWLIST
+}
+non_allowlisted_exemptions = sorted(set(version_boundary_exemptions) - V08_IMPORT_LIMIT_KIND_ALLOWLIST)
+missing_allowlisted_exemptions = sorted(V08_IMPORT_LIMIT_KIND_ALLOWLIST - set(version_boundary_exemptions))
+if non_allowlisted_exemptions or missing_allowlisted_exemptions:
+    raise ValueError(
+        "version-boundary exemption allowlist violation: "
+        f"non_allowlisted={non_allowlisted_exemptions}, missing_required={missing_allowlisted_exemptions}"
+    )
+if VERSION_BOUNDARY_REASON_CODE not in contract:
+    raise ValueError(
+        f"contract does not declare mandatory version-boundary reason code {VERSION_BOUNDARY_REASON_CODE!r}"
+    )
+
+v0_4_rows = [r for r in fixed_limit_rows if r["limit_kind"] not in version_boundary_exemptions]
 deferred_or_unset_rows = [r for r in rows if r["unset"] or r["limit_kind"] in V05_DEFERRED_LIMIT_KINDS]
 expected_limit_kinds = sorted({r["limit_kind"] for r in v0_4_rows})
+fixed_limit_kind_count = len({r["limit_kind"] for r in fixed_limit_rows})
+evaluated_limit_kind_count = len(expected_limit_kinds)
+if fixed_limit_kind_count != 32 or evaluated_limit_kind_count != 28 or len(version_boundary_exemptions) != 4:
+    raise ValueError(
+        "v0.4 limit-kind accounting must be exactly 32 = 28 evaluated + 4 version-boundary "
+        f"exemptions, got {fixed_limit_kind_count} = {evaluated_limit_kind_count} + "
+        f"{len(version_boundary_exemptions)}"
+    )
 
 wire_m = re.search(r"FlowLimitsV1 = \{(.*?)\n\}", contract, re.S)
 wire_fields = {}
@@ -364,7 +414,7 @@ def const_name_for_key(key: str) -> str:
 
 row_violations = []
 row_cross_check = []
-for r in v0_4_rows:
+for r in fixed_limit_rows:
     const_name = const_name_for_key(r["key"])
     source_value = resolve_const(const_name)
     ok = source_value is not None and source_value == r["value"]
@@ -624,6 +674,7 @@ findings["boundary_test_covering"] = {
         ("websocket_frame_bytes", "WEBSOCKET_FRAME_BYTES_MAX"),
         ("presence_payload_bytes", "PRESENCE_PAYLOAD_BYTES_MAX"),
         ("presence_ttl_seconds", "PRESENCE_TTL_SECONDS_MAX"),
+        ("semantic_patch_bytes", "SEMANTIC_PATCH_JSON_BYTES_MAX"),
         ("page_size", None),
         # The two bootstrap ceilings were absent from this map, so their `.get()` below always
         # returned None and their case could never pass no matter what test was written -- the
@@ -719,8 +770,44 @@ server_fields_snake = sorted({k for k in wire_fields if k != "version"})
 missing_in_frontend = sorted(set(server_fields_snake) - set(fe_fields_snake))
 extra_in_frontend = sorted(set(fe_fields_snake) - set(server_fields_snake))
 
+default_limits_m = re.search(
+    r"export\s+const\s+DEFAULT_FLOW_LIMITS\s*:\s*FlowLimitsV1\s*=\s*\{(.*?)\n\};",
+    frontend_limits_text,
+    re.S,
+)
+frontend_default_wire_fields = {}
+frontend_default_parse_errors = []
+frontend_version_m = re.search(
+    r"export\s+const\s+FLOW_LIMITS_VERSION\s*=\s*'([^']+)'\s*;",
+    frontend_limits_text,
+)
+frontend_default_version = frontend_version_m.group(1) if frontend_version_m else None
+if frontend_default_version is None:
+    frontend_default_parse_errors.append("FLOW_LIMITS_VERSION string literal was not found")
+if default_limits_m:
+    entry_re = re.compile(r"^\s*([A-Za-z][A-Za-z0-9]*)\s*:\s*([0-9][0-9_]*)\s*,?\s*$", re.M)
+    entries = entry_re.findall(default_limits_m.group(1))
+    for field, raw_value in entries:
+        wire_name = camel_to_snake(field)
+        if wire_name in frontend_default_wire_fields:
+            frontend_default_parse_errors.append(f"duplicate DEFAULT_FLOW_LIMITS field {field}")
+            continue
+        frontend_default_wire_fields[wire_name] = int(raw_value.replace("_", ""))
+else:
+    frontend_default_parse_errors.append("DEFAULT_FLOW_LIMITS literal object was not found")
+
+frontend_default_missing = sorted(set(server_fields_snake) - set(frontend_default_wire_fields))
+frontend_default_extra = sorted(set(frontend_default_wire_fields) - set(server_fields_snake))
+if len(frontend_default_wire_fields) != 35:
+    frontend_default_parse_errors.append(
+        f"DEFAULT_FLOW_LIMITS parsed {len(frontend_default_wire_fields)} numeric fields, expected 35"
+    )
+
 print(json.dumps({
     "expected_limit_kinds": expected_limit_kinds,
+    "fixed_limit_kind_count": fixed_limit_kind_count,
+    "evaluated_limit_kind_count": evaluated_limit_kind_count,
+    "version_boundary_exemptions": [version_boundary_exemptions[k] for k in sorted(version_boundary_exemptions)],
     "v0_4_rows": v0_4_rows,
     "deferred_or_unset_rows": deferred_or_unset_rows,
     "row_cross_check": row_cross_check,
@@ -736,6 +823,11 @@ print(json.dumps({
         "frontend_field_count": len(fe_fields_snake),
         "missing_in_frontend": missing_in_frontend,
         "extra_in_frontend": extra_in_frontend,
+        "default_wire_fields": frontend_default_wire_fields,
+        "default_version": frontend_default_version,
+        "default_missing": frontend_default_missing,
+        "default_extra": frontend_default_extra,
+        "default_parse_errors": frontend_default_parse_errors,
     },
 }))
 PY
@@ -755,7 +847,8 @@ if [[ "$EXPECTED_COUNT" -eq 0 ]]; then
   exit 2
 fi
 echo "=== static check: contracts/limits-v1.md limit_kind rows vs apps/api/src/flow/collab/limits.rs constants ===" >&2
-echo "  v0.4 expected limit_kind count: $EXPECTED_COUNT" >&2
+echo "  v0.4 limit_kind accounting: $(jq -r '.fixed_limit_kind_count' "$STATIC_JSON_FILE") = $EXPECTED_COUNT evaluated + $(jq -r '.version_boundary_exemptions | length' "$STATIC_JSON_FILE") not_applicable_until_v0_8" >&2
+echo "  version-boundary exemptions: $(jq -r '[.version_boundary_exemptions[].limit_kind] | join(", ")' "$STATIC_JSON_FILE")" >&2
 echo "  row cross-check violations: $(jq '.row_violations | length' "$STATIC_JSON_FILE")" >&2
 echo "  wire-schema cross-check violations: $(jq '.wire_violations | length' "$STATIC_JSON_FILE")" >&2
 jq -r '.row_violations[] | "    VIOLATION(row): " + .' "$STATIC_JSON_FILE" >&2
@@ -1370,10 +1463,6 @@ boundary_cases.append(case(
 
 for key, limit_kind, const in (
     ("authorized_scan_rows_max", "scan_budget", "AUTHORIZED_SCAN_ROWS_MAX"),
-    ("import_archive_bytes_max", "import_archive_bytes", "IMPORT_ARCHIVE_BYTES_MAX"),
-    ("import_expanded_bytes_max", "import_expanded_bytes", "IMPORT_EXPANDED_BYTES_MAX"),
-    ("import_entry_count_max", "import_entry_count", "IMPORT_ENTRY_COUNT_MAX"),
-    ("import_compression_ratio_max", "import_compression_ratio", "IMPORT_COMPRESSION_RATIO_MAX"),
 ):
     r = row_by_kind[limit_kind]
     ref_count = f.get(f"{const.lower()}_referenced_outside_limits_rs", 0)
@@ -1525,6 +1614,14 @@ dispatch_numeric_budgets_locked_status = (
 server_canonical = json.dumps(static["wire_fields"], sort_keys=True, separators=(",", ":"))
 server_limits_sha256 = hashlib.sha256(server_canonical.encode()).hexdigest()
 fe_parity = static["frontend_bootstrap_parity"]
+web_wire_fields = {"version": fe_parity["default_version"], **fe_parity["default_wire_fields"]}
+web_canonical = json.dumps(web_wire_fields, sort_keys=True, separators=(",", ":"))
+web_limits_sha256 = hashlib.sha256(web_canonical.encode()).hexdigest()
+web_value_mismatches = {
+    field: {"server": static["wire_fields"].get(field), "web": web_wire_fields.get(field)}
+    for field in sorted(set(static["wire_fields"]) | set(web_wire_fields))
+    if static["wire_fields"].get(field) != web_wire_fields.get(field)
+}
 
 wire_spotcheck = None
 bootstrap_test_status = dtest("bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot")
@@ -1537,25 +1634,36 @@ if bootstrap_test_status is not None:
     }
 
 bootstrap_parity_field_sets_match = (
-    len(fe_parity["missing_in_frontend"]) == 0 and len(fe_parity["extra_in_frontend"]) == 0
+    len(fe_parity["missing_in_frontend"]) == 0
+    and len(fe_parity["extra_in_frontend"]) == 0
+    and len(fe_parity["default_missing"]) == 0
+    and len(fe_parity["default_extra"]) == 0
+    and len(fe_parity["default_parse_errors"]) == 0
 )
 bootstrap_parity_unknown_version_found = f["frontend_unknown_version_handling_found"]
-bootstrap_parity_ok = bootstrap_parity_field_sets_match and bootstrap_parity_unknown_version_found
+bootstrap_parity_values_match = web_limits_sha256 == server_limits_sha256 and not web_value_mismatches
+bootstrap_parity_ok = (
+    bootstrap_parity_field_sets_match
+    and bootstrap_parity_values_match
+    and bootstrap_parity_unknown_version_found
+)
 
 bootstrap_parity = {
     "server_limits_sha256": server_limits_sha256,
     "server_limits_field_count": fe_parity["server_field_count"],
     "server_wire_spotcheck": wire_spotcheck,
-    "web_limits_sha256": None,
+    "web_limits_sha256": web_limits_sha256,
     "web_limits_field_count": fe_parity["frontend_field_count"],
     "unknown_version_read_only": "not_covered" if not bootstrap_parity_unknown_version_found else "found",
     "missing_in_frontend": fe_parity["missing_in_frontend"],
     "extra_in_frontend": fe_parity["extra_in_frontend"],
+    "web_default_parse_errors": fe_parity["default_parse_errors"],
+    "value_mismatches": web_value_mismatches,
     "status": "passed" if bootstrap_parity_ok else "failed",
     "reason": (
-        "frontend/src/lib/flow/types.ts's FlowLimitsV1 interface field set matches the server's "
-        f"{fe_parity['server_field_count']} wire fields, and version-negotiation code for an "
-        "unrecognized limits.version was found in frontend/src"
+        "frontend/src/lib/flow/types.ts's FlowLimitsV1 interface and limits.ts's 35 numeric "
+        "DEFAULT_FLOW_LIMITS values match the server wire schema byte-for-byte under canonical "
+        f"JSON sha256={server_limits_sha256}, and unknown-version read-only negotiation is present"
         if bootstrap_parity_ok
         else (
             f"frontend/src/lib/flow/types.ts's FlowLimitsV1 interface declares only "
@@ -1568,11 +1676,14 @@ bootstrap_parity = {
             if not bootstrap_parity_field_sets_match else ""
         )
         + (
-            "frontend/src/lib/flow/limits.ts's DEFAULT_FLOW_LIMITS is a hand-maintained constant with "
-            "zero call sites fetching or diffing against a live Bootstrap response -- parity is never "
-            "checked, let alone enforced, and the field sets are structurally incompatible so no sha256 "
-            "comparison is meaningful without first fixing the field-set mismatch; "
-            if not bootstrap_parity_field_sets_match else ""
+            "frontend/src/lib/flow/limits.ts's DEFAULT_FLOW_LIMITS could not be parsed as exactly 35 "
+            f"numeric literal fields: {fe_parity['default_parse_errors']}; "
+            if fe_parity["default_parse_errors"] else ""
+        )
+        + (
+            f"server/web canonical sha256 differs ({server_limits_sha256} != {web_limits_sha256}); "
+            f"value mismatches: {web_value_mismatches}; "
+            if not bootstrap_parity_values_match else ""
         )
         + (
             "`unknown_version_read_only` is not_covered: no version-negotiation code for an "
@@ -1590,7 +1701,13 @@ expected = static["expected_limit_kinds"]
 missing = sorted(set(expected) - set(observed))
 unknown = sorted(set(observed) - set(expected))
 error_kind_coverage = {
-    "expected": expected, "observed": observed, "missing": missing, "unknown": unknown,
+    "defined": static["fixed_limit_kind_count"],
+    "evaluated": static["evaluated_limit_kind_count"],
+    "expected": expected,
+    "observed": observed,
+    "missing": missing,
+    "unknown": unknown,
+    "not_applicable": static["version_boundary_exemptions"],
     "note": (
         "observed[] counts a limit_kind only where a real, currently-passing test proves some caller-"
         "reachable transport actually emits that exact limit_kind string in a rejection; 'update_bytes' "
@@ -1682,6 +1799,16 @@ result = {
     "generated_at": generated_at,
     "executor": "scripts/verify-flow-limits-v0.4.sh",
     "engine": "loro",
+    "limit_kind_accounting": {
+        "defined": static["fixed_limit_kind_count"],
+        "evaluated": static["evaluated_limit_kind_count"],
+        "not_applicable_count": len(static["version_boundary_exemptions"]),
+        "equation": (
+            f"{static['fixed_limit_kind_count']} = {static['evaluated_limit_kind_count']} evaluated + "
+            f"{len(static['version_boundary_exemptions'])} not_applicable_until_v0_8"
+        ),
+        "not_applicable": static["version_boundary_exemptions"],
+    },
     "boundary_cases": boundary_cases,
     "isolation": isolation,
     "connection_rate_queue": connection_rate_queue,

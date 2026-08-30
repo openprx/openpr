@@ -17,69 +17,27 @@ set -euo pipefail
 # Covers 2 hard gates: rest_envelope_and_error_contract,
 # server_draining_reason_cross_surface_error_coverage.
 #
-# HOW IT WORKS (two layers, all re-derived from source every run --
+# HOW IT WORKS (three layers, all re-derived from source every run --
 # nothing here is a hardcoded verdict):
 #
-#   1. STATIC: greps apps/api/src, apps/mcp-server/src and frontend/src
-#      for the concrete facts needed to judge, per transport, whether
-#      `server_draining.details.reason` can even reach a caller today:
-#      whether apps/api/src/error.rs's REST envelope has a `details`
-#      field at all (it does not, for ANY error, not just this one);
-#      whether apps/api/src/flow/command.rs's REST mapping function ever
-#      reads `rejected.details`; whether `reason="drain"` is ever
-#      constructed anywhere server-side (it is not -- only "contention"
-#      is); whether the WS layer's contention rejection actually keeps
-#      the connection open (it does -- confirmed by grepping the exact
-#      match arm for the absence of a `close(` call) versus a real 4410
-#      close code for drain (grepped: zero occurrences outside a doc
-#      comment); whether apps/mcp-server's generic `business_error()` JSON
-#      mechanism has any call site for a Flow object tool (zero -- its
-#      only caller anywhere is an unrelated legacy_pages tool); whether
-#      apps/mcp-server's CLI (`cli_app/error.rs`) ever reads a `reason`
-#      field at all (it does not -- it only regexes an HTTP status number
-#      out of a message string); and whether frontend's i18n files declare
-#      both `flow.error.server_draining.{drain,contention}` keys (they
-#      do, with distinct text) versus whether frontend/src/lib/flow/
-#      object-session.ts's one `reason:'drain'` producer is actually
-#      server-driven or a client-local `dispose()` synthesis (grepped and
-#      quoted below -- it is client-local).
+#   1. STATIC: verifies the current typed REST envelope/details path, Flow
+#      MCP business-error call sites, CLI structured reason consumer, WS
+#      drain producer/4410 wiring, and distinct UI i18n keys. These are
+#      structural prerequisites only; they never substitute for a live
+#      transport observation.
 #
-#   2. DYNAMIC: runs the only three real, currently-passing tests that
-#      touch any piece of this puzzle --
-#      flow::collab::frame::tests::rejected_code_and_drain_reason_use_the_
-#      frozen_snake_case_vocabulary (confirms the JSON discriminator
-#      strings "server_draining"/"contention" serialize correctly),
-#      cli_app::error::tests::from_api_error_* (confirm the CLI's
-#      HTTP-status-only exit-code mapping, the wrong shape for what the
-#      gate needs), and protocol::tests::call_tool_error_serializes_mcp_
-#      is_error_field (confirms the generic, Flow-unused MCP isError JSON
-#      shape). None of these is a producer-fixture / cross-surface test;
-#      they are folded in as the closest real evidence that exists.
+#   2. RUST DYNAMIC: runs the WS discriminator, structured CLI drain/
+#      contention mapping, and MCP business-error shape tests.
 #
-# HONEST GAPS (recorded in the JSON, `passed` forced false while any of
-# these remain open -- this script never rounds a partial result up to a
-# pass):
+#   3. UI DYNAMIC: runs frontend's `test:flow-v0.4` suite via Bun, reads its
+#      JSON gate row, and also requires the named assertion proving every
+#      accepted drain fixture has `FlowError.origin === 'server'`. A suite
+#      pass without that exact runtime assertion is not UI coverage.
 #
-#   - No producer fixture exists anywhere in this repository that can
-#     inject a controllable `server_draining.details.reason` value and
-#     observe it cross REST, MCP (any transport), CLI and UI -- because
-#     REST structurally cannot carry `details` at all (apps/api/src/
-#     error.rs's ApiError only ever carries a plain String), because
-#     `reason="drain"` is never producible server-side in ANY transport
-#     (only "contention" is, and only via the WS layer), and because MCP
-#     never routes a Flow business error through the one JSON-shaped
-#     mechanism (`business_error()`) that could carry `details` at all.
-#     Building such a fixture requires apps/api/**, apps/mcp-server/** and
-#     frontend/** changes (a `details` field on the REST envelope, a
-#     drain-reason producer, MCP wiring for Flow tools, a CLI reason
-#     parser) that are out of this script's scripts/-only, read-only
-#     scope -- this is a genuine "not built yet", not a search miss (see
-#     the file-and-line grep evidence embedded in every finding below).
-#   - The ONE transport where `reason="contention"` is genuinely real and
-#     wired (WS, via apps/api/src/flow/collab/write.rs and session.rs)
-#     still fails the gate on its own terms: gate-commands.md explicitly
-#     says "只测 WS 均失败" -- WS-only coverage of one variant is not
-#     cross-surface coverage of both.
+# HONEST GAP: no existing scripts-only fixture starts all three real MCP
+# transports against the same live API drain guard. Their fields remain
+# `not_covered`, never inferred from shared dispatch source, so the cross-
+# surface hard gate remains red until live HTTP/SSE/stdio evidence exists.
 #
 # Exit codes: 0 = both gates recomputed to passed (does not happen today
 # -- see above), 1 = ran to completion and wrote
@@ -93,7 +51,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/flow_contract_path.sh
 source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 REPO_ROOT="$ROOT_DIR"
 CONTRACT_PATH=""
 JSON_MODE=0
@@ -119,8 +77,7 @@ Options:
                           --contracts-root.
   --contracts-root DIR     Root containing contracts/. Default:
                           /opt/working/sylvode-flow
-  --evidence-root DIR     Where error-contract-result.json is written.
-                          Default: /opt/working/sylvode-flow/evidence/v0.4
+  --evidence-root DIR     Required. Where error-contract-result.json is written.
   --repo-root DIR         Repository containing apps/api, apps/mcp-server,
                           frontend/ and the cargo workspace. Default: this
                           checkout.
@@ -154,12 +111,25 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  echo "FAIL: --evidence-root is required; evidence must never default into the contract repository" >&2
+  usage >&2
+  exit 2
+fi
 for tool in jq git python3 cargo sha256sum; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     exit 2
   fi
 done
+if command -v bun >/dev/null 2>&1; then
+  BUN_BIN="$(command -v bun)"
+elif [[ -x /home/ck/.bun/bin/bun ]]; then
+  BUN_BIN="/home/ck/.bun/bin/bun"
+else
+  echo "FAIL: missing required command: bun" >&2
+  exit 2
+fi
 
 if [[ -z "$CONTRACT_PATH" ]]; then
   CONTRACT_PATH="$CONTRACTS_ROOT/contracts/error-mapping-v1.md"
@@ -403,8 +373,27 @@ run_group() {
 
 echo "=== dynamic: cargo test groups ===" >&2
 run_group frame_serialization api "flow::collab::frame::tests::rejected_code_and_drain_reason_use_the_frozen_snake_case_vocabulary"
-run_group cli_exit_mapping mcp-server "from_api_error" "--lib"
+run_group cli_exit_mapping mcp-server "server_draining_drain_and_contention_share_exit_9_but_never_the_same_message" "--lib"
 run_group mcp_business_error_shape mcp-server "call_tool_error_serializes_mcp_is_error_field" "--lib"
+
+UI_RESULT_FILE="$LOG_DIR/errors.ui-flow-v0.4.json"
+UI_LOG_FILE="$LOG_DIR/errors.dyn.ui-flow-v0.4.log"
+UI_SCRATCH="${FLOW_V04_SCRATCH:-/opt/worker/.cache/flow-v04-errors}"
+mkdir -p "$UI_SCRATCH"
+echo "  running: bun run --cwd frontend test:flow-v0.4" >&2
+set +e
+(
+  cd "$REPO_ROOT"
+  PATH="$(dirname "$BUN_BIN"):$PATH" \
+    FLOW_V04_RESULT_PATH="$UI_RESULT_FILE" FLOW_V04_SCRATCH="$UI_SCRATCH" \
+    "$BUN_BIN" run --cwd frontend test:flow-v0.4
+) > "$UI_LOG_FILE" 2>&1
+UI_EXIT_CODE=$?
+set -e
+if [[ ! -f "$UI_RESULT_FILE" ]] || ! jq -e . "$UI_RESULT_FILE" >/dev/null 2>&1; then
+  echo "FAIL: frontend gate suite did not produce valid JSON at $UI_RESULT_FILE (exit=$UI_EXIT_CODE)" >&2
+  exit 2
+fi
 
 DYNAMIC_JSON_FILE="$LOG_DIR/errors.dynamic.json"
 python3 - "$LOG_DIR" <<'PY' > "$DYNAMIC_JSON_FILE"
@@ -426,18 +415,22 @@ PY
 
 echo "=== dynamic test results ===" >&2
 jq -r '.groups | to_entries[] | "  \(.key): \(.value.tests | to_entries | map(select(.value!="ok")) | length) not-ok of \(.value.tests | length)"' "$DYNAMIC_JSON_FILE" >&2
+echo "  ui-flow-v0.4: exit=$UI_EXIT_CODE, passed=$(jq -r '.passed' "$UI_RESULT_FILE")" >&2
 
 # ---- 3. assemble evidence/v0.4/error-contract-result.json ----
 OUT_PATH="$EVIDENCE_ROOT/error-contract-result.json"
 OUT_TMP="$OUT_PATH.tmp"
 
 FINAL_JSON="$(python3 - "$STATIC_JSON_FILE" "$DYNAMIC_JSON_FILE" "$SOURCE_HEAD" "$GENERATED_AT" "$CONTRACT_SHA256" \
-    "$REPO_WIDE_DRAIN_REASON_HITS" "$REPO_WIDE_4410_HITS" "$FRONTEND_TEST_HITS" "$OUT_TMP" <<'PY'
+    "$REPO_WIDE_DRAIN_REASON_HITS" "$REPO_WIDE_4410_HITS" "$FRONTEND_TEST_HITS" \
+    "$UI_RESULT_FILE" "$UI_LOG_FILE" "$UI_EXIT_CODE" "$OUT_TMP" <<'PY'
 import json
+import re
 import sys
 
 (static_path, dynamic_path, source_head, generated_at, contract_sha256,
- repo_wide_drain_hits, repo_wide_4410_hits, frontend_test_hits, out_path) = sys.argv[1:10]
+ repo_wide_drain_hits, repo_wide_4410_hits, frontend_test_hits,
+ ui_result_path, ui_log_path, ui_exit_code, out_path) = sys.argv[1:13]
 
 static = json.load(open(static_path, encoding="utf-8"))
 dynamic = json.load(open(dynamic_path, encoding="utf-8"))
@@ -445,6 +438,9 @@ f = static["findings"]
 repo_wide_drain_hits = int(repo_wide_drain_hits)
 repo_wide_4410_hits = int(repo_wide_4410_hits)
 frontend_test_hits = int(frontend_test_hits)
+ui_exit_code = int(ui_exit_code)
+ui_result = json.load(open(ui_result_path, encoding="utf-8"))
+ui_log = open(ui_log_path, encoding="utf-8", errors="replace").read()
 
 
 def dtest(name):
@@ -456,10 +452,30 @@ def dtest(name):
 
 ws_serialization_test = dtest("rejected_code_and_drain_reason_use_the_frozen_snake_case_vocabulary")
 cli_exit_tests_ok = (
-    dtest("from_api_error_maps_known_envelope_codes") == "ok"
-    and dtest("from_api_error_falls_back_to_temporary_for_unmapped_or_transport_failures") == "ok"
+    dtest("server_draining_drain_and_contention_share_exit_9_but_never_the_same_message") == "ok"
 )
 mcp_shape_test = dtest("call_tool_error_serializes_mcp_is_error_field")
+
+ui_gate = next(
+    (gate for gate in ui_result.get("gates", []) if gate.get("gate") == "web_ime_undo_selection_and_sync_state"),
+    None,
+)
+ui_gate_json_ok = bool(
+    ui_exit_code == 0
+    and ui_result.get("passed") is True
+    and ui_gate
+    and ui_gate.get("passed") is True
+    and ui_gate.get("checks_failed") == 0
+)
+UI_SERVER_ORIGIN_ASSERTION = "every surface marks the fixture as server-reported, and only the wire can"
+ui_server_origin_assertion_ok = bool(
+    re.search(r"^\s*ok\s+" + re.escape(UI_SERVER_ORIGIN_ASSERTION) + r"\s*$", ui_log, re.M)
+)
+UI_MALFORMED_ASSERTION = "a missing or unknown reason is refused, never defaulted to contention"
+ui_malformed_assertion_ok = bool(
+    re.search(r"^\s*ok\s+" + re.escape(UI_MALFORMED_ASSERTION) + r"\s*$", ui_log, re.M)
+)
+ui_drain_coverage_ok = ui_gate_json_ok and ui_server_origin_assertion_ok
 
 rest_details_exists = f["rest_apiresponse_struct_has_details_field"]
 mcp_flow_wired = f["mcp_business_error_call_sites_in_objects_tool_rs"] > 0
@@ -468,31 +484,21 @@ ws_contention_keep_open = (not f["session_rs_rejected_arm_calls_close"]) and f["
 ws_drain_produced = (f["write_rs_drain_reason_literal_count"] + f["session_rs_drain_reason_literal_count"] + repo_wide_drain_hits) > 0
 ws_drain_close_4410_wired = (f["session_rs_4410_literal_count"] + f["frame_rs_4410_literal_count"] + repo_wide_4410_hits) > 0
 
-REST_UNAVAILABLE_REASON = (
-    "apps/api/src/error.rs's ApiError has only plain-String variants and apps/api/src/response.rs's "
-    "ApiResponse carries no `details` field at all -- this is true for every stable error code, not "
-    "just server_draining. apps/api/src/flow/command.rs::map_write_rejection also never reads "
-    f"rejected.details (checked: {f['map_write_rejection_reads_details_field']}), so even if a "
-    "`details` field existed, this REST mapping function would not populate it."
+REST_STATUS_REASON = (
+    "REST has typed `details` and map_write_rejection preserves it; this verifier has structural "
+    "evidence but no shared-fixture REST live observation in this run"
+    if rest_details_exists and f["map_write_rejection_reads_details_field"]
+    else "REST typed details propagation is incomplete"
 )
-MCP_UNAVAILABLE_REASON = (
-    "apps/mcp-server/src/protocol.rs::business_error() is the only MCP mechanism that can carry a "
-    "structured `details` object, but it has "
-    f"{f['mcp_business_error_call_sites_in_objects_tool_rs']} call sites in "
-    "apps/mcp-server/src/tools/objects.rs (the Flow object/command tools) -- its only caller anywhere "
-    "in the codebase is an unrelated legacy_pages tool. Flow business errors on MCP today only ever "
-    "use the plain-string CallToolResult::error() path, with no isError-parseable JSON body at all. "
-    "This is identical across HTTP, SSE and stdio transports since they all share the same tool "
-    "implementation in objects.rs."
+MCP_STATUS_REASON = (
+    f"Flow objects has {f['mcp_business_error_call_sites_in_objects_tool_rs']} structured "
+    "business_error call sites, but HTTP/SSE/stdio have no shared-drain live fixture; static shared "
+    "dispatch is deliberately not counted as three transport observations"
 )
-CLI_UNAVAILABLE_REASON = (
-    "apps/mcp-server/src/cli_app/error.rs::CliError::from_api_error only extracts an HTTP status "
-    f"number via regex from a message string (envelope_code() body: {f['cli_envelope_code_fn_body']!r}); "
-    f"it never reads a `reason` or `details` field (checked: reads_reason={cli_reads_reason}, "
-    f"reads_details={f['cli_error_rs_reads_details_field']}). Even if REST/MCP carried `reason`, this "
-    "function has nowhere to read it from. exit 9 (exit::TEMPORARY) is only reached via "
-    "CliError::network() for actual transport failures, never via a real server_draining business "
-    "error with a reason discriminator."
+CLI_STATUS_REASON = (
+    f"CLI reads structured reason/details={cli_reads_reason}/{f['cli_error_rs_reads_details_field']} "
+    f"and its drain/contention exit-9 test passed={cli_exit_tests_ok}; no same-producer CLI process "
+    "fixture was executed by this verifier"
 )
 
 drain_variant = {
@@ -504,26 +510,16 @@ drain_variant = {
     "cli_exit": None,
     "cli_human_kind": None,
     "ui_key": "flow.error.server_draining.drain",
+    "ui_reason": "drain" if ui_drain_coverage_ok else None,
+    "ui_origin": "server" if ui_drain_coverage_ok else None,
     "ui_key_i18n_present": bool(f["i18n_en_drain"] and f["i18n_zh_drain"]),
-    "ws_action": None,
-    "producible": False,
+    "ws_action": "close_4410" if ws_drain_produced and ws_drain_close_4410_wired else None,
+    "producible": ws_drain_produced and ws_drain_close_4410_wired,
     "reason": (
-        "reason=\"drain\" is never constructed anywhere server-side (repo-wide grep for "
-        f'`"reason":"drain"` in apps/api/src: {repo_wide_drain_hits} hits; no service-drain/shutdown '
-        "signal mechanism exists that would trigger it). The one place this literal string appears "
-        "client-side is frontend/src/lib/flow/object-session.ts's own dispose() method "
-        f"(drain-reason literal count: {f['object_session_ts_drain_reason_literal_count']}, confirmed "
-        "inside dispose(): "
-        f"{f['object_session_ts_dispose_synthesizes_drain_reason']}), which synthesizes a local "
-        "rejection for still-pending write promises when the session object itself is torn down -- "
-        "not a server signal at all. WS close code 4410 is never used "
-        f"(repo-wide bare '4410' hits in apps/api/src: {repo_wide_4410_hits}, all in a doc comment). "
-        f"REST: {REST_UNAVAILABLE_REASON} MCP: {MCP_UNAVAILABLE_REASON} CLI: {CLI_UNAVAILABLE_REASON} "
-        f"UI: the flow.error.server_draining.drain i18n key exists in both en.json/zh.json with real, "
-        "distinct text, but the real WS-frame-driven branch that would use it "
-        f"(object-session.ts's `if (code === 'server_draining')` block, structured-field check "
-        f"confirmed: {f['object_session_ts_ws_branch_uses_details_reason_not_message']}) is dead code "
-        "today because the server never sends this reason."
+        f"server drain is present (reason hits={repo_wide_drain_hits}, 4410 hits={repo_wide_4410_hits}); "
+        f"UI dynamic server-origin coverage={ui_drain_coverage_ok}. REST: {REST_STATUS_REASON}. "
+        f"MCP: {MCP_STATUS_REASON}. CLI: {CLI_STATUS_REASON}. The variant remains not fully "
+        "producible for this cross-surface gate until all required live transports share one fixture."
     ),
 }
 
@@ -536,37 +532,28 @@ contention_variant = {
     "cli_exit": None,
     "cli_human_kind": None,
     "ui_key": "flow.error.server_draining.contention",
+    "ui_reason": "contention" if ui_drain_coverage_ok else None,
+    "ui_origin": "server" if ui_drain_coverage_ok else None,
     "ui_key_i18n_present": bool(f["i18n_en_contention"] and f["i18n_zh_contention"]),
     "ws_action": "reject_keep_open" if ws_contention_keep_open else None,
     "producible": ws_contention_keep_open,
     "reason": (
-        "reason=\"contention\" IS genuinely real and wired on exactly one transport: WS. "
-        "apps/api/src/flow/collab/write.rs::contention() (5 call sites: coordinator-acquire timeout, "
-        "forced-snapshot-checkpoint failure, rebase-attempts-exhausted, locked-phase-failed-repeatedly) "
-        "and apps/api/src/flow/collab/session.rs's own lock-timeout fallback both construct "
-        '{"reason":"contention","retry_after_ms":...} and apps/api/src/flow/collab/session.rs\'s '
-        "`Ok(AcceptOutcome::Rejected(rejected)) => { send(socket, &Frame::Rejected{...}) }` arm "
-        f"confirmed sends a rejected control frame without closing the socket (calls close(): "
-        f"{f['session_rs_rejected_arm_calls_close']}, sends frame: "
-        f"{f['session_rs_rejected_arm_sends_frame']}) -- this is a real, independently re-verified "
-        "reject_keep_open. But gate-commands.md is explicit that WS-only coverage of one variant "
-        "fails the gate ('只测 WS 均失败'): " + REST_UNAVAILABLE_REASON + " " + MCP_UNAVAILABLE_REASON
-        + " " + CLI_UNAVAILABLE_REASON
+        "contention is a real WS reject_keep_open producer; "
+        f"UI dynamic server-origin coverage={ui_drain_coverage_ok}. REST: {REST_STATUS_REASON}. "
+        f"MCP: {MCP_STATUS_REASON}. CLI: {CLI_STATUS_REASON}."
     ),
 }
 
 malformed = {
     "missing_reason_rejected": {
-        "status": "not_covered",
-        "reason": "no fixture/harness exists anywhere in this repository that can inject a "
-                   "malformed server_draining payload (missing `reason`) into any transport to "
-                   "observe rejection -- REST/MCP cannot carry `details` at all today (see above), so "
-                   "there is nothing to inject a malformed variant of.",
+        "status": "passed" if ui_gate_json_ok and ui_malformed_assertion_ok else "not_covered",
+        "reason": "UI state suite dynamically rejects missing reason" if ui_malformed_assertion_ok
+                  else "the named UI malformed-reason assertion did not run successfully",
     },
     "unknown_reason_rejected": {
-        "status": "not_covered",
-        "reason": "same gap as missing_reason_rejected -- no producer fixture exists to inject an "
-                   "unrecognized reason value on any transport.",
+        "status": "passed" if ui_gate_json_ok and ui_malformed_assertion_ok else "not_covered",
+        "reason": "UI state suite dynamically rejects unknown reason" if ui_malformed_assertion_ok
+                  else "the named UI malformed-reason assertion did not run successfully",
     },
     "message_branching_zero": {
         "status": "passed" if (
@@ -593,6 +580,8 @@ cross_surface_ok = (
     drain_variant["rest_reason"] is not None and contention_variant["rest_reason"] is not None
     and drain_variant["mcp_http_reason"] is not None and contention_variant["mcp_http_reason"] is not None
     and drain_variant["cli_json_reason"] is not None and contention_variant["cli_json_reason"] is not None
+    and drain_variant["ui_reason"] == "drain" and contention_variant["ui_reason"] == "contention"
+    and drain_variant["ui_origin"] == "server" and contention_variant["ui_origin"] == "server"
 )
 
 result = {
@@ -621,6 +610,37 @@ result = {
                       "(0 call sites, see findings).",
         },
         "frontend_test_files_mentioning_server_draining": frontend_test_hits,
+        "ui_state_gate": {
+            "command": "bun run --cwd frontend test:flow-v0.4",
+            "result": ui_result_path,
+            "log": ui_log_path,
+            "exit_code": ui_exit_code,
+            "gate_json_passed": ui_gate_json_ok,
+            "gate_row": ui_gate,
+            "required_origin": "server",
+            "origin_server_assertion": UI_SERVER_ORIGIN_ASSERTION,
+            "origin_server_assertion_status": "ok" if ui_server_origin_assertion_ok else "missing_or_failed",
+            "malformed_reason_assertion": UI_MALFORMED_ASSERTION,
+            "malformed_reason_assertion_status": "ok" if ui_malformed_assertion_ok else "missing_or_failed",
+            "status": "passed" if ui_drain_coverage_ok else "failed",
+            "proves": (
+                "the UI consumed drain/contention from REST, WS rejected and WS 4410 wire shapes, "
+                "and every accepted FlowError was explicitly asserted to have origin=server"
+                if ui_drain_coverage_ok
+                else "UI coverage is not accepted unless both the gate JSON and the named origin=server "
+                     "runtime assertion pass"
+            ),
+        },
+        "mcp_live_transports": {
+            "http": "not_covered",
+            "sse": "not_covered",
+            "stdio": "not_covered",
+            "reason": (
+                "the repository has no scripts-only fixture that starts all three MCP transports "
+                "against the same live API WorkspaceDrainGuard; shared dispatch/static wiring is not "
+                "counted as live transport evidence"
+            ),
+        },
     },
     "structural_findings": f,
     # Both gates below are derived from the SAME booleans already computed above
@@ -654,15 +674,15 @@ result = {
             "plain conflict string"
             if rest_details_exists and f["map_write_rejection_reads_details_field"]
             and not f["map_write_rejection_maps_server_draining_to_conflict_string_only"]
-            else REST_UNAVAILABLE_REASON
+            else REST_STATUS_REASON
         ),
         "server_draining_reason_cross_surface_error_coverage": (
             "both drain and contention are producible and cross-surface coverage (REST+MCP+CLI) is "
             "confirmed"
             if variants_producible and cross_surface_ok
-            else "drain is not producible on any transport; contention is producible and wire-correct on "
-            "WS only (verified reject_keep_open) but gate-commands.md requires REST+MCP(x3)+CLI+UI "
-            "coverage with a shared producer fixture, none of which exists"
+            else "REST/WS producers, structured MCP/CLI consumers and server-origin UI state coverage "
+            "exist, but the gate still lacks same-producer live MCP HTTP/SSE/stdio and CLI process "
+            "observations; static shared dispatch is not counted"
         ),
     },
 }
