@@ -60,28 +60,40 @@ struct ChainNode {
     inherit_from_parent: bool,
 }
 
+/// How a `parent_id` walk that started at some object ended.
+///
+/// The walk itself is shared by the read path ([`fetch_chain`], which turns anything but
+/// `Complete` into a denial) and the write path ([`ensure_parent_can_adopt_child`], which has to
+/// tell an over-deep parent apart from a corrupted one because the two are different rejections
+/// on the wire — `limit_exceeded{limit_kind:"tree_depth"}` vs `invalid_update`). Keeping one SQL
+/// walk behind one enum is what stops those two sides from ever disagreeing about what "the
+/// chain" is.
+enum ChainWalk {
+    /// Starts at the requested object and terminates at a genuine root within
+    /// [`MAX_CHAIN_NODES`].
+    Complete(Vec<ChainNode>),
+    /// The requested object itself has no row in this workspace.
+    Missing,
+    /// More rows came back than [`MAX_CHAIN_NODES`] allows: the chain is deeper than
+    /// `tree_depth_max`.
+    TooDeep,
+    /// The walk visited the same object twice: the `parent_id` edges form a cycle. Only cycles
+    /// short enough to close inside the probe bound are reported here; a longer one is
+    /// indistinguishable from a genuinely over-deep chain and comes back as [`Self::TooDeep`].
+    /// Both are denials, so the distinction is about the error a caller sees, never about
+    /// whether it is one.
+    Cyclic,
+    /// The walk stopped without reaching a root inside the probe bound: a `parent_id` cycle, or
+    /// an ancestor row that is absent from this workspace.
+    Incomplete,
+}
+
 /// Walks `object_id`'s ancestor chain via `parent_id`, starting at the object itself and ending at
-/// the root, in that order.
+/// the root, in that order, and classifies how it ended.
 ///
-/// Fail-closed by construction: this returns a chain only when it is *complete* — it starts at
-/// `object_id` and terminates at a genuine root (`parent_id IS NULL`) within
-/// [`MAX_CHAIN_NODES`]. A truncated chain can hide the authorization boundary that
-/// [`effective_permission`] exists to find, and a hidden boundary silently re-applies the
-/// workspace baseline — exactly the escalation `ADR-0012` R16 was revised to remove. So a chain
-/// deeper than [`TREE_DEPTH_MAX`], a `parent_id` cycle, and a chain whose named ancestor row is
-/// missing from this workspace are all rejected outright rather than evaluated partially, per
-/// `gates/gate-commands.md`: "`depth=33`、继承链成环、或链不完整…**必须 fail closed** 并返回可
-/// 判定的拒绝，不得像 R15 之前那样把 21-32 层静默截断成别的结果".
-///
-/// # Errors
-/// `NotFound` when `object_id` itself has no row in `workspace_id` (the caller's object simply
-/// does not exist — a 404, not a broken invariant). `Forbidden` when the chain is over-deep,
-/// cyclic, or incomplete. Propagates a database read failure otherwise.
-async fn fetch_chain<C: ConnectionTrait>(
-    conn: &C,
-    workspace_id: Uuid,
-    object_id: Uuid,
-) -> Result<Vec<ChainNode>, ApiError> {
+/// The probe deliberately runs one hop past the legal maximum so that an over-deep or cyclic chain
+/// is *detected* rather than coming back looking like a valid short one.
+async fn walk_chain<C: ConnectionTrait>(conn: &C, workspace_id: Uuid, object_id: Uuid) -> Result<ChainWalk, ApiError> {
     #[derive(FromQueryResult)]
     struct Row {
         id: Uuid,
@@ -121,30 +133,162 @@ async fn fetch_chain<C: ConnectionTrait>(
     // `effective_permission`'s `chain.get(..=index)` ("the boundary node and everything below
     // it") depends on exactly this order.
     let Some(top) = rows.last() else {
-        return Err(ApiError::NotFound("flow object not found".to_string()));
+        return Ok(ChainWalk::Missing);
     };
+    // A cycle re-enters a node the walk has already visited. Checked before the length test
+    // because a short cycle also *looks* over-deep: the recursion spins until the probe bound and
+    // comes back with `MAX_CHAIN_NODES + 1` rows, so without this the write path would report a
+    // corrupted chain as a depth-limit violation.
+    let mut seen: Vec<Uuid> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if seen.contains(&row.id) {
+            return Ok(ChainWalk::Cyclic);
+        }
+        seen.push(row.id);
+    }
     if rows.len() > MAX_CHAIN_NODES {
-        return Err(ApiError::Forbidden(
-            "object inheritance chain is deeper than the frozen tree depth limit".to_string(),
-        ));
+        return Ok(ChainWalk::TooDeep);
     }
     if top.parent_id.is_some() {
         // The walk did not reach a root: either the recursion bound cut a longer chain or a
         // `parent_id` cycle short, or the ancestor row it names is absent from this workspace
         // (`flow_objects_parent_workspace_fk` should make the latter impossible — treat a
         // violated invariant as a denial, never as a licence to judge on a partial chain).
-        return Err(ApiError::Forbidden(
-            "object inheritance chain is incomplete".to_string(),
-        ));
+        return Ok(ChainWalk::Incomplete);
     }
 
-    Ok(rows
-        .into_iter()
-        .map(|row| ChainNode {
-            id: row.id,
-            inherit_from_parent: row.inherit_from_parent,
-        })
-        .collect())
+    Ok(ChainWalk::Complete(
+        rows.into_iter()
+            .map(|row| ChainNode {
+                id: row.id,
+                inherit_from_parent: row.inherit_from_parent,
+            })
+            .collect(),
+    ))
+}
+
+/// Walks `object_id`'s ancestor chain via `parent_id`, starting at the object itself and ending at
+/// the root, in that order.
+///
+/// Fail-closed by construction: this returns a chain only when it is *complete* — it starts at
+/// `object_id` and terminates at a genuine root (`parent_id IS NULL`) within
+/// [`MAX_CHAIN_NODES`]. A truncated chain can hide the authorization boundary that
+/// [`effective_permission`] exists to find, and a hidden boundary silently re-applies the
+/// workspace baseline — exactly the escalation `ADR-0012` R16 was revised to remove. So a chain
+/// deeper than [`TREE_DEPTH_MAX`], a `parent_id` cycle, and a chain whose named ancestor row is
+/// missing from this workspace are all rejected outright rather than evaluated partially, per
+/// `gates/gate-commands.md`: "`depth=33`、继承链成环、或链不完整…**必须 fail closed** 并返回可
+/// 判定的拒绝，不得像 R15 之前那样把 21-32 层静默截断成别的结果".
+///
+/// # Errors
+/// `NotFound` when `object_id` itself has no row in `workspace_id` (the caller's object simply
+/// does not exist — a 404, not a broken invariant). `Forbidden` when the chain is over-deep,
+/// cyclic, or incomplete. Propagates a database read failure otherwise.
+async fn fetch_chain<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+) -> Result<Vec<ChainNode>, ApiError> {
+    match walk_chain(conn, workspace_id, object_id).await? {
+        ChainWalk::Complete(chain) => Ok(chain),
+        ChainWalk::Missing => Err(ApiError::NotFound("flow object not found".to_string())),
+        ChainWalk::TooDeep => Err(ApiError::Forbidden(
+            "object inheritance chain is deeper than the frozen tree depth limit".to_string(),
+        )),
+        ChainWalk::Cyclic => Err(ApiError::Forbidden("object inheritance chain is cyclic".to_string())),
+        ChainWalk::Incomplete => Err(ApiError::Forbidden(
+            "object inheritance chain is incomplete".to_string(),
+        )),
+    }
+}
+
+/// The write-side counterpart of [`fetch_chain`]: refuses a `parent_id` that would create an
+/// object whose own inheritance chain the read side could never evaluate.
+///
+/// `ADR-0012` §3 freezes the inheritance-chain depth at `limits-v1.md`'s `tree_depth_max` (32,
+/// root at depth 0), and `gate-commands.md` requires `depth=33` and a `parent_id` cycle to fail
+/// closed. Enforcing that *only* on the read side leaves the row writable: a child of a parent
+/// already sitting at depth 32 lands in the table and is then permanently un-authorizable for
+/// every non-admin principal (`fetch_chain` returns `Forbidden` for it and for its whole subtree)
+/// — a durable, self-inflicted denial of service that no read-side check can undo. The same
+/// argument applies to attaching a child under an already-cyclic or already-broken chain: the row
+/// is accepted and instantly dead.
+///
+/// The database only guards `parent_id <> id` (`flow_objects_parent_not_self_check`, migration
+/// `0054`), so `A -> B -> A` is a perfectly legal row pair as far as `PostgreSQL` is concerned; this
+/// walk is what actually rejects it. v0.4 has no path that *re-parents* an existing object (only
+/// `create_object` writes `parent_id`, always with a freshly generated `id`), so a cycle cannot be
+/// closed by today's surface — but this check is the one that must hold when v0.5's cross-parent
+/// `move` command arrives, and it costs one already-budgeted recursive CTE outside any lock.
+///
+/// # Errors
+/// `BadRequest` when `parent_id` has no row in `workspace_id`. A typed `limit_exceeded` carrying
+/// `limits-v1.md`'s frozen `limit_kind = "tree_depth"` when the child would sit deeper than
+/// `TREE_DEPTH_MAX`. A typed `invalid_update` when the parent's own chain is cyclic or incomplete
+/// (a cycle too long to close inside the probe bound is reported as the `tree_depth` limit
+/// instead — still a refusal, just under the other name).
+/// Propagates a database read failure otherwise.
+pub async fn ensure_parent_can_adopt_child<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    parent_id: Uuid,
+) -> Result<(), ApiError> {
+    match walk_chain(conn, workspace_id, parent_id).await? {
+        ChainWalk::Complete(chain) => {
+            // `chain.len()` is the parent's own depth + 1, so the child's chain would have
+            // `chain.len() + 1` nodes. The child is legal exactly while that stays within
+            // `MAX_CHAIN_NODES` (33 nodes = depths 0..=32) — the same boundary `fetch_chain`
+            // enforces on the way back out, so a row this accepts is always one the read path can
+            // still evaluate.
+            let child_nodes = chain.len().saturating_add(1);
+            if child_nodes > MAX_CHAIN_NODES {
+                return Err(ApiError::limit_exceeded(
+                    "parent_object_id is already at the frozen tree depth limit",
+                    "tree_depth",
+                    Some(serde_json::json!(TREE_DEPTH_MAX)),
+                    Some(serde_json::json!(child_nodes.saturating_sub(1))),
+                    None,
+                ));
+            }
+            Ok(())
+        }
+        ChainWalk::Missing => Err(ApiError::BadRequest("parent_object_id not found".to_string())),
+        ChainWalk::TooDeep => Err(ApiError::limit_exceeded(
+            "parent_object_id's inheritance chain is already deeper than the frozen tree depth limit",
+            "tree_depth",
+            Some(serde_json::json!(TREE_DEPTH_MAX)),
+            None,
+            None,
+        )),
+        ChainWalk::Cyclic => Err(ApiError::invalid_update(
+            "parent_object_id's inheritance chain is cyclic",
+        )),
+        ChainWalk::Incomplete => Err(ApiError::invalid_update(
+            "parent_object_id's inheritance chain is incomplete",
+        )),
+    }
+}
+
+/// Cheap existence-and-ownership probe: does `object_id` have a row in `workspace_id`?
+///
+/// This is the *only* thing [`effective_permission`]'s workspace-admin override needs from the
+/// database, and it deliberately does not walk the inheritance chain: `ADR-0012` §4.1 point 3
+/// ("workspace admin 兜底永不可被边界切断，管理员救援路径…") and the `authz_boundary_self_lockout_
+/// guarded` gate both require an admin to keep `full_access` precisely when the chain is broken,
+/// so running [`fetch_chain`] first would take the rescue path away exactly when it is needed.
+async fn object_exists_in_workspace<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+) -> Result<bool, ApiError> {
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT 1 FROM flow_objects WHERE id = $1 AND workspace_id = $2",
+            vec![object_id.into(), workspace_id.into()],
+        ))
+        .await?;
+    Ok(row.is_some())
 }
 
 /// Explicit grants for one principal across a set of object ids, keyed by `object_id`.
@@ -222,9 +366,32 @@ pub async fn effective_permission<C: ConnectionTrait>(
     role: &str,
 ) -> Result<PermissionLevel, ApiError> {
     // Workspace admin always keeps `full_access` regardless of any authorization boundary
-    // (`ADR-0012` §3: "workspace admin 永远保留 full_access（可审计的管理员兜底）").
+    // (`ADR-0012` §3: "workspace admin 永远保留 full_access（可审计的管理员兜底）"; §4.1 point 3:
+    // "workspace admin 兜底永不可被边界切断"; gate `authz_boundary_self_lockout_guarded`:
+    // "边界永不切断 admin 兜底").
+    //
+    // What the contract grants is `full_access` *inside this workspace* — every one of those four
+    // statements says "workspace admin", and `role` itself comes from the caller's
+    // `workspace_members` row for `workspace_id`. So the override is gated on the object actually
+    // belonging to `workspace_id` first. Before that gate this function was the one place where a
+    // caller-supplied `object_id` and `workspace_id` were never compared at all: `fetch_chain`'s
+    // `WHERE o.id = $1 AND o.workspace_id = $2` is the only join between them, and the admin
+    // return jumped over it, so an admin got `full_access` for another tenant's object id and for
+    // ids that do not exist — the same shape as the cross-tenant ticket hole fixed in `5ca6845`,
+    // which survived there only for `owner`/`admin`.
+    //
+    // Deliberately a single-row probe rather than `fetch_chain`: an admin must keep the rescue
+    // path when the chain is cyclic, over-deep, or broken (`ADR-0012` §4.1 point 3 exists
+    // precisely because an authorization boundary can lock its own author out and only an admin
+    // can undo it), and `fetch_chain` denies all three. Ownership is a different question from
+    // chain health, and only the first one belongs in front of the admin override.
     if role == "owner" || role == "admin" {
-        return Ok(PermissionLevel::FullAccess);
+        if object_exists_in_workspace(conn, workspace_id, object_id).await? {
+            return Ok(PermissionLevel::FullAccess);
+        }
+        // Collapses "belongs to another workspace" and "does not exist" into one answer, so the
+        // override cannot be used as a cross-tenant existence oracle.
+        return Err(ApiError::NotFound("flow object not found".to_string()));
     }
 
     let chain = fetch_chain(conn, workspace_id, object_id).await?;
@@ -835,6 +1002,100 @@ mod database_tests {
                     .await
                     .expect("the admin fallback never depends on the chain");
                 assert_eq!(level, PermissionLevel::FullAccess, "role {role} must keep full_access");
+            }
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// ★ The admin override grants `full_access` **inside this workspace** — every statement of
+    /// it says so (`ADR-0012` §3's table row "workspace admin 永远保留 `full_access`（可审计的管理员
+    /// 兜底）", §3's baseline "admin ⇒ `full_access`", §4.1 point 3 "workspace admin 兜底永不可被
+    /// 边界切断", and the `authz_boundary_self_lockout_guarded` gate's "边界永不切断 admin 兜底").
+    /// It said nothing about objects that are not in the workspace at all.
+    ///
+    /// Before the ownership probe was put in front of it, this function was the one place where a
+    /// caller-supplied `object_id` and `workspace_id` were never compared: `fetch_chain`'s
+    /// `WHERE o.id = $1 AND o.workspace_id = $2` is their only join, and the admin return jumped
+    /// over it. An `owner`/`admin` therefore got `full_access` for another tenant's object id, and
+    /// for ids that do not exist anywhere — the same shape as the cross-tenant ticket hole fixed
+    /// in `5ca6845`, which is exactly why that hole only ever reproduced for `owner`/`admin`.
+    #[tokio::test]
+    async fn the_admin_override_does_not_reach_outside_its_own_workspace() {
+        let scratch = scratch_or_skip!("admin_scope");
+        let fx = seed_workspace(&scratch.db).await;
+        let other = seed_workspace(&scratch.db).await;
+
+        let foreign_object = insert_object(&scratch.db, other.workspace_id, None, true).await;
+        let absent_object = Uuid::new_v4();
+
+        for role in ["owner", "admin"] {
+            for (object_id, what) in [
+                (foreign_object, "another workspace's object"),
+                (absent_object, "an object that does not exist"),
+            ] {
+                // `fx.member_id` is a member of `fx.workspace_id` only; `role` is that workspace's
+                // role. Both answers must collapse to the same `NotFound`, so the override cannot
+                // double as a cross-tenant existence oracle either.
+                match effective_permission(&scratch.db, fx.workspace_id, object_id, "user", fx.member_id, role).await {
+                    Err(ApiError::NotFound(_)) => {}
+                    Ok(level) => panic!("role {role} got {level:?} for {what} (cross-tenant fail-open)"),
+                    Err(other) => panic!("role {role}: expected NotFound for {what}, got {other:?}"),
+                }
+            }
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// The other half of the same change: gating the override on *ownership* must not gate it on
+    /// *chain health*. `ADR-0012` §4.1 point 3 and the `authz_boundary_self_lockout_guarded` gate
+    /// exist precisely because an authorization boundary can lock its own author out and only an
+    /// admin can undo it, so an admin has to keep `full_access` over a chain this module refuses
+    /// to evaluate for anybody else. Running `fetch_chain` before the override — instead of the
+    /// single-row ownership probe — would take the rescue path away exactly when it is needed.
+    #[tokio::test]
+    async fn a_workspace_admin_keeps_the_rescue_path_when_the_chain_is_broken() {
+        let scratch = scratch_or_skip!("admin_rescue");
+        let fx = seed_workspace(&scratch.db).await;
+
+        // (1) a `parent_id` cycle
+        let a = insert_object(&scratch.db, fx.workspace_id, None, true).await;
+        let b = insert_object(&scratch.db, fx.workspace_id, Some(a), true).await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET parent_id = $1 WHERE id = $2",
+            vec![b.into(), a.into()],
+        )
+        .await;
+
+        // (2) a chain past the depth limit, and (3) an authorization boundary that has cut every
+        //     non-admin off the object.
+        let over_deep = build_chain(&scratch.db, fx.workspace_id, FIRST_ILLEGAL_CHAIN_NODES, None).await;
+        let restricted = build_chain(&scratch.db, fx.workspace_id, 3, Some(2)).await;
+
+        // Every one of these is `Forbidden` for a plain member...
+        assert_forbidden(&member_level(&scratch.db, &fx, b).await, "cyclic chain, member");
+        assert_forbidden(
+            &member_level(&scratch.db, &fx, over_deep[0]).await,
+            "over-deep chain, member",
+        );
+
+        // ...and still `full_access` for the workspace's own admins.
+        for role in ["owner", "admin"] {
+            for (object_id, what) in [
+                (b, "an object inside a parent_id cycle"),
+                (over_deep[0], "an object below the depth limit"),
+                (restricted[0], "an object behind an authorization boundary"),
+            ] {
+                let level = effective_permission(&scratch.db, fx.workspace_id, object_id, "user", fx.member_id, role)
+                    .await
+                    .unwrap_or_else(|err| panic!("role {role} lost the rescue path for {what}: {err:?}"));
+                assert_eq!(
+                    level,
+                    PermissionLevel::FullAccess,
+                    "role {role} must keep full_access for {what}"
+                );
             }
         }
 

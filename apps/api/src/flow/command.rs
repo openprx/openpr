@@ -265,6 +265,15 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         if parent.lifecycle_status == "archived" {
             return Err(ApiError::BadRequest("parent_object_id is archived".to_string()));
         }
+        // The write-side half of `ADR-0012` §3's depth/cycle rule. The read side already fails
+        // closed on an over-deep, cyclic, or incomplete inheritance chain
+        // (`authz::fetch_chain`), but nothing stopped such a chain from being *created*: the only
+        // schema guard on `parent_id` is `flow_objects_parent_not_self_check` (migration `0054`),
+        // which rejects `parent_id = id` and nothing else. Without this call a child of a parent
+        // already at `tree_depth_max` lands in the table and is then permanently unauthorizable
+        // for every non-admin -- the read side denies it and its whole subtree forever, and v0.4
+        // ships no re-parent command to repair it.
+        authz::ensure_parent_can_adopt_child(&state.db, input.workspace_id, parent_id).await?;
     }
 
     // Build the document outside any lock, matching `v0.4-flow-alpha.md`'s "hydrate/apply
@@ -859,6 +868,20 @@ async fn execute_command_authorized(
         return Ok(accepted_change_from_row(current, existing.id));
     }
 
+    // `ADR-0012` §3.1's fence compares the epoch this command *checked permission against* with
+    // the epoch still in force at commit, so `checked_epoch` has to be taken no later than the
+    // permission read it is fencing. It used to be read afterwards (inside
+    // `execute_content_command` / `execute_lifecycle_command`), which inverted the barrier: an
+    // authorization change committing in the window between the permission read and the epoch
+    // read got *baked into* `checked_epoch`, so the commit-time `FOR SHARE` compared the new
+    // epoch against itself, matched, and let the already-stale permission land. The fence only
+    // ever compares epochs — it never recomputes permission (`authz::fence_epoch_for_share`) —
+    // so this ordering is the whole of the protection. Reading it first is also strictly safe in
+    // the other direction: a revocation that commits *before* this read is seen by
+    // `effective_permission` below, and one that commits after moves the epoch past this value
+    // and is caught by the fence.
+    let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
+
     let principal_kind = if input.principal_kind == "bot" { "bot" } else { "user" };
     let level = authz::effective_permission(
         &state.db,
@@ -875,10 +898,10 @@ async fn execute_command_authorized(
 
     match kind {
         CommandKind::Content(content_kind) => {
-            execute_content_command(state, input, workspace_id, document_id, content_kind).await
+            execute_content_command(state, input, workspace_id, document_id, checked_epoch, content_kind).await
         }
         CommandKind::Lifecycle(lifecycle_kind) => {
-            execute_lifecycle_command(state, input, workspace_id, lifecycle_kind).await
+            execute_lifecycle_command(state, input, workspace_id, checked_epoch, lifecycle_kind).await
         }
     }
 }
@@ -1252,6 +1275,9 @@ async fn execute_content_command(
     input: &ExecuteCommandInput,
     workspace_id: Uuid,
     document_id: Uuid,
+    // The epoch `execute_command_authorized` read *before* computing this caller's permission --
+    // see the comment there for why it must not be re-read here.
+    checked_epoch: i64,
     kind: ContentCommandType,
 ) -> Result<AcceptedChange, ApiError> {
     let expected_frontier = input
@@ -1275,7 +1301,6 @@ async fn execute_content_command(
         .map_err(|err| map_collab_error(&err))?;
 
     let collab = runtime::runtime();
-    let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
     let update_id = Uuid::new_v4();
 
     let outcome = write::accept_update(
@@ -1346,6 +1371,9 @@ async fn execute_lifecycle_command(
     state: &AppState,
     input: &ExecuteCommandInput,
     workspace_id: Uuid,
+    // The epoch `execute_command_authorized` read *before* computing this caller's permission --
+    // see the comment there for why it must not be re-read here.
+    checked_epoch: i64,
     kind: LifecycleCommandType,
 ) -> Result<AcceptedChange, ApiError> {
     if input.expected_frontier.is_some() {
@@ -1359,12 +1387,6 @@ async fn execute_lifecycle_command(
         LifecycleCommandType::Archive => ("flow.object.archived", "archived"),
         LifecycleCommandType::Restore => ("flow.object.restored", "active"),
     };
-
-    // The `authz_epoch` `execute_command`'s own `authz::effective_permission` check (the caller
-    // of this function) was computed against, re-read here immediately before opening the
-    // transaction that will commit this lifecycle change -- matches
-    // `execute_content_command`'s own `checked_epoch` read right before its write path.
-    let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
 
     let tx = state.db.begin().await?;
 
@@ -1680,5 +1702,556 @@ mod typed_error_mapping_tests {
     fn collab_unknown_node_maps_to_invalid_update() {
         let err = map_collab_error(&CollabError::UnknownNode { id: "n1".to_string() });
         assert_eq!(err.kind(), ApiErrorKind::InvalidUpdate);
+    }
+}
+
+// ---- Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
+//
+// Same throwaway-scratch-database convention as `super::collab::write`'s and
+// `super::collab::authz`'s database tests. These cover two properties that are only observable
+// against a real PostgreSQL instance with real concurrent sessions:
+//
+//  1. `ADR-0012` §3.1's fencing barrier is only sound if `checked_epoch` is taken no *later* than
+//     the permission read it fences (`authz_epoch_is_read_before_permission_...`);
+//  2. `ADR-0012` §3's `tree_depth_max` and the "继承链成环 fail closed" rule have to be enforced on
+//     the *write* path, not only when the chain is later read
+//     (`create_object_rejects_...`).
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::struct_field_names,
+    clippy::too_many_lines
+)]
+mod database_tests {
+    use platform::{
+        app::AppState,
+        config::{AppConfig, Secret},
+    };
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    use super::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
+    use crate::error::{ApiError, ApiErrorKind};
+    use crate::flow::collab::authz;
+
+    const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    /// `limits-v1.md`'s `tree_depth_max = 32` with the root at depth 0, written as a literal so
+    /// these fixtures pin the *contract* rather than sliding along with any implementation
+    /// constant: a legal chain spans depths `0..=32`, i.e. 33 nodes joined by 32 hops.
+    const DEEPEST_LEGAL_CHAIN_NODES: usize = 33;
+
+    struct Scratch {
+        db: DatabaseConnection,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        async fn drop_self(self) {
+            let Self { db, name, admin_url } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            let _ = admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await;
+        }
+    }
+
+    async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = Database::connect(&admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+        let name = format!("openpr_flow_command_{label}");
+        let quoted = format!("\"{name}\"");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+            .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+            .await
+            .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        let db = Database::connect(&url)
+            .await
+            .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+        migrate(&db).await;
+
+        Some(Scratch { db, name, admin_url })
+    }
+
+    async fn migrate(db: &DatabaseConnection) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migration file was found in {dir}");
+        for path in files {
+            let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+            db.execute_unprepared(&sql)
+                .await
+                .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+        }
+    }
+
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!("skipped: {TEST_DATABASE_URL_ENV} is not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    fn state_for(db: DatabaseConnection) -> AppState {
+        AppState {
+            cfg: AppConfig {
+                app_name: "flow-command-test".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                database_url: Secret::new("postgres://unused/unused"),
+                jwt_secret: Secret::new("flow-command-test-secret"),
+                jwt_access_ttl_seconds: 900,
+                jwt_refresh_ttl_seconds: 3600,
+                default_author_id: None,
+                allow_insecure_cookies: false,
+                collab_allowed_origins: Vec::new(),
+            },
+            db,
+        }
+    }
+
+    async fn exec(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) {
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .unwrap_or_else(|err| panic!("setup statement failed: {err}"));
+    }
+
+    struct Fixture {
+        workspace_id: Uuid,
+        owner_id: Uuid,
+        member_id: Uuid,
+    }
+
+    async fn seed_workspace(db: &DatabaseConnection) -> Fixture {
+        let workspace_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        for user_id in [owner_id, member_id] {
+            exec(
+                db,
+                "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+                 VALUES ($1, $2, '!', 'test', 'user', true)",
+                vec![user_id.into(), format!("{user_id}@command.test").into()],
+            )
+            .await;
+        }
+        exec(
+            db,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'command test', $3)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+        for (user_id, role) in [(owner_id, "owner"), (member_id, "member")] {
+            exec(
+                db,
+                "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+                vec![workspace_id.into(), user_id.into(), role.into()],
+            )
+            .await;
+        }
+        exec(
+            db,
+            "INSERT INTO flow_workspace_settings (workspace_id, flow_enabled, default_member_level) \
+             VALUES ($1, true, 'edit')",
+            vec![workspace_id.into()],
+        )
+        .await;
+        Fixture {
+            workspace_id,
+            owner_id,
+            member_id,
+        }
+    }
+
+    async fn create_page(state: &AppState, fx: &Fixture, parent: Option<Uuid>) -> Result<Uuid, ApiError> {
+        create_object(
+            state,
+            CreateObjectInput {
+                workspace_id: fx.workspace_id,
+                actor_id: fx.owner_id,
+                object_type: "page".to_string(),
+                project_id: None,
+                parent_object_id: parent,
+                title: "Command Path Test Page".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+        .map(|accepted| accepted.object.id)
+    }
+
+    async fn insert_raw_object(db: &DatabaseConnection, workspace_id: Uuid, parent_id: Option<Uuid>) -> Uuid {
+        let id = Uuid::new_v4();
+        exec(
+            db,
+            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id) VALUES ($1, $2, 'page', $3)",
+            vec![id.into(), workspace_id.into(), parent_id.into()],
+        )
+        .await;
+        id
+    }
+
+    /// Root-to-leaf chain of `nodes` objects written straight to `flow_objects` (its leaf sits at
+    /// depth `nodes - 1`), returned root-first.
+    async fn build_chain(db: &DatabaseConnection, workspace_id: Uuid, nodes: usize) -> Vec<Uuid> {
+        let mut ids = Vec::with_capacity(nodes);
+        let mut parent = None;
+        for _ in 0..nodes {
+            let id = insert_raw_object(db, workspace_id, parent).await;
+            ids.push(id);
+            parent = Some(id);
+        }
+        ids
+    }
+
+    async fn count_collab_updates(db: &DatabaseConnection, document_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("count query runs")
+        .expect("count query returns a row");
+        row.n
+    }
+
+    async fn document_of(db: &DatabaseConnection, object_id: Uuid) -> Uuid {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: Uuid,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM collab_documents WHERE object_id = $1",
+            vec![object_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("query runs")
+        .expect("the object has a document")
+        .id
+    }
+
+    fn assert_limit_exceeded_tree_depth(err: &ApiError, what: &str) {
+        assert_eq!(
+            err.kind(),
+            ApiErrorKind::LimitExceeded,
+            "{what}: wrong error kind ({err:?})"
+        );
+        let ApiError::Typed { details, .. } = err else {
+            panic!("{what}: expected a Typed limit_exceeded error, got {err:?}");
+        };
+        assert_eq!(
+            details.as_ref().and_then(|d| d.get("limit_kind")),
+            Some(&serde_json::json!("tree_depth")),
+            "{what}: limit_kind must be the frozen `tree_depth`"
+        );
+    }
+
+    // ---- 1. the `authz_epoch` fence's own TOCTOU: the two reads must not be inverted ----
+
+    /// ★ `ADR-0012` §3.1's commit-time fence compares "the epoch permission was checked against"
+    /// with the epoch still in force at commit. That comparison is worthless if `checked_epoch` is
+    /// read *after* the permission it is supposed to fence: an authorization change committing in
+    /// between is then folded into `checked_epoch` itself, the fence compares the new epoch with
+    /// itself, matches, and the already-stale permission lands. `fence_epoch_for_share` never
+    /// recomputes permission — it only compares epochs — so the order of these two reads is the
+    /// entire barrier.
+    ///
+    /// The interleaving is made deterministic with a real lock, not a sleep: `B` takes
+    /// `LOCK TABLE flow_workspace_settings IN ACCESS EXCLUSIVE MODE`, which blocks even a plain
+    /// `SELECT` on that table — so `A` parks precisely on its `authz::read_epoch` round trip and
+    /// nowhere else. The fixture object carries its own authorization boundary
+    /// (`inherit_from_parent = false`) plus an explicit `full_access` grant, so
+    /// `effective_permission` resolves entirely out of `flow_objects` + `flow_object_grants` and
+    /// never touches the locked table itself; that is what makes "blocked" mean "blocked at the
+    /// epoch read".
+    ///
+    /// With the reads in the wrong order this test observes the exact defect: `A` computes
+    /// `full_access` from the grant, then blocks; `B` deletes the grant and advances the epoch;
+    /// `A` reads the *post-revocation* epoch as its `checked_epoch`, the fence matches, and the
+    /// update commits after the revocation.
+    #[tokio::test]
+    async fn authz_epoch_is_read_before_permission_so_a_revocation_between_them_cannot_be_fenced_out() {
+        let scratch = scratch_or_skip!("epoch_read_order");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let object_id = create_page(&state, &fx, None).await.expect("page is created");
+        let document_id = document_of(&scratch.db, object_id).await;
+
+        // An authorization boundary on the object itself + an explicit grant to the member. Two
+        // consequences, both load-bearing: (a) `effective_permission` takes the boundary branch
+        // and never reads `flow_workspace_settings`, so the table lock below isolates the epoch
+        // read; (b) deleting the grant is a *real* revocation — with the baseline cut off, the
+        // member drops straight to `view`.
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![object_id.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "INSERT INTO flow_object_grants (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, 'full_access')",
+            vec![fx.workspace_id.into(), object_id.into(), fx.member_id.into()],
+        )
+        .await;
+
+        let original_epoch = authz::read_epoch(&scratch.db, fx.workspace_id)
+            .await
+            .expect("epoch reads");
+        let updates_before = count_collab_updates(&scratch.db, document_id).await;
+
+        // `B` on its own connection: a genuinely separate session, so the table lock is
+        // cross-transaction rather than a self-block.
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).expect("checked by scratch_or_skip! above");
+        let db_url = admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("db url");
+        let db_b = Database::connect(&db_url).await.expect("B connects independently");
+
+        let (b_holding_tx, b_holding_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_b_tx, release_b_rx) = tokio::sync::oneshot::channel::<()>();
+        let workspace_id = fx.workspace_id;
+        let member_id = fx.member_id;
+
+        let b_task = tokio::spawn(async move {
+            use sea_orm::TransactionTrait;
+            let tx = db_b.begin().await.expect("B begins");
+            tx.execute_unprepared("LOCK TABLE flow_workspace_settings IN ACCESS EXCLUSIVE MODE")
+                .await
+                .expect("B locks the epoch table");
+            b_holding_tx.send(()).expect("A is still waiting to receive this");
+
+            release_b_rx.await.expect("A releases B");
+            // The authorization change itself: revoke the grant and advance the epoch in one
+            // transaction, exactly as `ADR-0012` §3.1 point 1 requires.
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM flow_object_grants WHERE workspace_id = $1 AND principal_id = $2",
+                vec![workspace_id.into(), member_id.into()],
+            ))
+            .await
+            .expect("B revokes the grant");
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("B advances the epoch");
+            tx.commit().await.expect("B commits, releasing the table lock");
+        });
+
+        b_holding_rx.await.expect("B signals it holds the lock");
+
+        let state_for_a = state_for(scratch.db.clone());
+        let a_task = tokio::spawn(async move {
+            execute_command(
+                &state_for_a,
+                ExecuteCommandInput {
+                    object_id,
+                    actor_id: member_id,
+                    principal_kind: "user".to_string(),
+                    role: "member".to_string(),
+                    command_type: "set_title".to_string(),
+                    payload: serde_json::json!({ "title": "written after the revocation" }),
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                    origin_client_id: "test-client-a".to_string(),
+                },
+            )
+            .await
+        });
+
+        // `A` must genuinely be parked on the locked table, not merely slow: nothing else in this
+        // command path reads `flow_workspace_settings`, so still-unfinished here means "waiting on
+        // the epoch read". No `lock_timeout` is in force on that read (`run_locked_phase`'s is a
+        // `SET LOCAL` inside its own, later transaction), so the wait is unbounded and this is a
+        // barrier rather than a race with a timer.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !a_task.is_finished(),
+            "A must still be blocked on B's table lock at this point -- the interleaving this test \
+             depends on did not happen"
+        );
+
+        release_b_tx.send(()).expect("B is still waiting to receive this");
+        b_task.await.expect("B task joins");
+
+        let a_result = a_task.await.expect("A task joins");
+        let Err(err) = a_result else {
+            panic!(
+                "a command whose permission was revoked while it sat between its own authorization \
+                 reads was accepted -- `checked_epoch` was taken after the permission read, so the \
+                 fence compared the post-revocation epoch with itself"
+            );
+        };
+        assert_eq!(
+            err.kind(),
+            ApiErrorKind::PolicyRejected,
+            "the revoked command must be rejected as policy_rejected, got {err:?}"
+        );
+
+        // The decisive assertion, independent of what the in-memory result claimed: nothing was
+        // persisted for a caller whose permission had already been taken away.
+        assert_eq!(
+            count_collab_updates(&scratch.db, document_id).await,
+            updates_before,
+            "a content write landed after the revocation committed"
+        );
+        assert_eq!(
+            authz::read_epoch(&scratch.db, fx.workspace_id)
+                .await
+                .expect("epoch reads"),
+            original_epoch + 1,
+            "B's revocation must still have taken effect"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    // ---- 3. the write path must enforce `tree_depth_max` and refuse a corrupted chain ----
+
+    /// A parent already sitting at `tree_depth_max` (depth 32) cannot adopt a child: the child
+    /// would sit at depth 33, which `authz::fetch_chain` refuses to evaluate for anyone but a
+    /// workspace admin — so accepting the row would mint an object that is permanently
+    /// unauthorizable, for it and for everything ever created beneath it, with no v0.4 command
+    /// able to re-parent it back.
+    ///
+    /// Nailed from both sides: depth 32 is legal and must still be creatable, and the object
+    /// created there must still resolve on the read path.
+    #[tokio::test]
+    async fn create_object_rejects_a_parent_that_is_already_at_the_frozen_tree_depth_limit() {
+        let scratch = scratch_or_skip!("create_depth");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+
+        // Root-first, so `chain[i]` sits at depth `i`.
+        let chain = build_chain(&scratch.db, fx.workspace_id, DEEPEST_LEGAL_CHAIN_NODES).await;
+        let at_limit = chain[DEEPEST_LEGAL_CHAIN_NODES - 1]; // depth 32
+        let one_below_limit = chain[DEEPEST_LEGAL_CHAIN_NODES - 2]; // depth 31
+
+        // A child of the depth-31 node lands at depth 32 -- the deepest legal position -- and must
+        // be accepted *and* still resolve on the read path.
+        let legal_child = create_page(&state, &fx, Some(one_below_limit))
+            .await
+            .expect("a child at exactly tree_depth_max must be creatable");
+        let level = authz::effective_permission(
+            &scratch.db,
+            fx.workspace_id,
+            legal_child,
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await
+        .expect("an object at exactly tree_depth_max must still be authorizable");
+        assert_eq!(
+            level,
+            authz::PermissionLevel::Edit,
+            "no boundary ⇒ the edit baseline applies"
+        );
+
+        // One deeper is not creatable at all.
+        let err = create_page(&state, &fx, Some(at_limit))
+            .await
+            .expect_err("a child at depth 33 must be rejected by the write path");
+        assert_limit_exceeded_tree_depth(&err, "a child one past tree_depth_max");
+
+        // ...and nothing was written: no `flow_objects` row past the limit.
+        #[derive(FromQueryResult)]
+        struct OrphanCount {
+            n: i64,
+        }
+        let orphans = OrphanCount::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM flow_objects WHERE parent_id = $1",
+            vec![at_limit.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("count runs")
+        .expect("count row")
+        .n;
+        assert_eq!(orphans, 0, "the rejected create must not have left a row behind");
+
+        scratch.drop_self().await;
+    }
+
+    /// `flow_objects_parent_not_self_check` (migration `0054`) only forbids `parent_id = id`, so
+    /// `A -> B -> A` is a legal row pair as far as `PostgreSQL` is concerned. The read path fails
+    /// closed on such a chain; the write path must refuse to attach anything new underneath it
+    /// rather than mint another permanently unauthorizable row.
+    #[tokio::test]
+    async fn create_object_rejects_a_parent_whose_chain_is_cyclic() {
+        let scratch = scratch_or_skip!("create_cycle");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+
+        let a = insert_raw_object(&scratch.db, fx.workspace_id, None).await;
+        let b = insert_raw_object(&scratch.db, fx.workspace_id, Some(a)).await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET parent_id = $1 WHERE id = $2",
+            vec![b.into(), a.into()],
+        )
+        .await;
+
+        let err = create_page(&state, &fx, Some(b))
+            .await
+            .expect_err("a parent inside a parent_id cycle must be rejected");
+        assert_eq!(
+            err.kind(),
+            ApiErrorKind::InvalidUpdate,
+            "a cyclic parent chain must fail closed as invalid_update, got {err:?}"
+        );
+
+        scratch.drop_self().await;
     }
 }

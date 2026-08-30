@@ -825,6 +825,18 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         reject_and_close(socket, document_id, RejectedCode::Forbidden, "not a workspace member").await;
         return None;
     };
+    // `ADR-0012` §3.1: `checked_epoch` is "the epoch permission was computed against", and every
+    // update this connection later commits is fenced against it (`write::run_locked_phase` ->
+    // `authz::fence_epoch_for_share`). It therefore has to be read no later than the permission
+    // read it fences. Reading it afterwards -- as this did -- meant a revocation committing
+    // between the two reads was folded into `checked_epoch` itself, so the commit-time fence
+    // compared the post-revocation epoch against itself and every subsequent write on this
+    // connection sailed through on permission that had already been taken away. The fence only
+    // compares epochs, so the order of these two reads is the entire barrier.
+    let Ok(checked_epoch) = authz::read_epoch(&state.db, consumed.workspace_id).await else {
+        reject_and_close(socket, document_id, RejectedCode::Forbidden, "epoch read failed").await;
+        return None;
+    };
     let Ok(level) = authz::effective_permission(
         &state.db,
         consumed.workspace_id,
@@ -842,10 +854,6 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         reject_and_close(socket, document_id, RejectedCode::Forbidden, "insufficient permission").await;
         return None;
     }
-    let Ok(checked_epoch) = authz::read_epoch(&state.db, consumed.workspace_id).await else {
-        reject_and_close(socket, document_id, RejectedCode::Forbidden, "epoch read failed").await;
-        return None;
-    };
     Some(DocumentContext {
         object_id,
         checked_epoch,
