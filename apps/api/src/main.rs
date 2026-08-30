@@ -1773,7 +1773,12 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        // `make_span_with` is `routes::collab::trace_span`, not the tower-http default, solely to
+        // strip the WS ticket query string off `GET /api/v1/collab/ws` before it ever reaches a
+        // trace span (`CLAUDE.md`: "Sanitize URLs before logging") -- every other route's span is
+        // byte-for-byte the same as `TraceLayer::new_for_http()`'s own default. See that
+        // function's doc comment for why the global layer, not a per-route one, is required here.
+        .layer(TraceLayer::new_for_http().make_span_with(routes::collab::trace_span))
         .layer(CorsLayer::permissive())
         .layer(CompressionLayer::new())
         .with_state(state);

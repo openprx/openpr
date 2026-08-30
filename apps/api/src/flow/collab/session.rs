@@ -5,7 +5,7 @@
 #![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use base64::Engine;
@@ -18,18 +18,198 @@ use super::authz::{self, PermissionLevel};
 use super::bootstrap;
 use super::egress::{EgressSequencer, SeqDecision};
 use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate};
-use super::limits::{PRESENCE_TTL_SECONDS_DEFAULT, PRESENCE_TTL_SECONDS_MAX, WEBSOCKET_FRAME_BYTES_MAX};
+use super::limits::{
+    CONNECTION_LIMIT_RETRY_AFTER_MS, FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND,
+    PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, PRESENCE_PAYLOAD_BYTES_MAX,
+    PRESENCE_TTL_SECONDS_DEFAULT, PRESENCE_TTL_SECONDS_MAX, RATE_LIMIT_RETRY_AFTER_MS, UPDATE_BURST_MAX,
+    UPDATES_PER_CONNECTION_PER_SECOND, WEBSOCKET_FRAME_BYTES_MAX,
+};
 use super::registry::{OutboundEvent, PresenceLimit};
 use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
+use crate::error::ApiErrorKind;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A close code this module owns: policy violation, matching RFC 6455's registered meaning
 /// closely enough (protocol error / auth failure at handshake) without colliding with the
-/// contract's own frozen 4410 drain code.
+/// contract's own frozen 4410 drain code. Used as [`ws_close_code_for`]'s fallback for every
+/// `RejectedCode` `error-mapping-v1.md` leaves as "control frame, connection stays open"
+/// (`invalid_update`, `stale_frontier`, `resync_required`, `server_draining{contention}`) when this
+/// module still has to hang up on it anyway, at handshake time, before a steady-state loop exists
+/// to keep the connection open for.
 const CLOSE_POLICY_VIOLATION: u16 = 1008;
-const CLOSE_UNSUPPORTED_DATA: u16 = 1003;
+
+/// `limits-v1.md`'s connection/rate/slow-consumer close code — computed once from
+/// [`ApiErrorKind::LimitExceeded`] so it can never drift from `error-mapping-v1.md`'s frozen table
+/// (`flow::collab::registry` computes the identical value independently for its own slow-consumer
+/// close path — both derive from this one source of truth, so they cannot disagree even though
+/// each module owns its own constant).
+const LIMIT_EXCEEDED_CLOSE_CODE: u16 = match ApiErrorKind::LimitExceeded.ws_close_code() {
+    Some(code) => code,
+    None => CLOSE_POLICY_VIOLATION,
+};
+
+/// `hello.capabilities` this server understands (`collab-protocol-v1.md`: "未知 required
+/// capability... 必须失败关闭,不得部分应用"). The wire shape carries no required/optional
+/// distinction, so every capability a client declares is treated as required — an empty list
+/// (every real client today, and this module's own tests) trivially passes.
+const KNOWN_CAPABILITIES: &[&str] = &["presence"];
+
+/// The first capability in `capabilities` this server does not recognize, if any.
+fn first_unknown_capability(capabilities: &[String]) -> Option<&str> {
+    capabilities
+        .iter()
+        .map(String::as_str)
+        .find(|capability| !KNOWN_CAPABILITIES.contains(capability))
+}
+
+/// Maps this module's own wire [`RejectedCode`] to the richer [`ApiErrorKind`] so a close can use
+/// [`ApiErrorKind::ws_close_code`] instead of a second, hand-maintained close-code table
+/// (`error-mapping-v1.md`'s frozen mapping lives in exactly one place: `error.rs`).
+const fn rejected_code_to_api_kind(code: RejectedCode) -> ApiErrorKind {
+    match code {
+        RejectedCode::Unauthenticated => ApiErrorKind::Unauthenticated,
+        RejectedCode::Forbidden => ApiErrorKind::Forbidden,
+        RejectedCode::FeatureDisabled => ApiErrorKind::FeatureDisabled,
+        RejectedCode::NotFound => ApiErrorKind::NotFound,
+        RejectedCode::UnsupportedProtocol => ApiErrorKind::UnsupportedProtocol,
+        RejectedCode::StaleFrontier => ApiErrorKind::StaleFrontier,
+        RejectedCode::InvalidUpdate => ApiErrorKind::InvalidUpdate,
+        RejectedCode::PolicyRejected => ApiErrorKind::PolicyRejected,
+        RejectedCode::LimitExceeded => ApiErrorKind::LimitExceeded,
+        RejectedCode::ResyncRequired => ApiErrorKind::ResyncRequired,
+        // A handshake-time close always reports `drain`, never `contention`: there is no document
+        // lock/rebase/snapshot contention to report about a session that has not reached `open`
+        // yet (`collab-protocol-v1.md`: "两者不得互换"). The one real `contention` rejection this
+        // package sends (`write::accept_update`'s error branch, below) never calls this mapping —
+        // it stays a `rejected` control frame and never closes the socket.
+        RejectedCode::ServerDraining => ApiErrorKind::ServerDraining(crate::error::ServerDrainingReason::Drain),
+    }
+}
+
+/// The WS close code to send right after a `rejected`/failed-handshake `code` when this connection
+/// is being closed (`error-mapping-v1.md` via [`ApiErrorKind::ws_close_code`]).
+fn ws_close_code_for(code: RejectedCode) -> u16 {
+    rejected_code_to_api_kind(code)
+        .ws_close_code()
+        .unwrap_or(CLOSE_POLICY_VIOLATION)
+}
+
+/// Sends a `rejected` frame for `code` and immediately closes with the matching close code
+/// (`ws_close_code_for`) — the shared shape every handshake-phase failure in [`run`]/
+/// [`reverify_open`] uses. `recoverable` comes from [`ApiErrorKind::recoverable`], not a
+/// per-call-site literal, so it stays in lockstep with `error-mapping-v1.md`'s own table (e.g.
+/// `resync_required` is `true` there even though this module always closes right after sending it
+/// during the handshake).
+async fn reject_and_close(socket: &mut WebSocket, document_id: Uuid, code: RejectedCode, reason: &str) {
+    let recoverable = rejected_code_to_api_kind(code).recoverable();
+    send(socket, &rejected_frame(document_id, code, recoverable, None)).await;
+    close(socket, ws_close_code_for(code), reason).await;
+}
+
+/// Builds a `limit_exceeded` `rejected` frame carrying the contract-mandated `details.limit_kind`
+/// (`limits-v1.md`: "`limit_kind` 全集正是上表第三列的唯一值... 未知 kind 违反 contract") plus
+/// `limit` and, when meaningful, `observed`/`retry_after_ms`.
+fn limit_exceeded_frame(
+    document_id: Uuid,
+    limit_kind: &str,
+    limit: u64,
+    observed: Option<u64>,
+    retry_after_ms: Option<u64>,
+) -> Frame {
+    let mut details = serde_json::Map::new();
+    details.insert("limit_kind".to_string(), serde_json::json!(limit_kind));
+    details.insert("limit".to_string(), serde_json::json!(limit));
+    if let Some(observed) = observed {
+        details.insert("observed".to_string(), serde_json::json!(observed));
+    }
+    if let Some(retry_after_ms) = retry_after_ms {
+        details.insert("retry_after_ms".to_string(), serde_json::json!(retry_after_ms));
+    }
+    let details = serde_json::Value::Object(details);
+    Frame::Rejected {
+        protocol_version: PROTOCOL_VERSION,
+        document_id,
+        update_id: None,
+        code: RejectedCode::LimitExceeded,
+        recoverable: true,
+        details: Some(details),
+        current_seq: None,
+        current_frontier: None,
+        audit_event_id: None,
+    }
+}
+
+/// A fixed sustained-rate token bucket with burst capacity (`limits-v1.md`: "Rate 使用 token
+/// bucket"). Also tracks the "3 consecutive 1-second enforcement intervals over limit" close
+/// trigger the same paragraph requires ("连续 3 个 1-second enforcement interval 超限...则关闭连接为
+/// 4408") — a single denied request only ever produces a `limit_exceeded` control frame; only
+/// sustained abuse across three whole enforcement windows escalates to a close.
+struct RateLimiter {
+    capacity: f64,
+    tokens: f64,
+    refill_per_sec: f64,
+    last_refill: Instant,
+    window_start: Instant,
+    window_exceeded: bool,
+    consecutive_exceeded_windows: u32,
+}
+
+/// One [`RateLimiter::take`] outcome.
+struct RateOutcome {
+    /// Whether the just-evaluated frame consumed a token (and should proceed).
+    admitted: bool,
+    /// Whether 3 consecutive 1-second enforcement windows have now been over limit — the caller
+    /// must close the connection at [`LIMIT_EXCEEDED_CLOSE_CODE`] regardless of `admitted`.
+    force_close: bool,
+}
+
+impl RateLimiter {
+    #[allow(clippy::cast_precision_loss)] // sustained/burst are small fixed contract constants
+    fn new(sustained_per_sec: u64, burst: u64) -> Self {
+        let now = Instant::now();
+        Self {
+            capacity: burst as f64,
+            tokens: burst as f64,
+            refill_per_sec: sustained_per_sec as f64,
+            last_refill: now,
+            window_start: now,
+            window_exceeded: false,
+            consecutive_exceeded_windows: 0,
+        }
+    }
+
+    fn take(&mut self) -> RateOutcome {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = elapsed.mul_add(self.refill_per_sec, self.tokens).min(self.capacity);
+
+        let admitted = if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            self.window_exceeded = true;
+            false
+        };
+
+        let force_close = if now.duration_since(self.window_start).as_secs_f64() >= 1.0 {
+            self.consecutive_exceeded_windows = if self.window_exceeded {
+                self.consecutive_exceeded_windows + 1
+            } else {
+                0
+            };
+            self.window_exceeded = false;
+            self.window_start = now;
+            self.consecutive_exceeded_windows >= 3
+        } else {
+            false
+        };
+
+        RateOutcome { admitted, force_close }
+    }
+}
 
 struct DocumentContext {
     object_id: Uuid,
@@ -118,22 +298,40 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     let Some(hello) = read_frame(&mut socket, HANDSHAKE_TIMEOUT).await else {
         return;
     };
-    let Frame::Hello { protocol_version, .. } = hello else {
-        send(
+    let Frame::Hello {
+        protocol_version,
+        capabilities,
+        ..
+    } = hello
+    else {
+        reject_and_close(
             &mut socket,
-            &rejected_frame(document_id, RejectedCode::UnsupportedProtocol, false, None),
+            document_id,
+            RejectedCode::UnsupportedProtocol,
+            "expected hello",
         )
         .await;
-        close(&mut socket, CLOSE_POLICY_VIOLATION, "expected hello").await;
         return;
     };
     if protocol_version != PROTOCOL_VERSION {
-        send(
+        reject_and_close(
             &mut socket,
-            &rejected_frame(document_id, RejectedCode::UnsupportedProtocol, false, None),
+            document_id,
+            RejectedCode::UnsupportedProtocol,
+            "unsupported protocol_version",
         )
         .await;
-        close(&mut socket, CLOSE_POLICY_VIOLATION, "unsupported protocol_version").await;
+        return;
+    }
+    if let Some(unknown) = first_unknown_capability(&capabilities) {
+        tracing::debug!(capability = %unknown, "collab session: rejecting hello with an unknown capability");
+        reject_and_close(
+            &mut socket,
+            document_id,
+            RejectedCode::UnsupportedProtocol,
+            "unknown hello capability",
+        )
+        .await;
         return;
     }
     send(
@@ -156,23 +354,14 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
         ..
     } = open
     else {
-        send(
-            &mut socket,
-            &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
-        )
-        .await;
-        close(&mut socket, CLOSE_POLICY_VIOLATION, "expected open").await;
+        reject_and_close(&mut socket, document_id, RejectedCode::InvalidUpdate, "expected open").await;
         return;
     };
     if opened_document_id != document_id {
-        send(
+        reject_and_close(
             &mut socket,
-            &rejected_frame(document_id, RejectedCode::Forbidden, false, None),
-        )
-        .await;
-        close(
-            &mut socket,
-            CLOSE_POLICY_VIOLATION,
+            document_id,
+            RejectedCode::Forbidden,
             "open.document_id does not match the ticket",
         )
         .await;
@@ -185,12 +374,13 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
 
     // ---- snapshot ----
     let Ok(boot) = bootstrap::load(&state.db, document_id).await else {
-        send(
+        reject_and_close(
             &mut socket,
-            &rejected_frame(document_id, RejectedCode::ResyncRequired, true, None),
+            document_id,
+            RejectedCode::ResyncRequired,
+            "bootstrap failed",
         )
         .await;
-        close(&mut socket, CLOSE_POLICY_VIOLATION, "bootstrap failed").await;
         return;
     };
     send(
@@ -218,8 +408,38 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     .await;
 
     // ---- steady state ----
-    let mut outbound_rx = collab.registry.register(document_id, session_id);
+    // `limits-v1.md`'s three connection ceilings (`connections_per_user_max`/`_per_document_max`/
+    // `_per_workspace_max`) are checked and reserved atomically here, as late as possible (after
+    // the ticket/permission/flag reverification above, so an over-ceiling caller never pays for a
+    // database round trip whose result it cannot use). `open_documents_per_connection_max = 8` has
+    // no counting to do: v0.4 scopes one WebSocket connection to exactly the one `document_id` its
+    // ticket was issued for (`frame.rs`'s own doc comment), so that ceiling is met structurally by
+    // every connection, not enforced by counting.
+    let mut registered =
+        match collab
+            .registry
+            .try_register(document_id, consumed.user_id, consumed.workspace_id, session_id)
+        {
+            Ok(registered) => registered,
+            Err(limit) => {
+                send(
+                    &mut socket,
+                    &limit_exceeded_frame(
+                        document_id,
+                        limit.limit_kind(),
+                        limit.limit(),
+                        None,
+                        Some(CONNECTION_LIMIT_RETRY_AFTER_MS),
+                    ),
+                )
+                .await;
+                close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
+                return;
+            }
+        };
     let checked_epoch = ctx.checked_epoch;
+    let mut frame_limiter = RateLimiter::new(FRAMES_PER_CONNECTION_PER_SECOND, FRAME_BURST_MAX);
+    let mut update_limiter = RateLimiter::new(UPDATES_PER_CONNECTION_PER_SECOND, UPDATE_BURST_MAX);
     // `collab-protocol-v1.md` "accepted 出站顺序": "snapshot.head_seq=H 后第一条 accepted 只能是
     // H+1". Registration happens strictly after the snapshot above was already loaded, so a commit
     // landing in that (necessarily nonzero) gap would otherwise reach this session's channel as an
@@ -236,9 +456,15 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     loop {
         tokio::select! {
             biased;
-            event = outbound_rx.recv() => {
+            event = registered.receiver.recv() => {
                 match event {
-                    Some(OutboundEvent::Frame(frame)) => {
+                    Some(OutboundEvent::Frame(frame, encoded_len)) => {
+                        // Releases this frame's slow-consumer queue charge (`registry.rs`'s
+                        // `SessionHandle::deliver`) the moment it leaves the channel, regardless of
+                        // whether it is forwarded immediately, buffered for pairing, or dropped as
+                        // a stale duplicate below -- the ceiling bounds channel backlog, not any
+                        // further in-process buffering.
+                        registered.record_dequeued(encoded_len);
                         handle_outbound_frame(
                             &state.db,
                             document_id,
@@ -263,13 +489,39 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                     Message::Close(_) => break,
                     Message::Text(text) => {
                         if text.len() > WEBSOCKET_FRAME_BYTES_MAX {
-                            send(&mut socket, &rejected_frame(document_id, RejectedCode::LimitExceeded, false, None)).await;
+                            send(&mut socket, &limit_exceeded_frame(document_id, "websocket_frame_bytes", WEBSOCKET_FRAME_BYTES_MAX as u64, Some(text.len() as u64), None)).await;
+                            continue;
+                        }
+                        // `limits-v1.md`: "frames_per_connection_per_second... 持续洪泛在 decode 前
+                        // 限流" -- checked before the frame is even parsed.
+                        let frame_outcome = frame_limiter.take();
+                        if !frame_outcome.admitted {
+                            send(&mut socket, &limit_exceeded_frame(document_id, "frame_rate", FRAMES_PER_CONNECTION_PER_SECOND, None, Some(RATE_LIMIT_RETRY_AFTER_MS))).await;
+                        }
+                        if frame_outcome.force_close {
+                            close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "sustained frame rate exceeded").await;
+                            break;
+                        }
+                        if !frame_outcome.admitted {
                             continue;
                         }
                         let Ok(frame) = serde_json::from_str::<Frame>(text.as_str()) else {
                             send(&mut socket, &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None)).await;
                             continue;
                         };
+                        if matches!(frame, Frame::Update { .. }) {
+                            let update_outcome = update_limiter.take();
+                            if !update_outcome.admitted {
+                                send(&mut socket, &limit_exceeded_frame(document_id, "update_rate", UPDATES_PER_CONNECTION_PER_SECOND, None, Some(RATE_LIMIT_RETRY_AFTER_MS))).await;
+                            }
+                            if update_outcome.force_close {
+                                close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "sustained update rate exceeded").await;
+                                break;
+                            }
+                            if !update_outcome.admitted {
+                                continue;
+                            }
+                        }
                         handle_client_frame(
                             &state,
                             collab,
@@ -286,10 +538,10 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                     }
                     Message::Binary(bytes) => {
                         if bytes.len() > WEBSOCKET_FRAME_BYTES_MAX {
-                            send(&mut socket, &rejected_frame(document_id, RejectedCode::LimitExceeded, false, None)).await;
+                            send(&mut socket, &limit_exceeded_frame(document_id, "websocket_frame_bytes", WEBSOCKET_FRAME_BYTES_MAX as u64, Some(bytes.len() as u64), None)).await;
                         } else {
                             send(&mut socket, &rejected_frame(document_id, RejectedCode::UnsupportedProtocol, false, None)).await;
-                            close(&mut socket, CLOSE_UNSUPPORTED_DATA, "binary frames are not supported").await;
+                            close(&mut socket, ws_close_code_for(RejectedCode::UnsupportedProtocol), "binary frames are not supported").await;
                             break;
                         }
                     }
@@ -461,39 +713,31 @@ async fn plan_gap_resolution(
 async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut WebSocket) -> Option<DocumentContext> {
     let document_id = consumed.document_id;
     let Some(object_id) = fetch_document_object_id(&state.db, document_id).await else {
-        send(
-            socket,
-            &rejected_frame(document_id, RejectedCode::NotFound, false, None),
-        )
-        .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "document not found").await;
+        reject_and_close(socket, document_id, RejectedCode::NotFound, "document not found").await;
         return None;
     };
     let Ok(flow_enabled) = crate::flow::repository::fetch_flow_enabled(&state.db, consumed.workspace_id).await else {
-        send(
+        reject_and_close(
             socket,
-            &rejected_frame(document_id, RejectedCode::FeatureDisabled, false, None),
+            document_id,
+            RejectedCode::FeatureDisabled,
+            "flow is not enabled",
         )
         .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "flow is not enabled").await;
         return None;
     };
     if !flow_enabled {
-        send(
+        reject_and_close(
             socket,
-            &rejected_frame(document_id, RejectedCode::FeatureDisabled, false, None),
+            document_id,
+            RejectedCode::FeatureDisabled,
+            "flow is not enabled",
         )
         .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "flow is not enabled").await;
         return None;
     }
     let Some(role) = fetch_role(&state.db, consumed.workspace_id, consumed.user_id).await else {
-        send(
-            socket,
-            &rejected_frame(document_id, RejectedCode::Forbidden, false, None),
-        )
-        .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "not a workspace member").await;
+        reject_and_close(socket, document_id, RejectedCode::Forbidden, "not a workspace member").await;
         return None;
     };
     let Ok(level) = authz::effective_permission(
@@ -506,30 +750,15 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
     )
     .await
     else {
-        send(
-            socket,
-            &rejected_frame(document_id, RejectedCode::Forbidden, false, None),
-        )
-        .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "permission check failed").await;
+        reject_and_close(socket, document_id, RejectedCode::Forbidden, "permission check failed").await;
         return None;
     };
     if level < PermissionLevel::Edit {
-        send(
-            socket,
-            &rejected_frame(document_id, RejectedCode::Forbidden, false, None),
-        )
-        .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "insufficient permission").await;
+        reject_and_close(socket, document_id, RejectedCode::Forbidden, "insufficient permission").await;
         return None;
     }
     let Ok(checked_epoch) = authz::read_epoch(&state.db, consumed.workspace_id).await else {
-        send(
-            socket,
-            &rejected_frame(document_id, RejectedCode::Forbidden, false, None),
-        )
-        .await;
-        close(socket, CLOSE_POLICY_VIOLATION, "epoch read failed").await;
+        reject_and_close(socket, document_id, RejectedCode::Forbidden, "epoch read failed").await;
         return None;
     };
     Some(DocumentContext {
@@ -685,6 +914,32 @@ async fn handle_client_frame(
                 .await;
                 return;
             }
+            // `limits-v1.md`: "presence_payload_bytes_max... update/presence payload 在分配 engine
+            // state 前检查" -- checked before anything else touches the payload.
+            let Ok(encoded_payload) = serde_json::to_vec(&payload) else {
+                send(
+                    socket,
+                    &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
+                )
+                .await;
+                return;
+            };
+            #[allow(clippy::cast_possible_truncation)] // a WS frame is already bounded far below u64::MAX
+            let payload_len = encoded_payload.len() as u64;
+            if payload_len > PRESENCE_PAYLOAD_BYTES_MAX {
+                send(
+                    socket,
+                    &limit_exceeded_frame(
+                        document_id,
+                        "presence_payload_bytes",
+                        PRESENCE_PAYLOAD_BYTES_MAX,
+                        Some(payload_len),
+                        None,
+                    ),
+                )
+                .await;
+                return;
+            }
             let ttl_seconds = ttl_seconds.unwrap_or(PRESENCE_TTL_SECONDS_DEFAULT);
             if ttl_seconds == 0 {
                 send(
@@ -697,7 +952,13 @@ async fn handle_client_frame(
             if ttl_seconds > PRESENCE_TTL_SECONDS_MAX {
                 send(
                     socket,
-                    &rejected_frame(document_id, RejectedCode::LimitExceeded, false, None),
+                    &limit_exceeded_frame(
+                        document_id,
+                        "presence_ttl_seconds",
+                        u64::from(PRESENCE_TTL_SECONDS_MAX),
+                        Some(u64::from(ttl_seconds)),
+                        None,
+                    ),
                 )
                 .await;
                 return;
@@ -719,10 +980,29 @@ async fn handle_client_frame(
                     };
                     collab.registry.broadcast(document_id, &frame, Some(session_id));
                 }
-                Err(PresenceLimit::PerConnection | PresenceLimit::PerDocument) => {
+                Err(PresenceLimit::PerConnection) => {
                     send(
                         socket,
-                        &rejected_frame(document_id, RejectedCode::LimitExceeded, false, None),
+                        &limit_exceeded_frame(
+                            document_id,
+                            "presence_entries_per_connection",
+                            PRESENCE_ENTRIES_PER_CONNECTION_MAX as u64,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await;
+                }
+                Err(PresenceLimit::PerDocument) => {
+                    send(
+                        socket,
+                        &limit_exceeded_frame(
+                            document_id,
+                            "presence_entries_per_document",
+                            PRESENCE_ENTRIES_PER_DOCUMENT_MAX as u64,
+                            None,
+                            None,
+                        ),
                     )
                     .await;
                 }

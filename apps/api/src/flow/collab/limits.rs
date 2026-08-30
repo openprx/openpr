@@ -64,6 +64,17 @@ pub const SNAPSHOT_TAIL_BYTES_HARD_MAX: i64 = 4_194_304;
 /// `collab_tickets` TTL (`ADR-0007`: "TTL 固定 60 秒,不可续期").
 pub const TICKET_TTL_SECONDS: i64 = 60;
 
+/// Not itself a frozen `limits-v1.md` value -- that contract only says "rate/connection/queue 可按
+/// `retry_after_ms` 重试" without freezing a number for the connection ceilings
+/// (`user_connections`/`document_connections`/`workspace_connections`). A conservative fixed
+/// backoff hint for those three rejections.
+pub const CONNECTION_LIMIT_RETRY_AFTER_MS: u64 = 5_000;
+
+/// Same status as [`CONNECTION_LIMIT_RETRY_AFTER_MS`] -- not frozen by `limits-v1.md` for
+/// `frame_rate`/`update_rate`. Always a safe hint regardless of which of the two sustained rates
+/// (30/s or 10/s) was exceeded: both buckets refill to at least one token within one second.
+pub const RATE_LIMIT_RETRY_AFTER_MS: u64 = 1_000;
+
 /// Coordinator acquisition timeout.
 ///
 /// Not itself a frozen `limits-v1.md` row (the coordinator is explicitly "not part of the DB lock
