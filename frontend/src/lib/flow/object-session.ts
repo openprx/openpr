@@ -25,12 +25,14 @@ import type {
 	EngineUpdate,
 	FlowError,
 	FlowErrorCode,
+	FlowLimitsNegotiation,
+	FlowLimitsV1,
 	ObjectHandle,
 	ObjectSessionContract,
 	SemanticIntent,
 	SyncState
 } from './types';
-import { checkUpdateBytes } from './limits';
+import { DEFAULT_FLOW_LIMITS, checkUpdateBytes } from './limits';
 
 export interface AcceptedNotice {
 	readonly headSeq: number;
@@ -108,6 +110,13 @@ export class LoroObjectSession implements ObjectSessionContract {
 	private disposed = false;
 	private manualClose = false;
 	private readonly stateStore = writable<SyncState>('local');
+	/** Effective ceilings for this session's client-side pre-checks. Starts at the pre-bootstrap
+	 * fallback and is replaced wholesale the first time a real `Bootstrap.limits` payload is
+	 * negotiated (`adoptLimits`); never merged field-by-field. */
+	private limits: FlowLimitsV1 = DEFAULT_FLOW_LIMITS;
+	/** True once a `Bootstrap.limits` payload was rejected by version negotiation. Local writes
+	 * are blocked while set (`limits-v1.md`: "Client 不得自行放宽或缓存跨 `version` limits"). */
+	private unknownLimitsVersion: Extract<FlowLimitsNegotiation, { outcome: 'unknownVersion' }> | null = null;
 	/** Resolved/rejected the first time this connection reaches `snapshot` or a terminal failure.
 	 * `connect()` awaits this so callers (`ObjectRepository.open`) never hand a doc to
 	 * `EditorAdapter`/a navigator reorder before the doc actually has server content imported --
@@ -132,6 +141,33 @@ export class LoroObjectSession implements ObjectSessionContract {
 
 	private setState(next: SyncState): void {
 		this.stateStore.set(next);
+	}
+
+	/** Adopts (or refuses) a live `Bootstrap.limits` payload for this session.
+	 *
+	 * On `supported` the server's numbers replace whatever this session was using -- including
+	 * undoing an earlier read-only degradation, because a later bootstrap that negotiates cleanly
+	 * is proof the mismatch is gone. On `unknownVersion` the session drops to the `read_only`
+	 * sync state and `submit()` refuses every local write from then on, rather than falling back
+	 * to this build's compiled-in ceilings. */
+	adoptLimits(negotiation: FlowLimitsNegotiation): void {
+		if (negotiation.outcome === 'supported') {
+			this.limits = negotiation.limits;
+			this.unknownLimitsVersion = null;
+			return;
+		}
+		this.unknownLimitsVersion = negotiation;
+		this.setState('read_only');
+	}
+
+	/** The ceilings this session currently pre-checks against. */
+	get effectiveLimits(): FlowLimitsV1 {
+		return this.limits;
+	}
+
+	/** Whether local writes are blocked because `Bootstrap.limits` failed version negotiation. */
+	get isReadOnly(): boolean {
+		return this.unknownLimitsVersion !== null;
 	}
 
 	async connect(handle: ObjectHandle): Promise<void> {
@@ -369,11 +405,26 @@ export class LoroObjectSession implements ObjectSessionContract {
 		if (!this.socket || this.socket.readyState !== WebSocket.OPEN || !this.handle) {
 			throw { code: 'server_draining', recoverable: true, details: { reason: 'contention' } } satisfies FlowError;
 		}
+		// `Bootstrap.limits` failed version negotiation: this client cannot know the real
+		// ceilings, and `limits-v1.md` forbids writing under its own cached/compiled-in ones
+		// ("Client 不得自行放宽或缓存跨 `version` limits"). Refuse locally instead of sending.
+		const unknownVersion = this.unknownLimitsVersion;
+		if (unknownVersion) {
+			throw {
+				code: 'policy_rejected',
+				recoverable: false,
+				details: {
+					reason: 'unknown_limits_version',
+					limits_version: unknownVersion.version,
+					negotiation: unknownVersion.reason
+				}
+			} satisfies FlowError;
+		}
 		// Client-side pre-check (`ui-surface-v1.md` "Session/CommandService 在编码前按
 		// limits-v1.md 检查 update/frame...超限不进入 IndexedDB outbox、不发网络请求"): reject an
 		// obviously over-budget update before spending a round trip. This does not replace the
 		// server's own re-validation of the same limit.
-		const violation = checkUpdateBytes(update.bytes);
+		const violation = checkUpdateBytes(update.bytes, this.limits);
 		if (violation) {
 			throw {
 				code: 'limit_exceeded',

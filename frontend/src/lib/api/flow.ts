@@ -172,6 +172,9 @@ export interface FlowBootstrap {
 	snapshot_base64: string;
 	tail_updates: TailUpdateEntry[];
 	head_frontier: string;
+	/** Raw `sylvode.flow.limits.v1` wire object (snake_case fields + `version`). Deliberately
+	 * `unknown`: it is untrusted until `flow/limits.ts::negotiateFlowLimitsVersion` proves the
+	 * `version` is one this client implements and the payload is complete. */
 	limits: unknown;
 	websocket_path: string;
 }

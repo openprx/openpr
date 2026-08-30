@@ -18,6 +18,7 @@ import { flowApi, type FlowBootstrap, type FlowObjectView } from '$lib/api/flow'
 import { FlowCommandService } from './command-service';
 import { LoroObjectSession, type AcceptedNotice, type SnapshotPayload } from './object-session';
 import { LiveProjectionStore } from './projection-store';
+import { negotiateFlowLimitsVersion } from './limits';
 import type { EngineDiff, FlowError, ObjectHandle, ObjectProjection, SyncState } from './types';
 // `LoroDocType` (from `loro-prosemirror`, type-only) is the specific `{doc, data}` container
 // shape `LoroSyncPlugin`/`LoroUndoPlugin` require; `loro-crdt`'s own `LoroDoc` generic defaults
@@ -270,7 +271,19 @@ export class FlowObjectRepository {
 				recoverable: result.code === 409
 			} satisfies FlowError;
 		}
+		this.adoptBootstrapLimits(result.data);
 		return result.data;
+	}
+
+	/** Feeds a fresh `Bootstrap.limits` payload through version negotiation and hands the outcome
+	 * to the matching open session. This is the only place the client adopts server ceilings: a
+	 * `supported` payload replaces the session's pre-bootstrap fallback with the server's real
+	 * numbers, an unrecognised `version` drops that session to read-only
+	 * (`contracts/limits-v1.md`: "Client 不得自行放宽或缓存跨 `version` limits"). */
+	private adoptBootstrapLimits(bootstrap: FlowBootstrap): void {
+		const entry = this.open_.get(bootstrap.object_id);
+		if (!entry) return;
+		entry.session.adoptLimits(negotiateFlowLimitsVersion(bootstrap.limits));
 	}
 
 	/** `ObjectRepositoryContract.replaceWithAccepted`: imports a bootstrap's snapshot+tail into the
