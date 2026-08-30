@@ -64,8 +64,13 @@ scenario_templates.get, members.list, search.all, work_items.search, files.uploa
 proposals.get, labels.create, labels.list, labels.update, labels.delete, flow.feature_get.
 
 flow.feature_set and legacy_pages.* are also workspace wide, and additionally require the
-calling bot/user to be a workspace admin with Flow admin capability; the API is the
-authority on that check. objects.get and objects.history are governed by the project agent
+calling bot/user to be a workspace admin with Flow admin capability, checked against an
+explicit workspace_id the caller supplies (never a configured default). flow.feature_set is
+gated by three independent layers: this server's own tool policy (only this exact tool
+name, PolicyScope::WorkspaceWideAdmin), a genuine pre-flight admin-capability probe against
+the API, and the target REST route's own workspace-admin check, which remains the authority
+of record. legacy_pages.* only get the tool-policy layer today, because the API exposes no
+legacy-pages admin REST surface at all yet; they always refuse locally regardless. objects.get and objects.history are governed by the project agent
 policy of the Flow object's owning project when it has one, and are workspace wide (no
 project policy) when it does not. objects.query accepts a project_id but does not require
 one: pass project_id to be governed by that project's policy, or unprojected=true to list
@@ -408,6 +413,38 @@ fn tool_policy_scope(tool_name: &str) -> PolicyScope {
         .map_or(PolicyScope::DeclaredProject { required: true }, |(_, scope)| *scope)
 }
 
+/// The "exact tool policy" leg of `WorkspaceWide(admin)` (`mcp-surface-v1.md:17`: a caller
+/// must hold "Flow admin capability、exact tool policy 与 route workspace admin policy";
+/// "不得从配置默认 workspace、tool 名或 caller payload 推导 admin scope").
+///
+/// Before this change, `PolicyScope::WorkspaceWideAdmin` was enforced nowhere at runtime:
+/// `McpServer::resolve_policy_project_id` answers `Ok(None)` for it exactly like plain
+/// `WorkspaceWide` (no project to check a policy against), so
+/// `McpServer::enforce_project_tool_policy` always trivially succeeded for the five admin
+/// tools and the entire admission decision fell through to whatever the target REST route
+/// itself checked. This closes that: the call is only admitted here if (a) its own registered
+/// [`PolicyScope`] — never a heuristic on the tool's name or a `project_id`/`workspace_id`
+/// argument — is exactly [`PolicyScope::WorkspaceWideAdmin`], the "exact tool policy" itself,
+/// and (b) the caller supplied an explicit, canonical `workspace_id` of their own, so the
+/// admin scope is always the workspace the caller named, never this process's
+/// `mcp.workspace_id` default. Every other tool is untouched: this only fires for tools this
+/// file itself has classified as workspace-admin, and it fails closed on anything else.
+///
+/// A free function, not a method: it needs nothing from `McpServer` itself, only the tool's
+/// own registered scope and its own arguments.
+fn enforce_workspace_admin_tool_policy(tool_name: &str, args: &Value) -> Result<(), String> {
+    if tool_policy_scope(tool_name) != PolicyScope::WorkspaceWideAdmin {
+        return Ok(());
+    }
+    match uuid_argument(args, "workspace_id")? {
+        Some(_) => Ok(()),
+        None => Err(format!(
+            "Tool '{tool_name}' requires an explicit, canonical workspace_id; admin scope is never derived from \
+             this process's configured default workspace"
+        )),
+    }
+}
+
 /// The object a form scoped call operates on. The governing project is always
 /// resolved from this object through the API, never from the call arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,10 +636,63 @@ impl McpServer {
             client: self.client.recording_operation(name),
             project_id_cache: Arc::clone(&self.project_id_cache),
         };
+        if let Err(error) = enforce_workspace_admin_tool_policy(name, &args) {
+            return CallToolResult::error(error);
+        }
+        if let Err(error) = scoped.enforce_flow_admin_capability(name, &args).await {
+            return CallToolResult::error(error);
+        }
         match scoped.enforce_project_tool_policy(name, &args).await {
             Ok(()) => scoped.execute_tool(name, args).await,
             Err(error) => CallToolResult::error(error),
         }
+    }
+
+    /// The "Flow admin capability" leg of `WorkspaceWide(admin)` (`mcp-surface-v1.md:17`).
+    ///
+    /// `apps/api` carries no capability distinct from generic workspace admin for Flow
+    /// specifically — there is no `flow_admin` column or bit anywhere in `migrations/*.sql`
+    /// today, only `workspace_bots.permissions`'s `read`/`write`/`admin`
+    /// (`migrations/0022_bot_tokens.sql:10`) — so this leg and the "route workspace admin
+    /// policy" leg the target endpoint itself enforces
+    /// (`apps/api/src/flow/policy.rs`'s `require_flow_workspace_admin_access`) are, in
+    /// today's data model, backed by the exact same permission bit. Rather than fabricate a
+    /// second check that would silently pass on the strength of the first one's own success,
+    /// this performs one genuine, separate round trip — with the caller's own forwarded
+    /// credential, via `OpenPrClient::list_workspace_bots` — against real, already-admin-gated
+    /// REST surface before the write is ever attempted. A caller that cannot pass this
+    /// genuinely does not hold admin capability in this workspace; the write's own check
+    /// downstream remains the authority of record for the "route workspace admin policy" leg.
+    ///
+    /// Applied only to `flow.feature_set`: `apps/api` exposes no legacy-pages admin REST
+    /// surface at all yet (see `tools::legacy_pages`'s module doc), so probing an unrelated
+    /// endpoint to gate a feature with zero backend would be exactly the "MCP 侧跑到后端就绪
+    /// 之前" mistake this package was told to avoid. Those four tools keep their existing,
+    /// always-local behaviour (refused with `not_required_zero_inventory`, never reaching the
+    /// network); this gap is called out in the delivery report rather than papered over here.
+    async fn enforce_flow_admin_capability(&self, tool_name: &str, args: &Value) -> Result<(), String> {
+        if tool_name != "flow.feature_set" {
+            return Ok(());
+        }
+        // `enforce_workspace_admin_tool_policy` already refuses a missing/malformed
+        // `workspace_id` for every `WorkspaceWideAdmin` tool; this re-derives it rather than
+        // assume call order, so this function stays correct even if it is ever called on its
+        // own.
+        let Some(workspace_id) = uuid_argument(args, "workspace_id")? else {
+            return Err(format!(
+                "Tool '{tool_name}' requires an explicit, canonical workspace_id"
+            ));
+        };
+        self.client
+            .list_workspace_bots(&workspace_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                format!(
+                    "Refusing '{tool_name}': the calling bot/user does not hold Flow admin capability for workspace \
+                 {workspace_id} ({error})"
+                )
+            })
     }
 
     /// Dispatches a tool *after* it has been authorized. Private on purpose: `call_tool`

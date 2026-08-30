@@ -4,6 +4,7 @@
 //! resolver、typed error 和 JSON renderer". `mcp-server` keeps its own existing `cli.rs`
 //! business subcommands unchanged; this module is `sylvode`'s alone.
 
+pub mod api_client;
 pub mod command;
 pub mod config;
 pub mod error;
@@ -61,7 +62,10 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
             FeaturesAction::Flow(flow) => match &flow.action {
                 FlowFeatureAction::Get { workspace } => {
                     let workspace = checked_uuid("--workspace", workspace)?;
-                    api_data(client.get_flow_feature(&workspace).await)
+                    // `workspace` is already a canonicalized UUID (`checked_uuid`), safe to
+                    // interpolate.
+                    let path = format!("/api/v1/workspaces/{workspace}/features/flow");
+                    api_data(client.get_structured::<Value>(&path).await)
                 }
                 FlowFeatureAction::Set {
                     workspace,
@@ -87,7 +91,8 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                             object.insert("default_member_level".to_string(), json!(level));
                         }
                     }
-                    api_data(client.set_flow_feature(&workspace, body).await)
+                    let path = format!("/api/v1/workspaces/{workspace}/features/flow");
+                    api_data(client.put_structured::<Value, _>(&path, &body).await)
                 }
             },
         },
@@ -102,7 +107,8 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                     // clap's `value_parser` already restricted this to semantic-json|markdown.
                     query.push(format!("render={}", render.replace('-', "_")));
                 }
-                api_data(client.get_flow_object(&id, &query_suffix(&query)).await)
+                let path = format!("/api/v1/flow/objects/{id}{}", query_suffix(&query));
+                api_data(client.get_structured::<Value>(&path).await)
             }
             ObjectsAction::Query {
                 workspace,
@@ -142,7 +148,8 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                     }
                     query.push(format!("limit={limit}"));
                 }
-                api_data(client.list_flow_objects(&workspace, &query_suffix(&query)).await)
+                let path = format!("/api/v1/workspaces/{workspace}/flow/objects{}", query_suffix(&query));
+                api_data(client.get_structured::<Value>(&path).await)
             }
             ObjectsAction::History { id, before_seq, limit } => {
                 let id = checked_uuid("object id", id)?;
@@ -156,7 +163,8 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                     }
                     query.push(format!("limit={limit}"));
                 }
-                api_data(client.get_flow_object_history(&id, &query_suffix(&query)).await)
+                let path = format!("/api/v1/flow/objects/{id}/history{}", query_suffix(&query));
+                api_data(client.get_structured::<Value>(&path).await)
             }
         },
         Commands::Collab(cmd) => match &cmd.action {
@@ -169,7 +177,7 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 // see `client.rs`'s Flow section doc comment for why.
                 // `id` is already a canonicalized UUID (`checked_uuid`), safe to interpolate.
                 let path = format!("/api/v1/flow/objects/{id}/collab?include_sizes=true");
-                api_data(client.get::<Value>(&path).await)
+                api_data(client.get_structured::<Value>(&path).await)
             }
             CollabAction::Verify { id, expected_head } => {
                 let id = checked_uuid("object id", id)?;
@@ -178,7 +186,10 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                     object.insert("expected_head_seq".to_string(), json!(expected_head));
                 }
                 let path = format!("/api/v1/flow/objects/{id}/collab/verify");
-                let envelope: Value = client.post(&path, &body).await.map_err(CliError::from_api_error)?;
+                let envelope: Value = client
+                    .post_structured(&path, &body)
+                    .await
+                    .map_err(CliError::from_structured)?;
                 let data = envelope.get("data").cloned().unwrap_or(Value::Null);
                 if verify_found_mismatch(&data) {
                     return Err(CliError::integrity_mismatch(data));
@@ -189,12 +200,14 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
     }
 }
 
-/// Unwraps an `OpenPrClient` `{code,message,data}` envelope down to its `data`, which is
-/// `sylvode`'s own stable `data` field (`cli-surface-v1.md`'s per-command "稳定 `data`"
+/// Unwraps a structured API call's `{code, message, data}` envelope down to its `data`, which
+/// is `sylvode`'s own stable `data` field (`cli-surface-v1.md`'s per-command "稳定 `data`"
 /// column) — distinct from the legacy `mcp-server` tool convention of rendering the whole
-/// envelope as tool output.
-fn api_data(result: Result<Value, String>) -> Result<Value, CliError> {
-    let envelope = result.map_err(CliError::from_api_error)?;
+/// envelope as tool output. `get_structured`/`put_structured::<Value>` deserialize the whole
+/// envelope on success, exactly like the String-returning `get`/`put` this replaces, so `data`
+/// still has to be pulled out here.
+fn api_data(result: Result<Value, api_client::StructuredApiError>) -> Result<Value, CliError> {
+    let envelope = result.map_err(CliError::from_structured)?;
     Ok(envelope.get("data").cloned().unwrap_or(Value::Null))
 }
 
