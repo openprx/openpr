@@ -64,8 +64,33 @@ openpr.example.com {
 	# authenticate with their own workspace bot token over an SSH tunnel.
 	reverse_proxy 127.0.0.1:3000
 
+	# `format json` on its own logs `request.uri` verbatim, and two OpenPR URLs
+	# carry a credential in their query string: the one-time WebSocket ticket on
+	# `GET /api/v1/collab/ws?ticket=...` (`ADR-0007`) and the HMAC on the signed
+	# attachment/upload download URLs (`?expires=...&signature=...`). Both are
+	# bearer credentials -- anyone replaying the logged URL before it expires is
+	# that user. apps/api/src/routes/collab.rs::trace_span already strips the
+	# query off the ticket route in the API's own tracing spans; without the
+	# filter below the reverse proxy simply writes it back, into the one log that
+	# is most likely to be retained and shipped to a log aggregator.
+	#
+	# Caddy already redacts the `Authorization` and `Cookie` request headers to
+	# "REDACTED" by itself -- verified against caddy 2.11.4, not assumed -- so
+	# only the query string needs handling here. `delete` removes the named
+	# parameter and keeps the rest of the query, so the logs stay useful.
+	#
+	# `wrap json` must stay: the `filter` encoder only rewrites fields, the
+	# wrapped encoder is what actually formats the entry.
 	log {
 		output stdout
-		format json
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					delete ticket
+					delete signature
+				}
+			}
+		}
 	}
 }
