@@ -19,10 +19,123 @@ use super::collab::frame::TailUpdate;
 use super::collab::limits;
 use super::model::{Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
 use super::projection;
-use super::repository::{self, FlowSettingsRow, HistoryFilter, ListFilter, ObjectViewRow};
+use super::repository::{self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow};
 
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
 pub const MAX_LIST_LIMIT: u64 = 100;
+
+/// Each authorized-scan batch is one `page_limit_max`-sized page of *candidate* rows —
+/// `limits-v1.md`'s own reasoning for `authorized_scan_rows_max` ("最多 overfetch 10 个最大页")
+/// is ten of these, not an independently chosen tuning constant.
+const SCAN_BATCH_SIZE: u64 = MAX_LIST_LIMIT;
+
+/// Advances the running count of *candidate* rows checked so far and returns
+/// `limit_exceeded`/`scan_budget` the instant it would exceed `limits::AUTHORIZED_SCAN_ROWS_MAX` —
+/// `limits-v1.md`: "最多 overfetch 10 个最大页；授权过滤后不足一页也不得无界扫描". `examined` is
+/// counted *before* policy filtering runs on the row (`limits-v1.md`: "Scan budget 统计
+/// policy-filter 前实际检查 rows"), so this must be called for every candidate a scan loop looks
+/// at, whether or not that candidate turns out to be policy-visible.
+///
+/// The error's `observed` is always exactly `AUTHORIZED_SCAN_ROWS_MAX`, never the caller's true
+/// candidate count beyond it. `limits-v1.md` also says "不向 caller 返回过滤前 count" — the
+/// pre-filter row count is exactly the number that would tell a caller how many rows exist that
+/// policy would have rejected them from seeing, which is the thing this ceiling exists to keep
+/// from leaking. Echoing back the fixed ceiling instead of the real scan depth satisfies
+/// `error-mapping-v1.md`'s convention of naming what was exceeded (every other `limit_exceeded`
+/// case here does the same) without revealing anything data-dependent: it is the same public
+/// number for every caller, on every request, win or lose — already published verbatim in
+/// `Bootstrap.limits.authorized_scan_rows_max` — so it carries zero information beyond "the scan
+/// hit its ceiling".
+fn check_scan_budget(examined: u64) -> Result<(), ApiError> {
+    if examined > limits::AUTHORIZED_SCAN_ROWS_MAX {
+        return Err(ApiError::limit_exceeded(
+            "authorized scan budget exceeded before enough policy-visible rows were found",
+            "scan_budget",
+            Some(json!(limits::AUTHORIZED_SCAN_ROWS_MAX)),
+            Some(json!(limits::AUTHORIZED_SCAN_ROWS_MAX)),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Fetches up to `needed` policy-visible [`ObjectViewRow`]s, scanning in
+/// [`SCAN_BATCH_SIZE`]-sized candidate batches (advancing `filter`'s keyset cursor after every
+/// row) until either `needed` rows have been accepted, the table runs out of matching rows, or
+/// [`check_scan_budget`] rejects the scan.
+///
+/// v0.4 has no `flow_object_grants` yet (`super::policy`'s doc comment: "collapses to plain
+/// workspace membership") — every candidate this filter already scoped to the caller's
+/// workspace/project/etc. is policy-visible, so `is_visible` below is unconditionally `true`. That
+/// is a real, load-bearing no-op, not a stub: `authorized_scan_rows_max` bounds the *scan* itself,
+/// independently of whether anything is being filtered out today, so this accounting has to be
+/// live infrastructure now — `ADR-0012`'s v0.5 grants must be able to replace the `true` below
+/// with a real per-row check without touching the budget/pagination logic around it.
+async fn scan_objects_within_budget(
+    state: &AppState,
+    mut filter: ListFilter,
+    needed: usize,
+) -> Result<Vec<ObjectViewRow>, ApiError> {
+    let mut accepted: Vec<ObjectViewRow> = Vec::new();
+    let mut examined: u64 = 0;
+    loop {
+        filter.limit = SCAN_BATCH_SIZE;
+        let batch = repository::list_objects(&state.db, &filter).await?;
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            return Ok(accepted);
+        }
+        for row in batch {
+            examined += 1;
+            check_scan_budget(examined)?;
+            filter.after = Some((row.created_at, row.id));
+            let is_visible = true; // see doc comment above
+            if is_visible {
+                accepted.push(row);
+                if accepted.len() >= needed {
+                    return Ok(accepted);
+                }
+            }
+        }
+        if (batch_len as u64) < SCAN_BATCH_SIZE {
+            return Ok(accepted);
+        }
+    }
+}
+
+/// The `get_history` analog of [`scan_objects_within_budget`] — same batch/cursor/budget shape,
+/// walking `HistoryFilter::before_seq` backwards instead of `ListFilter::after` forwards.
+async fn scan_history_within_budget(
+    state: &AppState,
+    mut filter: HistoryFilter,
+    needed: usize,
+) -> Result<Vec<HistoryRow>, ApiError> {
+    let mut accepted: Vec<HistoryRow> = Vec::new();
+    let mut examined: u64 = 0;
+    loop {
+        filter.limit = SCAN_BATCH_SIZE;
+        let batch = repository::fetch_history(&state.db, &filter).await?;
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            return Ok(accepted);
+        }
+        for row in batch {
+            examined += 1;
+            check_scan_budget(examined)?;
+            filter.before_seq = Some(row.seq);
+            let is_visible = true; // see scan_objects_within_budget's doc comment
+            if is_visible {
+                accepted.push(row);
+                if accepted.len() >= needed {
+                    return Ok(accepted);
+                }
+            }
+        }
+        if (batch_len as u64) < SCAN_BATCH_SIZE {
+            return Ok(accepted);
+        }
+    }
+}
 
 /// Clamps a caller-supplied `limit` query parameter.
 ///
@@ -218,6 +331,8 @@ pub async fn list_objects(state: &AppState, params: ListObjectsParams) -> Result
     let limit = validate_limit(params.limit)?;
     let after = params.cursor.as_deref().map(decode_cursor).transpose()?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Fetch one extra row to know whether a further page exists without a second query.
+    let needed = limit_usize.saturating_add(1);
 
     let filter = ListFilter {
         workspace_id: params.workspace_id,
@@ -228,10 +343,10 @@ pub async fn list_objects(state: &AppState, params: ListObjectsParams) -> Result
         title_prefix: params.q,
         include_archived: params.include_archived,
         after,
-        // Fetch one extra row to know whether a further page exists without a second query.
-        limit: limit + 1,
+        // Overwritten per candidate batch by `scan_objects_within_budget`.
+        limit: 0,
     };
-    let mut rows = repository::list_objects(&state.db, &filter).await?;
+    let mut rows = scan_objects_within_budget(state, filter, needed).await?;
 
     let next_cursor = if rows.len() > limit_usize {
         rows.truncate(limit_usize);
@@ -256,15 +371,18 @@ pub async fn get_history(
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
     let limit = validate_limit(limit)?;
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    // Fetch one extra row to know whether a further page exists without a second query.
+    let needed = limit_usize.saturating_add(1);
 
     let filter = HistoryFilter {
         document_id: row.document_id,
         before_seq,
-        limit: limit + 1,
+        // Overwritten per candidate batch by `scan_history_within_budget`.
+        limit: 0,
     };
-    let mut rows = repository::fetch_history(&state.db, &filter).await?;
+    let mut rows = scan_history_within_budget(state, filter, needed).await?;
 
-    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let next_before_seq = if rows.len() > limit_usize {
         rows.truncate(limit_usize);
         rows.last().map(|row| row.seq)
@@ -334,4 +452,52 @@ fn decode_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), ApiError> {
         .with_timezone(&Utc);
     let id = Uuid::parse_str(id_raw).map_err(|_| ApiError::BadRequest("cursor is not valid".to_string()))?;
     Ok((created_at, id))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::error::ApiErrorKind;
+
+    /// `limits-v1.md`'s `authorized_scan_rows_max` (1,000) exact boundary: a scan that examines
+    /// exactly the ceiling's worth of candidate rows is still within budget — the ceiling is a
+    /// "would need one more row" trigger, not an "at the ceiling" one.
+    #[test]
+    fn check_scan_budget_accepts_the_exact_authorized_scan_rows_max_boundary() {
+        assert!(check_scan_budget(limits::AUTHORIZED_SCAN_ROWS_MAX).is_ok());
+    }
+
+    /// One candidate row past the ceiling is rejected as `limit_exceeded`/`scan_budget`, and both
+    /// `limit` and `observed` in the response are the fixed ceiling itself — never the caller's
+    /// true candidate count, which would tell them how many rows exist that they are not
+    /// authorized to see (`limits-v1.md`: "不向 caller 返回过滤前 count"). This is asserted at
+    /// `AUTHORIZED_SCAN_ROWS_MAX + 1` specifically (not some larger number) so the boundary itself
+    /// — not just "eventually rejects" — is what is pinned.
+    #[test]
+    fn check_scan_budget_rejects_one_row_past_the_authorized_scan_rows_max_boundary() {
+        let err =
+            check_scan_budget(limits::AUTHORIZED_SCAN_ROWS_MAX + 1).expect_err("one row past the ceiling must reject");
+        let ApiError::Typed { kind, details, .. } = err else {
+            panic!("expected ApiError::Typed, got a differently-shaped ApiError");
+        };
+        assert_eq!(kind.stable_code(), ApiErrorKind::LimitExceeded.stable_code());
+        let details = details.expect("limit_exceeded always carries structured details");
+        assert_eq!(details["limit_kind"], "scan_budget");
+        assert_eq!(details["limit"], limits::AUTHORIZED_SCAN_ROWS_MAX);
+        assert_eq!(
+            details["observed"],
+            limits::AUTHORIZED_SCAN_ROWS_MAX,
+            "observed must equal the fixed ceiling, not a real pre-filter row count -- that would \
+             leak how many unauthorized rows exist beyond it"
+        );
+    }
+
+    /// A scan budget one below the ceiling never trips, regardless of how many more candidates
+    /// remain to be examined after it -- `examined` alone (not "examined so far this request minus
+    /// something") is what the ceiling compares against.
+    #[test]
+    fn check_scan_budget_accepts_one_row_before_the_authorized_scan_rows_max_boundary() {
+        assert!(check_scan_budget(limits::AUTHORIZED_SCAN_ROWS_MAX - 1).is_ok());
+    }
 }
