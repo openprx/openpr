@@ -299,6 +299,9 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             .get("code")
             == 409
         )
+        response_convergence_ok = fixtures.get("concurrent_same_idempotency_key", {}).get(
+            "all_response_object_ids_canonical"
+        ) is True
         preallocated = fixtures.get("preallocated_uuid_conflict", {})
         preallocated_rollback_ok = (
             preallocated.get("collision_exit_code") not in (None, 0)
@@ -312,6 +315,7 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             and len(concurrency.get("violations", [])) == 0
             and fixture_statuses_ok
             and negative_reuse_ok
+            and response_convergence_ok
             and preallocated_rollback_ok
         )
         ok = static_ok and static_violation_count == 0 and dynamic_ok and concurrency_ok
@@ -319,7 +323,8 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             "command_contended_document_cardinality",
             ok,
             f"static_ok={static_ok} dynamic_ok={dynamic_ok} concurrency_status={concurrency.get('status')} "
-            f"four_fixtures={fixture_statuses_ok} negative_reuse={negative_reuse_ok} preallocated_rollback={preallocated_rollback_ok}",
+            f"four_fixtures={fixture_statuses_ok} negative_reuse={negative_reuse_ok} "
+            f"response_convergence={response_convergence_ok} preallocated_rollback={preallocated_rollback_ok}",
         )
 
     # ---- legacy pages: inventory completeness + zero/nonzero branch + 4 conditional gates ----

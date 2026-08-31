@@ -93,6 +93,7 @@ def main() -> int:
     canonical_same_id = scalar(args.database_url, f"SELECT aggregate_id FROM business_events WHERE workspace_id='{workspace}' AND idempotency_key='{same_key}'")
     same_passed = (
         all(response.get("code") == 0 for response in same_responses)
+        and same_ids == [canonical_same_id]
         and len(same_events) == 1
         and all(value == 1 for value in same_db.values())
         and same_negative.get("code") == 409
@@ -106,7 +107,7 @@ def main() -> int:
         "distinct_object_ids": same_ids,
         "canonical_object_id": canonical_same_id,
         "all_response_object_ids_canonical": same_ids == [canonical_same_id],
-        "response_projection_note": "canonical zero-duplicate/zero-overwrite is the gate invariant; divergent successful response object IDs are retained as visible producer behavior",
+        "response_projection_note": "every successful replay response must identify the one canonical object; a rolled-back temporary object ID is a phantom success",
         "distinct_event_ids": same_events,
         "database_counts": same_db,
         "negative_different_body": same_negative,
