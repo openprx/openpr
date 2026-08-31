@@ -219,11 +219,78 @@ const HARVEST_RETRY_MS: u64 = 500;
 
 const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 const PG_LOG_ENGINE_ENV: &str = "OPENPR_FLOW_PG_LOG_ENGINE";
+const DEDICATED_PG_CONTAINER_ENV: &str = "OPENPR_FLOW_DEDICATED_PG_CONTAINER";
 const PG_LOG_CONTAINER_ENV: &str = "OPENPR_FLOW_PG_LOG_CONTAINER";
 const EVIDENCE_OUT_ENV: &str = "OPENPR_FLOW_LOAD_HARNESS_OUT";
-const DEFAULT_PG_LOG_CONTAINER: &str = "flow-test-pg";
 const TEST_ORIGIN: &str = "http://collab-load.local";
 const JWT_SECRET: &str = "collab-load-harness-secret";
+
+/// A distribution is admissible only when the caller explicitly declares the
+/// `PostgreSQL` instance dedicated and binds log harvesting to that same
+/// container. In particular, never infer the shared workspace-test container
+/// as a default merely because `OPENPR_TEST_DATABASE_URL` is present.
+fn load_environment_problem() -> Option<(&'static str, String)> {
+    let dedicated = std::env::var(DEDICATED_PG_CONTAINER_ENV).unwrap_or_default();
+    let log_container = std::env::var(PG_LOG_CONTAINER_ENV).unwrap_or_default();
+    if dedicated.is_empty() {
+        return Some((
+            "dedicated_container_not_declared",
+            format!("{DEDICATED_PG_CONTAINER_ENV} is required; the load distribution was not run"),
+        ));
+    }
+    if log_container.is_empty() {
+        return Some((
+            "pg_log_container_not_declared",
+            format!("{PG_LOG_CONTAINER_ENV} is required; the load distribution was not run"),
+        ));
+    }
+    if dedicated != log_container {
+        return Some((
+            "container_declaration_mismatch",
+            format!(
+                "declared dedicated container {dedicated:?} does not match PostgreSQL log container {log_container:?}"
+            ),
+        ));
+    }
+    let normalized = dedicated.to_ascii_lowercase();
+    if normalized == "flow-test-pg" || normalized.contains("shared") {
+        return Some((
+            "known_shared_postgresql_instance",
+            format!("PostgreSQL container {dedicated:?} is shared; the load distribution was not run"),
+        ));
+    }
+    None
+}
+
+fn emit_environment_not_satisfied(reason_code: &str, detail: &str) {
+    let dedicated = std::env::var(DEDICATED_PG_CONTAINER_ENV).ok();
+    let log_container = std::env::var(PG_LOG_CONTAINER_ENV).ok();
+    let value = json!({
+        "schema_version": "sylvode.flow.collab-load-harness-environment.v1",
+        "source_head": option_env!("GIT_HASH").unwrap_or("runtime-test-build"),
+        "generated_at": Utc::now().to_rfc3339(),
+        "environment_gate": {
+            "status": "not_satisfied",
+            "reason_code": reason_code,
+            "detail": detail,
+            "declared_dedicated_pg_container": dedicated,
+            "pg_log_container": log_container,
+            "active_other_clients": null,
+            "known_shared_instances_rejected": ["flow-test-pg"],
+        },
+        "execution": {
+            "status": "not_run_environment_not_satisfied",
+            "harness_started": false,
+        },
+        "violations": [detail],
+        "passed": false,
+    });
+    let rendered = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
+    println!("---- flow collab load harness environment result ----\n{rendered}");
+    if let Ok(path) = std::env::var(EVIDENCE_OUT_ENV) {
+        let _ = std::fs::write(path, rendered);
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Scratch database
@@ -958,14 +1025,14 @@ fn group_transactions(per_pid: &BTreeMap<i32, Vec<LoggedStatement>>) -> (Vec<Log
 }
 
 /// Reads the `PostgreSQL` server log out of the container running the test database. The container
-/// engine and name are overridable; the defaults match the dedicated `flow-test-pg` instance
-/// `OPENPR_TEST_DATABASE_URL` points at.
+/// engine and name are explicit inputs already qualified by the environment gate.
 fn harvest_pg_log(window_start: DateTime<Utc>) -> Result<String, String> {
     let engines: Vec<String> = std::env::var(PG_LOG_ENGINE_ENV).map_or_else(
         |_| vec!["podman".to_string(), "docker".to_string()],
         |value| vec![value],
     );
-    let container = std::env::var(PG_LOG_CONTAINER_ENV).unwrap_or_else(|_| DEFAULT_PG_LOG_CONTAINER.to_string());
+    let container =
+        std::env::var(PG_LOG_CONTAINER_ENV).map_err(|_| format!("{PG_LOG_CONTAINER_ENV} is not declared"))?;
     let since = (window_start - chrono::Duration::seconds(2))
         .format("%Y-%m-%dT%H:%M:%SZ")
         .to_string();
@@ -1301,8 +1368,7 @@ impl Report {
             "environment": {
                 "build_profile": self.build_profile,
                 "postgres_version": self.postgres_version,
-                "pg_log_container": std::env::var(PG_LOG_CONTAINER_ENV)
-                    .unwrap_or_else(|_| DEFAULT_PG_LOG_CONTAINER.to_string()),
+                "pg_log_container": std::env::var(PG_LOG_CONTAINER_ENV).unwrap_or_default(),
                 "hold_ms_resolution": "±1ms (PostgreSQL %m log prefix is millisecond-quantized)",
                 "measurement_authority": "postgresql server statement log (log_min_duration_statement=0), not an in-process timer",
             },
@@ -1576,6 +1642,12 @@ struct CountRow {
 /// cross-surface `seq`/hash/frontier parity, no gaps).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
+    if let Some((reason_code, detail)) = load_environment_problem() {
+        emit_environment_not_satisfied(reason_code, &detail);
+        eprintln!("ENVIRONMENT NOT SATISFIED [{reason_code}]: {detail}");
+        return;
+    }
+
     // Without a real database there is nothing to measure -- `gate-commands.md` fails any run that
     // substitutes a mock or in-memory database outright. The test does not panic (that would break
     // `cargo test -p api` on every machine without the scratch instance), but it also refuses to

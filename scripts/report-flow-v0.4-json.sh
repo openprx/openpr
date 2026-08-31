@@ -103,7 +103,7 @@ if [[ -z "$EVIDENCE_ROOT" ]]; then
   exit 2
 fi
 
-for tool in jq sha256sum git; do
+for tool in jq sha256sum git python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     echo "Fix: sudo apt-get install -y $tool" >&2
@@ -327,17 +327,32 @@ for entry in "${REQUIRED_ARTIFACTS[@]}"; do
   sha="$(sha256_of "$abs_path")"
   ARTIFACTS_JSON="$(jq -c --arg k "$key" --arg path "$rel_path" --arg sha "$sha" '.[$k] = {path:$path, sha256:$sha}' <<<"$ARTIFACTS_JSON")"
 done
-ARTIFACTS_JSON="$(jq -c '.gate_result = {path:"evidence/v0.4/gate-result.json", sha256:"0000000000000000000000000000000000000000000000000000000000000"[0:64]}' <<<"$ARTIFACTS_JSON")"
+ARTIFACTS_JSON="$(jq -c '.gate_result = {path:"evidence/v0.4/gate-result.json", sha256:("0" * 64)}' <<<"$ARTIFACTS_JSON")"
 
-echo "REPORT: all required artifacts present -- assembling evidence/v0.4/gate-result.json" >&2
-echo "REPORT: hard_gates below are deliberately conservative 'not_verified' placeholders -- this script does not itself compute hard-gate verdicts; run scripts/verify-flow-v0.4-json.sh against this file to get the authoritative recomputed verdicts, then scripts/gate-flow-v0.4.sh to aggregate with manual signoffs." >&2
+echo "REPORT: all required artifacts present -- independently recomputing 52 hard gates" >&2
+set +e
+RECOMPUTE_JSON="$(python3 "$ROOT_DIR/scripts/lib/flow_gate_v0_4_recompute.py" \
+  --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT")"
+RECOMPUTE_EXIT=$?
+set -e
+if [[ $RECOMPUTE_EXIT -ne 0 ]] || ! jq -e '
+  type == "object"
+  and (.hard_gates | type == "object" and length == 52)
+  and (.reasons | type == "object")
+' >/dev/null 2>&1 <<<"$RECOMPUTE_JSON"; then
+  echo "FAIL: hard-gate recomputation failed or did not return exactly 52 verdicts" >&2
+  [[ -n "$RECOMPUTE_JSON" ]] && echo "$RECOMPUTE_JSON" >&2
+  exit 2
+fi
+HARD_GATES_JSON="$(jq -c '.hard_gates' <<<"$RECOMPUTE_JSON")"
+HARD_GATE_NON_PASS_COUNT="$(jq '[.hard_gates[] | select(. != "passed")] | length' <<<"$RECOMPUTE_JSON")"
+echo "REPORT: recomputed hard gates: $(jq -c '.hard_gates | to_entries | group_by(.value) | map({(.[0].value):length}) | add' <<<"$RECOMPUTE_JSON")" >&2
 
 get_check() {
-  jq -c --arg id "$1" '[.[] | select(.id==$id)][0] // {status:"failed",command:"(not run)",exit_code:2,duration_ms:0,evidence:"",sha256:"0000000000000000000000000000000000000000000000000000000000000"[0:64]}' <<<"$CHECKS_JSON" | \
+  jq -c --arg id "$1" '[.[] | select(.id==$id)][0] // {status:"failed",command:"(not run)",exit_code:2,duration_ms:0,evidence:"",sha256:("0" * 64)}' <<<"$CHECKS_JSON" | \
     jq -c '{command:.command, status:.status, exit_code:.exit_code, duration_ms:.duration_ms, evidence:.evidence, sha256:.sha256}'
 }
-ZERO_SHA="0000000000000000000000000000000000000000000000000000000000000"
-ZERO_SHA="${ZERO_SHA:0:64}"
+ZERO_SHA="$(printf '%064d' 0)"
 if [[ $OVERALL_FAILED -eq 0 ]]; then
   REPORT_COMMAND_STATUS="passed"
   REPORT_COMMAND_EXIT=0
@@ -394,9 +409,9 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     transport_auth_verify:$transport_auth_verify,
     cross_workspace_verify:$cross_workspace_verify,
     report:{command:"scripts/report-flow-v0.4-json.sh", status:$report_status, exit_code:$report_exit, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
-    verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
-    gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
-    manual_signoff:{command:"scripts/record-flow-v0.4-manual-signoff.sh", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha}
+    verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
+    gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
+    manual_signoff:{command:"scripts/record-flow-v0.4-manual-signoff.sh", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha}
   }')"
 
 GATE_RESULT_PATH="$EVIDENCE_ROOT/gate-result.json"
@@ -409,7 +424,8 @@ jq -n \
   --argjson checks "$CHECKS_JSON" \
   --argjson artifacts "$ARTIFACTS_JSON" \
   --argjson required_commands "$REQUIRED_COMMANDS_JSON" \
-  --argjson hard_gates '{"rest_mcp_cli_ui_surface_parity":"not_verified","mcp_default_rest_coverage_three_adr_threat_exceptions_only":"not_verified","migration_forward_and_rollback_strategy":"not_verified","document_row_lock_seq_unique":"not_verified","collab_architecture_adr_accepted":"not_verified","bounded_warm_cache_lock_hold_and_round_trip_budgets":"not_verified","minimal_snapshot_advancement_bounds_tail":"not_verified","snapshot_tail_restart_recovery":"not_verified","bootstrap_repeatable_read_and_ws_parity":"not_verified","accepted_egress_seq_monotonic_and_gap_resync":"not_verified","rest_envelope_and_error_contract":"not_verified","server_draining_reason_cross_surface_error_coverage":"not_verified","ticket_single_use_origin_bot_exclusion":"not_verified","secure_cookie_and_local_dev_guard":"not_verified","cross_workspace_and_policy_bypass_negative":"not_verified","unauthorized_update_rejected":"not_verified","mcp_three_transport_contract":"not_verified","tool_registry_expected_107_or_rebased":"not_verified","cli_json_and_exit_code_contract":"not_verified","web_ime_undo_selection_and_sync_state":"not_verified","navigator_keyboard_drag_equivalence":"not_verified","i18n_zh_en_flow_key_parity":"not_verified","vite_wasm_static_build_and_deep_route":"not_verified","feature_flag_navigation_and_direct_url":"not_verified","feature_flag_mcp_read_admin_write_and_cli_equivalence":"not_verified","forms_regression_no_degradation":"not_verified","flow_limits_exact_boundary_and_plus_one_rejection":"not_verified","isolated_decode_apply_cpu_wall_memory":"not_verified","websocket_rate_connection_and_backpressure_limits":"not_verified","deployed_chain_websocket_upgrade":"not_verified","bootstrap_limits_web_server_parity":"not_verified","limit_exceeded_kind_coverage":"not_verified","flow_event_registry_payload_policy_complete":"not_verified","business_event_dispatch_same_transaction":"not_verified","dispatch_expansion_snapshot_semantics":"not_verified","no_subscribers_terminalized_and_reaped":"not_verified","dispatcher_liveness_and_backlog":"not_verified","flow_content_delivery_coalescing":"not_verified","coalescing_seal_and_source_first_expansion":"not_verified","dispatch_numeric_budgets_locked":"not_verified","command_contended_document_cardinality":"not_verified","integrity_record_on_fail_closed":"not_verified","flow_parent_authority_in_postgres":"not_verified","member_baseline_no_behaviour_regression":"not_verified","event_idempotency_audit_and_redaction":"not_verified","legacy_pages_inventory_three_environments_complete":"not_verified","legacy_pages_zero_or_importer_surface_available":"not_verified","legacy_pages_mcp_admin_policy_and_semantic_equivalence":"not_verified","legacy_pages_dry_run_and_rerun_idempotent":"not_verified","legacy_pages_failure_source_immutable":"not_verified","legacy_pages_lineage_complete":"not_verified","legacy_pages_drop_requires_separate_adr":"not_verified"}' \
+  --argjson hard_gates "$HARD_GATES_JSON" \
+  --argjson hard_gate_non_pass_count "$HARD_GATE_NON_PASS_COUNT" \
   '{
     schema_version: "sylvode.flow.gate-result.v1",
     schema_path: "docs/schemas/sylvode-flow-gate-v0.4.schema.json",
@@ -422,7 +438,7 @@ jq -n \
     },
     source: {repository: $repository, head: $head, dirty: $dirty},
     generated_at: $generated_at,
-    mode: "blocked",
+    mode: (if $hard_gate_non_pass_count == 0 then "pre_signoff" else "blocked" end),
     gate_passed: false,
     counts: {
       automated: ($checks | length),
@@ -442,7 +458,7 @@ jq -n \
       feature_flag: {status:"pending", reviewer:"", evidence:""},
       forms_regression: {status:"pending", reviewer:"", evidence:""}
     },
-    blockers: ["hard-gates-not-yet-verified", "manual-signoffs-pending"]
+    blockers: ((if $hard_gate_non_pass_count == 0 then [] else ["hard-gates-not-passed"] end) + ["manual-signoffs-pending"])
   }' > "$GATE_RESULT_TMP"
 
 sync "$GATE_RESULT_TMP" 2>/dev/null || true

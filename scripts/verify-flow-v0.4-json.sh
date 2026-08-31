@@ -310,7 +310,10 @@ if [[ $ANY_HARD_GATE_NOT_PASSED -eq 1 ]]; then
   DRIFT+=("at least one hard gate does not recompute to 'passed' -- automation is not fully green")
 fi
 
-# ---- required_commands: every entry must show status=passed ----
+# ---- required_commands: producer/report commands must have passed. The three
+# commands that are ordered after report may truthfully be not_run with no exit
+# code in report's initial artifact. A recorded failure is never equivalent to
+# that state and remains drift.
 while IFS= read -r key; do
   [[ -z "$key" ]] && continue
   if [[ "$(jq --arg k "$key" '.required_commands | has($k)' "$GATE_RESULT_PATH")" != "true" ]]; then
@@ -318,7 +321,15 @@ while IFS= read -r key; do
     continue
   fi
   status="$(jq -r --arg k "$key" '.required_commands[$k].status // empty' "$GATE_RESULT_PATH")"
-  if [[ "$status" != "passed" ]]; then
+  has_exit_code="$(jq --arg k "$key" '.required_commands[$k] | has("exit_code")' "$GATE_RESULT_PATH")"
+  exit_code_type="$(jq -r --arg k "$key" '.required_commands[$k].exit_code | type' "$GATE_RESULT_PATH")"
+  if [[ "$has_exit_code" != "true" ]]; then
+    DRIFT+=("required_commands.$key is missing exit_code")
+  elif [[ "$status" == "not_run" ]] && [[ "$key" == "verify" || "$key" == "gate" || "$key" == "manual_signoff" ]]; then
+    if [[ "$exit_code_type" != "null" ]]; then
+      DRIFT+=("required_commands.$key status='not_run' must carry exit_code=null")
+    fi
+  elif [[ "$status" != "passed" ]]; then
     DRIFT+=("required_commands.$key status='$status' (must be 'passed')")
   fi
 done < <(union_keys required_commands)

@@ -130,6 +130,7 @@ trap cleanup EXIT
 set +e
 (cd "$REPO_ROOT" && \
   OPENPR_TEST_DATABASE_URL="$DATABASE_URL" \
+  OPENPR_FLOW_DEDICATED_PG_CONTAINER="$DEDICATED_PG_CONTAINER" \
   OPENPR_FLOW_PG_LOG_CONTAINER="$PG_LOG_CONTAINER" \
   OPENPR_FLOW_LOAD_HARNESS_OUT="$EVIDENCE_OUT" \
   cargo test --release -p api --test flow_collab_load_harness \

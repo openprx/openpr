@@ -902,11 +902,15 @@
           "enum": [
             "passed",
             "failed",
-            "skipped"
+            "skipped",
+            "not_run"
           ]
         },
         "exit_code": {
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "duration_ms": {
           "type": "integer",
@@ -918,7 +922,17 @@
         "sha256": {
           "$ref": "#/$defs/sha256"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "not_run" } },
+            "required": ["status"]
+          },
+          "then": { "properties": { "exit_code": { "type": "null" } } },
+          "else": { "properties": { "exit_code": { "type": "integer" } } }
+        }
+      ]
     },
     "artifact_entry": {
       "type": "object",

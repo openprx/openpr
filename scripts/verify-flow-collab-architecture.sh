@@ -491,20 +491,24 @@ echo "=== cache evidence: available=$(jq -r .available <<<"$CACHE_CHECK_JSON") p
 jq -r '.violations[] | "  VIOLATION: " + .' <<<"$CACHE_CHECK_JSON" >&2
 
 # ---- 1+2. static checks: ADR status + frozen numeric budgets ----
-STATIC_JSON="$(python3 - "$ADR_PATH" "$LIMITS_RS" "$REPO_ROOT" <<'PY'
+STATIC_JSON="$(python3 - "$ADR_PATH" "$LIMITS_RS" <<'PY'
 import json
 import re
-import subprocess
 import sys
 
-adr_path, limits_rs, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
+adr_path, limits_rs = sys.argv[1], sys.argv[2]
 adr_text = open(adr_path, encoding="utf-8").read()
 
-sm = re.search(r"^-\s*状态：\s*(\S+)\s*$", adr_text, re.M)
+sm = re.search(r"^-\s*状态：\s*(.+?)\s*$", adr_text, re.M)
 if not sm:
-    print(json.dumps({"error": "could not find '- 状态：<word>' line in " + adr_path}))
+    print(json.dumps({"error": "could not find '- 状态：<status>' line in " + adr_path}))
     sys.exit(0)
-adr_status = sm.group(1)
+status_text = sm.group(1).strip()
+status_match = re.match(r"^(?:\*\*)?([A-Za-z][A-Za-z_-]*)(?:\*\*)?(?:\s*[（(].*)?$", status_text)
+if not status_match:
+    print(json.dumps({"error": f"could not parse ADR status from {status_text!r} in {adr_path}"}))
+    sys.exit(0)
+adr_status = status_match.group(1)
 
 def find_int(pattern):
     m = re.search(pattern, adr_text)
@@ -547,38 +551,6 @@ for name, val in warm_cache_constants.items():
     if val is None:
         violations.append(f"expected warm-cache constant {name} not found in {limits_rs}")
 
-# ---- load-generation harness existence: re-grepped from the live tree every run, never assumed.
-# This structural check binds the supplied artifact to a real harness source in the checkout. The
-# numeric verdict still comes only from HARNESS_CHECK_JSON above, never from this grep.
-LOAD_HARNESS_PATTERNS = [
-    r"round_trip_p95",
-    r"lock_hold_p95",
-    r"p95_ms",
-    r"LoadHarness",
-    r"load_generat",
-    r"ten_client",
-    r"10_client",
-    r"concurrent_client",
-]
-
-
-def grep_repo_for_load_harness(root, patterns):
-    hits = []
-    for sub in ("apps", "crates"):
-        d = f"{root}/{sub}"
-        try:
-            out = subprocess.run(
-                ["grep", "-rlE", "--include=*.rs", "|".join(patterns), d],
-                capture_output=True, text=True, check=False,
-            ).stdout
-        except FileNotFoundError:
-            out = ""
-        hits.extend(line for line in out.splitlines() if "/target/" not in line)
-    return sorted(set(hits))
-
-
-load_harness_hits = grep_repo_for_load_harness(repo_root, LOAD_HARNESS_PATTERNS)
-
 print(json.dumps({
     "adr_status": adr_status,
     "adr_status_required_for_candidate": "Accepted",
@@ -593,11 +565,6 @@ print(json.dumps({
         "lock_hold_p95_ms": lock_hold_p95_ms_adr,
         "round_trip_p95_ms_10_clients": round_trip_p95_ms_adr,
         "reason": "frozen distribution targets independently re-evaluated from the supplied load-harness evidence",
-    },
-    "load_harness_grep": {
-        "patterns_searched": LOAD_HARNESS_PATTERNS,
-        "hit_files": load_harness_hits,
-        "exists": len(load_harness_hits) > 0,
     },
     "constant_cross_check_violations": violations,
 }))
@@ -618,7 +585,6 @@ ADR_STATUS="$(jq -r '.adr_status' <<<"$STATIC_JSON")"
 ADR_ACCEPTED="$(jq -r '.adr_accepted' <<<"$STATIC_JSON")"
 CONSTANT_VIOLATION_COUNT="$(jq '.constant_cross_check_violations | length' <<<"$STATIC_JSON")"
 CONSTANTS_PASSED=$([[ "$CONSTANT_VIOLATION_COUNT" -eq 0 ]] && echo true || echo false)
-LOAD_HARNESS_EXISTS="$(jq -r '.load_harness_grep.exists' <<<"$STATIC_JSON")"
 
 echo "=== ADR-0010 status: $ADR_STATUS (required for candidate: Accepted) ===" >&2
 echo "=== frozen numeric budgets: ADR-0010 text vs apps/api/src/flow/collab/limits.rs ===" >&2
@@ -628,12 +594,9 @@ if [[ "$CONSTANT_VIOLATION_COUNT" -gt 0 ]]; then
 fi
 echo "=== frozen load-test distribution targets ===" >&2
 jq -r '.load_test_targets | "  lock_hold_p95_ms=\(.lock_hold_p95_ms) round_trip_p95_ms_10_clients=\(.round_trip_p95_ms_10_clients)"' <<<"$STATIC_JSON" >&2
-echo "=== load-generation harness existence (re-grepped from apps/ and crates/ every run, never assumed) ===" >&2
-echo "  patterns searched: $(jq -c '.load_harness_grep.patterns_searched' <<<"$STATIC_JSON")" >&2
-echo "  harness found: $LOAD_HARNESS_EXISTS" >&2
-if [[ "$LOAD_HARNESS_EXISTS" == "true" ]]; then
-  jq -r '.load_harness_grep.hit_files[] | "  hit: " + .' <<<"$STATIC_JSON" >&2
-fi
+echo "=== load-generation harness authority: supplied evidence JSON (no source-string proxy) ===" >&2
+echo "  evidence available: $(jq -r '.available' <<<"$HARNESS_CHECK_JSON")" >&2
+echo "  official environment qualified: $(jq -r '.official_environment_ok' <<<"$HARNESS_CHECK_JSON")" >&2
 
 # ---- 3. "Gate <N> `<id>`" marker extraction from snapshot.rs (dynamic, re-parsed every run) ----
 MARKERS_JSON="$(python3 - "$SNAPSHOT_RS" <<'PY'
@@ -832,7 +795,6 @@ FINAL_JSON="$(jq -n \
   --argjson constants_passed "$CONSTANTS_PASSED" \
   --argjson lock_test_passed "$LOCK_TEST_PASSED" \
   --argjson frozen_limits_test_passed "$FROZEN_LIMITS_TEST_PASSED" \
-  --argjson load_harness_exists "$LOAD_HARNESS_EXISTS" \
   --argjson harness "$HARNESS_CHECK_JSON" \
   --argjson cache_evidence "$CACHE_CHECK_JSON" \
   --argjson snap "$RESULT_JSON" \
@@ -866,9 +828,9 @@ FINAL_JSON="$(jq -n \
         reason: (if $adr_accepted then null else ("ADR-0010 status is \"" + $static_check.adr_status + "\", not \"Accepted\"") end)
       },
       bounded_warm_cache_lock_hold_and_round_trip_budgets: {
-        status: (if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed and $cache_evidence.passed) then "passed" else "failed" end),
+        status: (if ($numeric_budgets_verified_portion and $harness.budget_gate_passed and $cache_evidence.passed) then "passed" else "failed" end),
         reason: (
-          if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed and $cache_evidence.passed) then
+          if ($numeric_budgets_verified_portion and $harness.budget_gate_passed and $cache_evidence.passed) then
             "frozen constants, dedicated load budgets, and the ADR fixed cache block all pass"
           elif $harness.execution_status == "not_run_environment_not_satisfied" then
             "load harness environment not satisfied; no load distribution was run or classified as an implementation failure"
@@ -881,7 +843,6 @@ FINAL_JSON="$(jq -n \
           lock_timeout_test_passed: $lock_test_passed,
           frozen_limits_test_passed: $frozen_limits_test_passed
         },
-        load_harness_grep: $static_check.load_harness_grep,
         load_harness: $harness,
         cache_evidence: $cache_evidence
       },
@@ -894,10 +855,10 @@ FINAL_JSON="$(jq -n \
         tests: gate_tests("snapshot_tail_restart_recovery")
       },
       bootstrap_repeatable_read_and_ws_parity: {
-        status: (if ($load_harness_exists and $harness.parity_gate_passed) then "passed" else "failed" end),
+        status: (if $harness.parity_gate_passed then "passed" else "failed" end),
         groundwork_test: ($snap.groundwork["9"] // null),
         reason: (
-          if ($load_harness_exists and $harness.parity_gate_passed) then
+          if $harness.parity_gate_passed then
             "dedicated release PostgreSQL harness independently confirms REPEATABLE READ READ ONLY bootstrap transactions, contiguous accepted seq/tails, frontier equivalence and zero REST/WS identity divergence"
           elif $harness.execution_status == "not_run_environment_not_satisfied" then
             "load harness environment not satisfied; REST/WS parity was not measured and is not passed or skipped"
@@ -905,7 +866,6 @@ FINAL_JSON="$(jq -n \
             "dedicated load-harness parity checks failed; see load_harness.violations and parity_checks"
           end
         ),
-        load_harness_grep: $static_check.load_harness_grep,
         load_harness: $harness,
         note: "the snapshot groundwork test remains supplemental; only the full harness evidence can satisfy this gate"
       },
