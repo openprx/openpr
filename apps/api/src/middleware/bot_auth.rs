@@ -182,7 +182,11 @@ pub fn ensure_bot_permission(bot: &BotAuthContext, required: BotPermission) -> R
     )))
 }
 
-fn bot_role_from_permissions(permissions: &[String]) -> String {
+/// `pub(crate)` so `ADR-0012` §4.1 point 5's second required direction can be asserted directly:
+/// the narrowing that stops an admin bot from crossing an object authorization boundary must
+/// **not** take away its workspace-level admin role, and the only honest witness for "the role is
+/// still synthesized" is this function itself.
+pub(crate) fn bot_role_from_permissions(permissions: &[String]) -> String {
     if bot_permissions_allow(permissions, BotPermission::Admin) {
         "admin".to_string()
     } else {

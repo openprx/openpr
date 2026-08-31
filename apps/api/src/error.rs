@@ -345,6 +345,14 @@ impl ApiError {
         Self::typed(ApiErrorKind::PolicyRejected, message)
     }
 
+    /// `policy_rejected` carrying the structured `details` `rest-api-v1.md`'s self-lockout clause
+    /// requires: "`details` 只含档位变化摘要，不泄漏其它 principal 的身份以外信息". The caller owns
+    /// what goes in — this constructor deliberately does not assemble it, so the one place that
+    /// knows which fields are safe stays the one place that decides.
+    pub fn policy_rejected_with_details(message: impl Into<String>, details: Value) -> Self {
+        Self::typed_with_details(ApiErrorKind::PolicyRejected, message, details)
+    }
+
     pub fn checksum_mismatch(message: impl Into<String>) -> Self {
         Self::typed(ApiErrorKind::ChecksumMismatch, message)
     }

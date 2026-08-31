@@ -64,11 +64,33 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.command.rejected",
         public_payload(&["action", "error_code", "object_id", "document_id"]),
     ),
+    // `ADR-0012`'s v0.5 authorization surface (`events-v1.md`'s `flow_permission` rows). The
+    // declared keys are exactly the registry's column list: ids, the `principal_kind` enum and
+    // the four grade names -- no principal display name, email or any other identifying field,
+    // matching "无 principal 明文标识以外的信息".
+    (
+        "flow.permission.granted",
+        public_payload(&["object_id", "principal_kind", "principal_id", "level"]),
+    ),
+    (
+        "flow.permission.revoked",
+        public_payload(&["object_id", "principal_kind", "principal_id", "old_level", "new_level"]),
+    ),
+    (
+        "flow.permission.inheritance_changed",
+        public_payload(&["object_id", "inherit_from_parent"]),
+    ),
 ];
 
 /// Event type prefix owned by the Flow module, for the same completeness-scan role
 /// `forms::event_redaction::FORM_EVENT_TYPE_PREFIXES` plays for Forms.
 pub const FLOW_EVENT_TYPE_PREFIX: &str = "flow.";
+
+/// Event type prefix of `ADR-0012`'s authorization events (the three `flow_permission` rows in
+/// `events-v1.md`'s registry). Declared here rather than at its use site in `flow::grants` for a
+/// concrete reason: [`event_type_literals`] scans that module for event-type-shaped literals, and
+/// a bare prefix literal there would be reported as an event type with no declared policy.
+pub const FLOW_PERMISSION_EVENT_TYPE_PREFIX: &str = "flow.permission.";
 
 pub fn flow_event_payload_policy(event_type: &str) -> Option<&'static EventPayloadPolicy> {
     FLOW_EVENT_PAYLOAD_POLICIES
@@ -210,8 +232,9 @@ mod tests {
     fn every_emitted_flow_event_type_declares_a_payload_policy() {
         let command_rs = include_str!("command.rs");
         let write_rs = include_str!("collab/write.rs");
+        let grants_rs = include_str!("grants.rs");
         let mut literals = BTreeSet::new();
-        for source in [command_rs, write_rs] {
+        for source in [command_rs, write_rs, grants_rs] {
             let cut = source.find("\n#[cfg(test)]").unwrap_or(source.len());
             literals.extend(event_type_literals(&source[..cut]));
         }
@@ -226,7 +249,7 @@ mod tests {
             .collect();
         assert!(
             undeclared.is_empty(),
-            "these event types are emitted by flow::command/flow::collab::write but declare no payload policy: {undeclared:?}"
+            "these event types are emitted by flow::command/flow::collab::write/flow::grants but declare no payload policy: {undeclared:?}"
         );
     }
 }

@@ -9,7 +9,7 @@
 //! surface — or a direct SQL seed in a test — puts there, and (b) enforce the commit-time fencing
 //! barrier so that whenever *something* advances `flow_workspace_settings.authz_epoch` (the v0.5
 //! `grant/membership/parent_id` write path, someday), an in-flight content write cannot straddle
-//! that change and land after the revocation. [`advance_epoch_for_test`] is the minimal internal
+//! that change and land after the revocation. [`advance_epoch`] is the minimal internal
 //! primitive that stands in for "an authorization-changing transaction" in this package: it is not
 //! reachable from any route, but it is the exact same one-line `UPDATE ... RETURNING authz_epoch`
 //! v0.5's grant-revoke endpoint will call, so exercising it here is not exercising a fake.
@@ -25,6 +25,21 @@ use crate::error::ApiError;
 /// `#[derive(Ord)]` gives exactly the contract's `view < comment < edit < full_access`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionLevel {
+    /// No access at all, and the bottom of the order.
+    ///
+    /// Deliberately **not** a `flow_object_grants.level` value ([`Self::parse`] never yields it,
+    /// and the table's `flow_object_grants_level_check` does not list it): it is the answer to
+    /// "the caller holds nothing here", which `ADR-0012` §3's boundary row asks for and the four
+    /// storable grades cannot express. The boundary row reads
+    /// "`max(边界节点及其以下的显式 grant)`；**workspace 基线不再适用**" — with no grant at or below
+    /// the boundary that maximum is over the *empty* set, i.e. nothing, not `view`. Returning
+    /// `View` there (what this module did before the v0.5 authorization surface landed) leaves a
+    /// smaller copy of exactly the hole `ADR-0012` R16 was revised to close: an author who
+    /// restricts a page to make it private still hands every workspace member read access, so
+    /// "限制访问" only half works. The v0.5 gate text allows either answer
+    /// ("边界下的成员确实降到 view/**无权**"); this picks 无权, which is also what Notion's
+    /// "restrict access" does.
+    Denied,
     View,
     Comment,
     Edit,
@@ -41,7 +56,42 @@ impl PermissionLevel {
             _ => None,
         }
     }
+
+    /// The wire spelling used in `rest-api-v1.md`'s `permission_changes.{caller,affected}`
+    /// `before_level`/`after_level` fields. [`Self::Denied`] is not a storable grade, so it
+    /// renders as `"none"` rather than as one of the four `flow_object_grants.level` values.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Denied => "none",
+            Self::View => "view",
+            Self::Comment => "comment",
+            Self::Edit => "edit",
+            Self::FullAccess => "full_access",
+        }
+    }
+
+    /// Parses a caller-supplied grade for `flow_object_grants.level`. Rejects `"none"`: a
+    /// principal with no access is expressed by *omitting* them from the grants list, never by
+    /// storing a row that grants nothing.
+    pub fn parse_grant_level(raw: &str) -> Option<Self> {
+        Self::parse(raw)
+    }
 }
+
+/// `limits-v1.md`'s frozen `grants_per_request_max`: the number of `grants[]` entries a single
+/// `PUT /flow/objects/{object_id}/grants` (or an `inheritance` call's `initial_grants`) may carry.
+pub const GRANTS_PER_REQUEST_MAX: usize = 100;
+
+/// `limits-v1.md`'s `object_grants_max` — **`status: unset` in the contract at the time this was
+/// written**, so this constant is this package's *proposed* value, not a frozen one, and the
+/// report accompanying it (`/opt/worker/report/v05-authz-core-2026-08-31.md`) carries the
+/// derivation and the measurements. It is deliberately equal to the frozen
+/// [`GRANTS_PER_REQUEST_MAX`]: `PUT .../grants` is a whole-list *replace*
+/// ("空数组即清空显式授予"), so on that surface the resulting row count is the request's own
+/// entry count and can never exceed 100 anyway; the only way to exceed it is
+/// `PUT .../inheritance`'s `initial_grants` merging on top of rows that already exist, which is
+/// exactly where this ceiling is enforced.
+pub const OBJECT_GRANTS_MAX: usize = 100;
 
 /// `ADR-0012` §3's inheritance-chain depth limit, pinned to `limits-v1.md`'s frozen
 /// `tree_depth_max`. Depth is counted the way `collab_core::limits::depth_of` counts it — a root
@@ -385,7 +435,21 @@ pub async fn effective_permission<C: ConnectionTrait>(
     // precisely because an authorization boundary can lock its own author out and only an admin
     // can undo it), and `fetch_chain` denies all three. Ownership is a different question from
     // chain health, and only the first one belongs in front of the admin override.
-    if role == "owner" || role == "admin" {
+    // `ADR-0012` §4.1 point 5 (2026-08-30): **the admin fallback belongs to people, not to bots.**
+    // `middleware::bot_auth::bot_role_from_permissions` synthesizes `role = "admin"` for any token
+    // carrying `BotPermission::Admin`, so without the `principal_kind` half of this condition every
+    // admin bot would short-circuit straight past every authorization boundary the moment
+    // `flow_object_grants` became writable — "被授予方同时又是万能兜底者，是自相矛盾的". The
+    // justification for the fallback is an *auditable human rescue* of a self-lockout (§4.1 point
+    // 3); a script is not who that is for. A bot that needs a restricted subtree gets an explicit
+    // `flow_object_grants` row like any other grantee.
+    //
+    // This does **not** revoke the bot's workspace-level admin powers (feature flag, legacy
+    // import, ...): those never pass through this function, and below, a bot with `role = "admin"`
+    // still picks up `full_access` from `workspace_baseline` wherever no boundary intervenes —
+    // which is every object v0.4 could reach. The narrowing is exactly the object-level boundary
+    // bypass §4.1 point 5 names, and nothing else.
+    if principal_kind == "user" && (role == "owner" || role == "admin") {
         if object_exists_in_workspace(conn, workspace_id, object_id).await? {
             return Ok(PermissionLevel::FullAccess);
         }
@@ -422,12 +486,86 @@ pub async fn effective_permission<C: ConnectionTrait>(
             tracing::error!(index, len = chain.len(), "authz: boundary index outside the chain");
             return Err(ApiError::Internal);
         };
-        Ok(best_grant_in(bounded).unwrap_or(PermissionLevel::View))
+        // No grant at or below the boundary ⇒ the maximum is taken over the empty set, which is
+        // *nothing*, not `view` — see [`PermissionLevel::Denied`].
+        Ok(best_grant_in(bounded).unwrap_or(PermissionLevel::Denied))
     } else {
         // No boundary anywhere up to the root: effective = max(all chain grants, baseline).
         let baseline = workspace_baseline(conn, workspace_id, role).await?;
         Ok(best_grant_in(&chain).map_or(baseline, |g| g.max(baseline)))
     }
+}
+
+/// One object's inheritance chain, resolved and classified for a caller that needs to *show* it
+/// rather than just be judged against it (`GET /flow/objects/{object_id}/grants`'s `inherited[]`).
+///
+/// `ids` is leaf-first — `ids[0]` is the object itself — exactly as [`effective_permission`] sees
+/// it, and `boundary_index` is the index of the first `inherit_from_parent = false` node, so
+/// `ids[1..=boundary_index]` is "the ancestors whose grants still reach this object" and
+/// `ids[1..]` is that same set when no boundary exists. Deriving both from the *same* walk is what
+/// stops a share panel from listing an ancestor grant that no longer applies.
+pub struct InheritanceChain {
+    pub ids: Vec<Uuid>,
+    pub boundary_index: Option<usize>,
+}
+
+impl InheritanceChain {
+    /// The ancestor ids whose grants actually contribute to this object's effective permission —
+    /// empty when the object is itself the authorization boundary.
+    #[must_use]
+    pub fn contributing_ancestors(&self) -> &[Uuid] {
+        let end = self
+            .boundary_index
+            .map_or(self.ids.len(), |index| index.saturating_add(1));
+        self.ids.get(1..end).unwrap_or(&[])
+    }
+}
+
+/// Resolves `object_id`'s inheritance chain with the same fail-closed walk [`effective_permission`]
+/// uses.
+///
+/// # Errors
+/// `NotFound` when the object has no row in this workspace; `Forbidden` when the chain is
+/// over-deep, cyclic, or incomplete. Propagates a database read failure otherwise.
+pub async fn inheritance_chain<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+) -> Result<InheritanceChain, ApiError> {
+    let chain = fetch_chain(conn, workspace_id, object_id).await?;
+    let boundary_index = chain.iter().position(|node| !node.inherit_from_parent);
+    Ok(InheritanceChain {
+        ids: chain.into_iter().map(|node| node.id).collect(),
+        boundary_index,
+    })
+}
+
+/// Takes the conflicting (`FOR UPDATE`) lock on the workspace's `authz_epoch` row, held to the
+/// caller's commit.
+///
+/// `ADR-0012` §3.1 point 2: an authorization change takes the exclusive lock on the same row a
+/// content write takes `FOR SHARE` on, "两者因此不可能交叉成功". Taking it as the *first* statement
+/// of an authorization transaction is also what fixes the lock rank — every later row this
+/// transaction touches (`flow_object_grants`, `flow_objects`) is acquired after the epoch row,
+/// matching the order [`fence_epoch_for_share`]'s callers use.
+///
+/// # Errors
+/// `NotFound` if the workspace has no `flow_workspace_settings` row. Propagates a database read
+/// failure otherwise.
+pub async fn lock_epoch_for_update<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<i64, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        authz_epoch: i64,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE",
+        vec![workspace_id.into()],
+    ))
+    .one(conn)
+    .await?;
+    row.map(|r| r.authz_epoch)
+        .ok_or_else(|| ApiError::NotFound("flow workspace settings not found".to_string()))
 }
 
 /// The `flow_workspace_settings.authz_epoch` row's current value, read outside any lock (used
@@ -459,7 +597,7 @@ pub async fn read_epoch<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Res
 /// permission against outside the transaction.
 ///
 /// This is not a pre-insert check: the `FOR SHARE` blocks until any concurrent authorization
-/// change (which takes `FOR UPDATE` on the same row, see [`advance_epoch_for_test`]) either
+/// change (which takes `FOR UPDATE` on the same row, see [`advance_epoch`]) either
 /// commits or rolls back, so the two can never interleave. If an authorization change commits
 /// first, this call observes the *new* epoch once unblocked and rejects rather than silently
 /// proceeding on stale permission — closing exactly the window `collab-protocol-v1.md` names:
@@ -504,15 +642,13 @@ pub async fn fence_epoch_for_share<C: ConnectionTrait>(
 /// takes the same row-exclusive lock `FOR UPDATE` would — `ADR-0012` §3.1: "授权类变更... 取冲突锁
 /// (FOR UPDATE) 推进 epoch").
 ///
-/// Not reachable from any route in this package: v0.4 ships no grant/inheritance/membership write
-/// path (`ADR-0012` marks `flow_object_grants` reserved for v0.5). This exists so the fencing
-/// barrier above has something real to test against — it is the same one-line primitive a v0.5
-/// grant-revoke handler will call, not a stand-in that only exists in test code.
+/// v0.5's `super::super::grants` write path calls this as the last step of every authorization
+/// change it commits; v0.4 had no caller and named it `advance_epoch_for_test` for that reason.
 ///
 /// # Errors
 /// `NotFound` if the workspace has no `flow_workspace_settings` row. Propagates a database write
 /// failure otherwise.
-pub async fn advance_epoch_for_test<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<i64, ApiError> {
+pub async fn advance_epoch<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<i64, ApiError> {
     #[derive(FromQueryResult)]
     struct Row {
         authz_epoch: i64,
@@ -536,6 +672,7 @@ mod tests {
 
     #[test]
     fn permission_levels_are_totally_ordered_per_adr_0012() {
+        assert!(PermissionLevel::Denied < PermissionLevel::View);
         assert!(PermissionLevel::View < PermissionLevel::Comment);
         assert!(PermissionLevel::Comment < PermissionLevel::Edit);
         assert!(PermissionLevel::Edit < PermissionLevel::FullAccess);
@@ -547,6 +684,9 @@ mod tests {
             assert!(PermissionLevel::parse(raw).is_some(), "{raw} must parse");
         }
         assert!(PermissionLevel::parse("owner").is_none());
+        // `Denied` is not a storable grade: it must never round-trip out of a `level` column.
+        assert!(PermissionLevel::parse("none").is_none());
+        assert_eq!(PermissionLevel::Denied.as_wire(), "none");
     }
 
     #[test]
@@ -890,7 +1030,7 @@ mod database_tests {
             .expect("a chain at exactly tree_depth_max must evaluate, not be rejected");
         assert_eq!(
             level,
-            PermissionLevel::View,
+            PermissionLevel::Denied,
             "a boundary at depth 32 must still cut the workspace baseline"
         );
 
@@ -964,7 +1104,7 @@ mod database_tests {
         let restricted = build_chain(&scratch.db, fx.workspace_id, 3, Some(2)).await;
         assert_eq!(
             member_level(&scratch.db, &fx, restricted[0]).await.expect("resolves"),
-            PermissionLevel::View,
+            PermissionLevel::Denied,
             "restrict-access must actually restrict"
         );
 
@@ -973,7 +1113,7 @@ mod database_tests {
         grant(&scratch.db, fx.workspace_id, restricted[1], fx.member_id, "full_access").await;
         assert_eq!(
             member_level(&scratch.db, &fx, restricted[0]).await.expect("resolves"),
-            PermissionLevel::View,
+            PermissionLevel::Denied,
             "a grant above the boundary must not leak through it"
         );
         grant(&scratch.db, fx.workspace_id, restricted[0], fx.member_id, "comment").await;

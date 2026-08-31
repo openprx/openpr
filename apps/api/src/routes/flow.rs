@@ -9,6 +9,9 @@
 //! GET  /api/v1/flow/objects/{object_id}
 //! POST /api/v1/flow/objects/{object_id}/commands
 //! GET  /api/v1/flow/objects/{object_id}/bootstrap
+//! GET  /api/v1/flow/objects/{object_id}/grants
+//! PUT  /api/v1/flow/objects/{object_id}/grants
+//! PUT  /api/v1/flow/objects/{object_id}/inheritance
 //! GET  /api/v1/flow/objects/{object_id}/history
 //! GET  /api/v1/workspaces/{workspace_id}/features/flow
 //! PUT  /api/v1/workspaces/{workspace_id}/features/flow
@@ -34,6 +37,7 @@ use crate::{
     error::ApiError,
     flow::{
         command::{CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput},
+        grants::{self, Caller, GrantRequest, SetGrantsInput, SetInheritanceInput},
         policy, query,
         query::Render,
     },
@@ -2035,4 +2039,138 @@ mod flow_database_tests {
 
         scratch.drop_self().await;
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `ADR-0012` authorization surface
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct GrantRequestBody {
+    pub principal_kind: String,
+    pub principal_id: Uuid,
+    pub level: String,
+}
+
+impl From<GrantRequestBody> for GrantRequest {
+    fn from(body: GrantRequestBody) -> Self {
+        Self {
+            principal_kind: body.principal_kind,
+            principal_id: body.principal_id,
+            level: body.level,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetGrantsRequest {
+    pub grants: Vec<GrantRequestBody>,
+    #[serde(default)]
+    pub confirm_self_lockout: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetInheritanceRequest {
+    pub inherit_from_parent: bool,
+    #[serde(default)]
+    pub confirm_self_lockout: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub initial_grants: Vec<GrantRequestBody>,
+    pub idempotency_key: String,
+}
+
+/// Resolves the object's workspace, runs the workspace-membership + `flow_enabled` gate, and
+/// packages the caller the way `authz::effective_permission` judges principals.
+///
+/// The object-level `view`/`full_access` check is deliberately *not* here: it belongs to
+/// `flow::grants`, which has to run it inside the same transaction it would commit
+/// (`ADR-0012` §4.1's post-state rule), not in the handler where it could go stale.
+async fn authorization_caller(
+    state: &AppState,
+    extensions: &axum::http::Extensions,
+    object_id: Uuid,
+) -> Result<(Uuid, Caller), ApiError> {
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let (actor_id, role, is_bot) = policy::require_flow_workspace_access(state, extensions, workspace_id).await?;
+    Ok((
+        workspace_id,
+        Caller {
+            actor_id,
+            principal_kind: if is_bot { "bot".to_string() } else { "user".to_string() },
+            role,
+        },
+    ))
+}
+
+/// `GET /api/v1/flow/objects/{object_id}/grants`
+pub async fn get_flow_object_grants(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let (workspace_id, caller) = authorization_caller(&state, &extensions, object_id).await?;
+    let view = grants::get_grants(&state, workspace_id, object_id, &caller).await?;
+    Ok(ApiResponse::success(view))
+}
+
+/// `PUT /api/v1/flow/objects/{object_id}/grants`
+pub async fn put_flow_object_grants(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Json(req): Json<SetGrantsRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let (workspace_id, caller) = authorization_caller(&state, &extensions, object_id).await?;
+    let view = grants::set_grants(
+        &state,
+        workspace_id,
+        SetGrantsInput {
+            object_id,
+            caller,
+            grants: req.grants.into_iter().map(Into::into).collect(),
+            confirm_self_lockout: req.confirm_self_lockout,
+            dry_run: req.dry_run,
+            idempotency_key: req.idempotency_key,
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(view))
+}
+
+/// `PUT /api/v1/flow/objects/{object_id}/inheritance`
+pub async fn put_flow_object_inheritance(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Json(req): Json<SetInheritanceRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let (workspace_id, caller) = authorization_caller(&state, &extensions, object_id).await?;
+    let view = grants::set_inheritance(
+        &state,
+        workspace_id,
+        SetInheritanceInput {
+            object_id,
+            caller,
+            inherit_from_parent: req.inherit_from_parent,
+            initial_grants: req.initial_grants.into_iter().map(Into::into).collect(),
+            confirm_self_lockout: req.confirm_self_lockout,
+            dry_run: req.dry_run,
+            idempotency_key: req.idempotency_key,
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(view))
 }
