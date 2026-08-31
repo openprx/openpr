@@ -250,6 +250,29 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         reasons["mcp_default_rest_coverage_three_adr_threat_exceptions_only"] = f"missing/unreadable {sc_path}"
     else:
         v = sc.get("violations", {})
+        implementation_parity = sc.get("implementation_parity", {})
+        version_scope_issues = []
+        scope = implementation_parity.get("scope", {}) if isinstance(implementation_parity, dict) else {}
+        diagnostic = implementation_parity.get("version_scope_diagnostic", {}) if isinstance(implementation_parity, dict) else {}
+        if scope.get("release") != sc.get("release"):
+            version_scope_issues.append("implementation parity did not bind its release filter to artifact.release")
+        if diagnostic.get("code") != "future_contract_entries_excluded_from_current_release_failure":
+            version_scope_issues.append("missing verifier_criterion_version_scope diagnostic")
+        for surface in ("mcp", "rest", "cli"):
+            dimension = implementation_parity.get(surface, {}) if isinstance(implementation_parity, dict) else {}
+            if not isinstance(dimension, dict):
+                version_scope_issues.append(f"{surface} implementation parity dimension is malformed")
+                continue
+            declared = set(dimension.get("contract_declared", []))
+            required = set(dimension.get("contract_required", []))
+            future = {item.get("name") for item in dimension.get("not_yet_in_release", []) if isinstance(item, dict)}
+            conditional = {item.get("name") for item in dimension.get("conditional_not_applicable", []) if isinstance(item, dict)}
+            implementation = set(dimension.get("implementation", []))
+            missing = set(dimension.get("contract_missing_in_implementation", []))
+            if declared != required | future | conditional or required & (future | conditional):
+                version_scope_issues.append(f"{surface} release classification is incomplete or overlapping")
+            if missing != required - implementation:
+                version_scope_issues.append(f"{surface} missing set is not current-release-required minus implementation")
         parity_keys = [
             "missing_rest_rows", "duplicate_rest_rows", "unknown_matrix_rest_rows",
             "orphan_mcp_tools", "orphan_mcp_resources", "orphan_cli_commands",
@@ -258,11 +281,16 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             "contract_mcp_missing_live", "contract_rest_missing_implementation",
             "contract_cli_missing_implementation",
         ]
-        parity_violations = sum(len(v.get(k, [])) for k in parity_keys)
+        parity_violations = sum(len(v.get(k, [])) for k in parity_keys) + len(version_scope_issues)
         set_gate(
             "rest_mcp_cli_ui_surface_parity",
             parity_violations == 0,
-            f"{parity_violations} surface-coverage violations across parity-relevant categories" if parity_violations else "0 violations across all parity-relevant categories",
+            (
+                f"{parity_violations} surface-coverage violations across parity-relevant categories; "
+                f"version_scope_issues={version_scope_issues}"
+                if parity_violations
+                else "0 violations across all parity-relevant categories; future contract entries classified not_yet_in_release and non-failing"
+            ),
         )
         exception_keys = ["invalid_reason_codes", "mcp_exception_endpoint_mismatches", "mcp_exception_without_authority"]
         exception_violations = sum(len(v.get(k, [])) for k in exception_keys)

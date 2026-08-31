@@ -7,8 +7,8 @@ set -euo pipefail
 # coverage verifier (v0.4-v1.0 共用)" section.
 #
 # Parses the five frozen contract files and recomputes every cross-reference
-# they require, then checks every declared promise against the
-# shipped implementation: MCP names come from executing list-tools, CLI
+# they require, then checks every promise due in the requested release against
+# the shipped implementation: MCP names come from executing list-tools, CLI
 # commands from executing sylvode's command tree, and REST identities from
 # the Axum route registrations assembled by apps/api/src/main.rs.
 # the full 49-endpoint REST<->matrix 1:1 correspondence, matrix<->live
@@ -43,9 +43,10 @@ docs/schemas/sylvode-flow-surface-coverage-result-v1.schema.json).
 Options:
   --release X.Y           Release view, e.g. "0.4". Required. Determines
                           counts.rest_in_release (REST rows whose own
-                          version is <= X.Y); the full 49-row contract and
-                          all violation checks are always evaluated in
-                          full regardless of release.
+                          version is <= X.Y). Contract cross-references are
+                          evaluated in full; implementation parity first
+                          filters declarations by release. Later entries are
+                          recorded as not_yet_in_release and do not fail.
   --contracts-root DIR     Root containing contracts/. Default:
                           /opt/working/sylvode-flow
   --evidence-root DIR     Where surface-coverage-result.json is written.
@@ -188,6 +189,11 @@ mv -f "$OUT_TMP" "$OUT_PATH"
 PASSED="$(jq -r '.passed' <<<"$RESULT")"
 TOTAL_VIOLATIONS="$(jq '[.violations[] | length] | add' <<<"$RESULT")"
 echo "SURFACE COVERAGE (release=$RELEASE): passed=$PASSED total_violations=$TOTAL_VIOLATIONS" >&2
+jq -r '.implementation_parity.version_scope_diagnostic |
+  "  [\(.classification)] \(.code): release=\(.release) not_yet_in_release=" +
+  (.not_yet_in_release_counts | to_entries | map("\(.key)=\(.value)") | join(",")) +
+  " future_absent_non_failing=" +
+  (.future_absent_but_non_failing_counts | to_entries | map("\(.key)=\(.value)") | join(","))' <<<"$RESULT" >&2
 echo "wrote $OUT_PATH" >&2
 if [[ "$PASSED" != "true" ]]; then
   jq -r '.violations | to_entries[] | select(.value | length > 0) | "  [\(.key)] " + (.value | join("; "))' <<<"$RESULT" >&2

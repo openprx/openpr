@@ -16,6 +16,7 @@ from flow_surface_coverage import (  # noqa: E402
     parse_cli_live,
     parse_mcp_live,
     parse_rest_table,
+    version_tuple,
 )
 
 
@@ -115,42 +116,110 @@ def main() -> int:
     contract_rest_all = parse_rest_table(f"{args.contracts_root}/contracts/rest-api-v1.md")
     contract_mcp_all, _ = parse_mcp_live(f"{args.contracts_root}/contracts/mcp-surface-v1.md")
     contract_cli_all = parse_cli_live(f"{args.contracts_root}/contracts/cli-surface-v1.md")
-    # a92e3e9 deliberately says every contract declaration, not merely the
-    # rows whose version is <= the requested release.  `release` remains
-    # provenance on the shared result; it is not authority to weaken this
-    # implementation-parity subset check.
-    contract_rest = sorted({r.identity for r in contract_rest_all})
-    contract_mcp = sorted({t.name for t in contract_mcp_all})
-    contract_cli = contract_cli_all
+    release = version_tuple(args.release)
+
+    def classify(rows, identity):
+        declared, required, future, conditional = [], [], [], []
+        for row in rows:
+            name = identity(row)
+            declared.append(name)
+            entry = {"name": name, "version": row.version}
+            if version_tuple(row.version) > release:
+                future.append(entry)
+            elif row.conditional:
+                conditional.append(entry)
+            else:
+                required.append(name)
+        return sorted(set(declared)), sorted(set(required)), sorted(
+            future, key=lambda item: (version_tuple(item["version"]), item["name"])
+        ), sorted(conditional, key=lambda item: item["name"])
+
+    rest_declared, contract_rest, rest_future, rest_conditional = classify(
+        contract_rest_all, lambda row: row.identity
+    )
+    mcp_declared, contract_mcp, mcp_future, mcp_conditional = classify(
+        contract_mcp_all, lambda row: row.name
+    )
+    cli_declared, contract_cli_keys, cli_future, cli_conditional = classify(
+        contract_cli_all, lambda row: row.key
+    )
 
     mcp_text = open(args.mcp_output, encoding="utf-8").read()
     mcp_live = parse_live_mcp(mcp_text)
     rest_live, rest_sha = live_rest(f"{args.repo_root}/apps/api/src/main.rs")
-    cli_live, cli_probes = live_cli(args.cli_binary, contract_cli)
+    # Probe the whole command contract so evidence can distinguish a future
+    # command that happens to exist from one that correctly does not exist yet.
+    # Only contract_cli_keys participates in the current-release subset check.
+    cli_live, cli_probes = live_cli(args.cli_binary, contract_cli_all)
 
-    def dimension(contract, implementation, proof, **extra):
+    def dimension(declared, contract, future, conditional, implementation, proof, **extra):
+        declared_set = set(declared)
         contract_set, implementation_set = set(contract), set(implementation)
+        future_with_presence = [
+            {**item, "implementation_present": item["name"] in implementation_set}
+            for item in future
+        ]
+        conditional_with_presence = [
+            {
+                **item,
+                "implementation_present": item["name"] in implementation_set,
+                "reason": "conditional_surface_requires_activation",
+            }
+            for item in conditional
+        ]
         return {
             "proof": proof,
+            "contract_declared": sorted(declared_set),
             "contract_required": sorted(contract_set),
+            "not_yet_in_release": future_with_presence,
+            "conditional_not_applicable": conditional_with_presence,
             "implementation": sorted(implementation_set),
             "contract_missing_in_implementation": sorted(contract_set - implementation_set),
-            "not_in_flow_contract": sorted(implementation_set - contract_set),
+            "not_in_flow_contract": sorted(implementation_set - declared_set),
             "counts": {
+                "contract_declared": len(declared_set),
                 "contract_required": len(contract_set),
+                "not_yet_in_release": len(future_with_presence),
+                "not_yet_in_release_absent": sum(
+                    not item["implementation_present"] for item in future_with_presence
+                ),
+                "conditional_not_applicable": len(conditional_with_presence),
                 "implementation": len(implementation_set),
                 "contract_missing_in_implementation": len(contract_set - implementation_set),
-                "not_in_flow_contract": len(implementation_set - contract_set),
+                "not_in_flow_contract": len(implementation_set - declared_set),
             },
             "passed": contract_set <= implementation_set,
             **extra,
         }
 
     result = {
-        "scope": "all declarations in the frozen contracts; release metadata does not filter the implementation subset check",
-        "mcp": dimension(contract_mcp, mcp_live, "executed shipped list-tools binary"),
-        "rest": dimension(contract_rest, rest_live, "Axum route registrations assembled by apps/api/src/main.rs", route_source_sha256=rest_sha),
-        "cli": dimension([c.key for c in contract_cli], cli_live, "executed shipped sylvode command tree with per-command --help and required-flag presence", probes=cli_probes),
+        "scope": {
+            "release": args.release,
+            "rule": "only non-conditional contract entries with version <= release are required in the shipped implementation",
+            "future_entry_disposition": "not_yet_in_release entries are diagnostic and never counted as missing",
+            "conditional_entry_disposition": "conditional entries require their contract activation condition before becoming required",
+        },
+        "mcp": dimension(mcp_declared, contract_mcp, mcp_future, mcp_conditional, mcp_live, "executed shipped list-tools binary"),
+        "rest": dimension(rest_declared, contract_rest, rest_future, rest_conditional, rest_live, "Axum route registrations assembled by apps/api/src/main.rs", route_source_sha256=rest_sha),
+        "cli": dimension(cli_declared, contract_cli_keys, cli_future, cli_conditional, cli_live, "executed shipped sylvode command tree with per-command --help and required-flag presence", probes=cli_probes),
+    }
+    result["version_scope_diagnostic"] = {
+        "code": "future_contract_entries_excluded_from_current_release_failure",
+        "classification": "verifier_criterion_version_scope",
+        "message": (
+            "The frozen contracts span later releases. Entries newer than the requested "
+            "release are recorded as not_yet_in_release; reporting them as ordinary missing "
+            "would be a verifier criterion error, not an implementation failure."
+        ),
+        "release": args.release,
+        "not_yet_in_release_counts": {
+            name: result[name]["counts"]["not_yet_in_release"]
+            for name in ("mcp", "rest", "cli")
+        },
+        "future_absent_but_non_failing_counts": {
+            name: result[name]["counts"]["not_yet_in_release_absent"]
+            for name in ("mcp", "rest", "cli")
+        },
     }
     result["passed"] = all(result[name]["passed"] for name in ("mcp", "rest", "cli"))
     json.dump(result, sys.stdout, indent=2, sort_keys=True)

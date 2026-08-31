@@ -63,12 +63,38 @@
     "implementation_parity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["scope", "mcp", "rest", "cli", "passed"],
+      "required": ["scope", "mcp", "rest", "cli", "version_scope_diagnostic", "passed"],
       "properties": {
-        "scope": { "type": "string" },
+        "scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["release", "rule", "future_entry_disposition", "conditional_entry_disposition"],
+          "properties": {
+            "release": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+            "rule": { "type": "string", "minLength": 1 },
+            "future_entry_disposition": { "const": "not_yet_in_release entries are diagnostic and never counted as missing" },
+            "conditional_entry_disposition": { "type": "string", "minLength": 1 }
+          }
+        },
         "mcp": { "$ref": "#/$defs/implementation_dimension" },
         "rest": { "$ref": "#/$defs/implementation_dimension" },
         "cli": { "$ref": "#/$defs/implementation_dimension" },
+        "version_scope_diagnostic": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "code", "classification", "message", "release",
+            "not_yet_in_release_counts", "future_absent_but_non_failing_counts"
+          ],
+          "properties": {
+            "code": { "const": "future_contract_entries_excluded_from_current_release_failure" },
+            "classification": { "const": "verifier_criterion_version_scope" },
+            "message": { "type": "string", "minLength": 1 },
+            "release": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+            "not_yet_in_release_counts": { "$ref": "#/$defs/implementation_dimension_counts_by_surface" },
+            "future_absent_but_non_failing_counts": { "$ref": "#/$defs/implementation_dimension_counts_by_surface" }
+          }
+        },
         "passed": { "type": "boolean" }
       }
     },
@@ -111,21 +137,67 @@
   },
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "implementation_dimension_counts_by_surface": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mcp", "rest", "cli"],
+      "properties": {
+        "mcp": { "type": "integer", "minimum": 0 },
+        "rest": { "type": "integer", "minimum": 0 },
+        "cli": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "release_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "implementation_present"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "implementation_present": { "type": "boolean" }
+      }
+    },
+    "conditional_release_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "implementation_present", "reason"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" },
+        "implementation_present": { "type": "boolean" },
+        "reason": { "const": "conditional_surface_requires_activation" }
+      }
+    },
     "implementation_dimension": {
       "type": "object",
-      "required": ["proof", "contract_required", "implementation", "contract_missing_in_implementation", "not_in_flow_contract", "counts", "passed"],
+      "required": [
+        "proof", "contract_declared", "contract_required", "not_yet_in_release",
+        "conditional_not_applicable", "implementation",
+        "contract_missing_in_implementation", "not_in_flow_contract", "counts", "passed"
+      ],
       "properties": {
         "proof": { "type": "string" },
+        "contract_declared": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "contract_required": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "not_yet_in_release": { "type": "array", "items": { "$ref": "#/$defs/release_entry" } },
+        "conditional_not_applicable": { "type": "array", "items": { "$ref": "#/$defs/conditional_release_entry" } },
         "implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "contract_missing_in_implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "not_in_flow_contract": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "counts": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["contract_required", "implementation", "contract_missing_in_implementation", "not_in_flow_contract"],
+          "required": [
+            "contract_declared", "contract_required", "not_yet_in_release",
+            "not_yet_in_release_absent", "conditional_not_applicable", "implementation",
+            "contract_missing_in_implementation", "not_in_flow_contract"
+          ],
           "properties": {
+            "contract_declared": { "type": "integer", "minimum": 0 },
             "contract_required": { "type": "integer", "minimum": 0 },
+            "not_yet_in_release": { "type": "integer", "minimum": 0 },
+            "not_yet_in_release_absent": { "type": "integer", "minimum": 0 },
+            "conditional_not_applicable": { "type": "integer", "minimum": 0 },
             "implementation": { "type": "integer", "minimum": 0 },
             "contract_missing_in_implementation": { "type": "integer", "minimum": 0 },
             "not_in_flow_contract": { "type": "integer", "minimum": 0 }
