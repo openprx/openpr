@@ -7,7 +7,7 @@ set -euo pipefail
 # coverage verifier (v0.4-v1.0 共用)" section.
 #
 # Parses the five frozen contract files and recomputes every cross-reference
-# they require, then checks the release-applicable promises against the
+# they require, then checks every declared promise against the
 # shipped implementation: MCP names come from executing list-tools, CLI
 # commands from executing sylvode's command tree, and REST identities from
 # the Axum route registrations assembled by apps/api/src/main.rs.

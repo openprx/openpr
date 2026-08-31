@@ -16,12 +16,7 @@ from flow_surface_coverage import (  # noqa: E402
     parse_cli_live,
     parse_mcp_live,
     parse_rest_table,
-    version_tuple,
 )
-
-
-def applicable(version: str, release: str, conditional: bool = False) -> bool:
-    return not conditional and version_tuple(version) <= version_tuple(release)
 
 
 def parse_live_mcp(text: str) -> list[str]:
@@ -91,8 +86,18 @@ def live_cli(binary: str, commands) -> tuple[list[str], list[dict]]:
     for command in commands:
         words = cli_command_words(command.raw)
         proc = subprocess.run([binary, *words, "--help"], text=True, capture_output=True, check=False)
-        ok = proc.returncode == 0
-        probes.append({"key": command.key, "argv": words + ["--help"], "exit_code": proc.returncode, "present": ok})
+        help_text = proc.stdout + proc.stderr
+        required_flags = sorted(set(re.findall(r"--[a-z][a-z0-9-]*", command.raw)))
+        missing_flags = [flag for flag in required_flags if flag not in help_text]
+        ok = proc.returncode == 0 and not missing_flags
+        probes.append({
+            "key": command.key,
+            "argv": words + ["--help"],
+            "exit_code": proc.returncode,
+            "required_flags": required_flags,
+            "missing_flags": missing_flags,
+            "present": ok,
+        })
         if ok:
             present.append(command.key)
     return sorted(set(present)), probes
@@ -110,41 +115,42 @@ def main() -> int:
     contract_rest_all = parse_rest_table(f"{args.contracts_root}/contracts/rest-api-v1.md")
     contract_mcp_all, _ = parse_mcp_live(f"{args.contracts_root}/contracts/mcp-surface-v1.md")
     contract_cli_all = parse_cli_live(f"{args.contracts_root}/contracts/cli-surface-v1.md")
-    contract_rest = sorted({r.identity for r in contract_rest_all if applicable(r.version, args.release, r.conditional)})
-    contract_mcp = sorted({t.name for t in contract_mcp_all if applicable(t.version, args.release, t.conditional)})
-    contract_cli = [c for c in contract_cli_all if applicable(c.version, args.release, c.conditional)]
+    # a92e3e9 deliberately says every contract declaration, not merely the
+    # rows whose version is <= the requested release.  `release` remains
+    # provenance on the shared result; it is not authority to weaken this
+    # implementation-parity subset check.
+    contract_rest = sorted({r.identity for r in contract_rest_all})
+    contract_mcp = sorted({t.name for t in contract_mcp_all})
+    contract_cli = contract_cli_all
 
     mcp_text = open(args.mcp_output, encoding="utf-8").read()
     mcp_live = parse_live_mcp(mcp_text)
     rest_live, rest_sha = live_rest(f"{args.repo_root}/apps/api/src/main.rs")
     cli_live, cli_probes = live_cli(args.cli_binary, contract_cli)
 
-    def dimension(contract, implementation, proof, contract_declared=None, **extra):
+    def dimension(contract, implementation, proof, **extra):
         contract_set, implementation_set = set(contract), set(implementation)
-        declared_set = set(contract_declared if contract_declared is not None else contract)
         return {
             "proof": proof,
-            "contract_applicable": sorted(contract_set),
-            "contract_declared": sorted(declared_set),
+            "contract_required": sorted(contract_set),
             "implementation": sorted(implementation_set),
             "contract_missing_in_implementation": sorted(contract_set - implementation_set),
-            "not_in_flow_contract": sorted(implementation_set - declared_set),
+            "not_in_flow_contract": sorted(implementation_set - contract_set),
             "counts": {
-                "contract_applicable": len(contract_set),
-                "contract_declared": len(declared_set),
+                "contract_required": len(contract_set),
                 "implementation": len(implementation_set),
                 "contract_missing_in_implementation": len(contract_set - implementation_set),
-                "not_in_flow_contract": len(implementation_set - declared_set),
+                "not_in_flow_contract": len(implementation_set - contract_set),
             },
             "passed": contract_set <= implementation_set,
             **extra,
         }
 
     result = {
-        "release_filter": "version <= release; conditional rows are not applicable without an activated legacy inventory branch",
-        "mcp": dimension(contract_mcp, mcp_live, "executed shipped list-tools binary", contract_declared=[t.name for t in contract_mcp_all]),
-        "rest": dimension(contract_rest, rest_live, "Axum route registrations assembled by apps/api/src/main.rs", contract_declared=[r.identity for r in contract_rest_all], route_source_sha256=rest_sha),
-        "cli": dimension([c.key for c in contract_cli], cli_live, "executed shipped sylvode command tree with per-command --help", contract_declared=[c.key for c in contract_cli_all], probes=cli_probes),
+        "scope": "all declarations in the frozen contracts; release metadata does not filter the implementation subset check",
+        "mcp": dimension(contract_mcp, mcp_live, "executed shipped list-tools binary"),
+        "rest": dimension(contract_rest, rest_live, "Axum route registrations assembled by apps/api/src/main.rs", route_source_sha256=rest_sha),
+        "cli": dimension([c.key for c in contract_cli], cli_live, "executed shipped sylvode command tree with per-command --help and required-flag presence", probes=cli_probes),
     }
     result["passed"] = all(result[name]["passed"] for name in ("mcp", "rest", "cli"))
     json.dump(result, sys.stdout, indent=2, sort_keys=True)

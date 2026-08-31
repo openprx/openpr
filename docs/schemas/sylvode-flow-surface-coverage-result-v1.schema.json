@@ -63,9 +63,9 @@
     "implementation_parity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["release_filter", "mcp", "rest", "cli", "passed"],
+      "required": ["scope", "mcp", "rest", "cli", "passed"],
       "properties": {
-        "release_filter": { "type": "string" },
+        "scope": { "type": "string" },
         "mcp": { "$ref": "#/$defs/implementation_dimension" },
         "rest": { "$ref": "#/$defs/implementation_dimension" },
         "cli": { "$ref": "#/$defs/implementation_dimension" },
@@ -113,21 +113,19 @@
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "implementation_dimension": {
       "type": "object",
-      "required": ["proof", "contract_applicable", "contract_declared", "implementation", "contract_missing_in_implementation", "not_in_flow_contract", "counts", "passed"],
+      "required": ["proof", "contract_required", "implementation", "contract_missing_in_implementation", "not_in_flow_contract", "counts", "passed"],
       "properties": {
         "proof": { "type": "string" },
-        "contract_applicable": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "contract_declared": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "contract_required": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "contract_missing_in_implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "not_in_flow_contract": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
         "counts": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["contract_applicable", "contract_declared", "implementation", "contract_missing_in_implementation", "not_in_flow_contract"],
+          "required": ["contract_required", "implementation", "contract_missing_in_implementation", "not_in_flow_contract"],
           "properties": {
-            "contract_applicable": { "type": "integer", "minimum": 0 },
-            "contract_declared": { "type": "integer", "minimum": 0 },
+            "contract_required": { "type": "integer", "minimum": 0 },
             "implementation": { "type": "integer", "minimum": 0 },
             "contract_missing_in_implementation": { "type": "integer", "minimum": 0 },
             "not_in_flow_contract": { "type": "integer", "minimum": 0 }
