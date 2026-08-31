@@ -58,6 +58,12 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
             "changed_block_ids_truncated",
         ]),
     ),
+    // `ADR-0012` §4 / `events-v1.md`'s `flow.object.moved` row: "`object_id,old_parent_id?,
+    // new_parent_id?,position_key?`". Ids and one ordering key, no title and no navigator content.
+    (
+        "flow.object.moved",
+        public_payload(&["object_id", "old_parent_id", "new_parent_id", "position_key"]),
+    ),
     ("flow.feature.enabled", public_payload(&["workspace_id"])),
     ("flow.feature.disabled", public_payload(&["workspace_id"])),
     (
@@ -233,8 +239,9 @@ mod tests {
         let command_rs = include_str!("command.rs");
         let write_rs = include_str!("collab/write.rs");
         let grants_rs = include_str!("grants.rs");
+        let move_object_rs = include_str!("move_object.rs");
         let mut literals = BTreeSet::new();
-        for source in [command_rs, write_rs, grants_rs] {
+        for source in [command_rs, write_rs, grants_rs, move_object_rs] {
             let cut = source.find("\n#[cfg(test)]").unwrap_or(source.len());
             literals.extend(event_type_literals(&source[..cut]));
         }

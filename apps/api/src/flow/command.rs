@@ -29,6 +29,7 @@ use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
 use super::collab::{authz, bootstrap, frame, limits as collab_limits, runtime, write};
 use super::model::{AcceptedChange, FlowFeatureUpdateView, FlowObjectView};
+use super::move_object::GovernanceCommandType;
 use super::projection;
 use super::query::feature_view_from_row;
 use super::repository::{self, NewCollabDocument, NewFlowObject, NewProjection};
@@ -125,6 +126,20 @@ pub fn v0_4_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
     registry
 }
 
+/// Every command registered at **v0.5**, by wire name, with its declared
+/// [`ExistingDocumentCardinality`].
+///
+/// `ADR-0013` §1 R16: "不得把 v0.5 的清单外推到 v0.8 …… 改为由机器字段持续证明：command registry
+/// 每个命令必须声明 `existing_document_cardinality`，逐版 gate 扫描所有新增 command variant" —
+/// so this is a superset of [`v0_4_command_cardinality_registry`], not a replacement, and the v0.4
+/// bound keeps being asserted against the v0.4 list alone.
+pub fn v0_5_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
+    let mut registry = v0_4_command_cardinality_registry();
+    let governance = GovernanceCommandType::MoveObject;
+    registry.push((governance.wire_name(), governance.existing_document_cardinality()));
+    registry
+}
+
 pub struct CreateObjectInput {
     pub workspace_id: Uuid,
     pub actor_id: Uuid,
@@ -176,12 +191,13 @@ fn validate(input: &CreateObjectInput) -> Result<(), ApiError> {
 /// `flow_integrity_records` (`ADR-0013` §4) before failing closed — the id existing at all but in
 /// the wrong workspace is never a plain "not found" typo, so it gets a paper trail a genuine
 /// missing-row `BadRequest` does not.
-async fn record_cross_workspace_relation_and_fail_closed(
+pub(super) async fn record_cross_workspace_relation_and_fail_closed(
     state: &AppState,
     requesting_workspace_id: Uuid,
     subject_kind: &str,
     referenced_id: Uuid,
     referenced_workspace_id: Uuid,
+    detected_by: &str,
 ) -> ApiError {
     if let Err(err) = repository::insert_integrity_record(
         &state.db,
@@ -190,7 +206,7 @@ async fn record_cross_workspace_relation_and_fail_closed(
             kind: "cross_workspace_relation",
             subject_kind,
             subject_id: &referenced_id.to_string(),
-            detected_by: "flow.command.create_object",
+            detected_by,
             details_redacted: json!({
                 "referenced_workspace_id": referenced_workspace_id,
                 "requesting_workspace_id": requesting_workspace_id,
@@ -268,6 +284,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
                 "project",
                 project_id,
                 project_workspace,
+                "flow.command.create_object", // detected_by: an ADR-0013 §4 integrity-record producer, not an events-v1 type
             )
             .await);
         }
@@ -284,6 +301,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
                 "flow_object",
                 parent_id,
                 parent.workspace_id,
+                "flow.command.create_object", // detected_by: an ADR-0013 §4 integrity-record producer, not an events-v1 type
             )
             .await);
         }
@@ -588,7 +606,7 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
 /// with `accepted_seq`/`projection_seq` read back from storage rather than re-derived, and
 /// `event_id` pointing at the original event row rather than minting a new one — a replay must
 /// report the same fact that already happened, not a second event.
-fn accepted_change_from_row(row: repository::ObjectViewRow, event_id: Uuid) -> AcceptedChange {
+pub(super) fn accepted_change_from_row(row: repository::ObjectViewRow, event_id: Uuid) -> AcceptedChange {
     let view = super::query::object_view_from_row(row);
     AcceptedChange {
         accepted_seq: view.document_seq,
@@ -701,6 +719,11 @@ impl LifecycleCommandType {
 enum CommandKind {
     Content(ContentCommandType),
     Lifecycle(LifecycleCommandType),
+    /// v0.5's governance family (`super::move_object`). Declared in that module rather than here
+    /// so this module stays the v0.4-frozen registry `verify-flow-authz-baseline-v0.4.sh`'s static
+    /// check reads, and so a `bounded_many` command's wire name lives next to the multi-document
+    /// machinery that makes it legal.
+    Governance(GovernanceCommandType),
 }
 
 impl CommandKind {
@@ -708,6 +731,7 @@ impl CommandKind {
         ContentCommandType::parse(raw)
             .map(Self::Content)
             .or_else(|| LifecycleCommandType::parse(raw).map(Self::Lifecycle))
+            .or_else(|| GovernanceCommandType::parse(raw).map(Self::Governance))
     }
 
     /// The `events-v1.md` primary event type this command produces on success — also the
@@ -719,6 +743,7 @@ impl CommandKind {
             Self::Content(_) => "flow.content.accepted",
             Self::Lifecycle(LifecycleCommandType::Archive) => "flow.object.archived",
             Self::Lifecycle(LifecycleCommandType::Restore) => "flow.object.restored",
+            Self::Governance(kind) => kind.event_type(),
         }
     }
 
@@ -731,6 +756,11 @@ impl CommandKind {
     fn required_permission_level(self, object_type: &str) -> authz::PermissionLevel {
         match self {
             Self::Lifecycle(_) if object_type == "navigator" => authz::PermissionLevel::FullAccess,
+            // `ADR-0012` §4: "被移动对象需 `full_access`（移动会改变它的继承）". This is only the
+            // source side of the double-sided rule; `move_object::execute` owns the target side
+            // (`edit` on the new parent), which is a different authorization domain whenever the
+            // two sides sit under different boundaries.
+            Self::Governance(GovernanceCommandType::MoveObject) => authz::PermissionLevel::FullAccess,
             _ => authz::PermissionLevel::Edit,
         }
     }
@@ -920,7 +950,7 @@ async fn execute_command_authorized(
         // (`flow.content.accepted`) and the object for lifecycle ones.
         let expected_aggregate = match kind {
             CommandKind::Content(_) => document_id,
-            CommandKind::Lifecycle(_) => input.object_id,
+            CommandKind::Lifecycle(_) | CommandKind::Governance(_) => input.object_id,
         };
         if existing.aggregate_id != expected_aggregate.to_string() {
             return Err(ApiError::Conflict(
@@ -967,6 +997,13 @@ async fn execute_command_authorized(
         }
         CommandKind::Lifecycle(lifecycle_kind) => {
             execute_lifecycle_command(state, input, workspace_id, checked_epoch, lifecycle_kind).await
+        }
+        // The `full_access` check above is an early rejection (and the one that produces the
+        // `flow.command.rejected` audit row); `move_object` re-decides both sides of
+        // `ADR-0012` §4's double-sided rule inside its own transaction, on the snapshot it
+        // commits, so it takes no permission level from here.
+        CommandKind::Governance(GovernanceCommandType::MoveObject) => {
+            super::move_object::execute(state, input, workspace_id, checked_epoch).await
         }
     }
 }
@@ -1057,7 +1094,7 @@ fn parse_payload<T: serde::de::DeserializeOwned>(command_type: &str, payload: &V
 /// internals — each arm produces a caller-safe message naming only the logical node id or limit
 /// kind, and `limit_exceeded` carries its `limit_kind`/`limit`/`observed` as structured `details`
 /// instead of interpolated into the message text.
-fn map_collab_error(err: &CollabError) -> ApiError {
+pub(super) fn map_collab_error(err: &CollabError) -> ApiError {
     match err {
         CollabError::UnknownNode { id } => ApiError::invalid_update(format!("unknown node id '{id}'")),
         CollabError::DuplicateNode { id } => ApiError::invalid_update(format!("duplicate node id '{id}'")),
@@ -1249,7 +1286,7 @@ fn apply_content_command(
 /// one `Conflict("server_draining")`). `rejected.details`' structured fields (`limit_kind`/
 /// `limit`/`observed`/`retry_after_ms`/`minimum_snapshot_seq`) are now carried through as typed
 /// `details` rather than interpolated into the message.
-fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
+pub(super) fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
     use super::collab::frame::RejectedCode;
 
     // Hoisted once so every arm below reads the same `Option<&Value>` instead of each

@@ -238,11 +238,11 @@ fn reject_from_collab_error(update_id: Option<Uuid>, err: &CollabError) -> Accep
     rejected(RejectedCode::InvalidUpdate, false, update_id, WriteState::NotApplied)
 }
 
-struct ObservedHead {
-    object_id: Uuid,
-    format_version: String,
-    head_seq: i64,
-    head_frontier: Vec<u8>,
+pub(crate) struct ObservedHead {
+    pub(crate) object_id: Uuid,
+    pub(crate) format_version: String,
+    pub(crate) head_seq: i64,
+    pub(crate) head_frontier: Vec<u8>,
 }
 
 /// `collab_documents.engine` is not selected here: the `collab_documents_engine_check` CHECK
@@ -345,23 +345,23 @@ pub fn replay_stable_update_id(document_id: Uuid, idempotency_key: &str) -> Uuid
 /// database transaction and never touches `WarmCache::put` for anything but re-seeding the
 /// observed-head base it just built (not the post-update candidate — that only happens after
 /// commit, in [`accept_update`]).
-struct Prepared {
-    observed: ObservedHead,
-    candidate: LoroCollabEngine,
-    after_frontier: Vec<u8>,
-    content_hash_hex: String,
-    title: String,
-    state_json: Value,
-    plain_text: String,
-    decoded_bytes_hint: u64,
+pub(crate) struct Prepared {
+    pub(crate) observed: ObservedHead,
+    pub(crate) candidate: LoroCollabEngine,
+    pub(crate) after_frontier: Vec<u8>,
+    pub(crate) content_hash_hex: String,
+    pub(crate) title: String,
+    pub(crate) state_json: Value,
+    pub(crate) plain_text: String,
+    pub(crate) decoded_bytes_hint: u64,
 }
 
-enum HydrateOutcome {
+pub(crate) enum HydrateOutcome {
     Prepared(Box<Prepared>),
     Rejected(AcceptOutcome),
 }
 
-async fn hydrate_and_apply(
+pub(crate) async fn hydrate_and_apply(
     db: &DatabaseConnection,
     cache: &WarmCache,
     document_id: Uuid,
@@ -583,7 +583,7 @@ enum LockedOutcome {
 }
 
 /// What [`stage_locked_writes`] concluded, before `COMMIT` is issued.
-enum StagedOutcome {
+pub(crate) enum StagedOutcome {
     Ready(StagedWrite),
     /// The locked head moved past the head this update was prepared against.
     Rebase,
@@ -591,10 +591,10 @@ enum StagedOutcome {
 }
 
 /// The values [`run_locked_phase`] needs from the staged writes once `COMMIT` succeeds.
-struct StagedWrite {
-    event_id: Uuid,
-    new_head_seq: i64,
-    after_frontier: Vec<u8>,
+pub(crate) struct StagedWrite {
+    pub(crate) event_id: Uuid,
+    pub(crate) new_head_seq: i64,
+    pub(crate) after_frontier: Vec<u8>,
 }
 
 /// Everything between `begin` and `commit`, exclusive of both. No engine call, no cache call, no
@@ -608,12 +608,7 @@ async fn stage_locked_writes(
     prepared: &Prepared,
     dispatch_max_attempts: i32,
 ) -> Result<StagedOutcome, ApiError> {
-    tx.execute_unprepared(&format!("SET LOCAL lock_timeout = '{DOCUMENT_LOCK_WAIT_MS_MAX}ms'"))
-        .await?;
-    tx.execute_unprepared(&format!(
-        "SET LOCAL statement_timeout = '{DOCUMENT_LOCK_HOLD_MS_MAX}ms'"
-    ))
-    .await?;
+    set_locked_phase_statement_budgets(tx).await?;
 
     // [layer 1] the commit-time epoch fence, held to commit. Only a genuine epoch mismatch
     // (`ApiError::Conflict` -- `authz_epoch` really did move past `checked_epoch`) means the
@@ -630,6 +625,52 @@ async fn stage_locked_writes(
         Err(err) => return Err(err),
     }
 
+    stage_one_document(tx, request, prepared, dispatch_max_attempts, "web").await
+}
+
+/// `limits-v1.md`'s `document_lock_wait_ms_max` / `document_lock_hold_ms_max`, applied
+/// server-side to every statement of a locked phase. Shared with `flow::move_object`, whose
+/// multi-document locked phase is held to the *same* per-statement budgets — `ADR-0013` §2.4
+/// withdrew the 150 ms multi-document ceiling and left multi-document commands on the
+/// single-document numbers until `document_lock_hold_ms_max_per_extra_document` is frozen.
+///
+/// # Errors
+/// Propagates a database failure.
+pub(crate) async fn set_locked_phase_statement_budgets(tx: &DatabaseTransaction) -> Result<(), ApiError> {
+    tx.execute_unprepared(&format!("SET LOCAL lock_timeout = '{DOCUMENT_LOCK_WAIT_MS_MAX}ms'"))
+        .await?;
+    tx.execute_unprepared(&format!(
+        "SET LOCAL statement_timeout = '{DOCUMENT_LOCK_HOLD_MS_MAX}ms'"
+    ))
+    .await?;
+    Ok(())
+}
+
+/// Advances **one** existing document's canonical head inside an already-open, already-fenced
+/// transaction: `SELECT ... FOR UPDATE` the `collab_documents` row, re-verify the head this update
+/// was prepared against, allocate `head_seq + 1`, and write the `flow.content.accepted` event, the
+/// `collab_updates` row, the new head, and the projection.
+///
+/// Factored out of [`stage_locked_writes`] so `flow::move_object` advances a navigator head
+/// through the *identical* statements a content write does, rather than a second, parallel
+/// implementation that could drift on seq allocation, byte/update accounting, or projection
+/// freshness. The caller owns everything above this level: the epoch fence, the `ADR-0013` §2.1
+/// document lock **order**, and the decision to commit or roll back.
+///
+/// `origin_surface` is stamped on `collab_updates.origin_surface` and on the event's
+/// `source.surface` — `"web"` for the WebSocket/REST content path, `"rest"` for a
+/// governance-command-produced navigator ordering change.
+///
+/// # Errors
+/// Propagates a database failure. A head that moved past the prepared head is
+/// [`StagedOutcome::Rebase`], not an error.
+pub(crate) async fn stage_one_document(
+    tx: &DatabaseTransaction,
+    request: &UpdateRequest,
+    prepared: &Prepared,
+    dispatch_max_attempts: i32,
+    origin_surface: &'static str,
+) -> Result<StagedOutcome, ApiError> {
     #[derive(FromQueryResult)]
     struct LockedHead {
         head_seq: i64,
@@ -662,7 +703,7 @@ async fn stage_locked_writes(
             aggregate_type: "flow_document".to_string(),
             aggregate_id: request.document_id.to_string(),
             actor_id: Some(request.actor_id),
-            source: serde_json::json!({ "surface": "web" }),
+            source: serde_json::json!({ "surface": origin_surface }),
             payload: serde_json::json!({
                 "object_id": prepared.observed.object_id,
                 "document_id": request.document_id,
@@ -696,7 +737,7 @@ async fn stage_locked_writes(
             INSERT INTO collab_updates
                 (document_id, seq, update_id, content_hash, idempotency_key, before_frontier, after_frontier,
                  bytes, actor_id, origin_surface, origin_client_id, projection_seq, event_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'web', $10, $2, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $12, $10, $2, $11)
         ",
         vec![
             request.document_id.into(),
@@ -710,6 +751,7 @@ async fn stage_locked_writes(
             request.actor_id.into(),
             request.origin_client_id.clone().into(),
             event_id.into(),
+            origin_surface.into(),
         ],
     ))
     .await?;
@@ -1046,7 +1088,7 @@ pub async fn accept_update(
 /// path and by [`LockedOutcome::CommitUnknown`]'s recovery, so a write whose `COMMIT` response was
 /// lost still reaches other sessions exactly once and in commit order, inside the same coordinator
 /// permit its committer holds.
-fn finish_committed(
+pub(crate) fn finish_committed(
     cache: &WarmCache,
     registry: &SessionRegistry,
     exclude_session_id: Option<Uuid>,

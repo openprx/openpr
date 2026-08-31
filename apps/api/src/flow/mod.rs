@@ -7,6 +7,8 @@
 //! - [`command`]: the one write path this package ships — object creation.
 //! - [`grants`]: `ADR-0012`'s v0.5 authorization surface — `flow_object_grants` and the
 //!   `inherit_from_parent` boundary, with the §4.1 self-lockout guard and the §3.1 epoch lock.
+//! - [`move_object`]: `ADR-0012` §4's cross-parent move, and the only command in the frozen v0.5
+//!   set that walks `ADR-0013` §2's multi-document ordered-lock path.
 //! - [`query`]: the three read paths — get, list, history.
 //! - [`repository`]: hand-written parameterized SQL against `flow_objects` / `collab_documents` /
 //!   `flow_object_projections` / `collab_updates` / `business_events` / `event_dispatch` (no
@@ -25,6 +27,7 @@ pub mod event_policy;
 pub mod grants;
 pub mod import;
 pub mod model;
+pub mod move_object;
 pub mod policy;
 pub mod projection;
 pub mod query;

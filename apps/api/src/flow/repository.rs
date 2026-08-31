@@ -861,3 +861,149 @@ pub async fn insert_import_lineage<C: ConnectionTrait>(
     .await?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// `flow::move_object` (`ADR-0012` §4 / `ADR-0013` §2) — cross-parent move
+// ---------------------------------------------------------------------------------------------
+
+/// The `flow_objects` governance columns a cross-parent move reads and rewrites.
+///
+/// `project_id` is here because `ADR-0013` §2.2 derives the command's *contended existing document
+/// set* from it ("`move_object` 的集合由对象当前 `project_id` 推出"), so it is not incidental
+/// metadata on this path — it is the input the whole lock plan is computed from, and the value the
+/// locked phase re-reads to detect set drift.
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct MovableObjectRow {
+    pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
+    pub object_type: String,
+    pub lifecycle_status: String,
+}
+
+const MOVABLE_OBJECT_COLUMNS: &str = "workspace_id, project_id, parent_id, object_type, lifecycle_status";
+
+/// Reads one object's move-relevant governance columns without taking any lock (the lock-free
+/// prepare phase).
+pub async fn fetch_movable_object<C: ConnectionTrait>(
+    conn: &C,
+    object_id: Uuid,
+) -> Result<Option<MovableObjectRow>, ApiError> {
+    Ok(MovableObjectRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!("SELECT {MOVABLE_OBJECT_COLUMNS} FROM flow_objects WHERE id = $1"),
+        vec![object_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// The same columns under `FOR UPDATE` — `ADR-0013` §2.1's "object / ancestor 行" lock-rank layer,
+/// taken *after* the workspace `authz_epoch` row and *before* any `collab_documents` row.
+///
+/// Callers that lock more than one object row must call this once per id in ascending `id` order,
+/// for the same reason the document layer is ordered.
+pub async fn lock_movable_object<C: ConnectionTrait>(
+    conn: &C,
+    object_id: Uuid,
+) -> Result<Option<MovableObjectRow>, ApiError> {
+    Ok(MovableObjectRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!("SELECT {MOVABLE_OBJECT_COLUMNS} FROM flow_objects WHERE id = $1 FOR UPDATE"),
+        vec![object_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+/// The navigator object (and its document) that holds ordering for one *scope* — a workspace and
+/// either one project or the projectless scope.
+///
+/// `ADR-0012` §1 leaves the navigator CRDT document holding "只持有排序（position key）与显示元
+/// 数据，不再持有父子关系", so this is the document a move has to rewrite when an object leaves one
+/// scope for another. `project_id = None` selects the projectless navigator via `IS NOT DISTINCT
+/// FROM`, which treats `NULL` as a value rather than as "unknown" — a plain `=` would silently
+/// match nothing and make every projectless move look like "this scope has no navigator".
+///
+/// Returns `None` when the scope has no navigator object at all; a workspace is not required to
+/// have one, and a move into or out of such a scope simply has no ordering entry to maintain
+/// there.
+pub async fn fetch_navigator_document<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+) -> Result<Option<NavigatorDocumentRow>, ApiError> {
+    Ok(NavigatorDocumentRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT fo.id AS object_id, cd.id AS document_id \
+           FROM flow_objects fo JOIN collab_documents cd ON cd.object_id = fo.id \
+          WHERE fo.workspace_id = $1 AND fo.object_type = 'navigator' \
+            AND fo.project_id IS NOT DISTINCT FROM $2 AND fo.lifecycle_status = 'active' \
+          ORDER BY fo.created_at, fo.id LIMIT 1",
+        vec![workspace_id.into(), project_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromQueryResult)]
+pub struct NavigatorDocumentRow {
+    pub object_id: Uuid,
+    pub document_id: Uuid,
+}
+
+/// How many `parent_id` hops the deepest descendant of `object_id` sits below it (0 for a leaf).
+///
+/// The write-side depth rule for a move needs this and `create_object`'s check cannot supply it:
+/// creating a child adds one node of known height 0, while moving relocates a whole subtree, so
+/// the constraint is `depth(new_parent) + 1 + height(subtree) <= tree_depth_max`. The recursion is
+/// bounded by `$3` for the same reason `authz::walk_chain`'s is — a corrupted `parent_id` cycle
+/// below the object must terminate the query rather than spin.
+pub async fn subtree_height<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+    probe_depth: i64,
+) -> Result<i64, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        height: i64,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "WITH RECURSIVE subtree AS ( \
+             SELECT o.id, 0 AS depth FROM flow_objects o \
+              WHERE o.id = $1 AND o.workspace_id = $2 \
+             UNION ALL \
+             SELECT c.id, s.depth + 1 FROM subtree s \
+               JOIN flow_objects c ON c.parent_id = s.id AND c.workspace_id = $2 \
+              WHERE s.depth < $3::int \
+         ) \
+         SELECT COALESCE(max(depth), 0)::bigint AS height FROM subtree",
+        vec![object_id.into(), workspace_id.into(), probe_depth.into()],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map_or(0, |r| r.height))
+}
+
+/// Rewrites the two governance columns a cross-parent move owns, in one parameterized statement.
+///
+/// `project_id` moves with `parent_id` because the object's scope *is* its parent's scope; keeping
+/// the old value would leave the object listed under a navigator whose subtree it is no longer in.
+pub async fn set_object_parent<C: ConnectionTrait>(
+    conn: &C,
+    object_id: Uuid,
+    parent_id: Uuid,
+    project_id: Option<Uuid>,
+    updated_by: Uuid,
+) -> Result<(), ApiError> {
+    conn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_objects SET parent_id = $2, project_id = $3, updated_at = now(), updated_by = $4 \
+         WHERE id = $1",
+        vec![object_id.into(), parent_id.into(), project_id.into(), updated_by.into()],
+    ))
+    .await?;
+    Ok(())
+}
