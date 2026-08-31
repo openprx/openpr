@@ -252,7 +252,15 @@ for ((i = 0; i < CHECKS_COUNT; i++)); do
   fi
   cabs="$REPO_ROOT/$crel"
   if [[ ! -f "$cabs" ]]; then
-    DRIFT+=("check '$cid': evidence log not found at $crel")
+    # report-flow-v0.4-json.sh supports an arbitrary --evidence-root while
+    # retaining the contract's canonical evidence/v0.4/logs/... paths in the
+    # portable result document. Resolve those logs the same way artifacts are
+    # resolved above instead of falsely treating a non-default evidence root
+    # as missing evidence.
+    cabs="$EVIDENCE_ROOT/logs/$(basename "$crel")"
+  fi
+  if [[ ! -f "$cabs" ]]; then
+    DRIFT+=("check '$cid': evidence log not found at $crel (nor $cabs)")
     continue
   fi
   actual_sha="$(sha256sum "$cabs" | awk '{print $1}')"
