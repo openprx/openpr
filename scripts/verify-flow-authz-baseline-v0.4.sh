@@ -105,10 +105,6 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
-if [[ -z "$DATABASE_URL" ]]; then
-  echo "FAIL: no database URL configured (set --database-url or OPENPR_TEST_DATABASE_URL)" >&2
-  exit 2
-fi
 for tool in jq sha256sum git psql curl python3 cargo; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
@@ -127,14 +123,29 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
-if ! psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT 1" >/dev/null 2>&1; then
-  echo "FAIL: database is not reachable: $DATABASE_URL" >&2
-  exit 2
-fi
-
 mkdir -p "$EVIDENCE_ROOT"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+write_environment_failure() {
+  local reason="$1" out="$EVIDENCE_ROOT/authz-baseline-result.json" tmp result
+  result="$(jq -n --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" --arg adr "$ADR_PATH" --arg reason "$reason" '{
+    schema_version:"sylvode.flow.authz-baseline-result.v1",source_head:$head,generated_at:$generated_at,adr:$adr,
+    environment:{reachable:false,reason:$reason},
+    flow_parent_authority_in_postgres:{violations:[$reason],passed:false},
+    member_baseline_no_behaviour_regression:{status:"failed",reason:$reason,violations:[$reason]},
+    passed:false
+  }')"
+  tmp="$out.tmp"
+  printf '%s\n' "$result" | jq . > "$tmp"
+  mv -f "$tmp" "$out"
+  printf '%s\n' "$result"
+  exit 1
+}
+
+[[ -n "$DATABASE_URL" ]] || write_environment_failure "no database URL configured"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT 1" >/dev/null 2>&1 || \
+  write_environment_failure "configured PostgreSQL environment is unreachable"
 
 VIOLATIONS=()
 
