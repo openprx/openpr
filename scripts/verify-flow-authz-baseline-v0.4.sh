@@ -6,14 +6,12 @@ set -euo pipefail
 # Contract: /opt/working/sylvode-flow/gates/gate-commands.md, "Authz-
 # baseline verifier" paragraph, and ADR-0012 §2-3.
 #
-# This script covers `flow_parent_authority_in_postgres` with a mix of
-# static schema/source introspection and one live end-to-end request
-# against the real `api` binary. It does NOT cover
-# `member_baseline_no_behaviour_regression` (the default_member_level
-# before/after comparison across REST, all three MCP transports and CLI)
-# -- that needs a much larger fixture (MCP HTTP/SSE/stdio + CLI binary
-# equivalence testing) this round did not build, and this is reported
-# explicitly rather than silently skipped.
+# This script covers `flow_parent_authority_in_postgres` and the live
+# `member_baseline_no_behaviour_regression` fixture. The latter uses a
+# default_member_level=edit member, writes set_title/archive/restore through
+# the frozen REST command surface, and observes every transition through REST,
+# MCP HTTP/SSE/stdio and the shipped CLI. It includes refusal controls for a
+# view-level member and lifecycle expected_frontier misuse.
 #
 # flow_parent_authority_in_postgres assertions:
 #   1. STATIC: `flow_object_projections` (information_schema.columns) has
@@ -38,10 +36,8 @@ set -euo pipefail
 #      `flow_objects.parent_id` shows -- confirming the live read path
 #      actually works end-to-end, not just in theory.
 #
-# Exit codes: 0 = flow_parent_authority_in_postgres assertions all
-# passed AND member_baseline is explicitly reported not_covered (so
-# overall `passed` is still false -- see script tail), 1 = an assertion
-# failed, 2 = usage/tool/environment error.
+# Exit codes: 0 = both gates passed, 1 = an assertion failed, 2 =
+# usage/tool/environment error.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Shared --adr/--contract/--limits path resolution (absolute -> as-is;
@@ -60,11 +56,9 @@ usage() {
   cat <<'EOF'
 Usage: scripts/verify-flow-authz-baseline-v0.4.sh --adr PATH --json [OPTIONS]
 
-Verifies flow_parent_authority_in_postgres via static schema/source
-introspection plus one live request against the real api binary.
-Explicitly reports member_baseline_no_behaviour_regression as
-not_covered (needs MCP 3-transport + CLI equivalence testing not built
-this round). Writes evidence/v0.4/authz-baseline-result.json.
+Verifies flow_parent_authority_in_postgres and the default-edit member
+before/after baseline across REST, MCP HTTP/SSE/stdio and CLI, explicitly
+including archive and restore. Writes authz-baseline-result.json.
 
 Options:
   --adr PATH              Path to ADR-0012. Required. Relative paths
@@ -80,8 +74,7 @@ Options:
   --json                  Required for CLI-contract compatibility.
   -h, --help              Show this help and exit 0.
 
-Exit codes: 0 never today (member_baseline gap always present, see
-header), 1 an assertion failed, 2 usage/tool/environment error.
+Exit codes: 0 both gates passed, 1 an assertion failed, 2 usage/tool/environment error.
 EOF
 }
 
@@ -170,6 +163,11 @@ echo "static check 3: v0.4 command wire names = $WIRE_NAMES" >&2
 
 # ---- live end-to-end check ----
 echo "=== building api binary (cargo build -p api --bin api) ===" >&2
+echo "=== prerequisite: cargo build -p collab-core --bin collab-isolated-apply-worker ===" >&2
+( cd "$REPO_ROOT" && cargo build -q -p collab-core --bin collab-isolated-apply-worker ) || {
+  echo "FAIL: collab-isolated-apply-worker failed to build" >&2
+  exit 2
+}
 ( cd "$REPO_ROOT" && cargo build -q -p api --bin api ) || {
   echo "FAIL: api binary failed to build" >&2
   exit 2
@@ -177,7 +175,7 @@ echo "=== building api binary (cargo build -p api --bin api) ===" >&2
 API_BIN="$REPO_ROOT/target/debug/api"
 
 RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
-TMP_DIR="$(mktemp -d "/tmp/openpr-authz-baseline-verify.XXXXXX")"
+TMP_DIR="$(mktemp -d "/opt/worker/.cache/openpr-authz-baseline-verify.XXXXXX")"
 API_PORT=$((22000 + RANDOM % 20000))
 API_LOG="$TMP_DIR/api.log"
 API_PID=""
@@ -298,10 +296,25 @@ fi
 PASSED_PARENT_AUTHORITY=$([[ ${#VIOLATIONS[@]} -eq 0 ]] && echo true || echo false)
 VIOLATIONS_JSON="$(printf '%s\n' "${VIOLATIONS[@]:-}" | jq -R 'select(length>0)' | jq -s '.')"
 
+# ---- live default-member before/after surface matrix ----
+MEMBER_HELPER="$ROOT_DIR/scripts/lib/flow_authz_baseline_live.sh"
+[[ -f "$MEMBER_HELPER" ]] || { echo "FAIL: missing member baseline helper: $MEMBER_HELPER" >&2; exit 2; }
+set +e
+MEMBER_JSON="$(bash "$MEMBER_HELPER" "$REPO_ROOT" "$DATABASE_URL" "$TMP_DIR" 2>"$TMP_DIR/member-helper.stderr")"
+MEMBER_EXIT=$?
+set -e
+if ! jq -e . >/dev/null 2>&1 <<<"$MEMBER_JSON"; then
+  MEMBER_JSON="$(jq -n -c --arg reason "member baseline helper produced invalid JSON: $(tail -30 "$TMP_DIR/member-helper.stderr" | tr '\n' ' ')" '{status:"failed",observations:{},negative_controls:{},violations:[$reason]}')"
+  MEMBER_EXIT=1
+fi
+MEMBER_STATUS="$(jq -r '.status // "failed"' <<<"$MEMBER_JSON")"
+OVERALL_PASSED=$([[ "$PASSED_PARENT_AUTHORITY" == true && "$MEMBER_STATUS" == passed && $MEMBER_EXIT -eq 0 ]] && echo true || echo false)
+
 RESULT="$(jq -n \
   --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" --arg adr "$ADR_PATH" \
   --arg proj_columns "$PROJ_COLUMNS" --arg wire_names "$WIRE_NAMES" \
   --argjson violations "$VIOLATIONS_JSON" --argjson parent_authority_passed "$PASSED_PARENT_AUTHORITY" \
+  --argjson member_baseline "$MEMBER_JSON" --argjson overall_passed "$OVERALL_PASSED" \
   '{
     schema_version: "sylvode.flow.authz-baseline-result.v1",
     source_head: $head,
@@ -313,11 +326,10 @@ RESULT="$(jq -n \
       violations: $violations,
       passed: $parent_authority_passed
     },
-    member_baseline_no_behaviour_regression: {
-      status: "not_covered",
-      reason: "requires a default_member_level=edit before/after fixture compared across REST, all three MCP transports (HTTP/SSE/stdio) and CLI, including archive|restore -- not built this round"
-    },
-    passed: false
+    member_baseline_no_behaviour_regression: ($member_baseline + {
+      reason: (if $member_baseline.status == "passed" then "live default_member_level=edit timeline preserved set_title, archive and restore across REST, MCP HTTP/SSE/stdio and CLI with refusal controls" else ($member_baseline.violations | join("; ")) end)
+    }),
+    passed: $overall_passed
   }')"
 
 OUT_PATH="$EVIDENCE_ROOT/authz-baseline-result.json"
@@ -328,4 +340,5 @@ mv -f "$OUT_TMP" "$OUT_PATH"
 echo "wrote $OUT_PATH" >&2
 
 echo "$RESULT"
+[[ "$OVERALL_PASSED" == true ]] && exit 0
 exit 1

@@ -281,12 +281,45 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         static_ok = card.get("static_check", {}).get("passed") is True
         static_violation_count = len(card.get("static_check", {}).get("violations", []))
         dynamic_ok = card.get("dynamic_check", {}).get("status") == "passed"
-        concurrency_ok = card.get("concurrency_fixtures", {}).get("status") == "passed"
+        concurrency = card.get("concurrency_fixtures", {})
+        fixtures = concurrency.get("fixtures", {}) if isinstance(concurrency, dict) else {}
+        required_fixtures = {
+            "concurrent_same_idempotency_key",
+            "different_keys_same_lineage",
+            "preallocated_uuid_conflict",
+            "lost_response_retry",
+        }
+        fixture_statuses_ok = required_fixtures == set(fixtures) and all(
+            isinstance(fixtures.get(name), dict) and fixtures[name].get("status") == "passed"
+            for name in required_fixtures
+        )
+        negative_reuse_ok = (
+            fixtures.get("concurrent_same_idempotency_key", {})
+            .get("negative_different_body", {})
+            .get("code")
+            == 409
+        )
+        preallocated = fixtures.get("preallocated_uuid_conflict", {})
+        preallocated_rollback_ok = (
+            preallocated.get("collision_exit_code") not in (None, 0)
+            and preallocated.get("constraint_error_observed") is True
+            and preallocated.get("marker_epoch_before") == preallocated.get("marker_epoch_after")
+            and preallocated.get("canonical_row_count") == 1
+        )
+        concurrency_ok = (
+            isinstance(concurrency, dict)
+            and concurrency.get("status") == "passed"
+            and len(concurrency.get("violations", [])) == 0
+            and fixture_statuses_ok
+            and negative_reuse_ok
+            and preallocated_rollback_ok
+        )
         ok = static_ok and static_violation_count == 0 and dynamic_ok and concurrency_ok
         set_gate(
             "command_contended_document_cardinality",
             ok,
-            f"static_ok={static_ok} dynamic_ok={dynamic_ok} concurrency_status={card.get('concurrency_fixtures', {}).get('status')}",
+            f"static_ok={static_ok} dynamic_ok={dynamic_ok} concurrency_status={concurrency.get('status')} "
+            f"four_fixtures={fixture_statuses_ok} negative_reuse={negative_reuse_ok} preallocated_rollback={preallocated_rollback_ok}",
         )
 
     # ---- legacy pages: inventory completeness + zero/nonzero branch + 4 conditional gates ----
@@ -410,6 +443,35 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
                 f"{authz_path}: member_baseline_no_behaviour_regression status={mb_status!r} "
                 f"is not one of {sorted(BRIDGE_GATE_STATUSES)}"
             )
+        if mb_status == "passed":
+            timeline = member_baseline.get("timeline", {})
+            writes = member_baseline.get("writes", {})
+            negatives = member_baseline.get("negative_controls", {})
+            fixture = member_baseline.get("fixture", {})
+            required_phases = {"before", "after_edit", "after_archive", "after_restore"}
+            surface_keys = {"rest", "mcp_http", "mcp_sse", "mcp_stdio", "cli"}
+            timeline_ok = required_phases == set(timeline) and all(
+                surface_keys <= set((timeline.get(phase, {}).get("normalized_objects", {})))
+                for phase in required_phases
+            )
+            lifecycle_writes_ok = all((writes.get(name) or {}).get("code") == 0 for name in ("archive", "restore"))
+            negatives_ok = (
+                (negatives.get("view_archive_denied") or {}).get("code") == 403
+                and negatives.get("view_denial_no_success_event") is True
+                and negatives.get("view_denial_status") == "active"
+                and (negatives.get("archive_expected_frontier_denied") or {}).get("code") != 0
+                and negatives.get("frontier_denial_status") == "active"
+            )
+            member_pass_evidence_ok = (
+                fixture.get("default_member_level") == "edit"
+                and fixture.get("inherit_from_parent_values") == "true"
+                and len(member_baseline.get("violations", [])) == 0
+                and timeline_ok
+                and lifecycle_writes_ok
+                and negatives_ok
+            )
+            if not member_pass_evidence_ok:
+                mb_status = "failed"
         gates["member_baseline_no_behaviour_regression"] = mb_status
         mb_detail = member_baseline.get("reason")
         reasons["member_baseline_no_behaviour_regression"] = (
