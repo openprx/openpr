@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::entities::webhook::{CreateWebhookRequest, UpdateWebhookRequest, WEBHOOK_EVENTS};
 use crate::{
     error::ApiError,
-    events::{BusinessEventInput, insert_business_event},
+    events::{BusinessEventInput, dispatcher::ensure_workspace_subscriber_slot, insert_business_event},
     outbound::validate_outbound_url,
     response::{ApiResponse, PaginatedData},
 };
@@ -254,6 +254,16 @@ pub async fn create_webhook(
     let active = req.enabled.or(req.active).unwrap_or(true);
 
     let tx = state.db.begin().await?;
+
+    // `subscribers_per_workspace_max` (`limits-v1.md`, `limit_kind: workspace_subscribers`, frozen
+    // at 100): a webhook is v0.4's only subscriber kind, so this endpoint is where a workspace's
+    // subscriber directory grows. Checked inside the transaction that inserts the row, and only
+    // for a row that would actually be active — an inactive webhook is not a subscriber (the
+    // dispatcher's own directory query and `webhook_trigger.rs` both require `active = true`).
+    if active {
+        ensure_workspace_subscriber_slot(&tx, workspace_id, None).await?;
+    }
+
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"INSERT INTO webhooks
@@ -392,6 +402,7 @@ pub async fn update_webhook(
         params.push(serde_json::to_value(&events).map_err(|_| ApiError::Internal)?.into());
         param_idx += 1;
     }
+    let activating = req.enabled.or(req.active).unwrap_or(false);
     if let Some(active) = req.enabled.or(req.active) {
         updates.push(format!("active = ${param_idx}"));
         params.push(active.into());
@@ -425,6 +436,16 @@ pub async fn update_webhook(
     );
 
     let tx = state.db.begin().await?;
+
+    // `subscribers_per_workspace_max` (`limits-v1.md`, `limit_kind: workspace_subscribers`):
+    // switching a webhook on grows the workspace's active subscriber directory exactly like
+    // creating one, so the same ceiling applies here. The webhook being updated is excluded from
+    // the tally and counted once as the slot it takes, so re-saving an already-active webhook in a
+    // workspace sitting exactly at the ceiling is not rejected.
+    if activating {
+        ensure_workspace_subscriber_slot(&tx, workspace_id, Some(webhook_id)).await?;
+    }
+
     let result = tx
         .execute(Statement::from_sql_and_values(DbBackend::Postgres, &sql, params))
         .await?;

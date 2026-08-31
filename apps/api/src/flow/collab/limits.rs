@@ -178,6 +178,28 @@ pub const IMPORT_ENTRY_COUNT_MAX: u64 = 100_000;
 /// `import_compression_ratio_max`.
 pub const IMPORT_COMPRESSION_RATIO_MAX: u64 = 100;
 
+/// `subscribers_per_workspace_max` (`limit_kind: workspace_subscribers`), frozen at 100 by
+/// `limits-v1.md` on 2026-08-31: the total number of active subscribers one workspace may hold
+/// (v0.4's only `subscriber_kind` is `webhook`). It is the dispatcher fan-out's amplification
+/// bound — one domain transaction always writes exactly one `event_dispatch` row, and expanding it
+/// may therefore create at most this many `event_deliveries` rows.
+///
+/// Deliberately **not** a `FlowLimitsV1` wire field: that schema is the document/collab bootstrap
+/// surface's client pre-check structure, and `limits-v1.md` states outright that the authorization
+/// and subscription ceilings do not enter it ("三者都不进入 v0.4 冻结的 `FlowLimitsV1` wire
+/// schema"). Its enforcement lives in `crate::events::dispatcher`
+/// ([`workspace_subscriber_count`](crate::events::dispatcher::workspace_subscriber_count) and
+/// friends), called both from the registration path (`crate::routes::webhook`) and from the
+/// dispatcher's own expansion path.
+///
+/// The contract's `rule` for this key ("使单次展开的 `event_deliveries` 插入量在 dispatcher 单次
+/// lease 预算内完成") is recorded there as **not binding**: the measured expansion cost is
+/// `2.606 + 0.433 * S` ms, so saturating `dispatch_lease_ttl_ms = 30_000` would take roughly
+/// 39,700 subscribers. The magnitude comes from the contract's own same-order anchor
+/// [`CONNECTIONS_PER_DOCUMENT_MAX`], and the measurement only shows that 100 leaves ~360x of lease
+/// headroom. Do not re-derive this value from a lease budget at runtime — it is a fixed ceiling.
+pub const SUBSCRIBERS_PER_WORKSPACE_MAX: i64 = 100;
+
 /// `FlowLimitsV1` (`limits-v1.md` "Bootstrap.limits wire schema"): the complete, non-empty,
 /// effective ceiling set every `Bootstrap` response must return verbatim — never partially
 /// assembled by an endpoint.

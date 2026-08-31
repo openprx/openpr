@@ -89,10 +89,13 @@ use api::events::dispatcher::run_tick;
 const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 const OUT_ENV: &str = "OPENPR_FLOW_DISPATCH_BUDGET_OUT";
 
-/// Subscriber counts the expansion cost is sampled at. The top of this ladder is deliberately far
-/// above anything a workspace would plausibly configure: the point is to find where expansion
-/// stops fitting inside a lease, not to confirm that eight subscribers are cheap.
-const SUBSCRIBER_LADDER: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
+/// Subscriber counts the expansion cost is sampled at. The point is to find where expansion stops
+/// fitting inside a lease, not to confirm that eight subscribers are cheap, so the ladder doubles
+/// until it reaches the ceiling itself: `subscribers_per_workspace_max` was frozen at 100 on
+/// 2026-08-31 and the dispatcher now refuses to expand a workspace past it, so a rung above 100
+/// would measure a state the implementation no longer permits. The affine fit over these rungs is
+/// what extrapolates the cost beyond the ceiling.
+const SUBSCRIBER_LADDER: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 100];
 /// Work items expanded per subscriber-count rung.
 const EXPANSIONS_PER_RUNG: usize = 25;
 /// Empty ticks used to establish the fixed per-tick cost.

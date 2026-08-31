@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::flow::collab::limits::SUBSCRIBERS_PER_WORKSPACE_MAX;
 use crate::outbound::validate_outbound_url;
 use crate::webhook_trigger::{WEBHOOK_SIGNATURE_HEADER, sign_payload};
 
@@ -105,13 +106,94 @@ const DELIVERY_LEASE_TTL_MS: i64 = WEBHOOK_REQUEST_TIMEOUT_MS * 3;
 /// `content_delivery_debounce_ms`, frozen at 2,000 by `limits-v1.md`.
 const CONTENT_DELIVERY_DEBOUNCE_MS: i64 = 2_000;
 
-/// `coalesced_source_events_max`. Rule: "取 debounce 窗口内单文档合并事件数的 p99 上界" — the
-/// structured block derives this from `content_delivery_debounce_ms=2000` and the frozen 10
-/// updates/s per-connection cap (`limits-v1.md`), i.e. at most ~20 accepted updates land in one
-/// 2-second debounce window; 64 (the same warm-cache entry count `flow::collab::limits` already
-/// uses elsewhere in this codebase for a similarly-derived per-document bound) gives 3x headroom
-/// above that p99 without letting a single row's `event_delivery_sources` fan-out grow unbounded.
-const COALESCED_SOURCE_EVENTS_MAX: i64 = 64;
+/// `coalesced_source_events_max`, frozen at 20 by `limits-v1.md`. Rule: "取 debounce 窗口内单文档
+/// 合并事件数的 p99 上界" — the structured block derives it from two values that are themselves
+/// frozen, `content_delivery_debounce_ms=2000` and the per-connection `updates_per_connection_
+/// _per_second=10`: at most 10 x 2 = 20 accepted updates can land in one 2-second debounce window,
+/// so 20 *is* that p99 upper bound.
+///
+/// This constant used to be 64 "for 3x headroom", where the 64 was borrowed from
+/// `flow::collab::limits`'s warm-cache entry count — a number from another domain, which is
+/// exactly the invented value `limits-v1.md` forbids. It is also not free: because the debounce is
+/// *trailing*, at the frozen 10 updates/s the cap itself is what closes the window, so the cap is
+/// paid directly in content-delivery latency (measured 8317 ms at 64, about 4.0 s at 20) and buys
+/// only a larger full-window body (9216 B at 20 vs. 10932 B at 64).
+const COALESCED_SOURCE_EVENTS_MAX: i64 = 20;
+
+/// The `limit_kind` `limits-v1.md` freezes for [`SUBSCRIBERS_PER_WORKSPACE_MAX`]; every rejection
+/// this module raises for that ceiling reports it verbatim.
+pub const WORKSPACE_SUBSCRIBERS_LIMIT_KIND: &str = "workspace_subscribers";
+
+/// Active subscribers in one workspace, judged by exactly the predicate [`expand_work`] and
+/// `webhook_trigger.rs` already use for "active" (`events-v1.md` "订阅目录与 active 的判据":
+/// "与源码...`WHERE active = true` 同一判据，不另立标准"). v0.4's only `subscriber_kind` is
+/// `webhook`, so this is the workspace's whole subscriber directory.
+///
+/// Counted without the `events ? type` filter on purpose: `subscribers_per_workspace_max` bounds
+/// the workspace's *subscriber total*, not the subset that happens to match one event type.
+pub async fn workspace_subscriber_count<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<i64, ApiError> {
+    workspace_subscriber_count_excluding(conn, workspace_id, None).await
+}
+
+/// [`workspace_subscriber_count`] with one subscriber left out of the tally — the row an update is
+/// about to switch on, which must not be counted both as "already there" and as "the one being
+/// added". `NULL` excludes nothing.
+async fn workspace_subscriber_count_excluding<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    excluded: Option<Uuid>,
+) -> Result<i64, ApiError> {
+    Ok(CountRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT COUNT(*) AS count FROM webhooks \
+         WHERE workspace_id = $1 AND active = true AND ($2::uuid IS NULL OR id <> $2)",
+        vec![workspace_id.into(), excluded.into()],
+    ))
+    .one(conn)
+    .await?
+    .map_or(0, |row| row.count))
+}
+
+/// The one place a `subscribers_per_workspace_max` rejection is built, so the registration path and
+/// the expansion path cannot report the ceiling differently. Carries the frozen `limit_kind` plus
+/// the numeric `limit`/`observed` that `error-mapping-v1.md` defines for `limit_exceeded`.
+fn workspace_subscribers_limit_exceeded(observed: i64) -> ApiError {
+    ApiError::limit_exceeded(
+        format!(
+            "limit_exceeded: {WORKSPACE_SUBSCRIBERS_LIMIT_KIND} (at most {SUBSCRIBERS_PER_WORKSPACE_MAX} active subscribers per workspace)"
+        ),
+        WORKSPACE_SUBSCRIBERS_LIMIT_KIND,
+        Some(json!(SUBSCRIBERS_PER_WORKSPACE_MAX)),
+        Some(json!(observed)),
+        None,
+    )
+}
+
+/// Registration ceiling for `subscribers_per_workspace_max`: called before a workspace gains one
+/// more *active* subscriber (a created webhook, or an existing one being switched back on).
+///
+/// This is the "拒绝 ceiling" half of the contract row — the exact ceiling is accepted, the one
+/// past it is refused with `limit_exceeded{limit_kind:"workspace_subscribers"}`, and nothing
+/// already registered is silently dropped (the same shape `limits-v1.md` spells out for
+/// `object_grants_max`: "达到上限即拒绝新增条目，不静默截断已有授予"). It is *not* the delivery-budget
+/// shape of `coalesced_source_events_max`, which raises no `limit_exceeded` at all: this key sits
+/// in the contract's authorization/subscription table, and `workspace_subscribers` enters the
+/// `limit_kind` universe (and therefore `error_kind_coverage.expected[]`) the moment it is frozen.
+/// `becoming_active` names an existing subscriber row that this write is switching on, so it is
+/// excluded from the "already there" tally and counted once, as the slot being taken; pass `None`
+/// when a brand-new row is being inserted. An update that leaves an already-active subscriber
+/// active therefore stays accepted even in a workspace sitting exactly at the ceiling.
+pub async fn ensure_workspace_subscriber_slot<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    becoming_active: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let current = workspace_subscriber_count_excluding(conn, workspace_id, becoming_active).await?;
+    if current + 1 > SUBSCRIBERS_PER_WORKSPACE_MAX {
+        return Err(workspace_subscribers_limit_exceeded(current + 1));
+    }
+    Ok(())
+}
 
 /// `changed_block_ids_per_delivery_max`. Rule: "使投递体在 p99 合并窗口下仍显著小于订阅端常见
 /// 请求体上限" — 200 UUIDs is ~7KB of JSON, well under typical webhook body limits even stacked
@@ -554,13 +636,47 @@ async fn expand_work(
 ) -> Result<ExpansionOutcome, ApiError> {
     let tx = db.begin().await?;
 
+    // `subscribers_per_workspace_max` = 100 (`limits-v1.md`, `limit_kind: workspace_subscribers`)
+    // on the expansion path. The contract's row for this key describes it as the **dispatcher
+    // fan-out amplification bound**: one domain transaction writes exactly one `event_dispatch`
+    // row, and expanding it may produce at most this many `event_deliveries` rows.
+    //
+    // A workspace over the ceiling makes the expansion refuse rather than expand a truncated
+    // subset: the contract's rejection ceilings say "达到上限即拒绝新增条目，不静默截断已有" — a
+    // silently dropped subscriber would be exactly that silent truncation, and it would be
+    // invisible (the delivery it should have got simply never exists). Refusing raises
+    // `limit_exceeded{limit_kind:"workspace_subscribers"}`, which [`expand_one`] turns into the
+    // ordinary expansion-failure path (`attempts + 1`, backoff, dead-letter at `max_attempts`
+    // with `last_error_code`) — loud, bounded and operator-visible.
+    //
+    // [`ensure_workspace_subscriber_slot`] on the registration path is what keeps this unreachable
+    // in practice: a workspace can only cross the ceiling through rows written before this ceiling
+    // existed, or written around the API. This is a fixed contract anchor, deliberately *not* a
+    // lease-budget computation — `limits-v1.md` records that its own `rule` cannot bind (expansion
+    // would need ~39,700 subscribers to saturate `dispatch_lease_ttl_ms`).
+    let subscriber_total = workspace_subscriber_count(&tx, work.workspace_id).await?;
+    if subscriber_total > SUBSCRIBERS_PER_WORKSPACE_MAX {
+        tx.rollback().await?;
+        return Err(workspace_subscribers_limit_exceeded(subscriber_total));
+    }
+
     // "active" subscribers, judged the same way `webhook_trigger.rs`'s existing fan-out judges
     // them (`events-v1.md` "订阅目录与 active 的判据": "与源码...WHERE active = true AND events ?
     // $2 同一判据，不另立标准"). v0.4's only `subscriber_kind` is `webhook`.
+    //
+    // `LIMIT` restates the same ceiling structurally, so the "at most
+    // `subscribers_per_workspace_max` delivery rows per work item" invariant holds for this query
+    // even if a subscriber were inserted between the count above and this select. The guard above
+    // is what makes that limit unreachable rather than a silent truncation.
     let subscribers = SubscriberRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT id FROM webhooks WHERE workspace_id = $1 AND active = true AND events ? $2",
-        vec![work.workspace_id.into(), work.event_type.clone().into()],
+        "SELECT id FROM webhooks WHERE workspace_id = $1 AND active = true AND events ? $2 \
+         ORDER BY id LIMIT $3",
+        vec![
+            work.workspace_id.into(),
+            work.event_type.clone().into(),
+            SUBSCRIBERS_PER_WORKSPACE_MAX.into(),
+        ],
     ))
     .all(&tx)
     .await?;
@@ -1326,10 +1442,12 @@ mod dispatcher_database_tests {
 
     use super::{
         DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B, OLDEST_PENDING_AGE_ALERT_MS,
-        backlog_alert, build_delivery_body, dispatcher_is_live, dispatcher_is_live_since, expand_one,
-        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_source_tombstones,
-        reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases, requeue_failed, run_tick, send_one,
+        SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body, dispatcher_is_live,
+        dispatcher_is_live_since, ensure_workspace_subscriber_slot, expand_one, oldest_pending_delivery_age_ms,
+        oldest_pending_dispatch_age_ms, reap_delivery_source_tombstones, reclaim_expired_delivery_leases,
+        reclaim_expired_dispatch_leases, requeue_failed, run_tick, send_one, workspace_subscriber_count,
     };
+    use crate::error::ApiError;
     use crate::events::{BusinessEventInput, insert_business_event};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -1773,6 +1891,196 @@ mod dispatcher_database_tests {
             .try_get("", "status")
             .expect("status column reads");
         assert_eq!(dispatch_status, "no_subscribers");
+
+        scratch.drop_self().await;
+    }
+
+    /// The `subscribers_per_workspace_max` ceiling, both halves, on the path the contract's row
+    /// describes ("dispatcher fan-out 的放大边界"): a workspace holding exactly
+    /// `SUBSCRIBERS_PER_WORKSPACE_MAX` active subscribers expands normally and produces exactly
+    /// that many `event_deliveries` rows, and one subscriber past it makes the expansion refuse
+    /// with `limit_exceeded{limit_kind:"workspace_subscribers"}` instead of quietly expanding a
+    /// truncated subset. The `+1` arm writes the extra subscriber straight to the table, because
+    /// `ensure_workspace_subscriber_slot` refuses it through the registration path -- the state
+    /// under test is one only pre-ceiling rows (or a write around the API) can produce.
+    #[tokio::test]
+    async fn workspace_subscribers_exact_boundary_expands_and_the_next_subscriber_is_rejected_with_the_frozen_limit_kind()
+     {
+        let scratch = scratch_or_skip!("workspace-subscribers-ceiling");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        const CEILING: i64 = SUBSCRIBERS_PER_WORKSPACE_MAX;
+
+        for _ in 0..CEILING {
+            seed_webhook(
+                &scratch.db,
+                workspace_id,
+                "http://example.invalid/hook",
+                &["flow.object.created"],
+            )
+            .await;
+        }
+        assert_eq!(
+            workspace_subscriber_count(&scratch.db, workspace_id)
+                .await
+                .expect("subscriber count query runs"),
+            CEILING,
+            "the exact ceiling must be reachable, not one short of it"
+        );
+
+        // Exact boundary: accepted, and the fan-out is exactly the ceiling.
+        let at_ceiling =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        let outcome = expand_one(&scratch.db)
+            .await
+            .expect("expansion at the exact ceiling runs")
+            .expect("the committed work item is pending");
+        assert!(matches!(outcome, ExpansionOutcome::Expanded), "{outcome:?}");
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![at_ceiling.into()],
+            )
+            .await,
+            CEILING,
+            "one work item at the ceiling must expand into exactly SUBSCRIBERS_PER_WORKSPACE_MAX deliveries"
+        );
+
+        // Boundary + 1.
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let past_ceiling =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        let err = expand_one(&scratch.db)
+            .await
+            .expect_err("expansion must refuse a workspace past subscribers_per_workspace_max");
+        let ApiError::Typed { kind, details, .. } = &err else {
+            panic!("expected a typed limit_exceeded rejection, got {err:?}");
+        };
+        assert_eq!(kind.stable_code(), "limit_exceeded");
+        let details = details.as_ref().expect("limit_exceeded always carries details");
+        assert_eq!(details["limit_kind"], json!("workspace_subscribers"));
+        assert_eq!(details["limit"], json!(CEILING));
+        assert_eq!(details["observed"], json!(CEILING + 1));
+
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id = $1",
+                vec![past_ceiling.into()],
+            )
+            .await,
+            0,
+            "a refused expansion must not write a single delivery row"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE source_event_id = $1",
+                vec![past_ceiling.into()],
+            )
+            .await,
+            0,
+            "a refused expansion must not reserve a single source row either"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM business_events WHERE id = $1",
+                vec![past_ceiling.into()],
+            )
+            .await,
+            1,
+            "the canonical business_events row is untouched by a refused expansion"
+        );
+        let status: String = get_col(
+            &scratch.db,
+            "SELECT status FROM event_dispatch WHERE event_id = $1",
+            vec![past_ceiling.into()],
+            "status",
+        )
+        .await;
+        assert_eq!(
+            status, "pending",
+            "a refused expansion goes back to pending, not expanded"
+        );
+        let attempts: i32 = get_col(
+            &scratch.db,
+            "SELECT attempts FROM event_dispatch WHERE event_id = $1",
+            vec![past_ceiling.into()],
+            "attempts",
+        )
+        .await;
+        assert_eq!(
+            attempts, 1,
+            "the refusal is charged as one expansion attempt, so it dead-letters instead of spinning"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The registration half of the same ceiling: the subscriber that lands exactly on
+    /// `SUBSCRIBERS_PER_WORKSPACE_MAX` is accepted, the next one is refused with the frozen
+    /// `limit_kind`, an already-active subscriber can still be re-saved at the ceiling, and an
+    /// inactive webhook does not occupy a slot (the dispatcher's directory query requires
+    /// `active = true`, so neither may this).
+    #[tokio::test]
+    async fn workspace_subscribers_registration_ceiling_rejects_the_subscriber_past_the_frozen_maximum() {
+        let scratch = scratch_or_skip!("workspace-subscribers-registration");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        const CEILING: i64 = SUBSCRIBERS_PER_WORKSPACE_MAX;
+
+        let mut last = Uuid::nil();
+        for _ in 0..(CEILING - 1) {
+            last = seed_webhook(
+                &scratch.db,
+                workspace_id,
+                "http://example.invalid/hook",
+                &["flow.object.created"],
+            )
+            .await;
+        }
+        ensure_workspace_subscriber_slot(&scratch.db, workspace_id, None)
+            .await
+            .expect("the subscriber landing exactly on the ceiling is accepted");
+
+        let at_ceiling = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let err = ensure_workspace_subscriber_slot(&scratch.db, workspace_id, None)
+            .await
+            .expect_err("the subscriber past the ceiling is refused");
+        let ApiError::Typed { kind, details, .. } = &err else {
+            panic!("expected a typed limit_exceeded rejection, got {err:?}");
+        };
+        assert_eq!(kind.stable_code(), "limit_exceeded");
+        let details = details.as_ref().expect("limit_exceeded always carries details");
+        assert_eq!(details["limit_kind"], json!("workspace_subscribers"));
+        assert_eq!(details["limit"], json!(CEILING));
+        assert_eq!(details["observed"], json!(CEILING + 1));
+
+        ensure_workspace_subscriber_slot(&scratch.db, workspace_id, Some(at_ceiling))
+            .await
+            .expect("re-saving an already-active subscriber at the ceiling is not a new slot");
+
+        exec(
+            &scratch.db,
+            "UPDATE webhooks SET active = false WHERE id = $1",
+            vec![last.into()],
+        )
+        .await;
+        ensure_workspace_subscriber_slot(&scratch.db, workspace_id, None)
+            .await
+            .expect("an inactive webhook is not a subscriber and frees its slot");
 
         scratch.drop_self().await;
     }
@@ -3188,9 +3496,10 @@ mod dispatcher_database_tests {
         .await;
         let document_id = Uuid::new_v4();
 
-        // COALESCED_SOURCE_EVENTS_MAX is 64 (private to this module): committing and expanding 65
-        // sequential accepted updates on the same document must fill exactly one row to the cap and
-        // open a second one for the overflow event, never drop or summarize a source entry.
+        // COALESCED_SOURCE_EVENTS_MAX is 20 (private to this module, read through `super::` below
+        // rather than restated): committing and expanding CAP+1 sequential accepted updates on the
+        // same document must fill exactly one row to the cap and open a second one for the overflow
+        // event, never drop or summarize a source entry.
         const CAP: i64 = super::COALESCED_SOURCE_EVENTS_MAX;
         for seq in 1..=(CAP + 1) {
             commit_dispatch_work(

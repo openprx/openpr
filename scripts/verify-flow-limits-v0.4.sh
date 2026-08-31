@@ -253,12 +253,17 @@ COLLAB_CORE_ISOLATED_APPLY_WORKER_RS="$REPO_ROOT/crates/collab-core/src/bin/isol
 # flow/query.rs alone -- read it too so a real boundary test written here (rather than in
 # query.rs, which has none) can actually be found.
 ROUTES_FLOW_RS="$REPO_ROOT/apps/api/src/routes/flow.rs"
+# `workspace_subscribers`'s registration ceiling lives in the webhook subscription endpoints
+# (v0.4's only `subscriber_kind` is `webhook`), so its enforcement call sites cannot be seen from
+# any of the collab/flow modules above. Read it too, or this limit_kind's case would report
+# "verified absent" while a real call site sits in a file this script never opened.
+ROUTES_WEBHOOK_RS="$REPO_ROOT/apps/api/src/routes/webhook.rs"
 for f in "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_CORE_ERROR_RS" "$REGISTRY_RS" "$SESSION_RS" \
          "$WRITE_RS" "$COMMAND_RS" "$QUERY_RS" "$BOOTSTRAP_RS" "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" \
          "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" "$COLLAB_CORE_ISOLATION_LIMITS_RS" \
          "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
          "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS" \
-         "$ROUTES_FLOW_RS"; do
+         "$ROUTES_FLOW_RS" "$ROUTES_WEBHOOK_RS"; do
   if [[ ! -f "$f" ]]; then
     echo "FAIL: source file not found (nothing to statically verify): $f" >&2
     exit 2
@@ -280,7 +285,7 @@ if ! python3 - "$CONTRACT_PATH" "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_C
       "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" \
       "$COLLAB_CORE_ISOLATION_LIMITS_RS" "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
       "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS" \
-      "$ROUTES_FLOW_RS" "$V08_GATE_YAML" "$V05_GATE_YAML" \
+      "$ROUTES_FLOW_RS" "$ROUTES_WEBHOOK_RS" "$V08_GATE_YAML" "$V05_GATE_YAML" \
       > "$STATIC_JSON_FILE" 2>"$EVIDENCE_ROOT/logs/limits.static.err.log" <<'PY'
 import json
 import re
@@ -290,7 +295,8 @@ import sys
  write_rs, command_rs, query_rs, bootstrap_rs, error_rs, response_rs, dispatcher_rs, migration_sql,
  frontend_types_ts, frontend_limits_ts, collab_core_isolation_limits_rs, collab_core_isolation_host_rs,
  collab_core_isolation_alloc_rs, collab_core_isolation_child_runtime_rs,
- collab_core_isolated_apply_worker_rs, routes_flow_rs, v08_gate_yaml, v05_gate_yaml) = sys.argv[1:25]
+ collab_core_isolated_apply_worker_rs, routes_flow_rs, routes_webhook_rs, v08_gate_yaml,
+ v05_gate_yaml) = sys.argv[1:26]
 
 
 def read(p):
@@ -300,13 +306,57 @@ def read(p):
 
 contract = read(contract_path)
 
+def _yaml_block(key):
+    """The indented body of `key:`'s own structured block in the contract, or ""."""
+    block_m = re.search(r"^" + re.escape(key) + r":\n((?:[ \t]+\S.*\n)+)", contract, re.M)
+    return block_m.group(1) if block_m else ""
+
+
+def frozen_status_in_yaml_block(key):
+    """The frozen number a key's structured YAML block declares, or None if it declares none.
+
+    Several ceilings' fixed-value table rows delegate their status to a block below the table
+    ("`set_by`/`rule` 见下方结构化块"), and that block -- not the value cell -- is where
+    limits-v1.md records the freeze: `subscribers_per_workspace_max`'s row still reads
+    `status: unset` while its block reads `status: 100 # 2026-08-31 冻结` with a `frozen_at`.
+
+    Deliberately strict, so this can never excuse a budget nobody froze: it takes a block only
+    when the block carries BOTH a numeric `status:` AND a `frozen_at:` date -- strictly more
+    evidence than the bare number a value cell carries. A block saying `status: unset`
+    (`object_grants_max` today), a key with no block at all, or a number with no `frozen_at`
+    all leave the key exactly as unset as its row says it is.
+    """
+    block = _yaml_block(key)
+    if not block:
+        return None
+    status_m = re.search(r"^\s*status:\s*([0-9][0-9,_]*)\s*(?:#.*)?$", block, re.M)
+    if status_m is None:
+        return None
+    if not re.search(r"^\s*frozen_at:\s*\S", block, re.M):
+        raise ValueError(
+            f"budget {key!r}'s structured block declares a numeric `status:` but no `frozen_at:` -- "
+            "refusing to treat it as frozen"
+        )
+    return int(status_m.group(1).replace(",", "").replace("_", ""))
+
+
 row_re = re.compile(r"^\|\s*`([a-z0-9_]+)`\s*\|\s*([^|]+?)\s*\|\s*`([a-z0-9_]+)`\s*\|", re.M)
 rows = []
+# key -> the value its structured block froze while its own table row still says `status: unset`.
+# Reported in the evidence so a reader can see exactly which rows were judged by their block
+# rather than by their value cell, instead of that being an invisible parser behaviour.
+block_frozen_status = {}
 for m in row_re.finditer(contract):
     key, raw_value, limit_kind = m.group(1), m.group(2), m.group(3)
     is_unset = "unset" in raw_value
     value = None
-    if not is_unset:
+    if is_unset:
+        block_value = frozen_status_in_yaml_block(key)
+        if block_value is not None:
+            block_frozen_status[key] = block_value
+            is_unset = False
+            value = block_value
+    if not is_unset and value is None:
         num_m = re.search(r"(\d[\d,]*)", raw_value)
         if num_m:
             value = int(num_m.group(1).replace(",", ""))
@@ -397,9 +447,13 @@ deferred_or_unset_rows = [r for r in rows if r["unset"] or r["limit_kind"] in V0
 expected_limit_kinds = sorted({r["limit_kind"] for r in v0_4_rows})
 fixed_limit_kind_count = len({r["limit_kind"] for r in fixed_limit_rows})
 evaluated_limit_kind_count = len(expected_limit_kinds)
-if fixed_limit_kind_count != 32 or evaluated_limit_kind_count != 28 or len(version_boundary_exemptions) != 4:
+# 33 = 29 + 4 since 2026-08-31: freezing `subscribers_per_workspace_max` brought
+# `workspace_subscribers` into the limit_kind universe, exactly as limits-v1.md says it must
+# ("`workspace_subscribers` 随 v0.4 投递底座进入 `limit_kind` 全集" / "值处于 `unset` 的
+# `limit_kind`...冻结后再纳入"). It was 32 = 28 + 4 while that key was unset.
+if fixed_limit_kind_count != 33 or evaluated_limit_kind_count != 29 or len(version_boundary_exemptions) != 4:
     raise ValueError(
-        "v0.4 limit-kind accounting must be exactly 32 = 28 evaluated + 4 version-boundary "
+        "v0.4 limit-kind accounting must be exactly 33 = 29 evaluated + 4 version-boundary "
         f"exemptions, got {fixed_limit_kind_count} = {evaluated_limit_kind_count} + "
         f"{len(version_boundary_exemptions)}"
     )
@@ -433,6 +487,7 @@ collab_core_isolation_alloc_text = read(collab_core_isolation_alloc_rs)
 collab_core_isolation_child_runtime_text = read(collab_core_isolation_child_runtime_rs)
 collab_core_isolated_apply_worker_text = read(collab_core_isolated_apply_worker_rs)
 routes_flow_rs_text = read(routes_flow_rs)
+routes_webhook_rs_text = read(routes_webhook_rs)
 
 const_re = re.compile(r"pub const (\w+):\s*[\w<>&']+\s*=\s*([\d_]+)\s*;")
 rust_consts = {m.group(1): int(m.group(2).replace("_", "")) for m in const_re.finditer(limits_rs_text)}
@@ -621,6 +676,9 @@ TEST_SOURCE_TEXT_PARTS = (
     # in the REST route handler file, not in flow/query.rs (which has no #[test] at all for this
     # limit_kind) -- see the ROUTES_FLOW_RS read above.
     ("routes/flow.rs", routes_flow_rs_text),
+    # `workspace_subscribers`'s registration surface -- read for the same reason routes/flow.rs is:
+    # a boundary test written next to the enforcement it proves must be findable here.
+    ("routes/webhook.rs", routes_webhook_rs_text),
 )
 TEST_SOURCE_BY_LABEL = {label: text for label, text in TEST_SOURCE_TEXT_PARTS}
 ALL_TEST_FN_NAMES = [
@@ -738,8 +796,35 @@ findings["boundary_test_covering"] = {
         # same shape as a hardcoded "failed", just one indirection further away.
         ("bootstrap_decoded_bytes", "BOOTSTRAP_DECODED_BYTES_MAX"),
         ("bootstrap_response_bytes", "BOOTSTRAP_RESPONSE_BYTES_MAX"),
+        # Frozen 2026-08-31; its exact/+1 boundary tests live in events/dispatcher.rs, which this
+        # scan already reads.
+        ("workspace_subscribers", "SUBSCRIBERS_PER_WORKSPACE_MAX"),
     )
 }
+
+# `workspace_subscribers`: the ceiling is declared in apps/api/src/flow/collab/limits.rs (its
+# wire-report/declaration home, excluded here exactly like every other constant's) and enforced in
+# the dispatcher's expansion path plus the webhook subscription endpoints that grow the directory.
+# Counted across both files, so "wired" means a real call site outside the declaration.
+# dispatcher.rs's own `#[cfg(test)] mod dispatcher_database_tests` is cut off first: a reference
+# from a test proves a test exists, not that production code enforces anything, and counting one
+# as an enforcement call site is exactly the false green this whole verifier exists to refuse.
+dispatcher_production_text = dispatcher_text.split("mod dispatcher_database_tests {", 1)[0]
+# The two paths are counted separately, so the case's prose can name only the ones that actually
+# exist: a single total lets a reason keep crediting an expansion guard that has been deleted while
+# the constant's own declaration and doc comments keep the number positive.
+expand_work_m = re.search(r"\nasync fn expand_work\(.*?\n\}\n", dispatcher_production_text, re.S)
+expand_work_text = expand_work_m.group(0) if expand_work_m else ""
+findings["subscribers_per_workspace_max_expansion_guard_call_sites"] = count(
+    r"workspace_subscriber_count\(|SUBSCRIBERS_PER_WORKSPACE_MAX", expand_work_text
+)
+findings["subscribers_per_workspace_max_registration_call_sites"] = count(
+    r"ensure_workspace_subscriber_slot\(", routes_webhook_rs_text
+)
+findings["subscribers_per_workspace_max_referenced_outside_limits_rs"] = (
+    findings["subscribers_per_workspace_max_expansion_guard_call_sites"]
+    + findings["subscribers_per_workspace_max_registration_call_sites"]
+)
 
 findings["bootstrap_rs_mentions_limit_exceeded"] = "limit_exceeded" in bootstrap_text
 findings["bootstrap_rs_mentions_bootstrap_decoded_bytes"] = "bootstrap_decoded_bytes" in bootstrap_text
@@ -893,7 +978,12 @@ delivery_cross_check["delivery_max_attempts"]["matches"] = (
 # the only way `dispatch_numeric_budgets_locked` can see that most
 # delivery-path budgets are still unset.
 unset_status_re = re.compile(r"^\|\s*`([a-z0-9_]+)`\s*\|\s*`status: unset`", re.M)
-all_unset_status_keys = sorted(set(unset_status_re.findall(contract)))
+# A row whose structured block froze the value (see `frozen_status_in_yaml_block`) is not still
+# unset, however its value cell reads -- the same resolution the fixed-row parse above applies, so
+# the two cannot disagree about which budgets this release still owes.
+all_unset_status_keys = sorted(
+    {k for k in unset_status_re.findall(contract) if frozen_status_in_yaml_block(k) is None}
+)
 # Population of this gate's freeze floor: every `status: unset` budget row in the contract. What
 # leaves this set has to be justified key by key below; nothing leaves it by pattern or by table.
 v08_gate_text = read(v08_gate_yaml)
@@ -1073,6 +1163,7 @@ print(json.dumps({
     "expected_limit_kinds": expected_limit_kinds,
     "fixed_limit_kind_count": fixed_limit_kind_count,
     "evaluated_limit_kind_count": evaluated_limit_kind_count,
+    "block_frozen_status": block_frozen_status,
     "version_boundary_exemptions": [version_boundary_exemptions[k] for k in sorted(version_boundary_exemptions)],
     "v0_4_rows": v0_4_rows,
     "deferred_or_unset_rows": deferred_or_unset_rows,
@@ -1201,6 +1292,7 @@ DB_LOGS=(
   "$LOG_DIR/limits.dyn.session_observable_kinds.log"
   "$LOG_DIR/limits.dyn.session_user_connections_kind.log"
   "$LOG_DIR/limits.dyn.session_wire_boundaries.log"
+  "$LOG_DIR/limits.dyn.workspace_subscribers_ceiling.log"
 )
 if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
   for f in "${DB_LOGS[@]}"; do
@@ -1247,6 +1339,13 @@ else
   set -e
   set +e
   ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::session::database_tests::" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_wire_boundaries.log" 2>&1
+  set -e
+  # `workspace_subscribers` (`subscribers_per_workspace_max`, frozen 2026-08-31): the exact/+1
+  # boundary on both enforcement paths -- the dispatcher expansion guard and the registration
+  # ceiling -- lives in events/dispatcher.rs's DB-backed suite, which no filter above reaches.
+  echo "  running: cargo test -p api events::dispatcher::...workspace_subscribers_... (DB-backed)" >&2
+  set +e
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "events::dispatcher::dispatcher_database_tests::workspace_subscribers_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.workspace_subscribers_ceiling.log" 2>&1
   set -e
   if grep -q "skipped: OPENPR_TEST_DATABASE_URL is not set" "${DB_LOGS[@]}" 2>/dev/null; then
     DB_SKIPPED=1
@@ -1781,6 +1880,94 @@ for key, limit_kind, const in (
         evidence={f"{const.lower()}_referenced_outside_limits_rs": ref_count, "boundary_test_covering": scan_test},
     ))
 
+# ---- workspace_subscribers (`subscribers_per_workspace_max`, frozen at 100 on 2026-08-31) ----
+#
+# This ceiling is enforced on two paths that have to agree, so both are required here: the
+# registration path (apps/api/src/routes/webhook.rs -- v0.4's only `subscriber_kind` is `webhook`,
+# so that endpoint is where a workspace's subscriber directory grows, and where a caller is refused
+# with `limit_exceeded{limit_kind:"workspace_subscribers"}`), and the dispatcher's own expansion
+# path (apps/api/src/events/dispatcher.rs -- the "dispatcher fan-out 的放大边界" the contract row
+# describes: one `event_dispatch` row may expand into at most this many `event_deliveries` rows).
+#
+# Same three-part evidence shape as every case above -- call sites outside the constant's own
+# declaration, a real boundary test found by name, and that test currently passing -- never a fixed
+# verdict.
+WORKSPACE_SUBSCRIBERS_TESTS = (
+    "workspace_subscribers_exact_boundary_expands_and_the_next_subscriber_is_rejected_with_the_frozen_limit_kind",
+    "workspace_subscribers_registration_ceiling_rejects_the_subscriber_past_the_frozen_maximum",
+)
+ws_row = row_by_kind["workspace_subscribers"]
+ws_expansion_sites = f.get("subscribers_per_workspace_max_expansion_guard_call_sites", 0)
+ws_registration_sites = f.get("subscribers_per_workspace_max_registration_call_sites", 0)
+ws_refs = f.get("subscribers_per_workspace_max_referenced_outside_limits_rs", 0)
+ws_named_test = f["boundary_test_covering"].get("workspace_subscribers")
+ws_test_statuses = {name: dtest(name) for name in WORKSPACE_SUBSCRIBERS_TESTS}
+# Both paths are required: the contract row calls this the dispatcher fan-out bound (expansion),
+# and the same table's ceilings reject the caller who would cross them (registration). One without
+# the other is half a ceiling.
+ws_passed = (
+    ws_expansion_sites > 0
+    and ws_registration_sites > 0
+    and ws_named_test is not None
+    and all(status == "ok" for status in ws_test_statuses.values())
+)
+boundary_cases.append(case(
+    "subscribers_per_workspace_max", "workspace_subscribers", ws_row["value"],
+    "passed" if ws_passed else "failed",
+    (
+        f"events/dispatcher.rs::expand_work names this ceiling {ws_expansion_sites} time(s) (the "
+        f"fan-out guard), and routes/webhook.rs calls ensure_workspace_subscriber_slot "
+        f"{ws_registration_sites} time(s) (the registration ceiling)"
+        + (
+            ""
+            if ws_expansion_sites > 0 and ws_registration_sites > 0
+            else " -- both paths are required and one of them is absent"
+        )
+    )
+    + (
+        f"; boundary test found: {ws_named_test}; required tests: {ws_test_statuses}"
+        if ws_named_test
+        else "; no test exercising the exact 100-accepted/101-rejected boundary was found by the "
+        f"name scan; required tests: {ws_test_statuses}"
+    ),
+    exact={
+        "accepted": (
+            dtest(WORKSPACE_SUBSCRIBERS_TESTS[0]) == "ok"
+            if dtest(WORKSPACE_SUBSCRIBERS_TESTS[0]) is not None
+            else None
+        ),
+        "head_after": (
+            "n/a: this ceiling has no document head; the expansion test asserts the exact ceiling "
+            "expands into exactly SUBSCRIBERS_PER_WORKSPACE_MAX event_deliveries rows"
+            if ws_test_statuses[WORKSPACE_SUBSCRIBERS_TESTS[0]] == "ok"
+            else "n/a: no passing boundary test to observe it from"
+        ),
+    },
+    plus_one={
+        "code": "limit_exceeded" if ws_passed else None,
+        "limit_kind": "workspace_subscribers" if ws_passed else None,
+        "head_unchanged": None,
+        "event_dispatch_zero": (
+            # The expansion test asserts the refused work item wrote zero `event_deliveries` and
+            # zero `event_delivery_sources` rows, left its `business_events` row untouched, and went
+            # back to `pending` with a single charged attempt.
+            True if ws_test_statuses[WORKSPACE_SUBSCRIBERS_TESTS[0]] == "ok" else None
+        ),
+    },
+    evidence={
+        "subscribers_per_workspace_max_referenced_outside_limits_rs": ws_refs,
+        "subscribers_per_workspace_max_expansion_guard_call_sites": ws_expansion_sites,
+        "subscribers_per_workspace_max_registration_call_sites": ws_registration_sites,
+        "boundary_test_covering": ws_named_test,
+        "required_tests": ws_test_statuses,
+        "contract_row_status_source": (
+            "structured block (`status: 100`, `frozen_at: 2026-08-31`)"
+            if "subscribers_per_workspace_max" in static.get("block_frozen_status", {})
+            else "fixed-value table row"
+        ),
+    },
+))
+
 if len(boundary_cases) != len(static["expected_limit_kinds"]):
     print(json.dumps({"error": f"boundary_cases ({len(boundary_cases)}) does not cover exactly the "
                                 f"v0.4 expected_limit_kinds ({len(static['expected_limit_kinds'])})"}))
@@ -2061,6 +2248,10 @@ WIRE_KIND_TESTS = {
         "per_workspace_connection_ceiling_is_enforced",
         "every_connection_ceiling_renders_its_frozen_limit_kind_and_limit_into_the_rejection_frame",
     ],
+    # Both tests assert the rejection carries `limit_kind: "workspace_subscribers"` with the
+    # numeric `limit` and `observed`, one on the dispatcher's expansion path and one on the
+    # registration path.
+    "workspace_subscribers": list(WORKSPACE_SUBSCRIBERS_TESTS),
 }
 privacy_omits_observed = {
     "user_connections",
