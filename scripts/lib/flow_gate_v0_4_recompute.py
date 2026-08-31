@@ -303,48 +303,73 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         ):
             reasons[g] = f"missing/unreadable {inv_path}"
     else:
-        kinds = [e.get("kind") for e in inv.get("environments", [])]
-        complete = sorted(kinds) == ["development", "target_deployment", "test"]
-        total_rows = inv.get("total_rows")
-        dist_ok = True
-        for e in inv.get("environments", []):
-            dist_sum = sum(d.get("row_count", 0) for d in e.get("workspace_distribution", []))
-            if dist_sum != e.get("row_count"):
-                dist_ok = False
-        computed_total = sum(e.get("row_count", 0) for e in inv.get("environments", []))
-        total_ok = total_rows == computed_total
-        set_gate(
-            "legacy_pages_inventory_three_environments_complete",
-            complete and dist_ok and total_ok,
-            f"kinds={sorted(kinds)} dist_sums_ok={dist_ok} total_rows={total_rows} computed_total={computed_total}",
-        )
-
-        if total_rows == 0:
-            set_gate("legacy_pages_zero_or_importer_surface_available", True, "total_rows=0: zero branch, no importer surface required")
-            for g in (
-                "legacy_pages_mcp_admin_policy_and_semantic_equivalence",
-                "legacy_pages_dry_run_and_rerun_idempotent",
-                "legacy_pages_failure_source_immutable",
-                "legacy_pages_lineage_complete",
-            ):
-                set_gate(g, True, "total_rows=0: legacy-pages-import-v1.md permits auto-pass with detail not_required_zero_inventory")
-        elif total_rows is not None and total_rows > 0:
-            import_result_path = os.path.join(evidence_root, "legacy-pages-import-result.json")
-            import_result = load_json(import_result_path)
+        collection_status = inv.get("collection_status")
+        if collection_status == "failed":
+            failures = [
+                f"{entry.get('kind')}:{entry.get('reason_code')}"
+                for entry in inv.get("environments", [])
+                if entry.get("status") == "failed"
+            ]
             set_gate(
-                "legacy_pages_zero_or_importer_surface_available",
-                import_result is not None,
-                f"total_rows={total_rows} > 0 (nonzero branch): importer artifact {'present' if import_result else 'MISSING: ' + import_result_path}",
+                "legacy_pages_inventory_three_environments_complete",
+                False,
+                f"collector produced durable failure evidence; failed environments={failures}",
             )
             for g in (
+                "legacy_pages_zero_or_importer_surface_available",
                 "legacy_pages_mcp_admin_policy_and_semantic_equivalence",
                 "legacy_pages_dry_run_and_rerun_idempotent",
                 "legacy_pages_failure_source_immutable",
                 "legacy_pages_lineage_complete",
             ):
-                set_gate(g, False, "nonzero branch requires the importer implementation + evidence, not present this round")
+                reasons[g] = "inventory collection failed; zero/nonzero branch is intentionally unknown"
         else:
-            reasons["legacy_pages_zero_or_importer_surface_available"] = "total_rows field missing/invalid"
+            kinds = [e.get("kind") for e in inv.get("environments", [])]
+            complete = (
+                collection_status == "complete"
+                and sorted(kinds) == ["development", "target_deployment", "test"]
+                and all(e.get("status") == "collected" for e in inv.get("environments", []))
+            )
+            total_rows = inv.get("total_rows")
+            dist_ok = True
+            for e in inv.get("environments", []):
+                dist_sum = sum(d.get("row_count", 0) for d in e.get("workspace_distribution", []))
+                if dist_sum != e.get("row_count"):
+                    dist_ok = False
+            computed_total = sum(e.get("row_count", 0) for e in inv.get("environments", []))
+            total_ok = total_rows == computed_total
+            set_gate(
+                "legacy_pages_inventory_three_environments_complete",
+                complete and dist_ok and total_ok,
+                f"collection_status={collection_status} kinds={sorted(kinds)} dist_sums_ok={dist_ok} total_rows={total_rows} computed_total={computed_total}",
+            )
+
+            if total_rows == 0:
+                set_gate("legacy_pages_zero_or_importer_surface_available", True, "total_rows=0: zero branch, no importer surface required")
+                for g in (
+                    "legacy_pages_mcp_admin_policy_and_semantic_equivalence",
+                    "legacy_pages_dry_run_and_rerun_idempotent",
+                    "legacy_pages_failure_source_immutable",
+                    "legacy_pages_lineage_complete",
+                ):
+                    set_gate(g, True, "total_rows=0: legacy-pages-import-v1.md permits auto-pass with detail not_required_zero_inventory")
+            elif total_rows is not None and total_rows > 0:
+                import_result_path = os.path.join(evidence_root, "legacy-pages-import-result.json")
+                import_result = load_json(import_result_path)
+                set_gate(
+                    "legacy_pages_zero_or_importer_surface_available",
+                    import_result is not None,
+                    f"total_rows={total_rows} > 0 (nonzero branch): importer artifact {'present' if import_result else 'MISSING: ' + import_result_path}",
+                )
+                for g in (
+                    "legacy_pages_mcp_admin_policy_and_semantic_equivalence",
+                    "legacy_pages_dry_run_and_rerun_idempotent",
+                    "legacy_pages_failure_source_immutable",
+                    "legacy_pages_lineage_complete",
+                ):
+                    set_gate(g, False, "nonzero branch requires the importer implementation + evidence, not present this round")
+            else:
+                reasons["legacy_pages_zero_or_importer_surface_available"] = "total_rows field missing/invalid"
 
     # ---- integrity-records: backs 1 gate ----
     ir_path = os.path.join(evidence_root, "integrity-records-result.json")

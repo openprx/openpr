@@ -10,6 +10,7 @@
     "source_head",
     "generated_at",
     "executor",
+    "collection_status",
     "environments",
     "total_rows"
   ],
@@ -26,32 +27,46 @@
         "role": { "type": "string", "minLength": 1 }
       }
     },
+    "collection_status": { "enum": ["complete", "failed"] },
     "environments": {
       "type": "array",
       "minItems": 3,
       "maxItems": 3,
       "items": { "$ref": "#/$defs/environment" }
     },
-    "total_rows": { "type": "integer", "minimum": 0 }
+    "total_rows": { "type": ["integer", "null"], "minimum": 0 }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "collection_status": { "const": "complete" } } },
+      "then": {
+        "properties": {
+          "total_rows": { "type": "integer", "minimum": 0 },
+          "environments": {
+            "items": { "properties": { "status": { "const": "collected" } } }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "total_rows": { "const": null },
+          "environments": {
+            "contains": { "properties": { "status": { "const": "failed" } }, "required": ["status"] }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "git_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "environment": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "kind",
-        "identity_sha256",
-        "collected_at",
-        "row_count",
-        "workspace_distribution",
-        "max_body_md_bytes",
-        "query_sha256",
-        "source_schema_sha256"
-      ],
+      "required": ["kind", "status", "collected_at"],
       "properties": {
         "kind": { "enum": ["development", "test", "target_deployment"] },
+        "status": { "enum": ["collected", "failed"] },
         "identity_sha256": { "$ref": "#/$defs/sha256" },
         "collected_at": { "type": "string", "format": "date-time" },
         "row_count": { "type": "integer", "minimum": 0 },
@@ -69,8 +84,44 @@
         },
         "max_body_md_bytes": { "type": "integer", "minimum": 0 },
         "query_sha256": { "$ref": "#/$defs/sha256" },
-        "source_schema_sha256": { "$ref": "#/$defs/sha256" }
-      }
+        "source_schema_sha256": { "$ref": "#/$defs/sha256" },
+        "reason_code": {
+          "enum": [
+            "missing_dsn",
+            "unreachable",
+            "pages_schema_missing",
+            "pages_schema_drift",
+            "read_query_failed",
+            "collection_failed"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "collected" } } },
+          "then": {
+            "required": [
+              "identity_sha256",
+              "row_count",
+              "workspace_distribution",
+              "max_body_md_bytes",
+              "query_sha256",
+              "source_schema_sha256"
+            ]
+          },
+          "else": {
+            "required": ["reason_code", "message"],
+            "not": {
+              "anyOf": [
+                { "required": ["row_count"] },
+                { "required": ["workspace_distribution"] },
+                { "required": ["max_body_md_bytes"] }
+              ]
+            }
+          }
+        }
+      ]
     }
   }
 }

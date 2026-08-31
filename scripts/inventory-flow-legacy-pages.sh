@@ -15,7 +15,10 @@ set -euo pipefail
 # This script NEVER treats a missing/unreachable environment as zero rows:
 # per the contract ("缺环境、采集失败或 schema drift 均使 gate 失败，不能按
 # 零行处理"), any environment whose database URL is not configured or not
-# reachable is a hard failure (exit 1), not a silently-zeroed row.
+# reachable is a hard failure (exit 1), not a silently-zeroed row. Operational
+# failures still atomically write a `collection_status=failed` artifact so the
+# report can preserve the failed check instead of degrading into structural
+# exit 2. Failed environments never carry row_count or contribute to total_rows.
 #
 # Environment DSNs (never written to the output; only sha256 identity
 # fingerprints are recorded):
@@ -25,7 +28,7 @@ set -euo pipefail
 #   OPENPR_FLOW_INVENTORY_TARGET_DEPLOYMENT_DATABASE_URL
 #
 # Exit codes: 0 = all three environments collected and evidence written,
-# 1 = one or more environments missing/unreachable/schema-drifted (no
+# 1 = one or more environments missing/unreachable/schema-drifted (failed
 # evidence written), 2 = usage/tool error.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -74,8 +77,9 @@ Options:
                           path plus a human summary on stderr).
   -h, --help              Show this help and exit 0.
 
-Exit codes: 0 all three environments collected and evidence written,
-1 an environment is missing/unreachable/schema-drifted, 2 usage/tool error.
+Exit codes: 0 all three environments collected and complete evidence written,
+1 an environment is missing/unreachable/schema-drifted and failed evidence was
+written, 2 usage/tool error.
 EOF
 }
 
@@ -183,6 +187,8 @@ SCHEMA_QUERY="SELECT string_agg(column_name || ':' || data_type || ':' || is_nul
 
 collect_one() {
   local kind="$1" dsn="$2"
+  COLLECT_FAILURE_REASON_CODE=""
+  COLLECT_FAILURE_MESSAGE=""
   echo "=== collecting legacy pages inventory: $kind ===" >&2
 
   local errfile
@@ -190,6 +196,8 @@ collect_one() {
   if ! psql "$dsn" -v ON_ERROR_STOP=1 -Atc "SELECT 1" >/dev/null 2>"$errfile"; then
     echo "FAIL: environment '$kind' is not reachable" >&2
     sed 's/^/  | /' "$errfile" >&2
+    COLLECT_FAILURE_REASON_CODE="unreachable"
+    COLLECT_FAILURE_MESSAGE="database connection failed"
     rm -f "$errfile"
     return 1
   fi
@@ -199,6 +207,8 @@ collect_one() {
   schema_fp="$(psql "$dsn" -v ON_ERROR_STOP=1 -Atc "$SCHEMA_QUERY" 2>/dev/null || true)"
   if [[ -z "$schema_fp" ]]; then
     echo "FAIL: environment '$kind' has no readable public.pages table (schema drift or missing table)" >&2
+    COLLECT_FAILURE_REASON_CODE="pages_schema_missing"
+    COLLECT_FAILURE_MESSAGE="public.pages is absent or unreadable"
     return 1
   fi
   local expected_schema_fp="id:uuid:NO,workspace_id:uuid:NO,title:text:NO,body_md:text:NO,created_by:uuid:YES,created_at:timestamp with time zone:NO,updated_at:timestamp with time zone:NO"
@@ -206,6 +216,8 @@ collect_one() {
     echo "FAIL: environment '$kind' public.pages schema drifted from ADR-0003's frozen shape" >&2
     echo "  expected: $expected_schema_fp" >&2
     echo "  actual:   $schema_fp" >&2
+    COLLECT_FAILURE_REASON_CODE="pages_schema_drift"
+    COLLECT_FAILURE_MESSAGE="public.pages differs from the frozen ADR-0003 shape"
     return 1
   fi
   local source_schema_sha256
@@ -224,6 +236,8 @@ $READ_QUERY;
 " -F$'\t' 2>"$errfile")" || {
     echo "FAIL: environment '$kind' read-only collection query failed" >&2
     sed 's/^/  | /' "$errfile" >&2
+    COLLECT_FAILURE_REASON_CODE="read_query_failed"
+    COLLECT_FAILURE_MESSAGE="frozen read-only inventory query failed"
     rm -f "$errfile"
     return 1
   }
@@ -254,7 +268,7 @@ $READ_QUERY;
     --argjson row_count "$row_count" --argjson dist "$dist_json" \
     --argjson max_bytes "${max_body_bytes:-0}" --arg query_sha "$QUERY_SHA256" \
     --arg schema_sha "$source_schema_sha256" \
-    '{kind:$kind, identity_sha256:$identity, collected_at:$collected_at, row_count:$row_count, workspace_distribution:$dist, max_body_md_bytes:$max_bytes, query_sha256:$query_sha, source_schema_sha256:$schema_sha}')"
+    '{kind:$kind, status:"collected", identity_sha256:$identity, collected_at:$collected_at, row_count:$row_count, workspace_distribution:$dist, max_body_md_bytes:$max_bytes, query_sha256:$query_sha, source_schema_sha256:$schema_sha}')"
 
   ENVIRONMENTS_JSON="$(jq -c --argjson e "$ENV_ENTRY" '. + [$e]' <<<"$ENVIRONMENTS_JSON")"
   TOTAL_ROWS=$((TOTAL_ROWS + row_count))
@@ -267,39 +281,49 @@ for kind in development test target_deployment; do
   dsn="$(dsn_for_kind "$kind")"
   if [[ -z "$dsn" ]]; then
     echo "FAIL: no DSN configured for environment '$kind' (set $(env_var_name_for_kind "$kind"))" >&2
+    ENV_ENTRY="$(jq -n --arg kind "$kind" --arg collected_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{kind:$kind,status:"failed",collected_at:$collected_at,reason_code:"missing_dsn",message:"required environment DSN is not configured"}')"
+    ENVIRONMENTS_JSON="$(jq -c --argjson e "$ENV_ENTRY" '. + [$e]' <<<"$ENVIRONMENTS_JSON")"
     MISSING_OR_FAILED+=("$kind")
     FAILED=1
     continue
   fi
   if ! collect_one "$kind" "$dsn"; then
+    ENV_ENTRY="$(jq -n --arg kind "$kind" --arg collected_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      --arg reason_code "${COLLECT_FAILURE_REASON_CODE:-collection_failed}" \
+      --arg message "${COLLECT_FAILURE_MESSAGE:-environment collection failed}" \
+      '{kind:$kind,status:"failed",collected_at:$collected_at,reason_code:$reason_code,message:$message}')"
+    ENVIRONMENTS_JSON="$(jq -c --argjson e "$ENV_ENTRY" '. + [$e]' <<<"$ENVIRONMENTS_JSON")"
     MISSING_OR_FAILED+=("$kind")
     FAILED=1
   fi
 done
 
-if [[ $FAILED -ne 0 ]]; then
-  echo "" >&2
-  echo "INVENTORY: FAIL -- environment(s) not collected: ${MISSING_OR_FAILED[*]}" >&2
-  echo "Per legacy-pages-import-v1.md: a missing/unreachable/drifted environment is a hard" >&2
-  echo "failure, never treated as zero rows. evidence/v0.4/legacy-pages-inventory.json was NOT written." >&2
-  exit 1
-fi
-
 jq -n \
   --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" \
   --arg name "$EXECUTOR_NAME" --arg role "$EXECUTOR_ROLE" \
-  --argjson environments "$ENVIRONMENTS_JSON" --argjson total_rows "$TOTAL_ROWS" \
+  --argjson environments "$ENVIRONMENTS_JSON" --argjson total_rows "$TOTAL_ROWS" --argjson failed "$FAILED" \
   '{
     schema_version: "sylvode.flow.legacy-pages-inventory.v1",
     source_head: $head,
     generated_at: $generated_at,
     executor: {name:$name, role:$role},
+    collection_status: (if $failed == 0 then "complete" else "failed" end),
     environments: $environments,
-    total_rows: $total_rows
+    total_rows: (if $failed == 0 then $total_rows else null end)
   }' > "$EVIDENCE_ROOT/legacy-pages-inventory.json.tmp"
 sync "$EVIDENCE_ROOT/legacy-pages-inventory.json.tmp" 2>/dev/null || true
 mv -f "$EVIDENCE_ROOT/legacy-pages-inventory.json.tmp" "$EVIDENCE_ROOT/legacy-pages-inventory.json"
 
-echo "INVENTORY: wrote $EVIDENCE_ROOT/legacy-pages-inventory.json (total_rows=$TOTAL_ROWS)" >&2
+if [[ $FAILED -ne 0 ]]; then
+  echo "" >&2
+  echo "INVENTORY: FAIL -- environment(s) not collected: ${MISSING_OR_FAILED[*]}" >&2
+  echo "Per legacy-pages-import-v1.md, failures were not treated as zero rows." >&2
+  echo "INVENTORY: wrote failed evidence $EVIDENCE_ROOT/legacy-pages-inventory.json (total_rows=null)" >&2
+  cat "$EVIDENCE_ROOT/legacy-pages-inventory.json"
+  exit 1
+fi
+
+echo "INVENTORY: wrote $EVIDENCE_ROOT/legacy-pages-inventory.json (collection_status=complete total_rows=$TOTAL_ROWS)" >&2
 cat "$EVIDENCE_ROOT/legacy-pages-inventory.json"
 exit 0

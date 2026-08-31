@@ -125,6 +125,10 @@ fi
 # or `total_rows` field and leak a raw jq error under `set -e`. Any problem here
 # is "evidence malformed" (exit 2), never folded into VIOLATIONS (exit 1).
 STRUCT_ERRORS=()
+COLLECTION_STATUS="$(jq -r 'if has("collection_status") then .collection_status else "missing" end' "$INVENTORY_PATH")"
+if [[ "$COLLECTION_STATUS" != "complete" && "$COLLECTION_STATUS" != "failed" ]]; then
+  STRUCT_ERRORS+=("top-level key 'collection_status' must be complete|failed, found $COLLECTION_STATUS")
+fi
 ENV_TYPE="$(jq -r 'if has("environments") then (.environments | type) else "missing" end' "$INVENTORY_PATH")"
 if [[ "$ENV_TYPE" == "missing" ]]; then
   STRUCT_ERRORS+=("missing required top-level key: environments")
@@ -134,8 +138,10 @@ fi
 TOTAL_ROWS_TYPE="$(jq -r 'if has("total_rows") then (.total_rows | type) else "missing" end' "$INVENTORY_PATH")"
 if [[ "$TOTAL_ROWS_TYPE" == "missing" ]]; then
   STRUCT_ERRORS+=("missing required top-level key: total_rows")
-elif [[ "$TOTAL_ROWS_TYPE" != "number" ]]; then
-  STRUCT_ERRORS+=("top-level key 'total_rows' must be a JSON number, found $TOTAL_ROWS_TYPE")
+elif [[ "$COLLECTION_STATUS" == "complete" && "$TOTAL_ROWS_TYPE" != "number" ]]; then
+  STRUCT_ERRORS+=("complete inventory total_rows must be a JSON number, found $TOTAL_ROWS_TYPE")
+elif [[ "$COLLECTION_STATUS" == "failed" && "$TOTAL_ROWS_TYPE" != "null" ]]; then
+  STRUCT_ERRORS+=("failed inventory total_rows must be null, found $TOTAL_ROWS_TYPE")
 fi
 if [[ ${#STRUCT_ERRORS[@]} -eq 0 && "$ENV_TYPE" == "array" ]]; then
   NON_OBJECT_ENTRIES="$(jq '[.environments[] | select(type != "object")] | length' "$INVENTORY_PATH")"
@@ -163,6 +169,37 @@ done
 env_count="$(jq '.environments | length' "$INVENTORY_PATH")"
 if [[ "$env_count" -ne 3 ]]; then
   VIOLATIONS+=("environments array has $env_count entries (must be exactly 3)")
+fi
+
+# A collector operational failure is valid failure evidence, not malformed
+# evidence and never the zero-row branch. Keep the required command at exit 1
+# while giving report/verify/gate a durable artifact to checksum and diagnose.
+if [[ "$COLLECTION_STATUS" == "failed" ]]; then
+  FAILED_ENV_COUNT="$(jq '[.environments[] | select(.status=="failed")] | length' "$INVENTORY_PATH")"
+  if [[ "$FAILED_ENV_COUNT" -eq 0 ]]; then
+    echo "FAIL: failed inventory contains no environment with status=failed" >&2
+    exit 2
+  fi
+  MALFORMED_FAILED_COUNT="$(jq '[.environments[] | select(.status=="failed") | select((.reason_code|type)!="string" or (.reason_code|length)==0 or (.message|type)!="string" or (.message|length)==0 or has("row_count") or has("workspace_distribution") or has("max_body_md_bytes"))] | length' "$INVENTORY_PATH")"
+  if [[ "$MALFORMED_FAILED_COUNT" -ne 0 ]]; then
+    echo "FAIL: failed inventory has $MALFORMED_FAILED_COUNT malformed failed environment entries" >&2
+    exit 2
+  fi
+  while IFS=$'\t' read -r kind reason_code message; do
+    VIOLATIONS+=("environment '$kind' collection failed ($reason_code): $message")
+  done < <(jq -r '.environments[] | select(.status=="failed") | [.kind,.reason_code,.message] | @tsv' "$INVENTORY_PATH")
+  VIOLATIONS_JSON="$(printf '%s\n' "${VIOLATIONS[@]:-}" | jq -R 'select(length>0)' | jq -s '.')"
+  jq -n \
+    --arg inventory_path "$INVENTORY_PATH" \
+    --arg branch "collection_failed" \
+    --argjson violations "$VIOLATIONS_JSON" \
+    '{inventory_path:$inventory_path,total_rows:null,branch:$branch,violations:$violations,passed:false}' | jq .
+  exit 1
+fi
+
+NON_COLLECTED_COUNT="$(jq '[.environments[] | select(.status!="collected")] | length' "$INVENTORY_PATH")"
+if [[ "$NON_COLLECTED_COUNT" -ne 0 ]]; then
+  VIOLATIONS+=("complete inventory has $NON_COLLECTED_COUNT environment entries not marked collected")
 fi
 
 # --- total_rows == sum(environment.row_count) ---
