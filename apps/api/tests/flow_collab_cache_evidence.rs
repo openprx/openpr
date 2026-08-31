@@ -159,6 +159,57 @@ impl Mutant {
     }
 }
 
+/// Fails the run *before* any measurement with an actionable message when the isolated-apply
+/// worker binary is missing.
+///
+/// Without this, a missing worker surfaces as `accept_update` returning `ApiError::Internal`, and
+/// every write-path section reports a failure whose stated cause is wrong -- the run looks like an
+/// implementation defect when it is a build gap. Observed twice while building this harness: the
+/// uplifted `target/<profile>/collab-isolated-apply-worker` does not survive every cargo
+/// invocation against the same target directory (a `cargo clippy --all-features` in between was
+/// enough to remove it), so the check has to run per-test-process, not once per session.
+fn require_isolated_apply_worker() {
+    let exe = std::env::current_exe().expect("test executable path resolves");
+    // The test binary lives in `<target>/<profile>/deps/`; the worker is uplifted one level up,
+    // which is exactly where `collab_core::isolation::host` looks for it.
+    let candidate = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join("collab-isolated-apply-worker"))
+        .expect("test executable has a grandparent directory");
+    assert!(
+        candidate.is_file(),
+        "collab-isolated-apply-worker is not at {}. Every accept_update below would fail as \
+         ApiError::Internal and this run would report the wrong cause. Build it into the same \
+         target directory first:\n    \
+         CARGO_TARGET_DIR=<same> cargo build --release -p collab-core --bin collab-isolated-apply-worker\n\
+         (and the debug equivalent for a debug run).",
+        candidate.display()
+    );
+}
+
+/// The commit this evidence was produced from, plus whether the tree was dirty. `ADR-0010`'s
+/// result schema requires `source_head`; an artifact that cannot say which source it measured is
+/// not evidence about anything in particular.
+fn source_head() -> (String, bool) {
+    let head = std::process::Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map_or_else(
+            || "unknown".to_string(),
+            |out| String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        );
+    let dirty = std::process::Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_some_and(|out| !out.stdout.is_empty());
+    (head, dirty)
+}
+
 const fn build_profile() -> &'static str {
     if cfg!(debug_assertions) { "debug" } else { "release" }
 }
@@ -2031,6 +2082,7 @@ async fn warm_cache_boundaries_rebuild_bypass_and_retry_exhaustion_evidence() {
         eprintln!("skipped: {TEST_DATABASE_URL_ENV} is not set");
         return;
     };
+    require_isolated_apply_worker();
     let mutant = Mutant::from_env();
     let mut violations: Vec<String> = Vec::new();
     let started = Instant::now();
@@ -2099,8 +2151,11 @@ async fn warm_cache_boundaries_rebuild_bypass_and_retry_exhaustion_evidence() {
         ));
     }
 
+    let (head, dirty) = source_head();
     let result = json!({
         "schema_version": "sylvode.flow.collab-cache-evidence.v1",
+        "source_head": head,
+        "source_tree_dirty": dirty,
         "environment": {
             "build_profile": build_profile(),
             "postgres_version": postgres_version(&db).await,
