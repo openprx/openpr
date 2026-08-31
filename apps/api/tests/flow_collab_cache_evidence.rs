@@ -1464,9 +1464,7 @@ async fn section_retry_exhaustion(
                 ));
             }
             if !rejected.recoverable {
-                violations.push(
-                    "exhaustion: head-mismatch exhaustion was not marked recoverable".to_string(),
-                );
+                violations.push("exhaustion: head-mismatch exhaustion was not marked recoverable".to_string());
             }
             let write_state = format!("{:?}", rejected.write_state);
             if write_state != "NotApplied" {
@@ -1481,9 +1479,8 @@ async fn section_retry_exhaustion(
                 ));
             }
             if details.get("retry_after_ms").is_none() {
-                violations.push(
-                    "exhaustion: no retry_after_ms was supplied with the head-mismatch backoff".to_string(),
-                );
+                violations
+                    .push("exhaustion: no retry_after_ms was supplied with the head-mismatch backoff".to_string());
             }
             (
                 format!("{:?}", rejected.code),
@@ -1759,11 +1756,9 @@ impl HydrateGate {
         let finished = tokio::spawn(async move {
             let conn = Database::connect(&url).await.expect("hydrate gate connects");
             let tx = conn.begin().await.expect("hydrate gate transaction opens");
-            tx.execute_unprepared(&format!(
-                "LOCK TABLE {HYDRATE_GATE_TABLE} IN ACCESS EXCLUSIVE MODE"
-            ))
-            .await
-            .expect("hydrate gate takes ACCESS EXCLUSIVE");
+            tx.execute_unprepared(&format!("LOCK TABLE {HYDRATE_GATE_TABLE} IN ACCESS EXCLUSIVE MODE"))
+                .await
+                .expect("hydrate gate takes ACCESS EXCLUSIVE");
             let _ = wait.await;
             let _ = tx.rollback().await;
         });
@@ -1878,8 +1873,7 @@ async fn force_head_mismatches(
 
     let mut rendezvous: Vec<Value> = Vec::new();
     for (round, bytes) in competing_bytes.into_iter().enumerate() {
-        let parked_after_ms = match wait_for_lock(db, &blocked_share, "the victim to park at the hydrate gate").await
-        {
+        let parked_after_ms = match wait_for_lock(db, &blocked_share, "the victim to park at the hydrate gate").await {
             Ok(ms) => ms,
             Err(err) => {
                 violations.push(format!("{label}: rendezvous {round}: {err}"));
