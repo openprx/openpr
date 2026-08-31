@@ -1675,24 +1675,167 @@ mod database_tests {
         }
     }
 
-    /// Submits `bytes` and retries every [`is_load_dependent`] rejection (`server_draining`, and
-    /// `limit_exceeded` naming one of the three isolated decode/apply resource ceilings) until
-    /// either it stops happening or a wall-clock deadline passes -- `error-mapping-v1.md`: that code is defined
-    /// as recoverable, "客户端保留 intent 后重试", the exact behavior a real caller is
-    /// contractually expected to have, with no contract-stated upper bound on how long a
-    /// compliant caller keeps trying (unlike `limit_exceeded`, which is final and never retried).
-    /// This module's own `epoch_fence_lock_timeout_must_not_surface_as_policy_rejected` test
-    /// already documents that many scratch databases hammering one shared Postgres instance under
-    /// `cargo test --workspace` produces real, transient lock/rebase contention independent of any
-    /// application bug; the several structural-limit tests below submit many real transactions in
-    /// a tight loop (building up to `container_count_max`/`document_block_count_max` fixture
-    /// state) and are exactly the shape most likely to observe it, including sustained multi-
-    /// second congestion windows a small fixed attempt count was observed not to outlast.
-    /// Retrying here changes nothing about what is under test: a `limit_exceeded` rejection (the
-    /// actual assertion every caller of this function cares about) is never `ServerDraining` and
-    /// is always returned on the first attempt, unretried; only the recoverable, contract-defined
-    /// transient code is retried, and only until `CONTENTION_RETRY_DEADLINE`, so a genuine,
+    /// Wall-clock ceiling on how long any one submission below keeps retrying an
+    /// [`is_load_dependent`] rejection. A genuinely persistent failure must still surface as a
+    /// test failure rather than hang forever.
+    const CONTENTION_RETRY_DEADLINE: Duration = Duration::from_mins(3);
+    /// First backoff step of [`contention_backoff`].
+    const CONTENTION_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(150);
+    /// Ceiling on [`contention_backoff`]'s exponential growth. Deliberately short: the rejections
+    /// being waited out (`decode_apply_cpu_ms`/`decode_apply_wall_ms`, and the lock/rebase
+    /// timeouts behind `server_draining`) clear in windows of hundreds of milliseconds to a few
+    /// seconds, so a long backoff spends the deadline sleeping through windows it could have used.
+    /// Measured: at a 5s cap only ~37 attempts fit inside `CONTENTION_RETRY_DEADLINE`, which was
+    /// observed to be too few; at 500ms roughly ten times as many do.
+    const CONTENTION_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(500);
+    /// Hard upper bound on retry attempts, independent of [`CONTENTION_RETRY_DEADLINE`]: with
+    /// [`contention_backoff`] capped at [`CONTENTION_RETRY_BACKOFF_MAX`] this many attempts
+    /// already span past the deadline, so neither bound alone can turn into an unbounded loop if
+    /// the other is ever relaxed.
+    const CONTENTION_RETRY_MAX_ATTEMPTS: u32 = 512;
+
+    /// Backoff before retry attempt `attempt` (0-based): `CONTENTION_RETRY_BACKOFF_BASE * 2^attempt`,
+    /// saturating at [`CONTENTION_RETRY_BACKOFF_MAX`], plus up to 50% jitter derived from `seed`.
+    ///
+    /// Exponential rather than a flat interval because retrying is itself expensive here: every
+    /// attempt spawns a fresh isolated-apply worker that decodes and re-applies the whole
+    /// document, which for the chunked fixtures below is already thousands of nodes. Retrying that
+    /// at a flat interval adds load to exactly the congestion it is waiting out -- the two
+    /// resource ceilings that produce most of these rejections (`decode_apply_cpu_ms`,
+    /// `decode_apply_wall_ms`) are measured on that very worker.
+    ///
+    /// Jittered because the structural-limit fixtures below run in parallel against one Postgres
+    /// and all back off from the same congestion event; without it they resynchronize onto the
+    /// same retry instants and keep re-creating it. `seed` is the retried update's own id, so the
+    /// spread is stable within one submission and independent across submissions.
+    fn contention_backoff(attempt: u32, seed: u128) -> Duration {
+        let capped = CONTENTION_RETRY_BACKOFF_BASE
+            .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+            .min(CONTENTION_RETRY_BACKOFF_MAX);
+        let ticks = u32::try_from(seed.rotate_right(attempt.min(127)) % 128).unwrap_or(0);
+        capped.saturating_add(capped.saturating_mul(ticks) / 256)
+    }
+
+    /// One `accept_update` round trip with no retry of its own -- the single call
+    /// [`submit_retrying_load_dependent`] layers its bounded retry on top of.
+    ///
+    /// `update_id` is a parameter rather than freshly minted here because every retry of one
+    /// logical submission must reuse it. A load-dependent rejection is not proof that nothing was
+    /// written: `accept_update`'s locked phase runs under a `tokio::time::timeout`, and a commit
+    /// that lands just as that timeout fires is reported to the caller as recoverable contention.
+    /// Retrying under the *same* `update_id` makes `accept_update`'s `find_prior_update` dedup
+    /// return that already-committed update as `Accepted`; retrying under a fresh one bypasses the
+    /// dedup and applies the same operations a second time (observed directly while building this:
+    /// a rebuild-and-retry variant of this helper panicked
+    /// `creating within the boundary must succeed locally: DuplicateNode { id: "nav-7000" }`,
+    /// i.e. the "rejected" chunk was in the document all along).
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_once(
+        state: &AppState,
+        cache: &WarmCache,
+        coordinator: &DocumentCoordinator,
+        registry: &SessionRegistry,
+        snapshot_advancer: &SnapshotAdvancer,
+        workspace_id: Uuid,
+        document_id: Uuid,
+        actor_id: Uuid,
+        update_id: Uuid,
+        bytes: Vec<u8>,
+        label: &str,
+    ) -> AcceptOutcome {
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+        accept_update(
+            &state.db,
+            cache,
+            coordinator,
+            registry,
+            snapshot_advancer,
+            10,
+            None,
+            UpdateRequest {
+                document_id,
+                update_id,
+                bytes,
+                idempotency_key: None,
+                origin_client_id: Some(label.to_string()),
+                message: None,
+                actor_id,
+                workspace_id,
+                checked_epoch,
+                expected_frontier: None,
+            },
+        )
+        .await
+        .expect("accept_update does not hit a hard database error")
+    }
+
+    /// Submits `bytes` under one stable `update_id` and retries every [`is_load_dependent`]
+    /// rejection (`server_draining`, and `limit_exceeded` naming one of the three isolated
+    /// decode/apply resource ceilings) with [`contention_backoff`], until it stops happening or
+    /// the bounded budget ([`CONTENTION_RETRY_MAX_ATTEMPTS`] attempts,
+    /// [`CONTENTION_RETRY_DEADLINE`] wall clock) is spent. Returns the final outcome together with
+    /// how many attempts it took, so a caller can name that count in a failure message.
+    ///
+    /// `error-mapping-v1.md` defines those codes as recoverable, "客户端保留 intent 后重试" --
+    /// keeping the intent means the same `update_id`, which is what makes the retry idempotent
+    /// (see [`submit_once`]); retrying is the contract-compliant caller behavior, not a way to
+    /// paper over a failure. This module's own
+    /// `epoch_fence_lock_timeout_must_not_surface_as_policy_rejected` test already documents that
+    /// many scratch databases hammering one shared Postgres instance under `cargo test
+    /// --workspace` produces real, transient lock/rebase contention independent of any application
+    /// bug; the several structural-limit tests below submit many real transactions in a tight loop
+    /// (building up to `container_count_max`/`document_block_count_max` fixture state) and are
+    /// exactly the shape most likely to observe it.
+    ///
+    /// Retrying here changes nothing about what is under test. Every `limit_exceeded` naming a
+    /// *shape* ceiling -- `container_count`, `document_block_count`, `text_block_chars`,
+    /// `document_text_chars`, `tree_depth`, `update_bytes`, i.e. the actual assertion every caller
+    /// of this function cares about -- is outside [`is_load_dependent`] and is returned on the
+    /// first attempt, unretried and unswallowed. And because both bounds are finite, a genuinely
     /// persistent failure still surfaces as a test failure rather than hanging forever.
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_retrying_load_dependent(
+        state: &AppState,
+        cache: &WarmCache,
+        coordinator: &DocumentCoordinator,
+        registry: &SessionRegistry,
+        snapshot_advancer: &SnapshotAdvancer,
+        workspace_id: Uuid,
+        document_id: Uuid,
+        actor_id: Uuid,
+        bytes: Vec<u8>,
+        label: &str,
+    ) -> (AcceptOutcome, u32) {
+        let update_id = Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            let outcome = submit_once(
+                state,
+                cache,
+                coordinator,
+                registry,
+                snapshot_advancer,
+                workspace_id,
+                document_id,
+                actor_id,
+                update_id,
+                bytes.clone(),
+                label,
+            )
+            .await;
+            attempt += 1;
+            if !is_load_dependent(&outcome)
+                || attempt >= CONTENTION_RETRY_MAX_ATTEMPTS
+                || started.elapsed() >= CONTENTION_RETRY_DEADLINE
+            {
+                return (outcome, attempt);
+            }
+            tokio::time::sleep(contention_backoff(attempt - 1, update_id.as_u128())).await;
+        }
+    }
+
+    /// [`submit_retrying_load_dependent`] for the callers that only need the outcome.
     #[allow(clippy::too_many_arguments)]
     async fn submit(
         state: &AppState,
@@ -1706,40 +1849,20 @@ mod database_tests {
         bytes: Vec<u8>,
         label: &str,
     ) -> AcceptOutcome {
-        const CONTENTION_RETRY_DEADLINE: Duration = Duration::from_mins(3);
-        const CONTENTION_RETRY_BACKOFF: Duration = Duration::from_millis(150);
-        let started = std::time::Instant::now();
-        loop {
-            let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
-            let outcome = accept_update(
-                &state.db,
-                cache,
-                coordinator,
-                registry,
-                snapshot_advancer,
-                10,
-                None,
-                UpdateRequest {
-                    document_id,
-                    update_id: Uuid::new_v4(),
-                    bytes: bytes.clone(),
-                    idempotency_key: None,
-                    origin_client_id: Some(label.to_string()),
-                    message: None,
-                    actor_id,
-                    workspace_id,
-                    checked_epoch,
-                    expected_frontier: None,
-                },
-            )
-            .await
-            .expect("accept_update does not hit a hard database error");
-            if is_load_dependent(&outcome) && started.elapsed() < CONTENTION_RETRY_DEADLINE {
-                tokio::time::sleep(CONTENTION_RETRY_BACKOFF).await;
-                continue;
-            }
-            return outcome;
-        }
+        submit_retrying_load_dependent(
+            state,
+            cache,
+            coordinator,
+            registry,
+            snapshot_advancer,
+            workspace_id,
+            document_id,
+            actor_id,
+            bytes,
+            label,
+        )
+        .await
+        .0
     }
 
     /// Call-direction proof for `check_snapshot`'s `tree_depth` branch: a chain reaching exactly
@@ -1857,8 +1980,12 @@ mod database_tests {
     /// wide safety margin, not tuned to the exact ceiling) -- a single update carrying all
     /// `container_count_max`/`document_block_count_max` (10,000) creates would itself be
     /// rejected `limit_kind="update_bytes"` before ever reaching the check under test. Every
-    /// intermediate chunk must itself be `Accepted` (none of them are the case under test);
-    /// returns the final chunk's outcome, i.e. the one that reaches exactly `total`.
+    /// intermediate chunk must itself be `Accepted` (none of them are the case under test); a
+    /// chunk rejected for a load-dependent reason is retried by
+    /// [`submit_retrying_load_dependent`] before that is decided, and only a rejection that
+    /// outlives that bounded budget -- or any rejection outside the retried family, a real
+    /// structural verdict included -- panics. Returns the final chunk's outcome, i.e. the one that
+    /// reaches exactly `total`.
     #[allow(clippy::too_many_arguments)]
     async fn submit_create_nodes_in_chunks(
         state: &AppState,
@@ -1893,7 +2020,7 @@ mod database_tests {
             })
             .await;
             created += this_chunk;
-            let outcome = submit(
+            let (outcome, attempts) = submit_retrying_load_dependent(
                 state,
                 cache,
                 coordinator,
@@ -1913,7 +2040,7 @@ mod database_tests {
                 AcceptOutcome::Accepted(_) => {}
                 AcceptOutcome::Rejected(rejected) => {
                     panic!(
-                        "an intermediate chunk (created {created} of {total}) was unexpectedly rejected: {rejected:?}"
+                        "an intermediate chunk (created {created} of {total}) was still rejected after {attempts} attempt(s): {rejected:?}"
                     )
                 }
             }
@@ -1926,8 +2053,9 @@ mod database_tests {
     /// ceiling, rejected `limit_kind="update_bytes"` before ever reaching the check under test).
     /// `first_chunk_creates_block` controls whether the very first chunk also creates `block_id`
     /// (`false` when appending to a block that already exists). Every intermediate chunk must
-    /// itself be `Accepted`; returns the final chunk's outcome, i.e. the one that reaches exactly
-    /// `total_chars`.
+    /// itself be `Accepted`, under the same bounded [`submit_retrying_load_dependent`] retry budget
+    /// as [`submit_create_nodes_in_chunks`]; returns the final chunk's outcome, i.e. the one that
+    /// reaches exactly `total_chars`.
     #[allow(clippy::too_many_arguments)]
     async fn submit_block_text_in_chunks(
         state: &AppState,
@@ -1974,7 +2102,7 @@ mod database_tests {
             .await;
             create_this_chunk = false;
             inserted += this_chunk;
-            let outcome = submit(
+            let (outcome, attempts) = submit_retrying_load_dependent(
                 state,
                 cache,
                 coordinator,
@@ -1993,7 +2121,7 @@ mod database_tests {
             match outcome {
                 AcceptOutcome::Accepted(_) => {}
                 AcceptOutcome::Rejected(rejected) => panic!(
-                    "an intermediate text chunk (inserted {inserted} of {total_chars}) was unexpectedly rejected: {rejected:?}"
+                    "an intermediate text chunk (inserted {inserted} of {total_chars}) was still rejected after {attempts} attempt(s): {rejected:?}"
                 ),
             }
         }
