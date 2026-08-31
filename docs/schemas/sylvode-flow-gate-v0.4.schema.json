@@ -150,6 +150,7 @@
         "migration_verify",
         "document_seq_verify",
         "mcp_transport_verify",
+        "feature_flag_verify",
         "tool_registry_verify",
         "cli_contract_verify",
         "transport_auth_verify",
@@ -206,6 +207,9 @@
           "$ref": "#/$defs/required_command_result"
         },
         "mcp_transport_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "feature_flag_verify": {
           "$ref": "#/$defs/required_command_result"
         },
         "tool_registry_verify": {
@@ -718,6 +722,7 @@
         "api_contract_fixture",
         "error_contract_result",
         "mcp_contract_fixture",
+        "feature_flag_result",
         "cli_contract_fixture",
         "ui_e2e_result",
         "deployed_chain_websocket_result",
@@ -744,6 +749,9 @@
           "$ref": "#/$defs/artifact_entry"
         },
         "mcp_contract_fixture": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "feature_flag_result": {
           "$ref": "#/$defs/artifact_entry"
         },
         "cli_contract_fixture": {

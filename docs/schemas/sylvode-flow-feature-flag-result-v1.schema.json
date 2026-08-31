@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sylvode.local/schemas/flow-feature-flag-result-v1.schema.json",
+  "title": "Sylvode Flow v0.4 feature flag verifier result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_head",
+    "generated_at",
+    "contract_command_mismatch",
+    "environment",
+    "transports",
+    "observations",
+    "negative_controls",
+    "violations",
+    "gates",
+    "passed"
+  ],
+  "properties": {
+    "schema_version": { "const": "sylvode.flow.feature-flag-result.v1" },
+    "source_head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "contract_command_mismatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_command", "expected_target", "target_exists", "discovered_integration_test_targets", "resolution"],
+      "properties": {
+        "contract_command": { "const": "cargo test -p mcp-server --test flow_feature_legacy_admin_e2e" },
+        "expected_target": { "const": "flow_feature_legacy_admin_e2e" },
+        "target_exists": { "type": "boolean" },
+        "discovered_integration_test_targets": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "resolution": { "type": "string", "minLength": 1 }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["reachable"],
+      "properties": { "reachable": { "type": "boolean" } }
+    },
+    "transports": {
+      "const": ["http", "sse", "stdio"]
+    },
+    "observations": { "type": "object" },
+    "negative_controls": { "type": "object" },
+    "violations": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "feature_flag_navigation_and_direct_url",
+        "feature_flag_mcp_read_admin_write_and_cli_equivalence"
+      ],
+      "properties": {
+        "feature_flag_navigation_and_direct_url": { "$ref": "#/$defs/gate" },
+        "feature_flag_mcp_read_admin_write_and_cli_equivalence": { "$ref": "#/$defs/gate" }
+      }
+    },
+    "passed": { "type": "boolean" }
+  },
+  "$defs": {
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "enum": ["passed", "failed"] },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "passed": { "const": true } }, "required": ["passed"] },
+      "then": {
+        "properties": {
+          "violations": { "maxItems": 0 },
+          "gates": {
+            "properties": {
+              "feature_flag_navigation_and_direct_url": { "properties": { "status": { "const": "passed" } } },
+              "feature_flag_mcp_read_admin_write_and_cli_equivalence": { "properties": { "status": { "const": "passed" } } }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

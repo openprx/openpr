@@ -509,6 +509,19 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         reasons,
     )
 
+    # ---- live feature-flag verifier: backs both rollout gates ----
+    # The contract's historical cargo integration-test target does not exist;
+    # feature-flag-result.json records that mismatch and derives both verdicts
+    # from live API/MCP HTTP+SSE+stdio/CLI/browser observations. A transport or
+    # environment failure is an explicit failed verdict, never a skip/pass.
+    bridge_verifier_gates(
+        evidence_root,
+        "feature-flag-result.json",
+        "sylvode.flow.feature-flag-result.v1",
+        gates,
+        reasons,
+    )
+
     # ---- forms regression: backs 1 gate ----
     # scripts/verify-flow-forms-regression-v0.4.sh runs the repository's
     # existing Universal Forms CI gate bundle (scripts/ci-universal-forms-

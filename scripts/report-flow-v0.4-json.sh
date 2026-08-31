@@ -227,6 +227,9 @@ run_step required.document_seq_verify "$ROOT_DIR/scripts/verify-flow-document-se
 echo "=== Sylvode Flow v0.4 report: MCP three-transport contract verify ==="
 run_step required.mcp_transport_verify "$ROOT_DIR/scripts/verify-flow-mcp-transports-v0.4.sh" --transports http,sse,stdio --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
+echo "=== Sylvode Flow v0.4 report: feature flag surfaces + disabled UI verify ==="
+run_step required.feature_flag_verify "$ROOT_DIR/scripts/verify-flow-feature-flags-v0.4.sh" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
 echo "=== Sylvode Flow v0.4 report: MCP tool registry count verify ==="
 run_step required.tool_registry_verify "$ROOT_DIR/scripts/verify-flow-tool-registry-v0.4.sh" --baseline "$CONTRACTS_ROOT/contracts/tool-count-baseline.md" --release 0.4 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
@@ -269,6 +272,7 @@ REQUIRED_ARTIFACTS=(
   "api_contract_fixture:$EVIDENCE_ROOT/rest-contract-result.json:evidence/v0.4/rest-contract-result.json"
   "error_contract_result:$EVIDENCE_ROOT/error-contract-result.json:evidence/v0.4/error-contract-result.json"
   "mcp_contract_fixture:$EVIDENCE_ROOT/mcp-contract-result.json:evidence/v0.4/mcp-contract-result.json"
+  "feature_flag_result:$EVIDENCE_ROOT/feature-flag-result.json:evidence/v0.4/feature-flag-result.json"
   "cli_contract_fixture:$EVIDENCE_ROOT/cli-contract-result.json:evidence/v0.4/cli-contract-result.json"
   "ui_e2e_result:$EVIDENCE_ROOT/ui-e2e-result.json:evidence/v0.4/ui-e2e-result.json"
   "deployed_chain_websocket_result:$EVIDENCE_ROOT/deployed-chain-websocket-result.json:evidence/v0.4/deployed-chain-websocket-result.json"
@@ -346,6 +350,7 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson migration_verify "$(get_check required.migration_verify)" \
   --argjson document_seq_verify "$(get_check required.document_seq_verify)" \
   --argjson mcp_transport_verify "$(get_check required.mcp_transport_verify)" \
+  --argjson feature_flag_verify "$(get_check required.feature_flag_verify)" \
   --argjson tool_registry_verify "$(get_check required.tool_registry_verify)" \
   --argjson cli_contract_verify "$(get_check required.cli_contract_verify)" \
   --argjson transport_auth_verify "$(get_check required.transport_auth_verify)" \
@@ -370,6 +375,7 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     migration_verify:$migration_verify,
     document_seq_verify:$document_seq_verify,
     mcp_transport_verify:$mcp_transport_verify,
+    feature_flag_verify:$feature_flag_verify,
     tool_registry_verify:$tool_registry_verify,
     cli_contract_verify:$cli_contract_verify,
     transport_auth_verify:$transport_auth_verify,
