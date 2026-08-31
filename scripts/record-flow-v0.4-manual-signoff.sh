@@ -6,7 +6,7 @@ set -euo pipefail
 # Contract: gate-commands.md ("record" role) -- "唯一可写人工签署入口；拒绝
 # 空 reviewer/evidence、未知 key、非法状态和覆盖已签记录." The five v0.4 keys
 # are the manual_signoffs required by sylvode-flow-gate-v1.schema.json:
-# editor_ime, selection_cursor, dependency_license, engine_decision.
+# page_editor, navigator_a11y, restart_recovery, feature_flag, forms_regression.
 #
 # This is the ONLY script allowed to write gate-result.json's
 # manual_signoffs block. It edits gate-result.json in place with an atomic
@@ -29,7 +29,9 @@ VALID_KEYS="page_editor navigator_a11y restart_recovery feature_flag forms_regre
 VALID_STATUSES="pending passed failed needs_rework"
 
 usage() {
-  cat <<'EOF'
+  local key_count
+  key_count="$(wc -w <<<"$VALID_KEYS" | tr -d ' ')"
+  cat <<EOF
 Usage: scripts/record-flow-v0.4-manual-signoff.sh --key KEY --status STATUS --reviewer NAME --evidence NOTE [OPTIONS]
 
 Records one manual signoff row in evidence/v0.4/gate-result.json's
@@ -47,7 +49,7 @@ Keys (sylvode-flow-gate-v0.4.schema.json manual_signoffs):
 Statuses: pending, passed, failed, needs_rework
 
 Required options:
-  --key KEY           One of the four keys above.
+  --key KEY           One of the ${key_count} keys above.
   --status STATUS      One of the four statuses above.
   --reviewer NAME       Non-empty reviewer identity. Required whenever
                         --status is not "pending" (a "pending" row records

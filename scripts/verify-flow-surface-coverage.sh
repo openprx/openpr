@@ -6,10 +6,11 @@ set -euo pipefail
 # Contract: /opt/working/sylvode-flow/gates/gate-commands.md, "Surface
 # coverage verifier (v0.4-v1.0 共用)" section.
 #
-# Parses ONLY the five frozen contract files (rest-api-v1.md,
-# mcp-surface-v1.md, cli-surface-v1.md, ui-surface-v1.md,
-# surface-coverage-v1.md) -- never live application source or a running
-# server -- and recomputes every cross-reference the contract requires:
+# Parses the five frozen contract files and recomputes every cross-reference
+# they require, then checks the release-applicable promises against the
+# shipped implementation: MCP names come from executing list-tools, CLI
+# commands from executing sylvode's command tree, and REST identities from
+# the Axum route registrations assembled by apps/api/src/main.rs.
 # the full 49-endpoint REST<->matrix 1:1 correspondence, matrix<->live
 # MCP tool/resource/CLI-command bidirectional coverage (no orphans, no
 # unknown refs), the three-item MCP not_exposed allowlist with
@@ -18,7 +19,7 @@ set -euo pipefail
 # It never substitutes a hand-written expected count for a real set
 # comparison (parsing logic: scripts/lib/flow_surface_coverage.py).
 #
-# Exit codes: 0 = zero violations across all 16 violation classes,
+# Exit codes: 0 = zero contract or implementation-parity violations,
 # 1 = one or more violations found, 2 = usage/tool/evidence malformed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -34,7 +35,8 @@ Usage: scripts/verify-flow-surface-coverage.sh --release X.Y --json [OPTIONS]
 
 Parses contracts/{rest-api-v1,mcp-surface-v1,cli-surface-v1,ui-surface-v1,
 surface-coverage-v1}.md under --contracts-root, recomputes the full
-REST<->MCP<->CLI<->UI cross-reference and writes
+REST<->MCP<->CLI<->UI cross-reference, probes the shipped MCP/CLI binaries
+and API route registrations, and writes
 evidence/vX.Y/surface-coverage-result.json (schema:
 docs/schemas/sylvode-flow-surface-coverage-result-v1.schema.json).
 
@@ -89,7 +91,7 @@ if [[ -z "$EVIDENCE_ROOT" ]]; then
   EVIDENCE_ROOT="$CONTRACTS_ROOT/evidence/v$RELEASE"
 fi
 
-for tool in jq sha256sum git python3; do
+for tool in jq sha256sum git python3 cargo; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     exit 2
@@ -110,6 +112,26 @@ SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "$EVIDENCE_ROOT"
 
+# These binaries are the shipped registries. Building and executing them is
+# intentional: source grep cannot prove that a declaration reached the binary.
+(cd "$REPO_ROOT" && cargo build -p mcp-server --bin list-tools --bin sylvode) >&2
+MCP_OUTPUT="$(mktemp)"
+"$REPO_ROOT/target/debug/list-tools" > "$MCP_OUTPUT"
+IMPL_OUT="$(mktemp)"
+set +e
+python3 "$ROOT_DIR/scripts/lib/flow_surface_implementation.py" \
+  --contracts-root "$CONTRACTS_ROOT" --repo-root "$REPO_ROOT" --release "$RELEASE" \
+  --mcp-output "$MCP_OUTPUT" --cli-binary "$REPO_ROOT/target/debug/sylvode" > "$IMPL_OUT"
+IMPL_EXIT=$?
+set -e
+rm -f "$MCP_OUTPUT"
+if ! jq empty "$IMPL_OUT" >/dev/null 2>&1; then
+  echo "FAIL: implementation surface probe did not produce valid JSON (exit=$IMPL_EXIT)" >&2
+  cat "$IMPL_OUT" >&2
+  rm -f "$IMPL_OUT"
+  exit 2
+fi
+
 PARSE_OUT="$(mktemp)"
 set +e
 python3 "$ROOT_DIR/scripts/lib/flow_surface_coverage.py" --contracts-root "$CONTRACTS_ROOT" --release "$RELEASE" > "$PARSE_OUT"
@@ -123,7 +145,7 @@ if ! jq empty "$PARSE_OUT" >/dev/null 2>&1; then
   exit 2
 fi
 
-RESULT="$(jq \
+RESULT="$(jq --slurpfile implementation "$IMPL_OUT" \
   --arg release "$RELEASE" --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" \
   '{
     schema_version: "sylvode.flow.surface-coverage-result.v1",
@@ -132,10 +154,15 @@ RESULT="$(jq \
     generated_at: $generated_at,
     contracts: .contracts,
     counts: .counts,
-    violations: .violations,
-    passed: .passed
+    implementation_parity: $implementation[0],
+    violations: (.violations + {
+      contract_mcp_missing_live: $implementation[0].mcp.contract_missing_in_implementation,
+      contract_rest_missing_implementation: $implementation[0].rest.contract_missing_in_implementation,
+      contract_cli_missing_implementation: $implementation[0].cli.contract_missing_in_implementation
+    }),
+    passed: (.passed and $implementation[0].passed)
   }' "$PARSE_OUT")"
-rm -f "$PARSE_OUT"
+rm -f "$PARSE_OUT" "$IMPL_OUT"
 
 # Sanity floor: an empty/gutted/unparseable contract file produces zero rows on
 # every side of the comparison, which is trivially self-consistent (0 == 0 == 0

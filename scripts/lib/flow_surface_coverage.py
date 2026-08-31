@@ -5,11 +5,10 @@ Contract: /opt/working/sylvode-flow/gates/gate-commands.md, "Surface coverage
 verifier (v0.4-v1.0 共用)" section, and
 /opt/working/sylvode-flow/contracts/surface-coverage-v1.md.
 
-This module ONLY parses the five frozen markdown contract files listed
-below; it never reads live application source or a running server. It
-recomputes the REST/MCP/CLI/UI cross-reference matrix from the contract
-text itself and reports every violation class gate-commands.md names,
-instead of trusting any hand-written expected count.
+This module parses the five frozen markdown contract files and recomputes
+their internal cross-reference matrix.  The shell verifier then combines
+this result with scripts/lib/flow_surface_implementation.py, which checks
+the shipped MCP/CLI binaries and the API route registrations.
 
 Inputs (paths under --contracts-root):
   contracts/rest-api-v1.md
@@ -89,6 +88,7 @@ def is_separator_row(cells: list[str]) -> bool:
 class RestRow:
     identity: str
     version: str  # e.g. "0.4"
+    conditional: bool = False
 
 
 def parse_rest_table(path: str) -> list[RestRow]:
@@ -111,7 +111,10 @@ def parse_rest_table(path: str) -> list[RestRow]:
             if current_version is None:
                 continue
             identity = normalize_rest_identity(m2.group(1), m2.group(2))
-            rows.append(RestRow(identity=identity, version=current_version))
+            # ADR-0003's legacy table is explicitly conditional on a nonzero
+            # inventory; the frozen zero-row v0.4 branch has no route surface.
+            conditional = "/legacy-pages/" in identity
+            rows.append(RestRow(identity=identity, version=current_version, conditional=conditional))
     return rows
 
 
@@ -177,6 +180,7 @@ def parse_matrix(path: str) -> list[MatrixRow]:
 class McpTool:
     name: str
     version: str
+    conditional: bool = False
 
 
 def parse_mcp_live(path: str) -> tuple[list[McpTool], list[McpTool]]:
@@ -205,12 +209,13 @@ def parse_mcp_live(path: str) -> tuple[list[McpTool], list[McpTool]]:
             if not m:
                 continue
             name = m.group(1)
-            version = cells[1].strip() if len(cells) > 1 else ""
-            version = version.split()[0] if version else ""
+            version_raw = cells[1].strip() if len(cells) > 1 else ""
+            conditional = "conditional" in version_raw
+            version = version_raw.split()[0] if version_raw else ""
             if section == "tools":
-                tools.append(McpTool(name=name, version=version))
+                tools.append(McpTool(name=name, version=version, conditional=conditional))
             else:
-                resources.append(McpTool(name=name, version=version))
+                resources.append(McpTool(name=name, version=version, conditional=conditional))
     return tools, resources
 
 
@@ -238,6 +243,7 @@ class CliCommand:
     version: str
     raw: str
     data_cell: str
+    conditional: bool = False
 
 
 def parse_cli_live(path: str) -> list[CliCommand]:
@@ -253,24 +259,25 @@ def parse_cli_live(path: str) -> list[CliCommand]:
                 continue
             base = cli_base_key(cells[0])
             version_raw = cells[1].strip() if len(cells) > 1 else ""
+            conditional = "conditional" in version_raw
             version = version_raw.split()[0] if version_raw else ""
             data_cell = cells[3] if len(cells) > 3 else ""
-            raw_rows.append((base, cells[0], version, data_cell))
+            raw_rows.append((base, cells[0], version, data_cell, conditional))
 
     # Group by base key text to detect duplicates needing a suffix.
     groups: dict[str, list[int]] = {}
-    for idx, (base, _raw, _v, _d) in enumerate(raw_rows):
+    for idx, (base, _raw, _v, _d, _conditional) in enumerate(raw_rows):
         groups.setdefault(".".join(base), []).append(idx)
 
     out: list[CliCommand] = []
     for base_str, idxs in groups.items():
         if len(idxs) == 1:
             i = idxs[0]
-            _base, raw, version, _data = raw_rows[i]
-            out.append(CliCommand(key=base_str, version=version, raw=raw, data_cell=_data))
+            _base, raw, version, _data, conditional = raw_rows[i]
+            out.append(CliCommand(key=base_str, version=version, raw=raw, data_cell=_data, conditional=conditional))
             continue
         for i in idxs:
-            _base, raw, version, data = raw_rows[i]
+            _base, raw, version, data, conditional = raw_rows[i]
             suffix = None
             # Priority 1: a literal boolean flag matching the closed
             # suffix vocabulary (surface-coverage-v1.md "记法": only
@@ -294,7 +301,7 @@ def parse_cli_live(path: str) -> list[CliCommand]:
                         suffix = word
                         break
             key = f"{base_str}#{suffix}" if suffix else f"{base_str}#UNRESOLVED{i}"
-            out.append(CliCommand(key=key, version=version, raw=raw, data_cell=data))
+            out.append(CliCommand(key=key, version=version, raw=raw, data_cell=data, conditional=conditional))
     return out
 
 

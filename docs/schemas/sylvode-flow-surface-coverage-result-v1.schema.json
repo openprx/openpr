@@ -12,6 +12,7 @@
     "generated_at",
     "contracts",
     "counts",
+    "implementation_parity",
     "violations",
     "passed"
   ],
@@ -59,6 +60,18 @@
         }
       }
     },
+    "implementation_parity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_filter", "mcp", "rest", "cli", "passed"],
+      "properties": {
+        "release_filter": { "type": "string" },
+        "mcp": { "$ref": "#/$defs/implementation_dimension" },
+        "rest": { "$ref": "#/$defs/implementation_dimension" },
+        "cli": { "$ref": "#/$defs/implementation_dimension" },
+        "passed": { "type": "boolean" }
+      }
+    },
     "violations": {
       "type": "object",
       "additionalProperties": false,
@@ -68,7 +81,9 @@
         "unknown_mcp_refs", "unknown_cli_refs", "unknown_ui_consumers",
         "blank_cells", "invalid_reason_codes", "reason_column_mismatches",
         "mcp_exception_endpoint_mismatches", "mcp_exception_without_authority",
-        "version_inversions", "future_exposure_counted_as_shipped"
+        "version_inversions", "future_exposure_counted_as_shipped",
+        "contract_mcp_missing_live", "contract_rest_missing_implementation",
+        "contract_cli_missing_implementation"
       ],
       "properties": {
         "missing_rest_rows": { "type": "array", "items": { "type": "string" } },
@@ -86,12 +101,40 @@
         "mcp_exception_endpoint_mismatches": { "type": "array", "items": { "type": "string" } },
         "mcp_exception_without_authority": { "type": "array", "items": { "type": "string" } },
         "version_inversions": { "type": "array", "items": { "type": "string" } },
-        "future_exposure_counted_as_shipped": { "type": "array", "items": { "type": "string" } }
+        "future_exposure_counted_as_shipped": { "type": "array", "items": { "type": "string" } },
+        "contract_mcp_missing_live": { "type": "array", "items": { "type": "string" } },
+        "contract_rest_missing_implementation": { "type": "array", "items": { "type": "string" } },
+        "contract_cli_missing_implementation": { "type": "array", "items": { "type": "string" } }
       }
     },
     "passed": { "type": "boolean" }
   },
   "$defs": {
-    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "implementation_dimension": {
+      "type": "object",
+      "required": ["proof", "contract_applicable", "contract_declared", "implementation", "contract_missing_in_implementation", "not_in_flow_contract", "counts", "passed"],
+      "properties": {
+        "proof": { "type": "string" },
+        "contract_applicable": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "contract_declared": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "contract_missing_in_implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "not_in_flow_contract": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["contract_applicable", "contract_declared", "implementation", "contract_missing_in_implementation", "not_in_flow_contract"],
+          "properties": {
+            "contract_applicable": { "type": "integer", "minimum": 0 },
+            "contract_declared": { "type": "integer", "minimum": 0 },
+            "implementation": { "type": "integer", "minimum": 0 },
+            "contract_missing_in_implementation": { "type": "integer", "minimum": 0 },
+            "not_in_flow_contract": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "passed": { "type": "boolean" }
+      }
+    }
   }
 }

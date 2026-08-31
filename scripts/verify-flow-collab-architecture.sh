@@ -91,6 +91,7 @@ LIMITS_PATH=""
 JSON_MODE=0
 SKIP_CARGO_TEST=0
 LOAD_HARNESS_EVIDENCE="${OPENPR_FLOW_LOAD_HARNESS_EVIDENCE:-}"
+CACHE_EVIDENCE="${OPENPR_FLOW_CACHE_EVIDENCE:-}"
 DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
 
 usage() {
@@ -130,6 +131,7 @@ Options:
                           workspace. Default: this checkout.
   --load-harness-evidence PATH
                           JSON emitted by flow_collab_load_harness.rs.
+  --cache-evidence PATH   JSON emitted by flow_collab_cache_evidence.rs.
   --dedicated-pg-container NAME
                           Required with harness evidence. Must exactly match
                           environment.pg_log_container in that evidence; this
@@ -158,6 +160,7 @@ while [[ $# -gt 0 ]]; do
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --load-harness-evidence) LOAD_HARNESS_EVIDENCE="${2:?--load-harness-evidence requires a PATH}"; shift 2 ;;
+    --cache-evidence) CACHE_EVIDENCE="${2:?--cache-evidence requires a PATH}"; shift 2 ;;
     --dedicated-pg-container) DEDICATED_PG_CONTAINER="${2:?--dedicated-pg-container requires a NAME}"; shift 2 ;;
     --skip-cargo-test) SKIP_CARGO_TEST=1; shift ;;
     --json) JSON_MODE=1; shift ;;
@@ -391,6 +394,58 @@ fi
 echo "=== load harness evidence ===" >&2
 jq -r '"  available=\(.available) dedicated_environment=\(.official_environment_ok) budget_gate=\(.budget_gate_passed) parity_gate=\(.parity_gate_passed)"' <<<"$HARNESS_CHECK_JSON" >&2
 jq -r '.violations[] | "  VIOLATION: " + .' <<<"$HARNESS_CHECK_JSON" >&2
+
+# Recompute ADR-0010's fixed eight-field cache block from the raw harness
+# observations.  The harness's own `passed` bit is an input integrity check,
+# never a substitute for these field-by-field predicates.
+CACHE_CHECK_JSON="$(python3 - "$CACHE_EVIDENCE" <<'PY'
+import hashlib, json, os, sys
+path = sys.argv[1]
+if not path:
+    print(json.dumps({"available": False, "evidence_path": None, "source_head": None, "source_tree_dirty": None,
+        "supplemental_checks": {k: False for k in ("cache_conditions_no_lost_update","retry_exhaustion_rolled_back","bypass_unique_seq")},
+        "violations": ["no --cache-evidence was supplied"], "passed": False,
+        "cache": {k: False for k in ("entry_exact","entry_plus_one_evicted","bytes_exact","bytes_plus_one_evicted","idle_ttl_reclaimed","restart_hash_equal","observers_after_destroy","timers_after_destroy")}}))
+    raise SystemExit
+if not os.path.isfile(path):
+    print(json.dumps({"error": f"cache evidence does not exist: {path}"})); raise SystemExit
+try: raw = json.load(open(path, encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    print(json.dumps({"error": f"cache evidence is not valid JSON: {exc}"})); raise SystemExit
+if raw.get("schema_version") != "sylvode.flow.collab-cache-evidence.v1":
+    print(json.dumps({"error": "cache evidence has the wrong schema_version"})); raise SystemExit
+b = raw.get("cache_boundaries") or {}; o = raw.get("observers_and_timers") or {}
+r = raw.get("rebuild_after_eviction") or {}; n = raw.get("no_accepted_update_lost") or {}
+x = raw.get("retry_exhaustion") or {}; y = raw.get("bypass_and_removal") or {}
+ce = b.get("entry_count_ceiling"); bc = b.get("decoded_bytes_ceiling")
+ce_ok = isinstance(ce, int) and ce > 0
+bc_ok = isinstance(bc, int) and bc > 0
+cache = {
+ "entry_exact": ce_ok and b.get("entry_exact_all_resident") is True and b.get("entry_exact_resident_count") == ce,
+ "entry_plus_one_evicted": ce_ok and b.get("entry_plus_one_lru_reclaimed") is True and b.get("entry_plus_one_newest_resident") is True and b.get("entry_plus_one_resident_count") == ce and b.get("entry_plus_one_non_lru_survivors") == ce - 1,
+ "bytes_exact": bc_ok and b.get("bytes_exact_equals_ceiling") is True and b.get("bytes_exact_total_bytes") == bc,
+ "bytes_plus_one_evicted": bc_ok and b.get("bytes_plus_one_lru_reclaimed") is True and b.get("bytes_plus_one_within_ceiling") is True and isinstance(b.get("bytes_plus_one_total_bytes"), int) and b.get("bytes_plus_one_total_bytes") <= bc,
+ "idle_ttl_reclaimed": b.get("idle_ttl_alive_before_expiry") is True and b.get("idle_ttl_reclaimed") is True and b.get("idle_ttl_alive_probe_seconds", 0) < b.get("idle_ttl_seconds", 0) < b.get("idle_ttl_reclaim_probe_seconds", 0),
+ "restart_hash_equal": r.get("semantic_hash_equal") is True and r.get("head_equal") is True and n.get("post_restart_rebuilt_head_seq") == n.get("canonical_head_seq") == n.get("accepted_total") and bool(n.get("post_restart_rebuilt_semantic_hash")),
+ "observers_after_destroy": o.get("cycle_original_entries_remaining") == 0 and o.get("open_fds_delta") == 0 and o.get("engine_observer_api_exists_in_collab_core") is False,
+ "timers_after_destroy": o.get("os_threads_delta") == 0 and o.get("static_background_constructs_in_cache_and_coordinator") == [],
+}
+supplemental = {
+ "cache_conditions_no_lost_update": set(n.get("conditions_exercised") or []) >= {"miss","warmup","hit","eviction","restart"} and n.get("seq_contiguous_from_one") is True and n.get("collab_updates_rows") == n.get("accepted_total"),
+ "retry_exhaustion_rolled_back": (x.get("lock_wait_exhaustion") or {}).get("canonical_state_unchanged") is True and not (x.get("head_mismatch_exhaustion") or {}).get("rejected_victims_that_left_a_row"),
+ "bypass_unique_seq": (y.get("cache_and_coordinator_deleted") or {}).get("seqs_unique") is True and y.get("correctness_unchanged_without_cache_or_coordinator") is True and (y.get("row_lock_negative_control") or {}).get("row_lock_is_the_authority") is True,
+}
+violations = [f"cache check failed: {k}" for k,v in {**cache, **supplemental}.items() if not v]
+if raw.get("passed") is not True or raw.get("violations") != []: violations.append("cache harness self-verdict is not passed with an empty violations array")
+print(json.dumps({"available": True, "evidence_path": os.path.abspath(path), "evidence_sha256": hashlib.sha256(open(path,"rb").read()).hexdigest(), "source_head": raw.get("source_head"), "source_tree_dirty": raw.get("source_tree_dirty"), "cache": cache, "supplemental_checks": supplemental, "violations": violations, "passed": not violations}))
+PY
+)"
+if ! jq -e . >/dev/null 2>&1 <<<"$CACHE_CHECK_JSON" || jq -e 'has("error")' >/dev/null 2>&1 <<<"$CACHE_CHECK_JSON"; then
+  echo "FAIL: $(jq -r '.error // "cache evidence parser produced invalid JSON"' <<<"$CACHE_CHECK_JSON" 2>/dev/null || true)" >&2
+  exit 2
+fi
+echo "=== cache evidence: available=$(jq -r .available <<<"$CACHE_CHECK_JSON") passed=$(jq -r .passed <<<"$CACHE_CHECK_JSON") ===" >&2
+jq -r '.violations[] | "  VIOLATION: " + .' <<<"$CACHE_CHECK_JSON" >&2
 
 # ---- 1+2. static checks: ADR status + frozen numeric budgets ----
 STATIC_JSON="$(python3 - "$ADR_PATH" "$LIMITS_RS" "$REPO_ROOT" <<'PY'
@@ -736,6 +791,7 @@ FINAL_JSON="$(jq -n \
   --argjson frozen_limits_test_passed "$FROZEN_LIMITS_TEST_PASSED" \
   --argjson load_harness_exists "$LOAD_HARNESS_EXISTS" \
   --argjson harness "$HARNESS_CHECK_JSON" \
+  --argjson cache_evidence "$CACHE_CHECK_JSON" \
   --argjson snap "$RESULT_JSON" \
   '
   def gate($id): ($snap.gates[$id].dynamic_passed // false);
@@ -759,18 +815,20 @@ FINAL_JSON="$(jq -n \
       verified_portion_passed: $numeric_budgets_verified_portion,
       load_harness: $harness
     },
+    cache: $cache_evidence.cache,
+    cache_evidence: $cache_evidence,
     gates: {
       collab_architecture_adr_accepted: {
         status: (if $adr_accepted then "passed" else "failed" end),
         reason: (if $adr_accepted then null else ("ADR-0010 status is \"" + $static_check.adr_status + "\", not \"Accepted\"") end)
       },
       bounded_warm_cache_lock_hold_and_round_trip_budgets: {
-        status: (if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed) then "passed" else "failed" end),
+        status: (if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed and $cache_evidence.passed) then "passed" else "failed" end),
         reason: (
-          if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed) then
-            "frozen constants and their tests pass; dedicated release PostgreSQL harness evidence meets lock hold p95/single, wait, in-lock gap, 10-client round-trip p95, sample-size, statement-inventory and reconstruction-coverage budgets"
+          if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed and $cache_evidence.passed) then
+            "frozen constants, dedicated load budgets, and the ADR fixed cache block all pass"
           else
-            "numeric constants or independently re-evaluated dedicated load-harness checks failed; see load_harness.violations and budget_checks"
+            "numeric constants, dedicated load-harness checks, or cache evidence failed; see load_harness/cache_evidence violations"
           end
         ),
         verified_portion: {
@@ -779,7 +837,8 @@ FINAL_JSON="$(jq -n \
           frozen_limits_test_passed: $frozen_limits_test_passed
         },
         load_harness_grep: $static_check.load_harness_grep,
-        load_harness: $harness
+        load_harness: $harness,
+        cache_evidence: $cache_evidence
       },
       minimal_snapshot_advancement_bounds_tail: {
         status: (if (gate("minimal_snapshot_advancement_bounds_tail") and $frozen_limits_test_passed) then "passed" else "failed" end),

@@ -255,6 +255,8 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             "orphan_mcp_tools", "orphan_mcp_resources", "orphan_cli_commands",
             "unknown_mcp_refs", "unknown_cli_refs", "unknown_ui_consumers",
             "blank_cells", "version_inversions", "future_exposure_counted_as_shipped",
+            "contract_mcp_missing_live", "contract_rest_missing_implementation",
+            "contract_cli_missing_implementation",
         ]
         parity_violations = sum(len(v.get(k, [])) for k in parity_keys)
         set_gate(

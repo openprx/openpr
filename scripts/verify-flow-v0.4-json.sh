@@ -110,6 +110,7 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 DRIFT=()
 
@@ -170,12 +171,22 @@ if [[ "$(jq -r '.release // empty' "$GATE_RESULT_PATH")" != "0.4.0" ]]; then
   DRIFT+=("release is not 0.4.0")
 fi
 
-# ---- source.head vs actual repo HEAD ----
+# ---- source/source_baseline vs actual checked-out repository ----
 ACTUAL_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+ACTUAL_RUST_VERSION="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)"
+ACTUAL_FRONTEND_VERSION="$(jq -r '.version // empty' "$REPO_ROOT/frontend/package.json")"
 RECORDED_HEAD="$(jq -r '.source.head // empty' "$GATE_RESULT_PATH")"
 if [[ "$RECORDED_HEAD" != "$ACTUAL_HEAD" ]]; then
   DRIFT+=("source.head=$RECORDED_HEAD does not match actual repo HEAD=$ACTUAL_HEAD")
 fi
+BASELINE_REPOSITORY="$(jq -r '.source_baseline.repository // empty' "$GATE_RESULT_PATH")"
+BASELINE_RUST_VERSION="$(jq -r '.source_baseline.rust_workspace_version // empty' "$GATE_RESULT_PATH")"
+BASELINE_FRONTEND_VERSION="$(jq -r '.source_baseline.frontend_package_version // empty' "$GATE_RESULT_PATH")"
+BASELINE_HEAD="$(jq -r '.source_baseline.reviewed_head // empty' "$GATE_RESULT_PATH")"
+[[ "$BASELINE_REPOSITORY" == "$REPO_ROOT" ]] || DRIFT+=("source_baseline.repository=$BASELINE_REPOSITORY does not match repo root=$REPO_ROOT")
+[[ "$BASELINE_RUST_VERSION" == "$ACTUAL_RUST_VERSION" ]] || DRIFT+=("source_baseline.rust_workspace_version=$BASELINE_RUST_VERSION does not match Cargo.toml=$ACTUAL_RUST_VERSION")
+[[ "$BASELINE_FRONTEND_VERSION" == "$ACTUAL_FRONTEND_VERSION" ]] || DRIFT+=("source_baseline.frontend_package_version=$BASELINE_FRONTEND_VERSION does not match frontend/package.json=$ACTUAL_FRONTEND_VERSION")
+[[ "$BASELINE_HEAD" == "$ACTUAL_HEAD" ]] || DRIFT+=("source_baseline.reviewed_head=$BASELINE_HEAD does not match actual repo HEAD=$ACTUAL_HEAD")
 RECORDED_DIRTY="$(jq -r 'if has("source") and (.source | has("dirty")) then (.source.dirty | tostring) else "" end' "$GATE_RESULT_PATH")"
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   ACTUAL_DIRTY=true

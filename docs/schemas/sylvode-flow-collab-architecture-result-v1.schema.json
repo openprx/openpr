@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-collab-architecture-result-v1.schema.json",
+  "title": "Sylvode Flow Collaboration Architecture Result v1",
+  "type": "object",
+  "required": ["schema_version", "release", "source_head", "generated_at", "cache", "cache_evidence", "gates", "passed"],
+  "properties": {
+    "schema_version": { "const": "sylvode.flow.collab-architecture-result.v1" },
+    "release": { "type": "string" },
+    "source_head": { "type": "string" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entry_exact", "entry_plus_one_evicted", "bytes_exact", "bytes_plus_one_evicted", "idle_ttl_reclaimed", "restart_hash_equal", "observers_after_destroy", "timers_after_destroy"],
+      "properties": {
+        "entry_exact": { "type": "boolean" },
+        "entry_plus_one_evicted": { "type": "boolean" },
+        "bytes_exact": { "type": "boolean" },
+        "bytes_plus_one_evicted": { "type": "boolean" },
+        "idle_ttl_reclaimed": { "type": "boolean" },
+        "restart_hash_equal": { "type": "boolean" },
+        "observers_after_destroy": { "type": "boolean" },
+        "timers_after_destroy": { "type": "boolean" }
+      }
+    },
+    "cache_evidence": {
+      "type": "object",
+      "required": ["available", "cache", "supplemental_checks", "violations", "passed"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "cache": { "$ref": "#/properties/cache" },
+        "supplemental_checks": { "type": "object", "additionalProperties": { "type": "boolean" } },
+        "violations": { "type": "array", "items": { "type": "string" } },
+        "passed": { "type": "boolean" }
+      }
+    },
+    "gates": { "type": "object" },
+    "passed": { "type": "boolean" }
+  }
+}

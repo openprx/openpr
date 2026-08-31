@@ -36,6 +36,7 @@ EVIDENCE_ROOT=""
 REPO_ROOT="$ROOT_DIR"
 SKIP_GENERIC=0
 LOAD_HARNESS_EVIDENCE=""
+CACHE_EVIDENCE=""
 DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
 
 usage() {
@@ -63,6 +64,8 @@ Options:
   --load-harness-evidence PATH
                           Load-harness JSON passed to the architecture
                           verifier. Default: <evidence-root>/load-harness-result.json.
+  --cache-evidence PATH  Cache-harness JSON passed to the architecture verifier.
+                         Default: <evidence-root>/cache-evidence-result.json.
   --dedicated-pg-container NAME
                           Explicit dedicated PostgreSQL container declaration
                           passed through to the architecture verifier. Default:
@@ -86,6 +89,7 @@ while [[ $# -gt 0 ]]; do
     --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --load-harness-evidence) LOAD_HARNESS_EVIDENCE="${2:?--load-harness-evidence requires a PATH}"; shift 2 ;;
+    --cache-evidence) CACHE_EVIDENCE="${2:?--cache-evidence requires a PATH}"; shift 2 ;;
     --dedicated-pg-container) DEDICATED_PG_CONTAINER="${2:?--dedicated-pg-container requires a NAME}"; shift 2 ;;
     --skip-generic) SKIP_GENERIC=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -111,9 +115,11 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 mkdir -p "$EVIDENCE_ROOT"
 [[ -n "$LOAD_HARNESS_EVIDENCE" ]] || LOAD_HARNESS_EVIDENCE="$EVIDENCE_ROOT/load-harness-result.json"
+[[ -n "$CACHE_EVIDENCE" ]] || CACHE_EVIDENCE="$EVIDENCE_ROOT/cache-evidence-result.json"
 
 CHECKS_JSON="[]"
 OVERALL_FAILED=0
@@ -197,6 +203,7 @@ ARCHITECTURE_ARGS=(
   --adr "$CONTRACTS_ROOT/decisions/ADR-0010-collab-server-architecture.md"
   --limits "$CONTRACTS_ROOT/contracts/limits-v1.md"
   --load-harness-evidence "$LOAD_HARNESS_EVIDENCE"
+  --cache-evidence "$CACHE_EVIDENCE"
   --contracts-root "$CONTRACTS_ROOT"
   --evidence-root "$EVIDENCE_ROOT"
   --repo-root "$REPO_ROOT"
@@ -246,6 +253,12 @@ echo "=== Sylvode Flow v0.4 report: deployed three-hop WebSocket verify ==="
 run_step required.deployed_chain_websocket_upgrade "$ROOT_DIR/scripts/verify-flow-deployed-websocket-v0.4.sh" --chain caddy,nginx,api --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
 
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+RUST_WORKSPACE_VERSION="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)"
+FRONTEND_PACKAGE_VERSION="$(jq -r '.version // empty' "$REPO_ROOT/frontend/package.json")"
+if [[ -z "$RUST_WORKSPACE_VERSION" || -z "$FRONTEND_PACKAGE_VERSION" ]]; then
+  echo "FAIL: could not derive workspace/frontend versions from the checked-out source" >&2
+  exit 2
+fi
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
   SOURCE_DIRTY=true
 else
@@ -390,6 +403,8 @@ GATE_RESULT_PATH="$EVIDENCE_ROOT/gate-result.json"
 GATE_RESULT_TMP="$GATE_RESULT_PATH.tmp"
 jq -n \
   --arg head "$SOURCE_HEAD" --argjson dirty "$SOURCE_DIRTY" \
+  --arg repository "$REPO_ROOT" --arg rust_version "$RUST_WORKSPACE_VERSION" \
+  --arg frontend_version "$FRONTEND_PACKAGE_VERSION" \
   --arg generated_at "$GENERATED_AT" \
   --argjson checks "$CHECKS_JSON" \
   --argjson artifacts "$ARTIFACTS_JSON" \
@@ -400,12 +415,12 @@ jq -n \
     schema_path: "docs/schemas/sylvode-flow-gate-v0.4.schema.json",
     release: "0.4.0",
     source_baseline: {
-      repository: "/opt/worker/code/openpr",
-      rust_workspace_version: "0.2.31",
-      frontend_package_version: "0.2.11",
-      reviewed_head: "ab01d5d94de96294986c4c39ff01392535efebaa"
+      repository: $repository,
+      rust_workspace_version: $rust_version,
+      frontend_package_version: $frontend_version,
+      reviewed_head: $head
     },
-    source: {repository: "/opt/worker/code/openpr", head: $head, dirty: $dirty},
+    source: {repository: $repository, head: $head, dirty: $dirty},
     generated_at: $generated_at,
     mode: "blocked",
     gate_passed: false,
