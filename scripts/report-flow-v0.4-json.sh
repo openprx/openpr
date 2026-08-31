@@ -10,8 +10,10 @@ set -euo pipefail
 # "report" runs only read-only checks and the product-provided verify
 # scripts; it never marks anything passed that it did not itself observe,
 # and it never invents an artifact. It writes evidence/v0.4/gate-result.json
-# ONLY when every artifact docs/schemas/sylvode-flow-gate-v0.4.schema.json
-# requires actually exists with a real, freshly computed checksum --
+# whenever every artifact docs/schemas/sylvode-flow-gate-v0.4.schema.json
+# requires actually exists with a real, freshly computed checksum, even when
+# one or more checks failed (the frozen report contract requires exit 1 while
+# preserving gate-result.json in that case) --
 # fabricating a schema-shaped file with missing/placeholder artifacts is
 # exactly the fake-green pattern this v0.4 work exists to close.
 #
@@ -24,9 +26,9 @@ set -euo pipefail
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
 #
 # Exit codes: 0 = all checks ran and passed and gate-result.json was
-# written, 1 = one or more checks failed or a required artifact is
-# missing (run log still written; gate-result.json is written only if it
-# would be schema-valid), 2 = usage/tool/evidence malformed.
+# written, 1 = one or more checks failed or a required artifact is missing
+# (run log is always written; gate-result.json is also written when all
+# required artifacts exist), 2 = usage/tool/evidence malformed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
@@ -164,7 +166,7 @@ else
   run_step generic.cargo_fmt cargo fmt --all -- --check || true
   run_step generic.cargo_check cargo check --workspace --all-targets || true
   run_step generic.cargo_clippy cargo clippy --workspace --all-targets -- -D warnings || true
-  run_step generic.cargo_test cargo test --workspace || true
+  run_step generic.cargo_test cargo test --workspace --no-fail-fast || true
   run_step generic.bun_check bun run --cwd frontend check || true
   run_step generic.bun_build bun run --cwd frontend build || true
   run_step generic.ci_universal_forms_gates bash scripts/ci-universal-forms-gates.sh || true
@@ -290,8 +292,8 @@ for entry in "${REQUIRED_ARTIFACTS[@]}"; do
   fi
 done
 
-if [[ $OVERALL_FAILED -ne 0 || ${#MISSING_ARTIFACTS[@]} -gt 0 ]]; then
-  echo "REPORT: FAIL -- not writing evidence/v0.4/gate-result.json (would not be schema-valid / not all checks passed)" >&2
+if [[ ${#MISSING_ARTIFACTS[@]} -gt 0 ]]; then
+  echo "REPORT: FAIL -- not writing evidence/v0.4/gate-result.json because required artifacts are missing" >&2
   if [[ ${#MISSING_ARTIFACTS[@]} -gt 0 ]]; then
     echo "Missing required artifacts:" >&2
     for m in "${MISSING_ARTIFACTS[@]}"; do
@@ -319,6 +321,13 @@ get_check() {
 }
 ZERO_SHA="0000000000000000000000000000000000000000000000000000000000000"
 ZERO_SHA="${ZERO_SHA:0:64}"
+if [[ $OVERALL_FAILED -eq 0 ]]; then
+  REPORT_COMMAND_STATUS="passed"
+  REPORT_COMMAND_EXIT=0
+else
+  REPORT_COMMAND_STATUS="failed"
+  REPORT_COMMAND_EXIT=1
+fi
 
 REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson surface_parity "$(get_check required.surface_parity)" \
@@ -341,6 +350,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson cli_contract_verify "$(get_check required.cli_contract_verify)" \
   --argjson transport_auth_verify "$(get_check required.transport_auth_verify)" \
   --argjson cross_workspace_verify "$(get_check required.cross_workspace_verify)" \
+  --arg report_status "$REPORT_COMMAND_STATUS" \
+  --argjson report_exit "$REPORT_COMMAND_EXIT" \
   --arg zero_sha "$ZERO_SHA" \
   '{
     surface_parity:$surface_parity,
@@ -363,7 +374,7 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     cli_contract_verify:$cli_contract_verify,
     transport_auth_verify:$transport_auth_verify,
     cross_workspace_verify:$cross_workspace_verify,
-    report:{command:"scripts/report-flow-v0.4-json.sh", status:"passed", exit_code:0, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
+    report:{command:"scripts/report-flow-v0.4-json.sh", status:$report_status, exit_code:$report_exit, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     manual_signoff:{command:"scripts/record-flow-v0.4-manual-signoff.sh", status:"failed", exit_code:1, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha}
@@ -416,4 +427,4 @@ jq -n \
 sync "$GATE_RESULT_TMP" 2>/dev/null || true
 mv -f "$GATE_RESULT_TMP" "$GATE_RESULT_PATH"
 echo "REPORT: wrote $GATE_RESULT_PATH" >&2
-exit 0
+exit "$REPORT_COMMAND_EXIT"

@@ -53,7 +53,35 @@
       }
     },
     "cross_surface_projection": { "type": "object" },
-    "pagination": { "type": "object" },
+    "pagination": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["list", "history", "relations"],
+      "properties": {
+        "list": { "$ref": "#/$defs/v0_4_pagination_check" },
+        "history": { "$ref": "#/$defs/v0_4_pagination_check" },
+        "relations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason_code",
+            "required_by_gate_release",
+            "evaluated_gate_release",
+            "probed_http_status",
+            "version_boundary_preserved"
+          ],
+          "properties": {
+            "status": { "const": "not_applicable" },
+            "reason_code": { "const": "not_applicable_until_v0_5" },
+            "required_by_gate_release": { "const": "0.5" },
+            "evaluated_gate_release": { "const": "0.4" },
+            "probed_http_status": { "const": 404 },
+            "version_boundary_preserved": { "const": true }
+          }
+        }
+      }
+    },
     "bootstrap_limits": { "type": "object" },
     "violations": { "type": "array", "items": { "type": "string" } },
     "passed": { "type": "boolean" },
@@ -68,6 +96,16 @@
     }
   },
   "$defs": {
+    "v0_4_pagination_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_count", "max_100_count", "limit_101_rejected"],
+      "properties": {
+        "default_count": { "const": 50 },
+        "max_100_count": { "const": 100 },
+        "limit_101_rejected": { "const": true }
+      }
+    },
     "gate": {
       "type": "object",
       "additionalProperties": true,

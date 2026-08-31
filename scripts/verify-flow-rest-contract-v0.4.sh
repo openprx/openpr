@@ -328,16 +328,17 @@ LIST_OVER_REJECTED="$(jq -n --argjson response "$LIST_OVER" \
 HISTORY_OVER_REJECTED="$(jq -n --argjson response "$HISTORY_OVER" \
   '$response.code != 0 and $response.error_code == "limit_exceeded" and $response.details.limit == 100')"
 
-# The frozen gate text asks this v0.4 verifier for relation pagination, while
-# rest-api-v1.md places `/relations` under the v0.5 Collaboration heading.  Do
-# not silently turn that contradiction into a passing N/A: probe the live route,
-# preserve the version boundary, and leave the gate red until the contract owner
-# corrects the frozen criterion or explicitly changes the implementation scope.
+# Contract revision f788023 corrected the former cross-version criterion:
+# `/relations` belongs to v0.5, while v0.4 owns only the backing table. Probe
+# the live route so the exclusion is evidence-backed, then record the required
+# named reason code. It is neither passed nor skipped, and list/history retain
+# their full default/max/over-limit assertions above.
 http_request GET "/api/v1/flow/objects/$OBJECT_ID/relations"
 RELATION_HTTP_STATUS="$HTTP_STATUS"
 RELATION_VERSION_BOUNDARY_OK=false
 if [[ "$RELATION_HTTP_STATUS" == "404" ]]; then RELATION_VERSION_BOUNDARY_OK=true; fi
-add_violation "frozen v0.4 REST gate requires relation pagination, but rest-api-v1.md defines /relations only in v0.5 (live v0.4 probe HTTP $RELATION_HTTP_STATUS)"
+[[ "$RELATION_VERSION_BOUNDARY_OK" == "true" ]] || \
+  add_violation "v0.5 relation endpoint unexpectedly appeared in the v0.4 live surface (HTTP $RELATION_HTTP_STATUS)"
 
 # `Bootstrap.limits` must be the complete effective schema, not merely non-null.
 EXPECTED_LIMIT_KEYS='["authorized_scan_rows_max","bootstrap_decoded_bytes_max","bootstrap_response_bytes_max","connections_per_document_max","connections_per_user_max","connections_per_workspace_max","container_count_max","decode_apply_cpu_ms_max","decode_apply_wall_ms_max","document_block_count_max","document_text_chars_max","frame_burst_max","frames_per_connection_per_second","import_archive_bytes_max","import_compression_ratio_max","import_entry_count_max","import_expanded_bytes_max","isolated_apply_memory_bytes_max","open_documents_per_connection_max","page_limit_default","page_limit_max","presence_entries_per_connection_max","presence_entries_per_document_max","presence_payload_bytes_max","presence_ttl_seconds_max","semantic_patch_json_bytes_max","semantic_patch_operations_max","slow_consumer_queue_bytes_max","slow_consumer_queue_frames_max","text_block_chars_max","tree_depth_max","update_burst_max","update_bytes_max","updates_per_connection_per_second","version","websocket_frame_bytes_max"]'
@@ -439,8 +440,9 @@ ENVELOPE_OK="$(jq -n --argjson endpoints "$ENDPOINT_CHECKS" --argjson limits "$L
   --argjson list_default "$LIST_DEFAULT_COUNT" --argjson list_max "$LIST_MAX_COUNT" \
   --argjson history_default "$HISTORY_DEFAULT_COUNT" --argjson history_max "$HISTORY_MAX_COUNT" \
   --argjson list_rejected "$LIST_OVER_REJECTED" --argjson history_rejected "$HISTORY_OVER_REJECTED" \
+  --argjson relation_boundary "$RELATION_VERSION_BOUNDARY_OK" \
   '([$endpoints[].passed] | all) and $limits and $list_default==50 and $list_max==100 and
-   $history_default==50 and $history_max==100 and $list_rejected and $history_rejected and false')"
+   $history_default==50 and $history_max==100 and $list_rejected and $history_rejected and $relation_boundary')"
 PARITY_OK="$(jq -n --argjson equal "$CROSS_SURFACE_EQUAL" \
   --argjson before "$READS_BEFORE_COUNT" --argjson after "$READS_AFTER_COUNT" \
   --argjson head "$READS_AFTER_HEAD" --argjson write_seq "$WRITE_SEQ" --argjson event_match "$EVENT_MATCH" \
@@ -448,7 +450,7 @@ PARITY_OK="$(jq -n --argjson equal "$CROSS_SURFACE_EQUAL" \
 ENVELOPE_STATUS=$([[ "$ENVELOPE_OK" == "true" ]] && echo passed || echo failed)
 PARITY_STATUS=$([[ "$PARITY_OK" == "true" ]] && echo passed || echo failed)
 PARITY_REASON="one Web REST command fixture was read without writes by REST, shipped MCP stdio and shipped CLI with identical title/block projection/seq"
-ENVELOPE_REASON="all 11 non-WebSocket v0.4 Flow REST endpoints returned a 2xx ApiResponse with code=0, list/history pagination and Bootstrap.limits passed, but the frozen relation-pagination criterion has $VIOLATION_COUNT blocking contradiction(s)"
+ENVELOPE_REASON="all 11 non-WebSocket v0.4 Flow REST endpoints returned a 2xx ApiResponse with code=0; list/history pagination and Bootstrap.limits passed; relation pagination is recorded not_applicable_until_v0_5"
 
 RESULT="$(jq -n \
   --arg release "$RELEASE" --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" \
@@ -474,7 +476,7 @@ RESULT="$(jq -n \
     pagination:{
       list:{default_count:$list_default,max_100_count:$list_max,limit_101_rejected:$list_rejected},
       history:{default_count:$history_default,max_100_count:$history_max,limit_101_rejected:$history_rejected},
-      relations:{status:"blocked_by_frozen_version_contradiction",required_by_gate_release:"0.4",defined_by_rest_contract_release:"0.5",probed_http_status:$relation_status,version_boundary_preserved:$relation_boundary}
+      relations:{status:"not_applicable",reason_code:"not_applicable_until_v0_5",required_by_gate_release:"0.5",evaluated_gate_release:"0.4",probed_http_status:$relation_status,version_boundary_preserved:$relation_boundary}
     },
     bootstrap_limits:{complete:$limits_complete,expected_keys:$expected_limit_keys,actual_keys:$actual_limit_keys},
     violations:$violations,
