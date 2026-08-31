@@ -119,8 +119,6 @@ const IDLE_TTL_RECLAIM_PROBE_SECONDS: u64 = 122;
 
 /// Concurrent writers used by the item-5 uniqueness runs and the row-lock negative control.
 const BYPASS_WRITERS: usize = 8;
-/// Rounds of the head-mismatch race attempted before reporting "not demonstrated".
-const REBASE_RACE_ROUNDS: usize = 24;
 
 /// Deliberate breakages, one per assertion family, so the evidence can be shown to be
 /// falsifiable. Every one of these must turn the run red.
@@ -1374,29 +1372,220 @@ async fn section_retry_exhaustion(
         ));
     }
 
-    // ---- Genuine head-mismatch arm: real competing writers advance the head while one victim is
-    // between its out-of-lock hydrate and its row lock. Observed, not simulated; head movement
-    // during a failed attempt is what distinguishes it from the lock-wait arm above.
-    let race = race_for_head_mismatch(db, scratch_url, workspace_id, actor_id, document_id, epoch).await;
-    let race_seqs = all_seqs(db, document_id).await;
-    let race_doc = read_document(db, document_id).await;
-    let race_contiguous = contiguous_from_one(&race_seqs);
-    if !race_contiguous {
+    // ---- Genuine head-mismatch arm. Nothing here is left to the scheduler: `flow_objects` is the
+    // one table `bootstrap::load` reads that no other statement on the accept path touches (see
+    // [`HYDRATE_GATE_TABLE`]), so an `ACCESS EXCLUSIVE` lock on it parks a writer *after* it has
+    // read the head it will be checked against and *before* the row lock that checks it. Real
+    // production writes are committed through that window, so the victim's next `FOR UPDATE`
+    // provably finds a moved head. Both sides of the ceiling are exercised, because a bound is
+    // only demonstrated by showing where it does *not* fire either.
+    let forced_events_before = count_scalar(
+        db,
+        "SELECT count(*) AS n FROM business_events WHERE workspace_id = $1",
+        vec![workspace_id.into()],
+    )
+    .await;
+    let forced_dispatch_before = count_scalar(db, "SELECT count(*) AS n FROM event_dispatch", vec![]).await;
+
+    let recovered = force_head_mismatches(
+        db,
+        scratch_url,
+        workspace_id,
+        actor_id,
+        document_id,
+        epoch,
+        MAX_REBASE_ATTEMPTS - 1,
+        "rebase_recovers",
+        violations,
+    )
+    .await;
+    let recovered_seq = match &recovered.outcome {
+        AcceptOutcome::Accepted(accepted) => Some(accepted.head_seq),
+        AcceptOutcome::Rejected(rejected) => {
+            violations.push(format!(
+                "rebase_recovers: a victim that lost {} head races -- one short of the \
+                 {MAX_REBASE_ATTEMPTS}-attempt ceiling -- came back {:?} instead of being rebased \
+                 onto the moved head and accepted",
+                MAX_REBASE_ATTEMPTS - 1,
+                rejected.code
+            ));
+            None
+        }
+    };
+    if let Some(seq) = recovered_seq {
+        let expected = recovered.head_before + i64::from(MAX_REBASE_ATTEMPTS - 1) + 1;
+        if seq != expected {
+            violations.push(format!(
+                "rebase_recovers: the recovered write landed at seq {seq}, not {expected} (head \
+                 {} + {} forced advances + itself)",
+                recovered.head_before,
+                MAX_REBASE_ATTEMPTS - 1
+            ));
+        }
+    }
+    let recovered_rows = count_scalar(
+        db,
+        "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1 AND update_id = $2",
+        vec![document_id.into(), recovered.update_id.into()],
+    )
+    .await;
+    if recovered_seq.is_some() && recovered_rows != 1 {
         violations.push(format!(
-            "exhaustion: after the rebase race, seq is not contiguous from 1: {race_seqs:?}"
+            "rebase_recovers: the accepted write left {recovered_rows} collab_updates rows, not 1"
         ));
     }
-    if race_doc.head_seq != race_seqs.len() as i64 {
+
+    let exhausted = force_head_mismatches(
+        db,
+        scratch_url,
+        workspace_id,
+        actor_id,
+        document_id,
+        epoch,
+        MAX_REBASE_ATTEMPTS,
+        "exhaustion",
+        violations,
+    )
+    .await;
+    let (mismatch_code, mismatch_recoverable, mismatch_write_state, mismatch_details) = match &exhausted.outcome {
+        AcceptOutcome::Accepted(accepted) => {
+            violations.push(format!(
+                "exhaustion: the victim was accepted at seq {} after losing {MAX_REBASE_ATTEMPTS} \
+                 head races -- the bounded rebase did not stop at its ceiling",
+                accepted.head_seq
+            ));
+            ("accepted".to_string(), false, "n/a".to_string(), Value::Null)
+        }
+        AcceptOutcome::Rejected(rejected) => {
+            if rejected.code != RejectedCode::ServerDraining {
+                violations.push(format!(
+                    "exhaustion: head-mismatch exhaustion reported {:?}, not server_draining",
+                    rejected.code
+                ));
+            }
+            if !rejected.recoverable {
+                violations.push(
+                    "exhaustion: head-mismatch exhaustion was not marked recoverable".to_string(),
+                );
+            }
+            let write_state = format!("{:?}", rejected.write_state);
+            if write_state != "NotApplied" {
+                violations.push(format!(
+                    "exhaustion: head-mismatch exhaustion reported write_state {write_state}, not NotApplied"
+                ));
+            }
+            let details = rejected.details.clone().unwrap_or(Value::Null);
+            if details.get("reason").and_then(Value::as_str) != Some("contention") {
+                violations.push(format!(
+                    "exhaustion: head-mismatch details.reason was not \"contention\": {details}"
+                ));
+            }
+            if details.get("retry_after_ms").is_none() {
+                violations.push(
+                    "exhaustion: no retry_after_ms was supplied with the head-mismatch backoff".to_string(),
+                );
+            }
+            (
+                format!("{:?}", rejected.code),
+                rejected.recoverable,
+                write_state,
+                details,
+            )
+        }
+    };
+    let mismatch_victim_rows = count_scalar(
+        db,
+        "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1 AND update_id = $2",
+        vec![document_id.into(), exhausted.update_id.into()],
+    )
+    .await;
+    // The gate script reads this key: it must stay an empty list.
+    let mut rejected_victims_that_left_a_row: Vec<String> = Vec::new();
+    if mismatch_victim_rows != 0 {
+        rejected_victims_that_left_a_row.push(exhausted.update_id.to_string());
         violations.push(format!(
-            "exhaustion: after the rebase race, head_seq {} != {} collab_updates rows",
-            race_doc.head_seq,
-            race_seqs.len()
+            "exhaustion: the exhausted victim left {mismatch_victim_rows} collab_updates row(s) behind"
         ));
     }
-    if race["exhausted_victims"].as_u64().unwrap_or(0) == 0 {
+    let mismatch_head_advanced = exhausted.head_after - exhausted.head_before;
+    // Every seq the head gained during the victim's call is accounted for: the forced mismatches,
+    // plus the victim's own commit if it made one. Anything else means a write nobody asked for.
+    let expected_head_advance =
+        i64::from(MAX_REBASE_ATTEMPTS) + i64::from(matches!(exhausted.outcome, AcceptOutcome::Accepted(_)));
+    if mismatch_head_advanced != expected_head_advance {
         violations.push(format!(
-            "exhaustion: no genuine head-mismatch exhaustion was observed in {REBASE_RACE_ROUNDS} rounds; \
-             the ADR's \"三次 rebase exhaustion\" clause is not demonstrated by this run"
+            "exhaustion: the head advanced {mismatch_head_advanced} times during the victim's call, \
+             not the {expected_head_advance} this construction can account for"
+        ));
+    }
+
+    // `collab-protocol-v1.md` calls this rejection recoverable: the identical bytes under the
+    // identical `update_id`, resubmitted once the head has stopped moving, must land. Proven by
+    // resubmitting them, not read off the `recoverable` flag.
+    let retry_db = Database::connect(scratch_url).await.expect("retry connects");
+    let retry_instance = Instance::new();
+    let retry_outcome = write_once(
+        &retry_db,
+        &retry_instance,
+        document_id,
+        workspace_id,
+        actor_id,
+        epoch,
+        exhausted.bytes.clone(),
+        exhausted.update_id,
+    )
+    .await;
+    let retry_seq = match &retry_outcome {
+        AcceptOutcome::Accepted(accepted) => Some(accepted.head_seq),
+        AcceptOutcome::Rejected(rejected) => {
+            violations.push(format!(
+                "exhaustion: the recoverable rejection was not recoverable -- the same update_id \
+                 resubmitted against a quiet head came back {:?}",
+                rejected.code
+            ));
+            None
+        }
+    };
+
+    let forced_events_after = count_scalar(
+        db,
+        "SELECT count(*) AS n FROM business_events WHERE workspace_id = $1",
+        vec![workspace_id.into()],
+    )
+    .await;
+    let forced_dispatch_after = count_scalar(db, "SELECT count(*) AS n FROM event_dispatch", vec![]).await;
+    // An accepted retry only adds a fact when the victim really was rejected; a retry that
+    // replays an already-committed `update_id` is served from the existing row and writes nothing.
+    let retry_committed = retry_seq.is_some() && matches!(exhausted.outcome, AcceptOutcome::Rejected(_));
+    let forced_commits = recovered.committed_writes + exhausted.committed_writes + i64::from(retry_committed);
+    if forced_events_after - forced_events_before != forced_commits {
+        violations.push(format!(
+            "exhaustion: business_events moved by {} across the forced-mismatch arms while only \
+             {forced_commits} writes committed -- a failed attempt left a fact behind",
+            forced_events_after - forced_events_before
+        ));
+    }
+    if forced_dispatch_after - forced_dispatch_before != forced_commits {
+        violations.push(format!(
+            "exhaustion: event_dispatch moved by {} across the forced-mismatch arms while only \
+             {forced_commits} writes committed -- a failed attempt left a dispatch row behind",
+            forced_dispatch_after - forced_dispatch_before
+        ));
+    }
+
+    let final_seqs = all_seqs(db, document_id).await;
+    let final_doc = read_document(db, document_id).await;
+    let final_contiguous = contiguous_from_one(&final_seqs);
+    if !final_contiguous {
+        violations.push(format!(
+            "exhaustion: after the forced head mismatches, seq is not contiguous from 1: {final_seqs:?}"
+        ));
+    }
+    if final_doc.head_seq != final_seqs.len() as i64 {
+        violations.push(format!(
+            "exhaustion: after the forced head mismatches, head_seq {} != {} collab_updates rows",
+            final_doc.head_seq,
+            final_seqs.len()
         ));
     }
 
@@ -1422,121 +1611,412 @@ async fn section_retry_exhaustion(
             "victim_collab_update_rows": victim_rows,
             "canonical_state_unchanged": canonical_unchanged,
         },
-        "head_mismatch_exhaustion": race,
-        "post_race_seq_contiguous": race_contiguous,
-        "post_race_head_seq": race_doc.head_seq,
-        "post_race_collab_updates_rows": race_seqs.len(),
+        "head_mismatch_exhaustion": {
+            "construction": "an ACCESS EXCLUSIVE lock on flow_objects -- the one table bootstrap::load \
+                             reads that no other statement on the accept path touches -- parks the \
+                             victim between its out-of-lock read_observed_head and its \
+                             SELECT ... FOR UPDATE, and a real production write is committed through \
+                             that window once per attempt, so every failed attempt is a constructed \
+                             head mismatch rather than an observed race",
+            "deterministic": true,
+            "discriminator": "the statement parked at each rendezvous is asserted to be \
+                              bootstrap::load's document read, and zero transactions hold a writer \
+                              lock on collab_documents when the gate opens -- so the victim's next \
+                              FOR UPDATE cannot be a lock wait, only a moved head",
+            "rebase_recovers_one_below_the_ceiling": recovered.evidence,
+            "exhausts_at_the_ceiling": exhausted.evidence,
+            "rejected_code": mismatch_code,
+            "recoverable": mismatch_recoverable,
+            "write_state": mismatch_write_state,
+            "details": mismatch_details,
+            "head_advanced_during_the_exhausted_call": mismatch_head_advanced,
+            "victim_collab_update_rows": mismatch_victim_rows,
+            "rejected_victims_that_left_a_row": rejected_victims_that_left_a_row,
+            "recovered_accepted_seq": recovered_seq,
+            "same_update_id_retry_accepted_seq": retry_seq,
+            "committed_writes": forced_commits,
+            "business_events_delta": forced_events_after - forced_events_before,
+            "event_dispatch_delta": forced_dispatch_after - forced_dispatch_before,
+        },
+        "post_forced_mismatch_seq_contiguous": final_contiguous,
+        "post_forced_mismatch_head_seq": final_doc.head_seq,
+        "post_forced_mismatch_collab_updates_rows": final_seqs.len(),
     })
 }
 
-/// Drives real competing writers at one document and reports every victim attempt that exhausted
-/// its bounded rebase while the head was moving underneath it.
-async fn race_for_head_mismatch(
+// ---------------------------------------------------------------------------------------------
+// Deterministic head-mismatch construction
+// ---------------------------------------------------------------------------------------------
+
+/// The one table `bootstrap::load` reads that no other statement on the accept path touches.
+///
+/// `accept_update`'s complete statement inventory, in execution order: `find_prior_update`
+/// (`collab_updates`, retries only), `read_observed_head` (`collab_documents`), `bootstrap::load`
+/// on a cache miss (`collab_documents JOIN flow_objects`, then `collab_updates`),
+/// `fence_epoch_for_share` (`flow_workspace_settings`), the locked `SELECT ... FOR UPDATE`
+/// (`collab_documents`), `insert_flow_event` (`business_events`, `event_dispatch`), the
+/// `collab_updates` insert, and the `collab_documents` / `flow_object_projections` updates.
+/// `flow_objects` appears exactly once in that list: in `bootstrap::load`'s first query, which
+/// runs **after** `read_observed_head` has pinned the head this attempt will be checked against
+/// and **before** the row lock that checks it. (The two `UPDATE`s against tables that carry a
+/// foreign key to `flow_objects` never write the referencing column, so `PostgreSQL` re-checks no
+/// constraint and takes no lock on it there.)
+///
+/// Holding `ACCESS EXCLUSIVE` on it therefore parks a writer precisely inside the window a head
+/// mismatch needs, for exactly as long as the lock is held, with **no timeout anywhere in the
+/// parked path**: `bootstrap::load`'s `REPEATABLE READ READ ONLY` transaction sets none, and the
+/// accept path's `SET LOCAL lock_timeout`/`statement_timeout` live inside the later write
+/// transaction, which has not been opened yet. That is what makes this construction a sequencing
+/// device rather than a race with a wider window.
+const HYDRATE_GATE_TABLE: &str = "flow_objects";
+
+/// The opening of `bootstrap::load`'s document read. Asserted against `pg_stat_activity` at every
+/// rendezvous, so the construction fails loudly instead of silently gating some other statement if
+/// the loader's query inventory ever changes.
+const HYDRATE_GATE_STATEMENT_PREFIX: &str = "SELECT fo.workspace_id";
+
+/// Tripwire on one rendezvous wait. Nothing in the construction is timing-dependent, so this is
+/// not a budget: reaching it means the interleaving being waited for can no longer happen at all.
+const GATE_RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Every table-lock mode on `collab_documents` a *writer* takes (`SELECT ... FOR UPDATE` takes
+/// `RowShareLock`, the `UPDATE` takes `RowExclusiveLock`). Counted the moment before each gate
+/// opens: zero is what proves the victim's next `SELECT ... FOR UPDATE` cannot be a lock wait, and
+/// therefore that the rejection it goes on to produce is a head mismatch and nothing else.
+const DOCUMENT_WRITER_LOCK_PROBE: &str = "SELECT count(*) AS n FROM pg_locks \
+     WHERE locktype = 'relation' AND relation = 'collab_documents'::regclass \
+       AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+       AND mode IN ('RowShareLock', 'RowExclusiveLock', 'ShareLock', 'ShareRowExclusiveLock', \
+                    'ExclusiveLock', 'AccessExclusiveLock')";
+
+/// A `pg_locks` count of one lock mode against [`HYDRATE_GATE_TABLE`], granted or not, in this
+/// database only (`pg_locks` is cluster-wide, and a relation OID is only unique per database).
+fn gate_lock_probe(mode: &str, granted: bool) -> String {
+    format!(
+        "SELECT count(*) AS n FROM pg_locks \
+         WHERE locktype = 'relation' AND relation = '{HYDRATE_GATE_TABLE}'::regclass \
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+           AND mode = '{mode}' AND granted IS {}",
+        if granted { "TRUE" } else { "FALSE" }
+    )
+}
+
+/// Polls `probe` until it counts at least one row. Returns how long that took, for the record.
+async fn wait_for_lock(db: &DatabaseConnection, probe: &str, what: &str) -> Result<f64, String> {
+    let started = Instant::now();
+    loop {
+        if count_scalar(db, probe, vec![]).await >= 1 {
+            return Ok(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        if started.elapsed() > GATE_RENDEZVOUS_TIMEOUT {
+            return Err(format!(
+                "waited {:.0} ms for {what} and it never happened",
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// The statement text of whichever backend is currently parked at the gate, read from
+/// `pg_stat_activity` -- the database's own account of what it is holding, not the test's.
+async fn blocked_gate_statement(db: &DatabaseConnection) -> String {
+    #[derive(FromQueryResult)]
+    struct QueryRow {
+        query: String,
+    }
+    QueryRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!(
+            "SELECT coalesce(a.query, '') AS query FROM pg_locks l \
+             JOIN pg_stat_activity a ON a.pid = l.pid \
+             WHERE l.locktype = 'relation' AND l.relation = '{HYDRATE_GATE_TABLE}'::regclass \
+               AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+               AND l.mode = 'AccessShareLock' AND l.granted IS FALSE \
+             LIMIT 1"
+        ),
+        vec![],
+    ))
+    .one(db)
+    .await
+    .ok()
+    .flatten()
+    .map_or_else(String::new, |row| row.query)
+}
+
+/// An open transaction holding `ACCESS EXCLUSIVE` on [`HYDRATE_GATE_TABLE`], released on command.
+struct HydrateGate {
+    releaser: tokio::sync::oneshot::Sender<()>,
+    finished: tokio::task::JoinHandle<()>,
+}
+
+impl HydrateGate {
+    /// Issues the lock request on its own connection. Returns immediately -- whether the request
+    /// is granted or queued is read back from `pg_locks`, never assumed.
+    fn arm(scratch_url: &str) -> Self {
+        let (releaser, wait) = tokio::sync::oneshot::channel::<()>();
+        let url = scratch_url.to_string();
+        let finished = tokio::spawn(async move {
+            let conn = Database::connect(&url).await.expect("hydrate gate connects");
+            let tx = conn.begin().await.expect("hydrate gate transaction opens");
+            tx.execute_unprepared(&format!(
+                "LOCK TABLE {HYDRATE_GATE_TABLE} IN ACCESS EXCLUSIVE MODE"
+            ))
+            .await
+            .expect("hydrate gate takes ACCESS EXCLUSIVE");
+            let _ = wait.await;
+            let _ = tx.rollback().await;
+        });
+        Self { releaser, finished }
+    }
+
+    /// Releases the gate and waits for the `ROLLBACK` to have been processed, so a caller that
+    /// returns from here can rely on the lock actually being gone.
+    async fn release(self) {
+        let _ = self.releaser.send(());
+        let _ = self.finished.await;
+    }
+}
+
+/// What one run of the deterministic construction produced.
+struct ForcedMismatchRun {
+    outcome: AcceptOutcome,
+    update_id: Uuid,
+    /// The victim's exact payload, kept so the protocol's "retry the same `update_id`" can be
+    /// exercised with the same bytes rather than a lookalike.
+    bytes: Vec<u8>,
+    head_before: i64,
+    head_after: i64,
+    /// Writes that really committed during this run, for the event/dispatch ledger check.
+    committed_writes: i64,
+    evidence: Value,
+}
+
+/// Forces exactly `forced` genuine head mismatches on one victim write, then lets it finish.
+///
+/// The victim is parked at [`HYDRATE_GATE_TABLE`] once per attempt -- after it has read the head
+/// it will be checked against, before it can take the row lock that checks it -- and a real
+/// production write is committed through that window each time. Nothing is retried until it
+/// happens to interleave: every rendezvous is observed in `pg_locks` before the head is moved, and
+/// the next gate is observed to be queued *ahead of the victim* before the current one is
+/// released, so the victim cannot slip through between attempts.
+#[allow(clippy::too_many_arguments)]
+async fn force_head_mismatches(
     db: &DatabaseConnection,
     scratch_url: &str,
     workspace_id: Uuid,
     actor_id: Uuid,
     document_id: Uuid,
     epoch: i64,
-) -> Value {
-    let mut exhausted = 0u64;
-    let mut attempted = 0u64;
-    let mut accepted = 0u64;
-    let mut samples: Vec<Value> = Vec::new();
-    let mut lost_update_ids: Vec<String> = Vec::new();
+    forced: u32,
+    label: &str,
+    violations: &mut Vec<String>,
+) -> ForcedMismatchRun {
+    let blocked_share = gate_lock_probe("AccessShareLock", false);
+    let queued_exclusive = gate_lock_probe("AccessExclusiveLock", false);
+    let granted_exclusive = gate_lock_probe("AccessExclusiveLock", true);
 
-    for round in 0..REBASE_RACE_ROUNDS {
-        let doc = read_document(db, document_id).await;
-        // Four competitors on four separate instances (so nothing but the row lock serializes
-        // them) plus one victim, all launched together.
-        let mut handles = Vec::new();
-        for competitor in 0..4usize {
-            let competitor_db = Database::connect(scratch_url).await.expect("competitor connects");
-            let bytes = build_update(&doc.snapshot, &format!("race-{round}-competitor-{competitor}"));
-            handles.push(tokio::spawn(async move {
-                let instance = Instance::new();
-                let outcome = write_once(
-                    &competitor_db,
-                    &instance,
-                    document_id,
-                    workspace_id,
-                    actor_id,
-                    epoch,
-                    bytes,
-                    Uuid::new_v4(),
-                )
-                .await;
-                matches!(outcome, AcceptOutcome::Accepted(_))
-            }));
-        }
+    // One competitor instance, warmed **before** the gate goes up: with its warm cache hit,
+    // `hydrate_and_apply` never calls `bootstrap::load`, so this is the one writer that can still
+    // commit while the gate is held. (A cold competitor would park at the same gate, and the run
+    // would report that instead of deadlocking -- see the `parked_backends` check below.)
+    let competitor_db = Database::connect(scratch_url).await.expect("competitor connects");
+    let competitor = Instance::new();
+    let warmup_bytes = build_update(&head_state_bytes(db, document_id).await, &format!("{label}-warmup"));
+    let mut committed_writes = 0i64;
+    match write_once(
+        &competitor_db,
+        &competitor,
+        document_id,
+        workspace_id,
+        actor_id,
+        epoch,
+        warmup_bytes,
+        Uuid::new_v4(),
+    )
+    .await
+    {
+        AcceptOutcome::Accepted(_) => committed_writes += 1,
+        AcceptOutcome::Rejected(rejected) => violations.push(format!(
+            "{label}: the competitor's cache-warming write came back {:?}",
+            rejected.code
+        )),
+    }
 
-        let victim_db = Database::connect(scratch_url).await.expect("victim connects");
-        let victim_id = Uuid::new_v4();
-        let victim_bytes = build_update(&doc.snapshot, &format!("race-{round}-victim"));
-        let head_before = doc.head_seq;
+    // Every payload is built now: building one reads the document through `bootstrap::load`, which
+    // is exactly what the gate blocks.
+    let base = head_state_bytes(db, document_id).await;
+    let competing_bytes: Vec<Vec<u8>> = (0..forced)
+        .map(|round| build_update(&base, &format!("{label}-competitor-{round}")))
+        .collect();
+    let victim_bytes = build_update(&base, &format!("{label}-victim"));
+    let victim_id = Uuid::new_v4();
+    let head_before = read_document(db, document_id).await.head_seq;
+
+    let mut gate = Some(HydrateGate::arm(scratch_url));
+    if let Err(err) = wait_for_lock(db, &granted_exclusive, "the first hydrate gate to be granted").await {
+        violations.push(format!("{label}: {err}"));
+    }
+
+    let victim_db = Database::connect(scratch_url).await.expect("victim connects");
+    let spawned_bytes = victim_bytes.clone();
+    let started = Instant::now();
+    let victim = tokio::spawn(async move {
         let instance = Instance::new();
-        let outcome = write_once(
+        write_once(
             &victim_db,
             &instance,
             document_id,
             workspace_id,
             actor_id,
             epoch,
-            victim_bytes,
+            spawned_bytes,
             victim_id,
         )
-        .await;
-        for handle in handles {
-            let _ = handle.await;
-        }
-        attempted += 1;
+        .await
+    });
 
-        let head_after = read_document(db, document_id).await.head_seq;
-        match outcome {
-            AcceptOutcome::Accepted(_) => accepted += 1,
-            AcceptOutcome::Rejected(rejected) => {
-                let rows = count_scalar(
-                    db,
-                    "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1 AND update_id = $2",
-                    vec![document_id.into(), victim_id.into()],
-                )
-                .await;
-                if rows != 0 {
-                    lost_update_ids.push(victim_id.to_string());
-                }
-                let head_moved = head_after - head_before;
-                if head_moved >= i64::from(MAX_REBASE_ATTEMPTS) {
-                    exhausted += 1;
-                }
-                samples.push(json!({
-                    "round": round,
-                    "code": format!("{:?}", rejected.code),
-                    "recoverable": rejected.recoverable,
-                    "write_state": format!("{:?}", rejected.write_state),
-                    "head_advanced_during_attempt": head_moved,
-                    "victim_collab_update_rows": rows,
-                    "counted_as_head_mismatch_exhaustion": head_moved >= i64::from(MAX_REBASE_ATTEMPTS),
-                }));
+    let mut rendezvous: Vec<Value> = Vec::new();
+    for (round, bytes) in competing_bytes.into_iter().enumerate() {
+        let parked_after_ms = match wait_for_lock(db, &blocked_share, "the victim to park at the hydrate gate").await
+        {
+            Ok(ms) => ms,
+            Err(err) => {
+                violations.push(format!("{label}: rendezvous {round}: {err}"));
+                break;
             }
+        };
+        // Exactly one backend may be parked here. Two would mean the competitor missed its cache
+        // and parked too, which would make the next line wait on a writer that cannot run.
+        let parked_backends = count_scalar(db, &blocked_share, vec![]).await;
+        if parked_backends != 1 {
+            violations.push(format!(
+                "{label}: rendezvous {round}: {parked_backends} backends are parked at the hydrate \
+                 gate, not 1 -- the construction cannot say which one it is sequencing"
+            ));
         }
-        if exhausted >= 3 {
+        let held_statement = blocked_gate_statement(db).await;
+        if !held_statement.starts_with(HYDRATE_GATE_STATEMENT_PREFIX) {
+            violations.push(format!(
+                "{label}: rendezvous {round}: the statement parked at the gate is not \
+                 bootstrap::load's document read but {held_statement:?} -- the gate no longer sits \
+                 between the observed head and the row lock"
+            ));
+        }
+
+        // A real production write, committed while the victim is provably parked past its own
+        // `read_observed_head`.
+        let Ok(advance) = tokio::time::timeout(
+            GATE_RENDEZVOUS_TIMEOUT,
+            write_once(
+                &competitor_db,
+                &competitor,
+                document_id,
+                workspace_id,
+                actor_id,
+                epoch,
+                bytes,
+                Uuid::new_v4(),
+            ),
+        )
+        .await
+        else {
+            violations.push(format!(
+                "{label}: rendezvous {round}: the competing write never finished -- it is parked at \
+                 the gate itself"
+            ));
             break;
+        };
+        let advanced_to = match &advance {
+            AcceptOutcome::Accepted(accepted) => {
+                committed_writes += 1;
+                Some(accepted.head_seq)
+            }
+            AcceptOutcome::Rejected(rejected) => {
+                violations.push(format!(
+                    "{label}: rendezvous {round}: the write that was supposed to move the head came \
+                     back {:?}",
+                    rejected.code
+                ));
+                None
+            }
+        };
+        let writer_locks = count_scalar(db, DOCUMENT_WRITER_LOCK_PROBE, vec![]).await;
+        if writer_locks != 0 {
+            violations.push(format!(
+                "{label}: rendezvous {round}: {writer_locks} transaction(s) still hold a writer lock \
+                 on collab_documents as the gate opens -- the victim's next FOR UPDATE could be a \
+                 lock wait rather than a head mismatch"
+            ));
         }
+
+        // Chain the next gate *before* releasing this one: once it is queued, the victim's next
+        // hydrate necessarily queues behind it, which is what removes the between-attempts race.
+        let next_gate = (round + 1 < forced as usize).then(|| HydrateGate::arm(scratch_url));
+        if next_gate.is_some()
+            && let Err(err) = wait_for_lock(db, &queued_exclusive, "the next hydrate gate to queue").await
+        {
+            violations.push(format!("{label}: rendezvous {round}: {err}"));
+        }
+        if let Some(open) = gate.take() {
+            open.release().await;
+        }
+        if let Some(next) = next_gate {
+            // Granted means the victim's parked read has been served *and finished*: any parked
+            // backend seen after this point is a fresh hydrate, i.e. a fresh attempt.
+            if let Err(err) = wait_for_lock(db, &granted_exclusive, "the next hydrate gate to take over").await {
+                violations.push(format!("{label}: rendezvous {round}: {err}"));
+            }
+            gate = Some(next);
+        }
+
+        rendezvous.push(json!({
+            "round": round,
+            "victim_parked_after_ms": parked_after_ms,
+            "backends_parked_at_the_gate": parked_backends,
+            "statement_parked_at_the_gate": held_statement.chars().take(96).collect::<String>(),
+            "competing_write_committed_at_seq": advanced_to,
+            "collab_documents_writer_locks_when_the_gate_opened": writer_locks,
+        }));
+    }
+    if let Some(open) = gate.take() {
+        open.release().await;
     }
 
-    json!({
-        "construction": "4 concurrent real writers on 4 separate instances (independent WarmCache + \
-                         DocumentCoordinator, so only the DB row lock serializes them) advance the head \
-                         while one victim attempt runs",
-        "rounds_run": attempted,
-        "victim_accepted": accepted,
-        "victim_rejected": attempted - accepted,
-        "exhausted_victims": exhausted,
-        "discriminator": "head_seq advanced by >= max_rebase_attempts during the failed attempt, which a \
-                          lock-wait timeout cannot produce (a held lock blocks every writer)",
-        "rejected_victims_that_left_a_row": lost_update_ids,
-        "samples": samples,
-    })
+    let outcome = victim.await.expect("the victim write task joins");
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if matches!(outcome, AcceptOutcome::Accepted(_)) {
+        committed_writes += 1;
+    }
+    let head_after = read_document(db, document_id).await.head_seq;
+
+    let evidence = json!({
+        "forced_head_mismatches": forced,
+        "head_before": head_before,
+        "head_after": head_after,
+        "head_advanced": head_after - head_before,
+        "victim_elapsed_ms": elapsed_ms,
+        "victim_outcome": match &outcome {
+            AcceptOutcome::Accepted(accepted) => json!({"accepted_seq": accepted.head_seq}),
+            AcceptOutcome::Rejected(rejected) => json!({
+                "code": format!("{:?}", rejected.code),
+                "recoverable": rejected.recoverable,
+                "write_state": format!("{:?}", rejected.write_state),
+                "details": rejected.details.clone().unwrap_or(Value::Null),
+            }),
+        },
+        "rendezvous": rendezvous,
+    });
+
+    ForcedMismatchRun {
+        outcome,
+        update_id: victim_id,
+        bytes: victim_bytes,
+        head_before,
+        head_after,
+        committed_writes,
+        evidence,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
