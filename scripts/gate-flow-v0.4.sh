@@ -93,7 +93,7 @@ if [[ $JSON_MODE -ne 1 ]]; then
 fi
 if [[ ! -f "$GATE_RESULT_PATH" ]]; then
   echo "FAIL: gate-result.json not found: $GATE_RESULT_PATH" >&2
-  echo "Fix: run scripts/report-flow-v0.4-json.sh first (it will refuse to write this file until every required artifact and check is green)." >&2
+  echo "Fix: run scripts/report-flow-v0.4-json.sh first (it writes this file when every required artifact exists, preserving failed checks with report exit 1)." >&2
   exit 2
 fi
 
