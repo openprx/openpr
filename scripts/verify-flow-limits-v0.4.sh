@@ -209,6 +209,18 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
+# The two v0.8-owned retention budgets are excluded from this release's freeze floor only while a
+# v0.8 gate actually re-demands them (see V08_DEFERRED_DISPATCH_BUDGET_KEYS in the static pass).
+# Without reading the v0.8 gate file, "deferred" and "permanently exempt" are indistinguishable,
+# so the exclusion is conditioned on that file naming its paired gate.
+V08_GATE_YAML="$CONTRACTS_ROOT/gates/v0.8-gate.yaml"
+V05_GATE_YAML="$CONTRACTS_ROOT/gates/v0.5-gate.yaml"
+for f in "$V08_GATE_YAML" "$V05_GATE_YAML"; do
+  if [[ ! -f "$f" ]]; then
+    echo "FAIL: later-release gate file not found, cannot prove a deferred budget is re-demanded later: $f" >&2
+    exit 2
+  fi
+done
 
 LIMITS_RS="$REPO_ROOT/apps/api/src/flow/collab/limits.rs"
 COLLAB_CORE_LIMITS_RS="$REPO_ROOT/crates/collab-core/src/limits.rs"
@@ -268,7 +280,7 @@ if ! python3 - "$CONTRACT_PATH" "$LIMITS_RS" "$COLLAB_CORE_LIMITS_RS" "$COLLAB_C
       "$ERROR_RS" "$RESPONSE_RS" "$DISPATCHER_RS" "$MIGRATION_SQL" "$FRONTEND_TYPES_TS" "$FRONTEND_LIMITS_TS" \
       "$COLLAB_CORE_ISOLATION_LIMITS_RS" "$COLLAB_CORE_ISOLATION_HOST_RS" "$COLLAB_CORE_ISOLATION_ALLOC_RS" \
       "$COLLAB_CORE_ISOLATION_CHILD_RUNTIME_RS" "$COLLAB_CORE_ISOLATED_APPLY_WORKER_RS" \
-      "$ROUTES_FLOW_RS" \
+      "$ROUTES_FLOW_RS" "$V08_GATE_YAML" "$V05_GATE_YAML" \
       > "$STATIC_JSON_FILE" 2>"$EVIDENCE_ROOT/logs/limits.static.err.log" <<'PY'
 import json
 import re
@@ -278,7 +290,7 @@ import sys
  write_rs, command_rs, query_rs, bootstrap_rs, error_rs, response_rs, dispatcher_rs, migration_sql,
  frontend_types_ts, frontend_limits_ts, collab_core_isolation_limits_rs, collab_core_isolation_host_rs,
  collab_core_isolation_alloc_rs, collab_core_isolation_child_runtime_rs,
- collab_core_isolated_apply_worker_rs, routes_flow_rs) = sys.argv[1:23]
+ collab_core_isolated_apply_worker_rs, routes_flow_rs, v08_gate_yaml, v05_gate_yaml) = sys.argv[1:25]
 
 
 def read(p):
@@ -312,6 +324,48 @@ V08_IMPORT_LIMIT_KIND_ALLOWLIST = {
     "import_compression_ratio",
 }
 VERSION_BOUNDARY_REASON_CODE = "not_applicable_until_v0_8"
+
+# Delivery/dispatch budget freeze floor: which `status: unset` budgets THIS release must have
+# frozen. gates/gate-commands.md's `dispatch_numeric_budgets_locked` paragraph calls its list
+# closed, so the default here is "every `status: unset` budget row in contracts/limits-v1.md is
+# required", and every exclusion has to earn itself from the contract, one named key at a time.
+#
+# An exclusion is legitimate only when BOTH hold, and both are re-derived from the contract on
+# every run (see the guards below), never asserted by this script alone:
+#   1. contracts/limits-v1.md assigns the budget to a LATER release's implementer (`set_by`), so
+#      v0.4 would be freezing a number it does not own -- the criterion asking this release to
+#      prove what the next one delivers; and
+#   2. that later release's gate file re-demands the freeze, so the exclusion is a deferral with
+#      a named owner rather than a permanent amnesty.
+#
+# Named keys ONLY -- deliberately not a `*retention*` pattern. A pattern would have swallowed
+# `delivery_retention_days` and `dispatch_expanded_retention_days`, both v0.4-owned and frozen,
+# and would silently absorb any future retention budget nobody got round to freezing.
+V08_DEFERRED_DISPATCH_BUDGET_KEYS = {
+    "delivery_source_retention_days",
+    "replay_max_window_days",
+}
+# Each allowlisted key must prove its own deferral from the contract row it appears in, so the
+# allowlist cannot be widened by editing this script alone: the row must still say `status: unset`
+# (a key that got frozen must leave the allowlist and be verified, not stay excused) and must name
+# the v0.8 implementer as its setter (a v0.4-owned budget can never qualify).
+V08_SET_BY_MARKER = "`set_by`：v0.8 实现者"
+V08_PAIRED_BUDGET_GATE = "deferred_retention_budgets_frozen"
+
+# The v0.5 authorization surface's own unset budget. gate-commands.md gives `object_grants_max` to
+# `authz_numeric_budgets_locked` (v0.5), not to this gate, and limits-v1.md's structured block
+# assigns it to the v0.5 implementer. `grants_per_request_max` is already frozen at 100 and so is
+# never in the unset set at all; it is named here only so the intent of this exclusion stays
+# readable.
+#
+# `subscribers_per_workspace_max` was in this exclusion until 2026-08-31 and does NOT belong here:
+# limits-v1.md's structured block sets it by the **v0.4 dispatcher 实现者**, and gate-commands.md
+# names it in this gate's own closed 12-key list. Excluding it made this gate silently one key
+# short of the list it claims to enforce. No version-boundary argument reaches a v0.4-owned
+# budget, so it is required below like any other.
+V05_AUTHZ_SURFACE_KEYS = {"object_grants_max", "grants_per_request_max"}
+V05_SET_BY_MARKER = "set_by: v0.5 授权面实现者"
+V05_PAIRED_BUDGET_GATE = "authz_numeric_budgets_locked"
 
 fixed_limit_rows = [
     r for r in rows if not r["unset"] and r["limit_kind"] not in V05_DEFERRED_LIMIT_KINDS
@@ -724,28 +778,113 @@ for const in ("DECODE_APPLY_CPU_MS_MAX", "DECODE_APPLY_WALL_MS_MAX", "ISOLATED_A
         + count(re.escape(const), collab_core_isolated_apply_worker_text)
     )
 
-delivery_const_re = re.compile(r"const (\w+):\s*i64\s*=\s*([\d_]+);")
-dispatcher_consts = {m.group(1): int(m.group(2).replace("_", "")) for m in delivery_const_re.finditer(dispatcher_text)}
-delivery_cross_check = {
-    "content_delivery_debounce_ms": {"contract": 2000, "source_const": "CONTENT_DELIVERY_DEBOUNCE_MS",
-                                      "source_value": dispatcher_consts.get("CONTENT_DELIVERY_DEBOUNCE_MS")},
-    "delivery_retention_days": {"contract": 30, "source_const": "DELIVERY_RETENTION_DAYS",
-                                 "source_value": dispatcher_consts.get("DELIVERY_RETENTION_DAYS")},
-    "dispatch_no_subscribers_retention_hours": {"contract": 24, "source_const": "DISPATCH_NO_SUBSCRIBERS_RETENTION_HOURS",
-                                                 "source_value": dispatcher_consts.get("DISPATCH_NO_SUBSCRIBERS_RETENTION_HOURS")},
+# Every delivery-path budget the contract has frozen is cross-checked against the constant the
+# dispatcher actually executes -- "locked" is meaningless if the frozen number and the running
+# number disagree, and gate-commands.md says so outright ("已冻结的值必须与 evidence/v0.4/
+# flow-events-result.json 里实际执行的 fixture 取同一常量...二者不一致即失败"). Until 2026-08-31
+# only three constants were compared here, so a contract freeze that contradicted the code passed
+# unnoticed. Contract values are parsed from the row's own value cell, never hand-copied.
+delivery_const_re = re.compile(r"^(?:pub )?const (\w+):\s*\w+\s*=\s*([^;]+);", re.M)
+dispatcher_const_exprs = {m.group(1): m.group(2).strip() for m in delivery_const_re.finditer(dispatcher_text)}
+
+
+def resolve_dispatcher_const(name, depth=0):
+    """Literal, or a one-level `OTHER_CONST * <int>` (delivery_lease_ttl_ms is defined that way)."""
+    expr = dispatcher_const_exprs.get(name)
+    if expr is None or depth > 4:
+        return None
+    if re.fullmatch(r"[\d_]+", expr):
+        return int(expr.replace("_", ""))
+    m = re.fullmatch(r"(\w+)\s*\*\s*([\d_]+)", expr)
+    if m:
+        base = resolve_dispatcher_const(m.group(1), depth + 1)
+        return None if base is None else base * int(m.group(2).replace("_", ""))
+    return None
+
+
+def contract_row_value_numbers(key):
+    """Integers in the row's VALUE cell only -- the 依据 cell is full of unrelated numbers."""
+    row_m = re.search(r"^\|\s*`" + re.escape(key) + r"`\s*\|(.*)$", contract, re.M)
+    if row_m is None:
+        return None
+    value_cell = row_m.group(1).split("|")[0]
+    return [int(n.replace(",", "").replace("_", "")) for n in re.findall(r"\d[\d,_]*", value_cell)]
+
+
+# key -> dispatcher constants, in the order they appear in the contract's value cell. A formula
+# cell (`min(attempts*30000, 300000)`) carries two numbers and therefore two constants.
+DELIVERY_BUDGET_CONSTS = {
+    "dispatch_max_lease_reclaims": ["DISPATCH_MAX_LEASE_RECLAIMS"],
+    "dispatch_lease_ttl_ms": ["DISPATCH_LEASE_TTL_MS"],
+    "dispatch_backoff_ms": ["DISPATCH_BACKOFF_STEP_MS", "DISPATCH_BACKOFF_CAP_MS"],
+    "delivery_backoff_ms": ["DELIVERY_BACKOFF_STEP_MS", "DELIVERY_BACKOFF_CAP_MS"],
+    "webhook_request_timeout_ms": ["WEBHOOK_REQUEST_TIMEOUT_MS"],
+    "delivery_lease_ttl_ms": ["DELIVERY_LEASE_TTL_MS"],
+    "content_delivery_debounce_ms": ["CONTENT_DELIVERY_DEBOUNCE_MS"],
+    "coalesced_source_events_max": ["COALESCED_SOURCE_EVENTS_MAX"],
+    "changed_block_ids_per_delivery_max": ["CHANGED_BLOCK_IDS_PER_DELIVERY_MAX"],
+    "delivery_retention_days": ["DELIVERY_RETENTION_DAYS"],
+    "dispatch_no_subscribers_retention_hours": ["DISPATCH_NO_SUBSCRIBERS_RETENTION_HOURS"],
+    "dispatch_expanded_retention_days": ["DISPATCH_EXPANDED_RETENTION_DAYS"],
+    "dispatch_failed_retention_days": ["DISPATCH_FAILED_RETENTION_DAYS"],
 }
+# Frozen budgets with no single module constant to compare against: `dispatch_max_attempts` is a
+# per-row `event_dispatch.max_attempts` column the caller supplies (the migration deliberately
+# gives it no DEFAULT), and `dispatch_head_wait_backoff_ms` is realized structurally -- a non-head
+# work item is simply not selected. Recorded as `matches: null` rather than omitted, so they are
+# visibly unverified here instead of silently absent; their behaviour is covered by
+# verify-flow-events-v0.4.sh's fixtures.
+DELIVERY_BUDGETS_WITHOUT_CONSTANT = {
+    "dispatch_max_attempts": "per-row event_dispatch.max_attempts supplied by the caller (no module constant)",
+    "dispatch_head_wait_backoff_ms": "realized structurally: a non-head work item is not selected (no module constant)",
+}
+delivery_cross_check = {}
+for key, const_names in DELIVERY_BUDGET_CONSTS.items():
+    contract_values = contract_row_value_numbers(key)
+    source_values = [resolve_dispatcher_const(n) for n in const_names]
+    entry = {
+        "contract": contract_values[0] if contract_values and len(const_names) == 1 else contract_values,
+        "source_const": const_names[0] if len(const_names) == 1 else const_names,
+        "source_value": source_values[0] if len(const_names) == 1 else source_values,
+    }
+    if contract_values is None:
+        entry["matches"] = False
+        entry["note"] = "no such row in contracts/limits-v1.md"
+    elif len(contract_values) != len(const_names):
+        entry["matches"] = False
+        entry["note"] = (
+            f"contract value cell carries {len(contract_values)} number(s), "
+            f"{len(const_names)} constant(s) mapped"
+        )
+    else:
+        entry["matches"] = contract_values == source_values
+    delivery_cross_check[key] = entry
+for key, why in DELIVERY_BUDGETS_WITHOUT_CONSTANT.items():
+    contract_values = contract_row_value_numbers(key)
+    delivery_cross_check[key] = {
+        "contract": contract_values[0] if contract_values else None,
+        "source_const": None,
+        "source_value": None,
+        "matches": None,
+        "note": why,
+    }
 mig_m = re.search(r"CREATE TABLE IF NOT EXISTS event_deliveries.*?\n\);", migration_text, re.S)
 delivery_max_attempts_default = None
 if mig_m:
     dm = re.search(r"max_attempts\s+INTEGER\s+NOT NULL\s+DEFAULT\s+(\d+)", mig_m.group(0))
     if dm:
         delivery_max_attempts_default = int(dm.group(1))
+delivery_max_attempts_contract = contract_row_value_numbers("delivery_max_attempts")
 delivery_cross_check["delivery_max_attempts"] = {
-    "contract": 10, "source": "migrations/0054_flow_data_layer.sql event_deliveries.max_attempts DEFAULT",
+    "contract": delivery_max_attempts_contract[0] if delivery_max_attempts_contract else None,
+    "source": "migrations/0054_flow_data_layer.sql event_deliveries.max_attempts DEFAULT",
+    "source_const": "event_deliveries.max_attempts DEFAULT",
     "source_value": delivery_max_attempts_default,
 }
-for v in delivery_cross_check.values():
-    v["matches"] = v["source_value"] == v["contract"]
+delivery_cross_check["delivery_max_attempts"]["matches"] = (
+    delivery_cross_check["delivery_max_attempts"]["source_value"]
+    == delivery_cross_check["delivery_max_attempts"]["contract"]
+)
 
 # Delivery-path `status: unset` rows use a 3-column shape (Key | value |
 # 执行与依据) with no `limit_kind` column at all, so `row_re` above (which
@@ -755,8 +894,132 @@ for v in delivery_cross_check.values():
 # delivery-path budgets are still unset.
 unset_status_re = re.compile(r"^\|\s*`([a-z0-9_]+)`\s*\|\s*`status: unset`", re.M)
 all_unset_status_keys = sorted(set(unset_status_re.findall(contract)))
-unset_delivery_keys = sorted(
-    set(all_unset_status_keys) - {"object_grants_max", "subscribers_per_workspace_max", "grants_per_request_max"}
+# Population of this gate's freeze floor: every `status: unset` budget row in the contract. What
+# leaves this set has to be justified key by key below; nothing leaves it by pattern or by table.
+v08_gate_text = read(v08_gate_yaml)
+v05_gate_text = read(v05_gate_yaml)
+
+
+def _contract_row(key):
+    row_m = re.search(r"^\|\s*`" + re.escape(key) + r"`\s*\|.*$", contract, re.M)
+    if row_m is None:
+        raise ValueError(f"budget {key!r} has no row in contracts/limits-v1.md")
+    return row_m.group(0)
+
+
+def _contract_yaml_block(key):
+    block_m = re.search(r"^" + re.escape(key) + r":\n((?:[ \t]+\S.*\n)+)", contract, re.M)
+    return block_m.group(1) if block_m else ""
+
+
+# Deferral 1: the two retention budgets limits-v1.md hands to the v0.8 implementer, one of which
+# (`replay_max_window_days`) bounds an admin replay surface with no code in v0.4 at all. Re-derived
+# from the contract every run; any failure here is a hard error, because an exclusion this script
+# cannot justify from the contract is exactly what the allowlist exists to prevent.
+if not re.search(r"^\s*" + re.escape(V08_PAIRED_BUDGET_GATE) + r"\s*:", v08_gate_text, re.M):
+    raise ValueError(
+        f"v0.8 gate does not declare the paired gate {V08_PAIRED_BUDGET_GATE!r}; without it the v0.4 "
+        "exclusion of the deferred retention budgets is a permanent amnesty, not a deferral"
+    )
+deferred_dispatch_budget_exemptions = []
+for key in sorted(V08_DEFERRED_DISPATCH_BUDGET_KEYS):
+    row_text = _contract_row(key)
+    if "`status: unset`" not in row_text:
+        raise ValueError(
+            f"deferred dispatch budget {key!r} is no longer `status: unset` in contracts/limits-v1.md; "
+            "a frozen budget must leave V08_DEFERRED_DISPATCH_BUDGET_KEYS and be verified, not stay excused"
+        )
+    if V08_SET_BY_MARKER not in row_text:
+        raise ValueError(
+            f"deferred dispatch budget {key!r} does not declare {V08_SET_BY_MARKER!r} in its contract row; "
+            "only budgets the contract itself assigns to the v0.8 implementer may be deferred"
+        )
+    deferred_dispatch_budget_exemptions.append({
+        "key": key,
+        "status": VERSION_BOUNDARY_REASON_CODE,
+        "reason_code": VERSION_BOUNDARY_REASON_CODE,
+        "surface_version": "v0.8",
+        "contract_set_by": "v0.8 实现者",
+        "contract_evidence": "contracts/limits-v1.md row declares " + V08_SET_BY_MARKER,
+        "paired_gate": f"gates/v0.8-gate.yaml::{V08_PAIRED_BUDGET_GATE}",
+    })
+
+# Deferral 2 (pre-existing, now justified the same way): the v0.5 authorization surface's own unset
+# budget, which gate-commands.md assigns to `authz_numeric_budgets_locked`, not to this gate.
+if not re.search(r"^\s*" + re.escape(V05_PAIRED_BUDGET_GATE) + r"\s*:", v05_gate_text, re.M):
+    raise ValueError(
+        f"v0.5 gate does not declare the paired gate {V05_PAIRED_BUDGET_GATE!r}; without it the v0.4 "
+        "exclusion of the v0.5 authorization budgets is a permanent amnesty, not a deferral"
+    )
+for key in sorted(V05_AUTHZ_SURFACE_KEYS & set(all_unset_status_keys)):
+    if V05_SET_BY_MARKER not in _contract_yaml_block(key):
+        raise ValueError(
+            f"v0.5 authorization budget {key!r} does not declare {V05_SET_BY_MARKER!r} in its structured "
+            "block; only budgets the contract itself assigns to the v0.5 implementer may be deferred"
+        )
+    deferred_dispatch_budget_exemptions.append({
+        "key": key,
+        "status": "not_applicable_until_v0_5",
+        "reason_code": "not_applicable_until_v0_5",
+        "surface_version": "v0.5",
+        "contract_set_by": "v0.5 授权面实现者",
+        "contract_evidence": "contracts/limits-v1.md structured block declares " + V05_SET_BY_MARKER,
+        "paired_gate": f"gates/v0.5-gate.yaml::{V05_PAIRED_BUDGET_GATE}",
+    })
+
+exempt_budget_keys = {e["key"] for e in deferred_dispatch_budget_exemptions}
+non_allowlisted_budget_exemptions = sorted(
+    exempt_budget_keys - (V08_DEFERRED_DISPATCH_BUDGET_KEYS | V05_AUTHZ_SURFACE_KEYS)
+)
+if non_allowlisted_budget_exemptions:
+    raise ValueError(
+        f"dispatch budget exemption allowlist violation: non_allowlisted={non_allowlisted_budget_exemptions}"
+    )
+
+# Everything the contract still leaves `status: unset` and nobody deferred is required NOW. This is
+# where `subscribers_per_workspace_max` re-enters: `set_by: v0.4 dispatcher 实现者`, named in
+# gate-commands.md's closed list for this gate, so it can only be closed by freezing it.
+unset_delivery_keys = sorted(set(all_unset_status_keys) - exempt_budget_keys)
+
+# Accounting over the "Delivery path budgets" section, so the evidence can state
+# total = frozen + exempt rather than only listing what is still missing.
+delivery_section_m = re.search(r"^### Delivery path budgets\s*$(.*?)^### ", contract, re.M | re.S)
+if delivery_section_m is None:
+    raise ValueError("contract has no '### Delivery path budgets' section to account for")
+dispatch_budget_keys = []
+for m in re.finditer(r"^\|\s*`([a-z0-9_]+)`\s*\|", delivery_section_m.group(1), re.M):
+    if m.group(1) not in dispatch_budget_keys:
+        dispatch_budget_keys.append(m.group(1))
+for e in deferred_dispatch_budget_exemptions:
+    if e["surface_version"] == "v0.8" and e["key"] not in dispatch_budget_keys:
+        raise ValueError(
+            f"deferred dispatch budget {e['key']!r} is not in the 'Delivery path budgets' section"
+        )
+section_frozen = sorted(set(dispatch_budget_keys) - set(all_unset_status_keys))
+section_exempt = sorted(set(dispatch_budget_keys) & exempt_budget_keys)
+section_required = sorted(set(dispatch_budget_keys) & set(unset_delivery_keys))
+dispatch_budget_accounting = {
+    "delivery_section_total": len(dispatch_budget_keys),
+    "delivery_section_frozen": len(section_frozen),
+    "delivery_section_exempt": len(section_exempt),
+    "delivery_section_still_unset": len(section_required),
+    "delivery_section_frozen_keys": section_frozen,
+    "delivery_section_exempt_keys": section_exempt,
+    "unset_budget_rows_total": len(all_unset_status_keys),
+    "unset_budget_rows_exempt": len(exempt_budget_keys),
+    "unset_budget_rows_required": len(unset_delivery_keys),
+    "unset_budget_rows_exempt_keys": sorted(exempt_budget_keys),
+    "unset_budget_rows_required_keys": unset_delivery_keys,
+}
+if len(section_frozen) + len(section_exempt) + len(section_required) != len(dispatch_budget_keys):
+    raise ValueError("delivery-section budget accounting does not close")
+if len(exempt_budget_keys) + len(unset_delivery_keys) != len(all_unset_status_keys):
+    raise ValueError("unset budget accounting does not close")
+dispatch_budget_accounting["identity"] = (
+    f"Delivery path budgets: {len(dispatch_budget_keys)} total = {len(section_frozen)} frozen + "
+    f"{len(section_exempt)} deferred + {len(section_required)} still unset; "
+    f"contract-wide `status: unset` budget rows: {len(all_unset_status_keys)} = "
+    f"{len(exempt_budget_keys)} deferred + {len(unset_delivery_keys)} required by v0.4"
 )
 
 fe_field_re = re.compile(r"readonly (\w+):")
@@ -821,6 +1084,8 @@ print(json.dumps({
     "findings": findings,
     "delivery_cross_check": delivery_cross_check,
     "unset_delivery_keys": unset_delivery_keys,
+    "deferred_dispatch_budget_exemptions": deferred_dispatch_budget_exemptions,
+    "dispatch_budget_accounting": dispatch_budget_accounting,
     "frontend_bootstrap_parity": {
         "server_field_count": len(server_fields_snake),
         "frontend_field_count": len(fe_fields_snake),
@@ -852,6 +1117,8 @@ fi
 echo "=== static check: contracts/limits-v1.md limit_kind rows vs apps/api/src/flow/collab/limits.rs constants ===" >&2
 echo "  v0.4 limit_kind accounting: $(jq -r '.fixed_limit_kind_count' "$STATIC_JSON_FILE") = $EXPECTED_COUNT evaluated + $(jq -r '.version_boundary_exemptions | length' "$STATIC_JSON_FILE") not_applicable_until_v0_8" >&2
 echo "  version-boundary exemptions: $(jq -r '[.version_boundary_exemptions[].limit_kind] | join(", ")' "$STATIC_JSON_FILE")" >&2
+echo "  dispatch budget accounting: $(jq -r '.dispatch_budget_accounting.identity' "$STATIC_JSON_FILE")" >&2
+echo "  deferred dispatch budgets: $(jq -r '[.deferred_dispatch_budget_exemptions[] | "\(.key) (\(.reason_code), surface \(.surface_version))"] | join(", ")' "$STATIC_JSON_FILE")" >&2
 echo "  row cross-check violations: $(jq '.row_violations | length' "$STATIC_JSON_FILE")" >&2
 echo "  wire-schema cross-check violations: $(jq '.wire_violations | length' "$STATIC_JSON_FILE")" >&2
 jq -r '.row_violations[] | "    VIOLATION(row): " + .' "$STATIC_JSON_FILE" >&2
@@ -1596,7 +1863,10 @@ else:
     }
 
 dcc = static["delivery_cross_check"]
-delivery_constant_violations = [k for k, v in dcc.items() if not v["matches"]]
+# `matches: null` means "no single constant to compare against" (recorded, not silently dropped);
+# only an actual contract-vs-source disagreement is a violation.
+delivery_constant_violations = [k for k, v in dcc.items() if v["matches"] is False]
+delivery_constants_not_cross_checkable = [k for k, v in dcc.items() if v["matches"] is None]
 delivery_path = {
     "max_attempts": dcc["delivery_max_attempts"]["source_value"],
     "retry_schedule": "next_attempt_at = now + min(attempts*30s, 300s) (delivery_backoff_ms formula; "
@@ -1610,7 +1880,11 @@ delivery_path = {
     ),
     "coalesced_cap_starts_new_row": None,
     "constant_cross_check": dcc,
+    "constant_violations": delivery_constant_violations,
+    "constants_not_cross_checkable": delivery_constants_not_cross_checkable,
     "unset_dispatch_budget_keys": static["unset_delivery_keys"],
+    "deferred_dispatch_budget_exemptions": static["deferred_dispatch_budget_exemptions"],
+    "dispatch_budget_accounting": static["dispatch_budget_accounting"],
 }
 if events is not None:
     egates = events.get("gates", {})
@@ -1627,8 +1901,15 @@ delivery_path["all_passed"] = (
 delivery_path["status"] = "passed" if delivery_path["all_passed"] else "failed"
 if delivery_path["all_passed"]:
     delivery_path["reason"] = (
-        "all frozen delivery-path constants match source, zero budget keys remain `status: unset` in "
-        "contracts/limits-v1.md, and no_subscribers reaping per flow-events-result.json is confirmed"
+        "all frozen delivery-path constants match source, "
+        + static["dispatch_budget_accounting"]["identity"]
+        + " ("
+        + "; ".join(
+            f"{e['key']}: {e['reason_code']}, set_by {e['contract_set_by']}, re-demanded by {e['paired_gate']}"
+            for e in static["deferred_dispatch_budget_exemptions"]
+        )
+        + "), zero required budget keys remain `status: unset` in contracts/limits-v1.md, and "
+        "no_subscribers reaping per flow-events-result.json is confirmed"
     )
 else:
     delivery_path["reason"] = (
