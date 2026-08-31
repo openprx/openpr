@@ -1,0 +1,56 @@
+{
+  "_comment": "Example descriptor for scripts/verify-flow-deployed-websocket-v0.4.sh. Copy to flow-deployed-websocket.json and fill in the local values. The real file is gitignored because it carries a plaintext gate account password and machine-specific absolute paths.",
+  "public_url": "https://flow-v04.deploy.local:18443",
+  "ca_cert": "<absolute-path-on-your-machine>",
+  "account": {
+    "email": "<gate-account@example.local>",
+    "password": "<set-this-locally>"
+  },
+  "container_cli": "podman",
+  "hops": [
+    {
+      "name": "caddy",
+      "container": "v04-caddy",
+      "config_probe": [
+        "cat",
+        "/etc/caddy/Caddyfile"
+      ],
+      "version_probe": [
+        "caddy",
+        "version"
+      ],
+      "access_log": {
+        "path": "<absolute-path-on-your-machine>",
+        "format": "caddy_json"
+      }
+    },
+    {
+      "name": "nginx",
+      "container": "v04-frontend",
+      "config_probe": [
+        "nginx",
+        "-T"
+      ],
+      "version_probe": [
+        "nginx",
+        "-v"
+      ],
+      "access_log": {
+        "path": "<absolute-path-on-your-machine>",
+        "format": "w5corr"
+      }
+    },
+    {
+      "name": "api",
+      "container": "v04-api",
+      "config_hash_probe": [
+        "sha256sum",
+        "/app/config/openpr.toml"
+      ],
+      "binary_probe": [
+        "sha256sum",
+        "/app/api"
+      ]
+    }
+  ]
+}
