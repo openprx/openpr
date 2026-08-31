@@ -54,7 +54,7 @@ done
 for tool in jq git python3 psql curl cargo sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: missing required command: $tool" >&2; exit 2; }
 done
-[[ -d "$REPO_ROOT/.git" ]] || { echo "FAIL: invalid --repo-root: $REPO_ROOT" >&2; exit 2; }
+git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "FAIL: invalid --repo-root: $REPO_ROOT" >&2; exit 2; }
 PROBE="$ROOT_DIR/scripts/lib/mcp_transport_probe.py"
 UI_PROBE="$ROOT_DIR/scripts/lib/flow_feature_ui_probe.py"
 REVERSE_PROXY="$ROOT_DIR/scripts/lib/flow_feature_reverse_proxy.py"
