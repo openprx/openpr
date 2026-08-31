@@ -25,8 +25,11 @@ set -euo pipefail
 # Every invocation (pass or fail) also writes an atomic run log so a
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
 #
-# Exit codes: 0 = all checks ran and passed and gate-result.json was
-# written, 1 = one or more checks failed or a required artifact is missing
+# Exit codes: 0 = all required checks passed and gate-result.json was written.
+# The optional compose-style generic.test_mcp probe may instead be recorded as
+# environment_unavailable only when its stronger required MCP verifiers pass;
+# this remains visible in checks/counts and is never rewritten as passed.
+# Exit 1 = one or more checks failed or a required artifact is missing
 # (run log is always written; gate-result.json is also written when all
 # required artifacts exist), 2 = usage/tool/evidence malformed.
 
@@ -38,6 +41,7 @@ SKIP_GENERIC=0
 LOAD_HARNESS_EVIDENCE=""
 CACHE_EVIDENCE=""
 DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
+RECEIPT_STATE_FILTER="$ROOT_DIR/scripts/lib/flow_gate_v0_4_receipt_state.jq"
 
 usage() {
   cat <<'EOF'
@@ -78,8 +82,10 @@ Options:
                           required).
   -h, --help              Show this help and exit 0.
 
-Exit codes: 0 all green and gate-result.json written, 1 one or more
-checks failed / artifacts missing, 2 usage/tool error.
+Exit codes: 0 all required checks green and gate-result.json written
+(generic.test_mcp may be visibly environment_unavailable only when stronger
+required MCP coverage passes), 1 one or more checks failed / artifacts
+missing, 2 usage/tool error.
 EOF
 }
 
@@ -110,6 +116,10 @@ for tool in jq sha256sum git python3; do
     exit 2
   fi
 done
+if [[ ! -f "$RECEIPT_STATE_FILTER" ]]; then
+  echo "FAIL: receipt-state filter not found: $RECEIPT_STATE_FILTER" >&2
+  exit 2
+fi
 
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
@@ -138,6 +148,13 @@ run_step() {
   duration=$((end - start))
   if [[ $exit_code -eq 0 ]]; then
     status="passed"
+  elif [[ "$id" == "generic.test_mcp" && $exit_code -eq 69 ]]; then
+    # test-mcp.sh actively probes its configured endpoint. Exit 69 means the
+    # external compose-style MCP environment is unavailable, not that product
+    # behavior failed. The receipt keeps that fact visible; the shared state
+    # derivation only clears it as a blocker after the required live
+    # three-transport and full-registry verifiers both pass.
+    status="environment_unavailable"
   else
     status="failed"
     OVERALL_FAILED=1
@@ -438,12 +455,13 @@ jq -n \
     },
     source: {repository: $repository, head: $head, dirty: $dirty},
     generated_at: $generated_at,
-    mode: (if $hard_gate_non_pass_count == 0 then "pre_signoff" else "blocked" end),
+    mode: "blocked",
     gate_passed: false,
     counts: {
-      automated: ($checks | length),
-      passed: ($checks | map(select(.status=="passed")) | length),
-      failed: ($checks | map(select(.status=="failed")) | length),
+      automated: 0,
+      passed: 0,
+      failed: 0,
+      environment_unavailable: 0,
       manual_pending: 5,
       unresolved: 5
     },
@@ -458,8 +476,8 @@ jq -n \
       feature_flag: {status:"pending", reviewer:"", evidence:""},
       forms_regression: {status:"pending", reviewer:"", evidence:""}
     },
-    blockers: ((if $hard_gate_non_pass_count == 0 then [] else ["hard-gates-not-passed"] end) + ["manual-signoffs-pending"])
-  }' > "$GATE_RESULT_TMP"
+    blockers: []
+  }' | jq -f "$RECEIPT_STATE_FILTER" > "$GATE_RESULT_TMP"
 
 sync "$GATE_RESULT_TMP" 2>/dev/null || true
 mv -f "$GATE_RESULT_TMP" "$GATE_RESULT_PATH"

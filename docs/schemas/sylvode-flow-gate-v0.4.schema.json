@@ -97,6 +97,7 @@
         "automated",
         "passed",
         "failed",
+        "environment_unavailable",
         "manual_pending",
         "unresolved"
       ],
@@ -110,6 +111,11 @@
           "minimum": 0
         },
         "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "environment_unavailable": {
+          "description": "Checks that actively probed an external environment and returned the dedicated environment-unavailable result. This is not a failure only when stronger required evidence covers the same surface.",
           "type": "integer",
           "minimum": 0
         },
@@ -862,7 +868,8 @@
           "enum": [
             "passed",
             "failed",
-            "skipped"
+            "skipped",
+            "environment_unavailable"
           ]
         },
         "command": {

@@ -21,13 +21,16 @@ set -euo pipefail
 # Exit codes: 0 = zero drift (every hard gate the file claims "passed"
 # recomputes to "passed", every artifact checksum matches, and gate_passed
 # is only true when the recomputation agrees -- i.e. automation is fully
-# green), 1 = drift found / automation not fully green, 2 = usage/tool/
-# evidence malformed.
+# green). generic.test_mcp may retain environment_unavailable/69 only with
+# integrity-checked proof plus passed live three-transport and registry gates.
+# Exit 1 = drift found / automation not fully green, 2 = usage/tool/evidence
+# malformed.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 REPO_ROOT="$ROOT_DIR"
 SCHEMA_PATH="$ROOT_DIR/docs/schemas/sylvode-flow-gate-v0.4.schema.json"
+RECEIPT_STATE_FILTER="$ROOT_DIR/scripts/lib/flow_gate_v0_4_receipt_state.jq"
 JSON_MODE=0
 GATE_RESULT_PATH=""
 
@@ -106,6 +109,10 @@ if [[ ! -f "$SCHEMA_PATH" ]]; then
   echo "FAIL: schema file not found: $SCHEMA_PATH" >&2
   exit 2
 fi
+if [[ ! -f "$RECEIPT_STATE_FILTER" ]]; then
+  echo "FAIL: receipt-state filter not found: $RECEIPT_STATE_FILTER" >&2
+  exit 2
+fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
@@ -146,6 +153,8 @@ declare -A REQUIRED_TOP_LEVEL_TYPES=(
   [required_commands]=object
   [checks]=array
   [manual_signoffs]=object
+  [counts]=object
+  [blockers]=array
 )
 for key in "${!REQUIRED_TOP_LEVEL_TYPES[@]}"; do
   expected="${REQUIRED_TOP_LEVEL_TYPES[$key]}"
@@ -247,6 +256,7 @@ done < <(union_keys artifacts)
 
 # ---- checks[]: every recorded check's log evidence must exist with matching sha256 ----
 CHECKS_COUNT="$(jq '.checks | length' "$GATE_RESULT_PATH")"
+MCP_ENVIRONMENT_UNAVAILABLE=0
 for ((i = 0; i < CHECKS_COUNT; i++)); do
   entry_type="$(jq -r ".checks[$i] | type" "$GATE_RESULT_PATH")"
   if [[ "$entry_type" != "object" ]]; then
@@ -255,6 +265,7 @@ for ((i = 0; i < CHECKS_COUNT; i++)); do
   fi
   cid="$(jq -r ".checks[$i].id // empty" "$GATE_RESULT_PATH")"
   cstatus="$(jq -r ".checks[$i].status // empty" "$GATE_RESULT_PATH")"
+  cexit="$(jq -r ".checks[$i].exit_code // empty" "$GATE_RESULT_PATH")"
   crel="$(jq -r ".checks[$i].evidence // empty" "$GATE_RESULT_PATH")"
   csha="$(jq -r ".checks[$i].sha256 // empty" "$GATE_RESULT_PATH")"
   if [[ -z "$cid" || -z "$crel" || -z "$csha" ]]; then
@@ -278,7 +289,17 @@ for ((i = 0; i < CHECKS_COUNT; i++)); do
   if [[ "$actual_sha" != "$csha" ]]; then
     DRIFT+=("check '$cid': recorded sha256 does not match actual log at $crel")
   fi
-  if [[ "$cstatus" != "passed" ]]; then
+  if [[ "$cstatus" == "environment_unavailable" ]]; then
+    if [[ "$cid" != "generic.test_mcp" ]]; then
+      DRIFT+=("check '$cid' uses environment_unavailable, which is only defined for generic.test_mcp")
+    elif [[ "$cexit" != "69" ]]; then
+      DRIFT+=("check '$cid' status='environment_unavailable' must carry exit_code=69, found '$cexit'")
+    elif ! grep -Fq 'MCP_TEST_RESULT=environment_unavailable' "$cabs"; then
+      DRIFT+=("check '$cid' claims environment_unavailable but its integrity-checked log has no environment gate result")
+    else
+      MCP_ENVIRONMENT_UNAVAILABLE=$((MCP_ENVIRONMENT_UNAVAILABLE + 1))
+    fi
+  elif [[ "$cstatus" != "passed" ]]; then
     DRIFT+=("check '$cid' status='$cstatus' (must be 'passed' for a green gate)")
   fi
 done
@@ -333,6 +354,45 @@ while IFS= read -r key; do
     DRIFT+=("required_commands.$key status='$status' (must be 'passed')")
   fi
 done < <(union_keys required_commands)
+
+# generic.test_mcp is a compose-environment integration check. Its dedicated
+# exit 69 remains visible in checks/counts and is non-blocking only when two
+# stronger required verifiers independently passed: the shipped server spoke
+# real JSON-RPC over HTTP/SSE/stdio and the live registry enumerated all tools.
+if [[ $MCP_ENVIRONMENT_UNAVAILABLE -gt 0 ]]; then
+  MCP_TRANSPORT_COMMAND_STATUS="$(jq -r '.required_commands.mcp_transport_verify.status // empty' "$GATE_RESULT_PATH")"
+  MCP_REGISTRY_COMMAND_STATUS="$(jq -r '.required_commands.tool_registry_verify.status // empty' "$GATE_RESULT_PATH")"
+  MCP_TRANSPORT_GATE_STATUS="$(jq -r '.mcp_three_transport_contract // "not_verified"' <<<"$RECOMPUTED_GATES")"
+  MCP_REGISTRY_GATE_STATUS="$(jq -r '.tool_registry_expected_107_or_rebased // "not_verified"' <<<"$RECOMPUTED_GATES")"
+  if [[ $MCP_ENVIRONMENT_UNAVAILABLE -ne 1 ]]; then
+    DRIFT+=("generic.test_mcp environment_unavailable appears $MCP_ENVIRONMENT_UNAVAILABLE times; expected at most once")
+  fi
+  if [[ "$MCP_TRANSPORT_COMMAND_STATUS" != "passed" || "$MCP_REGISTRY_COMMAND_STATUS" != "passed" ||
+        "$MCP_TRANSPORT_GATE_STATUS" != "passed" || "$MCP_REGISTRY_GATE_STATUS" != "passed" ]]; then
+    DRIFT+=("generic.test_mcp environment is unavailable and stronger MCP coverage is not fully green (transport command=$MCP_TRANSPORT_COMMAND_STATUS gate=$MCP_TRANSPORT_GATE_STATUS; registry command=$MCP_REGISTRY_COMMAND_STATUS gate=$MCP_REGISTRY_GATE_STATUS)")
+  fi
+fi
+
+# ---- derived receipt-state consistency ----
+# Recompute against independently derived hard gates, not the receipt's claims,
+# then require every writer-maintained field to match the single shared state
+# transition. This proves mode=release is reachable only through real green
+# automation plus five passed manual rows.
+set +e
+EXPECTED_RECEIPT="$(jq --argjson gates "$RECOMPUTED_GATES" '.hard_gates = $gates' "$GATE_RESULT_PATH" | jq -f "$RECEIPT_STATE_FILTER")"
+EXPECTED_RECEIPT_EXIT=$?
+set -e
+if [[ $EXPECTED_RECEIPT_EXIT -ne 0 ]]; then
+  echo "FAIL: gate-result.json cannot be evaluated by the receipt-state derivation" >&2
+  exit 2
+fi
+for state_path in mode gate_passed counts blockers; do
+  actual_state="$(jq -c ".$state_path" "$GATE_RESULT_PATH")"
+  expected_state="$(jq -c ".$state_path" <<<"$EXPECTED_RECEIPT")"
+  if [[ "$actual_state" != "$expected_state" ]]; then
+    DRIFT+=("derived $state_path drift: receipt=$actual_state recomputed=$expected_state")
+  fi
+done
 
 # ---- gate_passed consistency: must only be true when there is zero drift so far ----
 CLAIMED_GATE_PASSED="$(jq -r '.gate_passed' "$GATE_RESULT_PATH")"

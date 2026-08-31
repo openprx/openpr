@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # MCP Server Integration Test Script
 # Tests tool discovery and invocation
@@ -9,11 +9,52 @@ set -e
 #   OPENPR_CONFIG_FILE     MCP configuration file the caller token is read from.
 #                          Default: config/openpr.compose.mcp.toml in the repository root.
 #   OPENPR_MCP_BOT_TOKEN   Call as this workspace bot instead (opr_ prefix).
+#
+# Exit codes:
+#   0  live MCP discovery and invocation passed
+#   1  a reachable MCP implementation failed a behavioral assertion
+#   2  local usage/tool error
+#   69 the configured external MCP environment is unavailable (machine-readable
+#      MCP_TEST_RESULT=environment_unavailable is emitted). Callers must not
+#      reinterpret this as product success without stronger live coverage.
 
 MCP_URL="${MCP_URL:-http://localhost:8090}"
 EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-107}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${OPENPR_CONFIG_FILE:-$PROJECT_ROOT/config/openpr.compose.mcp.toml}"
+
+environment_unavailable() {
+  local reason="$1"
+  echo "MCP_TEST_RESULT=environment_unavailable reason=$reason url=$MCP_URL"
+  exit 69
+}
+
+for required_tool in curl python3 grep sed wc tr; do
+  if ! command -v "$required_tool" >/dev/null 2>&1; then
+    echo "MCP_TEST_RESULT=tool_error missing=$required_tool" >&2
+    exit 2
+  fi
+done
+
+# Probe the external runtime before reading credentials. A closed compose port
+# is an environment precondition failure, not evidence that MCP product code
+# failed. Conversely, an HTTP response from a reachable service with a bad
+# health payload is a real behavioral failure and remains exit 1.
+HEALTH_FILE="$(mktemp)"
+trap 'rm -f "$HEALTH_FILE"' EXIT
+set +e
+HEALTH_HTTP_CODE="$(curl -sS --connect-timeout 2 --max-time 5 -o "$HEALTH_FILE" -w '%{http_code}' "$MCP_URL/health")"
+HEALTH_CURL_EXIT=$?
+set -e
+if [[ $HEALTH_CURL_EXIT -ne 0 ]]; then
+  environment_unavailable "health_endpoint_unreachable_curl_exit_${HEALTH_CURL_EXIT}"
+fi
+HEALTH_RESPONSE="$(cat "$HEALTH_FILE")"
+if [[ "$HEALTH_HTTP_CODE" != "200" ]] || ! grep -Eiq "^(ok|healthy)$" <<<"$HEALTH_RESPONSE"; then
+  echo "MCP_TEST_RESULT=implementation_failed reason=health_contract http_status=$HEALTH_HTTP_CODE"
+  echo "Response: $HEALTH_RESPONSE"
+  exit 1
+fi
 
 # Reads one dotted key out of the TOML configuration file, using the tomllib parser in python3
 # (3.11+) rather than a grep that would mis-handle quoting and section scoping. Prints nothing
@@ -63,7 +104,7 @@ if [ -z "$MCP_BOT_TOKEN" ]; then
   echo "   The MCP server rejects /mcp/rpc without 'Authorization: Bearer <opr_ bot token>'."
   echo "   Set mcp.bot_token in $CONFIG_FILE, or export OPENPR_MCP_BOT_TOKEN."
   echo "   bash scripts/bootstrap-restaurant-demo.sh creates a workspace bot and writes it there."
-  exit 1
+  environment_unavailable "caller_bot_token_missing"
 fi
 case "$MCP_BOT_TOKEN" in
   # The bootstrap placeholder scripts/start.sh writes so the container passes validation and
@@ -73,7 +114,7 @@ case "$MCP_BOT_TOKEN" in
     echo "   It belongs to no workspace, so the API rejects it. Run"
     echo "   bash scripts/bootstrap-restaurant-demo.sh to replace it, and mcp.workspace_id with"
     echo "   it, or export OPENPR_MCP_BOT_TOKEN for a bot of the configured workspace."
-    exit 1
+    environment_unavailable "caller_bot_token_placeholder"
     ;;
 esac
 
@@ -81,16 +122,11 @@ echo "🧪 Starting MCP Server Tests"
 echo "MCP URL: $MCP_URL"
 echo ""
 
-# Test 1: Health Check
+# Test 1: Health Check (the environment gate above already performed the live
+# request; repeat its recorded result here so the human test transcript remains
+# in the familiar three-test order without issuing a weaker second probe).
 echo "📋 Test 1: MCP Server Health Check"
-response=$(curl -s "$MCP_URL/health" || echo "failed")
-if echo "$response" | grep -Eiq "^(ok|healthy)$"; then
-  echo "✅ MCP server is healthy"
-else
-  echo "❌ MCP server health check failed"
-  echo "Response: $response"
-  exit 1
-fi
+echo "✅ MCP server is healthy (HTTP $HEALTH_HTTP_CODE)"
 echo ""
 
 # Test 2: List Tools

@@ -9,8 +9,10 @@ set -euo pipefail
 # page_editor, navigator_a11y, restart_recovery, feature_flag, forms_regression.
 #
 # This is the ONLY script allowed to write gate-result.json's
-# manual_signoffs block. It edits gate-result.json in place with an atomic
-# write (tmp + rename); it never touches checks/hard_gates/artifacts.
+# manual_signoffs block. It also recomputes the receipt's derived acceptance
+# state (mode, gate_passed, counts, blockers) from checks, hard_gates and all
+# five manual rows. It edits gate-result.json in place with an atomic write;
+# it never changes checks/hard_gates/artifacts.
 #
 # Exit codes: 0 = recorded, 1 = rejected (unknown key/status, empty
 # reviewer/evidence, overwrite of an already-signed row without --force),
@@ -24,6 +26,8 @@ REVIEWER=""
 EVIDENCE_NOTE=""
 FORCE=0
 DRY_RUN=0
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RECEIPT_STATE_FILTER="$ROOT_DIR/scripts/lib/flow_gate_v0_4_receipt_state.jq"
 
 VALID_KEYS="page_editor navigator_a11y restart_recovery feature_flag forms_regression"
 VALID_STATUSES="pending passed failed needs_rework"
@@ -100,6 +104,10 @@ fi
 if ! command -v jq >/dev/null 2>&1; then
   echo "FAIL: missing required command: jq" >&2
   echo "Fix: sudo apt-get install -y jq" >&2
+  exit 2
+fi
+if [[ ! -f "$RECEIPT_STATE_FILTER" ]]; then
+  echo "FAIL: receipt-state filter not found: $RECEIPT_STATE_FILTER" >&2
   exit 2
 fi
 
@@ -185,8 +193,10 @@ fi
 TMP_PATH="$GATE_RESULT_PATH.tmp"
 jq --arg k "$KEY" --arg status "$STATUS_VALUE" --arg reviewer "$REVIEWER" --arg evidence "$EVIDENCE_NOTE" \
   '.manual_signoffs[$k] = {status: $status, reviewer: $reviewer, evidence: $evidence}' \
-  "$GATE_RESULT_PATH" > "$TMP_PATH"
+  "$GATE_RESULT_PATH" | jq -f "$RECEIPT_STATE_FILTER" > "$TMP_PATH"
 mv -f "$TMP_PATH" "$GATE_RESULT_PATH"
 
+DERIVED_SUMMARY="$(jq -c '{mode,gate_passed,counts,blockers}' "$GATE_RESULT_PATH")"
 echo "Recorded manual_signoffs.$KEY = $STATUS_VALUE (reviewer=$REVIEWER) in $GATE_RESULT_PATH (was: $CURRENT_STATUS)"
+echo "Derived receipt state: $DERIVED_SUMMARY"
 exit 0
