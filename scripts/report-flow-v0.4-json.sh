@@ -33,6 +33,8 @@ CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT=""
 REPO_ROOT="$ROOT_DIR"
 SKIP_GENERIC=0
+LOAD_HARNESS_EVIDENCE=""
+DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
 
 usage() {
   cat <<'EOF'
@@ -56,6 +58,13 @@ Options:
   --repo-root DIR         Repository the cargo/bun commands run in and
                           whose HEAD becomes source.head. Default: this
                           checkout.
+  --load-harness-evidence PATH
+                          Load-harness JSON passed to the architecture
+                          verifier. Default: <evidence-root>/load-harness-result.json.
+  --dedicated-pg-container NAME
+                          Explicit dedicated PostgreSQL container declaration
+                          passed through to the architecture verifier. Default:
+                          $OPENPR_FLOW_DEDICATED_PG_CONTAINER.
   --skip-generic          Skip the generic cargo fmt/check/clippy/test +
                           bun check/build + ci-universal-forms-gates +
                           test-mcp bundle (fast iteration only; report
@@ -74,6 +83,8 @@ while [[ $# -gt 0 ]]; do
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
     --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
+    --load-harness-evidence) LOAD_HARNESS_EVIDENCE="${2:?--load-harness-evidence requires a PATH}"; shift 2 ;;
+    --dedicated-pg-container) DEDICATED_PG_CONTAINER="${2:?--dedicated-pg-container requires a NAME}"; shift 2 ;;
     --skip-generic) SKIP_GENERIC=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -100,6 +111,7 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
 fi
 
 mkdir -p "$EVIDENCE_ROOT"
+[[ -n "$LOAD_HARNESS_EVIDENCE" ]] || LOAD_HARNESS_EVIDENCE="$EVIDENCE_ROOT/load-harness-result.json"
 
 CHECKS_JSON="[]"
 OVERALL_FAILED=0
@@ -173,8 +185,25 @@ echo "=== Sylvode Flow v0.4 report: integrity-records + authz-baseline (live api
 run_step required.integrity_records_verify "$ROOT_DIR/scripts/verify-flow-integrity-records-v0.4.sh" --adr "$CONTRACTS_ROOT/decisions/ADR-0013-multi-document-atomicity.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
 run_step required.authz_baseline_verify "$ROOT_DIR/scripts/verify-flow-authz-baseline-v0.4.sh" --adr "$CONTRACTS_ROOT/decisions/ADR-0012-object-authorization-and-sharing.md" --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
 
+echo "=== Sylvode Flow v0.4 report: live REST success contract + document integrity ==="
+run_step required.rest_contract_verify "$ROOT_DIR/scripts/verify-flow-rest-contract-v0.4.sh" --release 0.4 --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
+run_step required.document_integrity_verify "$ROOT_DIR/scripts/verify-flow-document-integrity-v0.4.sh" --release 0.4 --repo-root "$REPO_ROOT" --evidence-root "$EVIDENCE_ROOT" --json || true
+
 echo "=== Sylvode Flow v0.4 report: collab-architecture verify ==="
-run_step required.collab_architecture_verify "$ROOT_DIR/scripts/verify-flow-collab-architecture.sh" --release 0.4 --adr "$CONTRACTS_ROOT/decisions/ADR-0010-collab-server-architecture.md" --limits "$CONTRACTS_ROOT/contracts/limits-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+ARCHITECTURE_ARGS=(
+  --release 0.4
+  --adr "$CONTRACTS_ROOT/decisions/ADR-0010-collab-server-architecture.md"
+  --limits "$CONTRACTS_ROOT/contracts/limits-v1.md"
+  --load-harness-evidence "$LOAD_HARNESS_EVIDENCE"
+  --contracts-root "$CONTRACTS_ROOT"
+  --evidence-root "$EVIDENCE_ROOT"
+  --repo-root "$REPO_ROOT"
+  --json
+)
+if [[ -n "$DEDICATED_PG_CONTAINER" ]]; then
+  ARCHITECTURE_ARGS+=(--dedicated-pg-container "$DEDICATED_PG_CONTAINER")
+fi
+run_step required.collab_architecture_verify "$ROOT_DIR/scripts/verify-flow-collab-architecture.sh" "${ARCHITECTURE_ARGS[@]}" || true
 
 echo "=== Sylvode Flow v0.4 report: events/dispatch verify ==="
 run_step required.events_verify "$ROOT_DIR/scripts/verify-flow-events-v0.4.sh" --contract "$CONTRACTS_ROOT/contracts/events-v1.md" --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
@@ -296,6 +325,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson legacy_pages_inventory "$(get_check required.legacy_pages_inventory)" \
   --argjson legacy_pages_entry_verify "$(get_check required.legacy_pages_entry_verify)" \
   --argjson collab_architecture_verify "$(get_check required.collab_architecture_verify)" \
+  --argjson rest_contract_verify "$(get_check required.rest_contract_verify)" \
+  --argjson document_integrity_verify "$(get_check required.document_integrity_verify)" \
   --argjson error_contract_verify "$(get_check required.error_contract_verify)" \
   --argjson deployed_chain_websocket_upgrade "$(get_check required.deployed_chain_websocket_upgrade)" \
   --argjson cardinality_verify "$(get_check required.cardinality_verify)" \
@@ -316,6 +347,8 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     legacy_pages_inventory:$legacy_pages_inventory,
     legacy_pages_entry_verify:$legacy_pages_entry_verify,
     collab_architecture_verify:$collab_architecture_verify,
+    rest_contract_verify:$rest_contract_verify,
+    document_integrity_verify:$document_integrity_verify,
     error_contract_verify:$error_contract_verify,
     deployed_chain_websocket_upgrade:$deployed_chain_websocket_upgrade,
     cardinality_verify:$cardinality_verify,

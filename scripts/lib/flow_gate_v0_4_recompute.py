@@ -110,7 +110,15 @@ class EvidenceFormatError(Exception):
 BRIDGE_GATE_STATUSES = {"passed", "failed", "not_covered"}
 
 
-def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_version: str, gates: dict, reasons: dict) -> bool:
+def bridge_verifier_gates(
+    evidence_root: str,
+    filename: str,
+    expected_schema_version: str,
+    gates: dict,
+    reasons: dict,
+    *,
+    conjoin: bool = False,
+) -> bool:
     """Read a per-verifier evidence artifact and copy each hard gate's own
     verdict into `gates`/`reasons` verbatim -- never re-deriving or softening
     a verdict the verifier already computed.
@@ -207,8 +215,21 @@ def bridge_verifier_gates(evidence_root: str, filename: str, expected_schema_ver
             raise EvidenceFormatError(
                 f"{path}: {gate_key}.{gate_name} status={status!r} is not one of {sorted(BRIDGE_GATE_STATUSES)}"
             )
-        gates[gate_name] = status
-        reasons[gate_name] = f"{filename}: {gate_key}.{gate_name}={status}" + (f" -- {detail}" if detail else "")
+        artifact_reason = f"{filename}: {gate_key}.{gate_name}={status}" + (f" -- {detail}" if detail else "")
+        if conjoin and gates.get(gate_name) != "not_verified":
+            previous = gates[gate_name]
+            if "failed" in (previous, status):
+                combined = "failed"
+            elif "not_covered" in (previous, status):
+                combined = "not_covered"
+            else:
+                combined = "passed"
+            previous_reason = reasons.get(gate_name, f"prior evidence={previous}")
+            gates[gate_name] = combined
+            reasons[gate_name] = f"{previous_reason}; AND {artifact_reason}"
+        else:
+            gates[gate_name] = status
+            reasons[gate_name] = artifact_reason
 
     return True
 
@@ -401,6 +422,43 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     # as the two above -- see bridge_verifier_gates() docstring.
     bridge_verifier_gates(evidence_root, "limits-result.json", "sylvode.flow.limits-result.v1", gates, reasons)
     bridge_verifier_gates(evidence_root, "error-contract-result.json", "sylvode.flow.error-contract-result.v1", gates, reasons)
+
+    # The success-path REST artifact is independently required in addition to
+    # the surface matrix and error mapping artifact.  It strengthens (never
+    # overwrites) both relevant gates: a markdown-complete matrix cannot stand
+    # in for one live REST/MCP/CLI object, and error-shape coverage cannot stand
+    # in for successful ApiResponse envelopes.  Absence is not allowed to
+    # inherit an earlier pass from either weaker artifact.
+    if not bridge_verifier_gates(
+        evidence_root,
+        "rest-contract-result.json",
+        "sylvode.flow.rest-contract-result.v1",
+        gates,
+        reasons,
+        conjoin=True,
+    ):
+        missing = os.path.join(evidence_root, "rest-contract-result.json")
+        for gate_name in ("rest_mcp_cli_ui_surface_parity", "rest_envelope_and_error_contract"):
+            gates[gate_name] = "not_verified"
+            reasons[gate_name] = f"missing/unreadable required live success-path artifact {missing}"
+
+    # Likewise, architecture's in-process restart test is necessary but not
+    # sufficient for the frozen document-integrity criterion.  Require the
+    # independent PostgreSQL replay/projection/API-process-restart artifact as
+    # a conjunct of snapshot_tail_restart_recovery.
+    if not bridge_verifier_gates(
+        evidence_root,
+        "document-integrity-result.json",
+        "sylvode.flow.document-integrity-result.v1",
+        gates,
+        reasons,
+        conjoin=True,
+    ):
+        missing = os.path.join(evidence_root, "document-integrity-result.json")
+        gates["snapshot_tail_restart_recovery"] = "not_verified"
+        reasons["snapshot_tail_restart_recovery"] = (
+            f"missing/unreadable required live canonical replay/restart artifact {missing}"
+        )
 
     # ---- deployed three-hop WebSocket verifier: backs 1 gate ----
     # A missing/unreachable real deployment is written as an explicit failed

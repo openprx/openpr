@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-document-integrity-result-v1.schema.json",
+  "title": "Sylvode Flow v0.4 document integrity verifier result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release",
+    "source_head",
+    "generated_at",
+    "fixture",
+    "database_replay",
+    "projection_recompute",
+    "process_restart",
+    "violations",
+    "passed",
+    "gates"
+  ],
+  "properties": {
+    "schema_version": { "const": "sylvode.flow.document-integrity-result.v1" },
+    "release": { "const": "0.4" },
+    "source_head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "fixture": { "type": "object" },
+    "database_replay": {
+      "type": "object",
+      "required": [
+        "snapshot_seq",
+        "head_seq",
+        "tail_update_count",
+        "seq_contiguous",
+        "frontier_matches_head_byte_for_byte",
+        "semantic_hash"
+      ],
+      "properties": {
+        "snapshot_seq": { "type": "integer", "minimum": 0 },
+        "head_seq": { "type": "integer", "minimum": 0 },
+        "tail_update_count": { "type": "integer", "minimum": 0 },
+        "seq_contiguous": { "type": "boolean" },
+        "frontier_matches_head_byte_for_byte": { "type": "boolean" },
+        "semantic_hash": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": true
+    },
+    "projection_recompute": { "type": "object" },
+    "process_restart": {
+      "type": "object",
+      "required": [
+        "first_pid",
+        "first_process_observed_dead",
+        "second_pid",
+        "distinct_processes",
+        "before_semantic_hash",
+        "after_semantic_hash",
+        "semantic_hash_equal"
+      ],
+      "properties": {
+        "first_pid": { "type": "integer", "minimum": 1 },
+        "first_process_observed_dead": { "type": "boolean" },
+        "second_pid": { "type": "integer", "minimum": 1 },
+        "distinct_processes": { "type": "boolean" },
+        "before_semantic_hash": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "after_semantic_hash": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "semantic_hash_equal": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "violations": { "type": "array", "items": { "type": "string" } },
+    "passed": { "type": "boolean" },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_tail_restart_recovery"],
+      "properties": {
+        "snapshot_tail_restart_recovery": { "$ref": "#/$defs/gate" }
+      }
+    }
+  },
+  "$defs": {
+    "gate": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["status", "reason"],
+      "properties": {
+        "status": { "enum": ["passed", "failed"] },
+        "reason": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

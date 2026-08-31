@@ -138,6 +138,8 @@
         "legacy_pages_inventory",
         "legacy_pages_entry_verify",
         "collab_architecture_verify",
+        "rest_contract_verify",
+        "document_integrity_verify",
         "error_contract_verify",
         "deployed_chain_websocket_upgrade",
         "cardinality_verify",
@@ -168,6 +170,12 @@
           "$ref": "#/$defs/required_command_result"
         },
         "collab_architecture_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "rest_contract_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "document_integrity_verify": {
           "$ref": "#/$defs/required_command_result"
         },
         "error_contract_verify": {
