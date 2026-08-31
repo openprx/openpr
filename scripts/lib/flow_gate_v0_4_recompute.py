@@ -271,6 +271,8 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             missing = set(dimension.get("contract_missing_in_implementation", []))
             if declared != required | future | conditional or required & (future | conditional):
                 version_scope_issues.append(f"{surface} release classification is incomplete or overlapping")
+            if not required or dimension.get("required_set_non_empty") is not True:
+                version_scope_issues.append(f"{surface} current-release required set is empty")
             if missing != required - implementation:
                 version_scope_issues.append(f"{surface} missing set is not current-release-required minus implementation")
         parity_keys = [
@@ -278,6 +280,7 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
             "orphan_mcp_tools", "orphan_mcp_resources", "orphan_cli_commands",
             "unknown_mcp_refs", "unknown_cli_refs", "unknown_ui_consumers",
             "blank_cells", "version_inversions", "future_exposure_counted_as_shipped",
+            "empty_contract_required_surfaces",
             "contract_mcp_missing_live", "contract_rest_missing_implementation",
             "contract_cli_missing_implementation",
         ]

@@ -171,6 +171,7 @@ def main() -> int:
             "proof": proof,
             "contract_declared": sorted(declared_set),
             "contract_required": sorted(contract_set),
+            "required_set_non_empty": bool(contract_set),
             "not_yet_in_release": future_with_presence,
             "conditional_not_applicable": conditional_with_presence,
             "implementation": sorted(implementation_set),
@@ -188,7 +189,7 @@ def main() -> int:
                 "contract_missing_in_implementation": len(contract_set - implementation_set),
                 "not_in_flow_contract": len(implementation_set - declared_set),
             },
-            "passed": contract_set <= implementation_set,
+            "passed": bool(contract_set) and contract_set <= implementation_set,
             **extra,
         }
 
@@ -221,6 +222,44 @@ def main() -> int:
             for name in ("mcp", "rest", "cli")
         },
     }
+    required_total = sum(result[name]["counts"]["contract_required"] for name in ("mcp", "rest", "cli"))
+    declared_total = sum(result[name]["counts"]["contract_declared"] for name in ("mcp", "rest", "cli"))
+    result["proof_limitations"] = {
+        "rest": {
+            "proof_kind": "source_route_registration_parser",
+            "proves": "matching method/path registrations were found by parsing balanced .route(...) calls in apps/api/src/main.rs",
+            "does_not_prove": "the routes are present in a running runtime router",
+        },
+        "cli": {
+            "proof_kind": "shipped_help_probe",
+            "proves": "the shipped command path exits zero for --help and its help text contains contract-required flag strings",
+            "does_not_prove": "the command can successfully perform its operation",
+        },
+        "release_scope": {
+            "required_entries_compared": required_total,
+            "contract_entries_declared": declared_total,
+            "ratio": f"{required_total}/{declared_total}",
+            "excluded_entries": declared_total - required_total,
+            "excluded_disposition": "not_yet_in_release or conditional_not_applicable",
+        },
+    }
+    result["conditional_surface_observation"] = {
+        "code": "conditional_legacy_pages_surface_asymmetry",
+        "non_failing": True,
+        "reason": "conditional surfaces do not become required until their activation condition is satisfied",
+        **{
+            f"{surface}_{presence}": sorted(
+                item["name"]
+                for item in result[surface]["conditional_not_applicable"]
+                if item["implementation_present"] == (presence == "present")
+            )
+            for surface in ("mcp", "rest", "cli")
+            for presence in ("present", "absent")
+        },
+    }
+    result["empty_contract_required_surfaces"] = sorted(
+        name for name in ("mcp", "rest", "cli") if not result[name]["required_set_non_empty"]
+    )
     result["passed"] = all(result[name]["passed"] for name in ("mcp", "rest", "cli"))
     json.dump(result, sys.stdout, indent=2, sort_keys=True)
     print()

@@ -252,6 +252,35 @@ try:
 except (OSError, json.JSONDecodeError) as exc:
     print(json.dumps({"error": f"load harness evidence is not valid JSON: {exc}"}))
     raise SystemExit(0)
+if raw.get("schema_version") == "sylvode.flow.collab-load-harness-environment.v1":
+    gate = raw.get("environment_gate") or {}
+    execution = raw.get("execution") or {}
+    detail = gate.get("detail") or "load harness environment prerequisite was not satisfied"
+    print(json.dumps({
+        "available": True,
+        "evidence_path": os.path.abspath(path),
+        "evidence_sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+        "execution_status": execution.get("status"),
+        "official_environment": {
+            "required": "release build on an explicitly declared, uncontended dedicated PostgreSQL container",
+            "declared_dedicated_pg_container": gate.get("declared_dedicated_pg_container"),
+            "recorded_pg_log_container": gate.get("pg_log_container"),
+            "qualification_status": gate.get("status"),
+            "reason_code": gate.get("reason_code"),
+            "active_other_clients_at_preflight": gate.get("active_other_clients"),
+            "shared_database_measurements_accepted": False,
+        },
+        "official_environment_ok": False,
+        "budget_checks": {},
+        "parity_checks": {},
+        "surface_comparisons": 0,
+        "divergent_heads": [],
+        "budget_gate_passed": False,
+        "parity_gate_passed": False,
+        "measurements": {},
+        "violations": [f"load harness environment not satisfied: {detail}"],
+    }))
+    raise SystemExit(0)
 if raw.get("schema_version") != "sylvode.flow.collab-load-harness.v1":
     print(json.dumps({"error": "load harness evidence has the wrong schema_version"}))
     raise SystemExit(0)
@@ -273,6 +302,10 @@ actual_container = env.get("pg_log_container")
 official_environment_ok = bool(
     dedicated_container
     and actual_container == dedicated_container
+    and env.get("declared_dedicated_pg_container") == dedicated_container
+    and env.get("qualification_status") == "satisfied"
+    and env.get("active_other_clients_at_preflight") == 0
+    and env.get("shared_database_measurements_accepted") is False
     and env.get("build_profile") == "release"
     and isinstance(env.get("postgres_version"), str)
     and env.get("postgres_version")
@@ -284,6 +317,14 @@ elif actual_container != dedicated_container:
     violations.append(
         f"declared dedicated PostgreSQL container {dedicated_container!r} does not match evidence {actual_container!r}"
     )
+if env.get("qualification_status") != "satisfied":
+    violations.append("load harness artifact lacks a satisfied preflight environment qualification")
+if env.get("declared_dedicated_pg_container") != dedicated_container:
+    violations.append("load harness preflight declaration does not match --dedicated-pg-container")
+if env.get("active_other_clients_at_preflight") != 0:
+    violations.append("load harness preflight did not prove an uncontended dedicated PostgreSQL instance")
+if env.get("shared_database_measurements_accepted") is not False:
+    violations.append("load harness artifact does not explicitly reject shared-database measurements")
 if env.get("build_profile") != "release":
     violations.append("load harness evidence is not from a release build")
 if not official_environment_ok and dedicated_container and actual_container == dedicated_container:
@@ -356,6 +397,8 @@ print(json.dumps({
         "build_profile": env.get("build_profile"),
         "postgres_version": env.get("postgres_version"),
         "measurement_authority": env.get("measurement_authority"),
+        "qualification_status": env.get("qualification_status"),
+        "active_other_clients_at_preflight": env.get("active_other_clients_at_preflight"),
         "shared_database_measurements_accepted": False,
     },
     "official_environment_ok": official_environment_ok,
@@ -827,6 +870,8 @@ FINAL_JSON="$(jq -n \
         reason: (
           if ($numeric_budgets_verified_portion and $load_harness_exists and $harness.budget_gate_passed and $cache_evidence.passed) then
             "frozen constants, dedicated load budgets, and the ADR fixed cache block all pass"
+          elif $harness.execution_status == "not_run_environment_not_satisfied" then
+            "load harness environment not satisfied; no load distribution was run or classified as an implementation failure"
           else
             "numeric constants, dedicated load-harness checks, or cache evidence failed; see load_harness/cache_evidence violations"
           end
@@ -854,6 +899,8 @@ FINAL_JSON="$(jq -n \
         reason: (
           if ($load_harness_exists and $harness.parity_gate_passed) then
             "dedicated release PostgreSQL harness independently confirms REPEATABLE READ READ ONLY bootstrap transactions, contiguous accepted seq/tails, frontier equivalence and zero REST/WS identity divergence"
+          elif $harness.execution_status == "not_run_environment_not_satisfied" then
+            "load harness environment not satisfied; REST/WS parity was not measured and is not passed or skipped"
           else
             "dedicated load-harness parity checks failed; see load_harness.violations and parity_checks"
           end

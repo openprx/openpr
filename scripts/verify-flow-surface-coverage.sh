@@ -112,17 +112,21 @@ fi
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "$EVIDENCE_ROOT"
+CARGO_OUTPUT_DIR="${CARGO_TARGET_DIR:-target}"
+if [[ "$CARGO_OUTPUT_DIR" != /* ]]; then
+  CARGO_OUTPUT_DIR="$REPO_ROOT/$CARGO_OUTPUT_DIR"
+fi
 
 # These binaries are the shipped registries. Building and executing them is
 # intentional: source grep cannot prove that a declaration reached the binary.
 (cd "$REPO_ROOT" && cargo build -p mcp-server --bin list-tools --bin sylvode) >&2
 MCP_OUTPUT="$(mktemp)"
-"$REPO_ROOT/target/debug/list-tools" > "$MCP_OUTPUT"
+"$CARGO_OUTPUT_DIR/debug/list-tools" > "$MCP_OUTPUT"
 IMPL_OUT="$(mktemp)"
 set +e
 python3 "$ROOT_DIR/scripts/lib/flow_surface_implementation.py" \
   --contracts-root "$CONTRACTS_ROOT" --repo-root "$REPO_ROOT" --release "$RELEASE" \
-  --mcp-output "$MCP_OUTPUT" --cli-binary "$REPO_ROOT/target/debug/sylvode" > "$IMPL_OUT"
+  --mcp-output "$MCP_OUTPUT" --cli-binary "$CARGO_OUTPUT_DIR/debug/sylvode" > "$IMPL_OUT"
 IMPL_EXIT=$?
 set -e
 rm -f "$MCP_OUTPUT"
@@ -157,6 +161,7 @@ RESULT="$(jq --slurpfile implementation "$IMPL_OUT" \
     counts: .counts,
     implementation_parity: $implementation[0],
     violations: (.violations + {
+      empty_contract_required_surfaces: $implementation[0].empty_contract_required_surfaces,
       contract_mcp_missing_live: $implementation[0].mcp.contract_missing_in_implementation,
       contract_rest_missing_implementation: $implementation[0].rest.contract_missing_in_implementation,
       contract_cli_missing_implementation: $implementation[0].cli.contract_missing_in_implementation
@@ -194,6 +199,15 @@ jq -r '.implementation_parity.version_scope_diagnostic |
   (.not_yet_in_release_counts | to_entries | map("\(.key)=\(.value)") | join(",")) +
   " future_absent_non_failing=" +
   (.future_absent_but_non_failing_counts | to_entries | map("\(.key)=\(.value)") | join(","))' <<<"$RESULT" >&2
+jq -r '.implementation_parity.proof_limitations |
+  "  [proof_limitations] REST=" + .rest.proof_kind +
+  " (not runtime router); CLI=" + .cli.proof_kind +
+  " (existence, not operability); release_scope=" + .release_scope.ratio' <<<"$RESULT" >&2
+jq -r '.implementation_parity.conditional_surface_observation |
+  "  [conditional_surface] " + .code +
+  ": mcp_present=" + ((.mcp_present | length) | tostring) +
+  " cli_absent=" + ((.cli_absent | length) | tostring) +
+  " non_failing=" + (.non_failing | tostring)' <<<"$RESULT" >&2
 echo "wrote $OUT_PATH" >&2
 if [[ "$PASSED" != "true" ]]; then
   jq -r '.violations | to_entries[] | select(.value | length > 0) | "  [\(.key)] " + (.value | join("; "))' <<<"$RESULT" >&2

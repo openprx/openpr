@@ -126,6 +126,10 @@ fi
 mkdir -p "$EVIDENCE_ROOT"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CARGO_OUTPUT_DIR="${CARGO_TARGET_DIR:-target}"
+if [[ "$CARGO_OUTPUT_DIR" != /* ]]; then
+  CARGO_OUTPUT_DIR="$REPO_ROOT/$CARGO_OUTPUT_DIR"
+fi
 
 write_environment_failure() {
   local reason="$1" out="$EVIDENCE_ROOT/authz-baseline-result.json" tmp result
@@ -183,7 +187,7 @@ echo "=== prerequisite: cargo build -p collab-core --bin collab-isolated-apply-w
   echo "FAIL: api binary failed to build" >&2
   exit 2
 }
-API_BIN="$REPO_ROOT/target/debug/api"
+API_BIN="$CARGO_OUTPUT_DIR/debug/api"
 
 RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:8])')"
 TMP_DIR="$(mktemp -d "/opt/worker/.cache/openpr-authz-baseline-verify.XXXXXX")"

@@ -63,7 +63,11 @@
     "implementation_parity": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["scope", "mcp", "rest", "cli", "version_scope_diagnostic", "passed"],
+      "required": [
+        "scope", "mcp", "rest", "cli", "version_scope_diagnostic",
+        "proof_limitations", "conditional_surface_observation",
+        "empty_contract_required_surfaces", "passed"
+      ],
       "properties": {
         "scope": {
           "type": "object",
@@ -95,6 +99,14 @@
             "future_absent_but_non_failing_counts": { "$ref": "#/$defs/implementation_dimension_counts_by_surface" }
           }
         },
+        "proof_limitations": { "$ref": "#/$defs/proof_limitations" },
+        "conditional_surface_observation": { "$ref": "#/$defs/conditional_surface_observation" },
+        "empty_contract_required_surfaces": {
+          "type": "array",
+          "items": { "enum": ["mcp", "rest", "cli"] },
+          "uniqueItems": true,
+          "maxItems": 0
+        },
         "passed": { "type": "boolean" }
       }
     },
@@ -108,6 +120,7 @@
         "blank_cells", "invalid_reason_codes", "reason_column_mismatches",
         "mcp_exception_endpoint_mismatches", "mcp_exception_without_authority",
         "version_inversions", "future_exposure_counted_as_shipped",
+        "empty_contract_required_surfaces",
         "contract_mcp_missing_live", "contract_rest_missing_implementation",
         "contract_cli_missing_implementation"
       ],
@@ -128,6 +141,11 @@
         "mcp_exception_without_authority": { "type": "array", "items": { "type": "string" } },
         "version_inversions": { "type": "array", "items": { "type": "string" } },
         "future_exposure_counted_as_shipped": { "type": "array", "items": { "type": "string" } },
+        "empty_contract_required_surfaces": {
+          "type": "array",
+          "items": { "enum": ["mcp", "rest", "cli"] },
+          "uniqueItems": true
+        },
         "contract_mcp_missing_live": { "type": "array", "items": { "type": "string" } },
         "contract_rest_missing_implementation": { "type": "array", "items": { "type": "string" } },
         "contract_cli_missing_implementation": { "type": "array", "items": { "type": "string" } }
@@ -168,17 +186,76 @@
         "reason": { "const": "conditional_surface_requires_activation" }
       }
     },
+    "proof_limitation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["proof_kind", "proves", "does_not_prove"],
+      "properties": {
+        "proof_kind": { "type": "string", "minLength": 1 },
+        "proves": { "type": "string", "minLength": 1 },
+        "does_not_prove": { "type": "string", "minLength": 1 }
+      }
+    },
+    "proof_limitations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rest", "cli", "release_scope"],
+      "properties": {
+        "rest": { "$ref": "#/$defs/proof_limitation" },
+        "cli": { "$ref": "#/$defs/proof_limitation" },
+        "release_scope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "required_entries_compared", "contract_entries_declared", "ratio",
+            "excluded_entries", "excluded_disposition"
+          ],
+          "properties": {
+            "required_entries_compared": { "type": "integer", "minimum": 3 },
+            "contract_entries_declared": { "type": "integer", "minimum": 3 },
+            "ratio": { "type": "string", "pattern": "^[1-9][0-9]*/[1-9][0-9]*$" },
+            "excluded_entries": { "type": "integer", "minimum": 0 },
+            "excluded_disposition": { "const": "not_yet_in_release or conditional_not_applicable" }
+          }
+        }
+      }
+    },
+    "conditional_surface_observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code", "non_failing", "reason", "mcp_present", "mcp_absent",
+        "rest_present", "rest_absent", "cli_present", "cli_absent"
+      ],
+      "properties": {
+        "code": { "const": "conditional_legacy_pages_surface_asymmetry" },
+        "non_failing": { "const": true },
+        "reason": { "type": "string", "minLength": 1 },
+        "mcp_present": { "$ref": "#/$defs/unique_strings" },
+        "mcp_absent": { "$ref": "#/$defs/unique_strings" },
+        "rest_present": { "$ref": "#/$defs/unique_strings" },
+        "rest_absent": { "$ref": "#/$defs/unique_strings" },
+        "cli_present": { "$ref": "#/$defs/unique_strings" },
+        "cli_absent": { "$ref": "#/$defs/unique_strings" }
+      }
+    },
+    "unique_strings": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
     "implementation_dimension": {
       "type": "object",
       "required": [
-        "proof", "contract_declared", "contract_required", "not_yet_in_release",
+        "proof", "contract_declared", "contract_required", "required_set_non_empty", "not_yet_in_release",
         "conditional_not_applicable", "implementation",
         "contract_missing_in_implementation", "not_in_flow_contract", "counts", "passed"
       ],
       "properties": {
         "proof": { "type": "string" },
         "contract_declared": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-        "contract_required": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "contract_required": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "minItems": 1 },
+        "required_set_non_empty": { "const": true },
         "not_yet_in_release": { "type": "array", "items": { "$ref": "#/$defs/release_entry" } },
         "conditional_not_applicable": { "type": "array", "items": { "$ref": "#/$defs/conditional_release_entry" } },
         "implementation": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
@@ -194,7 +271,7 @@
           ],
           "properties": {
             "contract_declared": { "type": "integer", "minimum": 0 },
-            "contract_required": { "type": "integer", "minimum": 0 },
+            "contract_required": { "type": "integer", "minimum": 1 },
             "not_yet_in_release": { "type": "integer", "minimum": 0 },
             "not_yet_in_release_absent": { "type": "integer", "minimum": 0 },
             "conditional_not_applicable": { "type": "integer", "minimum": 0 },

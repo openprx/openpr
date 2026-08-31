@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpr.dev/schemas/sylvode-flow-collab-load-harness-environment-result-v1.schema.json",
+  "title": "Sylvode Flow Collab Load Harness Environment Result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_head", "generated_at", "environment_gate", "execution", "violations", "passed"],
+  "properties": {
+    "schema_version": { "const": "sylvode.flow.collab-load-harness-environment.v1" },
+    "source_head": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "environment_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "reason_code", "detail", "declared_dedicated_pg_container",
+        "pg_log_container", "active_other_clients", "known_shared_instances_rejected"
+      ],
+      "properties": {
+        "status": { "const": "not_satisfied" },
+        "reason_code": {
+          "enum": [
+            "database_url_missing", "dedicated_container_not_declared",
+            "pg_log_container_not_declared", "container_declaration_mismatch",
+            "known_shared_postgresql_instance", "dedicated_container_unreachable",
+            "database_unreachable", "database_activity_probe_failed",
+            "dedicated_instance_contended"
+          ]
+        },
+        "detail": { "type": "string", "minLength": 1 },
+        "declared_dedicated_pg_container": { "type": ["string", "null"] },
+        "pg_log_container": { "type": ["string", "null"] },
+        "active_other_clients": { "type": ["integer", "null"], "minimum": 0 },
+        "known_shared_instances_rejected": {
+          "type": "array",
+          "contains": { "const": "flow-test-pg" },
+          "minContains": 1
+        }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "harness_started"],
+      "properties": {
+        "status": { "const": "not_run_environment_not_satisfied" },
+        "harness_started": { "const": false }
+      }
+    },
+    "violations": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
+    "passed": { "const": false }
+  }
+}

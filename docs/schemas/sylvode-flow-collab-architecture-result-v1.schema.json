@@ -3,12 +3,19 @@
   "$id": "https://openpr.dev/schemas/sylvode-flow-collab-architecture-result-v1.schema.json",
   "title": "Sylvode Flow Collaboration Architecture Result v1",
   "type": "object",
-  "required": ["schema_version", "release", "source_head", "generated_at", "cache", "cache_evidence", "gates", "passed"],
+  "required": ["schema_version", "release", "source_head", "generated_at", "numeric_budgets_check", "cache", "cache_evidence", "gates", "passed"],
   "properties": {
     "schema_version": { "const": "sylvode.flow.collab-architecture-result.v1" },
     "release": { "type": "string" },
     "source_head": { "type": "string" },
     "generated_at": { "type": "string", "format": "date-time" },
+    "numeric_budgets_check": {
+      "type": "object",
+      "required": ["load_harness"],
+      "properties": {
+        "load_harness": { "$ref": "#/$defs/load_harness_consumption" }
+      }
+    },
     "cache": {
       "type": "object",
       "additionalProperties": false,
@@ -37,5 +44,33 @@
     },
     "gates": { "type": "object" },
     "passed": { "type": "boolean" }
+  },
+  "$defs": {
+    "load_harness_consumption": {
+      "type": "object",
+      "required": [
+        "available", "official_environment", "official_environment_ok",
+        "budget_gate_passed", "parity_gate_passed", "violations"
+      ],
+      "properties": {
+        "available": { "type": "boolean" },
+        "execution_status": { "type": "string" },
+        "official_environment": {
+          "type": "object",
+          "required": ["required", "shared_database_measurements_accepted"],
+          "properties": {
+            "required": { "type": "string", "minLength": 1 },
+            "qualification_status": { "type": ["string", "null"] },
+            "reason_code": { "type": ["string", "null"] },
+            "active_other_clients_at_preflight": { "type": ["integer", "null"], "minimum": 0 },
+            "shared_database_measurements_accepted": { "const": false }
+          }
+        },
+        "official_environment_ok": { "type": "boolean" },
+        "budget_gate_passed": { "type": "boolean" },
+        "parity_gate_passed": { "type": "boolean" },
+        "violations": { "type": "array", "items": { "type": "string" } }
+      }
+    }
   }
 }

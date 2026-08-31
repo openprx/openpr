@@ -136,13 +136,17 @@ fi
 mkdir -p "$EVIDENCE_ROOT"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CARGO_OUTPUT_DIR="${CARGO_TARGET_DIR:-target}"
+if [[ "$CARGO_OUTPUT_DIR" != /* ]]; then
+  CARGO_OUTPUT_DIR="$REPO_ROOT/$CARGO_OUTPUT_DIR"
+fi
 
 echo "=== building api binary (cargo build -p api --bin api) ===" >&2
 ( cd "$REPO_ROOT" && cargo build -q -p api --bin api ) || {
   echo "FAIL: api binary failed to build" >&2
   exit 2
 }
-API_BIN="$REPO_ROOT/target/debug/api"
+API_BIN="$CARGO_OUTPUT_DIR/debug/api"
 if [[ ! -x "$API_BIN" ]]; then
   echo "FAIL: api binary not found after build: $API_BIN" >&2
   exit 2
