@@ -81,7 +81,9 @@ def main() -> int:
         page.goto(args.frontend_url + flow_object, wait_until="networkidle", timeout=30_000)
         page.wait_for_timeout(500)
         enabled_direct_has_navigator = page.get_by_text("Feature UI control", exact=True).count() > 0
-        enabled_direct_has_disabled = page.get_by_text(re.compile(r"Flow (is not enabled|未启用)"), exact=False).count() > 0
+        enabled_direct_has_disabled = page.get_by_text(
+            re.compile(r"(This workspace has not enabled Flow\.|该工作区尚未启用 Flow。)"), exact=True
+        ).count() > 0
         enabled_body_text = page.locator("body").inner_text()
         if not enabled_direct_has_navigator:
             violations.append("enabled positive control did not expose the live Flow direct URL")
@@ -103,7 +105,12 @@ def main() -> int:
         page.goto(args.frontend_url + flow_object, wait_until="networkidle", timeout=30_000)
         page.wait_for_timeout(500)
         disabled_direct_has_navigator = page.get_by_text("Feature UI control", exact=True).count() > 0
-        disabled_direct_has_safe_page = page.get_by_text(re.compile(r"Flow (is not enabled|未启用)"), exact=False).count() > 0
+        # Match the route guard's semantic explanatory copy, not a transient
+        # API-error toast carrying the same heading. The latter would let a
+        # broken guard pass.
+        disabled_direct_has_safe_page = page.get_by_text(
+            re.compile(r"(This workspace has not enabled Flow\.|该工作区尚未启用 Flow。)"), exact=True
+        ).count() > 0
         disabled_body_text = page.locator("body").inner_text()
         if disabled_nav_count != 0:
             violations.append(f"flow_enabled=false left {disabled_nav_count} Flow navigation entry/entries visible")
