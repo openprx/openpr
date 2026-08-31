@@ -39,7 +39,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode};
+use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, WriteState};
 use super::limits::{
     CONNECTIONS_PER_DOCUMENT_MAX, CONNECTIONS_PER_USER_MAX, CONNECTIONS_PER_WORKSPACE_MAX,
     PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, SLOW_CONSUMER_QUEUE_BYTES_MAX,
@@ -76,6 +76,10 @@ fn drain_rejected_frame(document_id: Uuid, signal: DrainSignal) -> Frame {
         update_id: None,
         code: RejectedCode::ServerDraining,
         recoverable: true,
+        // A drain is an admission decision about the *connection*, not about any one update: it
+        // is announced without a write having been attempted at all (`update_id` is `None` for
+        // the same reason), so nothing this session submitted can have been applied by it.
+        write_state: WriteState::NotApplied,
         details: Some(signal.details()),
         current_seq: None,
         current_frontier: None,

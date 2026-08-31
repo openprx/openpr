@@ -862,6 +862,20 @@ async fn execute_command_authorized(
                 "idempotency_key was already used for a different operation".to_string(),
             ));
         }
+        // Same event type, different target. `business_events`' idempotency index is
+        // *workspace*-scoped, so without this a key reused across two objects would return the
+        // first object's event id while reporting the second object's current state -- and
+        // silently apply nothing. `aggregate_id` is the document for content commands
+        // (`flow.content.accepted`) and the object for lifecycle ones.
+        let expected_aggregate = match kind {
+            CommandKind::Content(_) => document_id,
+            CommandKind::Lifecycle(_) => input.object_id,
+        };
+        if existing.aggregate_id != expected_aggregate.to_string() {
+            return Err(ApiError::Conflict(
+                "idempotency_key was already used for a different operation".to_string(),
+            ));
+        }
         let current = repository::fetch_object_view(&state.db, input.object_id)
             .await?
             .ok_or(ApiError::Internal)?;
@@ -1301,7 +1315,11 @@ async fn execute_content_command(
         .map_err(|err| map_collab_error(&err))?;
 
     let collab = runtime::runtime();
-    let update_id = Uuid::new_v4();
+    // Never `Uuid::new_v4()`: this function is re-entered from scratch on every REST retry of one
+    // logical command, so a freshly minted id here is a *different* id on every attempt, and the
+    // whole of `write::accept_update`'s replay dedup keys off it. See
+    // `write::replay_stable_update_id`.
+    let update_id = write::replay_stable_update_id(document_id, &input.idempotency_key);
 
     let outcome = write::accept_update(
         &state.db,
@@ -1316,6 +1334,12 @@ async fn execute_content_command(
             update_id,
             bytes: update_bytes,
             idempotency_key: Some(input.idempotency_key.clone()),
+            // Records this command's `flow.content.accepted` event under the caller's key, so the
+            // `find_idempotent_event` replay guard in `execute_command_authorized` covers content
+            // commands the way it already covers create/feature/lifecycle. Content commands were
+            // the one family that wrote `None` here, which made that guard unreachable for all six
+            // of them (`write::UpdateRequest::event_idempotency_key`).
+            event_idempotency_key: Some(input.idempotency_key.clone()),
             origin_client_id: Some(input.origin_client_id.clone()),
             message: input.message.clone(),
             actor_id: input.actor_id,
@@ -1532,7 +1556,7 @@ mod typed_error_mapping_tests {
 
     use super::{check_semantic_patch_json_bytes, map_collab_error, map_write_rejection};
     use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
-    use crate::flow::collab::frame::RejectedCode;
+    use crate::flow::collab::frame::{RejectedCode, WriteState};
     use crate::flow::collab::write::Rejected;
 
     fn rejected(code: RejectedCode, details: Option<Value>) -> Rejected {
@@ -1540,6 +1564,7 @@ mod typed_error_mapping_tests {
             update_id: None,
             code,
             recoverable: false,
+            write_state: WriteState::NotApplied,
             details,
             current_seq: None,
             current_frontier: None,

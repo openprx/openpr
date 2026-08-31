@@ -60,6 +60,33 @@ pub enum RejectedCode {
     ServerDraining,
 }
 
+/// `rejected.write_state` — the required "did the server change anything?" discriminant
+/// (`collab-protocol-v1.md`, 2026-08-30: "`recoverable` 只回答「能不能重试」，不回答「服务端状态改了
+/// 没有」，而这两件事必须分开").
+///
+/// It is deliberately *not* derivable from `code` + `recoverable`: `stale_frontier` and
+/// `server_draining{contention}` are both `{recoverable:true}` yet the first provably wrote
+/// nothing while the second historically could be returned after a commit had already landed.
+///
+/// Producers must classify every rejection point explicitly. [`Self::Unknown`] is not a default:
+/// the contract forbids using it to cover all uncertainty ("能确定未写的路径必须报 `not_applied`,
+/// 否则客户端会失去可以安全重编码的能力"), because a client that sees `unknown` is obliged to retry
+/// under the *same* `update_id` and must not re-encode — an obligation that costs it the ability
+/// to rebase, so it may only be imposed where the server genuinely cannot tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteState {
+    /// The server is certain no canonical state was written: the rejection happened before any
+    /// write was issued, or the transaction that issued them was rolled back. The client may
+    /// safely retry, including with re-encoded bytes and a fresh `update_id`.
+    NotApplied,
+    /// The rejection was produced at a point where the write may already have been durably
+    /// committed. The client must retry under the same `update_id` and must not re-encode the
+    /// bytes: a fresh id walks past both `(document_id,update_id)` and `(document_id,content_hash)`
+    /// and applies the same operations twice.
+    Unknown,
+}
+
 /// `server_draining.details.reason` (contract: "两者不得互换,缺失/未知 reason 违反协议").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,6 +178,8 @@ pub enum Frame {
         update_id: Option<Uuid>,
         code: RejectedCode,
         recoverable: bool,
+        /// Required (`collab-protocol-v1.md`): never skipped on the wire, never defaulted.
+        write_state: WriteState,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]

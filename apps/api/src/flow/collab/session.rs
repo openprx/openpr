@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::authz::{self, PermissionLevel};
 use super::bootstrap;
 use super::egress::{EgressSequencer, SeqDecision};
-use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate};
+use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate, WriteState};
 use super::limits::{
     CONNECTION_LIMIT_RETRY_AFTER_MS, FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND,
     OPEN_DOCUMENTS_PER_CONNECTION_MAX, PRESENCE_PAYLOAD_BYTES_MAX, PRESENCE_TTL_SECONDS_DEFAULT,
@@ -149,6 +149,9 @@ async fn reject_drain_and_close(socket: &mut WebSocket, document_id: Uuid, signa
             update_id: None,
             code: RejectedCode::ServerDraining,
             recoverable: true,
+            // Handshake-phase drain: the connection is refused before any `update` frame can
+            // even be read, so no write of this session's was attempted.
+            write_state: WriteState::NotApplied,
             details: Some(signal.details()),
             current_seq: None,
             current_frontier: None,
@@ -190,6 +193,11 @@ fn limit_exceeded_frame(
         update_id: None,
         code: RejectedCode::LimitExceeded,
         recoverable: true,
+        // Every producer of this frame refuses *before* the payload reaches the write path: an
+        // oversized/over-rate frame is rejected on the raw bytes before decode, and a registry
+        // admission refusal happens before the session is even registered. None of them can have
+        // written canonical state.
+        write_state: WriteState::NotApplied,
         details: Some(details),
         current_seq: None,
         current_frontier: None,
@@ -360,6 +368,13 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
         .await;
 }
 
+/// The bare `rejected` frame for every *pre-write* refusal this module produces: handshake and
+/// authorization failures, protocol/decode errors, and payload validation that runs before
+/// `write::accept_update` is ever called. All of them are
+/// [`WriteState::NotApplied`](super::frame::WriteState::NotApplied) by construction, which is why
+/// this constructor pins the field rather than taking it as a parameter — a rejection produced
+/// *after* a write attempt must not be built here at all, it must carry the `write_state` the
+/// write path itself computed (see [`write::Rejected`](super::write::Rejected)).
 const fn rejected_frame(document_id: Uuid, code: RejectedCode, recoverable: bool, update_id: Option<Uuid>) -> Frame {
     Frame::Rejected {
         protocol_version: PROTOCOL_VERSION,
@@ -367,6 +382,7 @@ const fn rejected_frame(document_id: Uuid, code: RejectedCode, recoverable: bool
         update_id,
         code,
         recoverable,
+        write_state: WriteState::NotApplied,
         details: None,
         current_seq: None,
         current_frontier: None,
@@ -973,6 +989,11 @@ async fn handle_client_frame(
                     update_id,
                     bytes: raw_bytes,
                     idempotency_key,
+                    // Not the client's frame key: see `write::UpdateRequest::event_idempotency_key`
+                    // for why the WebSocket surface must not record a free-form, per-document key
+                    // in the workspace-scoped `business_events` index. This surface's replay key is
+                    // `update_id`, which the protocol already requires a retrying client to reuse.
+                    event_idempotency_key: None,
                     origin_client_id: Some(origin_client_id.to_string()),
                     message,
                     actor_id,
@@ -1030,6 +1051,9 @@ async fn handle_client_frame(
                             update_id: rejected.update_id,
                             code: rejected.code,
                             recoverable: rejected.recoverable,
+                            // Never re-derived here: only the write path knows how far this
+                            // update got before it was refused.
+                            write_state: rejected.write_state,
                             details: rejected.details,
                             current_seq: rejected.current_seq,
                             current_frontier: rejected.current_frontier.map(|f| BASE64.encode(f)),
@@ -1048,6 +1072,12 @@ async fn handle_client_frame(
                             update_id: Some(update_id),
                             code: RejectedCode::ServerDraining,
                             recoverable: true,
+                            // `write::accept_update` only returns `Err` from the phases that run
+                            // *before* its locked phase opens a transaction (the dedup lookup,
+                            // the tail-stats read, hydrate/apply); every failure the locked phase
+                            // itself can observe is folded into an `Ok(Rejected)` carrying its own
+                            // `write_state`. So an `Err` here provably wrote nothing.
+                            write_state: WriteState::NotApplied,
                             details: Some(serde_json::json!({"reason": "contention", "retry_after_ms": 500})),
                             current_seq: None,
                             current_frontier: None,
@@ -2936,6 +2966,7 @@ mod database_tests {
                     update_id: Uuid::new_v4(),
                     bytes,
                     idempotency_key: None,
+                    event_idempotency_key: None,
                     origin_client_id: Some("gap-test".to_string()),
                     message: None,
                     actor_id,
