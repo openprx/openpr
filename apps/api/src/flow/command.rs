@@ -204,6 +204,47 @@ async fn record_cross_workspace_relation_and_fail_closed(
     ApiError::BadRequest("invalid_update".to_string())
 }
 
+/// Resolves an already-committed `flow.object.created` event for `idempotency_key` into the
+/// [`AcceptedChange`] a replay of that creation must return — the *canonical* object named by
+/// `business_events.aggregate_id`, never a caller- or attempt-local id.
+///
+/// Used twice by [`create_object`], on purpose: once as the ordinary pre-transaction replay guard,
+/// and once after the transaction's own `business_events` insert loses the unique-index race. Both
+/// are the same question ("has this key already created an object?") asked at the only two points
+/// where it can be answered, so they must produce the same answer rather than two near-copies that
+/// can drift.
+///
+/// `Ok(None)` means the key is unused and the caller should go ahead and create.
+///
+/// # Errors
+/// `Conflict` if the key was already used for a different operation or to create an object with a
+/// different title; `Internal` if the event names an object that cannot be read back.
+async fn replay_created_object(
+    state: &AppState,
+    workspace_id: Uuid,
+    idempotency_key: &str,
+    title: &str,
+) -> Result<Option<AcceptedChange>, ApiError> {
+    let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, idempotency_key).await? else {
+        return Ok(None);
+    };
+    if existing.event_type != "flow.object.created" {
+        return Err(ApiError::Conflict(
+            "idempotency_key was already used for a different operation".to_string(),
+        ));
+    }
+    let object_id = Uuid::parse_str(&existing.aggregate_id).map_err(|_| ApiError::Internal)?;
+    let view = repository::fetch_object_view(&state.db, object_id)
+        .await?
+        .ok_or(ApiError::Internal)?;
+    if view.projection_title != title {
+        return Err(ApiError::Conflict(
+            "idempotency_key was already used to create an object with a different title".to_string(),
+        ));
+    }
+    Ok(Some(accepted_change_from_row(view, existing.id)))
+}
+
 pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result<AcceptedChange, ApiError> {
     runtime::runtime().ensure_workspace_accepting(input.workspace_id)?;
     validate(&input)?;
@@ -212,24 +253,8 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     // Idempotent replay: a caller retrying the exact same `idempotency_key` gets back the
     // original result instead of a unique-violation `Conflict`
     // (`business_events_idempotency` is unique on `(workspace_id, idempotency_key)`).
-    if let Some(existing) =
-        repository::find_idempotent_event(&state.db, input.workspace_id, &input.idempotency_key).await?
-    {
-        if existing.event_type != "flow.object.created" {
-            return Err(ApiError::Conflict(
-                "idempotency_key was already used for a different operation".to_string(),
-            ));
-        }
-        let object_id = Uuid::parse_str(&existing.aggregate_id).map_err(|_| ApiError::Internal)?;
-        let view = repository::fetch_object_view(&state.db, object_id)
-            .await?
-            .ok_or(ApiError::Internal)?;
-        if view.projection_title != title {
-            return Err(ApiError::Conflict(
-                "idempotency_key was already used to create an object with a different title".to_string(),
-            ));
-        }
-        return Ok(accepted_change_from_row(view, existing.id));
+    if let Some(replay) = replay_created_object(state, input.workspace_id, &input.idempotency_key, &title).await? {
+        return Ok(replay);
     }
 
     if let Some(project_id) = input.project_id {
@@ -342,7 +367,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     .await?;
 
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
-    let event_id = insert_flow_event(
+    let outcome = insert_flow_event(
         &tx,
         BusinessEventInput {
             workspace_id: input.workspace_id,
@@ -368,8 +393,34 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             accepted_seq: None,
         }),
     )
-    .await?
-    .event_id;
+    .await?;
+
+    // Race lost. `insert_flow_event` resolves its `ON CONFLICT ... DO NOTHING` by *reading back*
+    // the winner's row rather than erroring, so `was_new == false` means a concurrent request
+    // with this same key already committed the whole aggregate — and the object/document/
+    // projection rows staged above are now a second, unreferenced aggregate for one logical
+    // creation. Committing them would answer the caller with a `object_id` that no
+    // `business_events` row names and that no replay of this key will ever return again: a
+    // phantom success. The pre-transaction guard above cannot cover this, because it necessarily
+    // runs before the winner commits; the database's own unique index is the only point at which
+    // the race is decided, so the answer has to be recovered here.
+    //
+    // Roll back, then re-read the winner's committed aggregate and return *that*. This is not a
+    // retry: the caller's create already happened (under the other request), so the correct
+    // response for this request is the canonical object, produced inside this same call.
+    if !outcome.was_new {
+        // A rollback failure means the connection died with the transaction still open; the
+        // server has no way to make the staged rows visible in that case either, so the caller's
+        // answer is still the winner's committed object.
+        let _ = tx.rollback().await;
+        return replay_created_object(state, input.workspace_id, &input.idempotency_key, &title)
+            .await?
+            // `was_new == false` is only reachable once the conflicting row is committed and
+            // visible (`ON CONFLICT DO NOTHING` waits out an in-flight speculative insertion
+            // before deciding), so the event this just conflicted with must be readable here.
+            .ok_or(ApiError::Internal);
+    }
+    let event_id = outcome.event_id;
 
     tx.commit().await?;
 
@@ -1276,6 +1327,36 @@ fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
     }
 }
 
+/// Resolves an already-committed `flow.content.accepted` event for `idempotency_key` on
+/// `document_id` into the [`AcceptedChange`] a replay of that content write must return.
+///
+/// `Ok(None)` means no such event exists — the key is unused, or it belongs to a different
+/// operation or a different document — and the caller must keep its own error rather than
+/// substitute someone else's result. The cross-target case is already refused as a `Conflict` by
+/// [`execute_command_authorized`]'s guard whenever it is visible to it, so returning `None`
+/// here leaves that decision where it belongs instead of duplicating it.
+///
+/// # Errors
+/// `Internal` if the event exists but the object it belongs to cannot be read back.
+async fn replay_content_command(
+    state: &AppState,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    object_id: Uuid,
+    idempotency_key: &str,
+) -> Result<Option<AcceptedChange>, ApiError> {
+    let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, idempotency_key).await? else {
+        return Ok(None);
+    };
+    if existing.event_type != "flow.content.accepted" || existing.aggregate_id != document_id.to_string() {
+        return Ok(None);
+    }
+    let view = repository::fetch_object_view(&state.db, object_id)
+        .await?
+        .ok_or(ApiError::Internal)?;
+    Ok(Some(accepted_change_from_row(view, existing.id)))
+}
+
 /// Builds the CRDT update bytes for one content command (isolated fork, outside any lock — matches
 /// `write::hydrate_and_apply`'s own discipline for exactly this reason: neither path may hold a
 /// lock across a CRDT apply), then submits them through [`write::accept_update`] — the identical
@@ -1309,7 +1390,35 @@ async fn execute_content_command(
             .map_err(|err| map_collab_error(&err))?;
     }
     let base_frontier = engine.frontier();
-    apply_content_command(&mut engine, kind, &input.payload)?;
+    if let Err(err) = apply_content_command(&mut engine, kind, &input.payload) {
+        // The concurrent same-key double submit `rest-api-v1.md` registers as a known residual
+        // window: this request's `find_idempotent_event` guard (in `execute_command_authorized`)
+        // ran *before* the other request committed and so missed, while the `bootstrap::load`
+        // above ran *after* it and already sees that request's effect — so `insert_block` fails
+        // `DuplicateNode` here, before `update_id` deduplication in `write::accept_update` is ever
+        // reached, and the caller is told `invalid_update` for a command that in fact succeeded.
+        //
+        // Asking the guard's question again, now, closes it: the effect that made the apply fail
+        // was read out of committed state, and `write::stage_locked_writes` writes the
+        // `flow.content.accepted` event in the very same transaction as the `collab_updates` row
+        // that carries it, so if that effect is visible its event under this key is visible too.
+        // The recovery is therefore decided by committed rows, not by timing. It only fires when
+        // an event already exists under *this* caller's key on *this* document; a `DuplicateNode`
+        // caused by anything else (a block some other key created, a malformed payload) finds no
+        // such event and still fails, unchanged.
+        if let Some(replay) = replay_content_command(
+            state,
+            workspace_id,
+            document_id,
+            input.object_id,
+            &input.idempotency_key,
+        )
+        .await?
+        {
+            return Ok(replay);
+        }
+        return Err(err);
+    }
     let update_bytes = engine
         .export_from(&base_frontier)
         .map_err(|err| map_collab_error(&err))?;
@@ -2275,6 +2384,458 @@ mod database_tests {
             err.kind(),
             ApiErrorKind::InvalidUpdate,
             "a cyclic parent chain must fail closed as invalid_update, got {err:?}"
+        );
+
+        scratch.drop_self().await;
+    }
+}
+
+// ---- Real-database idempotency-race tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
+//
+// Same scratch-database convention as `flow::collab::write::database_tests`: own throwaway
+// database per run, migrated from `migrations/*.sql` on disk, dropped on the way out.
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::too_many_lines
+)]
+mod idempotency_race_database_tests {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    use platform::{
+        app::AppState,
+        config::{AppConfig, Secret},
+    };
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{
+        ContentCommandType, CreateObjectInput, ExecuteCommandInput, create_object, execute_command,
+        execute_content_command,
+    };
+    use crate::flow::collab::authz;
+    use crate::flow::repository;
+
+    const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    struct Scratch {
+        db: DatabaseConnection,
+        name: String,
+        admin_url: String,
+    }
+
+    impl Scratch {
+        async fn drop_self(self) {
+            let Self { db, name, admin_url } = self;
+            drop(db);
+            let Ok(admin) = Database::connect(&admin_url).await else {
+                return;
+            };
+            let _ = admin
+                .execute_unprepared(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .await;
+        }
+    }
+
+    async fn scratch(label: &str) -> Option<Scratch> {
+        let admin_url = std::env::var(TEST_DATABASE_URL_ENV).ok()?;
+        let admin = Database::connect(&admin_url)
+            .await
+            .unwrap_or_else(|err| panic!("{TEST_DATABASE_URL_ENV} is set but unusable: {err}"));
+
+        let name = format!("openpr_flow_idem_race_{label}");
+        let quoted = format!("\"{name}\"");
+        admin
+            .execute_unprepared(&format!("DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
+            .await
+            .unwrap_or_else(|err| panic!("could not reset scratch database {name}: {err}"));
+        admin
+            .execute_unprepared(&format!("CREATE DATABASE {quoted}"))
+            .await
+            .unwrap_or_else(|err| panic!("could not create scratch database {name}: {err}"));
+
+        let (prefix, _) = admin_url.rsplit_once('/')?;
+        let url = format!("{prefix}/{name}");
+        // Every racing request below holds one connection for the whole of its transaction --
+        // including the wait `INSERT ... ON CONFLICT DO NOTHING` performs on the winner's
+        // uncommitted speculative insertion -- so the pool has to be wider than the race.
+        let mut opts = ConnectOptions::new(url);
+        opts.max_connections(24).connect_timeout(Duration::from_secs(30));
+        let db = Database::connect(opts)
+            .await
+            .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
+
+        migrate(&db).await;
+
+        Some(Scratch { db, name, admin_url })
+    }
+
+    async fn migrate(db: &DatabaseConnection) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .expect("migrations directory is readable")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "sql"))
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no migration file was found in {dir}");
+        for path in files {
+            let sql = std::fs::read_to_string(&path).expect("a migration file is readable");
+            db.execute_unprepared(&sql)
+                .await
+                .unwrap_or_else(|err| panic!("applying {} failed: {err}", path.display()));
+        }
+    }
+
+    macro_rules! scratch_or_skip {
+        ($label:expr) => {
+            match scratch($label).await {
+                Some(scratch) => scratch,
+                None => {
+                    eprintln!("skipped: {TEST_DATABASE_URL_ENV} is not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    fn state_for(db: DatabaseConnection) -> AppState {
+        AppState {
+            cfg: AppConfig {
+                app_name: "flow-idem-race-test".to_string(),
+                bind_addr: "127.0.0.1:0".to_string(),
+                database_url: Secret::new("postgres://unused/unused"),
+                jwt_secret: Secret::new("flow-idem-race-test-secret"),
+                jwt_access_ttl_seconds: 900,
+                jwt_refresh_ttl_seconds: 3600,
+                default_author_id: None,
+                allow_insecure_cookies: false,
+                collab_allowed_origins: Vec::new(),
+            },
+            db,
+        }
+    }
+
+    async fn exec(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) {
+        state
+            .db
+            .execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .unwrap_or_else(|err| panic!("setup statement failed: {err}"));
+    }
+
+    async fn seed_workspace(state: &AppState) -> (Uuid, Uuid) {
+        let workspace_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        exec(
+            state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'test', 'user', true)",
+            vec![owner_id.into(), format!("{owner_id}@flow-idem.test").into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'flow idem race test', $3)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO flow_workspace_settings (workspace_id, flow_enabled) VALUES ($1, true)",
+            vec![workspace_id.into()],
+        )
+        .await;
+        (workspace_id, owner_id)
+    }
+
+    async fn count(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .one(&state.db)
+            .await
+            .expect("count query runs")
+            .expect("count query returns a row")
+            .n
+    }
+
+    /// Eight concurrent creations under one `idempotency_key`. The database layer was already
+    /// clean before the fix -- exactly one `business_events` row, one aggregate reachable *through*
+    /// that row -- and the defect lived entirely in the answers: the losers of the unique-index
+    /// race each committed and returned their own attempt-local `object_id`, so one logical
+    /// creation reported several different objects, only one of which the key will ever replay to.
+    ///
+    /// The assertions therefore check the *responses* against the canonical row, and then check
+    /// that the workspace holds exactly one object at all -- the second half is what makes a
+    /// returned id "real" rather than merely equal to its siblings.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_creates_under_one_idempotency_key_all_answer_with_the_one_canonical_object() {
+        let scratch = scratch_or_skip!("create_phantom_id");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+
+        const RACERS: usize = 8;
+        let key = format!("phantom-race-{}", Uuid::new_v4());
+        let title = "one canonical object".to_string();
+
+        let mut handles = Vec::with_capacity(RACERS);
+        for _ in 0..RACERS {
+            let state = state.clone();
+            let key = key.clone();
+            let title = title.clone();
+            handles.push(tokio::spawn(async move {
+                create_object(
+                    &state,
+                    CreateObjectInput {
+                        workspace_id,
+                        actor_id: owner_id,
+                        object_type: "page".to_string(),
+                        project_id: None,
+                        parent_object_id: None,
+                        title,
+                        idempotency_key: key,
+                        message: None,
+                    },
+                )
+                .await
+            }));
+        }
+
+        let mut object_ids = BTreeSet::new();
+        let mut event_ids = BTreeSet::new();
+        for handle in handles {
+            let accepted = handle
+                .await
+                .expect("racing create task does not panic")
+                .expect("every racer under one idempotency key must succeed");
+            object_ids.insert(accepted.object.id);
+            event_ids.insert(accepted.event_id);
+            assert_eq!(accepted.affected_object_ids, vec![accepted.object.id]);
+        }
+
+        #[derive(FromQueryResult)]
+        struct EventRow {
+            id: Uuid,
+            aggregate_id: String,
+        }
+        let canonical = EventRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, aggregate_id FROM business_events \
+             WHERE workspace_id = $1 AND idempotency_key = $2",
+            vec![workspace_id.into(), key.clone().into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("canonical event query runs");
+        assert_eq!(canonical.len(), 1, "one key must record exactly one creation event");
+        let canonical_object_id =
+            Uuid::parse_str(&canonical[0].aggregate_id).expect("the event names a UUID aggregate");
+
+        assert_eq!(
+            object_ids.iter().copied().collect::<Vec<_>>(),
+            vec![canonical_object_id],
+            "every successful response must identify the one canonical object; \
+             a response carrying any other id is a phantom success"
+        );
+        assert_eq!(
+            event_ids.iter().copied().collect::<Vec<_>>(),
+            vec![canonical[0].id],
+            "every successful response must report the one committed event"
+        );
+
+        // The returned id is not merely equal across responses -- it resolves to a committed,
+        // readable object with the requested title.
+        let view = repository::fetch_object_view(&state.db, canonical_object_id)
+            .await
+            .expect("object view query runs")
+            .expect("the id every response returned must resolve to a committed object");
+        assert_eq!(view.id, canonical_object_id);
+        assert_eq!(view.projection_title, title);
+
+        // And no loser left a second, unreferenced aggregate behind: the counts here are scoped to
+        // the workspace, not joined through `business_events`, so an orphaned object *is* visible.
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            )
+            .await,
+            1,
+            "the losing transactions must leave no orphaned flow_objects row behind"
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) AS n FROM collab_documents cd \
+                 JOIN flow_objects fo ON fo.id = cd.object_id WHERE fo.workspace_id = $1",
+                vec![workspace_id.into()],
+            )
+            .await,
+            1,
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) AS n FROM flow_object_projections p \
+                 JOIN flow_objects fo ON fo.id = p.object_id WHERE fo.workspace_id = $1",
+                vec![workspace_id.into()],
+            )
+            .await,
+            1,
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) AS n FROM event_dispatch WHERE event_id = $1",
+                vec![canonical[0].id.into()],
+            )
+            .await,
+            1,
+            "exactly one dispatch row for the one committed creation event"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `rest-api-v1.md`'s registered residual window, reproduced deterministically: a content
+    /// command whose replay guard missed (here: bypassed, which is exactly what a guard read
+    /// before the winner's COMMIT observes) but whose `bootstrap::load` already sees the winner's
+    /// committed block. `apply_content_command` then fails `DuplicateNode` before `update_id`
+    /// deduplication is ever reached.
+    ///
+    /// The window's defining state -- winner committed, this request's guard blind to it -- is
+    /// fully determined by committed rows, so driving `execute_content_command` directly
+    /// reproduces it without depending on an interleaving that cannot be scheduled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_content_command_racing_its_own_committed_same_key_write_replays_it() {
+        let scratch = scratch_or_skip!("content_residual_window");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+
+        let created = create_object(
+            &state,
+            CreateObjectInput {
+                workspace_id,
+                actor_id: owner_id,
+                object_type: "page".to_string(),
+                project_id: None,
+                parent_object_id: None,
+                title: "residual window page".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+        .expect("object creation succeeds");
+        let object_id = created.object.id;
+        let document_id = created.object.document_id;
+
+        let key = format!("residual-{}", Uuid::new_v4());
+        let payload = json!({ "block_id": "block-under-race", "text": "hello" });
+        let input = |key: &str| ExecuteCommandInput {
+            object_id,
+            actor_id: owner_id,
+            principal_kind: "user".to_string(),
+            role: "owner".to_string(),
+            command_type: "insert_block".to_string(),
+            payload: payload.clone(),
+            expected_frontier: None,
+            idempotency_key: key.to_string(),
+            message: None,
+            origin_client_id: "residual-window-test".to_string(),
+        };
+
+        // The winner: a complete, committed `insert_block` under `key`.
+        let winner = execute_command(&state, input(&key))
+            .await
+            .expect("the winning insert_block commits");
+        assert_eq!(winner.accepted_seq, 1);
+
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        // The loser, entering the write path with a guard read that predates that commit.
+        let loser = execute_content_command(
+            &state,
+            &input(&key),
+            workspace_id,
+            document_id,
+            checked_epoch,
+            ContentCommandType::InsertBlock,
+        )
+        .await
+        .expect(
+            "a same-key content command whose apply collides with its own already-committed \
+             effect must replay that effect, not fail invalid_update",
+        );
+
+        assert_eq!(
+            loser.event_id, winner.event_id,
+            "the replay must report the committed event, not a new one"
+        );
+        assert_eq!(loser.object.id, object_id);
+        assert_eq!(
+            loser.accepted_seq, winner.accepted_seq,
+            "the replay must report the committed head, not advance it"
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1",
+                vec![document_id.into()],
+            )
+            .await,
+            1,
+            "the replay must not have written a second update"
+        );
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) AS n FROM business_events \
+                 WHERE workspace_id = $1 AND idempotency_key = $2",
+                vec![workspace_id.into(), key.clone().into()],
+            )
+            .await,
+            1,
+        );
+
+        // A `DuplicateNode` that is *not* this caller's own committed write still fails: same
+        // block id, a key that never wrote anything.
+        let unrelated = execute_content_command(
+            &state,
+            &input("residual-unused-key"),
+            workspace_id,
+            document_id,
+            checked_epoch,
+            ContentCommandType::InsertBlock,
+        )
+        .await;
+        let err = unrelated.expect_err("a duplicate block under an unused key is still invalid_update");
+        assert!(
+            format!("{err:?}").contains("duplicate node"),
+            "expected the original duplicate-node rejection, got {err:?}"
         );
 
         scratch.drop_self().await;
