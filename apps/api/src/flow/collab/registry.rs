@@ -175,6 +175,18 @@ pub struct PresenceEntry {
     expires_at: Instant,
 }
 
+/// One subscription's acknowledged position (`collab-protocol-v1.md`'s `ack document_id, seq,
+/// frontier`). Recorded per session, never per document: two sessions on the same document
+/// acknowledge independently, and `collab-protocol-v1.md` makes the client's `last_applied_seq`
+/// the thing an `ack` reports ("`seq<=last_applied_seq` 是幂等重复,忽略但可重发 ack").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckFrontier {
+    pub seq: i64,
+    /// Base64 of the client's frontier at `seq`, exactly as it arrived on the wire — the server
+    /// never decodes or interprets it in v0.5, it only retains the last acknowledged one.
+    pub frontier: String,
+}
+
 /// Per-session connection metadata (`limits-v1.md`'s `user_connections`/`document_connections`/
 /// `workspace_connections` accounting dimensions), keyed by `session_id` so
 /// [`SessionRegistry::try_register`]/[`SessionRegistry::unregister`] can maintain it without a
@@ -183,6 +195,8 @@ struct ConnMeta {
     document_id: Uuid,
     user_id: Uuid,
     workspace_id: Uuid,
+    /// The highest `ack` this session has sent, or `None` until it sends its first one.
+    acked: Option<AckFrontier>,
 }
 
 /// Which `limits-v1.md` connection ceiling a [`SessionRegistry::try_register`] admission refused.
@@ -313,6 +327,7 @@ impl SessionRegistry {
                 document_id,
                 user_id,
                 workspace_id,
+                acked: None,
             },
         );
         drop(connections);
@@ -456,6 +471,56 @@ impl SessionRegistry {
     #[must_use]
     pub fn session_count(&self, document_id: Uuid) -> usize {
         self.sessions.lock().get(&document_id).map_or(0, HashMap::len)
+    }
+
+    /// Records one `ack` frame's `(seq, frontier)` for `session_id`.
+    ///
+    /// Monotonic by construction: `collab-protocol-v1.md` states an `ack` at or below what the
+    /// client already acknowledged is an idempotent repeat the server ignores ("`seq<=
+    /// last_applied_seq` 是幂等重复,忽略但可重发 ack"), so a regression must never move the recorded
+    /// frontier backwards — otherwise a duplicate ack replayed after a later one would rewind a
+    /// position that v0.8 retention/compaction is meant to read.
+    ///
+    /// Returns whether the recorded frontier actually advanced (`false` for a repeat, and for an
+    /// unknown `session_id` — a session already unregistered).
+    #[allow(clippy::significant_drop_tightening)] // guard held across the read-then-update by design
+    pub fn record_ack(&self, session_id: Uuid, seq: i64, frontier: String) -> bool {
+        let mut connections = self.connections.lock();
+        let Some(meta) = connections.get_mut(&session_id) else {
+            return false;
+        };
+        if meta.acked.as_ref().is_some_and(|current| seq <= current.seq) {
+            return false;
+        }
+        meta.acked = Some(AckFrontier { seq, frontier });
+        true
+    }
+
+    /// The last position `session_id` acknowledged, or `None` if it has acknowledged nothing (or
+    /// is no longer registered).
+    #[must_use]
+    pub fn acked(&self, session_id: Uuid) -> Option<AckFrontier> {
+        self.connections.lock().get(&session_id)?.acked.clone()
+    }
+
+    /// The live presence entries for `document_id`, excluding `exclude` (the session that is about
+    /// to receive them), with expired entries swept first so a joining session is never handed a
+    /// cursor the contract already required to have disappeared.
+    ///
+    /// This is the "join" half of presence fan-out: `broadcast` only reaches sessions that are
+    /// already connected when a `presence` frame arrives, so without this a session joining a
+    /// document sees nobody until each peer's next refresh. Read-only — it never inserts, never
+    /// refreshes an expiry, and therefore cannot be used by a joining session to keep another
+    /// session's entry alive.
+    #[must_use]
+    pub fn presence_snapshot(&self, document_id: Uuid, exclude: Option<Uuid>) -> Vec<(Uuid, Value)> {
+        let mut presence = self.presence.lock();
+        Self::expire_presence(&mut presence);
+        presence
+            .iter()
+            .filter(|((did, sid), _)| *did == document_id && Some(*sid) != exclude)
+            .map(|((_, sid), entry)| (*sid, entry.payload.clone()))
+            .collect()
     }
 
     fn expire_presence(presence: &mut HashMap<(Uuid, Uuid), PresenceEntry>) {
@@ -795,6 +860,122 @@ mod tests {
             registered.receiver.try_recv().is_err(),
             "a closing session receives nothing further"
         );
+    }
+
+    /// The "不得无界缓冲" half of `limits-v1.md`'s slow-consumer rule, stated as a bound rather than
+    /// as an event: however many frames are broadcast at a session that has stopped reading, the
+    /// outbound channel must never hold more than `slow_consumer_queue_frames_max` of them. The
+    /// force-close assertions above stop at the boundary; this one keeps pushing well past it, so
+    /// removing the ceiling shows up as the queue length itself growing without bound rather than
+    /// only as a missing `Close`.
+    #[test]
+    fn a_stalled_sessions_outbound_queue_never_grows_past_the_frame_ceiling_however_much_is_pushed() {
+        const PUSHED: u64 = 1_000;
+
+        let registry = SessionRegistry::new();
+        let document_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let mut registered = registry
+            .try_register(document_id, Uuid::new_v4(), Uuid::new_v4(), session_id)
+            .expect("registers");
+
+        // Never drained: the session's consumer is stalled for the whole burst.
+        for i in 0..PUSHED {
+            registry.broadcast(document_id, &ping(&i.to_string()), None);
+        }
+
+        let mut queued = 0u64;
+        while let Ok(event) = registered.receiver.try_recv() {
+            if matches!(event, OutboundEvent::Frame(..)) {
+                queued += 1;
+            }
+        }
+        assert!(
+            queued <= SLOW_CONSUMER_QUEUE_FRAMES_MAX,
+            "a stalled session buffered {queued} frames out of {PUSHED} pushed; the ceiling is {SLOW_CONSUMER_QUEUE_FRAMES_MAX}"
+        );
+    }
+
+    /// `collab-protocol-v1.md`: "`seq<=last_applied_seq` 是幂等重复,忽略但可重发 ack". A replayed
+    /// older ack arriving after a newer one -- the exact shape a client's reconnect outbox
+    /// produces -- must not rewind the recorded position.
+    #[test]
+    fn ack_advances_only_forwards_and_a_replayed_older_ack_never_rewinds_it() {
+        let registry = SessionRegistry::new();
+        let document_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let unknown_session = Uuid::new_v4();
+        let _registered = registry
+            .try_register(document_id, Uuid::new_v4(), Uuid::new_v4(), session_id)
+            .expect("registers");
+
+        assert!(registry.acked(session_id).is_none(), "nothing is acknowledged yet");
+        assert!(registry.record_ack(session_id, 4, "frontier-4".to_string()));
+        assert!(registry.record_ack(session_id, 9, "frontier-9".to_string()));
+
+        assert!(
+            !registry.record_ack(session_id, 4, "frontier-4-replayed".to_string()),
+            "a replayed older ack must be reported as a no-op"
+        );
+        assert!(
+            !registry.record_ack(session_id, 9, "frontier-9-again".to_string()),
+            "re-acking the current position is an idempotent repeat, not an advance"
+        );
+        let recorded = registry.acked(session_id).expect("an ack is recorded");
+        assert_eq!(recorded.seq, 9);
+        assert_eq!(
+            recorded.frontier, "frontier-9",
+            "the payload of a rewinding ack must not be stored either"
+        );
+
+        assert!(
+            !registry.record_ack(unknown_session, 1, "orphan".to_string()),
+            "an ack for a session that is no longer registered is dropped"
+        );
+        assert!(registry.acked(unknown_session).is_none());
+    }
+
+    /// `presence_snapshot` is the "join" half of presence fan-out. It must exclude the joining
+    /// session itself, be scoped to one document, and never hand out an entry whose TTL has
+    /// already lapsed -- the contract requires a crashed peer's cursor to be gone at 30 seconds
+    /// whether or not anyone happened to call `presence_count` in the meantime.
+    #[test]
+    fn presence_snapshot_is_document_scoped_excludes_the_joiner_and_omits_expired_entries() {
+        let registry = SessionRegistry::new();
+        let document_id = Uuid::new_v4();
+        let other_document = Uuid::new_v4();
+        let peer = Uuid::new_v4();
+        let joiner = Uuid::new_v4();
+        let elsewhere = Uuid::new_v4();
+        let expiring = Uuid::new_v4();
+
+        registry
+            .upsert_presence(document_id, peer, json!({"cursor": 1}), Duration::from_secs(30))
+            .expect("peer presence is accepted");
+        registry
+            .upsert_presence(document_id, joiner, json!({"cursor": 2}), Duration::from_secs(30))
+            .expect("joiner presence is accepted");
+        registry
+            .upsert_presence(other_document, elsewhere, json!({"cursor": 3}), Duration::from_secs(30))
+            .expect("another document's presence is accepted");
+        registry
+            .upsert_presence(document_id, expiring, json!({"cursor": 4}), Duration::from_millis(1))
+            .expect("expiring presence is accepted");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let snapshot = registry.presence_snapshot(document_id, Some(joiner));
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "only the live peer on this document may be handed to the joiner, got {snapshot:?}"
+        );
+        assert_eq!(snapshot[0].0, peer);
+        assert_eq!(snapshot[0].1["cursor"], 1);
+
+        // Reading the snapshot must not have refreshed anything: the expired entry is gone for
+        // good, and the joiner's own entry is still its own.
+        assert_eq!(registry.presence_count(document_id), 2);
+        assert_eq!(registry.presence_count(other_document), 1);
     }
 
     #[test]

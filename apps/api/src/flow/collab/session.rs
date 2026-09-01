@@ -31,6 +31,29 @@ use super::write::{self, AcceptOutcome, UpdateRequest};
 use crate::error::ApiErrorKind;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connection may go without producing an inbound frame before the server sends its
+/// own `ping`, and — once that `ping` is outstanding — how long it then waits for any inbound
+/// frame before hanging up (`collab-protocol-v1.md`'s `ping/pong nonce/time` heartbeat).
+///
+/// **Not a `limits-v1.md` row**: that contract freezes no heartbeat interval or pong deadline (the
+/// same status [`super::limits::CONNECTION_LIMIT_RETRY_AFTER_MS`] and
+/// [`super::limits::PROCESS_DRAIN_GRACE_MS`] carry, and recorded as a contract to-do rather than
+/// invented here). The *number* is taken verbatim from the one frozen value that already defines
+/// this system's crash-detection budget, [`PRESENCE_TTL_SECONDS_MAX`] = 30 s — `limits-v1.md`
+/// justifies that value as "使 crash 后 cursor/selection 最迟 30 秒消失". A dead peer's presence
+/// entry is therefore already gone by the time the first heartbeat fires, and the socket itself is
+/// reclaimed within one further interval; picking anything larger would leave sockets outliving
+/// the ephemeral state the contract says they own, and anything smaller would be a number this
+/// package made up.
+const HEARTBEAT_IDLE: Duration = Duration::from_secs(PRESENCE_TTL_SECONDS_MAX as u64);
+
+/// RFC 6455's registered "going away" code, used when a peer stops answering the heartbeat. Not an
+/// application close code: `error-mapping-v1.md` freezes the 44xx range for contract rejections,
+/// and an unresponsive transport is not one of them — nothing was rejected, the peer simply
+/// stopped being reachable.
+const CLOSE_GOING_AWAY: u16 = 1001;
+
 /// A close code this module owns: policy violation, matching RFC 6455's registered meaning
 /// closely enough (protocol error / auth failure at handshake) without colliding with the
 /// contract's own frozen 4410 drain code. Used as [`ws_close_code_for`]'s fallback for every
@@ -308,6 +331,71 @@ impl RateLimiter {
     }
 }
 
+/// What [`Heartbeat::evaluate_at`] wants the session loop to do at this instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatAction {
+    /// The peer has been heard from recently enough, or an outstanding `ping` has not yet timed
+    /// out. Do nothing.
+    Idle,
+    /// The connection has been silent for a full [`HEARTBEAT_IDLE`]. Send a server `ping`; the
+    /// peer's `pong` (or literally any other inbound frame) clears it.
+    SendPing,
+    /// A `ping` has been outstanding for a full [`HEARTBEAT_IDLE`] with no inbound frame at all.
+    /// The peer is gone; close at [`CLOSE_GOING_AWAY`].
+    Close,
+}
+
+/// The server half of `collab-protocol-v1.md`'s `ping/pong` heartbeat: liveness detection for a
+/// peer that has stopped sending anything at all (a half-open TCP connection produces no `Close`
+/// frame and no read error, so the session loop would otherwise hold the connection slot — and the
+/// `limits-v1.md` `user_connections`/`document_connections`/`workspace_connections` budget it
+/// occupies — indefinitely).
+///
+/// Deliberately keyed on *any* inbound frame, not only `pong`: an actively editing client that
+/// never implements `ping` handling is provably alive, and hanging up on it would be a regression
+/// dressed up as a health check.
+///
+/// Split out as pure logic parameterized on "now", exactly like [`RateLimiter::take_at`], so the
+/// 30-second interval is testable in microseconds with manually advanced `Instant`s instead of
+/// real sleeping.
+struct Heartbeat {
+    idle_after: Duration,
+    last_inbound: Instant,
+    /// When the currently-outstanding server `ping` was sent, if one is outstanding.
+    ping_sent_at: Option<Instant>,
+}
+
+impl Heartbeat {
+    const fn new(idle_after: Duration, now: Instant) -> Self {
+        Self {
+            idle_after,
+            last_inbound: now,
+            ping_sent_at: None,
+        }
+    }
+
+    /// Any inbound frame — `pong` included — proves the peer is alive and clears an outstanding
+    /// heartbeat.
+    const fn record_inbound(&mut self, now: Instant) {
+        self.last_inbound = now;
+        self.ping_sent_at = None;
+    }
+
+    fn evaluate_at(&mut self, now: Instant) -> HeartbeatAction {
+        if let Some(sent_at) = self.ping_sent_at {
+            if now.duration_since(sent_at) >= self.idle_after {
+                return HeartbeatAction::Close;
+            }
+            return HeartbeatAction::Idle;
+        }
+        if now.duration_since(self.last_inbound) >= self.idle_after {
+            self.ping_sent_at = Some(now);
+            return HeartbeatAction::SendPing;
+        }
+        HeartbeatAction::Idle
+    }
+}
+
 struct DocumentContext {
     object_id: Uuid,
     checked_epoch: i64,
@@ -456,6 +544,8 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     };
     let Frame::Open {
         document_id: opened_document_id,
+        known_seq,
+        known_frontier,
         ..
     } = open
     else {
@@ -488,29 +578,48 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
         .await;
         return;
     };
-    send(
-        &mut socket,
-        &Frame::Snapshot {
-            protocol_version: PROTOCOL_VERSION,
-            document_id,
-            snapshot_seq: boot.snapshot_seq,
-            head_seq: boot.head_seq,
-            snapshot: BASE64.encode(&boot.snapshot),
-            tail_updates: boot
-                .tail_updates
-                .iter()
-                .map(|u| TailUpdate {
-                    seq: u.seq,
-                    update_id: u.update_id,
-                    bytes: BASE64.encode(&u.bytes),
-                    before_frontier: BASE64.encode(&u.before_frontier),
-                    after_frontier: BASE64.encode(&u.after_frontier),
-                })
-                .collect(),
-            head_frontier: BASE64.encode(&boot.head_frontier),
-        },
-    )
-    .await;
+    // `collab-protocol-v1.md`'s `open known_seq/known_frontier`: a reconnecting client that still
+    // holds the document up to a seq this server can continue from gets the accepted stream it
+    // missed instead of the whole snapshot. Any refusal falls back to the full bootstrap below,
+    // which is always a correct answer to `open`.
+    match plan_resume(&state.db, document_id, &boot, known_seq, known_frontier.as_deref()).await {
+        Ok(frames) => {
+            for frame in &frames {
+                send(&mut socket, frame).await;
+            }
+        }
+        Err(refusal) => {
+            if refusal != ResumeRefusal::NotRequested {
+                tracing::debug!(
+                    %document_id, ?refusal, ?known_seq,
+                    "collab session: resume refused, falling back to a full snapshot"
+                );
+            }
+            send(
+                &mut socket,
+                &Frame::Snapshot {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    snapshot_seq: boot.snapshot_seq,
+                    head_seq: boot.head_seq,
+                    snapshot: BASE64.encode(&boot.snapshot),
+                    tail_updates: boot
+                        .tail_updates
+                        .iter()
+                        .map(|u| TailUpdate {
+                            seq: u.seq,
+                            update_id: u.update_id,
+                            bytes: BASE64.encode(&u.bytes),
+                            before_frontier: BASE64.encode(&u.before_frontier),
+                            after_frontier: BASE64.encode(&u.after_frontier),
+                        })
+                        .collect(),
+                    head_frontier: BASE64.encode(&boot.head_frontier),
+                },
+            )
+            .await;
+        }
+    }
 
     // ---- steady state ----
     // `limits-v1.md`'s three connection ceilings (`connections_per_user_max`/`_per_document_max`/
@@ -532,6 +641,27 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                 return;
             }
         };
+    // The "join" half of presence fan-out. `SessionRegistry::broadcast` only reaches sessions that
+    // were already connected when a peer's `presence` frame arrived, so without this a session
+    // joining a document sees an empty document until every peer happens to refresh — up to a full
+    // `presence_ttl_seconds_max`. Read-only: sending these neither creates nor refreshes any entry,
+    // so a joining session cannot keep a departed peer's cursor alive. Sent directly on the socket
+    // (not through the registry) because it is addressed to this one session, and before the loop
+    // below starts so it can never overtake a live `presence` broadcast for the same peer.
+    for (peer_session_id, payload) in collab.registry.presence_snapshot(document_id, Some(session_id)) {
+        send(
+            &mut socket,
+            &Frame::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                session_id: peer_session_id,
+                payload,
+                ttl_seconds: None,
+            },
+        )
+        .await;
+    }
+
     let checked_epoch = ctx.checked_epoch;
     let mut frame_limiter = RateLimiter::new(FRAMES_PER_CONNECTION_PER_SECOND, FRAME_BURST_MAX);
     let mut update_limiter = RateLimiter::new(UPDATES_PER_CONNECTION_PER_SECOND, UPDATE_BURST_MAX);
@@ -551,10 +681,36 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     // on this socket, but counting repeated `open` abuse still makes the frozen
     // `open_documents` limit_kind observable on the ninth attempted subscription.
     let mut open_attempts = 1u64;
+    // `collab-protocol-v1.md`'s `ping/pong` heartbeat, server side. A half-open TCP connection
+    // produces neither a `Close` frame nor a read error, so without this the `select!` below would
+    // park forever on a peer that is already gone while still holding its `limits-v1.md` connection
+    // slot. The ticker's period matches the idle threshold so at most two ticks (one to send the
+    // `ping`, one to observe no answer) are ever needed.
+    let mut heartbeat = Heartbeat::new(HEARTBEAT_IDLE, Instant::now());
+    let mut heartbeat_ticks = tokio::time::interval(HEARTBEAT_IDLE);
+    heartbeat_ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The interval's first tick completes immediately; consume it here so the first real evaluation
+    // happens one full period in, not at connection time.
+    heartbeat_ticks.tick().await;
 
     loop {
         tokio::select! {
             biased;
+            _ = heartbeat_ticks.tick() => {
+                match heartbeat.evaluate_at(Instant::now()) {
+                    HeartbeatAction::Idle => {}
+                    HeartbeatAction::SendPing => {
+                        send(&mut socket, &Frame::Ping {
+                            protocol_version: PROTOCOL_VERSION,
+                            nonce: Uuid::new_v4().to_string(),
+                        }).await;
+                    }
+                    HeartbeatAction::Close => {
+                        close(&mut socket, CLOSE_GOING_AWAY, "heartbeat timeout").await;
+                        break;
+                    }
+                }
+            }
             event = registered.receiver.recv() => {
                 match event {
                     Some(OutboundEvent::Frame(frame, encoded_len)) => {
@@ -595,6 +751,9 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
             incoming = socket.recv() => {
                 let Some(incoming) = incoming else { break };
                 let Ok(message) = incoming else { break };
+                // Any inbound frame -- `pong`, `update`, `presence`, even a transport-level
+                // ping/pong -- proves the peer is alive and clears an outstanding heartbeat.
+                heartbeat.record_inbound(Instant::now());
                 match message {
                     Message::Close(_) => break,
                     Message::Text(text) => {
@@ -834,6 +993,142 @@ async fn plan_gap_resolution(
         frames,
         advance_to: revealing_seq,
     }
+}
+
+/// Why a client's `open{known_seq, known_frontier}` could not be resumed, and the connection has
+/// to fall back to a full `snapshot` bootstrap instead. Every variant is a normal, expected
+/// outcome — never an error the client is told about beyond receiving a `snapshot` rather than the
+/// `ack` + replay a resume produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeRefusal {
+    /// No `known_seq`/`known_frontier` pair was supplied: a first connection, not a reconnect.
+    /// Both are required — resuming on `known_seq` alone would let a client whose local state had
+    /// diverged (a partially-applied update, a crashed tab that never persisted its outbox)
+    /// silently continue from a position it does not actually hold.
+    NotRequested,
+    /// `known_seq` is outside `[snapshot_seq, head_seq]`: either behind the retained history
+    /// boundary (v0.8 compaction) or ahead of the canonical head, which no client may legitimately
+    /// be.
+    OutOfRange,
+    /// The frontier the client claims at `known_seq` is not the one the server recorded there.
+    FrontierMismatch,
+    /// `(known_seq, head_seq]` is not fully readable from `collab_updates`.
+    HistoryUnavailable,
+}
+
+/// `collab-protocol-v1.md`'s `open document_id, known_seq, known_frontier` → reconnect resume.
+///
+/// A client that reconnects already holding the document up to `known_seq` does not need the
+/// snapshot back; it needs the accepted stream it missed. This plans exactly that: the frames
+/// `(known_seq, head_seq]` would have produced had the connection never dropped, in strict seq
+/// order, so the resumed subscription rejoins the live stream at `head_seq + 1` with the same
+/// [`EgressSequencer`] invariant a fresh `snapshot` establishes.
+///
+/// Deliberately reuses [`bootstrap::fetch_update_range`] — the same persisted-receipt read the
+/// outbound gap backfill uses — rather than re-applying CRDT bytes, and refuses (falling back to a
+/// full bootstrap) on any doubt: `collab-protocol-v1.md` forbids guessing across a seq gap, and a
+/// full `snapshot` is always a correct answer to `open`.
+async fn plan_resume(
+    db: &sea_orm::DatabaseConnection,
+    document_id: Uuid,
+    boot: &bootstrap::BootstrapResult,
+    known_seq: Option<i64>,
+    known_frontier: Option<&str>,
+) -> Result<Vec<Frame>, ResumeRefusal> {
+    let (Some(known_seq), Some(known_frontier)) = (known_seq, known_frontier) else {
+        return Err(ResumeRefusal::NotRequested);
+    };
+    // `known_seq >= boot.snapshot_seq` is also what bounds the size of the replay, and that is a
+    // load-bearing dependency on `bootstrap::load` rather than a check this function performs:
+    //
+    //   * this bound makes the replay range `(known_seq, head_seq]` a **subset** of the tail
+    //     interval `(snapshot_seq, head_seq]` that `boot` already carries;
+    //   * `bootstrap::load` has already enforced `BOOTSTRAP_DECODED_BYTES_MAX` (8 MiB) and
+    //     `BOOTSTRAP_RESPONSE_BYTES_MAX` over exactly that tail interval, before this function is
+    //     ever called (`bootstrap.rs`: the `(snapshot_seq,head_seq]` read, then
+    //     `check_bootstrap_decoded_bytes` / `check_bootstrap_response_bytes`);
+    //   * the replay's own re-read below is upper-bounded by `boot.head_seq`, not by the live
+    //     head, so commits landing after the bootstrap cannot enlarge it either.
+    //
+    // So an unbounded replay is structurally impossible: a client cannot pick a `known_seq` whose
+    // replay is larger than a bootstrap this server would already have refused to build. There is
+    // deliberately no second byte ceiling here — a duplicated one could drift from the bootstrap
+    // ceiling and would then either reject resumes the loader accepts or, worse, accept replays it
+    // would not.
+    //
+    // ⚠️ If `bootstrap::load` ever stops enforcing those two ceilings over the whole
+    // `(snapshot_seq, head_seq]` interval — or if this range check is ever loosened below
+    // `snapshot_seq` — resume becomes an unbounded-response amplifier and needs its own ceiling.
+    if known_seq < boot.snapshot_seq || known_seq > boot.head_seq {
+        return Err(ResumeRefusal::OutOfRange);
+    }
+
+    // The `ack` that confirms the resume point back to the client. Sent whether or not there is
+    // anything to replay, so "resumed, you are already at head" is distinguishable from a stalled
+    // server -- a resumed `open` otherwise produces no response at all when `known_seq == head_seq`.
+    let confirmation = Frame::Ack {
+        protocol_version: PROTOCOL_VERSION,
+        document_id,
+        seq: known_seq,
+        frontier: known_frontier.to_string(),
+    };
+
+    if known_seq == boot.head_seq {
+        if known_frontier != BASE64.encode(&boot.head_frontier) {
+            return Err(ResumeRefusal::FrontierMismatch);
+        }
+        return Ok(vec![confirmation]);
+    }
+
+    let expected_count = boot.head_seq - known_seq;
+    let rows = match bootstrap::fetch_update_range(db, document_id, known_seq + 1, boot.head_seq).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, %document_id, known_seq, "collab session: resume backfill query failed");
+            return Err(ResumeRefusal::HistoryUnavailable);
+        }
+    };
+    if !i64::try_from(rows.len()).is_ok_and(|count| count == expected_count) {
+        return Err(ResumeRefusal::HistoryUnavailable);
+    }
+    // The client's claimed frontier must be the one the first replayed update was authored on
+    // top of, and the replay must land exactly on the head this bootstrap observed. Checking both
+    // ends is what makes the replay a continuation of *this* client's state rather than a stream
+    // of bytes it cannot apply.
+    let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
+        return Err(ResumeRefusal::HistoryUnavailable);
+    };
+    if BASE64.encode(&first.before_frontier) != known_frontier {
+        return Err(ResumeRefusal::FrontierMismatch);
+    }
+    if last.after_frontier != boot.head_frontier {
+        return Err(ResumeRefusal::HistoryUnavailable);
+    }
+
+    let mut frames = Vec::with_capacity(rows.len().saturating_mul(2) + 1);
+    frames.push(confirmation);
+    for row in rows {
+        frames.push(Frame::Update {
+            protocol_version: PROTOCOL_VERSION,
+            document_id,
+            update_id: row.update_id,
+            base_frontier: BASE64.encode(&row.before_frontier),
+            bytes: BASE64.encode(&row.bytes),
+            idempotency_key: None,
+            origin: row.origin_client_id.unwrap_or_default(),
+            message: None,
+        });
+        frames.push(Frame::Accepted {
+            protocol_version: PROTOCOL_VERSION,
+            document_id,
+            update_id: row.update_id,
+            head_seq: row.seq,
+            head_frontier: BASE64.encode(&row.after_frontier),
+            projection_seq: row.projection_seq,
+            event_id: row.event_id,
+        });
+    }
+    Ok(frames)
 }
 
 async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut WebSocket) -> Option<DocumentContext> {
@@ -1183,7 +1478,38 @@ async fn handle_client_frame(
             )
             .await;
         }
-        Frame::Ack { .. } => {}
+        Frame::Ack {
+            document_id: frame_document_id,
+            seq,
+            frontier,
+            ..
+        } => {
+            if frame_document_id != document_id {
+                send(
+                    socket,
+                    &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
+                )
+                .await;
+                return;
+            }
+            // The highest seq this subscription has actually been sent. `EgressSequencer` is
+            // seeded at `snapshot.head_seq + 1` (or the resumed head + 1) and advances only when a
+            // frame is forwarded, so `next_expected_seq - 1` is exactly "everything this client
+            // could legitimately have applied". Acknowledging past it is a protocol violation, not
+            // a race: no path forwards an `accepted` without advancing the sequencer first.
+            let highest_forwarded = sequencer.next_expected_seq().saturating_sub(1);
+            if seq < 0 || seq > highest_forwarded {
+                send(
+                    socket,
+                    &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
+                )
+                .await;
+                return;
+            }
+            // A repeat at or below the recorded position is ignored rather than rejected
+            // (`collab-protocol-v1.md`: "`seq<=last_applied_seq` 是幂等重复,忽略但可重发 ack").
+            collab.registry.record_ack(session_id, seq, frontier);
+        }
         // `Frame::Open` is already handled by the early `is_reopen_attempt` return above, before
         // this match ever runs -- this arm can never actually observe one at runtime, but stays
         // listed here (rather than behind a `_` wildcard) so the compiler's own exhaustiveness
@@ -1661,6 +1987,68 @@ mod tests {
             }
             other => panic!("expected a limit_exceeded(bootstrap_response_bytes) error, got {other:?}"),
         }
+    }
+
+    /// The server heartbeat's decision core, on a virtual clock (the same technique the
+    /// `RateLimiter` cases above use): after a full idle period the server pings, and a peer that
+    /// answers nothing at all for one further period is hung up on. `HEARTBEAT_IDLE` is 30
+    /// seconds, so exercising this against the real clock would cost a minute per assertion.
+    #[test]
+    fn heartbeat_pings_after_one_idle_period_and_closes_when_the_ping_goes_unanswered() {
+        let t0 = Instant::now();
+        let idle = super::HEARTBEAT_IDLE;
+        let mut heartbeat = super::Heartbeat::new(idle, t0);
+
+        assert_eq!(
+            heartbeat.evaluate_at((t0 + idle).checked_sub(Duration::from_millis(1)).expect("in range")),
+            super::HeartbeatAction::Idle,
+            "one millisecond short of the idle period must not ping"
+        );
+        assert_eq!(
+            heartbeat.evaluate_at(t0 + idle),
+            super::HeartbeatAction::SendPing,
+            "a full idle period with no inbound frame must produce exactly one ping"
+        );
+        assert_eq!(
+            heartbeat.evaluate_at(t0 + idle + Duration::from_secs(1)),
+            super::HeartbeatAction::Idle,
+            "the outstanding ping must not be re-sent while it is still within its deadline"
+        );
+        assert_eq!(
+            heartbeat.evaluate_at(
+                (t0 + idle + idle)
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("in range")
+            ),
+            super::HeartbeatAction::Idle
+        );
+        assert_eq!(
+            heartbeat.evaluate_at(t0 + idle + idle),
+            super::HeartbeatAction::Close,
+            "a ping outstanding for a full further idle period means the peer is gone"
+        );
+    }
+
+    /// Deliberately keyed on *any* inbound frame, not only `pong`: an actively editing client that
+    /// never implements `ping` handling is provably alive and must not be hung up on.
+    #[test]
+    fn any_inbound_frame_clears_an_outstanding_heartbeat_ping() {
+        let t0 = Instant::now();
+        let idle = super::HEARTBEAT_IDLE;
+        let mut heartbeat = super::Heartbeat::new(idle, t0);
+
+        assert_eq!(heartbeat.evaluate_at(t0 + idle), super::HeartbeatAction::SendPing);
+        heartbeat.record_inbound(t0 + idle + Duration::from_secs(1));
+        assert_eq!(
+            heartbeat.evaluate_at(t0 + idle + idle),
+            super::HeartbeatAction::Idle,
+            "the deadline must be cleared by the inbound frame, not merely postponed"
+        );
+        assert_eq!(
+            heartbeat.evaluate_at(t0 + idle + idle + Duration::from_secs(1)),
+            super::HeartbeatAction::SendPing,
+            "and a fresh idle period after that inbound frame pings again"
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2729,6 +3117,767 @@ mod tests {
             );
 
             drop(open_sessions);
+            scratch.drop_self().await;
+        }
+
+        // -----------------------------------------------------------------------------------
+        // WP-16 (v0.5 session extension) helpers: presence fan-out, outbound-order injection,
+        // reconnect resume, ack frontier, and the 10-client round-trip budget.
+        // -----------------------------------------------------------------------------------
+
+        /// Drives `hello` + `open` and stops there, handing back the stream and the
+        /// server-assigned `session_id` (from the `hello` reply) without consuming whatever the
+        /// server answers `open` with -- a resuming `open` answers with `ack` + replay, a fresh
+        /// one with `snapshot`, and several tests below assert exactly which.
+        async fn handshake(
+            addr: SocketAddr,
+            ticket: &str,
+            client_id: &str,
+            document_id: Uuid,
+            known_seq: Option<i64>,
+            known_frontier: Option<String>,
+        ) -> (WsStream, Uuid) {
+            let mut ws = connect(addr, ticket, client_id).await;
+            send_frame(
+                &mut ws,
+                &Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: vec![],
+                    client_id: client_id.to_string(),
+                    session_id: Uuid::new_v4(),
+                },
+            )
+            .await;
+            let hello_reply = recv_frame(&mut ws).await;
+            let Frame::Hello { session_id, .. } = hello_reply else {
+                panic!("expected a hello reply, got {hello_reply:?}");
+            };
+            send_frame(
+                &mut ws,
+                &Frame::Open {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    known_seq,
+                    known_frontier,
+                },
+            )
+            .await;
+            (ws, session_id)
+        }
+
+        /// [`open_session`] plus the server-assigned `session_id` and the snapshot's
+        /// `head_frontier` -- everything a test needs to address this subscription in the
+        /// process-global registry and to reconnect against it later.
+        async fn open_session_full(
+            addr: SocketAddr,
+            ticket: &str,
+            client_id: &str,
+            document_id: Uuid,
+        ) -> (WsStream, i64, String, Uuid) {
+            let (mut ws, session_id) = handshake(addr, ticket, client_id, document_id, None, None).await;
+            let snapshot_frame = recv_frame(&mut ws).await;
+            let Frame::Snapshot {
+                head_seq,
+                head_frontier,
+                ..
+            } = snapshot_frame
+            else {
+                panic!("expected a snapshot frame, got {snapshot_frame:?}");
+            };
+            (ws, head_seq, head_frontier, session_id)
+        }
+
+        /// A `ping`/`pong` round trip: the server's steady-state loop handles inbound frames
+        /// strictly in arrival order, so a `pong` coming back proves every frame sent before the
+        /// `ping` has already been fully processed. Used instead of sleeping, so the presence
+        /// assertions below are deterministic rather than timing-dependent.
+        async fn sync(ws: &mut WsStream) {
+            let nonce = Uuid::new_v4().to_string();
+            send_frame(
+                ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: nonce.clone(),
+                },
+            )
+            .await;
+            let reply = recv_frame(ws).await;
+            let Frame::Pong { nonce: echoed, .. } = reply else {
+                panic!("expected a pong, got {reply:?}");
+            };
+            assert_eq!(echoed, nonce);
+        }
+
+        fn presence_frame(document_id: Uuid, cursor: i64, ttl_seconds: Option<u32>) -> Frame {
+            Frame::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                // Ignored by the server: the entry key is `(document_id, server-assigned
+                // session_id)`, never a client-supplied one.
+                session_id: Uuid::new_v4(),
+                payload: serde_json::json!({"cursor": cursor}),
+                ttl_seconds,
+            }
+        }
+
+        fn live_registry() -> &'static crate::flow::collab::registry::SessionRegistry {
+            &crate::flow::collab::runtime::runtime().registry
+        }
+
+        async fn count_collab_updates(state: &AppState, document_id: Uuid) -> i64 {
+            #[derive(sea_orm::FromQueryResult)]
+            struct Row {
+                n: i64,
+            }
+            Row::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1",
+                vec![document_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("count query runs")
+            .expect("count query returns a row")
+            .n
+        }
+
+        /// Commits `count` real updates through the production write path but against a
+        /// **local** [`crate::flow::collab::registry::SessionRegistry`], so none of them reach the
+        /// live sessions this module's tests have open. That is what makes the outbound-order and
+        /// resume tests deterministic: the rows exist in `collab_updates` (so backfill/replay can
+        /// find them) while the connected client provably has not been told about them yet.
+        async fn commit_updates_offline(
+            state: &AppState,
+            document_id: Uuid,
+            workspace_id: Uuid,
+            actor_id: Uuid,
+            count: usize,
+        ) -> Vec<crate::flow::collab::write::Accepted> {
+            use collab_core::{CollabEngine, LoroCollabEngine};
+            #[derive(sea_orm::FromQueryResult)]
+            struct SnapshotRow {
+                snapshot: Vec<u8>,
+            }
+            let snapshot_row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT snapshot FROM collab_documents WHERE id = $1",
+                vec![document_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("query runs")
+            .expect("row exists");
+            let mut engine = LoroCollabEngine::load(&snapshot_row.snapshot).expect("loads");
+
+            let cache = crate::flow::collab::cache::WarmCache::new();
+            let coordinator = crate::flow::collab::coordinator::DocumentCoordinator::new();
+            let registry = crate::flow::collab::registry::SessionRegistry::new();
+            let advancer = crate::flow::collab::snapshot::SnapshotAdvancer::new();
+
+            let mut committed = Vec::with_capacity(count);
+            for i in 0..count {
+                let base_frontier = engine.frontier();
+                engine
+                    .set_title(&format!("wp16-offline-{i}-{}", Uuid::new_v4()))
+                    .expect("set_title succeeds");
+                let bytes = engine.export_from(&base_frontier).expect("export succeeds");
+                let checked_epoch = crate::flow::collab::authz::read_epoch(&state.db, workspace_id)
+                    .await
+                    .expect("epoch reads");
+                let outcome = crate::flow::collab::write::accept_update(
+                    &state.db,
+                    &cache,
+                    &coordinator,
+                    &registry,
+                    &advancer,
+                    10,
+                    None,
+                    crate::flow::collab::write::UpdateRequest {
+                        document_id,
+                        update_id: Uuid::new_v4(),
+                        bytes,
+                        idempotency_key: None,
+                        event_idempotency_key: None,
+                        origin_client_id: Some("wp16-offline".to_string()),
+                        message: None,
+                        actor_id,
+                        workspace_id,
+                        checked_epoch,
+                        expected_frontier: None,
+                    },
+                )
+                .await
+                .expect("accept_update does not hit a hard database error");
+                let crate::flow::collab::write::AcceptOutcome::Accepted(accepted) = outcome else {
+                    panic!("expected Accepted for offline commit {i}");
+                };
+                committed.push(accepted);
+            }
+            committed
+        }
+
+        fn encode_b64(bytes: &[u8]) -> String {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        }
+
+        fn accepted_frame_for(document_id: Uuid, accepted: &crate::flow::collab::write::Accepted) -> Frame {
+            Frame::Accepted {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                update_id: accepted.update_id,
+                head_seq: accepted.head_seq,
+                head_frontier: encode_b64(&accepted.head_frontier),
+                projection_seq: accepted.projection_seq,
+                event_id: accepted.event_id,
+            }
+        }
+
+        /// `versions/v0.5-collaboration.md`: "显示其他用户 cursor/selection". A `presence` frame must
+        /// reach every *other* session on the document and never echo back to its sender
+        /// (`SessionRegistry::broadcast`'s `exclude`), and a session joining afterwards must be
+        /// handed the peers already present rather than waiting up to a full
+        /// `presence_ttl_seconds_max` for their next refresh.
+        #[tokio::test]
+        async fn presence_fans_out_to_every_peer_and_never_echoes_to_its_sender() {
+            let scratch = scratch_or_skip!("presence-fanout");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket_a = issue_ticket(addr, &token, workspace_id, document_id, "fanout-a").await;
+            let (mut a, _, _, a_session) = open_session_full(addr, &ticket_a, "fanout-a", document_id).await;
+            let ticket_b = issue_ticket(addr, &token, workspace_id, document_id, "fanout-b").await;
+            let (mut b, _, _, _) = open_session_full(addr, &ticket_b, "fanout-b", document_id).await;
+            let ticket_c = issue_ticket(addr, &token, workspace_id, document_id, "fanout-c").await;
+            let (mut c, _, _, _) = open_session_full(addr, &ticket_c, "fanout-c", document_id).await;
+
+            send_frame(&mut a, &presence_frame(document_id, 7, None)).await;
+
+            for (label, peer) in [("b", &mut b), ("c", &mut c)] {
+                let received = recv_frame(peer).await;
+                let Frame::Presence {
+                    session_id,
+                    payload,
+                    ttl_seconds,
+                    ..
+                } = received
+                else {
+                    panic!("peer {label} must receive the presence frame, got {received:?}");
+                };
+                assert_eq!(session_id, a_session, "presence must carry the *server* session id");
+                assert_eq!(payload["cursor"], 7);
+                assert_eq!(
+                    ttl_seconds,
+                    Some(crate::flow::collab::limits::PRESENCE_TTL_SECONDS_DEFAULT),
+                    "an omitted ttl_seconds is filled in with the contract default"
+                );
+            }
+
+            // The sender must not have been sent its own presence back. Proven without sleeping:
+            // the server processes this connection's inbound frames in order, so if a presence
+            // echo had been queued for `a` it would necessarily be delivered before the `pong`.
+            sync(&mut a).await;
+
+            // A session joining now is handed the presence already on the document.
+            let ticket_d = issue_ticket(addr, &token, workspace_id, document_id, "fanout-d").await;
+            let (mut d, d_session) = handshake(addr, &ticket_d, "fanout-d", document_id, None, None).await;
+            assert!(matches!(recv_frame(&mut d).await, Frame::Snapshot { .. }));
+            // A trailing `ping` bounds the wait: the join snapshot is written to the socket before
+            // the steady-state loop reads anything, so if it were missing the next frame would be
+            // this `pong` -- named by the assertion below instead of surfacing as a timeout.
+            send_frame(
+                &mut d,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "join-presence".to_string(),
+                },
+            )
+            .await;
+            let joined = recv_frame(&mut d).await;
+            let Frame::Presence {
+                session_id, payload, ..
+            } = joined
+            else {
+                panic!("a joining session must be handed the document's live presence, got {joined:?}");
+            };
+            assert_eq!(session_id, a_session);
+            assert_ne!(session_id, d_session);
+            assert_eq!(payload["cursor"], 7);
+
+            scratch.drop_self().await;
+        }
+
+        /// `limits-v1.md`: "Entry key 固定为 `(document_id,session_id)`：同 key frame 只刷新 payload/
+        /// expiry，不增加计数". Reported forty times from one session, the document must still hold
+        /// exactly one entry -- an append-instead-of-upsert would both inflate the count and walk
+        /// into `presence_entries_per_document_max`.
+        #[tokio::test]
+        async fn repeated_presence_from_one_session_refreshes_in_place_without_growing_the_count() {
+            let scratch = scratch_or_skip!("presence-inplace");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "presence-inplace").await;
+            let (mut ws, _, _, _) = open_session_full(addr, &ticket, "presence-inplace", document_id).await;
+
+            // Forty is deliberately past `presence_entries_per_document_max` (100) / 2 and well
+            // past `presence_entries_per_connection_max` (8): an append implementation trips a
+            // ceiling long before the fortieth report, so this fails loudly either way.
+            for cursor in 0..40i64 {
+                send_frame(&mut ws, &presence_frame(document_id, cursor, Some(30))).await;
+                sync(&mut ws).await;
+                assert_eq!(
+                    live_registry().presence_count(document_id),
+                    1,
+                    "report {cursor} must refresh the one (document_id, session_id) entry in place"
+                );
+            }
+
+            scratch.drop_self().await;
+        }
+
+        /// `versions/v0.5-collaboration.md`: presence "不写 `collab_updates`"; `collab-protocol-v1.md`:
+        /// "presence 永不进入 CRDT、history、event 或投递". Presence is not document content, so a
+        /// burst of it must leave `collab_updates`, the document head, and `event_dispatch`
+        /// byte-for-byte where they were.
+        #[tokio::test]
+        async fn presence_writes_neither_collab_updates_nor_the_document_head_nor_a_dispatch() {
+            let scratch = scratch_or_skip!("presence-no-persist");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "presence-no-persist").await;
+            let (mut ws, _, _, _) = open_session_full(addr, &ticket, "presence-no-persist", document_id).await;
+
+            let updates_before = count_collab_updates(&state, document_id).await;
+            let head_before = read_head_seq(&state, document_id).await;
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+
+            for cursor in 0..10i64 {
+                send_frame(&mut ws, &presence_frame(document_id, cursor, Some(30))).await;
+                sync(&mut ws).await;
+            }
+            assert_eq!(
+                live_registry().presence_count(document_id),
+                1,
+                "the presence really was accepted -- otherwise the counts below prove nothing"
+            );
+
+            assert_eq!(
+                count_collab_updates(&state, document_id).await,
+                updates_before,
+                "presence must never write a collab_updates row"
+            );
+            assert_eq!(
+                read_head_seq(&state, document_id).await,
+                head_before,
+                "presence must never advance the document head"
+            );
+            assert_eq!(
+                count_event_dispatch(&state, document_id).await,
+                dispatch_before,
+                "presence must never produce an event dispatch"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// `limits-v1.md`: "Expiry 从服务端接受 frame 的单调时钟起算，30 秒无刷新自动删除，连接关闭或权限
+        /// 撤销立即删除". Both halves against the live registry: a 1-second TTL that lapses, and a
+        /// 30-second TTL whose entry must still vanish the moment the socket goes away.
+        #[tokio::test]
+        async fn presence_disappears_on_ttl_expiry_and_again_on_disconnect() {
+            let scratch = scratch_or_skip!("presence-cleanup");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "presence-cleanup").await;
+            let (mut ws, _, _, _) = open_session_full(addr, &ticket, "presence-cleanup", document_id).await;
+
+            // ---- TTL expiry ----
+            send_frame(&mut ws, &presence_frame(document_id, 1, Some(1))).await;
+            sync(&mut ws).await;
+            assert_eq!(live_registry().presence_count(document_id), 1);
+            tokio::time::sleep(Duration::from_millis(1_400)).await;
+            assert_eq!(
+                live_registry().presence_count(document_id),
+                0,
+                "a 1-second presence TTL must have lapsed after 1.4 seconds"
+            );
+
+            // ---- disconnect ----
+            send_frame(&mut ws, &presence_frame(document_id, 2, Some(30))).await;
+            sync(&mut ws).await;
+            assert_eq!(live_registry().presence_count(document_id), 1);
+            drop(ws);
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if live_registry().presence_count(document_id) == 0 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a 30-second presence entry must be removed by the disconnect, not left to expire"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            scratch.drop_self().await;
+        }
+
+        /// `collab-protocol-v1.md` "accepted 出站顺序", injected directly at the boundary the
+        /// sequencer guards (`SessionRegistry::broadcast`, the one path every outbound `accepted`
+        /// takes): a repeat of an already-forwarded seq is dropped, and a notice that skips a seq
+        /// is held back until the missing row has been backfilled from `collab_updates` and sent
+        /// first. The commits are made against a *local* registry so the live session provably has
+        /// not seen them, which is what lets the injection order be chosen freely.
+        #[tokio::test]
+        async fn outbound_duplicates_are_dropped_and_a_gap_is_backfilled_in_strict_seq_order() {
+            let scratch = scratch_or_skip!("egress-dup-gap");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "egress-dup-gap").await;
+            let (mut ws, head_seq, _, _) = open_session_full(addr, &ticket, "egress-dup-gap", document_id).await;
+
+            let committed = commit_updates_offline(&state, document_id, workspace_id, owner_id, 3).await;
+            assert_eq!(committed[0].head_seq, head_seq + 1);
+            assert_eq!(committed[2].head_seq, head_seq + 3);
+
+            let registry = live_registry();
+
+            // ---- in order ----
+            registry.broadcast(document_id, &accepted_frame_for(document_id, &committed[0]), None);
+            let first = recv_frame(&mut ws).await;
+            let Frame::Accepted { head_seq: got_seq, .. } = first else {
+                panic!("expected the in-order accepted, got {first:?}");
+            };
+            assert_eq!(got_seq, head_seq + 1);
+
+            // ---- duplicate: the identical notice again, then a marker that must arrive next ----
+            registry.broadcast(document_id, &accepted_frame_for(document_id, &committed[0]), None);
+            let marker = Frame::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                session_id: Uuid::new_v4(),
+                payload: serde_json::json!({"marker": "after-duplicate"}),
+                ttl_seconds: Some(30),
+            };
+            registry.broadcast(document_id, &marker, None);
+            let after_duplicate = recv_frame(&mut ws).await;
+            let Frame::Presence { payload, .. } = &after_duplicate else {
+                panic!(
+                    "the duplicate accepted must be dropped; the next frame must be the marker, got {after_duplicate:?}"
+                );
+            };
+            assert_eq!(payload["marker"], "after-duplicate");
+
+            // ---- gap: seq head+3 arrives while head+2 has never been forwarded ----
+            registry.broadcast(document_id, &accepted_frame_for(document_id, &committed[2]), None);
+            let backfilled_update = recv_frame(&mut ws).await;
+            let Frame::Update {
+                update_id: backfilled_id,
+                ..
+            } = backfilled_update
+            else {
+                panic!("the missing seq must be backfilled as an update first, got {backfilled_update:?}");
+            };
+            assert_eq!(backfilled_id, committed[1].update_id);
+            let backfilled_accepted = recv_frame(&mut ws).await;
+            let Frame::Accepted {
+                head_seq: filled_seq,
+                update_id: filled_id,
+                ..
+            } = backfilled_accepted
+            else {
+                panic!("expected the backfilled accepted, got {backfilled_accepted:?}");
+            };
+            assert_eq!(
+                filled_seq,
+                head_seq + 2,
+                "the gap must be filled before the notice that revealed it"
+            );
+            assert_eq!(filled_id, committed[1].update_id);
+            let revealing = recv_frame(&mut ws).await;
+            let Frame::Accepted {
+                head_seq: revealing_seq,
+                ..
+            } = revealing
+            else {
+                panic!("expected the revealing accepted last, got {revealing:?}");
+            };
+            assert_eq!(revealing_seq, head_seq + 3);
+
+            scratch.drop_self().await;
+        }
+
+        /// `collab-protocol-v1.md`: "补不齐则发送 `resync(reason="outbound_gap")`，禁止先发 `N`". A
+        /// notice for a seq that does not exist in `collab_updates` at all can never be backfilled,
+        /// so the client must be told to resync and must never be handed the notice itself -- nor
+        /// any later one, until it reconnects.
+        #[tokio::test]
+        async fn an_unfillable_outbound_gap_resyncs_and_never_forwards_the_revealing_notice() {
+            let scratch = scratch_or_skip!("egress-unfillable");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "egress-unfillable").await;
+            let (mut ws, head_seq, _, _) = open_session_full(addr, &ticket, "egress-unfillable", document_id).await;
+
+            let registry = live_registry();
+            let phantom = |seq: i64| Frame::Accepted {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                update_id: Uuid::new_v4(),
+                head_seq: seq,
+                head_frontier: String::new(),
+                projection_seq: seq,
+                event_id: Uuid::new_v4(),
+            };
+
+            registry.broadcast(document_id, &phantom(head_seq + 50), None);
+            let resync = recv_frame(&mut ws).await;
+            let Frame::Resync {
+                reason,
+                minimum_snapshot_seq,
+                ..
+            } = resync
+            else {
+                panic!("an unfillable gap must produce a resync, got {resync:?}");
+            };
+            assert_eq!(reason, "outbound_gap");
+            assert_eq!(minimum_snapshot_seq, Some(head_seq));
+
+            // Every later notice stays frozen behind that resync; a marker proves the connection
+            // is still live and that no accepted slipped through.
+            registry.broadcast(document_id, &phantom(head_seq + 51), None);
+            let marker = Frame::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                session_id: Uuid::new_v4(),
+                payload: serde_json::json!({"marker": "after-resync"}),
+                ttl_seconds: Some(30),
+            };
+            registry.broadcast(document_id, &marker, None);
+            let after = recv_frame(&mut ws).await;
+            let Frame::Presence { payload, .. } = &after else {
+                panic!("no accepted may cross a pending resync, got {after:?}");
+            };
+            assert_eq!(payload["marker"], "after-resync");
+
+            scratch.drop_self().await;
+        }
+
+        /// `versions/v0.5-collaboration.md`: "reconnect resume". A client that reconnects still
+        /// holding the document at a seq/frontier the server can continue from receives the
+        /// accepted stream it missed -- confirmed by an `ack` at its own resume point -- instead of
+        /// a whole fresh `snapshot`.
+        #[tokio::test]
+        async fn reconnect_resume_replays_the_missed_accepted_stream_instead_of_a_snapshot() {
+            let scratch = scratch_or_skip!("resume-replay");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "resume-a").await;
+            let (first, head_seq, head_frontier, _) = open_session_full(addr, &ticket, "resume-a", document_id).await;
+            drop(first);
+
+            let committed = commit_updates_offline(&state, document_id, workspace_id, owner_id, 2).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "resume-b").await;
+            let (mut ws, _) = handshake(
+                addr,
+                &ticket,
+                "resume-b",
+                document_id,
+                Some(head_seq),
+                Some(head_frontier.clone()),
+            )
+            .await;
+
+            let confirmation = recv_frame(&mut ws).await;
+            let Frame::Ack { seq, frontier, .. } = confirmation else {
+                panic!("a resumed open must be confirmed with an ack, got {confirmation:?}");
+            };
+            assert_eq!(seq, head_seq);
+            assert_eq!(frontier, head_frontier);
+
+            for expected in &committed {
+                let update = recv_frame(&mut ws).await;
+                let Frame::Update { update_id, .. } = update else {
+                    panic!("expected a replayed update, got {update:?}");
+                };
+                assert_eq!(update_id, expected.update_id);
+                let accepted = recv_frame(&mut ws).await;
+                let Frame::Accepted {
+                    head_seq: seq,
+                    update_id,
+                    ..
+                } = accepted
+                else {
+                    panic!("expected a replayed accepted, got {accepted:?}");
+                };
+                assert_eq!(seq, expected.head_seq);
+                assert_eq!(update_id, expected.update_id);
+            }
+
+            // The replay is complete and the subscription is live: nothing else is pending.
+            sync(&mut ws).await;
+
+            scratch.drop_self().await;
+        }
+
+        /// The other half of resume: a `known_frontier` that is not the one the server recorded at
+        /// `known_seq` means the client's local state has diverged, so it must be rebuilt from a
+        /// full `snapshot` rather than have a replay applied on top of state it does not hold. The
+        /// same must happen for a `known_seq` beyond the canonical head.
+        #[tokio::test]
+        async fn a_resume_with_a_stale_frontier_or_an_impossible_seq_falls_back_to_a_full_snapshot() {
+            let scratch = scratch_or_skip!("resume-refused");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "refused-a").await;
+            let (first, head_seq, head_frontier, _) = open_session_full(addr, &ticket, "refused-a", document_id).await;
+            drop(first);
+            commit_updates_offline(&state, document_id, workspace_id, owner_id, 2).await;
+
+            // ---- stale frontier at a perfectly valid seq ----
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "refused-b").await;
+            let (mut ws, _) = handshake(
+                addr,
+                &ticket,
+                "refused-b",
+                document_id,
+                Some(head_seq),
+                Some(encode_b64(b"not-the-recorded-frontier")),
+            )
+            .await;
+            let answer = recv_frame(&mut ws).await;
+            assert!(
+                matches!(answer, Frame::Snapshot { .. }),
+                "a stale known_frontier must fall back to a full snapshot, got {answer:?}"
+            );
+            drop(ws);
+
+            // ---- a seq no client can legitimately hold ----
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "refused-c").await;
+            let (mut ws, _) = handshake(
+                addr,
+                &ticket,
+                "refused-c",
+                document_id,
+                Some(head_seq + 1_000),
+                Some(head_frontier),
+            )
+            .await;
+            let answer = recv_frame(&mut ws).await;
+            assert!(
+                matches!(answer, Frame::Snapshot { .. }),
+                "a known_seq past the canonical head must fall back to a full snapshot, got {answer:?}"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// `collab-protocol-v1.md`'s `ack document_id, seq, frontier`. The server records the
+        /// acknowledged position, ignores an idempotent repeat rather than rewinding to it
+        /// ("`seq<=last_applied_seq` 是幂等重复，忽略但可重发 ack"), and refuses an `ack` for a seq it
+        /// never forwarded to this subscription.
+        #[tokio::test]
+        async fn ack_records_the_frontier_monotonically_and_refuses_a_seq_never_forwarded() {
+            let scratch = scratch_or_skip!("ack-frontier");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            // One committed update before connecting, so the snapshot head is provably >= 1 and a
+            // *regressing* ack (`head_seq - 1`) is expressible.
+            commit_updates_offline(&state, document_id, workspace_id, owner_id, 1).await;
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "ack-frontier").await;
+            let (mut ws, head_seq, head_frontier, session_id) =
+                open_session_full(addr, &ticket, "ack-frontier", document_id).await;
+            assert!(head_seq >= 1, "the fixture must leave at least one committed seq");
+
+            let ack = |seq: i64, frontier: &str| Frame::Ack {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                seq,
+                frontier: frontier.to_string(),
+            };
+
+            // ---- a seq this subscription was never sent ----
+            // Followed immediately by a `ping`: the server answers inbound frames in order, so if
+            // the illegal `ack` were silently accepted the next frame back would be the `pong`,
+            // and the assertion below names exactly that.
+            send_frame(&mut ws, &ack(head_seq + 1, "ahead")).await;
+            send_frame(
+                &mut ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "ack-guard".to_string(),
+                },
+            )
+            .await;
+            let rejected = recv_frame(&mut ws).await;
+            let Frame::Rejected { code, .. } = rejected else {
+                panic!("an ack past the highest forwarded seq must be rejected, got {rejected:?}");
+            };
+            assert_eq!(code, RejectedCode::InvalidUpdate);
+            let pong = recv_frame(&mut ws).await;
+            assert!(
+                matches!(pong, Frame::Pong { .. }),
+                "expected the trailing pong, got {pong:?}"
+            );
+            assert!(
+                live_registry().acked(session_id).is_none(),
+                "a refused ack must never be recorded"
+            );
+
+            // ---- the snapshot head itself is ackable ----
+            send_frame(&mut ws, &ack(head_seq, &head_frontier)).await;
+            sync(&mut ws).await;
+            let recorded = live_registry().acked(session_id).expect("the ack is recorded");
+            assert_eq!(recorded.seq, head_seq);
+            assert_eq!(recorded.frontier, head_frontier);
+
+            // ---- an idempotent repeat behind it is ignored, not applied ----
+            send_frame(&mut ws, &ack(head_seq - 1, "stale-replay")).await;
+            sync(&mut ws).await;
+            let recorded = live_registry().acked(session_id).expect("the ack is still recorded");
+            assert_eq!(
+                recorded.seq, head_seq,
+                "a replayed older ack must never rewind the recorded frontier"
+            );
+            assert_eq!(recorded.frontier, head_frontier);
+
             scratch.drop_self().await;
         }
     }
