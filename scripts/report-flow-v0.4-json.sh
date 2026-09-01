@@ -18,7 +18,9 @@ set -euo pipefail
 # exactly the fake-green pattern this v0.4 work exists to close.
 #
 # Every required verification command that has a repository producer is run
-# here. The deployed verifier reports an explicit failed gate when its real
+# here exactly once. In particular, forms_regression_verify is the canonical
+# wrapper around ci-universal-forms-gates.sh; the generic bundle must not invoke
+# that same entrypoint a second time. The deployed verifier reports an explicit failed gate when its real
 # three-hop environment is unavailable; report invokes it instead of pretending
 # its script is absent.
 #
@@ -42,13 +44,15 @@ LOAD_HARNESS_EVIDENCE=""
 CACHE_EVIDENCE=""
 DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
 RECEIPT_STATE_FILTER="$ROOT_DIR/scripts/lib/flow_gate_v0_4_receipt_state.jq"
+SCHEMA_PATH="$ROOT_DIR/docs/schemas/sylvode-flow-gate-v0.4.schema.json"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/report-flow-v0.4-json.sh [OPTIONS]
 
-Runs the read-only v0.4 report bundle: the generic cargo/bun/forms-gate
-commands, then every required_commands verify step v0.4-gate.yaml names.
+Runs the read-only v0.4 report bundle: the generic cargo/bun/MCP commands,
+then every required_commands verify step v0.4-gate.yaml names. The required
+Forms verifier owns the single Universal Forms gate execution.
 Records the exact command, exit code and duration for every step, then --
 only if every artifact the v0.4 gate schema requires is actually present
 with a real checksum -- atomically writes <evidence-root>/gate-result.json.
@@ -75,8 +79,9 @@ Options:
                           passed through to the architecture verifier. Default:
                           $OPENPR_FLOW_DEDICATED_PG_CONTAINER.
   --skip-generic          Skip the generic cargo fmt/check/clippy/test +
-                          bun check/build + ci-universal-forms-gates +
-                          test-mcp bundle (fast iteration only; report
+                          bun check/build + test-mcp bundle (fast iteration
+                          only; the required Forms verifier still runs once;
+                          report
                           will still correctly fail to write
                           gate-result.json because those checks are
                           required).
@@ -120,6 +125,15 @@ if [[ ! -f "$RECEIPT_STATE_FILTER" ]]; then
   echo "FAIL: receipt-state filter not found: $RECEIPT_STATE_FILTER" >&2
   exit 2
 fi
+if [[ ! -f "$SCHEMA_PATH" ]]; then
+  echo "FAIL: v0.4 gate schema not found: $SCHEMA_PATH" >&2
+  exit 2
+fi
+GATE_YAML="$CONTRACTS_ROOT/gates/v0.4-gate.yaml"
+if [[ ! -f "$GATE_YAML" ]]; then
+  echo "FAIL: v0.4 gate contract not found: $GATE_YAML" >&2
+  exit 2
+fi
 
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
@@ -135,6 +149,46 @@ CHECKS_JSON="[]"
 OVERALL_FAILED=0
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+
+# Read only the top-level scalar maps used by the frozen gate ledger. This is
+# intentionally the same bounded parser shape used by the newer v0.5 report;
+# a nested/new YAML form cannot silently disappear because its key set must
+# still equal the JSON schema before any product command runs.
+yaml_map_json() {
+  local section="$1"
+  awk -v section="$section" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    $0 == section ":" { inside=1; next }
+    inside && $0 ~ /^[^[:space:]#]/ { exit }
+    inside && $0 ~ /^  [A-Za-z0-9_]+:/ {
+      line=substr($0,3); split_at=index(line, ":")
+      key=substr(line,1,split_at-1); value=trim(substr(line,split_at+1))
+      sub(/[[:space:]]+#.*$/, "", value)
+      printf "%s\t%s\n", key, value
+    }
+  ' "$GATE_YAML" | jq -Rn '
+    [inputs | capture("^(?<key>[^\\t]+)\\t(?<value>.*)$") | {key:.key,value:.value}] | from_entries'
+}
+
+YAML_ARTIFACTS="$(yaml_map_json artifacts)"
+YAML_REQUIRED_COMMANDS="$(yaml_map_json required_commands)"
+YAML_HARD_GATES="$(yaml_map_json hard_gates)"
+SCHEMA_ARTIFACT_KEYS="$(jq -c '.properties.artifacts.required | sort' "$SCHEMA_PATH")"
+SCHEMA_REQUIRED_COMMAND_KEYS="$(jq -c '.properties.required_commands.required | sort' "$SCHEMA_PATH")"
+SCHEMA_HARD_GATE_KEYS="$(jq -c '.properties.hard_gates.required | sort' "$SCHEMA_PATH")"
+EXPECTED_HARD_GATE_COUNT="$(jq 'length' <<<"$SCHEMA_HARD_GATE_KEYS")"
+
+for ledger_section in artifacts required_commands hard_gates; do
+  case "$ledger_section" in
+    artifacts) yaml_json="$YAML_ARTIFACTS"; schema_keys="$SCHEMA_ARTIFACT_KEYS" ;;
+    required_commands) yaml_json="$YAML_REQUIRED_COMMANDS"; schema_keys="$SCHEMA_REQUIRED_COMMAND_KEYS" ;;
+    hard_gates) yaml_json="$YAML_HARD_GATES"; schema_keys="$SCHEMA_HARD_GATE_KEYS" ;;
+  esac
+  if ! jq -e --argjson expected "$schema_keys" 'keys == $expected' >/dev/null <<<"$yaml_json"; then
+    echo "FAIL: v0.4 ledger drift: YAML $ledger_section keys do not equal schema required keys" >&2
+    exit 2
+  fi
+done
 
 run_step() {
   local id="$1"; shift
@@ -192,7 +246,6 @@ else
   run_step generic.cargo_test cargo test --workspace --no-fail-fast || true
   run_step generic.bun_check bun run --cwd frontend check || true
   run_step generic.bun_build bun run --cwd frontend build || true
-  run_step generic.ci_universal_forms_gates bash scripts/ci-universal-forms-gates.sh || true
   run_step generic.test_mcp bash scripts/test-mcp.sh || true
 fi
 
@@ -315,8 +368,17 @@ REQUIRED_ARTIFACTS=(
   "integrity_records_result:$EVIDENCE_ROOT/integrity-records-result.json:evidence/v0.4/integrity-records-result.json"
   "authz_baseline_result:$EVIDENCE_ROOT/authz-baseline-result.json:evidence/v0.4/authz-baseline-result.json"
   "surface_coverage_result:$EVIDENCE_ROOT/surface-coverage-result.json:evidence/v0.4/surface-coverage-result.json"
+  "migration_result:$EVIDENCE_ROOT/migration-result.json:evidence/v0.4/migration-result.json"
+  "document_seq_result:$EVIDENCE_ROOT/document-seq-result.json:evidence/v0.4/document-seq-result.json"
+  "tool_registry_result:$EVIDENCE_ROOT/tool-registry-result.json:evidence/v0.4/tool-registry-result.json"
   "legacy_pages_inventory:$EVIDENCE_ROOT/legacy-pages-inventory.json:evidence/v0.4/legacy-pages-inventory.json"
 )
+
+REPORT_ARTIFACT_KEYS="$(printf '%s\n' "${REQUIRED_ARTIFACTS[@]}" | awk -F: '{print $1}' | jq -R . | jq -sc 'sort + ["gate_result"] | unique')"
+if [[ "$REPORT_ARTIFACT_KEYS" != "$SCHEMA_ARTIFACT_KEYS" ]]; then
+  echo "FAIL: report REQUIRED_ARTIFACTS keys do not equal the aligned YAML/schema artifact ledger" >&2
+  exit 2
+fi
 
 MISSING_ARTIFACTS=()
 for entry in "${REQUIRED_ARTIFACTS[@]}"; do
@@ -346,18 +408,18 @@ for entry in "${REQUIRED_ARTIFACTS[@]}"; do
 done
 ARTIFACTS_JSON="$(jq -c '.gate_result = {path:"evidence/v0.4/gate-result.json", sha256:("0" * 64)}' <<<"$ARTIFACTS_JSON")"
 
-echo "REPORT: all required artifacts present -- independently recomputing 52 hard gates" >&2
+echo "REPORT: all required artifacts present -- independently recomputing $EXPECTED_HARD_GATE_COUNT hard gates" >&2
 set +e
 RECOMPUTE_JSON="$(python3 "$ROOT_DIR/scripts/lib/flow_gate_v0_4_recompute.py" \
   --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT")"
 RECOMPUTE_EXIT=$?
 set -e
-if [[ $RECOMPUTE_EXIT -ne 0 ]] || ! jq -e '
+if [[ $RECOMPUTE_EXIT -ne 0 ]] || ! jq -e --argjson expected_count "$EXPECTED_HARD_GATE_COUNT" --argjson expected_keys "$SCHEMA_HARD_GATE_KEYS" '
   type == "object"
-  and (.hard_gates | type == "object" and length == 52)
+  and (.hard_gates | type == "object" and length == $expected_count and (keys | sort) == $expected_keys)
   and (.reasons | type == "object")
 ' >/dev/null 2>&1 <<<"$RECOMPUTE_JSON"; then
-  echo "FAIL: hard-gate recomputation failed or did not return exactly 52 verdicts" >&2
+  echo "FAIL: hard-gate recomputation failed or did not return the exact aligned $EXPECTED_HARD_GATE_COUNT-key ledger" >&2
   [[ -n "$RECOMPUTE_JSON" ]] && echo "$RECOMPUTE_JSON" >&2
   exit 2
 fi
@@ -396,6 +458,7 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
   --argjson document_seq_verify "$(get_check required.document_seq_verify)" \
   --argjson mcp_transport_verify "$(get_check required.mcp_transport_verify)" \
   --argjson feature_flag_verify "$(get_check required.feature_flag_verify)" \
+  --argjson forms_regression_verify "$(get_check required.forms_regression_verify)" \
   --argjson tool_registry_verify "$(get_check required.tool_registry_verify)" \
   --argjson cli_contract_verify "$(get_check required.cli_contract_verify)" \
   --argjson transport_auth_verify "$(get_check required.transport_auth_verify)" \
@@ -421,6 +484,7 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     document_seq_verify:$document_seq_verify,
     mcp_transport_verify:$mcp_transport_verify,
     feature_flag_verify:$feature_flag_verify,
+    forms_regression_verify:$forms_regression_verify,
     tool_registry_verify:$tool_registry_verify,
     cli_contract_verify:$cli_contract_verify,
     transport_auth_verify:$transport_auth_verify,
@@ -430,6 +494,11 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
     manual_signoff:{command:"scripts/record-flow-v0.4-manual-signoff.sh", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha}
   }')"
+
+if ! jq -e --argjson expected "$SCHEMA_REQUIRED_COMMAND_KEYS" 'keys == $expected' >/dev/null <<<"$REQUIRED_COMMANDS_JSON"; then
+  echo "FAIL: report required_commands keys do not equal the aligned YAML/schema command ledger" >&2
+  exit 2
+fi
 
 GATE_RESULT_PATH="$EVIDENCE_ROOT/gate-result.json"
 GATE_RESULT_TMP="$GATE_RESULT_PATH.tmp"

@@ -80,6 +80,13 @@ ALL_HARD_GATES = [
     "legacy_pages_drop_requires_separate_adr",
 ]
 
+# Ledger invariant: duplicate identifiers would be collapsed by the output
+# dictionary and make a quoted denominator larger than the number of distinct
+# decisions. report/verify additionally require this exact key set to equal the
+# YAML and JSON-schema ledgers before accepting a receipt.
+if len(ALL_HARD_GATES) != len(set(ALL_HARD_GATES)):
+    raise RuntimeError("ALL_HARD_GATES contains duplicate identifiers")
+
 
 def load_json(path: str):
     if not os.path.isfile(path):
@@ -622,13 +629,16 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         reasons,
     )
 
-    # ---- forms regression: backs 1 gate ----
+    # ---- forms regression: backs exactly 1 gate ----
     # scripts/verify-flow-forms-regression-v0.4.sh runs the repository's
     # existing Universal Forms CI gate bundle (scripts/ci-universal-forms-
     # gates.sh -- the same entrypoint CI uses) and writes forms-regression-
     # result.json carrying that run's exact command, exit code, duration,
     # assertion counts, log checksum and its own passed/failed verdict for
-    # forms_regression_no_degradation under `hard_gates`. The bundle had been
+    # forms_regression_no_degradation under `hard_gates`. The report used to
+    # execute the same bundle once in its generic section and once through this
+    # artifact producer; that was duplicate execution, not a second hard-gate
+    # key. Only this artifact-producing run remains canonical. The bundle had been
     # passing every round while nobody recorded it, which is why this gate sat
     # at not_verified. Bridged verbatim -- see bridge_verifier_gates()
     # docstring; absent artifact still means not_verified, never passed.

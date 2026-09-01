@@ -22,6 +22,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+CONTRACTS_ROOT="/opt/working/sylvode-flow"
 REPO_ROOT="$ROOT_DIR"
 SCHEMA_PATH="$ROOT_DIR/docs/schemas/sylvode-flow-gate-v0.4.schema.json"
 GATE_RESULT_PATH=""
@@ -53,6 +54,9 @@ Options:
                           <evidence-root>/gate-result.json
   --evidence-root DIR    Root passed through to verify-flow-v0.4-json.sh.
                           Default: /opt/working/sylvode-flow/evidence/v0.4
+  --contracts-root DIR   Contract root passed through to verify so the YAML
+                          ledger is checked against the schema. Default:
+                          /opt/working/sylvode-flow
   --repo-root DIR         Path passed through to verify-flow-v0.4-json.sh.
                           Default: this checkout.
   --schema PATH           Path passed through to verify-flow-v0.4-json.sh.
@@ -69,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --json) JSON_MODE=1; shift ;;
     --gate-result) GATE_RESULT_PATH="${2:?--gate-result requires a PATH argument}"; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
+    --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --schema) SCHEMA_PATH="${2:?--schema requires a PATH argument}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -105,7 +110,7 @@ fi
 
 echo "=== Running scripts/verify-flow-v0.4-json.sh (authoritative automated result) ===" >&2
 set +e
-VERIFY_OUTPUT="$("$VERIFY_SCRIPT" "$GATE_RESULT_PATH" --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --schema "$SCHEMA_PATH" --json 2>&1)"
+VERIFY_OUTPUT="$("$VERIFY_SCRIPT" "$GATE_RESULT_PATH" --evidence-root "$EVIDENCE_ROOT" --contracts-root "$CONTRACTS_ROOT" --repo-root "$REPO_ROOT" --schema "$SCHEMA_PATH" --json 2>&1)"
 VERIFY_EXIT=$?
 set -e
 while IFS= read -r line; do

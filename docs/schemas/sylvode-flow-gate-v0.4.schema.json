@@ -157,6 +157,7 @@
         "document_seq_verify",
         "mcp_transport_verify",
         "feature_flag_verify",
+        "forms_regression_verify",
         "tool_registry_verify",
         "cli_contract_verify",
         "transport_auth_verify",
@@ -216,6 +217,9 @@
           "$ref": "#/$defs/required_command_result"
         },
         "feature_flag_verify": {
+          "$ref": "#/$defs/required_command_result"
+        },
+        "forms_regression_verify": {
           "$ref": "#/$defs/required_command_result"
         },
         "tool_registry_verify": {
@@ -741,6 +745,9 @@
         "integrity_records_result",
         "authz_baseline_result",
         "surface_coverage_result",
+        "migration_result",
+        "document_seq_result",
+        "tool_registry_result",
         "legacy_pages_inventory",
         "gate_result"
       ],
@@ -794,6 +801,15 @@
           "$ref": "#/$defs/artifact_entry"
         },
         "surface_coverage_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "migration_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "document_seq_result": {
+          "$ref": "#/$defs/artifact_entry"
+        },
+        "tool_registry_result": {
           "$ref": "#/$defs/artifact_entry"
         },
         "legacy_pages_inventory": {

@@ -5,7 +5,9 @@ set -euo pipefail
 #
 # Contract: gates/gate-commands.md
 #   - 「通用命令束」requires every report to run and record the exact command
-#     `bash scripts/ci-universal-forms-gates.sh`;
+#     `bash scripts/ci-universal-forms-gates.sh`; since the 2026-09-01 ledger
+#     correction, v0.4 records this wrapper as the one canonical execution and
+#     does not also run the same command in the generic section;
 #   - 「防假绿」requires exact command + exit + duration + artifact checksum to
 #     be recorded ("手工复制终端文字不是 evidence"), requires a targeted run to
 #     prove executed check count > 0, and states that a missing script is a

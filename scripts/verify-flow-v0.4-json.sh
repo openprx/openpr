@@ -28,6 +28,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+CONTRACTS_ROOT="/opt/working/sylvode-flow"
 REPO_ROOT="$ROOT_DIR"
 SCHEMA_PATH="$ROOT_DIR/docs/schemas/sylvode-flow-gate-v0.4.schema.json"
 RECEIPT_STATE_FILTER="$ROOT_DIR/scripts/lib/flow_gate_v0_4_receipt_state.jq"
@@ -53,6 +54,9 @@ Options:
                         source.head, and whose migrations/ directory is
                         scanned for legacy_pages_drop_requires_separate_adr.
                         Default: this checkout.
+  --contracts-root DIR  Root containing gates/v0.4-gate.yaml. Its artifacts,
+                        required_commands and hard_gates key sets must exactly
+                        match the schema. Default: /opt/working/sylvode-flow
   --schema PATH         Path to the v0.4 gate schema (structural
                         required-key check only -- this script does not
                         implement a general JSON Schema validator).
@@ -68,6 +72,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
+    --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --schema) SCHEMA_PATH="${2:?--schema requires a PATH argument}"; shift 2 ;;
     --json) JSON_MODE=1; shift ;;
@@ -109,6 +114,11 @@ if [[ ! -f "$SCHEMA_PATH" ]]; then
   echo "FAIL: schema file not found: $SCHEMA_PATH" >&2
   exit 2
 fi
+GATE_YAML="$CONTRACTS_ROOT/gates/v0.4-gate.yaml"
+if [[ ! -f "$GATE_YAML" ]]; then
+  echo "FAIL: v0.4 gate contract not found: $GATE_YAML" >&2
+  exit 2
+fi
 if [[ ! -f "$RECEIPT_STATE_FILTER" ]]; then
   echo "FAIL: receipt-state filter not found: $RECEIPT_STATE_FILTER" >&2
   exit 2
@@ -120,6 +130,37 @@ fi
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 DRIFT=()
+
+yaml_map_json() {
+  local section="$1"
+  awk -v section="$section" '
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    $0 == section ":" { inside=1; next }
+    inside && $0 ~ /^[^[:space:]#]/ { exit }
+    inside && $0 ~ /^  [A-Za-z0-9_]+:/ {
+      line=substr($0,3); split_at=index(line, ":")
+      key=substr(line,1,split_at-1); value=trim(substr(line,split_at+1))
+      sub(/[[:space:]]+#.*$/, "", value)
+      printf "%s\t%s\n", key, value
+    }
+  ' "$GATE_YAML" | jq -Rn '
+    [inputs | capture("^(?<key>[^\\t]+)\\t(?<value>.*)$") | {key:.key,value:.value}] | from_entries'
+}
+
+# YAML is the release ledger and the JSON schema is the receipt wire contract.
+# A key existing in only one of them is malformed evidence, not ordinary drift:
+# it can otherwise recreate the missing-producer hole that made gate-result.json
+# structurally impossible to produce.
+for ledger_section in artifacts required_commands hard_gates; do
+  yaml_keys="$(yaml_map_json "$ledger_section" | jq -c 'keys')"
+  schema_keys="$(jq -c --arg s "$ledger_section" '.properties[$s].required | sort' "$SCHEMA_PATH")"
+  if [[ "$yaml_keys" != "$schema_keys" ]]; then
+    echo "FAIL: v0.4 ledger is structurally inconsistent: YAML $ledger_section keys do not equal schema required keys" >&2
+    echo "  yaml:   $yaml_keys" >&2
+    echo "  schema: $schema_keys" >&2
+    exit 2
+  fi
+done
 
 # ---- structural pre-flight: verify the document's SHAPE before any jq call that
 # assumes it, so a malformed/incomplete gate-result.json produces a clear exit-2
