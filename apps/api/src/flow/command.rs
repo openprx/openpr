@@ -261,10 +261,18 @@ async fn replay_created_object(
     Ok(Some(accepted_change_from_row(view, existing.id)))
 }
 
-/// `details.reason` on the `invalid_update` a create with a parent in a different project scope
-/// gets. `ADR-0013` §2.2 R17 names the invariant but freezes no code for the create side (only
-/// `move_object`'s `subtree_spans_multiple_projects`), so this spelling is this implementation's
-/// and is listed as a contract item to ratify.
+/// `details.reason` on the `invalid_update` a create that *explicitly declares* a `project_id`
+/// other than its parent's gets. Frozen by contract, not chosen here: `rest-api-v1.md` "v0.5 起,
+/// `POST /workspaces/{workspace_id}/flow/objects` 携带 `parent_object_id` 时" spells this exact
+/// string for the create side, and `ADR-0013` §2.2 R17's first step repeats it. The earlier note
+/// here — that only `move_object`'s `subtree_spans_multiple_projects` was frozen and that this
+/// spelling was the implementation's own, pending ratification — is obsolete and was wrong from
+/// the contract's side: it is ratified.
+///
+/// The same two contract sentences also bound *when* this reason may be produced: only for a
+/// declared-and-different scope. An **omitted** `project_id` is not a declaration of the
+/// unprojected scope — the server inherits the parent's own value, `NULL` included — so it never
+/// reaches this rejection. See `create_object`'s parent branch.
 pub const CHILD_PROJECT_MUST_MATCH_PARENT: &str = "child_project_must_match_parent";
 
 pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result<AcceptedChange, ApiError> {
@@ -296,6 +304,13 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         }
     }
 
+    // The scope the row is actually written with. It equals `input.project_id` for a root object
+    // and for a child that declared its parent's scope; for a child that *omitted* `project_id`
+    // the parent branch below replaces it with the parent's own value (`NULL` included), which is
+    // the inheritance `rest-api-v1.md` and `ADR-0013` §2.2 R17 require. Nothing between here and
+    // `insert_flow_object` may go back to reading `input.project_id` for the stored scope.
+    let mut effective_project_id = input.project_id;
+
     if let Some(parent_id) = input.parent_object_id {
         let parent = repository::fetch_parent_object(&state.db, parent_id)
             .await?
@@ -325,17 +340,42 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         // answer: the caller learns which of the two fields to change, and the constraint stays
         // what it should be -- the backstop, not the error message.
         //
-        // `NULL` compares as a scope, not as "unspecified": leaving `project_id` off a child of a
-        // projected parent is a rejection, because the child's ordering entry would land in the
-        // unprojected navigator while its parent's sits in the project's one. That is the same
-        // two-navigator subtree the invariant exists to prevent, just with one of the two scopes
-        // spelled `NULL`.
-        if input.project_id != parent.project_id {
-            return Err(ApiError::invalid_update_with_details(
-                "project_id must equal the parent object's project_id: a non-root object sits in \
-                 its parent's project scope (leave project_id unset only when the parent is unprojected)",
-                json!({ "reason": CHILD_PROJECT_MUST_MATCH_PARENT }),
-            ));
+        // Declaring vs. omitting are two different requests and the contract gives them two
+        // different answers (`rest-api-v1.md` "v0.5 起 ...": 显式携带且与父级不一致 → reject;
+        // 省略 → 由服务端继承父级的值，包括父级为 `NULL` 的未投影 scope):
+        //
+        // - **Declared and different** is the rejection. `NULL` is a real scope on the declared
+        //   side too, so `Some(project)` under an unprojected parent is just as much a mismatch as
+        //   `Some(other_project)` under a projected one — the child's ordering entry would land in
+        //   a different navigator document from its parent's, which is exactly the two-navigator
+        //   subtree the invariant exists to prevent.
+        // - **Declared and equal** passes untouched.
+        // - **Omitted** inherits. Reading omission as "the caller declared the unprojected scope"
+        //   would reject the most ordinary request there is ("new child page under this page") and
+        //   would be the server picking a scope the caller never named — `rest-api-v1.md`'s "不得
+        //   把省略解释成另一个 scope" forbids precisely that.
+        //
+        // `project_id: Option<Uuid>` cannot separate an omitted field from an explicit JSON
+        // `null` (serde folds both to `None`, and `CreateFlowObjectRequest` has the same shape),
+        // so an explicit `null` is treated as omission and inherits. The contract only ever
+        // speaks of 省略/omission and freezes no distinct answer for a declared `null`, so no
+        // frozen behaviour is lost; widening the type would change `CreateObjectInput` for every
+        // caller, and is left as the thing to do if the contract ever splits the two.
+        //
+        // Inheritance keeps `flow_objects_parent_project_fk` satisfied by construction rather than
+        // relaxing it: the row goes in carrying the parent's own scope, so the *stored* values
+        // still compare equal and the constraint (which is deliberately blind to how the value was
+        // obtained) never sees a difference.
+        match input.project_id {
+            Some(declared) if parent.project_id != Some(declared) => {
+                return Err(ApiError::invalid_update_with_details(
+                    "project_id must equal the parent object's project_id: a non-root object sits in \
+                     its parent's project scope (omit project_id to inherit the parent's scope)",
+                    json!({ "reason": CHILD_PROJECT_MUST_MATCH_PARENT }),
+                ));
+            }
+            Some(_) => {}
+            None => effective_project_id = parent.project_id,
         }
         // The write-side half of `ADR-0012` §3's depth/cycle rule. The read side already fails
         // closed on an over-deep, cyclic, or incomplete inheritance chain
@@ -380,7 +420,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         &NewFlowObject {
             id: object_id,
             workspace_id: input.workspace_id,
-            project_id: input.project_id,
+            project_id: effective_project_id,
             object_type: input.object_type.clone(),
             parent_id: input.parent_object_id,
             created_by: input.actor_id,
@@ -418,7 +458,11 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         &tx,
         BusinessEventInput {
             workspace_id: input.workspace_id,
-            project_id: input.project_id,
+            // The event's scope is the object's scope, and after inheritance those are
+            // `effective_project_id`, not the possibly-omitted request field. A `flow.object.created`
+            // row filed under the unprojected scope for an object stored in a project's scope would
+            // make every project-filtered event read disagree with `flow_objects` itself.
+            project_id: effective_project_id,
             event_type: "flow.object.created".to_string(),
             aggregate_type: "flow_object".to_string(),
             aggregate_id: object_id.to_string(),
@@ -474,7 +518,9 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     let object = FlowObjectView {
         id: object_id,
         workspace_id: input.workspace_id,
-        project_id: input.project_id,
+        // Same reason as the event above: this view is the caller's copy of the row that was just
+        // committed, so it reports the inherited scope, not the omitted request field.
+        project_id: effective_project_id,
         parent_id: input.parent_object_id,
         object_type: input.object_type,
         lifecycle_status: "active".to_string(),
@@ -1939,6 +1985,7 @@ mod database_tests {
     use super::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::authz;
+    use crate::flow::model::AcceptedChange;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
@@ -2451,6 +2498,374 @@ mod database_tests {
             ApiErrorKind::InvalidUpdate,
             "a cyclic parent chain must fail closed as invalid_update, got {err:?}"
         );
+
+        scratch.drop_self().await;
+    }
+
+    // ---- 5. `project_id` inheritance from `parent_object_id` (`rest-api-v1.md` v0.5 create) ----
+
+    async fn seed_project(db: &DatabaseConnection, workspace_id: Uuid, key: &str) -> Uuid {
+        let project_id = Uuid::new_v4();
+        exec(
+            db,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, $3, $3, (SELECT created_by FROM workspaces WHERE id = $2))",
+            vec![project_id.into(), workspace_id.into(), key.into()],
+        )
+        .await;
+        project_id
+    }
+
+    async fn try_create(
+        state: &AppState,
+        fx: &Fixture,
+        object_type: &str,
+        project_id: Option<Uuid>,
+        parent: Option<Uuid>,
+    ) -> Result<AcceptedChange, ApiError> {
+        create_object(
+            state,
+            CreateObjectInput {
+                workspace_id: fx.workspace_id,
+                actor_id: fx.owner_id,
+                object_type: object_type.to_string(),
+                project_id,
+                parent_object_id: parent,
+                title: format!("Scope Test {object_type}"),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+    }
+
+    /// The committed `flow_objects.project_id`, read back as its own nullable column so a `NULL`
+    /// scope stays distinguishable from any UUID (including the nil UUID that `0056`'s generated
+    /// `project_scope_id` normalises `NULL` onto — that normalisation belongs to the constraint
+    /// key, never to the stored `project_id`).
+    async fn stored_project_id(db: &DatabaseConnection, object_id: Uuid) -> Option<Uuid> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            project_id: Option<Uuid>,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT project_id FROM flow_objects WHERE id = $1",
+            vec![object_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("query runs")
+        .expect("the object row is committed and readable")
+        .project_id
+    }
+
+    async fn created_event_project_id(db: &DatabaseConnection, object_id: Uuid) -> Option<Uuid> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            project_id: Option<Uuid>,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT project_id FROM business_events \
+             WHERE event_type = 'flow.object.created' AND aggregate_id = $1",
+            vec![object_id.to_string().into()],
+        ))
+        .one(db)
+        .await
+        .expect("query runs")
+        .expect("the creation event is committed and readable")
+        .project_id
+    }
+
+    async fn scalar_i64(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            value: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .one(db)
+            .await
+            .expect("count query runs")
+            .expect("count query returns a row")
+            .value
+    }
+
+    fn reason_of(err: &ApiError) -> Option<String> {
+        let ApiError::Typed { details, .. } = err else {
+            return None;
+        };
+        details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// ★ `rest-api-v1.md` ("v0.5 起 ... 请求**省略** `project_id` 时由服务端继承父级的值") and
+    /// `ADR-0013` §2.2 R17 ("省略时继承父级 scope"): omitting `project_id` under a projected parent
+    /// is the most ordinary create there is — "a new child page under this page" — and the server
+    /// answers it by writing the *parent's* scope. Reading omission as a declaration of the
+    /// unprojected scope and rejecting it is the defect this pins: it turns a legal request into
+    /// `child_project_must_match_parent` and leaves callers no way to spell "same scope as my
+    /// parent" except by re-deriving it client-side.
+    ///
+    /// The assertion is deliberately on the **committed row**, not on the response body: a
+    /// response echoing the request field would look right while the row went in unprojected.
+    /// The event's scope is checked for the same reason.
+    #[tokio::test]
+    async fn create_object_inherits_a_projected_parents_scope_when_project_id_is_omitted() {
+        let scratch = scratch_or_skip!("scope_inherit_projected");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let project = seed_project(&scratch.db, fx.workspace_id, "SCOPEA").await;
+
+        let parent = try_create(&state, &fx, "navigator", Some(project), None)
+            .await
+            .expect("a projected root is created")
+            .object;
+        assert_eq!(
+            stored_project_id(&scratch.db, parent.id).await,
+            Some(project),
+            "fixture precondition: the parent really is in the project scope"
+        );
+
+        let accepted = try_create(&state, &fx, "page", None, Some(parent.id))
+            .await
+            .expect("omitting project_id under a projected parent is a legal request");
+
+        assert_eq!(
+            stored_project_id(&scratch.db, accepted.object.id).await,
+            Some(project),
+            "the committed row must carry the inherited scope, not the omitted request field"
+        );
+        assert_eq!(
+            created_event_project_id(&scratch.db, accepted.object.id).await,
+            Some(project),
+            "flow.object.created must be filed under the same scope the row was written with"
+        );
+        assert_eq!(
+            accepted.object.project_id,
+            Some(project),
+            "the response must report the scope the object actually has"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// ★ The `NULL` half of the same rule: `rest-api-v1.md` says the inherited value includes
+    /// "父级为 `NULL` 的未投影 scope". Written so it can fail: the parent is created unprojected and
+    /// *asserted* to be unprojected first, and the child's stored scope is read back as a nullable
+    /// column, so an implementation that inherited through `0056`'s nil-UUID scope normalisation
+    /// (`project_scope_id`) — or that supplied any other placeholder — fails here even though the
+    /// projected-parent test above would still pass.
+    #[tokio::test]
+    async fn create_object_inherits_an_unprojected_parents_null_scope_when_project_id_is_omitted() {
+        let scratch = scratch_or_skip!("scope_inherit_null");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        // A project exists but is not the parent's: nothing may drift into it by accident.
+        let unrelated = seed_project(&scratch.db, fx.workspace_id, "SCOPEU").await;
+
+        let parent = try_create(&state, &fx, "navigator", None, None)
+            .await
+            .expect("an unprojected root is created")
+            .object;
+        assert_eq!(
+            stored_project_id(&scratch.db, parent.id).await,
+            None,
+            "fixture precondition: the parent really is unprojected"
+        );
+
+        let accepted = try_create(&state, &fx, "page", None, Some(parent.id))
+            .await
+            .expect("omitting project_id under an unprojected parent is a legal request");
+
+        let stored = stored_project_id(&scratch.db, accepted.object.id).await;
+        assert_eq!(
+            stored, None,
+            "an unprojected parent's scope is NULL and must be inherited as NULL, not as the nil \
+             UUID and not as any project (got {stored:?}, unrelated project is {unrelated})"
+        );
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM flow_objects WHERE id = $1 AND project_id IS NULL",
+                vec![accepted.object.id.into()],
+            )
+            .await,
+            1,
+            "the column itself must be SQL NULL"
+        );
+        assert_eq!(
+            created_event_project_id(&scratch.db, accepted.object.id).await,
+            None,
+            "flow.object.created must be filed unprojected too"
+        );
+        assert_eq!(accepted.object.project_id, None, "the response must report NULL");
+
+        scratch.drop_self().await;
+    }
+
+    /// The committed-row count of objects that violate "a non-root object sits in its parent's
+    /// project scope". Backed by `flow_object_project_scope_violations` (migration `0056`), the
+    /// same monitor view `move_object`'s own suite asserts against, so both write paths are held
+    /// to one definition of the invariant instead of two hand-rolled queries.
+    async fn scope_violation_count(db: &DatabaseConnection) -> i64 {
+        crate::flow::repository::project_scope_violation_count(db)
+            .await
+            .expect("the invariant monitor view is queryable")
+    }
+
+    /// ★ The write path answers `ADR-0013` §2.2 R17's invariant with a decidable error rather than
+    /// letting `flow_objects_parent_project_fk` surface as a 500, and writes nothing when it
+    /// refuses.
+    ///
+    /// This test used to live in `move_object.rs`'s suite, next to the migration-`0056` constraint
+    /// tests it shares an invariant with. It is about `create_object`, so it belongs here.
+    ///
+    /// It covers the *declared* half only. `rest-api-v1.md` ("v0.5 起 ... 请求**显式携带**
+    /// `project_id` 且与父级不一致 ... 请求**省略** `project_id` 时由服务端继承父级的值") and
+    /// `ADR-0013` §2.2 R17 give omission the opposite answer, and an earlier revision of this test
+    /// asserted the rejection for omission too — it was wrong, and the inheritance assertions
+    /// below (plus the two dedicated tests above) are what replaced it. The rejections that remain
+    /// are the ones the contract actually freezes a reason code for: a `project_id` the caller
+    /// spelled out that is not the parent's, in both directions.
+    #[tokio::test]
+    async fn create_object_refuses_a_parent_in_a_different_project_scope() {
+        let scratch = scratch_or_skip!("scope_create");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let project_a = seed_project(&scratch.db, fx.workspace_id, "SCOPEDA").await;
+        let project_b = seed_project(&scratch.db, fx.workspace_id, "SCOPEDB").await;
+
+        let root_a = try_create(&state, &fx, "navigator", Some(project_a), None)
+            .await
+            .expect("a projected root is created")
+            .object
+            .id;
+        let root_unprojected = try_create(&state, &fx, "navigator", None, None)
+            .await
+            .expect("an unprojected root is created")
+            .object
+            .id;
+        let before_objects = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        let before_events = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value FROM business_events \
+             WHERE workspace_id = $1 AND event_type = 'flow.object.created'",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+
+        for (declared, parent, label) in [
+            (Some(project_b), root_a, "a declared project that is not the parent's"),
+            (
+                Some(project_a),
+                root_unprojected,
+                "a declared project under an unprojected parent",
+            ),
+        ] {
+            let err = match try_create(&state, &fx, "page", declared, Some(parent)).await {
+                Ok(accepted) => panic!("{label} must be refused, but object {} was created", accepted.object.id),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.kind(),
+                ApiErrorKind::InvalidUpdate,
+                "{label} must be a decidable invalid_update, not a database 500: {err:?}"
+            );
+            assert_eq!(
+                reason_of(&err).as_deref(),
+                Some(super::CHILD_PROJECT_MUST_MATCH_PARENT),
+                "{label}: {err:?}"
+            );
+        }
+
+        // The refusals wrote nothing: no object row, no document, no projection, no event.
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
+                vec![fx.workspace_id.into()],
+            )
+            .await,
+            before_objects,
+            "a refused create must not leave a flow_objects row behind"
+        );
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM business_events \
+                 WHERE workspace_id = $1 AND event_type = 'flow.object.created'",
+                vec![fx.workspace_id.into()],
+            )
+            .await,
+            before_events,
+            "a refused create must not emit flow.object.created"
+        );
+        assert_eq!(scope_violation_count(&scratch.db).await, 0);
+
+        // The legal shapes still work, so the check is a rule and not a blanket refusal.
+        let same = try_create(&state, &fx, "page", Some(project_a), Some(root_a))
+            .await
+            .expect("a child in its parent's project is legal")
+            .object
+            .id;
+        assert_eq!(stored_project_id(&scratch.db, same).await, Some(project_a));
+        let root = try_create(&state, &fx, "page", Some(project_b), None)
+            .await
+            .expect("a root has no parent to agree with")
+            .object
+            .id;
+        assert_eq!(stored_project_id(&scratch.db, root).await, Some(project_b));
+
+        // Omission is inheritance, not a third scope. The assertion is on the **committed row**,
+        // because that is the value `flow_objects_parent_project_fk` and every project-scoped read
+        // go on to use; a response body echoing the request field would look identical here and be
+        // wrong. Reverting `create_object` to write `input.project_id` makes this line fail.
+        let inherited = try_create(&state, &fx, "page", None, Some(root_a))
+            .await
+            .expect("omitting project_id under a projected parent inherits, it is not a rejection")
+            .object
+            .id;
+        assert_eq!(
+            stored_project_id(&scratch.db, inherited).await,
+            Some(project_a),
+            "an omitted project_id must be filled in from the parent, not stored as NULL"
+        );
+
+        // The `NULL` half of the same sentence ("包括父级为 `NULL` 的未投影 scope"). Note what this
+        // one can and cannot catch: inheriting `NULL` from an unprojected parent and never
+        // inheriting at all are indistinguishable *here*, so this is a regression guard rather
+        // than the case that would have caught the original defect. It is not vacuous, though —
+        // it fails if the inherited value is materialised as anything other than SQL `NULL` (for
+        // instance as `0056`'s nil-UUID `project_scope_id` sentinel), and it fails if the omitted
+        // branch is ever made to fail closed on an unprojected parent.
+        let unprojected = try_create(&state, &fx, "page", None, Some(root_unprojected))
+            .await
+            .expect("an unprojected child of an unprojected parent is legal")
+            .object
+            .id;
+        assert_eq!(stored_project_id(&scratch.db, unprojected).await, None);
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM flow_objects WHERE id = $1 AND project_id IS NULL",
+                vec![unprojected.into()],
+            )
+            .await,
+            1,
+            "the inherited NULL must be SQL NULL, not a sentinel UUID"
+        );
+
+        // Every shape created above still satisfies the invariant the constraint enforces.
+        assert_eq!(scope_violation_count(&scratch.db).await, 0);
 
         scratch.drop_self().await;
     }
