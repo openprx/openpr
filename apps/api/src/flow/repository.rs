@@ -174,6 +174,11 @@ pub async fn fetch_project_workspace<C: ConnectionTrait>(conn: &C, project_id: U
 pub struct ParentRow {
     pub workspace_id: Uuid,
     pub lifecycle_status: String,
+    /// The parent's project scope. `create_object` needs it because `ADR-0013` §2.2 R17 makes
+    /// "a non-root object sits in its parent's project scope" an invariant, and the write path
+    /// has to reject a mismatch with a decidable error instead of letting
+    /// `flow_objects_parent_project_fk` answer with a 500.
+    pub project_id: Option<Uuid>,
 }
 
 pub async fn fetch_parent_object<C: ConnectionTrait>(conn: &C, parent_id: Uuid) -> Result<Option<ParentRow>, ApiError> {
@@ -181,10 +186,11 @@ pub async fn fetch_parent_object<C: ConnectionTrait>(conn: &C, parent_id: Uuid) 
     struct Row {
         workspace_id: Uuid,
         lifecycle_status: String,
+        project_id: Option<Uuid>,
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT workspace_id, lifecycle_status FROM flow_objects WHERE id = $1",
+        "SELECT workspace_id, lifecycle_status, project_id FROM flow_objects WHERE id = $1",
         vec![parent_id.into()],
     ))
     .one(conn)
@@ -192,6 +198,7 @@ pub async fn fetch_parent_object<C: ConnectionTrait>(conn: &C, parent_id: Uuid) 
     Ok(row.map(|r| ParentRow {
         workspace_id: r.workspace_id,
         lifecycle_status: r.lifecycle_status,
+        project_id: r.project_id,
     }))
 }
 
@@ -985,6 +992,67 @@ pub async fn subtree_height<C: ConnectionTrait>(
     .one(conn)
     .await?;
     Ok(row.map_or(0, |r| r.height))
+}
+
+/// The distinct project scopes of `object_id`'s **strict** descendants.
+///
+/// `None` is a scope like any other here (the unprojected navigator is a real document that real
+/// ordering entries live in), so the result is deliberately `Option<Uuid>` rather than a filtered
+/// list of ids -- collapsing `NULL` away would make a subtree that straddles a project and the
+/// unprojected scope look single-scoped, which is the exact shape `ADR-0013` §2.2 R17 exists to
+/// catch.
+///
+/// Same recursion and same `probe_depth` termination as [`subtree_height`], for the same reason: a
+/// corrupted `parent_id` cycle below the object must end the query rather than spin.
+pub async fn descendant_project_scopes<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+    probe_depth: i64,
+) -> Result<Vec<Option<Uuid>>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        project_id: Option<Uuid>,
+    }
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "WITH RECURSIVE subtree AS ( \
+             SELECT o.id, 0 AS depth FROM flow_objects o \
+              WHERE o.id = $1 AND o.workspace_id = $2 \
+             UNION ALL \
+             SELECT c.id, s.depth + 1 FROM subtree s \
+               JOIN flow_objects c ON c.parent_id = s.id AND c.workspace_id = $2 \
+              WHERE s.depth < $3::int \
+         ) \
+         SELECT DISTINCT o.project_id FROM subtree s \
+           JOIN flow_objects o ON o.id = s.id \
+          WHERE s.depth > 0",
+        vec![object_id.into(), workspace_id.into(), probe_depth.into()],
+    ))
+    .all(conn)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.project_id).collect())
+}
+
+/// How many rows currently break the `ADR-0013` §2.2 R17 parent/child project-scope invariant.
+///
+/// Reads `flow_object_project_scope_violations` (migration `0056`) rather than restating its
+/// query, so "the constraint is enforced" and "the monitor says it is enforced" cannot drift apart
+/// -- a test asserting on a private copy of the predicate would keep passing after the view was
+/// changed to look at something else.
+pub async fn project_scope_violation_count<C: ConnectionTrait>(conn: &C) -> Result<i64, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        violations: i64,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT count(*)::bigint AS violations FROM flow_object_project_scope_violations",
+        vec![],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map_or(0, |r| r.violations))
 }
 
 /// Rewrites the two governance columns a cross-parent move owns, in one parameterized statement.

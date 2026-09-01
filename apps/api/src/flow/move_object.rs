@@ -568,6 +568,11 @@ async fn run_locked_phase(
     // `tx`, not on a second connection: it must see the same snapshot the locked rows above came
     // from, or the rule is being checked against a state this transaction is not committing.
     check_cycle_and_depth(tx, plan, &locked_chain.ids).await?;
+    // Re-decided under the locks, for the same reason the cycle/depth rules are: the unlocked
+    // pre-check ran before this transaction existed. `lock_movable_object`'s `FOR UPDATE` on the
+    // moved object conflicts with the `FOR KEY SHARE` a concurrent child insert takes on its
+    // parent, so from here the subtree cannot gain a member behind this command's back.
+    ensure_move_keeps_the_subtree_in_one_project(tx, plan.workspace_id, plan.object_id, target.project_id).await?;
 
     // `ADR-0012` §4's double-sided rule, re-decided on this transaction's own snapshot rather
     // than trusted from the unlocked pre-check. `caller_before` is therefore also the level the
@@ -853,6 +858,60 @@ async fn check_cycle_and_depth<C: sea_orm::ConnectionTrait>(
     Ok(())
 }
 
+/// `details.reason` on the transitional refusal `ADR-0013` §2.2 R17 and `rest-api-v1.md`'s
+/// `move_object` clause both spell out by name.
+pub const SUBTREE_SPANS_MULTIPLE_PROJECTS: &str = "subtree_spans_multiple_projects";
+
+/// The transitional fail-closed rule for `project_id` cascading (`ADR-0013` §2.2 R17).
+///
+/// The ruling has two steps and this is the gap between them. Step one -- migration `0056`'s
+/// `flow_objects_parent_project_fk` -- makes "a subtree belongs to one project scope" a database
+/// invariant. Step two, cascading the subtree's `project_id` and ordering entries with the moved
+/// object, is blocked on `limits-v1.md`'s `move_subtree_nodes_max`, which is still
+/// `status: unset`. Until it is frozen, this command must refuse anything the non-cascading
+/// implementation would answer wrongly, because both alternatives are explicitly rejected by the
+/// ADR: silently not cascading is a known data inconsistency, and silently cascading breaks the
+/// declared `BoundedMany(2)` document ceiling.
+///
+/// The rule is one predicate over the post-move subtree, computed **without** cascading: the moved
+/// object would land in `target_project_id` while every descendant keeps the scope it has, so the
+/// set of scopes that subtree would span is `{target_project_id} ∪ {descendant scopes}`. More than
+/// one entry means this move cannot be completed correctly today. That covers both reachable
+/// causes with one code:
+///
+/// * **a cross-project move of an object that has descendants** -- the common case, and after
+///   `0056` also the case the database itself would refuse: rewriting the moved row's
+///   `project_id` while its children still reference the old scope violates the foreign key, so
+///   without this check the caller gets a 500 instead of a decision;
+/// * **a subtree that already spans scopes** -- pre-`0056` data. Unreachable for anything created
+///   after the constraint lands, kept because defence in depth is the point: the check must not
+///   depend on the constraint having been applied to the database it is running against.
+///
+/// `None` participates as a scope value, matching the invariant's own NULL semantics.
+async fn ensure_move_keeps_the_subtree_in_one_project<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+    target_project_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let probe = i64::try_from(TREE_DEPTH_MAX.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut scopes: std::collections::BTreeSet<Option<Uuid>> =
+        repository::descendant_project_scopes(conn, workspace_id, object_id, probe)
+            .await?
+            .into_iter()
+            .collect();
+    scopes.insert(target_project_id);
+    if scopes.len() > 1 {
+        return Err(ApiError::invalid_update_with_details(
+            "this move would leave the subtree spanning more than one project scope; cascading \
+             project_id across a subtree is gated on the move_subtree_nodes_max limit, which is \
+             not frozen yet",
+            json!({ "reason": SUBTREE_SPANS_MULTIPLE_PROJECTS }),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------------------------
@@ -1012,6 +1071,7 @@ pub async fn execute_on(
         navigator_object_ids,
     };
     check_cycle_and_depth(&state.db, &plan, &plan.target_chain).await?;
+    ensure_move_keeps_the_subtree_in_one_project(&state.db, workspace_id, plan.object_id, target.project_id).await?;
 
     // [layer 0] every contended document's admission slot, ascending, before anything else.
     let Ok(_permits) = collab.coordinator.acquire_many(&plan.document_lock_order).await else {
@@ -2559,6 +2619,474 @@ mod database_tests {
         assert_eq!(err.kind(), ApiErrorKind::InvalidUpdate, "got {err:?}");
 
         assert_eq!(moved_event_count(&scratch.db, fx.workspace_id).await, 0);
+        scratch.drop_self().await;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // 8. WP-07b: the parent/child project-scope invariant, and the transitional fail-closed rule
+    //    that stands in for the cascade until `move_subtree_nodes_max` is frozen (ADR-0013 §2.2 R17).
+    // -----------------------------------------------------------------------------------------
+
+    /// Runs a raw statement and hands back the database's own error instead of panicking on it.
+    /// The constraint tests are *about* that error text, so it has to survive to the assertion.
+    async fn try_exec(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) -> Result<(), sea_orm::DbErr> {
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .await
+            .map(|_| ())
+    }
+
+    async fn try_create(
+        state: &AppState,
+        fx: &Fixture,
+        object_type: &str,
+        project_id: Option<Uuid>,
+        parent: Option<Uuid>,
+    ) -> Result<Uuid, ApiError> {
+        create_object(
+            state,
+            CreateObjectInput {
+                workspace_id: fx.workspace_id,
+                actor_id: fx.owner_id,
+                object_type: object_type.to_string(),
+                project_id,
+                parent_object_id: parent,
+                title: "Scope Fixture".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+        .map(|accepted| accepted.object.id)
+    }
+
+    /// Writes a `flow_objects` row straight through, bypassing `create_object`. Used to build the
+    /// pre-`0056` shapes the constraint is supposed to make impossible.
+    async fn try_insert_raw(
+        db: &DatabaseConnection,
+        fx: &Fixture,
+        project_id: Option<Uuid>,
+        parent_id: Option<Uuid>,
+    ) -> Result<Uuid, sea_orm::DbErr> {
+        let id = Uuid::new_v4();
+        try_exec(
+            db,
+            "INSERT INTO flow_objects (id, workspace_id, project_id, object_type, parent_id) \
+             VALUES ($1, $2, $3, 'page', $4)",
+            vec![id.into(), fx.workspace_id.into(), project_id.into(), parent_id.into()],
+        )
+        .await
+        .map(|()| id)
+    }
+
+    async fn scope_violation_count(db: &DatabaseConnection) -> i64 {
+        crate::flow::repository::project_scope_violation_count(db)
+            .await
+            .expect("the invariant monitor view is queryable")
+    }
+
+    fn reason_of(err: &ApiError) -> Option<String> {
+        let ApiError::Typed { details, .. } = err else {
+            return None;
+        };
+        details
+            .as_ref()
+            .and_then(|d| d.get("reason"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// `ADR-0013` §2.2 R17 step one: the invariant is a database constraint, not an application
+    /// convention, so a writer that never goes through `create_object` is bound by it too.
+    ///
+    /// Both directions of the NULL rule are asserted here rather than left to prose: `project_id`
+    /// is nullable and NULL is a *scope* (the unprojected navigator is a real document), so the
+    /// rule is strict equality with NULL participating — not "NULL means unspecified, allow it
+    /// anywhere". The two rows that would exist under the looser reading (`P -> NULL` and
+    /// `NULL -> P`) are exactly the rows asserted to be rejected.
+    #[tokio::test]
+    async fn the_database_refuses_a_child_in_a_different_project_scope_than_its_parent() {
+        let scratch = scratch_or_skip!("scope_constraint");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+
+        let root_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let root_unprojected = create(&state, &fx, "navigator", None, None).await;
+
+        // Allowed: a root defines its own scope, in either direction.
+        assert_eq!(project_of(&scratch.db, root_a).await, Some(fx.project_a));
+        assert_eq!(project_of(&scratch.db, root_unprojected).await, None);
+
+        // Allowed: child scope == parent scope, for both spellings of "a scope".
+        let same_project = try_insert_raw(&scratch.db, &fx, Some(fx.project_a), Some(root_a))
+            .await
+            .expect("a child in its parent's project is legal");
+        let both_unprojected = try_insert_raw(&scratch.db, &fx, None, Some(root_unprojected))
+            .await
+            .expect("an unprojected child of an unprojected parent is legal");
+
+        // Rejected: a different project.
+        let err = try_insert_raw(&scratch.db, &fx, Some(fx.project_b), Some(root_a))
+            .await
+            .expect_err("a child in another project must be refused by the database");
+        let text = format!("{err}");
+        assert!(
+            text.contains("flow_objects_parent_project_fk"),
+            "the refusal must come from the invariant's own constraint, got: {text}"
+        );
+
+        // Rejected: parent projected, child unprojected. This is the case a plain MATCH SIMPLE
+        // composite foreign key on `(workspace_id, parent_id, project_id)` would let through.
+        let err = try_insert_raw(&scratch.db, &fx, None, Some(root_a))
+            .await
+            .expect_err("an unprojected child of a projected parent must be refused");
+        assert!(
+            format!("{err}").contains("flow_objects_parent_project_fk"),
+            "got: {err}"
+        );
+
+        // Rejected: parent unprojected, child projected — the mirror image.
+        let err = try_insert_raw(&scratch.db, &fx, Some(fx.project_a), Some(root_unprojected))
+            .await
+            .expect_err("a projected child of an unprojected parent must be refused");
+        assert!(
+            format!("{err}").contains("flow_objects_parent_project_fk"),
+            "got: {err}"
+        );
+
+        // Rejected on UPDATE too, not only on INSERT — in both roles of the edge.
+        let err = try_exec(
+            &scratch.db,
+            "UPDATE flow_objects SET project_id = $2 WHERE id = $1",
+            vec![same_project.into(), fx.project_b.into()],
+        )
+        .await
+        .expect_err("moving a child out of its parent's scope must be refused");
+        assert!(
+            format!("{err}").contains("flow_objects_parent_project_fk"),
+            "got: {err}"
+        );
+        let err = try_exec(
+            &scratch.db,
+            "UPDATE flow_objects SET project_id = $2 WHERE id = $1",
+            vec![root_a.into(), fx.project_b.into()],
+        )
+        .await
+        .expect_err("moving a parent out from under its children must be refused");
+        assert!(
+            format!("{err}").contains("flow_objects_parent_project_fk"),
+            "got: {err}"
+        );
+
+        // And nothing above left a violation behind.
+        assert_eq!(scope_violation_count(&scratch.db).await, 0);
+        assert_eq!(project_of(&scratch.db, same_project).await, Some(fx.project_a));
+        assert_eq!(project_of(&scratch.db, both_unprojected).await, None);
+        scratch.drop_self().await;
+    }
+
+    /// The write path answers the same rule with a decidable error rather than letting the
+    /// foreign key surface as a 500, and writes nothing when it refuses.
+    #[tokio::test]
+    async fn create_object_refuses_a_parent_in_a_different_project_scope() {
+        let scratch = scratch_or_skip!("scope_create");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+
+        let root_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let root_unprojected = create(&state, &fx, "navigator", None, None).await;
+        let before_objects = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        let before_events = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value FROM business_events \
+             WHERE workspace_id = $1 AND event_type = 'flow.object.created'",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+
+        for (project, parent, label) in [
+            (Some(fx.project_b), root_a, "a child in a different project"),
+            (None, root_a, "an unprojected child of a projected parent"),
+            (
+                Some(fx.project_a),
+                root_unprojected,
+                "a projected child of an unprojected parent",
+            ),
+        ] {
+            let err = match try_create(&state, &fx, "page", project, Some(parent)).await {
+                Ok(id) => panic!("{label} must be refused, but object {id} was created"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.kind(),
+                ApiErrorKind::InvalidUpdate,
+                "{label} must be a decidable invalid_update, not a database 500: {err:?}"
+            );
+            assert_eq!(
+                reason_of(&err).as_deref(),
+                Some(crate::flow::command::CHILD_PROJECT_MUST_MATCH_PARENT),
+                "{label}: {err:?}"
+            );
+        }
+
+        // The refusals wrote nothing: no object row, no document, no projection, no event.
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
+                vec![fx.workspace_id.into()],
+            )
+            .await,
+            before_objects,
+            "a refused create must not leave a flow_objects row behind"
+        );
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM business_events \
+                 WHERE workspace_id = $1 AND event_type = 'flow.object.created'",
+                vec![fx.workspace_id.into()],
+            )
+            .await,
+            before_events,
+            "a refused create must not emit flow.object.created"
+        );
+        assert_eq!(scope_violation_count(&scratch.db).await, 0);
+
+        // The three legal shapes still work, so the check is a rule and not a blanket refusal.
+        let same = try_create(&state, &fx, "page", Some(fx.project_a), Some(root_a))
+            .await
+            .expect("a child in its parent's project is legal");
+        assert_eq!(project_of(&scratch.db, same).await, Some(fx.project_a));
+        let unprojected = try_create(&state, &fx, "page", None, Some(root_unprojected))
+            .await
+            .expect("an unprojected child of an unprojected parent is legal");
+        assert_eq!(project_of(&scratch.db, unprojected).await, None);
+        let root = try_create(&state, &fx, "page", Some(fx.project_b), None)
+            .await
+            .expect("a root has no parent to agree with");
+        assert_eq!(project_of(&scratch.db, root).await, Some(fx.project_b));
+
+        scratch.drop_self().await;
+    }
+
+    /// The transitional fail-closed rule: until `limits-v1.md`'s `move_subtree_nodes_max` is
+    /// frozen, `move_object` refuses any move that would leave the subtree spanning more than one
+    /// project scope, with the reason code `ADR-0013` §2.2 R17 names.
+    #[tokio::test]
+    async fn move_object_fails_closed_on_a_subtree_that_would_span_project_scopes() {
+        let scratch = scratch_or_skip!("scope_failclosed");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let parent = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let child = create(&state, &fx, "page", Some(fx.project_a), Some(parent)).await;
+        let leaf = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+
+        let doc_a = document_of(&scratch.db, nav_a).await;
+        let doc_b = document_of(&scratch.db, nav_b).await;
+        let before = (
+            head_seq(&scratch.db, doc_a).await,
+            head_seq(&scratch.db, doc_b).await,
+            moved_event_count(&scratch.db, fx.workspace_id).await,
+            epoch_of(&scratch.db, fx.workspace_id).await,
+        );
+
+        // A subtree with descendants cannot cross a project boundary today: cascading is step two
+        // of the ruling and its node ceiling is not frozen.
+        let err = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(parent, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect_err("a subtree cannot cross a project boundary before the cascade exists");
+        assert_eq!(err.kind(), ApiErrorKind::InvalidUpdate, "got {err:?}");
+        assert_eq!(
+            reason_of(&err).as_deref(),
+            Some(super::SUBTREE_SPANS_MULTIPLE_PROJECTS),
+            "the refusal must carry the reason code ADR-0013 s2.2 R17 names, got {err:?}"
+        );
+
+        // Zero change: no re-parent, no head advance, no event, no epoch bump.
+        assert_eq!(parent_of(&scratch.db, parent).await, Some(nav_a), "nothing moved");
+        assert_eq!(project_of(&scratch.db, parent).await, Some(fx.project_a));
+        assert_eq!(parent_of(&scratch.db, child).await, Some(parent), "no partial cascade");
+        assert_eq!(project_of(&scratch.db, child).await, Some(fx.project_a));
+        assert_eq!(
+            (
+                head_seq(&scratch.db, doc_a).await,
+                head_seq(&scratch.db, doc_b).await,
+                moved_event_count(&scratch.db, fx.workspace_id).await,
+                epoch_of(&scratch.db, fx.workspace_id).await,
+            ),
+            before,
+            "the refusal must leave both navigators, the event log and the epoch untouched"
+        );
+        assert_eq!(update_count(&scratch.db, doc_a).await, 0);
+        assert_eq!(update_count(&scratch.db, doc_b).await, 0);
+
+        // The same subtree moved *within* its own scope is unaffected: the rule is about spanning
+        // scopes, not about having descendants.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(parent, fx.owner_id, "owner", json!({ "target_object_id": leaf })),
+        )
+        .await
+        .expect("a same-scope move of a subtree is still allowed");
+        assert_eq!(parent_of(&scratch.db, parent).await, Some(leaf));
+
+        // And a childless object still crosses freely — one node, one scope, two navigators.
+        let single = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(single, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("a leaf crossing a project boundary is the case the cascade is not needed for");
+        assert_eq!(project_of(&scratch.db, single).await, Some(fx.project_b));
+        scratch.drop_self().await;
+    }
+
+    /// Defence in depth: the same refusal on data that already violates the invariant, i.e. rows
+    /// that could only exist on a database predating migration `0056`. The constraint is dropped
+    /// to build them, then restored — so this asserts the *application* check, independently of
+    /// whether the constraint is in place.
+    #[tokio::test]
+    async fn move_object_fails_closed_on_a_pre_existing_cross_project_subtree() {
+        let scratch = scratch_or_skip!("scope_legacy");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let parent = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+
+        // The pre-`0056` world, reproduced exactly: with the constraint gone, a child in another
+        // project is accepted, which is the defect the cross audit found.
+        exec(
+            &scratch.db,
+            "ALTER TABLE flow_objects DROP CONSTRAINT flow_objects_parent_project_fk",
+            vec![],
+        )
+        .await;
+        let stranded = try_insert_raw(&scratch.db, &fx, Some(fx.project_b), Some(parent))
+            .await
+            .expect("without the constraint the illegal shape is accepted — that is the defect");
+        assert_eq!(
+            scope_violation_count(&scratch.db).await,
+            1,
+            "the invariant monitor must see the injected violation, or it is asserting nothing"
+        );
+
+        let before_events = moved_event_count(&scratch.db, fx.workspace_id).await;
+
+        // Same scope on both sides of the move, so nothing about the *move* crosses a boundary —
+        // the subtree itself is what spans, and that is enough to refuse.
+        let sibling = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let err = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(parent, fx.owner_id, "owner", json!({ "target_object_id": sibling })),
+        )
+        .await
+        .expect_err("a subtree that already spans scopes must be refused");
+        assert_eq!(err.kind(), ApiErrorKind::InvalidUpdate, "got {err:?}");
+        assert_eq!(
+            reason_of(&err).as_deref(),
+            Some(super::SUBTREE_SPANS_MULTIPLE_PROJECTS),
+            "got {err:?}"
+        );
+        assert_eq!(parent_of(&scratch.db, parent).await, Some(nav_a), "nothing moved");
+        assert_eq!(project_of(&scratch.db, stranded).await, Some(fx.project_b));
+        assert_eq!(moved_event_count(&scratch.db, fx.workspace_id).await, before_events);
+
+        // Repair the data, restore the constraint: it is accepted again, which proves the repaired
+        // rows really do satisfy it.
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET project_id = $2 WHERE id = $1",
+            vec![stranded.into(), fx.project_a.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "ALTER TABLE flow_objects ADD CONSTRAINT flow_objects_parent_project_fk \
+             FOREIGN KEY (parent_id, project_scope_id) \
+             REFERENCES flow_objects (id, project_scope_id) ON DELETE CASCADE",
+            vec![],
+        )
+        .await;
+        assert_eq!(scope_violation_count(&scratch.db).await, 0);
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(parent, fx.owner_id, "owner", json!({ "target_object_id": sibling })),
+        )
+        .await
+        .expect("once the subtree is single-scoped again the move is ordinary");
+        scratch.drop_self().await;
+    }
+
+    /// The existing-data proof as a repeatable check rather than a one-off query: a
+    /// freshly-migrated database reports zero violations, and the same monitor reports them when
+    /// they are injected (so "zero" is a measurement, not a vacuous truth).
+    #[tokio::test]
+    async fn the_invariant_monitor_reports_zero_on_a_migrated_database_and_counts_real_violations() {
+        let scratch = scratch_or_skip!("scope_monitor");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+
+        assert_eq!(
+            scope_violation_count(&scratch.db).await,
+            0,
+            "a database built from migrations/ must start with no invariant violations"
+        );
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_unprojected = create(&state, &fx, "navigator", None, None).await;
+        for parent in [nav_a, nav_unprojected] {
+            let project = project_of(&scratch.db, parent).await;
+            let child = create(&state, &fx, "page", project, Some(parent)).await;
+            let _ = create(&state, &fx, "page", project, Some(child)).await;
+        }
+        assert_eq!(
+            scope_violation_count(&scratch.db).await,
+            0,
+            "objects created through the write path never violate the invariant"
+        );
+
+        exec(
+            &scratch.db,
+            "ALTER TABLE flow_objects DROP CONSTRAINT flow_objects_parent_project_fk",
+            vec![],
+        )
+        .await;
+        try_insert_raw(&scratch.db, &fx, Some(fx.project_b), Some(nav_a))
+            .await
+            .expect("the constraint is gone, so the illegal row lands");
+        try_insert_raw(&scratch.db, &fx, Some(fx.project_a), Some(nav_unprojected))
+            .await
+            .expect("the constraint is gone, so the illegal row lands");
+        assert_eq!(
+            scope_violation_count(&scratch.db).await,
+            2,
+            "the monitor must count both spellings of a scope mismatch"
+        );
         scratch.drop_self().await;
     }
 }

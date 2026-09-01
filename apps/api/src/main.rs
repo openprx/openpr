@@ -2102,6 +2102,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0055_flow_import_jobs.sql",
         include_str!("../../../migrations/0055_flow_import_jobs.sql"),
     ),
+    (
+        "0056_flow_objects_parent_project_invariant.sql",
+        include_str!("../../../migrations/0056_flow_objects_parent_project_invariant.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2377,6 +2381,14 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     ),
     ("0054_flow_data_layer.sql", SchemaProbe::Relation("flow_objects")),
     ("0055_flow_import_jobs.sql", SchemaProbe::Relation("flow_import_jobs")),
+    // Not `Relation`: this migration creates no table. It adds a generated column, a view and two
+    // constraints, and the one object whose *presence* means the invariant is really enforced is
+    // the foreign key -- probed by its definition, so a database carrying an older, differently
+    // shaped `flow_objects_parent_project_fk` is not mistaken for one that has this migration.
+    (
+        "0056_flow_objects_parent_project_invariant.sql",
+        SchemaProbe::ConstraintContains("flow_objects", "flow_objects_parent_project_fk", "project_scope_id"),
+    ),
 ];
 
 /// One recorded migration outcome.
@@ -2885,7 +2897,8 @@ mod tests {
                 "0052_drop_connectors_and_agent_invocations.sql",
                 "0053_drop_event_outbox.sql",
                 "0054_flow_data_layer.sql",
-                "0055_flow_import_jobs.sql"
+                "0055_flow_import_jobs.sql",
+                "0056_flow_objects_parent_project_invariant.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );

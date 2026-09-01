@@ -261,6 +261,12 @@ async fn replay_created_object(
     Ok(Some(accepted_change_from_row(view, existing.id)))
 }
 
+/// `details.reason` on the `invalid_update` a create with a parent in a different project scope
+/// gets. `ADR-0013` §2.2 R17 names the invariant but freezes no code for the create side (only
+/// `move_object`'s `subtree_spans_multiple_projects`), so this spelling is this implementation's
+/// and is listed as a contract item to ratify.
+pub const CHILD_PROJECT_MUST_MATCH_PARENT: &str = "child_project_must_match_parent";
+
 pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result<AcceptedChange, ApiError> {
     runtime::runtime().ensure_workspace_accepting(input.workspace_id)?;
     validate(&input)?;
@@ -307,6 +313,29 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         }
         if parent.lifecycle_status == "archived" {
             return Err(ApiError::BadRequest("parent_object_id is archived".to_string()));
+        }
+        // `ADR-0013` §2.2 R17: a non-root object sits in its parent's project scope. Until this
+        // check existed, `project_id` and `parent_object_id` were validated *independently* -- each
+        // only against the workspace -- so `P1 root -> P2 child -> P3 grandchild` was a fully legal
+        // shape to create, and a cross-project `move_object` of such a subtree would have to touch
+        // four navigator documents against a declared `BoundedMany(2)` ceiling.
+        //
+        // `flow_objects_parent_project_fk` (migration `0056`) now rejects the same shape at the
+        // database, but a foreign-key violation surfaces as an opaque 500. This is the decidable
+        // answer: the caller learns which of the two fields to change, and the constraint stays
+        // what it should be -- the backstop, not the error message.
+        //
+        // `NULL` compares as a scope, not as "unspecified": leaving `project_id` off a child of a
+        // projected parent is a rejection, because the child's ordering entry would land in the
+        // unprojected navigator while its parent's sits in the project's one. That is the same
+        // two-navigator subtree the invariant exists to prevent, just with one of the two scopes
+        // spelled `NULL`.
+        if input.project_id != parent.project_id {
+            return Err(ApiError::invalid_update_with_details(
+                "project_id must equal the parent object's project_id: a non-root object sits in \
+                 its parent's project scope (leave project_id unset only when the parent is unprojected)",
+                json!({ "reason": CHILD_PROJECT_MUST_MATCH_PARENT }),
+            ));
         }
         // The write-side half of `ADR-0012` §3's depth/cycle rule. The read side already fails
         // closed on an over-deep, cyclic, or incomplete inheritance chain

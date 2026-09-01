@@ -341,6 +341,19 @@ impl ApiError {
         Self::typed(ApiErrorKind::InvalidUpdate, message)
     }
 
+    /// `invalid_update` carrying a machine-readable `details.reason`.
+    ///
+    /// `error-mapping-v1.md` freezes no `details` shape for `invalid_update`, but `ADR-0013` §2.2
+    /// and `rest-api-v1.md`'s `move_object` clause both name a *reason code*
+    /// (`subtree_spans_multiple_projects`) that a caller has to branch on, and the same document's
+    /// first rule is "禁止用英文 message 分支". A reason code that only exists inside the message
+    /// string would violate exactly that. The field name mirrors `server_draining`'s
+    /// `details.reason`, which is the one reason discriminator the contract has already frozen, so
+    /// this does not invent a second spelling for the same idea.
+    pub fn invalid_update_with_details(message: impl Into<String>, details: Value) -> Self {
+        Self::typed_with_details(ApiErrorKind::InvalidUpdate, message, details)
+    }
+
     pub fn policy_rejected(message: impl Into<String>) -> Self {
         Self::typed(ApiErrorKind::PolicyRejected, message)
     }
