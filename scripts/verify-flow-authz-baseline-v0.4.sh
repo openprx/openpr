@@ -21,8 +21,9 @@ set -euo pipefail
 #   2. STATIC (read-only source grep, never edits apps/**): the read
 #      queries in apps/api/src/flow/repository.rs select `fo.parent_id`
 #      (the `flow_objects` alias), not any projection-table alias.
-#   3. STATIC: v0.4's registered command wire names
-#      (apps/api/src/flow/command.rs) contain no cross-parent "move"
+#   3. STATIC: v0.4's registered command wire names (the unique
+#      `v0_4_command_cardinality_registry` found anywhere under the committed
+#      apps/api/src tree) contain no cross-parent "move"
 #      command -- a v0.4 navigator drag cannot invoke anything that
 #      changes `parent_id` between different parents; only v0.4's content
 #      commands (which never touch `parent_id`) and the parent-less
@@ -51,6 +52,8 @@ EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
 ADR_PATH=""
 DATABASE_URL="${OPENPR_TEST_DATABASE_URL:-}"
 JSON_MODE=0
+STATIC_CHECK_3_ONLY=0
+TEST_ADD_V0_4_COMMAND=""
 
 usage() {
   cat <<'EOF'
@@ -72,6 +75,11 @@ Options:
   --evidence-root DIR     Where authz-baseline-result.json is written.
                           Default: /opt/working/sylvode-flow/evidence/v0.4
   --json                  Required for CLI-contract compatibility.
+  --static-check-3-only   Run only the committed-source v0.4 registry check;
+                          writes no evidence artifact and does not use a DB.
+  --test-add-v0-4-command NAME
+                          Test-only fault injection for --static-check-3-only.
+                          Adds NAME to the parsed registry; can never pass.
   -h, --help              Show this help and exit 0.
 
 Exit codes: 0 both gates passed, 1 an assertion failed, 2 usage/tool/environment error.
@@ -85,6 +93,8 @@ while [[ $# -gt 0 ]]; do
     --database-url) DATABASE_URL="${2:?--database-url requires a value}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
+    --static-check-3-only) STATIC_CHECK_3_ONLY=1; shift ;;
+    --test-add-v0-4-command) TEST_ADD_V0_4_COMMAND="${2:?--test-add-v0-4-command requires NAME}"; shift 2 ;;
     --json) JSON_MODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -105,25 +115,31 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
+if [[ -n "$TEST_ADD_V0_4_COMMAND" ]]; then
+  if [[ $STATIC_CHECK_3_ONLY -ne 1 ]]; then
+    echo "FAIL: --test-add-v0-4-command is allowed only with --static-check-3-only" >&2
+    exit 2
+  fi
+  if [[ ! "$TEST_ADD_V0_4_COMMAND" =~ ^[a-z_]+$ ]]; then
+    echo "FAIL: --test-add-v0-4-command NAME must match [a-z_]+" >&2
+    exit 2
+  fi
+fi
 for tool in jq sha256sum git psql curl python3 cargo; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     exit 2
   fi
 done
-COMMAND_RS="$REPO_ROOT/apps/api/src/flow/command.rs"
 REPOSITORY_RS="$REPO_ROOT/apps/api/src/flow/repository.rs"
-for f in "$COMMAND_RS" "$REPOSITORY_RS"; do
-  if [[ ! -f "$f" ]]; then
-    echo "FAIL: source file not found (nothing to statically verify): $f" >&2
-    exit 2
-  fi
-done
+if [[ ! -f "$REPOSITORY_RS" ]]; then
+  echo "FAIL: source file not found (nothing to statically verify): $REPOSITORY_RS" >&2
+  exit 2
+fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
-mkdir -p "$EVIDENCE_ROOT"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CARGO_OUTPUT_DIR="${CARGO_TARGET_DIR:-target}"
@@ -147,11 +163,398 @@ write_environment_failure() {
   exit 1
 }
 
+VIOLATIONS=()
+
+# ---- static 3: frozen v0.4 registry has no cross-parent command ----
+#
+# Read only the committed tree.  The registry may move anywhere inside
+# apps/api/src without weakening the check; moving it outside the scan tree,
+# defining it twice, or changing it to syntax this deliberately small parser
+# cannot prove is a parser_error and therefore a failure.  The exact frozen set
+# prevents an unparsed new spelling from becoming an empty/partial false green.
+REGISTRY_SCAN_JSON="$(python3 - "$REPO_ROOT" "$SOURCE_HEAD" "$TEST_ADD_V0_4_COMMAND" <<'PY'
+import json
+import re
+import subprocess
+import sys
+
+repo_root, source_head, injected_name = sys.argv[1:]
+expected = {
+    "create_object", "set_flow_feature", "set_title", "insert_block",
+    "update_block", "delete_block", "move_block", "semantic_patch",
+    "archive", "restore",
+}
+cross_parent = {"move_object", "change_parent", "reparent"}
+parser_errors = []
+violations = []
+
+
+def git(*args):
+    completed = subprocess.run(
+        ["git", "-C", repo_root, *args], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed ({completed.returncode}): {completed.stderr.strip()}"
+        )
+    return completed.stdout
+
+
+def line_at(text, offset):
+    return text.count("\n", 0, offset) + 1
+
+
+def strip_comments(text):
+    """Blank Rust comments while preserving positions and newlines."""
+    chars = list(text)
+    i = 0
+    state = "code"
+    depth = 0
+    while i < len(chars):
+        c = chars[i]
+        n = chars[i + 1] if i + 1 < len(chars) else ""
+        if state == "code":
+            if c == '"':
+                state = "string"
+            elif c == "'":
+                tail = text[i + 1:i + 8]
+                if re.match(r"(?:\\.|[^'\\])'", tail):
+                    state = "char"
+            elif c == "/" and n == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "line_comment"
+            elif c == "/" and n == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                state = "block_comment"
+                depth = 1
+        elif state == "string":
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                state = "code"
+        elif state == "char":
+            if c == "\\":
+                i += 1
+            elif c == "'":
+                state = "code"
+        elif state == "line_comment":
+            if c == "\n":
+                state = "code"
+            else:
+                chars[i] = " "
+        elif state == "block_comment":
+            if c == "/" and n == "*":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                depth += 1
+            elif c == "*" and n == "/":
+                chars[i] = chars[i + 1] = " "
+                i += 1
+                depth -= 1
+                if depth == 0:
+                    state = "code"
+            elif c != "\n":
+                chars[i] = " "
+        i += 1
+    return "".join(chars)
+
+
+def matching(text, opening, left="{", right="}"):
+    depth = 0
+    state = "code"
+    i = opening
+    while i < len(text):
+        c = text[i]
+        if state == "code":
+            if c == '"':
+                state = "string"
+            elif c == "'":
+                tail = text[i + 1:i + 8]
+                if re.match(r"(?:\\.|[^'\\])'", tail):
+                    state = "char"
+            elif c == left:
+                depth += 1
+            elif c == right:
+                depth -= 1
+                if depth == 0:
+                    return i
+        elif state == "string":
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                state = "code"
+        elif state == "char":
+            if c == "\\":
+                i += 1
+            elif c == "'":
+                state = "code"
+        i += 1
+    return None
+
+
+def remove_cfg_test_items(text):
+    chars = list(text)
+    pattern = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+    cursor = 0
+    while True:
+        match = pattern.search(text, cursor)
+        if not match:
+            break
+        opening = text.find("{", match.end())
+        semi = text.find(";", match.end())
+        if semi >= 0 and (opening < 0 or semi < opening):
+            end = semi
+        elif opening >= 0:
+            end = matching(text, opening)
+            if end is None:
+                end = len(text) - 1
+        else:
+            end = len(text) - 1
+        for index in range(match.start(), end + 1):
+            if chars[index] != "\n":
+                chars[index] = " "
+        cursor = end + 1
+    return "".join(chars)
+
+
+def functions(sources, name):
+    found = []
+    pattern = re.compile(rf"\bfn\s+{re.escape(name)}\s*(?:<[^{{;]*>)?\s*\(")
+    for path, item in sources.items():
+        code = item["code"]
+        for match in pattern.finditer(code):
+            opening = code.find("{", match.end())
+            semi = code.find(";", match.end())
+            if opening < 0 or (semi >= 0 and semi < opening):
+                continue
+            closing = matching(code, opening)
+            if closing is None:
+                found.append({"path": path, "line": line_at(item["raw"], match.start()), "error": "unclosed body"})
+            else:
+                found.append({
+                    "path": path,
+                    "line": line_at(item["raw"], match.start()),
+                    "body": code[opening + 1:closing],
+                })
+    return found
+
+
+def wire_map_for(sources, type_name):
+    mappings = {}
+    method_count = 0
+    impl_pattern = re.compile(rf"\bimpl\s+{re.escape(type_name)}\s*\{{")
+    for path, item in sources.items():
+        code = item["code"]
+        for impl_match in impl_pattern.finditer(code):
+            impl_open = code.find("{", impl_match.start())
+            impl_close = matching(code, impl_open)
+            if impl_close is None:
+                parser_errors.append(f"unclosed impl {type_name} at {path}:{line_at(item['raw'], impl_match.start())}")
+                continue
+            impl_body = code[impl_open + 1:impl_close]
+            for method in re.finditer(r"\bfn\s+wire_name\s*\([^)]*\)[^\{;]*\{", impl_body):
+                method_count += 1
+                method_open = impl_body.find("{", method.start())
+                method_close = matching(impl_body, method_open)
+                if method_close is None:
+                    parser_errors.append(f"unclosed {type_name}::wire_name at {path}")
+                    continue
+                method_body = impl_body[method_open + 1:method_close]
+                arm_pattern = re.compile(
+                    r"((?:Self::[A-Za-z_]\w*\s*(?:\|\s*)?)+)\s*=>\s*\"([^\"]+)\""
+                )
+                for arm in arm_pattern.finditer(method_body):
+                    for variant in re.findall(r"Self::([A-Za-z_]\w*)", arm.group(1)):
+                        if variant in mappings:
+                            parser_errors.append(f"duplicate {type_name}::{variant} wire_name mapping")
+                        mappings[variant] = arm.group(2)
+    if method_count != 1:
+        parser_errors.append(f"expected exactly one parseable {type_name}::wire_name; found {method_count}")
+    return mappings
+
+
+sources = {}
+registry_location = None
+observed_entries = []
+try:
+    paths = sorted(
+        path for path in git("ls-tree", "-r", "--name-only", source_head, "--", "apps/api/src").splitlines()
+        if path.endswith(".rs")
+    )
+    if not paths:
+        raise RuntimeError("committed apps/api/src scan tree contains no Rust files")
+    for path in paths:
+        raw = git("show", f"{source_head}:{path}")
+        sources[path] = {"raw": raw, "code": remove_cfg_test_items(strip_comments(raw))}
+
+    occurrences = functions(sources, "v0_4_command_cardinality_registry")
+    if len(occurrences) != 1 or (occurrences and "error" in occurrences[0]):
+        parser_errors.append(
+            "expected exactly one parseable v0_4_command_cardinality_registry "
+            f"inside committed apps/api/src; found {len(occurrences)}"
+        )
+    else:
+        occurrence = occurrences[0]
+        registry_location = {"file": occurrence["path"], "line": occurrence["line"]}
+        body = occurrence["body"]
+        consumed = [False] * len(body)
+
+        vector = re.search(r"\blet\s+mut\s+registry\s*=\s*vec!\s*\[", body)
+        if not vector:
+            parser_errors.append("registry initializer is not parseable as `let mut registry = vec![...]`")
+        else:
+            vector_open = body.find("[", vector.start())
+            vector_close = matching(body, vector_open, "[", "]")
+            if vector_close is None:
+                parser_errors.append("v0.4 registry vec initializer has no closing bracket")
+            else:
+                semi = body.find(";", vector_close)
+                if semi < 0 or body[vector_close + 1:semi].strip():
+                    parser_errors.append("v0.4 registry vec initializer has an unparseable terminator")
+                else:
+                    content = body[vector_open + 1:vector_close]
+                    tuple_pattern = re.compile(r"\(\s*\"([a-z_]+)\"\s*,\s*[A-Z][A-Z0-9_]*\s*\)")
+                    content_residual = list(content)
+                    for item in tuple_pattern.finditer(content):
+                        observed_entries.append(item.group(1))
+                        for index in range(item.start(), item.end()):
+                            content_residual[index] = " "
+                    if re.sub(r"[\s,]", "", "".join(content_residual)):
+                        parser_errors.append("v0.4 registry vec contains an unparseable entry")
+                    for index in range(vector.start(), semi + 1):
+                        consumed[index] = True
+
+        loop_pattern = re.compile(r"\bfor\s+([a-z_]\w*)\s+in\s*\[")
+        for loop in loop_pattern.finditer(body):
+            variable = loop.group(1)
+            array_open = body.find("[", loop.start())
+            array_close = matching(body, array_open, "[", "]")
+            if array_close is None:
+                parser_errors.append(f"registry loop `{variable}` has no closing array bracket")
+                continue
+            loop_open = body.find("{", array_close)
+            if loop_open < 0 or body[array_close + 1:loop_open].strip():
+                parser_errors.append(f"registry loop `{variable}` has an unparseable body opener")
+                continue
+            loop_close = matching(body, loop_open)
+            if loop_close is None:
+                parser_errors.append(f"registry loop `{variable}` has no closing body brace")
+                continue
+
+            array = body[array_open + 1:array_close]
+            variant_pattern = re.compile(r"\b([A-Z][A-Za-z0-9_]*)::([A-Z][A-Za-z0-9_]*)\b")
+            variants = list(variant_pattern.finditer(array))
+            array_residual = list(array)
+            for variant in variants:
+                for index in range(variant.start(), variant.end()):
+                    array_residual[index] = " "
+            if not variants or re.sub(r"[\s,]", "", "".join(array_residual)):
+                parser_errors.append(f"registry loop `{variable}` contains an unparseable variant list")
+                continue
+
+            loop_body = body[loop_open + 1:loop_close]
+            push_pattern = re.compile(
+                rf"registry\s*\.\s*push\s*\(\s*\(\s*{re.escape(variable)}\s*\.\s*wire_name\s*\(\s*\)\s*,\s*"
+                rf"{re.escape(variable)}\s*\.\s*existing_document_cardinality\s*\(\s*\)\s*\)\s*\)\s*;"
+            )
+            pushes = list(push_pattern.finditer(loop_body))
+            loop_residual = list(loop_body)
+            for push in pushes:
+                for index in range(push.start(), push.end()):
+                    loop_residual[index] = " "
+            if len(pushes) != 1 or re.sub(r"\s", "", "".join(loop_residual)):
+                parser_errors.append(f"registry loop `{variable}` body is not the one recognized push form")
+                continue
+
+            maps = {}
+            for variant in variants:
+                type_name, variant_name = variant.groups()
+                if type_name not in maps:
+                    maps[type_name] = wire_map_for(sources, type_name)
+                wire_name = maps[type_name].get(variant_name)
+                if wire_name is None:
+                    parser_errors.append(f"cannot resolve {type_name}::{variant_name} through wire_name")
+                else:
+                    observed_entries.append(wire_name)
+            for index in range(loop.start(), loop_close + 1):
+                consumed[index] = True
+
+        final_registry = list(re.finditer(r"\bregistry\b", body))
+        unconsumed_registry = [item for item in final_registry if not consumed[item.start()]]
+        if len(unconsumed_registry) == 1:
+            final = unconsumed_registry[0]
+            for index in range(final.start(), final.end()):
+                consumed[index] = True
+        else:
+            parser_errors.append(
+                "expected exactly one final registry expression after parsed initializer/loops; "
+                f"found {len(unconsumed_registry)}"
+            )
+
+        residual = "".join(" " if used else char for char, used in zip(body, consumed))
+        if re.sub(r"\s", "", residual):
+            parser_errors.append("v0.4 registry function contains unrecognized syntax")
+except Exception as exc:
+    parser_errors.append(f"committed-source enumeration/read failure: {exc}")
+
+if len(observed_entries) != len(set(observed_entries)):
+    parser_errors.append("v0.4 registry contains duplicate wire names")
+
+observed = set(observed_entries)
+missing = sorted(expected - observed)
+unexpected = sorted(observed - expected)
+if missing:
+    parser_errors.append(f"cannot prove the complete frozen v0.4 registry; missing={missing}")
+
+if injected_name:
+    observed.add(injected_name)
+    unexpected = sorted(observed - expected)
+
+forbidden = sorted(observed & cross_parent)
+if forbidden:
+    violations.append(f"cross-parent command(s) found in frozen v0.4 registry: {forbidden}")
+if unexpected:
+    violations.append(f"frozen v0.4 registry gained unexpected command(s): {unexpected}")
+
+result = {
+    "scan_root": "apps/api/src",
+    "source_head": source_head,
+    "registry_function": "v0_4_command_cardinality_registry",
+    "registry_location": registry_location,
+    "expected_names": sorted(expected),
+    "observed_names": sorted(observed),
+    "parser_status": "parser_error" if parser_errors else "passed",
+    "parser_errors": parser_errors,
+    "violations": violations,
+    "test_injection": {"added_command": injected_name or None},
+    "passed": not parser_errors and not violations,
+}
+print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+PY
+)"
+
+WIRE_NAMES="$(jq -r '(.observed_names | join(",")) + (if (.observed_names | length) > 0 then "," else "" end)' <<<"$REGISTRY_SCAN_JSON")"
+while IFS= read -r reason; do
+  [[ -z "$reason" ]] || VIOLATIONS+=("static check 3 parser_error: $reason")
+done < <(jq -r '.parser_errors[]' <<<"$REGISTRY_SCAN_JSON")
+while IFS= read -r reason; do
+  [[ -z "$reason" ]] || VIOLATIONS+=("static check 3 registry violation: $reason")
+done < <(jq -r '.violations[]' <<<"$REGISTRY_SCAN_JSON")
+echo "static check 3: committed v0.4 registry = $WIRE_NAMES location=$(jq -c '.registry_location' <<<"$REGISTRY_SCAN_JSON") parser_status=$(jq -r '.parser_status' <<<"$REGISTRY_SCAN_JSON") passed=$(jq -r '.passed' <<<"$REGISTRY_SCAN_JSON")" >&2
+
+if [[ $STATIC_CHECK_3_ONLY -eq 1 ]]; then
+  jq . <<<"$REGISTRY_SCAN_JSON"
+  [[ "$(jq -r '.passed' <<<"$REGISTRY_SCAN_JSON")" == true ]] && exit 0
+  exit 1
+fi
+
+mkdir -p "$EVIDENCE_ROOT"
 [[ -n "$DATABASE_URL" ]] || write_environment_failure "no database URL configured"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc "SELECT 1" >/dev/null 2>&1 || \
   write_environment_failure "configured PostgreSQL environment is unreachable"
-
-VIOLATIONS=()
 
 # ---- static 1: flow_object_projections has no parent-shaped column ----
 PROJ_COLUMNS="$(psql "$DATABASE_URL" -Atc "SELECT string_agg(column_name, ',') FROM information_schema.columns WHERE table_schema='public' AND table_name='flow_object_projections'")"
@@ -168,13 +571,6 @@ if grep -qE "p\.parent_id|projection[a-z_]*\.parent_id" "$REPOSITORY_RS"; then
   VIOLATIONS+=("$REPOSITORY_RS: found a parent_id reference on a projection-table alias")
 fi
 echo "static check 2: fo.parent_id present=$(grep -c 'fo\.parent_id' "$REPOSITORY_RS") projection-alias parent_id refs=$(grep -cE 'p\.parent_id|projection[a-z_]*\.parent_id' "$REPOSITORY_RS")" >&2
-
-# ---- static 3: no cross-parent "move" command registered in v0.4 ----
-WIRE_NAMES="$(grep -oE '"[a-z_]+" =>' "$COMMAND_RS" | sed -E 's/"([a-z_]+)" =>/\1/' | sort -u | tr '\n' ',' )"
-if grep -qE "move_object|change_parent|reparent" <<<"$WIRE_NAMES"; then
-  VIOLATIONS+=("a cross-parent command wire name was found in v0.4's registry: $WIRE_NAMES")
-fi
-echo "static check 3: v0.4 command wire names = $WIRE_NAMES" >&2
 
 # ---- live end-to-end check ----
 echo "=== building api binary (cargo build -p api --bin api) ===" >&2
@@ -328,6 +724,7 @@ OVERALL_PASSED=$([[ "$PASSED_PARENT_AUTHORITY" == true && "$MEMBER_STATUS" == pa
 RESULT="$(jq -n \
   --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" --arg adr "$ADR_PATH" \
   --arg proj_columns "$PROJ_COLUMNS" --arg wire_names "$WIRE_NAMES" \
+  --argjson registry_scan "$REGISTRY_SCAN_JSON" \
   --argjson violations "$VIOLATIONS_JSON" --argjson parent_authority_passed "$PASSED_PARENT_AUTHORITY" \
   --argjson member_baseline "$MEMBER_JSON" --argjson overall_passed "$OVERALL_PASSED" \
   '{
@@ -338,6 +735,7 @@ RESULT="$(jq -n \
     flow_parent_authority_in_postgres: {
       flow_object_projections_columns: $proj_columns,
       v0_4_command_wire_names: $wire_names,
+      v0_4_registry_scan: $registry_scan,
       violations: $violations,
       passed: $parent_authority_passed
     },
