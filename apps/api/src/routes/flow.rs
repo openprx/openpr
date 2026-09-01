@@ -373,7 +373,8 @@ mod flow_database_tests {
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectHistoryQuery,
         GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, SetFlowFeatureRequest,
         create_flow_object, get_flow_feature, get_flow_object, get_flow_object_bootstrap, get_flow_object_history,
-        list_flow_objects, post_flow_object_command, set_flow_feature,
+        list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
+        set_flow_feature,
     };
     use crate::error::ApiError;
     use axum::extract::{Path, Query, State};
@@ -598,6 +599,218 @@ mod flow_database_tests {
             .await
             .expect("response body reads");
         serde_json::from_slice(&bytes).expect("response body is JSON")
+    }
+
+    /// The two v0.5 authorization routes mounted on **their real paths and methods**, with an
+    /// `Extension<JwtClaims>` layer standing in for `bot_or_user_auth_middleware` (which is all
+    /// that middleware contributes for a user caller).
+    ///
+    /// Everything past that point is the production stack: axum's own path routing, its `Json`
+    /// extractor deserializing the raw request bytes, and the handler's own field mapping. Tests
+    /// that construct `SetInheritanceRequest` in Rust and hand it to the handler as `Json(req)`
+    /// skip the first two of those, and — the reason this exists — skip the handler's mapping
+    /// line as well.
+    fn authorization_router(state: AppState, caller_id: Uuid) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/api/v1/flow/objects/{object_id}/grants",
+                axum::routing::put(put_flow_object_grants),
+            )
+            .route(
+                "/api/v1/flow/objects/{object_id}/inheritance",
+                axum::routing::put(put_flow_object_inheritance),
+            )
+            .layer(claims_for(caller_id))
+            .with_state(state)
+    }
+
+    /// Drives one real `PUT` through the router: real bytes in, real `Response` out.
+    async fn http_put(app: &axum::Router, uri: &str, body: &str) -> (axum::http::StatusCode, Value) {
+        use tower::ServiceExt as _;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::PUT)
+                    .uri(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .expect("the request builds"),
+            )
+            .await
+            .expect("the router responds");
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    /// The object's explicit `flow_object_grants` rows, in a stable order. Read from the table,
+    /// not from a response body, so "the reply looked right" cannot cover for "the rows are
+    /// wrong".
+    async fn explicit_roster(state: &AppState, object_id: Uuid) -> Vec<(String, Uuid, String)> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            principal_kind: String,
+            principal_id: Uuid,
+            level: String,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT principal_kind, principal_id, level FROM flow_object_grants \
+              WHERE object_id = $1 ORDER BY principal_kind, principal_id",
+            vec![object_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("query runs")
+        .into_iter()
+        .map(|row| (row.principal_kind, row.principal_id, row.level))
+        .collect()
+    }
+
+    /// Creates a page and gives two bot principals an explicit grant each, both over HTTP.
+    async fn page_with_two_grants(
+        state: &AppState,
+        app: &axum::Router,
+        workspace_id: Uuid,
+        owner_id: Uuid,
+        first: Uuid,
+        second: Uuid,
+    ) -> Uuid {
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Boundary Fixture".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(create_body["code"], 0, "{create_body}");
+        let object_id = Uuid::parse_str(create_body["data"]["object"]["id"].as_str().expect("object id"))
+            .expect("object id is a uuid");
+
+        let (status, body) = http_put(
+            app,
+            &format!("/api/v1/flow/objects/{object_id}/grants"),
+            &json!({
+                "grants": [
+                    {"principal_kind": "bot", "principal_id": first, "level": "full_access"},
+                    {"principal_kind": "bot", "principal_id": second, "level": "edit"},
+                ],
+                "idempotency_key": Uuid::new_v4().to_string(),
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(
+            explicit_roster(state, object_id).await.len(),
+            2,
+            "fixture premise: two explicit grants exist before the boundary"
+        );
+        object_id
+    }
+
+    /// ★ The transport→domain seam of `PUT /api/v1/flow/objects/{object_id}/inheritance`.
+    ///
+    /// `ADR-0012` §4.1 point 2 makes `initial_grants` a whole-table **replacement**, and
+    /// `rest-api-v1.md` spells the field `initial_grants?`. Those two together mean the wire has
+    /// three distinct requests, and conflating the first two wipes an object's entire
+    /// authorization roster on a request that only meant to flip a flag:
+    ///
+    /// | request body | meaning |
+    /// |---|---|
+    /// | no `initial_grants` key | leave every existing grant alone |
+    /// | `"initial_grants": []` | clear every explicit grant |
+    /// | `"initial_grants": [...]` | replace the roster with exactly this list |
+    ///
+    /// This test exists because the domain layer and the deserialization layer were each covered
+    /// on their own while **the handler line that joins them was not**: a one-line change to
+    /// `initial_grants: req.initial_grants.map(...)` — folding `None` into `Some(vec![])` —
+    /// reintroduced the whole defect with every other test still green. Driving a real
+    /// `http::Request` through a real `axum::Router` is what puts that line under test.
+    #[tokio::test]
+    async fn the_inheritance_route_keeps_an_absent_initial_grants_distinct_from_an_empty_one() {
+        let scratch = scratch_or_skip!("inheritance_initial_grants");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let app = authorization_router(state.clone(), owner_id);
+
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        let carol = Uuid::new_v4();
+
+        // (1) The key is absent: a pure boundary flip must not touch a single grant row.
+        let absent = page_with_two_grants(&state, &app, workspace_id, owner_id, alice, bob).await;
+        let before = explicit_roster(&state, absent).await;
+        let (status, body) = http_put(
+            &app,
+            &format!("/api/v1/flow/objects/{absent}/inheritance"),
+            &json!({ "inherit_from_parent": false, "idempotency_key": Uuid::new_v4().to_string() }).to_string(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["inherit_from_parent"], false, "{body}");
+        assert_eq!(
+            explicit_roster(&state, absent).await,
+            before,
+            "a request that never mentioned `initial_grants` cleared the roster"
+        );
+
+        // (2) The key is present and empty: the explicit "clear it".
+        let emptied = page_with_two_grants(&state, &app, workspace_id, owner_id, alice, bob).await;
+        let (status, body) = http_put(
+            &app,
+            &format!("/api/v1/flow/objects/{emptied}/inheritance"),
+            &json!({
+                "inherit_from_parent": false,
+                "initial_grants": [],
+                "idempotency_key": Uuid::new_v4().to_string(),
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(
+            explicit_roster(&state, emptied).await,
+            Vec::new(),
+            "`\"initial_grants\": []` must clear every explicit grant"
+        );
+
+        // (3) The key is present and non-empty: replacement, not merge.
+        let replaced = page_with_two_grants(&state, &app, workspace_id, owner_id, alice, bob).await;
+        let (status, body) = http_put(
+            &app,
+            &format!("/api/v1/flow/objects/{replaced}/inheritance"),
+            &json!({
+                "inherit_from_parent": false,
+                "initial_grants": [{"principal_kind": "bot", "principal_id": carol, "level": "view"}],
+                "idempotency_key": Uuid::new_v4().to_string(),
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(
+            explicit_roster(&state, replaced).await,
+            vec![("bot".to_string(), carol, "view".to_string())],
+            "a non-empty `initial_grants` must replace the roster, not merge onto it"
+        );
+
+        scratch.drop_self().await;
     }
 
     #[tokio::test]
@@ -2079,8 +2292,12 @@ pub struct SetInheritanceRequest {
     pub confirm_self_lockout: bool,
     #[serde(default)]
     pub dry_run: bool,
+    /// `rest-api-v1.md` spells this field `initial_grants?`: absent means "leave the grants
+    /// alone", and is *not* the same request as `initial_grants: []`, which `ADR-0012` §4.1
+    /// point 2's replacement semantics make an explicit "clear every explicit grant". Hence
+    /// `Option`, not a `#[serde(default)]` `Vec`.
     #[serde(default)]
-    pub initial_grants: Vec<GrantRequestBody>,
+    pub initial_grants: Option<Vec<GrantRequestBody>>,
     pub idempotency_key: String,
 }
 
@@ -2165,7 +2382,9 @@ pub async fn put_flow_object_inheritance(
             object_id,
             caller,
             inherit_from_parent: req.inherit_from_parent,
-            initial_grants: req.initial_grants.into_iter().map(Into::into).collect(),
+            initial_grants: req
+                .initial_grants
+                .map(|grants| grants.into_iter().map(Into::into).collect()),
             confirm_self_lockout: req.confirm_self_lockout,
             dry_run: req.dry_run,
             idempotency_key: req.idempotency_key,

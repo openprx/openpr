@@ -205,10 +205,20 @@ pub struct SetInheritanceInput {
     pub inherit_from_parent: bool,
     /// Grants committed in the *same transaction* as the boundary change (`ADR-0012` §4.1 point
     /// 2), so no window exists in which the subtree has a boundary but nobody to administer it.
-    /// Merged onto whatever the object already has rather than replacing it — the boundary
-    /// endpoint's job is to add the administrators the boundary needs, not to silently drop
-    /// grants the caller did not mention.
-    pub initial_grants: Vec<GrantRequest>,
+    ///
+    /// `Some(list)` is a **whole-table replacement**, exactly the semantics of
+    /// `PUT .../grants` ("`initial_grants` 的语义 = 替换，不是合并", `ADR-0012` §4.1 point 2,
+    /// ruled 2026-08-31): after the commit the object's explicit grants are *exactly* `list`,
+    /// so `Some(vec![])` clears them. Merging would leave grants that predate the boundary in
+    /// place, which defeats the boundary's entire purpose, and would be the one path able to
+    /// walk past `object_grants_max` — the very structural fact `limits-v1.md` freezes that
+    /// ceiling on ("结果条数恒等于请求条数").
+    ///
+    /// `None` is "do not touch the grants at all", the only way to flip the boundary flag on
+    /// its own. It is a distinct value rather than an empty list precisely because the wire
+    /// field is optional (`rest-api-v1.md`: `initial_grants?`) and an omitted field must not
+    /// silently wipe the roster.
+    pub initial_grants: Option<Vec<GrantRequest>>,
     pub confirm_self_lockout: bool,
     pub dry_run: bool,
     pub idempotency_key: String,
@@ -610,10 +620,12 @@ pub async fn get_grants(
 enum Change {
     /// Replace the object's explicit grants with exactly this list.
     ReplaceGrants(Vec<Grant>),
-    /// Flip the boundary flag, optionally merging grants in the same transaction.
+    /// Flip the boundary flag. `Some(list)` *replaces* the object's explicit grants with
+    /// exactly `list` in the same transaction (`ADR-0012` §4.1 point 2); `None` leaves every
+    /// existing row alone.
     SetInheritance {
         inherit_from_parent: bool,
-        initial_grants: Vec<Grant>,
+        initial_grants: Option<Vec<Grant>>,
     },
 }
 
@@ -666,7 +678,10 @@ pub async fn set_inheritance(
     input: SetInheritanceInput,
 ) -> Result<SetInheritanceView, ApiError> {
     validate_idempotency_key(&input.idempotency_key)?;
-    let initial_grants = validate_grants(&input.initial_grants)?;
+    let initial_grants = match &input.initial_grants {
+        Some(requested) => Some(validate_grants(requested)?),
+        None => None,
+    };
     let outcome = apply(
         state,
         workspace_id,
@@ -808,7 +823,14 @@ async fn apply_in_transaction(
         Change::SetInheritance {
             inherit_from_parent,
             initial_grants,
-        } => (initial_grants.clone(), *inherit_from_parent),
+        } => (
+            // `None` writes no grant row, so the "replacement roster" this transaction is
+            // judged against is the empty list: `affected_principals` still picks up every
+            // principal that already holds a row, whose effective level the boundary flip may
+            // well change.
+            initial_grants.clone().unwrap_or_default(),
+            *inherit_from_parent,
+        ),
     };
 
     let principals = affected_principals(&before_rows, &requested);
@@ -837,8 +859,14 @@ async fn apply_in_transaction(
                     json!({ "object_id": object_id, "inherit_from_parent": inherit_after }),
                 ));
             }
-            for grant in initial_grants {
-                upsert_grant(tx, workspace_id, object_id, *grant, caller.granted_by()).await?;
+            // `ADR-0012` §4.1 point 2: `initial_grants` replaces, it does not merge. The same
+            // two statements `ReplaceGrants` runs, so a boundary really does redefine who can
+            // see the subtree instead of quietly keeping grants that predate it.
+            if let Some(grants) = initial_grants {
+                delete_grants_for(tx, object_id, grants).await?;
+                for grant in grants {
+                    upsert_grant(tx, workspace_id, object_id, *grant, caller.granted_by()).await?;
+                }
             }
         }
     }
@@ -911,11 +939,19 @@ async fn apply_in_transaction(
             .iter()
             .find(|grant| grant.kind == *kind && grant.id == *id)
             .map(|grant| grant.level);
-        let explicit_after = match &change {
-            // The inheritance endpoint merges, so a principal the request did not name keeps
-            // whatever row it already had.
-            Change::SetInheritance { .. } => explicit_after.or(explicit_before),
-            Change::ReplaceGrants(_) => explicit_after,
+        // A boundary flip that carried no `initial_grants` touched no grant row, so every
+        // principal keeps exactly the row it already had. Every other shape is a whole-table
+        // replacement, and `requested` *is* the post-state roster.
+        let explicit_after = if matches!(
+            change,
+            Change::SetInheritance {
+                initial_grants: None,
+                ..
+            }
+        ) {
+            explicit_before
+        } else {
+            explicit_after
         };
         if explicit_before == explicit_after {
             continue;
@@ -1353,6 +1389,53 @@ mod database_tests {
         .n
     }
 
+    /// The object's explicit `flow_object_grants` roster, in a stable order, as
+    /// `(principal_kind, principal_id, level)`. Read straight from the table rather than through
+    /// `get_grants`, so a replacement that failed to delete cannot hide behind a view layer.
+    async fn explicit_roster(db: &DatabaseConnection, object_id: Uuid) -> Vec<(String, Uuid, String)> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            principal_kind: String,
+            principal_id: Uuid,
+            level: String,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT principal_kind, principal_id, level FROM flow_object_grants \
+              WHERE object_id = $1 ORDER BY principal_kind, principal_id",
+            vec![object_id.into()],
+        ))
+        .all(db)
+        .await
+        .expect("query runs")
+        .into_iter()
+        .map(|row| (row.principal_kind, row.principal_id, row.level))
+        .collect()
+    }
+
+    /// Every `principal_id` a `flow.permission.revoked` audit event named, sorted so the
+    /// assertion does not depend on insertion order.
+    async fn revoked_principals(db: &DatabaseConnection, workspace_id: Uuid) -> Vec<Uuid> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            principal_id: Uuid,
+        }
+        let mut ids: Vec<Uuid> = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT (payload->>'principal_id')::uuid AS principal_id FROM business_events \
+              WHERE workspace_id = $1 AND event_type = 'flow.permission.revoked'",
+            vec![workspace_id.into()],
+        ))
+        .all(db)
+        .await
+        .expect("query runs")
+        .into_iter()
+        .map(|row| row.principal_id)
+        .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     async fn event_count(db: &DatabaseConnection, workspace_id: Uuid) -> i64 {
         #[derive(FromQueryResult)]
         struct Row {
@@ -1455,7 +1538,7 @@ mod database_tests {
                 object_id: child,
                 caller: user(fx.owner_id, "owner"),
                 inherit_from_parent: false,
-                initial_grants: Vec::new(),
+                initial_grants: None,
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: Uuid::new_v4().to_string(),
@@ -1629,7 +1712,7 @@ mod database_tests {
                 object_id: restricted,
                 caller: user(fx.owner_id, "owner"),
                 inherit_from_parent: false,
-                initial_grants: Vec::new(),
+                initial_grants: None,
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: Uuid::new_v4().to_string(),
@@ -1776,7 +1859,7 @@ mod database_tests {
                 object_id: child,
                 caller: user(fx.member_id, "member"),
                 inherit_from_parent: false,
-                initial_grants: Vec::new(),
+                initial_grants: None,
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: "lockout-attempt-1".to_string(),
@@ -1810,7 +1893,7 @@ mod database_tests {
                 object_id: child,
                 caller: user(fx.member_id, "member"),
                 inherit_from_parent: false,
-                initial_grants: vec![grant_of("user", fx.member_id, "full_access")],
+                initial_grants: Some(vec![grant_of("user", fx.member_id, "full_access")]),
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: Uuid::new_v4().to_string(),
@@ -1978,7 +2061,7 @@ mod database_tests {
                 object_id: page,
                 caller: user(fx.owner_id, "owner"),
                 inherit_from_parent: false,
-                initial_grants: Vec::new(),
+                initial_grants: None,
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: Uuid::new_v4().to_string(),
@@ -2052,7 +2135,7 @@ mod database_tests {
                 object_id: page,
                 caller: user(fx.owner_id, "owner"),
                 inherit_from_parent: false,
-                initial_grants: vec![grant_of("user", fx.member_id, "full_access")],
+                initial_grants: Some(vec![grant_of("user", fx.member_id, "full_access")]),
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: Uuid::new_v4().to_string(),
@@ -2144,15 +2227,264 @@ mod database_tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // 6. `initial_grants` replaces, it does not merge
+    // -----------------------------------------------------------------------------------------
+
+    /// ★ `ADR-0012` §4.1 point 2, ruled 2026-08-31: "**`initial_grants` 的语义 = 替换，不是合并**
+    /// ... 提交后该对象的显式 grant 集合恒等于本次给出的集合".
+    ///
+    /// This is a security assertion, not a taste one. A caller draws an authorization boundary
+    /// (`inherit_from_parent=false`) *and* names who may live behind it in the same transaction;
+    /// the intent is "from here down, only these principals". Merging kept every grant that
+    /// predated the boundary, so the boundary cut the inheritance but not the leak it existed to
+    /// stop. Three layers are asserted, because only the third is the actual harm:
+    /// - the row layer: the roster afterwards is *exactly* the requested list;
+    /// - the permission layer: a principal dropped from the list evaluates to `Denied`, not to a
+    ///   downgraded-but-present level;
+    /// - the behaviour layer: that principal's commands are refused.
+    ///
+    /// The audit trail is asserted too: a dropped principal must produce a
+    /// `flow.permission.revoked` event, since a silent deletion is its own defect.
+    #[tokio::test]
+    async fn initial_grants_replaces_the_roster_and_cuts_the_principals_it_omits() {
+        let scratch = scratch_or_skip!("initial_grants_replace");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let member = user(fx.member_id, "member");
+        let carol = Uuid::new_v4();
+
+        let page = create(&state, &fx, "page", None).await;
+
+        // Two explicit grants that predate the boundary: `A` = the member (`full_access`),
+        // `B` = a bot (`edit`).
+        set_grants(
+            &state,
+            fx.workspace_id,
+            SetGrantsInput {
+                object_id: page,
+                caller: user(fx.owner_id, "owner"),
+                grants: vec![
+                    grant_of("user", fx.member_id, "full_access"),
+                    grant_of("bot", fx.bot_id, "edit"),
+                ],
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("owner seeds two explicit grants");
+        assert_eq!(
+            explicit_roster(&scratch.db, page).await,
+            vec![
+                ("bot".to_string(), fx.bot_id, "edit".to_string()),
+                ("user".to_string(), fx.member_id, "full_access".to_string()),
+            ],
+            "fixture premise: two explicit grants exist before the boundary"
+        );
+        assert_eq!(
+            level_for(&scratch.db, &fx, page, &member).await,
+            PermissionLevel::FullAccess,
+            "fixture premise: the member's explicit grant is live"
+        );
+        run_command(&state, page, &member, "archive")
+            .await
+            .expect("fixture premise: the member can act on the page before the boundary");
+        run_command(&state, page, &member, "restore")
+            .await
+            .expect("...and restore it");
+
+        // The boundary, carrying the complete post-boundary roster: only `C` may remain.
+        set_inheritance(
+            &state,
+            fx.workspace_id,
+            SetInheritanceInput {
+                object_id: page,
+                caller: user(fx.owner_id, "owner"),
+                inherit_from_parent: false,
+                initial_grants: Some(vec![grant_of("bot", carol, "view")]),
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("owner draws the boundary and names its roster in one transaction");
+
+        // (1) Rows: exactly the requested list. Under the merge semantics this held three rows.
+        assert!(!inherit_flag(&scratch.db, page).await);
+        assert_eq!(
+            explicit_roster(&scratch.db, page).await,
+            vec![("bot".to_string(), carol, "view".to_string())],
+            "`initial_grants` replaces: the grants that predate the boundary must be gone"
+        );
+
+        // (2) Permission: `Denied`, not a downgrade. `ADR-0012` has already ruled that behind a
+        //     boundary "no grant" means no access at all.
+        assert_eq!(
+            level_for(&scratch.db, &fx, page, &member).await,
+            PermissionLevel::Denied,
+            "the member kept access across the boundary -- this is the cross-boundary leak"
+        );
+        assert_eq!(
+            level_for(&scratch.db, &fx, page, &bot(fx.bot_id, "member")).await,
+            PermissionLevel::Denied,
+            "the bot kept access across the boundary"
+        );
+        assert_eq!(
+            level_for(&scratch.db, &fx, page, &bot(carol, "member")).await,
+            PermissionLevel::View,
+            "the principal the request *did* name must hold exactly the level it was given"
+        );
+
+        // (3) Behaviour: the leak's actual surface.
+        assert_policy_rejected(
+            &run_command(&state, page, &member, "archive").await,
+            "a principal dropped by a replacing `initial_grants`",
+        );
+
+        // (4) Audit: both drops are recorded, so the deletion is never silent.
+        let mut expected = vec![fx.member_id, fx.bot_id];
+        expected.sort_unstable();
+        assert_eq!(
+            revoked_principals(&scratch.db, fx.workspace_id).await,
+            expected,
+            "a replaced-away grant must emit `flow.permission.revoked`"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// ★ Omitted (`None`) and empty (`Some(vec![])`) are different requests.
+    ///
+    /// `rest-api-v1.md` spells the wire field `initial_grants?`, so a plain boundary flip carries
+    /// no list at all; combined with replacement semantics, treating "absent" as "empty" would
+    /// make `PUT .../inheritance {inherit_from_parent}` silently wipe the roster. The domain type
+    /// is therefore `Option<Vec<_>>`, and both halves are asserted here — plus the wire layer, so
+    /// the distinction cannot be lost in `serde` on the way in.
+    #[tokio::test]
+    async fn an_omitted_initial_grants_list_is_not_an_empty_one() {
+        // The wire layer first: this is what makes the domain distinction reachable at all.
+        let omitted: crate::routes::flow::SetInheritanceRequest =
+            serde_json::from_str(r#"{"inherit_from_parent":false,"idempotency_key":"k"}"#)
+                .expect("a boundary flip may omit initial_grants");
+        assert!(
+            omitted.initial_grants.is_none(),
+            "an omitted `initial_grants` must not deserialize into an empty list"
+        );
+        let emptied: crate::routes::flow::SetInheritanceRequest =
+            serde_json::from_str(r#"{"inherit_from_parent":false,"initial_grants":[],"idempotency_key":"k"}"#)
+                .expect("an explicit empty list is a legal request");
+        assert_eq!(
+            emptied.initial_grants.map(|grants| grants.len()),
+            Some(0),
+            "an explicit `initial_grants: []` must survive as `Some(empty)`"
+        );
+
+        let scratch = scratch_or_skip!("initial_grants_absent");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let member = user(fx.member_id, "member");
+
+        let page = create(&state, &fx, "page", None).await;
+        set_grants(
+            &state,
+            fx.workspace_id,
+            SetGrantsInput {
+                object_id: page,
+                caller: user(fx.owner_id, "owner"),
+                grants: vec![
+                    grant_of("user", fx.member_id, "full_access"),
+                    grant_of("bot", fx.bot_id, "edit"),
+                ],
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("owner seeds two explicit grants");
+        let seeded = explicit_roster(&scratch.db, page).await;
+        assert_eq!(seeded.len(), 2, "fixture premise");
+        let revoked_before = revoked_principals(&scratch.db, fx.workspace_id).await;
+
+        // `None`: flip the boundary, touch nothing else.
+        set_inheritance(
+            &state,
+            fx.workspace_id,
+            SetInheritanceInput {
+                object_id: page,
+                caller: user(fx.owner_id, "owner"),
+                inherit_from_parent: false,
+                initial_grants: None,
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("a boundary flip with no list is legal");
+        assert!(!inherit_flag(&scratch.db, page).await);
+        assert_eq!(
+            explicit_roster(&scratch.db, page).await,
+            seeded,
+            "an omitted `initial_grants` must leave every existing row exactly as it was"
+        );
+        assert_eq!(
+            level_for(&scratch.db, &fx, page, &member).await,
+            PermissionLevel::FullAccess,
+            "the untouched grant is still live"
+        );
+        assert_eq!(
+            revoked_principals(&scratch.db, fx.workspace_id).await,
+            revoked_before,
+            "a request that deleted nothing must not claim a revocation in the audit trail"
+        );
+
+        // `Some(vec![])`: the explicit "clear the roster" request.
+        set_inheritance(
+            &state,
+            fx.workspace_id,
+            SetInheritanceInput {
+                object_id: page,
+                caller: user(fx.owner_id, "owner"),
+                inherit_from_parent: false,
+                initial_grants: Some(Vec::new()),
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("an explicit empty roster is legal for a caller the admin fallback keeps");
+        assert_eq!(
+            explicit_roster(&scratch.db, page).await,
+            Vec::new(),
+            "`initial_grants: []` must clear every explicit grant"
+        );
+        assert_eq!(
+            level_for(&scratch.db, &fx, page, &member).await,
+            PermissionLevel::Denied,
+            "behind the boundary, a cleared roster leaves the member with nothing"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Limits
     // -----------------------------------------------------------------------------------------
 
-    /// `limits-v1.md`'s frozen `grants_per_request_max = 100` and the proposed
-    /// `object_grants_max`. The second is only reachable through `PUT .../inheritance`'s
-    /// `initial_grants`, which merges onto rows that already exist -- `PUT .../grants` is a
-    /// whole-list replace, so its result count *is* its request count and can never pass the
-    /// per-request ceiling. That structural fact is half the derivation for the proposed value,
-    /// so it is asserted here rather than left as prose.
+    /// `limits-v1.md`'s frozen `grants_per_request_max = 100` and `object_grants_max = 100`.
+    ///
+    /// Since `ADR-0012` §4.1 point 2 was ruled (2026-08-31), **both** write surfaces are
+    /// whole-table replacements, so on both of them the result count *is* the request count and
+    /// the per-request ceiling already bounds the roster. That is exactly the structural fact
+    /// `limits-v1.md` freezes `object_grants_max` on ("PUT .../grants 是整表替换 ... 结果条数恒等于
+    /// 请求条数"), and the same note records that `initial_grants` "曾是唯一可能越过本上限的路径;
+    /// 定为合并会抽掉上面冻结论证的地基". It is asserted here rather than left as prose: the
+    /// per-request ceiling is enforced on `initial_grants` too, and a one-entry `initial_grants`
+    /// against a full roster leaves one row instead of accumulating a hundred-and-first.
     #[tokio::test]
     async fn grant_count_ceilings_are_enforced_and_never_silently_truncate() {
         let scratch = scratch_or_skip!("grant_limits");
@@ -2203,7 +2535,13 @@ mod database_tests {
         let at_ceiling = grant_count(&scratch.db, page).await;
         assert_eq!(at_ceiling, i64::try_from(OBJECT_GRANTS_MAX).expect("fits"));
 
-        // The one surface that *can* exceed it: `initial_grants` merges.
+        // `initial_grants` is bounded by the same per-request ceiling ("条目数同受
+        // `grants_per_request_max` 约束"), and a refusal changes nothing -- neither the roster it
+        // would have replaced nor the boundary flag the same transaction would have flipped.
+        let mut over_boundary: Vec<GrantRequest> = (0..GRANTS_PER_REQUEST_MAX)
+            .map(|_| grant_of("bot", Uuid::new_v4(), "view"))
+            .collect();
+        over_boundary.push(grant_of("bot", Uuid::new_v4(), "view"));
         let err = set_inheritance(
             &state,
             fx.workspace_id,
@@ -2211,21 +2549,48 @@ mod database_tests {
                 object_id: page,
                 caller: user(fx.owner_id, "owner"),
                 inherit_from_parent: false,
-                initial_grants: vec![grant_of("bot", Uuid::new_v4(), "view")],
+                initial_grants: Some(over_boundary),
                 confirm_self_lockout: false,
                 dry_run: false,
                 idempotency_key: Uuid::new_v4().to_string(),
             },
         )
         .await
-        .expect_err("merging one more grant past object_grants_max must be refused");
-        assert_limit_kind(&err, "object_grants");
-        // "达到上限即拒绝新增条目，不静默截断已有授予": the existing roster is untouched, and so is
-        // the boundary flag the same transaction would have flipped.
-        assert_eq!(grant_count(&scratch.db, page).await, at_ceiling);
+        .expect_err("101 initial_grants entries must be refused");
+        assert_limit_kind(&err, "grants_per_request");
+        assert_eq!(
+            grant_count(&scratch.db, page).await,
+            at_ceiling,
+            "\u{201c}达到上限即拒绝新增条目，不静默截断已有授予\u{201d}"
+        );
         assert!(
             inherit_flag(&scratch.db, page).await,
             "the refused transaction rolled back whole"
+        );
+
+        // And the path that used to walk past `object_grants_max` no longer exists: one entry
+        // submitted against a full roster *replaces* it. Under the old merge semantics this
+        // request was refused with `limit_exceeded{object_grants}` at 101 rows.
+        let survivor = Uuid::new_v4();
+        set_inheritance(
+            &state,
+            fx.workspace_id,
+            SetInheritanceInput {
+                object_id: page,
+                caller: user(fx.owner_id, "owner"),
+                inherit_from_parent: false,
+                initial_grants: Some(vec![grant_of("bot", survivor, "view")]),
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("a replacing initial_grants against a full roster cannot exceed the ceiling");
+        assert_eq!(
+            explicit_roster(&scratch.db, page).await,
+            vec![("bot".to_string(), survivor, "view".to_string())],
+            "the result count is the request count on this surface too"
         );
 
         scratch.drop_self().await;

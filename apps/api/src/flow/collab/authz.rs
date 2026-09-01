@@ -82,15 +82,17 @@ impl PermissionLevel {
 /// `PUT /flow/objects/{object_id}/grants` (or an `inheritance` call's `initial_grants`) may carry.
 pub const GRANTS_PER_REQUEST_MAX: usize = 100;
 
-/// `limits-v1.md`'s `object_grants_max` — **`status: unset` in the contract at the time this was
-/// written**, so this constant is this package's *proposed* value, not a frozen one, and the
-/// report accompanying it (`/opt/worker/report/v05-authz-core-2026-08-31.md`) carries the
-/// derivation and the measurements. It is deliberately equal to the frozen
-/// [`GRANTS_PER_REQUEST_MAX`]: `PUT .../grants` is a whole-list *replace*
-/// ("空数组即清空显式授予"), so on that surface the resulting row count is the request's own
-/// entry count and can never exceed 100 anyway; the only way to exceed it is
-/// `PUT .../inheritance`'s `initial_grants` merging on top of rows that already exist, which is
-/// exactly where this ceiling is enforced.
+/// `limits-v1.md`'s `object_grants_max`, **frozen at 100 on 2026-08-31**. It is deliberately equal
+/// to [`GRANTS_PER_REQUEST_MAX`], because both write paths replace the whole list rather than
+/// merging into it: `PUT .../grants` has always done so, and `PUT .../inheritance`'s
+/// `initial_grants` was ruled a replacement too (`ADR-0012` §4.1). A result therefore holds
+/// exactly as many rows as the request carried, and a request may carry at most 100.
+///
+/// So this ceiling is **unreachable by any legal v0.5 request**, and the contract says so rather
+/// than asking for a boundary case nobody can construct. The check below stays as the fail-closed
+/// last line, not as a reachable branch. Introducing any *incremental* grant path — one that adds
+/// to existing rows instead of replacing them — makes it reachable again, and that release owes
+/// the boundary case.
 pub const OBJECT_GRANTS_MAX: usize = 100;
 
 /// `ADR-0012` §3's inheritance-chain depth limit, pinned to `limits-v1.md`'s frozen

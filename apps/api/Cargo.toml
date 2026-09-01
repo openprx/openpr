@@ -36,6 +36,11 @@ uuid.workspace = true
 wasmtime.workspace = true
 
 [dev-dependencies]
+# `tower::ServiceExt::oneshot` — lets the route tests drive a real `axum::Router` with a real
+# `http::Request`, so the transport→domain seam (path routing, the `Json` extractor's own
+# deserialization, and the handler's field mapping) is actually executed rather than bypassed by
+# constructing the request struct in Rust. Already in `Cargo.lock` as a transitive dependency.
+tower.workspace = true
 wat = "1"
 tokio-tungstenite = "0.26"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
