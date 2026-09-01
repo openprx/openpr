@@ -28,6 +28,7 @@ use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
 use super::collab::{authz, bootstrap, frame, limits as collab_limits, runtime, write};
+use super::event_origin::CommandOrigin;
 use super::model::{AcceptedChange, FlowFeatureUpdateView, FlowObjectView};
 use super::move_object::GovernanceCommandType;
 use super::projection;
@@ -140,15 +141,51 @@ pub fn v0_5_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
     registry
 }
 
+/// The value a `REFERENCES users(id)` column may take for this actor: the actor's own id when it
+/// is a user, `None` when it is a bot.
+///
+/// `flow::grants` has always done this (`Caller::granted_by`, and `actor_id: if caller.is_bot()`),
+/// which is exactly why `PUT .../grants` was the one bot-reachable Flow write route that worked.
+/// Every other route wrote the bot id straight into a users FK and returned a 500 — measured, not
+/// inferred; see the report's probe section.
+///
+/// **The bot's identity is not lost by writing `NULL` here.** `events-v1.md` freezes no envelope
+/// field for a bot principal, so inventing one would be worse than the hole it fills; instead the
+/// event's `source.request` is the *same* `request_id` the middleware wrote to
+/// `bot_operation_logs.request_id` for the same call, so `business_events.source->>'request'` joins
+/// straight to the row that names the bot. That join only exists because the two were deliberately
+/// made the same value (`middleware::bot_auth::bot_auth_context`).
+#[must_use]
+pub const fn actor_user_id(actor_id: Uuid, actor_is_bot: bool) -> Option<Uuid> {
+    if actor_is_bot { None } else { Some(actor_id) }
+}
+
 pub struct CreateObjectInput {
     pub workspace_id: Uuid,
     pub actor_id: Uuid,
+    /// Whether [`Self::actor_id`] is a `workspace_bots` id rather than a `users` id.
+    ///
+    /// Every "who did this" column on the Flow write paths — `flow_objects.created_by`/
+    /// `updated_by`, `flow_workspace_settings.updated_by`, `collab_updates.actor_id`,
+    /// `business_events.actor_id` — is `REFERENCES users(id)`, while
+    /// `middleware::bot_auth::require_workspace_access_from_auth` returns the **bot id** as the
+    /// actor for a bot token. Writing that id into any of those columns is a foreign-key
+    /// violation, which is why this flag has to travel with the actor rather than be inferred: the
+    /// surface cannot tell you (a bot may legitimately present as `rest`), and the id itself
+    /// cannot tell you.
+    ///
+    /// See [`actor_user_id`].
+    pub actor_is_bot: bool,
     pub object_type: String,
     pub project_id: Option<Uuid>,
     pub parent_object_id: Option<Uuid>,
     pub title: String,
     pub idempotency_key: String,
     pub message: Option<String>,
+    /// Where this command came from, declared by the transport that accepted it — see
+    /// [`CommandOrigin`]. The producer below reads `source`/`correlation_id`/`causation_id` off
+    /// this value; it does not decide any of them itself.
+    pub origin: CommandOrigin,
 }
 
 fn validate(input: &CreateObjectInput) -> Result<(), ApiError> {
@@ -423,7 +460,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             project_id: effective_project_id,
             object_type: input.object_type.clone(),
             parent_id: input.parent_object_id,
-            created_by: input.actor_id,
+            created_by: actor_user_id(input.actor_id, input.actor_is_bot),
         },
     )
     .await?;
@@ -466,16 +503,16 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             event_type: "flow.object.created".to_string(),
             aggregate_type: "flow_object".to_string(),
             aggregate_id: object_id.to_string(),
-            actor_id: Some(input.actor_id),
-            source: json!({ "surface": "rest" }),
+            actor_id: actor_user_id(input.actor_id, input.actor_is_bot),
+            source: input.origin.source_json(),
             payload: json!({
                 "object_id": object_id,
                 "object_type": input.object_type,
                 "parent_object_id": input.parent_object_id,
             }),
             metadata: json!({ "message": input.message }),
-            correlation_id: None,
-            causation_id: None,
+            correlation_id: Some(input.origin.correlation_id),
+            causation_id: input.origin.causation_id,
             idempotency_key: Some(input.idempotency_key.clone()),
         },
         Some(FlowDispatchSpec {
@@ -557,9 +594,24 @@ const MEMBER_LEVELS: &[&str] = &["full_access", "edit", "comment", "view"];
 pub struct SetFlowFeatureInput {
     pub workspace_id: Uuid,
     pub actor_id: Uuid,
+    /// Whether [`Self::actor_id`] is a `workspace_bots` id rather than a `users` id.
+    ///
+    /// Every "who did this" column on the Flow write paths — `flow_objects.created_by`/
+    /// `updated_by`, `flow_workspace_settings.updated_by`, `collab_updates.actor_id`,
+    /// `business_events.actor_id` — is `REFERENCES users(id)`, while
+    /// `middleware::bot_auth::require_workspace_access_from_auth` returns the **bot id** as the
+    /// actor for a bot token. Writing that id into any of those columns is a foreign-key
+    /// violation, which is why this flag has to travel with the actor rather than be inferred: the
+    /// surface cannot tell you (a bot may legitimately present as `rest`), and the id itself
+    /// cannot tell you.
+    ///
+    /// See [`actor_user_id`].
+    pub actor_is_bot: bool,
     pub enabled: Option<bool>,
     pub default_member_level: Option<String>,
     pub idempotency_key: String,
+    /// See [`CreateObjectInput::origin`].
+    pub origin: CommandOrigin,
 }
 
 fn validate_set_flow_feature(input: &SetFlowFeatureInput) -> Result<(), ApiError> {
@@ -646,12 +698,12 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
                 event_type: event_type.to_string(),
                 aggregate_type: "flow_feature".to_string(),
                 aggregate_id: input.workspace_id.to_string(),
-                actor_id: Some(input.actor_id),
-                source: json!({ "surface": "rest" }),
+                actor_id: actor_user_id(input.actor_id, input.actor_is_bot),
+                source: input.origin.source_json(),
                 payload: json!({ "workspace_id": input.workspace_id }),
                 metadata: json!({}),
-                correlation_id: None,
-                causation_id: None,
+                correlation_id: Some(input.origin.correlation_id),
+                causation_id: input.origin.causation_id,
                 idempotency_key: Some(input.idempotency_key.clone()),
             },
             Some(FlowDispatchSpec {
@@ -667,7 +719,13 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
         None
     };
 
-    repository::update_flow_settings(&tx, input.workspace_id, new_enabled, input.actor_id).await?;
+    repository::update_flow_settings(
+        &tx,
+        input.workspace_id,
+        new_enabled,
+        actor_user_id(input.actor_id, input.actor_is_bot),
+    )
+    .await?;
     tx.commit().await?;
 
     let updated = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;
@@ -864,6 +922,26 @@ pub struct ExecuteCommandInput {
     /// no `client_id` handshake like the WebSocket ticket flow, so the REST layer synthesizes one
     /// (see `routes::flow::post_flow_object_command`).
     pub origin_client_id: String,
+    /// Where this command came from, declared by the transport that accepted it — see
+    /// [`CommandOrigin`]. Every producer this command reaches (`execute_content_command`'s
+    /// `flow.content.accepted`, `execute_lifecycle_command`'s archive/restore,
+    /// `move_object`'s `flow.object.moved` plus its derived `flow.content.accepted` rows, and
+    /// `record_command_rejected`'s audit-only row) reads its `source`/`correlation_id`/
+    /// `causation_id` from here rather than deciding any of them itself.
+    pub origin: CommandOrigin,
+}
+
+impl ExecuteCommandInput {
+    /// Whether [`Self::actor_id`] is a `workspace_bots` id rather than a `users` id.
+    ///
+    /// Derived from [`Self::principal_kind`] rather than carried as a second field: two
+    /// representations of one fact can disagree, and this one already exists and is already the
+    /// value `flow::grants` judges principals by (`Caller::is_bot`). See [`actor_user_id`] for why
+    /// the distinction has to reach the write sites at all.
+    #[must_use]
+    pub fn actor_is_bot(&self) -> bool {
+        self.principal_kind == "bot"
+    }
 }
 
 fn validate_execute_command_input(input: &ExecuteCommandInput) -> Result<(), ApiError> {
@@ -902,10 +980,18 @@ fn validate_execute_command_input(input: &ExecuteCommandInput) -> Result<(), Api
 /// Never surfaces a failure to the caller — `events-v1.md` requires "写 audit 失败必须告警", not
 /// that a command's own (already-decided) rejection be replaced by a second, unrelated database
 /// error — so a failure here is only logged.
+#[allow(clippy::too_many_arguments)]
 async fn record_command_rejected(
     state: &AppState,
     workspace_id: Uuid,
     actor_id: Uuid,
+    // Same `users(id)` FK as every other producer, and the same reason it has to be told rather
+    // than infer: see [`actor_user_id`]. Missing it here was worse than elsewhere, because this
+    // function **swallows its own failure** — the insert is logged and dropped, so a bot-triggered
+    // rejection did not 500, it simply left no audit row at all. A silently missing audit row is
+    // the one failure mode an audit stream cannot survive.
+    actor_is_bot: bool,
+    origin: &CommandOrigin,
     action: &str,
     error: &ApiError,
     object_id: Uuid,
@@ -924,8 +1010,8 @@ async fn record_command_rejected(
             // (never the caller's `idempotency_key`, which stays reserved for a future successful
             // retry of the same request).
             aggregate_id: Uuid::new_v4().to_string(),
-            actor_id: Some(actor_id),
-            source: json!({ "surface": "rest" }),
+            actor_id: actor_user_id(actor_id, actor_is_bot),
+            source: origin.source_json(),
             payload: json!({
                 "action": action,
                 "error_code": error_code,
@@ -933,8 +1019,12 @@ async fn record_command_rejected(
                 "document_id": document_id,
             }),
             metadata: json!({}),
-            correlation_id: None,
-            causation_id: None,
+            // A rejected command is its own command's only event, so it inherits the command's
+            // own place in the chain: the request's correlation, and whatever caused the command
+            // itself (`None` for a first user request). It is not "derived from" a primary event,
+            // because a rejected command never produced one.
+            correlation_id: Some(origin.correlation_id),
+            causation_id: origin.causation_id,
             idempotency_key: None,
         },
         None,
@@ -989,6 +1079,8 @@ pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Re
                 state,
                 workspace_id,
                 input.actor_id,
+                input.actor_is_bot(),
+                &input.origin,
                 &input.command_type,
                 &err,
                 input.object_id,
@@ -1564,9 +1656,17 @@ async fn execute_content_command(
             origin_client_id: Some(input.origin_client_id.clone()),
             message: input.message.clone(),
             actor_id: input.actor_id,
+            actor_is_bot: input.actor_is_bot(),
             workspace_id,
             checked_epoch,
             expected_frontier,
+            // A content command's `flow.content.accepted` **is** this command's primary event —
+            // there is no other event for it to be derived from — so the command's own origin
+            // goes through unchanged. Before this existed, `write::stage_locked_writes` stamped
+            // the literal `"web"` on every caller of `accept_update`, which meant a REST content
+            // command was recorded in `business_events.source` and in
+            // `collab_updates.origin_surface` as a WebSocket write.
+            origin: input.origin.clone(),
         },
     )
     .await?;
@@ -1676,7 +1776,14 @@ async fn execute_lifecycle_command(
     } else {
         None
     };
-    repository::set_object_lifecycle(&tx, input.object_id, target_status, archived_at, input.actor_id).await?;
+    repository::set_object_lifecycle(
+        &tx,
+        input.object_id,
+        target_status,
+        archived_at,
+        actor_user_id(input.actor_id, input.actor_is_bot()),
+    )
+    .await?;
 
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
     let event_id = insert_flow_event(
@@ -1687,12 +1794,12 @@ async fn execute_lifecycle_command(
             event_type: event_type.to_string(),
             aggregate_type: "flow_object".to_string(),
             aggregate_id: input.object_id.to_string(),
-            actor_id: Some(input.actor_id),
-            source: json!({ "surface": "rest" }),
+            actor_id: actor_user_id(input.actor_id, input.actor_is_bot()),
+            source: input.origin.source_json(),
             payload: json!({ "object_id": input.object_id, "status": target_status }),
             metadata: json!({ "message": input.message }),
-            correlation_id: None,
-            causation_id: None,
+            correlation_id: Some(input.origin.correlation_id),
+            causation_id: input.origin.causation_id,
             idempotency_key: Some(input.idempotency_key.clone()),
         },
         Some(FlowDispatchSpec {
@@ -1982,9 +2089,12 @@ mod database_tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    use super::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
+    use super::{
+        CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput, create_object, execute_command, set_flow_feature,
+    };
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::authz;
+    use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
     use crate::flow::model::AcceptedChange;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -2149,8 +2259,12 @@ mod database_tests {
         create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id: fx.workspace_id,
                 actor_id: fx.owner_id,
+                actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
                 parent_object_id: parent,
@@ -2341,6 +2455,9 @@ mod database_tests {
             execute_command(
                 &state_for_a,
                 ExecuteCommandInput {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
                     object_id,
                     actor_id: member_id,
                     principal_kind: "user".to_string(),
@@ -2526,8 +2643,12 @@ mod database_tests {
         create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id: fx.workspace_id,
                 actor_id: fx.owner_id,
+                actor_is_bot: false,
                 object_type: object_type.to_string(),
                 project_id,
                 parent_object_id: parent,
@@ -2869,6 +2990,154 @@ mod database_tests {
 
         scratch.drop_self().await;
     }
+
+    // -----------------------------------------------------------------------------------------
+    // `events-v1.md` origin: every producer in this module reads its surface from the caller
+    // -----------------------------------------------------------------------------------------
+
+    /// `events-v1.md`: "`source` 由服务端按 Web/REST/MCP/CLI/worker 覆盖".
+    ///
+    /// This module has five producers — `create_object`, the shared content write,
+    /// `execute_lifecycle_command`, `set_flow_feature`, and the audit-only
+    /// `record_command_rejected` — and every one of them used to write the literal
+    /// `{"surface":"rest"}`. Run here from `surface=cli`, which REST can never produce, so any
+    /// producer that still decides its own surface fails on its own row rather than hiding behind
+    /// the four that were fixed.
+    #[tokio::test]
+    async fn every_producer_in_this_module_stamps_the_callers_surface_not_a_literal() {
+        #[derive(Debug, FromQueryResult)]
+        struct EventRow {
+            event_type: String,
+            source: serde_json::Value,
+            correlation_id: Option<Uuid>,
+            /// Read, not merely selected: each of these producers writes exactly one event per
+            /// command, so every row here is a first user request's primary event and its
+            /// causation must be `NULL`. `flow.command.rejected` in particular once filled this
+            /// with a fresh `Uuid::new_v4()` — a parent id naming an event that never existed —
+            /// and no test noticed, because no row type read the column.
+            causation_id: Option<Uuid>,
+        }
+
+        let scratch = scratch_or_skip!("origin_surface_per_producer");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+
+        let cli_origin =
+            || CommandOrigin::first_request(EventSource::new(EventSurface::Cli).with_tool("sylvode objects create"));
+
+        // (1) create_object
+        let created = create_object(
+            &state,
+            CreateObjectInput {
+                origin: cli_origin(),
+                workspace_id: fx.workspace_id,
+                actor_id: fx.owner_id,
+                actor_is_bot: false,
+                object_type: "page".to_string(),
+                project_id: None,
+                parent_object_id: None,
+                title: "CLI Origin Page".to_string(),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+        .expect("create succeeds");
+        let object_id = created.object.id;
+
+        let command_input = |command_type: &str, payload: serde_json::Value| ExecuteCommandInput {
+            origin: cli_origin(),
+            object_id,
+            actor_id: fx.owner_id,
+            principal_kind: "user".to_string(),
+            role: "owner".to_string(),
+            command_type: command_type.to_string(),
+            payload,
+            expected_frontier: None,
+            idempotency_key: Uuid::new_v4().to_string(),
+            message: None,
+            origin_client_id: "cli-origin-test".to_string(),
+        };
+
+        // (2) the shared content write (`write::stage_one_document`)
+        execute_command(
+            &state,
+            command_input("set_title", serde_json::json!({ "title": "Renamed by CLI" })),
+        )
+        .await
+        .expect("set_title succeeds");
+
+        // (3) the lifecycle producer
+        execute_command(&state, command_input("archive", serde_json::json!({})))
+            .await
+            .expect("archive succeeds");
+
+        // (4) the audit-only rejection producer: a second archive is a real `Conflict`, and every
+        // rejection reached after the object resolves records `flow.command.rejected`.
+        let rejected = execute_command(&state, command_input("archive", serde_json::json!({})))
+            .await
+            .expect_err("archiving an already-archived object is a conflict");
+        assert!(matches!(rejected, ApiError::Conflict(_)), "{rejected:?}");
+
+        // (5) the workspace feature flag producer
+        set_flow_feature(
+            &state,
+            SetFlowFeatureInput {
+                origin: cli_origin(),
+                workspace_id: fx.workspace_id,
+                actor_id: fx.owner_id,
+                actor_is_bot: false,
+                enabled: Some(false),
+                default_member_level: None,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("set_flow_feature succeeds");
+
+        let rows = EventRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT event_type, source, correlation_id, causation_id FROM business_events \
+             WHERE workspace_id = $1 ORDER BY created_at, id",
+            vec![fx.workspace_id.into()],
+        ))
+        .all(&scratch.db)
+        .await
+        .expect("business_events query runs");
+
+        let types: Vec<&str> = rows.iter().map(|row| row.event_type.as_str()).collect();
+        for expected in [
+            "flow.object.created",
+            "flow.content.accepted",
+            "flow.object.archived",
+            "flow.command.rejected",
+            "flow.feature.disabled",
+        ] {
+            assert!(types.contains(&expected), "'{expected}' was not written; got {types:?}");
+        }
+
+        let expected_source = serde_json::json!({ "surface": "cli", "tool": "sylvode objects create" });
+        for row in &rows {
+            assert_eq!(
+                row.source, expected_source,
+                "'{}' was written with source {:?}, but every caller here declared {:?}",
+                row.event_type, row.source, expected_source
+            );
+            assert_eq!(
+                row.causation_id, None,
+                "'{}' is the only event of a first user request, so it roots the chain; a minted \
+                 causation here is an edge pointing at nothing",
+                row.event_type
+            );
+            assert!(
+                row.correlation_id.is_some(),
+                "'{}' must carry the correlation its request generated, not NULL",
+                row.event_type
+            );
+        }
+
+        scratch.drop_self().await;
+    }
 }
 
 // ---- Real-database idempotency-race tests (opt-in via `OPENPR_TEST_DATABASE_URL`) ----
@@ -3090,8 +3359,12 @@ mod idempotency_race_database_tests {
                 create_object(
                     &state,
                     CreateObjectInput {
+                        origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                            crate::flow::event_origin::EventSurface::Rest,
+                        ),
                         workspace_id,
                         actor_id: owner_id,
+                        actor_is_bot: false,
                         object_type: "page".to_string(),
                         project_id: None,
                         parent_object_id: None,
@@ -3219,8 +3492,12 @@ mod idempotency_race_database_tests {
         let created = create_object(
             &state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id,
                 actor_id: owner_id,
+                actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
                 parent_object_id: None,
@@ -3237,6 +3514,9 @@ mod idempotency_race_database_tests {
         let key = format!("residual-{}", Uuid::new_v4());
         let payload = json!({ "block_id": "block-under-race", "text": "hello" });
         let input = |key: &str| ExecuteCommandInput {
+            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                crate::flow::event_origin::EventSurface::Rest,
+            ),
             object_id,
             actor_id: owner_id,
             principal_kind: "user".to_string(),

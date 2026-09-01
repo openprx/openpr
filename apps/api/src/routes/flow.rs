@@ -37,12 +37,70 @@ use crate::{
     error::ApiError,
     flow::{
         command::{CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput},
+        event_origin::{CommandOrigin, EventSource, EventSurface},
         grants::{self, Caller, GrantRequest, SetGrantsInput, SetInheritanceInput},
         policy, query,
         query::Render,
     },
     response::ApiResponse,
 };
+
+/// The origin every write handler in this module stamps on the events its command produces.
+///
+/// **This is the point of the whole `CommandOrigin` plumbing**, and the one place any Flow route
+/// decides what surface it is.
+///
+/// `events-v1.md` freezes "`source` 由服务端按 Web/REST/MCP/CLI/worker 覆盖", and as of 2026-09-01
+/// adds the clause that makes this function's shape non-negotiable: "**`source` 必须由认证/传输
+/// 边界推导，不得由调用方自报**……surface、server session、exact registered tool 全部取自中间件
+/// 已解析出的可信上下文".
+///
+/// # Why a resolver and not a constant
+///
+/// The first version of this fix moved the hardcoded `json!({ "surface": "rest" })` out of the
+/// producers in `flow::command` / `flow::move_object` / `flow::grants` and into a single
+/// REST-returning helper here. That was only half a fix, and the contract now says so in as many
+/// words: "把 surface 变成一个参数**并不等于**修好了它——如果 handler 仍然无条件填一个常量，只是把
+/// 写死从 producer 挪到了 route 层". `flow.feature_set` is a **registered, in-use MCP tool**
+/// (`apps/mcp-server/src/tools/mod.rs`) whose client already sends `X-OpenPR-MCP-Surface` and
+/// `X-OpenPR-MCP-Tool` (`apps/mcp-server/src/client/mod.rs`), and `middleware::bot_auth` already
+/// parsed both — then spent them on the bot-operation log and dropped them. So every real MCP
+/// call through these routes was still recorded as `rest`. The defect this whole work package
+/// exists to fix was, for the one caller that actually exercises it today, not fixed at all.
+///
+/// # The resolution
+///
+/// | credential | surface | `request` | `tool` |
+/// |---|---|---|---|
+/// | bot token (MCP/CLI) | [`BotAuthContext::surface`], allow-listed at the boundary | the middleware's own `request_id`, shared with the `bot_operation_logs` row | the exact registered tool name, when the call is a tool call |
+/// | JWT direct | [`EventSurface::Rest`] | a per-request UUID minted here | omitted — REST has no tool concept |
+///
+/// `session`/`client_id`/`service` are omitted for both: MCP-over-HTTP plumbs no server session id
+/// to this process, `client_id` is the WebSocket ticket handshake's field (see
+/// `flow::collab::session`, the only other surface declaration point in the system), and `service`
+/// is reserved for `surface=system` background work. `events-v1.md`: "不适用时省略且不能填 caller
+/// 自报值" — so they are absent keys, not empty strings.
+///
+/// `correlation_id` is minted per request rather than reusing `request`: they answer different
+/// questions ("which HTTP call" vs "which causal chain"), and `events-v1.md` keeps them as
+/// separate envelope fields. Every event this one request writes — the command's primary
+/// transition and every event derived from it — carries this same value.
+///
+/// **Every** Flow write path resolves its origin through this one function; there is deliberately
+/// no second, `authorization_caller`-shaped bypass that fills a constant of its own.
+fn request_origin(extensions: &axum::http::Extensions) -> CommandOrigin {
+    let source = crate::middleware::bot_auth::extract_bot_context(extensions).map_or_else(
+        || EventSource::new(EventSurface::Rest).with_request(Uuid::new_v4().to_string()),
+        |bot| {
+            let source = EventSource::new(bot.surface).with_request(bot.request_id.to_string());
+            match bot.tool_name.as_deref() {
+                Some(tool) => source.with_tool(tool),
+                None => source,
+            }
+        },
+    );
+    CommandOrigin::first_request(source)
+}
 
 fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext>>) -> axum::http::Extensions {
     let mut extensions = axum::http::Extensions::new();
@@ -72,19 +130,22 @@ pub async fn create_flow_object(
     Json(req): Json<CreateFlowObjectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let extensions = build_auth_extensions(claims, bot);
-    let (actor_id, _role, _is_bot) = policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+    let (actor_id, _role, actor_is_bot) =
+        policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
 
     let accepted = crate::flow::command::create_object(
         &state,
         CreateObjectInput {
             workspace_id,
             actor_id,
+            actor_is_bot,
             object_type: req.object_type,
             project_id: req.project_id,
             parent_object_id: req.parent_object_id,
             title: req.title,
             idempotency_key: req.idempotency_key,
             message: req.message,
+            origin: request_origin(&extensions),
         },
     )
     .await?;
@@ -254,6 +315,7 @@ pub async fn post_flow_object_command(
             idempotency_key: req.idempotency_key,
             message: req.message,
             origin_client_id,
+            origin: request_origin(&extensions),
         },
     )
     .await?;
@@ -324,7 +386,7 @@ pub async fn set_flow_feature(
     Json(req): Json<SetFlowFeatureRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     let extensions = build_auth_extensions(claims, bot);
-    let (actor_id, _role, _is_bot) =
+    let (actor_id, _role, actor_is_bot) =
         policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
 
     let view = crate::flow::command::set_flow_feature(
@@ -332,9 +394,11 @@ pub async fn set_flow_feature(
         SetFlowFeatureInput {
             workspace_id,
             actor_id,
+            actor_is_bot,
             enabled: req.enabled,
             default_member_level: req.default_member_level,
             idempotency_key: req.idempotency_key,
+            origin: request_origin(&extensions),
         },
     )
     .await?;
@@ -357,6 +421,7 @@ pub async fn set_flow_feature(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod flow_database_tests {
+    use super::{GrantRequestBody, SetGrantsRequest};
     use axum::body::to_bytes;
     use axum::response::{IntoResponse, Response};
     use base64::Engine as _;
@@ -1543,6 +1608,9 @@ mod flow_database_tests {
             bot_id: Uuid::new_v4(),
             workspace_id,
             permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            surface: crate::flow::event_origin::EventSurface::Rest,
+            tool_name: None,
+            request_id: uuid::Uuid::new_v4(),
         });
         let bot_response = to_response(
             get_flow_object_bootstrap(
@@ -2252,6 +2320,875 @@ mod flow_database_tests {
 
         scratch.drop_self().await;
     }
+
+    /// `flow.command.rejected` is written for a bot's rejected command as well as a user's.
+    ///
+    /// This producer is the one that could fail **silently**: `record_command_rejected` logs its
+    /// own insert failure with `tracing::error!` and returns, by design, so that a failed audit
+    /// write never turns a correctly-rejected command into a 500. The cost of that design is that
+    /// it must never be handed a row the database will refuse — and it was: it wrote
+    /// `actor_id: Some(actor_id)` into a `users(id)` FK, so every bot-triggered rejection violated
+    /// the constraint, was logged, and **vanished**. The command still returned its correct 409,
+    /// which is exactly why nothing noticed: the only observable difference was an audit row that
+    /// was never there.
+    ///
+    /// Rejecting the same command for a user and for a bot must therefore leave *two* rows.
+    #[tokio::test]
+    async fn a_rejected_command_is_audited_for_a_bot_exactly_as_it_is_for_a_user() {
+        #[derive(FromQueryResult)]
+        struct RejectedRow {
+            actor_id: Option<Uuid>,
+            source: Value,
+        }
+
+        let scratch = scratch_or_skip!("rejected-audit-bot");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let bot_id = Uuid::new_v4();
+        let bot = Extension(crate::middleware::bot_auth::BotAuthContext {
+            bot_id,
+            workspace_id,
+            permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            surface: crate::flow::event_origin::EventSurface::McpStdio,
+            tool_name: Some("flow.object_command".to_string()),
+            request_id: Uuid::new_v4(),
+        });
+
+        // One object per caller, so each caller's second `archive` is the rejected one.
+        let make_object = |title: &str| {
+            let state = state.clone();
+            let claims = claims.clone();
+            let title = title.to_string();
+            async move {
+                let body = body_json(to_response(
+                    create_flow_object(
+                        State(state),
+                        claims,
+                        None,
+                        Path(workspace_id),
+                        Json(CreateFlowObjectRequest {
+                            object_type: "page".to_string(),
+                            project_id: None,
+                            parent_object_id: None,
+                            title,
+                            idempotency_key: Uuid::new_v4().to_string(),
+                            message: None,
+                        }),
+                    )
+                    .await,
+                ))
+                .await;
+                Uuid::parse_str(body["data"]["object"]["id"].as_str().expect("id")).expect("uuid")
+            }
+        };
+        let user_object = make_object("User Archive").await;
+        let bot_object = make_object("Bot Archive").await;
+
+        let archive = |object_id: Uuid, as_bot: Option<Extension<crate::middleware::bot_auth::BotAuthContext>>| {
+            let state = state.clone();
+            let claims = claims.clone();
+            async move {
+                body_json(to_response(
+                    post_flow_object_command(
+                        State(state),
+                        claims,
+                        as_bot,
+                        Path(object_id),
+                        Json(ExecuteFlowCommandRequest {
+                            command: FlowCommandEnvelope {
+                                command_type: "archive".to_string(),
+                                payload: json!({}),
+                            },
+                            expected_frontier: None,
+                            idempotency_key: Uuid::new_v4().to_string(),
+                            message: None,
+                        }),
+                    )
+                    .await,
+                ))
+                .await
+            }
+        };
+
+        // First archive succeeds, second is rejected — for each caller kind.
+        assert_eq!(archive(user_object, None).await["code"], 0);
+        let user_rejected = archive(user_object, None).await;
+        assert_ne!(
+            user_rejected["code"], 0,
+            "archiving twice must be rejected: {user_rejected}"
+        );
+
+        assert_eq!(archive(bot_object, Some(bot.clone())).await["code"], 0);
+        let bot_rejected = archive(bot_object, Some(bot)).await;
+        assert_ne!(
+            bot_rejected["code"], 0,
+            "archiving twice must be rejected: {bot_rejected}"
+        );
+
+        let rows = RejectedRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT actor_id, source FROM business_events WHERE workspace_id = $1 \
+              AND event_type = 'flow.command.rejected' ORDER BY created_at, id",
+            vec![workspace_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("business_events query runs");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both the user's and the bot's rejection must be audited; a bot rejection that leaves no row \
+             is the audit stream losing an event without anyone being told"
+        );
+
+        let user_row = rows
+            .iter()
+            .find(|row| row.source["surface"] == "rest")
+            .expect("the user's rejection was recorded");
+        assert_eq!(
+            user_row.actor_id,
+            Some(owner_id),
+            "a user's rejection still names the user"
+        );
+        let bot_row = rows
+            .iter()
+            .find(|row| row.source["surface"] == "mcp_stdio")
+            .expect("the bot's rejection was recorded");
+        assert_eq!(
+            bot_row.actor_id, None,
+            "a bot's rejection carries no `users(id)` actor — that is what made it insertable at all"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The bot behind an event, recovered the only way it can be — through the **real
+    /// middleware**, over HTTP, with a real bot token.
+    ///
+    /// `business_events.actor_id` is `NULL` for a bot (it is a `users(id)` FK and a bot id is not
+    /// a user id), so the claim that bot attribution survives rests entirely on one join:
+    ///
+    /// ```text
+    /// business_events.source->>'request'  ==  bot_operation_logs.request_id  ->  bot_id
+    /// ```
+    ///
+    /// That join exists only because `middleware::bot_auth::bot_auth_context` mints **one**
+    /// `request_id` per request and both the audit event and the operation log copy that same
+    /// value. Nothing had ever executed it: the existing assertions only checked that
+    /// `source.request` parses as a UUID, which is true of any UUID at all — including a fresh
+    /// one that joins to nothing. Replacing `bot.request_id` with `Uuid::new_v4()` in
+    /// [`request_origin`] left the whole suite green while silently severing bot attribution.
+    ///
+    /// This test runs the production `bot_or_user_auth_middleware` against a real
+    /// `workspace_bots` row, so the header → middleware → `BotAuthContext` → envelope chain is
+    /// executed rather than simulated by constructing the context in Rust.
+    // The axum route pattern below contains `{workspace_id}`, which is axum's path-parameter
+    // syntax and not a format argument, but is indistinguishable from one to the lint.
+    #[allow(clippy::literal_string_with_formatting_args)]
+    #[tokio::test]
+    async fn the_bot_behind_an_event_is_recoverable_through_the_request_id_the_middleware_minted() {
+        #[derive(FromQueryResult)]
+        struct EventRow {
+            actor_id: Option<Uuid>,
+            source: Value,
+        }
+        #[derive(FromQueryResult)]
+        struct JoinedBot {
+            bot_id: Uuid,
+            tool_name: Option<String>,
+            surface: String,
+        }
+
+        let scratch = scratch_or_skip!("bot-attribution-join");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, _owner_id) = seed_workspace(&state, true).await;
+
+        // A real bot token, hashed exactly the way the middleware hashes it.
+        let bot_id = Uuid::new_v4();
+        let raw_token = format!("opr_{}", Uuid::new_v4().simple());
+        let token_hash = {
+            use sha2::{Digest as _, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(raw_token.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+        exec(
+            &state,
+            "INSERT INTO workspace_bots (id, workspace_id, name, token_hash, token_prefix, permissions, is_active) \
+             VALUES ($1, $2, 'attribution-bot', $3, $4, '[\"read\",\"write\",\"admin\"]'::jsonb, true)",
+            vec![
+                bot_id.into(),
+                workspace_id.into(),
+                token_hash.into(),
+                raw_token[..8].to_string().into(),
+            ],
+        )
+        .await;
+
+        // The create route behind the **production** auth middleware.
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/flow/workspaces/{workspace_id}/objects",
+                axum::routing::post(create_flow_object),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::middleware::bot_auth::bot_or_user_auth_middleware,
+            ))
+            .with_state(state.clone());
+
+        let response = {
+            use tower::ServiceExt as _;
+            app.oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri(format!("/api/v1/flow/workspaces/{workspace_id}/objects"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {raw_token}"))
+                    .header("x-openpr-mcp-surface", "mcp_stdio")
+                    .header("x-openpr-mcp-tool", "flow.object_create")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "object_type": "page",
+                            "title": "Attributable",
+                            "idempotency_key": Uuid::new_v4().to_string(),
+                        })
+                        .to_string(),
+                    ))
+                    .expect("the request builds"),
+            )
+            .await
+            .expect("the router responds")
+        };
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["code"], 0,
+            "a real bot token over HTTP must be able to create: {body}"
+        );
+
+        // The event: no actor (the FK forbids it), but the transport the middleware resolved.
+        let event = EventRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT actor_id, source FROM business_events WHERE workspace_id = $1 \
+              AND event_type = 'flow.object.created'",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("business_events query runs")
+        .expect("the create wrote its event");
+        assert_eq!(event.actor_id, None, "a bot's actor_id must be NULL, not a bot id");
+        assert_eq!(
+            event.source["surface"], "mcp_stdio",
+            "the surface must come from the header the real middleware parsed: {:?}",
+            event.source
+        );
+        assert_eq!(
+            event.source["tool"], "flow.object_create",
+            "the exact registered tool must reach the envelope: {:?}",
+            event.source
+        );
+        let request_id = event.source["request"].as_str().expect("source.request is a string");
+
+        // `spawn_operation_log` is `tokio::spawn`ed, so give it a bounded moment to land.
+        let mut joined = None;
+        for _ in 0..40 {
+            joined = JoinedBot::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT bot_id, tool_name, surface FROM bot_operation_logs WHERE request_id = $1::uuid",
+                vec![request_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("bot_operation_logs query runs");
+            if joined.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // **The whole point.** Not "the request id parses" — the join resolves, and it resolves to
+        // *this* bot.
+        let joined = joined.expect(
+            "`business_events.source->>'request'` must join to a `bot_operation_logs` row: that join is the \
+             only thing that names the bot behind an event whose `actor_id` is NULL",
+        );
+        assert_eq!(
+            joined.bot_id, bot_id,
+            "the join must recover the bot that actually made the call"
+        );
+        assert_eq!(
+            joined.surface, "mcp_stdio",
+            "both sides must record one resolved transport"
+        );
+        assert_eq!(joined.tool_name.as_deref(), Some("flow.object_create"));
+
+        scratch.drop_self().await;
+    }
+
+    /// Every bot-reachable Flow write route, exercised **by a bot**, because until now none of
+    /// them worked.
+    ///
+    /// Measured, not inferred (the earlier report said "大概率 500" and declined to claim it):
+    /// with a bot token, `POST .../objects` returned `500 database error`
+    /// (`flow_objects_created_by_fkey`), `PUT .../features/flow` returned `500 database error`
+    /// (`flow_workspace_settings_updated_by_fkey`), and `POST .../commands` returned
+    /// `409 server_draining/contention` — the last one worst of all, because
+    /// `business_events_actor_id_fkey` aborted the locked phase, the write path retried it
+    /// `MAX_REBASE_ATTEMPTS` times and then reported a **retryable** rejection for a write that
+    /// could never succeed. `PUT .../grants` was the only one that worked, because
+    /// `flow::grants` was the only module that had ever handled the case.
+    ///
+    /// The cause is one mismatch: `middleware::bot_auth` returns the **bot id** as the actor, and
+    /// every "who did this" column on these paths is `REFERENCES users(id)`. See
+    /// `flow::command::actor_user_id`.
+    #[tokio::test]
+    async fn every_bot_reachable_write_route_works_for_a_bot_and_stays_attributable() {
+        #[derive(FromQueryResult)]
+        struct ActorRow {
+            event_type: String,
+            actor_id: Option<Uuid>,
+            source: Value,
+        }
+        #[derive(FromQueryResult)]
+        struct UpdateActor {
+            actor_id: Option<Uuid>,
+        }
+
+        let scratch = scratch_or_skip!("bot-write-routes");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let bot_id = Uuid::new_v4();
+        let bot = |tool: &str| {
+            Extension(crate::middleware::bot_auth::BotAuthContext {
+                bot_id,
+                workspace_id,
+                permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+                surface: crate::flow::event_origin::EventSurface::McpStdio,
+                tool_name: Some(tool.to_string()),
+                request_id: Uuid::new_v4(),
+            })
+        };
+
+        // ---- create, as a bot ----
+        let created = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                Some(bot("flow.object_create")),
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Bot Created".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            created["code"], 0,
+            "a bot must be able to create a Flow object: {created}"
+        );
+        let object_id = Uuid::parse_str(created["data"]["object"]["id"].as_str().expect("id")).expect("uuid");
+
+        // ---- a content command, as a bot ----
+        let renamed = body_json(to_response(
+            post_flow_object_command(
+                State(state.clone()),
+                claims.clone(),
+                Some(bot("flow.object_command")),
+                Path(object_id),
+                Json(ExecuteFlowCommandRequest {
+                    command: FlowCommandEnvelope {
+                        command_type: "set_title".to_string(),
+                        payload: json!({"title": "Bot Renamed"}),
+                    },
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            renamed["code"], 0,
+            "a bot content command must not be reported as retryable contention: {renamed}"
+        );
+
+        // ---- the feature flag, as a bot: the live `flow.feature_set` MCP tool ----
+        // Flipped to `false` so it is a real transition and really writes its event; done last,
+        // because the routes above need Flow enabled.
+        let feature = body_json(to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims.clone(),
+                Some(bot("flow.feature_set")),
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: Some(false),
+                    default_member_level: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            feature["code"], 0,
+            "a bot must be able to set the Flow feature flag: {feature}"
+        );
+        assert!(
+            feature["data"]["event_id"].is_string(),
+            "flipping the flag is a real transition and must record one: {feature}"
+        );
+
+        // ---- what landed ----
+        let rows = ActorRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT event_type, actor_id, source FROM business_events WHERE workspace_id = $1 \
+             ORDER BY created_at, id",
+            vec![workspace_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("business_events query runs");
+        for expected in ["flow.object.created", "flow.content.accepted", "flow.feature.disabled"] {
+            assert!(
+                rows.iter().any(|row| row.event_type == expected),
+                "'{expected}' must have been written by a bot; got {:?}",
+                rows.iter().map(|row| row.event_type.as_str()).collect::<Vec<_>>()
+            );
+        }
+        for row in &rows {
+            assert_eq!(
+                row.actor_id, None,
+                "'{}' was written by a bot, so `actor_id` — a `users(id)` FK — must be NULL rather \
+                 than a bot id that no `users` row matches",
+                row.event_type
+            );
+            // Attribution is not lost by that NULL: `source.request` is the very `request_id` the
+            // middleware wrote to `bot_operation_logs.request_id`, so the bot behind any of these
+            // events is one join away. That only holds because the two are deliberately the same
+            // value (`middleware::bot_auth::bot_auth_context`).
+            assert_eq!(row.source["surface"], "mcp_stdio", "{:?}", row.source);
+            assert!(
+                row.source["request"]
+                    .as_str()
+                    .is_some_and(|r| Uuid::parse_str(r).is_ok()),
+                "'{}' must carry the middleware's request id, which is what makes the bot \
+                 recoverable from `bot_operation_logs`: {:?}",
+                row.event_type,
+                row.source
+            );
+        }
+
+        // The content write's own `collab_updates` row has the same `users(id)` FK.
+        let updates = UpdateActor::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT actor_id FROM collab_updates WHERE document_id = $1",
+            vec![document_id_for(&state, object_id).await.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("collab_updates query runs");
+        assert!(
+            !updates.is_empty(),
+            "the bot's content command must have persisted an update"
+        );
+        for update in &updates {
+            assert_eq!(
+                update.actor_id, None,
+                "`collab_updates.actor_id` is a `users(id)` FK too"
+            );
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// 判据 (a) and (b) of `events-v1.md`'s 2026-09-01 clause, through the **real route seam**.
+    ///
+    /// > (a) 同一条 route 被不同 transport 打到时，落库的 `source.surface` **必须不同**；
+    /// > (b) `source.request` 必须**每请求不同**（同一请求的多条事件相同）。
+    ///
+    /// The first version of this work package moved the hardcoded surface from the producers into
+    /// the route layer and stopped — so `PUT .../grants` filled a constant `rest` no matter who
+    /// called it, and the only tests that exercised a non-REST surface constructed a
+    /// `CommandOrigin` by hand in the domain layer, which cannot observe a handler that ignores
+    /// its own auth context. This test drives the *same route* four times over four transports and
+    /// reads what landed in `business_events`, so a handler that unconditionally answers `rest`
+    /// fails it.
+    ///
+    /// It also pins (b) in the form that can actually fail: the REST call writes **two** events in
+    /// one request, so "same within one request" and "different across requests" are both
+    /// observable. Asserting only that `source.request` is a string — which is what the earlier
+    /// version did — stays green for any constant whatsoever.
+    #[tokio::test]
+    async fn the_same_route_records_the_transport_it_was_reached_over_and_one_request_id_per_request() {
+        #[derive(FromQueryResult)]
+        struct PermissionRow {
+            id: Uuid,
+            event_type: String,
+            source: Value,
+            causation_id: Option<Uuid>,
+            idempotency_key: Option<String>,
+            payload: Value,
+        }
+
+        let scratch = scratch_or_skip!("route-transport-origin");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+        let bot_id = Uuid::new_v4();
+
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Transport Origin".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(create_body["code"], 0, "{create_body}");
+        let object_id =
+            Uuid::parse_str(create_body["data"]["object"]["id"].as_str().expect("object id")).expect("object UUID");
+
+        let bot_extension = |surface: crate::flow::event_origin::EventSurface, tool: &str| {
+            Extension(crate::middleware::bot_auth::BotAuthContext {
+                bot_id,
+                workspace_id,
+                permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+                surface,
+                tool_name: Some(tool.to_string()),
+                // The middleware mints this once per request; a fresh one here is what a fresh
+                // request looks like.
+                request_id: Uuid::new_v4(),
+            })
+        };
+        let grant = |kind: &str, id: Uuid, level: &str| GrantRequestBody {
+            principal_kind: kind.to_string(),
+            principal_id: id,
+            level: level.to_string(),
+        };
+        let put_grants = |bot: Option<Extension<crate::middleware::bot_auth::BotAuthContext>>,
+                          grants: Vec<GrantRequestBody>| {
+            let state = state.clone();
+            let claims = claims.clone();
+            async move {
+                body_json(to_response(
+                    put_flow_object_grants(
+                        State(state),
+                        claims,
+                        bot,
+                        Path(object_id),
+                        Json(SetGrantsRequest {
+                            grants,
+                            confirm_self_lockout: true,
+                            dry_run: false,
+                            idempotency_key: Uuid::new_v4().to_string(),
+                        }),
+                    )
+                    .await,
+                ))
+                .await
+            }
+        };
+
+        // ---- leg 1: REST (JWT direct), writing two permission events in one request ----
+        // The bot is granted `full_access` here so the three MCP legs below can act at all: a bot
+        // token does *not* inherit the workspace-admin bypass (`flow::collab::authz` grants that
+        // only to `principal_kind == "user"`), so it needs an explicit object grant.
+        let rest_body = put_grants(
+            None,
+            vec![
+                grant("user", owner_id, "full_access"),
+                grant("bot", bot_id, "full_access"),
+            ],
+        )
+        .await;
+        assert_eq!(rest_body["code"], 0, "{rest_body}");
+
+        // ---- legs 2-4: the same route over each MCP transport ----
+        // Each leg flips the owner's own level so it really changes a row and really writes an
+        // event; the bot keeps `full_access` so it can still act on the next leg.
+        for (surface, level) in [
+            (crate::flow::event_origin::EventSurface::McpHttp, "edit"),
+            (crate::flow::event_origin::EventSurface::McpSse, "full_access"),
+            (crate::flow::event_origin::EventSurface::McpStdio, "edit"),
+        ] {
+            let body = put_grants(
+                Some(bot_extension(surface, "objects.grants_set")),
+                vec![grant("user", owner_id, level), grant("bot", bot_id, "full_access")],
+            )
+            .await;
+            assert_eq!(body["code"], 0, "{} leg: {body}", surface.as_wire());
+        }
+
+        let rows = PermissionRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, event_type, source, causation_id, idempotency_key, payload FROM business_events \
+             WHERE workspace_id = $1 AND event_type LIKE 'flow.permission.%' ORDER BY created_at, id",
+            vec![workspace_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("business_events query runs");
+        assert!(
+            rows.len() >= 5,
+            "expected the REST leg's two events plus one per MCP leg, got {}",
+            rows.len()
+        );
+
+        // ---- (a) one route, four transports, four surfaces ----
+        let surfaces: std::collections::BTreeSet<&str> =
+            rows.iter().filter_map(|row| row.source["surface"].as_str()).collect();
+        assert_eq!(
+            surfaces,
+            ["mcp_http", "mcp_sse", "mcp_stdio", "rest"].into_iter().collect(),
+            "the same route must record the transport it was reached over, not a constant"
+        );
+        for row in &rows {
+            let surface = row.source["surface"].as_str().unwrap_or_default();
+            if surface == "rest" {
+                assert!(
+                    row.source.get("tool").is_none(),
+                    "a JWT-direct REST call has no tool concept, so the key must be omitted: {:?}",
+                    row.source
+                );
+            } else {
+                assert_eq!(
+                    row.source["tool"], "objects.grants_set",
+                    "an MCP call must carry the exact registered tool the middleware resolved: {:?}",
+                    row.source
+                );
+            }
+        }
+
+        // ---- (b) one request id per request, shared by every event of that request ----
+        let rest_requests: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter(|row| row.source["surface"] == "rest")
+            .filter_map(|row| row.source["request"].as_str())
+            .collect();
+        assert_eq!(
+            rest_requests.len(),
+            1,
+            "the REST leg wrote several events in one request, so they must share one request id, got {rest_requests:?}"
+        );
+        let all_requests: Vec<&str> = rows.iter().filter_map(|row| row.source["request"].as_str()).collect();
+        let distinct: std::collections::BTreeSet<&str> = all_requests.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            4,
+            "four requests must mint four request ids (one shared within the REST leg), got {distinct:?}"
+        );
+        for request in &distinct {
+            assert!(
+                Uuid::parse_str(request).is_ok(),
+                "`source.request` must be the server's own request id, got {request:?}"
+            );
+        }
+
+        // ---- the primary event is the one carrying the caller's key, and the rest name it ----
+        // `events-v1.md` (2026-09-01 订正): "主事件 = 携带调用方 `idempotency_key` 的那一条".
+        let rest_leg: Vec<&PermissionRow> = rows.iter().filter(|row| row.source["surface"] == "rest").collect();
+        let keyed: Vec<&&PermissionRow> = rest_leg.iter().filter(|row| row.idempotency_key.is_some()).collect();
+        assert_eq!(
+            keyed.len(),
+            1,
+            "exactly one event of a command may carry the caller's key — that is what makes it the primary"
+        );
+        let primary = keyed[0];
+        assert_eq!(
+            primary.causation_id, None,
+            "the primary event of a first user request roots the chain"
+        );
+        assert_eq!(
+            primary.payload["principal_kind"], "bot",
+            "the primary is chosen from the events' own content (`bot` sorts before `user`), not from \
+             whichever principal the iteration happened to reach first"
+        );
+        for row in rest_leg.iter().filter(|row| row.id != primary.id) {
+            assert_eq!(
+                row.causation_id,
+                Some(primary.id),
+                "'{}' must name the command's primary event as its causation",
+                row.event_type
+            );
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// The REST surface **declaring** its own origin, end to end through the real handlers.
+    ///
+    /// `events-v1.md`: "`source` 由服务端按 Web/REST/MCP/CLI/worker 覆盖". Every event this
+    /// request writes must carry `surface="rest"` *because `routes::flow::request_origin` resolved
+    /// a JWT-direct call to REST*,
+    /// not because a producer hardcoded it — the producer-side half of that statement is proven
+    /// by `flow::move_object`'s and `flow::grants`' non-REST origin tests, which run the same
+    /// producers from `mcp_stdio`/`mcp_http`/`cli_tools_call` and get those surfaces back.
+    ///
+    /// This also pins a defect the split fixed rather than merely restructured: a REST content
+    /// command reached `write::stage_locked_writes`, which stamped the literal `"web"` on the
+    /// `flow.content.accepted` envelope **and** on `collab_updates.origin_surface`. Every
+    /// `set_title` issued over REST was recorded as a WebSocket write.
+    #[tokio::test]
+    async fn every_event_a_rest_request_writes_carries_the_rest_surface_and_a_server_request_id() {
+        #[derive(FromQueryResult)]
+        struct Row {
+            event_type: String,
+            source: Value,
+            correlation_id: Option<Uuid>,
+            /// Selected because an unselected column cannot be asserted on, and this one guards a
+            /// real regression: `flow.command.rejected` once filled `causation_id` with a fresh
+            /// `Uuid::new_v4()`, a dangling edge pointing at an event that never existed. Nothing
+            /// caught it, because this row type did not read the column.
+            causation_id: Option<Uuid>,
+        }
+        #[derive(FromQueryResult)]
+        struct SurfaceRow {
+            origin_surface: String,
+        }
+
+        let scratch = scratch_or_skip!("rest-origin-surface");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+
+        let create_body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "REST Origin Test".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(create_body["code"], 0, "{create_body}");
+        let object_id =
+            Uuid::parse_str(create_body["data"]["object"]["id"].as_str().expect("object id")).expect("object UUID");
+        let document_id = document_id_for(&state, object_id).await;
+
+        let renamed = run_command(&state, &claims, object_id, "set_title", json!({"title": "Renamed"})).await;
+        assert_eq!(renamed["code"], 0, "{renamed}");
+
+        let rows = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT event_type, source, correlation_id, causation_id FROM business_events \
+             WHERE workspace_id = $1 ORDER BY created_at, id",
+            vec![workspace_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("business_events query runs");
+
+        let types: Vec<&str> = rows.iter().map(|row| row.event_type.as_str()).collect();
+        assert!(
+            types.contains(&"flow.object.created") && types.contains(&"flow.content.accepted"),
+            "expected the create and the content command to be recorded, got {types:?}"
+        );
+        for row in &rows {
+            assert_eq!(
+                row.source["surface"], "rest",
+                "'{}' must carry the surface the REST entry point declared, got {:?}",
+                row.event_type, row.source
+            );
+            assert_eq!(
+                row.causation_id, None,
+                "'{}' was written by a first user request, so its causation must be NULL — not a \
+                 freshly minted id pointing at an event that never existed",
+                row.event_type
+            );
+            assert!(
+                row.source["request"].is_string(),
+                "'{}' must carry the server-generated request id `request_origin` fills, got {:?}",
+                row.event_type,
+                row.source
+            );
+            for absent in ["session", "tool", "client_id", "service"] {
+                assert!(
+                    row.source.get(absent).is_none(),
+                    "REST has no {absent}; `events-v1.md` says an inapplicable key is omitted, but \
+                     '{}' carried {:?}",
+                    row.event_type,
+                    row.source
+                );
+            }
+            assert!(
+                row.correlation_id.is_some(),
+                "'{}' must carry the correlation its request generated",
+                row.event_type
+            );
+        }
+
+        // Two separate HTTP requests are two separate causal chains. Stated as "the create's
+        // correlation is not the content command's" rather than as an exact count: `run_command`
+        // retries a `server_draining` rejection as a fresh request, and each retry legitimately
+        // roots its own correlation (and writes its own `flow.command.rejected`), so a count
+        // would be asserting on contention rather than on the contract.
+        let created_correlation = rows
+            .iter()
+            .find(|row| row.event_type == "flow.object.created")
+            .and_then(|row| row.correlation_id)
+            .expect("the create wrote a correlation");
+        let accepted_correlation = rows
+            .iter()
+            .find(|row| row.event_type == "flow.content.accepted")
+            .and_then(|row| row.correlation_id)
+            .expect("the content command wrote a correlation");
+        assert_ne!(
+            created_correlation, accepted_correlation,
+            "two separate HTTP requests must root two separate causal chains"
+        );
+
+        // The column the WebSocket literal used to poison, read straight out of the row the
+        // content command wrote.
+        let surfaces: Vec<String> = SurfaceRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT origin_surface FROM collab_updates WHERE document_id = $1 ORDER BY seq",
+            vec![document_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("collab_updates query runs")
+        .into_iter()
+        .map(|row| row.origin_surface)
+        .collect();
+        assert_eq!(
+            surfaces,
+            vec!["rest".to_string()],
+            "a REST content command must be recorded as a REST write, not a WebSocket one"
+        );
+
+        scratch.drop_self().await;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2322,6 +3259,7 @@ async fn authorization_caller(
             actor_id,
             principal_kind: if is_bot { "bot".to_string() } else { "user".to_string() },
             role,
+            origin: request_origin(extensions),
         },
     ))
 }

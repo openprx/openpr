@@ -111,6 +111,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
 
 use api::flow::collab::frame::{Frame, PROTOCOL_VERSION};
+use api::flow::event_origin::{CommandOrigin, EventSurface};
 use api::flow::projection;
 use api::middleware::bot_auth::bot_or_user_auth_middleware;
 use api::routes::collab::{create_ticket, ws_upgrade};
@@ -473,8 +474,10 @@ async fn create_page(state: &AppState, workspace_id: Uuid, actor_id: Uuid) -> (U
     let accepted = create_object(
         state,
         CreateObjectInput {
+            origin: CommandOrigin::first_request_from(EventSurface::Rest),
             workspace_id,
             actor_id,
+            actor_is_bot: false,
             object_type: "page".to_string(),
             project_id: None,
             parent_object_id: None,

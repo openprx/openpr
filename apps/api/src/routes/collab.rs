@@ -563,8 +563,12 @@ mod collab_database_tests {
         let accepted = create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id,
                 actor_id,
+                actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
                 parent_object_id: None,
@@ -844,6 +848,64 @@ mod collab_database_tests {
         .expect("count query runs")
         .expect("count query returns a row");
         assert_eq!(count.n, 1, "only the one genuinely accepted update was persisted");
+
+        // ---- the WebSocket surface declaring itself, read back from what it wrote ----
+        //
+        // `flow::collab::session` is one of only **two** places in the whole system that declare a
+        // surface (`routes::flow::request_origin` is the other), and it is the one this work
+        // package left unguarded: the declaration was executed by every real WebSocket write and
+        // covered by three end-to-end tests, but no test had ever read the value it put in the
+        // database, so changing `EventSurface::Web` to anything else stayed green across the full
+        // suite. `events-v1.md` requires the surface to come from the transport boundary; this is
+        // that boundary's half of the claim, checked against the row rather than the source.
+        //
+        // ⚠️ This assertion lives in `routes::collab`, not `flow::collab::session` — filtering a
+        // run down to `flow::collab::session` runs 34 tests that never open a socket and would
+        // report green while this one is not even built.
+        #[derive(sea_orm::FromQueryResult)]
+        struct AcceptedWrite {
+            origin_surface: String,
+            source: serde_json::Value,
+        }
+        let accepted_write = AcceptedWrite::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT u.origin_surface, e.source FROM collab_updates u \
+             JOIN business_events e ON e.id = u.event_id \
+             WHERE u.document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("accepted-write query runs")
+        .expect("the accepted update joined to its event");
+        assert_eq!(
+            accepted_write.origin_surface, "web",
+            "a WebSocket write must be recorded as `web` in `collab_updates.origin_surface`"
+        );
+        assert_eq!(
+            accepted_write.source["surface"], "web",
+            "the `flow.content.accepted` envelope must carry the surface the socket declared, got {:?}",
+            accepted_write.source
+        );
+        assert_eq!(
+            accepted_write.source["client_id"], client_id,
+            "`client_id` is the ADR-0007 ticket handshake's field and must survive into the envelope, got {:?}",
+            accepted_write.source
+        );
+        assert!(
+            accepted_write.source["session"]
+                .as_str()
+                .is_some_and(|session| Uuid::parse_str(session).is_ok()),
+            "`session` must be this connection's server-generated session id, got {:?}",
+            accepted_write.source
+        );
+        for absent in ["tool", "request", "service"] {
+            assert!(
+                accepted_write.source.get(absent).is_none(),
+                "`{absent}` does not apply to a WebSocket frame and must be omitted, got {:?}",
+                accepted_write.source
+            );
+        }
 
         scratch.drop_self().await;
     }

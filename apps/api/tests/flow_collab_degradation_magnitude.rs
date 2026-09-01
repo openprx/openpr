@@ -75,6 +75,7 @@ use api::flow::collab::registry::SessionRegistry;
 use api::flow::collab::snapshot::SnapshotAdvancer;
 use api::flow::collab::write::{AcceptOutcome, UpdateRequest, accept_update};
 use api::flow::collab::{authz, bootstrap};
+use api::flow::event_origin::{CommandOrigin, EventSurface};
 
 const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 const OUT_ENV: &str = "OPENPR_FLOW_DEGRADATION_OUT";
@@ -276,8 +277,10 @@ async fn create_page(state: &AppState, workspace_id: Uuid, actor_id: Uuid, title
     let accepted = create_object(
         state,
         CreateObjectInput {
+            origin: CommandOrigin::first_request_from(EventSurface::Rest),
             workspace_id,
             actor_id,
+            actor_is_bot: false,
             object_type: "page".to_string(),
             project_id: None,
             parent_object_id: None,
@@ -381,6 +384,7 @@ async fn write_once(
         10,
         None,
         UpdateRequest {
+            origin: CommandOrigin::first_request_from(EventSurface::Rest),
             document_id,
             update_id: Uuid::new_v4(),
             bytes,
@@ -389,6 +393,7 @@ async fn write_once(
             origin_client_id: Some("degradation-magnitude".to_string()),
             message: None,
             actor_id,
+            actor_is_bot: false,
             workspace_id,
             checked_epoch,
             expected_frontier: None,

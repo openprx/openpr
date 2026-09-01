@@ -59,6 +59,7 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
+use crate::flow::event_origin::CommandOrigin;
 use crate::flow::projection;
 
 use super::authz::fence_epoch_for_share;
@@ -105,6 +106,15 @@ pub struct UpdateRequest {
     pub origin_client_id: Option<String>,
     pub message: Option<String>,
     pub actor_id: Uuid,
+    /// Whether [`Self::actor_id`] is a `workspace_bots` id rather than a `users` id.
+    ///
+    /// Both of this function's "who" columns — `collab_updates.actor_id` and the
+    /// `business_events.actor_id` of the `flow.content.accepted` it writes — are
+    /// `REFERENCES users(id)`. A bot token's actor *is* its bot id, so without this flag every
+    /// bot-issued content command violated the FK, the locked phase rolled back, and the write
+    /// path reported it as `server_draining`/`contention` — a **retryable** rejection for a write
+    /// that could never succeed. See `flow::command::actor_user_id`.
+    pub actor_is_bot: bool,
     pub workspace_id: Uuid,
     /// The `authz_epoch` the caller's effective permission was last verified against (`open` time,
     /// or the most recent successful write). See [`fence_epoch_for_share`].
@@ -117,6 +127,19 @@ pub struct UpdateRequest {
     /// of the frontier it was locally based on, which is the whole point of shipping a CRDT; this
     /// guard exists only for callers that explicitly want strict optimistic locking instead.
     pub expected_frontier: Option<Vec<u8>>,
+    /// Where this write came from, declared by the surface that accepted it
+    /// (`flow::event_origin::CommandOrigin`): `source.surface` and the optional `session`/`tool`/
+    /// `request`/`client_id`/`service` keys of the `flow.content.accepted` envelope, the
+    /// `collab_updates.origin_surface` column, and the event's `correlation_id`/`causation_id`.
+    ///
+    /// Previously a `&'static str` parameter threaded down to [`stage_one_document`], which
+    /// [`stage_locked_writes`] filled with the literal `"web"` for **every** caller of
+    /// [`accept_update`] — so the REST `POST .../commands` content path was recorded as a
+    /// WebSocket write. It belongs on the request because it is a property of the request, and
+    /// because a derived write (`flow::move_object`'s navigator head advances) needs to carry a
+    /// *different* origin from a first-request one: same surface and correlation, but a
+    /// `causation_id` naming the `flow.object.moved` event that caused it.
+    pub origin: CommandOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -580,6 +603,12 @@ enum LockedOutcome {
     /// the one place in this module that cannot answer the contract's question, and therefore the
     /// only producer of [`WriteState::Unknown`].
     CommitUnknown,
+    /// The staging phase hit a database error that **retrying cannot fix** — a constraint
+    /// violation, a data exception, a schema error (`ApiError::is_deterministic_database_failure`).
+    /// Rolled back, nothing written, and deliberately *not* a [`Self::NotApplied`]: that variant
+    /// feeds the bounded-rebase loop, and a deterministic refusal must leave the loop at once
+    /// rather than be spent `MAX_REBASE_ATTEMPTS` times and then dressed up as `contention`.
+    Failed(ApiError),
 }
 
 /// What [`stage_locked_writes`] concluded, before `COMMIT` is issued.
@@ -625,7 +654,7 @@ async fn stage_locked_writes(
         Err(err) => return Err(err),
     }
 
-    stage_one_document(tx, request, prepared, dispatch_max_attempts, "web").await
+    stage_one_document(tx, request, prepared, dispatch_max_attempts).await
 }
 
 /// `limits-v1.md`'s `document_lock_wait_ms_max` / `document_lock_hold_ms_max`, applied
@@ -657,9 +686,11 @@ pub(crate) async fn set_locked_phase_statement_budgets(tx: &DatabaseTransaction)
 /// freshness. The caller owns everything above this level: the epoch fence, the `ADR-0013` §2.1
 /// document lock **order**, and the decision to commit or roll back.
 ///
-/// `origin_surface` is stamped on `collab_updates.origin_surface` and on the event's
-/// `source.surface` — `"web"` for the WebSocket/REST content path, `"rest"` for a
-/// governance-command-produced navigator ordering change.
+/// `request.origin` is stamped on `collab_updates.origin_surface` and on the event's
+/// `source`/`correlation_id`/`causation_id`. It is the *caller's* declaration
+/// (`UpdateRequest::origin`), never decided here: this function has no way to know whether it is
+/// serving a WebSocket frame, a REST command, an MCP tool call or a CLI invocation, and guessing
+/// is how an audit stream ends up recording every surface as one.
 ///
 /// # Errors
 /// Propagates a database failure. A head that moved past the prepared head is
@@ -669,7 +700,6 @@ pub(crate) async fn stage_one_document(
     request: &UpdateRequest,
     prepared: &Prepared,
     dispatch_max_attempts: i32,
-    origin_surface: &'static str,
 ) -> Result<StagedOutcome, ApiError> {
     #[derive(FromQueryResult)]
     struct LockedHead {
@@ -702,8 +732,8 @@ pub(crate) async fn stage_one_document(
             event_type: "flow.content.accepted".to_string(),
             aggregate_type: "flow_document".to_string(),
             aggregate_id: request.document_id.to_string(),
-            actor_id: Some(request.actor_id),
-            source: serde_json::json!({ "surface": origin_surface }),
+            actor_id: crate::flow::command::actor_user_id(request.actor_id, request.actor_is_bot),
+            source: request.origin.source_json(),
             payload: serde_json::json!({
                 "object_id": prepared.observed.object_id,
                 "document_id": request.document_id,
@@ -712,8 +742,8 @@ pub(crate) async fn stage_one_document(
                 "changed_block_ids": Vec::<Uuid>::new(),
             }),
             metadata: serde_json::json!({ "message": request.message }),
-            correlation_id: None,
-            causation_id: None,
+            correlation_id: Some(request.origin.correlation_id),
+            causation_id: request.origin.causation_id,
             // `UpdateRequest::event_idempotency_key`'s doc comment: the REST command surface sets
             // this so `flow::command`'s `find_idempotent_event` replay guard actually covers
             // content commands (it is the only command family that used to write `None` here, so
@@ -748,10 +778,10 @@ pub(crate) async fn stage_one_document(
             before_frontier.into(),
             after_frontier.clone().into(),
             request.bytes.clone().into(),
-            request.actor_id.into(),
+            crate::flow::command::actor_user_id(request.actor_id, request.actor_is_bot).into(),
             request.origin_client_id.clone().into(),
             event_id.into(),
-            origin_surface.into(),
+            request.origin.surface().as_wire().into(),
         ],
     ))
     .await?;
@@ -860,8 +890,21 @@ async fn run_locked_phase(
             return LockedOutcome::EpochMismatch;
         }
         Ok(Err(err)) => {
-            tracing::warn!(error = %err, "collab write: locked phase failed before commit, rolling back");
             let _ = tx.rollback().await;
+            // The two questions a retry loop must not conflate: "can this error change?" and
+            // "have I tried enough times?". A constraint violation answers the first with *no*,
+            // so it leaves here immediately, carrying its real cause, instead of being retried
+            // `MAX_REBASE_ATTEMPTS` times and reported as `server_draining`/`contention` — a
+            // *retryable* verdict that told MCP clients to keep hammering a write the database
+            // will refuse identically forever, and erased the FK name while doing it.
+            if err.is_deterministic_database_failure() {
+                tracing::warn!(
+                    error = %err,
+                    "collab write: locked phase hit a deterministic database refusal, not retrying"
+                );
+                return LockedOutcome::Failed(err);
+            }
+            tracing::warn!(error = %err, "collab write: locked phase failed before commit, rolling back");
             return LockedOutcome::NotApplied("locked phase failed before commit");
         }
         Err(_elapsed) => {
@@ -968,6 +1011,30 @@ pub async fn accept_update(
                     ));
                 }
                 Err(err) => {
+                    // Same rule as the locked phase below: a deterministic refusal is reported as
+                    // itself, never as a retryable `contention`.
+                    //
+                    // ⚠️ **No test executes this branch.** Reaching it needs a document already at
+                    // a *hard* snapshot boundary (`SNAPSHOT_TAIL_UPDATES_HARD_MAX` = 1,024 tail
+                    // rows, or `SNAPSHOT_TAIL_BYTES_HARD_MAX` = 4 MiB) **and** a database error out
+                    // of `snapshot::advance` on top of that; a fabricated tail cheap enough to
+                    // build fails inside the candidate *build* (a decode error, not a database
+                    // one) before it can reach the write this arm is about. Verified by injecting
+                    // an unconditional `panic!` here: the full suite stayed green.
+                    //
+                    // It is kept rather than dropped because the classification it applies is the
+                    // same one the locked phase applies and is exercised there — but the fact that
+                    // *this* call site is unproven is recorded here rather than left for a reader
+                    // to discover. It is production-reachable, not structurally dead: a real
+                    // `advance` failure at a real hard boundary lands here.
+                    if err.is_deterministic_database_failure() {
+                        tracing::warn!(
+                            error = %err,
+                            document_id = %request.document_id,
+                            "collab write: forced snapshot checkpoint hit a deterministic database refusal"
+                        );
+                        return Err(err);
+                    }
                     tracing::warn!(
                         error = %err,
                         document_id = %request.document_id,
@@ -1075,6 +1142,7 @@ pub async fn accept_update(
                     WriteState::Unknown,
                 ));
             }
+            LockedOutcome::Failed(err) => return Err(err),
             LockedOutcome::NotApplied(reason) => {
                 if attempts >= MAX_REBASE_ATTEMPTS {
                     return Ok(contention(Some(request.update_id), reason, WriteState::NotApplied));
@@ -1386,8 +1454,12 @@ mod database_tests {
         let accepted = create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id,
                 actor_id,
+                actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
                 parent_object_id: None,
@@ -1424,6 +1496,112 @@ mod database_tests {
         engine.set_title("mutated by test").expect("set_title succeeds");
         let update = engine.export_from(&base_frontier).expect("export succeeds");
         (update, engine)
+    }
+
+    /// A deterministic database refusal must leave the write path **once**, as itself.
+    ///
+    /// `events-v1.md` / `error-mapping-v1.md` (2026-09-01): 约束违约等确定性错误一次即判非可重试,
+    /// 不进重试循环、不套 `contention` 外衣.
+    ///
+    /// The `actor_id` here is a UUID with no `users` row, which `business_events.actor_id`'s
+    /// foreign key refuses — deterministically, on every attempt, forever. Before
+    /// `ApiError::is_deterministic_database_failure` existed, that refusal was folded into
+    /// `LockedOutcome::NotApplied`, walked around the bounded-rebase loop `MAX_REBASE_ATTEMPTS`
+    /// times, and returned as `Ok(server_draining / reason="contention" / retry_after_ms: 200)` —
+    /// a **retryable** verdict on a write that could never succeed, with the constraint name
+    /// discarded. A client that believes it retries forever.
+    ///
+    /// Note what is asserted: `Err`, i.e. the error is *reported*, not that it carries any
+    /// particular HTTP shape. The contract's requirement is that a permanent failure stops being
+    /// advertised as temporary; how `ApiError::Database` then renders is `error-mapping-v1.md`'s
+    /// business, not this module's.
+    #[tokio::test]
+    async fn a_deterministic_constraint_violation_is_reported_once_not_retried_as_contention() {
+        let scratch = scratch_or_skip!("deterministic-refusal");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct SnapshotRow {
+            snapshot: Vec<u8>,
+        }
+        let snapshot_row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("query runs")
+        .expect("row exists");
+        let (update_bytes, _engine) = a_valid_update_against(&snapshot_row.snapshot);
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        // A user id that does not exist. Everything else about this write is valid.
+        let ghost_actor = Uuid::new_v4();
+        let outcome = accept_update(
+            &state.db,
+            &WarmCache::new(),
+            &DocumentCoordinator::new(),
+            &SessionRegistry::new(),
+            &SnapshotAdvancer::new(),
+            10,
+            None,
+            UpdateRequest {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
+                document_id,
+                update_id: Uuid::new_v4(),
+                bytes: update_bytes,
+                idempotency_key: None,
+                event_idempotency_key: None,
+                origin_client_id: None,
+                message: None,
+                actor_id: ghost_actor,
+                actor_is_bot: false,
+                workspace_id,
+                checked_epoch,
+                expected_frontier: None,
+            },
+        )
+        .await;
+
+        match outcome {
+            Err(err) => {
+                assert!(
+                    err.is_deterministic_database_failure(),
+                    "the constraint violation must be classified as deterministic, got {err:?}"
+                );
+            }
+            Ok(AcceptOutcome::Rejected(rejected)) => panic!(
+                "a permanent constraint violation was reported as a retryable rejection \
+                 (code={:?}, details={:?}) — this is exactly the `contention` disguise the contract forbids",
+                rejected.code, rejected.details
+            ),
+            Ok(AcceptOutcome::Accepted(_)) => {
+                panic!("the write must not succeed: its actor has no `users` row")
+            }
+        }
+
+        // Nothing was written, and the document still holds its pre-write head.
+        #[derive(FromQueryResult)]
+        struct CountRow {
+            n: i64,
+        }
+        let count = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM collab_updates WHERE document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("count query runs")
+        .expect("count query returns a row");
+        assert_eq!(count.n, 0, "a refused write must leave no `collab_updates` row");
+
+        scratch.drop_self().await;
     }
 
     #[tokio::test]
@@ -1464,6 +1642,9 @@ mod database_tests {
             10,
             None,
             UpdateRequest {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 document_id,
                 update_id,
                 bytes: update_bytes,
@@ -1472,6 +1653,7 @@ mod database_tests {
                 origin_client_id: Some("test-client".to_string()),
                 message: None,
                 actor_id: owner_id,
+                actor_is_bot: false,
                 workspace_id,
                 checked_epoch,
                 expected_frontier: None,
@@ -1580,6 +1762,9 @@ mod database_tests {
                 10,
                 None,
                 UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
                     document_id,
                     update_id,
                     bytes: update_bytes,
@@ -1588,6 +1773,7 @@ mod database_tests {
                     origin_client_id: Some("test-client-a".to_string()),
                     message: None,
                     actor_id: owner_id,
+                    actor_is_bot: false,
                     workspace_id,
                     checked_epoch: original_epoch,
                     expected_frontier: None,
@@ -1729,6 +1915,9 @@ mod database_tests {
                 10,
                 None,
                 UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
                     document_id,
                     update_id,
                     bytes: update_bytes,
@@ -1737,6 +1926,7 @@ mod database_tests {
                     origin_client_id: Some("test-client-a".to_string()),
                     message: None,
                     actor_id: owner_id,
+                    actor_is_bot: false,
                     workspace_id,
                     checked_epoch: original_epoch,
                     expected_frontier: None,
@@ -1849,6 +2039,9 @@ mod database_tests {
                 10,
                 None,
                 UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
                     document_id,
                     update_id: Uuid::new_v4(),
                     bytes,
@@ -1857,6 +2050,7 @@ mod database_tests {
                     origin_client_id: Some("range-test".to_string()),
                     message: None,
                     actor_id: owner_id,
+                    actor_is_bot: false,
                     workspace_id,
                     checked_epoch,
                     expected_frontier: None,
@@ -2083,6 +2277,9 @@ mod database_tests {
             10,
             None,
             UpdateRequest {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 document_id,
                 update_id,
                 bytes,
@@ -2091,6 +2288,7 @@ mod database_tests {
                 origin_client_id: Some(label.to_string()),
                 message: None,
                 actor_id,
+                actor_is_bot: false,
                 workspace_id,
                 checked_epoch,
                 expected_frontier: None,
@@ -3056,6 +3254,9 @@ mod database_tests {
         key: &str,
     ) -> ExecuteCommandInput {
         ExecuteCommandInput {
+            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                crate::flow::event_origin::EventSurface::Rest,
+            ),
             object_id,
             actor_id,
             principal_kind: "user".to_string(),
@@ -3130,6 +3331,9 @@ mod database_tests {
         let head_before = head_seq_of(&state, document_id).await;
 
         let request = UpdateRequest {
+            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                crate::flow::event_origin::EventSurface::Rest,
+            ),
             document_id,
             update_id,
             bytes: update_bytes,
@@ -3138,6 +3342,7 @@ mod database_tests {
             origin_client_id: Some("stalled-commit".to_string()),
             message: None,
             actor_id: owner_id,
+            actor_is_bot: false,
             workspace_id,
             checked_epoch,
             expected_frontier: None,
@@ -3175,6 +3380,18 @@ mod database_tests {
                 assert_eq!(
                     head_after, accepted.head_seq,
                     "a committed write must leave the head it reported"
+                );
+            }
+            super::LockedOutcome::Failed(ref err) => {
+                // A deterministic refusal is rolled back exactly as `NotApplied` is; the only
+                // difference is that it never re-enters the rebase loop.
+                assert_eq!(
+                    rows, 0,
+                    "the locked phase failed deterministically (`{err}`), but the update is in collab_updates"
+                );
+                assert_eq!(
+                    head_after, head_before,
+                    "the locked phase failed deterministically (`{err}`), but the canonical head moved"
                 );
             }
             super::LockedOutcome::NotApplied(reason) => {

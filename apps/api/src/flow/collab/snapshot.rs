@@ -815,8 +815,12 @@ mod database_tests {
         let accepted = create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id,
                 actor_id,
+                actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
                 parent_object_id: None,
@@ -899,6 +903,9 @@ mod database_tests {
             10,
             None,
             UpdateRequest {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 document_id,
                 update_id: Uuid::new_v4(),
                 bytes,
@@ -907,6 +914,7 @@ mod database_tests {
                 origin_client_id: Some("snapshot-test".to_string()),
                 message: None,
                 actor_id,
+                actor_is_bot: false,
                 workspace_id,
                 checked_epoch,
                 expected_frontier: None,
@@ -1415,6 +1423,9 @@ mod database_tests {
                         10,
                         None,
                         UpdateRequest {
+                            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                                crate::flow::event_origin::EventSurface::Rest,
+                            ),
                             document_id,
                             update_id: Uuid::new_v4(),
                             bytes,
@@ -1423,6 +1434,7 @@ mod database_tests {
                             origin_client_id: Some("race-writer".to_string()),
                             message: None,
                             actor_id: owner_id,
+                            actor_is_bot: false,
                             workspace_id,
                             checked_epoch,
                             expected_frontier: None,

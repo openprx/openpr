@@ -23,6 +23,7 @@
 
 pub mod collab;
 pub mod command;
+pub mod event_origin;
 pub mod event_policy;
 pub mod grants;
 pub mod import;

@@ -40,7 +40,12 @@ use crate::error::ApiError;
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
 use super::collab::authz::{self, GRANTS_PER_REQUEST_MAX, OBJECT_GRANTS_MAX, PermissionLevel};
+use super::event_origin::CommandOrigin;
 use super::event_policy::FLOW_PERMISSION_EVENT_TYPE_PREFIX;
+
+/// The boundary-change event, named once so [`primary_event_index`] and the producer that pushes
+/// it cannot drift apart.
+const INHERITANCE_CHANGED_EVENT_TYPE: &str = "flow.permission.inheritance_changed";
 use super::repository;
 
 /// `flow_object_grants.principal_kind`'s registered values (the table's
@@ -171,6 +176,14 @@ pub struct Caller {
     /// The caller's `workspace_members.role`, or the role
     /// `middleware::bot_auth::bot_role_from_permissions` synthesized for a bot token.
     pub role: String,
+    /// Where the call came from, declared by the transport that accepted it.
+    ///
+    /// Lives on `Caller` rather than as a separate parameter because
+    /// `v0.5-collaboration.md` treats it as one audit fact — "审计……保存认证 actor、
+    /// origin(surface/session/tool)、causation" — and because `Caller` is already the value every
+    /// step of this module's transaction threads down to [`write_events`]. Both `PUT` endpoints
+    /// read `source`/`correlation_id`/`causation_id` off it instead of writing a literal.
+    pub origin: CommandOrigin,
 }
 
 impl Caller {
@@ -855,7 +868,7 @@ async fn apply_in_transaction(
             if inherit_after != inherit_before {
                 set_inherit_flag(tx, object_id, inherit_after, caller.granted_by()).await?;
                 events.push((
-                    "flow.permission.inheritance_changed",
+                    INHERITANCE_CHANGED_EVENT_TYPE,
                     json!({ "object_id": object_id, "inherit_from_parent": inherit_after }),
                 ));
             }
@@ -1000,6 +1013,60 @@ async fn apply_in_transaction(
     ))
 }
 
+/// Which of a command's events is its **primary** one — the causal root the rest hang off, and
+/// the only one that carries the caller's `idempotency_key`.
+///
+/// `events-v1.md` (2026-09-01 订正): "「直接父」= 该命令的主事件，而**主事件 = 携带调用方
+/// `idempotency_key` 的那一条**". The previous wording named "command registry 里那条
+/// `primary_event_type`", a registry that does not exist anywhere in this repository; the
+/// corrected rule picks a property that does exist and is already enforced, because
+/// `business_events` carries a unique index on `(workspace_id, idempotency_key)` — so "the one
+/// with the key" is unique by construction, queryable, and assertable.
+///
+/// That leaves this function with the obligation the correction created: **choose** which event
+/// gets the key, deterministically and from the events' own content. It must not be "index 0",
+/// which is what this module did before. For a pure `set_grants` the event vector is built by
+/// iterating principals, so index 0 is whichever principal the iteration reached first — making
+/// the causal root of the request *arbitrary*, and different across two runs of the same request.
+///
+/// The rule, in order:
+///
+/// 1. `flow.permission.inheritance_changed` if the command produced one. A boundary change is the
+///    command's headline transition — the grants that follow it are consequences of it — and
+///    `ADR-0012` §4.1 admits at most one per request, so this is unambiguous.
+/// 2. Otherwise the event smallest by `(event_type, principal_kind, principal_id)`. Every
+///    component comes from the event's own payload, so the answer is a function of *what the
+///    command did*, not of the order a `HashMap` happened to yield.
+fn primary_event_index(events: &[(&'static str, serde_json::Value)]) -> Option<usize> {
+    if let Some(index) = events
+        .iter()
+        .position(|(event_type, _)| *event_type == INHERITANCE_CHANGED_EVENT_TYPE)
+    {
+        return Some(index);
+    }
+    events
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (event_type, payload))| {
+            let text = |key: &str| payload.get(key).and_then(serde_json::Value::as_str).unwrap_or_default();
+            (
+                *event_type,
+                text("principal_kind").to_string(),
+                text("principal_id").to_string(),
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+/// Writes one command's permission events as a single causal tree and returns its primary event
+/// id.
+///
+/// The primary event ([`primary_event_index`]) is inserted **first** so that the events derived
+/// from it can name it in `causation_id` — the same parent-before-children ordering `move_object`
+/// cannot have (its lock order forces children first, which is why it pre-mints the parent id
+/// instead). Here nothing forces the order, so the simpler shape is the right one. Sibling
+/// permission events share one transaction and therefore one `created_at` to the microsecond;
+/// their insertion order carries no meaning and no contract depends on it.
 async fn write_events(
     tx: &DatabaseTransaction,
     workspace_id: Uuid,
@@ -1009,17 +1076,16 @@ async fn write_events(
     idempotency_key: &str,
 ) -> Result<Option<Uuid>, ApiError> {
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
+    let Some(primary_index) = primary_event_index(events) else {
+        return Ok(None);
+    };
     let mut primary = None;
-    for (index, (event_type, payload)) in events.iter().enumerate() {
-        // Only the first event carries the request's `idempotency_key`: `business_events`'
-        // `(workspace_id, idempotency_key)` unique index is what makes a replayed request return
-        // the original ids instead of writing a second set, and that index admits exactly one
-        // row per key. The rest are `NULL`, which the partial index ignores.
-        let key = if index == 0 {
-            Some(idempotency_key.to_string())
-        } else {
-            None
-        };
+    // Primary first, then the rest in their natural order.
+    let mut ordered: Vec<(usize, &(&'static str, serde_json::Value))> = Vec::with_capacity(events.len());
+    ordered.extend(events.iter().enumerate().filter(|(index, _)| *index == primary_index));
+    ordered.extend(events.iter().enumerate().filter(|(index, _)| *index != primary_index));
+    for (index, (event_type, payload)) in ordered {
+        let is_primary = index == primary_index;
         let outcome = insert_flow_event(
             tx,
             BusinessEventInput {
@@ -1029,12 +1095,29 @@ async fn write_events(
                 aggregate_type: "flow_permission".to_string(),
                 aggregate_id: object_id.to_string(),
                 actor_id: if caller.is_bot() { None } else { Some(caller.actor_id) },
-                source: json!({ "surface": "rest" }),
+                source: caller.origin.source_json(),
                 payload: payload.clone(),
                 metadata: json!({ "principal_kind": caller.principal_kind }),
-                correlation_id: None,
-                causation_id: None,
-                idempotency_key: key,
+                // Every event this one request writes shares the request's correlation
+                // (`events-v1.md`: "首个用户请求生成 `correlation_id`").
+                correlation_id: Some(caller.origin.correlation_id),
+                // The primary event carries whatever caused the *command* (`None` for a first
+                // user request — a meaningful "this is the root", not a missing value). Every
+                // other event of the same command names the primary, so the request reconstructs
+                // as one causal tree rather than N unrelated roots. `primary` is `Some` for all of
+                // them because the primary is inserted first; it is read rather than defaulted so
+                // that breaking that ordering surfaces as a wrong parent, not as a silent `NULL`.
+                causation_id: if is_primary {
+                    caller.origin.causation_id
+                } else {
+                    primary
+                },
+                // `business_events`' `(workspace_id, idempotency_key)` unique index is what makes a
+                // replayed request return the original ids instead of writing a second set, and it
+                // admits exactly one row per key — so exactly one event of a command may carry it,
+                // and `events-v1.md` makes *that* event the primary by definition. The rest are
+                // `NULL`, which the partial index ignores.
+                idempotency_key: is_primary.then(|| idempotency_key.to_string()),
             },
             Some(FlowDispatchSpec {
                 max_attempts: dispatch_max_attempts,
@@ -1043,7 +1126,7 @@ async fn write_events(
             }),
         )
         .await?;
-        if index == 0 {
+        if is_primary {
             primary = Some(outcome.event_id);
         }
     }
@@ -1100,6 +1183,90 @@ async fn replay(
 // way out. Every assertion here is about a rule that only exists once rows can be written, so
 // none of it can be covered by a pure function test.
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod primary_event_tests {
+    use super::{INHERITANCE_CHANGED_EVENT_TYPE, primary_event_index};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    /// The rule that replaced "index 0", stated where it can be falsified deterministically.
+    ///
+    /// `events-v1.md` (2026-09-01 订正) makes the primary event the one carrying the caller's
+    /// `idempotency_key`, and leaves this module to choose *which* event that is. The choice must
+    /// not be positional: a pure `set_grants` builds its event vector by iterating principals, so
+    /// "index 0" makes the causal root of the request depend on iteration order — the contract
+    /// calls that "任意的，这不可接受".
+    ///
+    /// Every fixture here deliberately puts a **non-primary event at index 0**, which is what
+    /// makes the assertion able to fail: reverting `primary_event_index` to `Some(0)` reddens
+    /// every case below, with no dependence on how a `HashMap` happened to iterate that day. The
+    /// database test that exercises the same rule through the real route cannot promise that —
+    /// there, whether index 0 and the primary differ is up to the iteration order of the day.
+    #[test]
+    fn the_primary_event_is_chosen_from_content_and_never_from_position() {
+        let alice = Uuid::parse_str("00000000-0000-0000-0000-0000000000a1").expect("fixture uuid");
+        let bob = Uuid::parse_str("00000000-0000-0000-0000-0000000000b2").expect("fixture uuid");
+        let granted = |kind: &str, id: Uuid| {
+            (
+                "flow.permission.granted",
+                json!({ "principal_kind": kind, "principal_id": id, "level": "edit" }),
+            )
+        };
+        let revoked = |kind: &str, id: Uuid| {
+            (
+                "flow.permission.revoked",
+                json!({ "principal_kind": kind, "principal_id": id, "old_level": "edit" }),
+            )
+        };
+
+        // (1) A boundary change is the command's headline transition wherever it sits.
+        let inheritance_last = vec![
+            granted("user", alice),
+            (INHERITANCE_CHANGED_EVENT_TYPE, json!({ "inherit_from_parent": false })),
+        ];
+        assert_eq!(
+            primary_event_index(&inheritance_last),
+            Some(1),
+            "the inheritance change is the primary even when it is not first in the vector"
+        );
+
+        // (2) No boundary change: the smallest `(event_type, principal_kind, principal_id)` wins.
+        // `granted` sorts before `revoked`, so index 0's revocation must lose.
+        let revoke_first = vec![revoked("user", alice), granted("user", bob)];
+        assert_eq!(
+            primary_event_index(&revoke_first),
+            Some(1),
+            "`flow.permission.granted` sorts before `flow.permission.revoked`, so index 0 is not the primary"
+        );
+
+        // (3) Same event type: `bot` sorts before `user`.
+        let user_first = vec![granted("user", alice), granted("bot", bob)];
+        assert_eq!(
+            primary_event_index(&user_first),
+            Some(1),
+            "`bot` sorts before `user`, so index 0 is not the primary"
+        );
+
+        // (4) Same type and kind: the principal id breaks the tie, and reordering the very same
+        // events must not move the answer — the property "index 0" cannot have.
+        let ascending = vec![granted("user", alice), granted("user", bob)];
+        let descending = vec![granted("user", bob), granted("user", alice)];
+        assert_eq!(primary_event_index(&ascending), Some(0));
+        assert_eq!(
+            primary_event_index(&descending),
+            Some(1),
+            "the same two events in the other order must still elect the same event"
+        );
+
+        assert_eq!(
+            primary_event_index(&[]),
+            None,
+            "a command that changed nothing has no primary"
+        );
+    }
+}
+
+#[cfg(test)]
 #[allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -1125,6 +1292,7 @@ mod database_tests {
     use crate::flow::command::{
         CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput, create_object, execute_command, set_flow_feature,
     };
+    use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
     use crate::middleware::bot_auth::bot_role_from_permissions;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -1285,8 +1453,12 @@ mod database_tests {
         create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id: fx.workspace_id,
                 actor_id: fx.owner_id,
+                actor_is_bot: false,
                 object_type: object_type.to_string(),
                 project_id: None,
                 parent_object_id: parent,
@@ -1303,6 +1475,9 @@ mod database_tests {
 
     fn user(actor_id: Uuid, role: &str) -> Caller {
         Caller {
+            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                crate::flow::event_origin::EventSurface::Rest,
+            ),
             actor_id,
             principal_kind: "user".to_string(),
             role: role.to_string(),
@@ -1311,10 +1486,51 @@ mod database_tests {
 
     fn bot(actor_id: Uuid, role: &str) -> Caller {
         Caller {
+            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                crate::flow::event_origin::EventSurface::Rest,
+            ),
             actor_id,
             principal_kind: "bot".to_string(),
             role: role.to_string(),
         }
+    }
+
+    /// A caller whose origin is an explicit, non-REST surface — the only way to tell "the
+    /// producer copied what the caller declared" apart from "the producer hardcoded REST".
+    fn user_from(actor_id: Uuid, role: &str, origin: CommandOrigin) -> Caller {
+        let mut caller = user(actor_id, role);
+        caller.origin = origin;
+        caller
+    }
+
+    #[derive(Debug, FromQueryResult)]
+    struct EventRow {
+        id: Uuid,
+        event_type: String,
+        source: serde_json::Value,
+        correlation_id: Option<Uuid>,
+        causation_id: Option<Uuid>,
+        /// Only `write_events`' **first** event of a command carries the request's key (the
+        /// `(workspace_id, idempotency_key)` unique index admits exactly one row per key), which
+        /// makes this column the only reliable marker of "this row is the command's primary
+        /// event". Row order cannot serve: every row of one command is inserted in one
+        /// transaction and shares `created_at = now()` to the microsecond, so `ORDER BY
+        /// created_at, id` breaks the tie on a random UUID.
+        idempotency_key: Option<String>,
+    }
+
+    /// The committed events one command wrote, identified by the correlation it rooted — read
+    /// back from the database.
+    async fn events_with_correlation(db: &DatabaseConnection, correlation_id: Uuid) -> Vec<EventRow> {
+        EventRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, event_type, source, correlation_id, causation_id, idempotency_key \
+             FROM business_events WHERE correlation_id = $1 ORDER BY created_at, id",
+            vec![correlation_id.into()],
+        ))
+        .all(db)
+        .await
+        .expect("business_events query runs")
     }
 
     fn grant_of(kind: &str, id: Uuid, level: &str) -> GrantRequest {
@@ -1457,6 +1673,9 @@ mod database_tests {
         execute_command(
             state,
             ExecuteCommandInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 object_id,
                 actor_id: caller.actor_id,
                 principal_kind: caller.principal_kind.clone(),
@@ -1765,8 +1984,12 @@ mod database_tests {
         set_flow_feature(
             &state,
             SetFlowFeatureInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id: fx.workspace_id,
                 actor_id: fx.owner_id,
+                actor_is_bot: false,
                 enabled: Some(true),
                 default_member_level: Some("edit".to_string()),
                 idempotency_key: Uuid::new_v4().to_string(),
@@ -2735,6 +2958,156 @@ mod database_tests {
             worst_roster < 250.0,
             "the full chain roster read took {worst_roster:.3} ms"
         );
+
+        scratch.drop_self().await;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `events-v1.md` origin / correlation / causation, for both authorization commands
+    // -----------------------------------------------------------------------------------------
+
+    /// `v0.5-collaboration.md`: "审计使用 `events-v1.md` 的同一 `business_events` fact，保存认证
+    /// actor、origin(surface/session/tool)、causation".
+    ///
+    /// Both `PUT` endpoints, each run from a surface REST could never produce, so an assertion on
+    /// the committed `source` can only pass if the producer copied the caller's declaration.
+    /// `set_inheritance` is run with an `initial_grants` roster so it writes **several** events in
+    /// one command, which is what makes the correlation/causation half of the contract checkable
+    /// here at all.
+    #[tokio::test]
+    async fn both_authorization_commands_stamp_the_callers_surface_and_share_one_correlation() {
+        let scratch = scratch_or_skip!("grants_origin");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let page = create(&state, &fx, "page", None).await;
+
+        // ---- PUT .../grants, from a CLI tools-call surface ----
+        let grants_origin = CommandOrigin::first_request(
+            EventSource::new(EventSurface::CliToolsCall)
+                .with_tool("objects.grants_set")
+                .with_session("cli-session-3"),
+        );
+        let grants_correlation = grants_origin.correlation_id;
+        set_grants(
+            &state,
+            fx.workspace_id,
+            SetGrantsInput {
+                object_id: page,
+                caller: user_from(fx.owner_id, "owner", grants_origin),
+                grants: vec![grant_of("user", fx.member_id, "full_access")],
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("set_grants succeeds");
+
+        let rows = events_with_correlation(&scratch.db, grants_correlation).await;
+        assert!(
+            !rows.is_empty(),
+            "set_grants must record its permission transitions under the request's correlation"
+        );
+        let expected_source = serde_json::json!({
+            "surface": "cli_tools_call",
+            "tool": "objects.grants_set",
+            "session": "cli-session-3",
+        });
+        for row in &rows {
+            assert!(
+                row.event_type.starts_with("flow.permission."),
+                "unexpected event type {}",
+                row.event_type
+            );
+            assert_eq!(
+                row.source, expected_source,
+                "'{}' was written with source {:?}, but the caller declared {:?}",
+                row.event_type, row.source, expected_source
+            );
+        }
+
+        // ---- PUT .../inheritance, from an MCP HTTP surface, writing several events ----
+        let inheritance_origin = CommandOrigin::first_request(
+            EventSource::new(EventSurface::McpHttp)
+                .with_tool("objects.inheritance_set")
+                .with_request("json-rpc-11"),
+        );
+        let inheritance_correlation = inheritance_origin.correlation_id;
+        set_inheritance(
+            &state,
+            fx.workspace_id,
+            SetInheritanceInput {
+                object_id: page,
+                caller: user_from(fx.owner_id, "owner", inheritance_origin),
+                inherit_from_parent: false,
+                // Replaces the roster set above: the boundary flip *and* the grant change are two
+                // transitions of one command.
+                initial_grants: Some(vec![grant_of("user", fx.owner_id, "full_access")]),
+                confirm_self_lockout: true,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("set_inheritance succeeds");
+
+        let rows = events_with_correlation(&scratch.db, inheritance_correlation).await;
+        assert!(
+            rows.len() >= 2,
+            "this request changes the boundary and the roster, so it writes more than one event; \
+             got {:?}",
+            rows.iter().map(|row| row.event_type.as_str()).collect::<Vec<_>>()
+        );
+        let expected_source = serde_json::json!({
+            "surface": "mcp_http",
+            "tool": "objects.inheritance_set",
+            "request": "json-rpc-11",
+        });
+        for row in &rows {
+            assert_eq!(
+                row.source, expected_source,
+                "'{}' was written with source {:?}, but the caller declared {:?}",
+                row.event_type, row.source, expected_source
+            );
+        }
+
+        // One request, one correlation, and the primary event is the causal root the rest hang
+        // off (`events-v1.md`: "由 command ... 导出的下一事件把直接父 event id 写 causation_id").
+        let distinct: std::collections::BTreeSet<Option<Uuid>> = rows.iter().map(|row| row.correlation_id).collect();
+        assert_eq!(
+            distinct,
+            std::iter::once(Some(inheritance_correlation)).collect(),
+            "every event of one request shares exactly one correlation"
+        );
+
+        // The primary event is the one carrying the request's `idempotency_key`, **not** the
+        // first row back: all of this command's rows share one transaction timestamp, so any
+        // ordering by `created_at` falls through to a random UUID tiebreak and would make this
+        // test's verdict depend on which UUID happened to sort first.
+        let primaries: Vec<&EventRow> = rows.iter().filter(|row| row.idempotency_key.is_some()).collect();
+        assert_eq!(
+            primaries.len(),
+            1,
+            "exactly one event of a command carries the request's idempotency key"
+        );
+        let primary = primaries[0];
+        assert_eq!(
+            primary.causation_id, None,
+            "the command's primary event roots the chain for a first user request"
+        );
+        let derived: Vec<&EventRow> = rows.iter().filter(|row| row.id != primary.id).collect();
+        assert!(
+            !derived.is_empty(),
+            "this request wrote more than its primary event, so there is a derived one to check"
+        );
+        for row in derived {
+            assert_eq!(
+                row.causation_id,
+                Some(primary.id),
+                "'{}' must name the command's primary event as its causation",
+                row.event_type
+            );
+        }
 
         scratch.drop_self().await;
     }

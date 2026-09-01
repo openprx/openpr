@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::{
     error::ApiError,
+    flow::event_origin::EventSurface,
     response::OperationResponseMeta,
     routes::auth::{extract_bearer_token, extract_cookie_token},
 };
@@ -40,20 +41,37 @@ struct BotOperationContext {
     bot_id: Uuid,
     workspace_id: Uuid,
     tool_name: Option<String>,
-    surface: &'static str,
+    surface: EventSurface,
     method: String,
     path: String,
     request_id: Uuid,
 }
 
-fn operation_surface(headers: &axum::http::HeaderMap) -> &'static str {
-    match headers.get(MCP_SURFACE_HEADER).and_then(|value| value.to_str().ok()) {
-        Some("mcp_http") => "mcp_http",
-        Some("mcp_sse") => "mcp_sse",
-        Some("mcp_stdio") => "mcp_stdio",
-        Some("cli") => "cli",
-        _ => "rest",
-    }
+/// The transport this authenticated request arrived over, resolved **here at the boundary** and
+/// nowhere else.
+///
+/// `events-v1.md` (2026-09-01) requires `source.surface` to be "由认证/传输边界推导" and carried
+/// into the domain by the auth context; [`EventSurface::from_client_transport_label`] is the
+/// allow-list, and an unrecognized or absent label falls back to [`EventSurface::Rest`]. Returning
+/// the typed enum rather than a `&'static str` is what stops a second, drifting vocabulary from
+/// appearing downstream: the bot-operation log spells it with `as_wire()`, and so does the event
+/// envelope.
+///
+/// ⚠️ **Residual trust gap, stated plainly.** The label is an HTTP header, so it is still
+/// *asserted* by the holder of a bot token rather than proven: a token may declare `mcp_http` on a
+/// plain `curl`. The allow-list bounds the damage — `web`, `worker` and `system` are unreachable,
+/// and a request with no bot credential never reaches this function at all (JWT-direct traffic is
+/// `Rest` by construction) — but it does not close it. Closing it needs the *credential* to carry
+/// its registered surface, which `workspace_bots` has no column for today; see the report's
+/// contract-TODO list. This is the pre-existing trust model of these headers, which already drive
+/// `bot_operation_logs.surface`; this change widens their blast radius from observability to
+/// audit evidence, and that is worth saying out loud rather than burying.
+fn operation_surface(headers: &axum::http::HeaderMap) -> EventSurface {
+    headers
+        .get(MCP_SURFACE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(EventSurface::from_client_transport_label)
+        .unwrap_or(EventSurface::Rest)
 }
 
 fn operation_tool_name(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -97,7 +115,7 @@ fn spawn_operation_log(
                     context.workspace_id.into(),
                     context.bot_id.into(),
                     context.tool_name.into(),
-                    context.surface.into(),
+                    context.surface.as_wire().into(),
                     context.method.into(),
                     context.path.into(),
                     business_code.into(),
@@ -125,6 +143,51 @@ pub struct BotAuthContext {
     pub bot_id: Uuid,
     pub workspace_id: Uuid,
     pub permissions: Vec<String>,
+    /// The transport this request arrived over, as resolved by [`operation_surface`].
+    ///
+    /// `events-v1.md` (2026-09-01) 判据 (c): "认证上下文（如 bot auth）**必须承载** transport 与
+    /// tool，否则中间件解析出的信息到不了 domain". Before this field existed the middleware parsed
+    /// the transport, spent it on the bot-operation log, and dropped it — so a real
+    /// `flow.feature_set` MCP tool call, which does send the header, was still recorded as
+    /// `surface: "rest"` in `business_events`. The parse was never the missing part; the wire from
+    /// the parse to the domain was.
+    pub surface: EventSurface,
+    /// The exact registered tool name from the MCP client, validated by [`operation_tool_name`].
+    /// `None` for a bot request that is not a tool call.
+    pub tool_name: Option<String>,
+    /// The server-minted id for this request, shared verbatim with the bot-operation log row.
+    ///
+    /// Reused as the event envelope's `source.request` so that an audit event and the
+    /// `bot_operation_logs` row describing the same call join on one value. 判据 (b) — "`source
+    /// .request` 必须每请求不同（同一请求的多条事件相同）" — is satisfied structurally: it is minted
+    /// once per request here, and every event the request writes copies that one value.
+    pub request_id: Uuid,
+}
+
+/// Builds the context the domain sees from what the transport boundary resolved.
+///
+/// Extracted from the middleware body so the wire that `events-v1.md` 判据 (c) is about —
+/// "认证上下文（如 bot auth）**必须承载** transport 与 tool，否则中间件解析出的信息到不了 domain" —
+/// is a function that can be called from a test and broken by a mutation. Inline in the
+/// middleware it was neither: reaching it needed a live bot token row, an axum `Router` and a
+/// real request, so replacing `operation_surface(headers)` with a constant `Rest` would have gone
+/// unnoticed by every test in the crate. That is the exact shape of the defect this work package
+/// exists to fix, one layer further out.
+fn bot_auth_context(
+    bot_id: Uuid,
+    workspace_id: Uuid,
+    permissions: Vec<String>,
+    headers: &axum::http::HeaderMap,
+) -> BotAuthContext {
+    BotAuthContext {
+        bot_id,
+        workspace_id,
+        permissions,
+        surface: operation_surface(headers),
+        tool_name: operation_tool_name(headers),
+        // Minted once per request, here, and copied by everything that describes this request.
+        request_id: Uuid::new_v4(),
+    }
 }
 
 pub fn extract_bot_context(extensions: &Extensions) -> Option<&BotAuthContext> {
@@ -335,11 +398,7 @@ pub async fn bot_or_user_auth_middleware(
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        let context = BotAuthContext {
-            bot_id: bot.id,
-            workspace_id: bot.workspace_id,
-            permissions,
-        };
+        let context = bot_auth_context(bot.id, bot.workspace_id, permissions, req.headers());
         // Every bot-reachable route passes through here, which makes this the one place the
         // `read` / `write` split can be enforced without trusting each handler to remember. The
         // HTTP method is the authority: safe methods (GET/HEAD/OPTIONS/TRACE) need `read`,
@@ -349,11 +408,14 @@ pub async fn bot_or_user_auth_middleware(
         let authenticated_operation = BotOperationContext {
             bot_id: context.bot_id,
             workspace_id: context.workspace_id,
-            tool_name: operation_tool_name(req.headers()),
-            surface: operation_surface(req.headers()),
+            // Copied from the auth context rather than resolved a second time, so the surface,
+            // tool and request id an audit event carries are the *same values* this log records
+            // for the same call — not a second, independently derived answer that can disagree.
+            tool_name: context.tool_name.clone(),
+            surface: context.surface,
             method: req.method().as_str().to_string(),
             path: req.uri().path().to_string(),
-            request_id: Uuid::new_v4(),
+            request_id: context.request_id,
         };
         if let Err(error) = ensure_bot_permission(&context, required_bot_permission(req.method())) {
             let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
@@ -412,8 +474,8 @@ pub async fn bot_or_user_auth_middleware(
 #[cfg(test)]
 mod tests {
     use super::{
-        BotAuthContext, BotPermission, bot_permissions_allow, bot_role_from_permissions, ensure_bot_permission,
-        operation_surface, operation_tool_name, required_bot_permission,
+        BotAuthContext, BotPermission, EventSurface, bot_permissions_allow, bot_role_from_permissions,
+        ensure_bot_permission, operation_surface, operation_tool_name, required_bot_permission,
     };
     use axum::http::{HeaderMap, HeaderValue, Method};
     use uuid::Uuid;
@@ -423,6 +485,9 @@ mod tests {
             bot_id: Uuid::new_v4(),
             workspace_id: Uuid::new_v4(),
             permissions: permissions.iter().map(|value| (*value).to_string()).collect(),
+            surface: EventSurface::Rest,
+            tool_name: None,
+            request_id: Uuid::new_v4(),
         }
     }
 
@@ -474,17 +539,96 @@ mod tests {
         }
     }
 
+    /// The transport labels a client may declare, and — the half that carries the security
+    /// weight — the ones it may not.
+    ///
+    /// These headers stopped being "bounded observability labels" the moment `BotAuthContext`
+    /// began carrying them into `business_events.source` (`events-v1.md` 判据 (c)). What bounds
+    /// them now is `EventSurface::from_client_transport_label`'s allow-list: a client can move
+    /// itself among the *client* transports, and cannot reach `web` (proven by the WebSocket
+    /// ticket handshake, never by a header), `worker`/`system` (background work has no remote
+    /// caller), or spell `rest` into anything but the default.
+    /// `events-v1.md` 判据 (c), at the seam it names.
+    ///
+    /// The middleware parsed the transport and the tool long before this work package existed —
+    /// and then spent them on the bot-operation log and dropped them, so a real `flow.feature_set`
+    /// MCP call still reached the domain looking exactly like a REST call. The parse was never the
+    /// missing piece; carrying it into the context the handlers read was.
     #[test]
-    fn operation_headers_are_bounded_observability_labels_only() {
+    fn the_auth_context_carries_the_transport_and_tool_the_boundary_resolved() {
+        let workspace_id = Uuid::new_v4();
+        let bot_id = Uuid::new_v4();
+
+        for (label, expected) in [
+            ("mcp_http", EventSurface::McpHttp),
+            ("mcp_sse", EventSurface::McpSse),
+            ("mcp_stdio", EventSurface::McpStdio),
+            ("cli_tools_call", EventSurface::CliToolsCall),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-openpr-mcp-surface",
+                HeaderValue::from_str(label).expect("static label is a valid header value"),
+            );
+            headers.insert("x-openpr-mcp-tool", HeaderValue::from_static("flow.feature_set"));
+            let context = super::bot_auth_context(bot_id, workspace_id, vec!["write".to_string()], &headers);
+            assert_eq!(
+                context.surface, expected,
+                "a `{label}` call must reach the domain as `{label}`, not as REST"
+            );
+            assert_eq!(
+                context.tool_name.as_deref(),
+                Some("flow.feature_set"),
+                "the exact registered tool must reach the domain too"
+            );
+        }
+
+        // No headers at all: a plain bot-token REST call, and a request id all the same.
+        let context = super::bot_auth_context(bot_id, workspace_id, vec!["read".to_string()], &HeaderMap::new());
+        assert_eq!(context.surface, EventSurface::Rest);
+        assert_eq!(context.tool_name, None);
+        assert_ne!(
+            context.request_id,
+            super::bot_auth_context(bot_id, workspace_id, vec!["read".to_string()], &HeaderMap::new()).request_id,
+            "each request must mint its own id — `source.request` is per request, not per process"
+        );
+    }
+
+    #[test]
+    fn a_client_may_declare_only_the_client_transports_and_nothing_else() {
         let mut headers = HeaderMap::new();
         headers.insert("x-openpr-mcp-surface", HeaderValue::from_static("mcp_http"));
         headers.insert("x-openpr-mcp-tool", HeaderValue::from_static("form_records.list"));
-        assert_eq!(operation_surface(&headers), "mcp_http");
+        assert_eq!(operation_surface(&headers), EventSurface::McpHttp);
         assert_eq!(operation_tool_name(&headers).as_deref(), Some("form_records.list"));
 
-        headers.insert("x-openpr-mcp-surface", HeaderValue::from_static("admin"));
+        for label in ["mcp_sse", "mcp_stdio", "cli", "cli_tools_call"] {
+            headers.insert(
+                "x-openpr-mcp-surface",
+                HeaderValue::from_str(label).expect("static label is a valid header value"),
+            );
+            assert_eq!(
+                operation_surface(&headers).as_wire(),
+                label,
+                "`{label}` is a client transport and must round-trip through the boundary"
+            );
+        }
+
+        // The refusals. `web`/`worker`/`system` are the ones that would let a bot token mint
+        // events indistinguishable from a browser session or from the server talking to itself.
+        for forged in ["web", "worker", "system", "admin", "REST", "mcp_http "] {
+            headers.insert(
+                "x-openpr-mcp-surface",
+                HeaderValue::from_str(forged).expect("static label is a valid header value"),
+            );
+            assert_eq!(
+                operation_surface(&headers),
+                EventSurface::Rest,
+                "`{forged}` must not be declarable by a client; the boundary falls back to REST"
+            );
+        }
+
         headers.insert("x-openpr-mcp-tool", HeaderValue::from_static("invalid"));
-        assert_eq!(operation_surface(&headers), "rest");
         assert!(operation_tool_name(&headers).is_none());
     }
 }

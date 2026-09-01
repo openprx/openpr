@@ -10,6 +10,210 @@ use thiserror::Error;
 
 use crate::response::{ApiResponse, OperationResponseMeta};
 
+/// Whether re-running the statement that produced a database error could ever change its answer.
+///
+/// `events-v1.md` / `error-mapping-v1.md` (2026-09-01): 约束违约等确定性错误**一次即判非可重试**,
+/// 不进重试循环、不套 `contention` 外衣. Before this existed, `flow::collab::write` folded *every*
+/// staging failure into `LockedOutcome::NotApplied`, ran it around the bounded-rebase loop
+/// `MAX_REBASE_ATTEMPTS` times, and then reported `server_draining` / `reason="contention"` /
+/// `retry_after_ms: 200` — telling the caller to retry a write the database will refuse
+/// identically forever. An MCP client does exactly what it is told, so a deterministic bug became
+/// an infinite retry loop that also erased its own cause.
+///
+/// The distinction this type draws is **"can the underlying error change?"**, which is not the
+/// same question as "have I retried enough times?" — conflating those two was the defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbFailureClass {
+    /// The data or the schema refuses this statement, and will go on refusing it: an integrity
+    /// constraint violation (`SQLSTATE` class 23), a data exception (class 22), or a syntax /
+    /// access-rule violation (class 42). Retrying is pure loss and hides the cause.
+    Deterministic,
+    /// Serialization failure, deadlock, lock timeout, cancelled statement, lost connection,
+    /// exhausted resources. The identical statement may well succeed on the next attempt.
+    Transient,
+}
+
+/// The `SQLSTATE` of a database error, when the driver reported one.
+fn sqlstate(err: &sea_orm::DbErr) -> Option<String> {
+    use sea_orm::{DbErr, RuntimeErr, sqlx};
+    let (DbErr::Exec(runtime) | DbErr::Query(runtime)) = err else {
+        return None;
+    };
+    let RuntimeErr::SqlxError(sqlx::Error::Database(database)) = runtime else {
+        return None;
+    };
+    database.code().map(std::borrow::Cow::into_owned)
+}
+
+/// Classifies a database error by `SQLSTATE`.
+///
+/// # The default is deliberately `Transient`
+///
+/// An error carrying no `SQLSTATE`, or one this function does not recognize, is reported as
+/// [`DbFailureClass::Transient`] — which is exactly the behaviour every caller had before this
+/// function existed. The cost is that an unrecognized deterministic error keeps being retried; the
+/// alternative default would turn a genuinely transient failure into a permanent one, and *that*
+/// direction loses writes rather than merely wasting attempts. Deterministic classes are therefore
+/// enumerated explicitly rather than inferred from "not in the transient list".
+#[must_use]
+pub fn classify_db_failure(err: &sea_orm::DbErr) -> DbFailureClass {
+    sqlstate(err).map_or(DbFailureClass::Transient, |code| classify_sqlstate(&code))
+}
+
+/// The `SQLSTATE` → class mapping, split out from [`classify_db_failure`] so it is reachable
+/// without a live database error: a `sqlx::Error::Database` cannot be constructed in a unit test,
+/// which would otherwise leave the actual decision table provable only by mutating production
+/// code and watching an integration test.
+#[must_use]
+pub fn classify_sqlstate(code: &str) -> DbFailureClass {
+    match code {
+        // Retryable by definition, and the whole reason a rebase loop exists at all.
+        // 40001 serialization_failure, 40P01 deadlock_detected, 40003 statement_completion_unknown,
+        // 55P03 lock_not_available, 55006 object_in_use, 57014 query_canceled (statement timeout).
+        "40001" | "40P01" | "40003" | "55P03" | "55006" | "57014" => DbFailureClass::Transient,
+        // 08 connection exception, 53 insufficient resources, 57 operator intervention,
+        // 58 system error. All about the server or the link, none about this statement.
+        code if code.starts_with("08")
+            || code.starts_with("53")
+            || code.starts_with("57")
+            || code.starts_with("58") =>
+        {
+            DbFailureClass::Transient
+        }
+        // 23 integrity constraint violation (23502 not-null, 23503 foreign key, 23505 unique,
+        // 23514 check, 23P01 exclusion), 22 data exception, 42 syntax error or access rule
+        // violation. Every one of these is a statement the database will refuse identically on
+        // every attempt.
+        code if code.starts_with("23") || code.starts_with("22") || code.starts_with("42") => {
+            DbFailureClass::Deterministic
+        }
+        _ => DbFailureClass::Transient,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod sqlstate_tests {
+    use super::{DbFailureClass, classify_db_failure, classify_sqlstate};
+
+    /// The decision table that stops a permanent failure being advertised as temporary.
+    ///
+    /// `events-v1.md` / `error-mapping-v1.md` (2026-09-01): 约束违约等确定性错误一次即判非可重试.
+    /// The two halves matter equally — calling a constraint violation retryable makes clients
+    /// hammer a write that can never land, and calling a serialization failure permanent throws
+    /// away writes that would have succeeded on the next attempt.
+    #[test]
+    fn constraint_violations_are_deterministic_and_contention_is_not() {
+        // The whole reason the rebase loop exists. These must stay retryable.
+        for transient in [
+            "40001", // serialization_failure
+            "40P01", // deadlock_detected
+            "40003", // statement_completion_unknown
+            "55P03", // lock_not_available
+            "55006", // object_in_use
+            "57014", // query_canceled — statement timeout
+            "08006", // connection_failure
+            "08003", // connection_does_not_exist
+            "53300", // too_many_connections
+            "57P01", // admin_shutdown
+            "58030", // io_error
+        ] {
+            assert_eq!(
+                classify_sqlstate(transient),
+                DbFailureClass::Transient,
+                "`{transient}` is genuine contention or a lost link; classifying it as permanent \
+                 would discard writes that a retry would have landed"
+            );
+        }
+
+        // Refused by the data or the schema, identically, forever.
+        for deterministic in [
+            "23502", // not_null_violation
+            "23503", // foreign_key_violation — the one this whole work package tripped over
+            "23505", // unique_violation
+            "23514", // check_violation
+            "23P01", // exclusion_violation
+            "22001", // string_data_right_truncation
+            "22003", // numeric_value_out_of_range
+            "22P02", // invalid_text_representation
+            "42703", // undefined_column
+            "42P01", // undefined_table
+            "42501", // insufficient_privilege
+        ] {
+            assert_eq!(
+                classify_sqlstate(deterministic),
+                DbFailureClass::Deterministic,
+                "`{deterministic}` will be refused identically on every attempt; retrying it and then \
+                 reporting `contention` tells the caller to hammer a write that can never land"
+            );
+        }
+
+        // An unrecognized code keeps the pre-existing behaviour. Stated as a test because it is a
+        // deliberate choice, not an oversight: the opposite default would turn an unclassified
+        // transient failure into a permanent one, and that direction loses writes.
+        for unknown in ["00000", "P0001", "XX000", ""] {
+            assert_eq!(
+                classify_sqlstate(unknown),
+                DbFailureClass::Transient,
+                "`{unknown}` is unclassified and must keep the conservative default"
+            );
+        }
+    }
+
+    /// The **other** half of the default, which the test above cannot reach.
+    ///
+    /// [`classify_db_failure`]'s doc says an error "carrying no `SQLSTATE`, **or** one this
+    /// function does not recognize" stays transient. `classify_sqlstate` covers the second clause
+    /// only — flipping `map_or`'s default in `classify_db_failure` to `Deterministic` leaves every
+    /// `SQLSTATE`-based assertion green, because none of them go through that path.
+    ///
+    /// What that half actually covers is the class of failure with no statement-level answer at
+    /// all: `DbErr::Conn`, a pool checkout timeout, an `sqlx::Error::Io`. Those are connection-level
+    /// and transient by nature; classifying them as deterministic would send them straight to
+    /// `LockedOutcome::Failed` and a hard error, losing writes that a retry would have landed —
+    /// precisely the direction `classify_sqlstate`'s own default exists to avoid.
+    #[test]
+    fn a_failure_with_no_sqlstate_at_all_stays_transient() {
+        use sea_orm::{DbErr, RuntimeErr};
+
+        // Connection-level: the link died, the statement never got an answer.
+        assert_eq!(
+            classify_db_failure(&DbErr::Conn(RuntimeErr::Internal(
+                "pool checkout timed out".to_string()
+            ))),
+            DbFailureClass::Transient,
+            "a connection failure has no `SQLSTATE` and must stay retryable"
+        );
+        // An `Exec`/`Query` error that is not a `sqlx::Error::Database` — no driver diagnostic to
+        // read, so no code to classify by.
+        assert_eq!(
+            classify_db_failure(&DbErr::Exec(RuntimeErr::Internal("connection reset".to_string()))),
+            DbFailureClass::Transient
+        );
+        assert_eq!(
+            classify_db_failure(&DbErr::Query(RuntimeErr::Internal("connection reset".to_string()))),
+            DbFailureClass::Transient
+        );
+        // Variants that carry no runtime error at all.
+        assert_eq!(
+            classify_db_failure(&DbErr::Custom("something the driver could not classify".to_string())),
+            DbFailureClass::Transient
+        );
+        assert_eq!(
+            classify_db_failure(&DbErr::RecordNotFound("no row".to_string())),
+            DbFailureClass::Transient
+        );
+
+        // And the same errors must not be reported as deterministic through `ApiError` either —
+        // that is the predicate the write path actually calls.
+        assert!(
+            !super::ApiError::Database(DbErr::Conn(RuntimeErr::Internal("pool checkout timed out".to_string())))
+                .is_deterministic_database_failure(),
+            "the write path must keep retrying a connection failure"
+        );
+    }
+}
+
 pub fn request_lang(headers: &HeaderMap) -> &str {
     headers
         .get(axum::http::header::ACCEPT_LANGUAGE)
@@ -308,6 +512,15 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Whether this error is a database refusal that retrying cannot possibly fix.
+    ///
+    /// The one question a retry loop has to ask before spending another attempt, and the one
+    /// `flow::collab::write` never asked. See [`classify_db_failure`].
+    #[must_use]
+    pub fn is_deterministic_database_failure(&self) -> bool {
+        matches!(self, Self::Database(err) if classify_db_failure(err) == DbFailureClass::Deterministic)
+    }
+
     /// Constructs a [`Self::Typed`] error with no structured `details`.
     pub fn typed(kind: ApiErrorKind, message: impl Into<String>) -> Self {
         Self::Typed {

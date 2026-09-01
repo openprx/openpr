@@ -850,6 +850,9 @@ mod tests {
                         bot_id,
                         workspace_id,
                         permissions,
+                        surface: crate::flow::event_origin::EventSurface::Rest,
+                        tool_name: None,
+                        request_id: uuid::Uuid::new_v4(),
                     })),
                 )
             }

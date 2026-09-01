@@ -121,6 +121,37 @@ pub async fn insert_flow_event<C>(
 where
     C: ConnectionTrait,
 {
+    insert_flow_event_with_id(tx, Uuid::new_v4(), input, dispatch).await
+}
+
+/// [`insert_flow_event`] with the new row's `id` chosen by the caller instead of minted here.
+///
+/// Exists for one reason, and only one caller needs it: `events-v1.md` requires a command's
+/// derived events to carry "直接父 event id" in `causation_id`, and `flow::move_object` writes its
+/// derived `flow.content.accepted` rows **before** the `flow.object.moved` row that caused them
+/// (the navigator document heads have to advance under the same lock, in `document_id` order,
+/// before the governance `UPDATE` runs). The parent's id therefore has to exist before the parent
+/// row does. Pre-minting it here is the alternative to reordering a lock-ordered transaction
+/// around an audit field.
+///
+/// On the `ON CONFLICT` (idempotent replay) path the caller's id is **discarded** and the
+/// already-committed row's id is returned, exactly as in [`insert_flow_event`] — a pre-minted id
+/// is a proposal, never an assertion that this row is new. `move_object` handles that case by
+/// rolling the whole transaction back (`LockedOutcome::AlreadyCommitted`), which takes the derived
+/// rows that pointed at the discarded id with it.
+///
+/// # Errors
+/// Propagates a database failure; `ApiError::Internal` if a conflict is reported for a row with no
+/// idempotency key (impossible against the partial unique index).
+pub async fn insert_flow_event_with_id<C>(
+    tx: &C,
+    event_id: Uuid,
+    input: BusinessEventInput,
+    dispatch: Option<FlowDispatchSpec>,
+) -> Result<FlowEventOutcome, ApiError>
+where
+    C: ConnectionTrait,
+{
     let inserted = BusinessEventIdentityRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
@@ -134,7 +165,7 @@ where
             RETURNING id, created_at
         ",
         vec![
-            Uuid::new_v4().into(),
+            event_id.into(),
             input.workspace_id.into(),
             input.project_id.into(),
             input.event_type.clone().into(),

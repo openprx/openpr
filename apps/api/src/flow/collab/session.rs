@@ -29,6 +29,7 @@ use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
 use crate::error::ApiErrorKind;
+use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1292,6 +1293,9 @@ async fn handle_client_frame(
                     origin_client_id: Some(origin_client_id.to_string()),
                     message,
                     actor_id,
+                    // A WebSocket session is authenticated by an `ADR-0007` ticket, which is issued
+                    // to a JWT user; there is no bot path onto this socket.
+                    actor_is_bot: false,
                     workspace_id: if let Some(id) = fetch_object_workspace_id(state, object_id).await {
                         id
                     } else {
@@ -1304,6 +1308,18 @@ async fn handle_client_frame(
                     },
                     checked_epoch,
                     expected_frontier: None,
+                    // The WebSocket collab surface declaring itself, the same way
+                    // `routes::flow::request_origin` resolves the HTTP surfaces — `events-v1.md`'s
+                    // "`source` 由服务端按 Web/REST/MCP/CLI/worker 覆盖". `session` is this
+                    // connection's server-generated session id and `client_id` is the
+                    // `ADR-0007` ticket handshake's client id; `tool`/`request`/`service` do not
+                    // apply to a WebSocket frame and are omitted. Each accepted `update` frame is
+                    // its own first request, so it roots its own correlation and has no causation.
+                    origin: CommandOrigin::first_request(
+                        EventSource::new(EventSurface::Web)
+                            .with_session(session_id.to_string())
+                            .with_client_id(origin_client_id),
+                    ),
                 },
             )
             .await;
@@ -1365,13 +1381,33 @@ async fn handle_client_frame(
                             protocol_version: PROTOCOL_VERSION,
                             document_id,
                             update_id: Some(update_id),
+                            // ⚠️ **A deterministic refusal is still dressed as retryable
+                            // contention here.** `error-mapping-v1.md` (2026-09-01) forbids that,
+                            // and the REST surface now obeys it — but this surface cannot: a
+                            // permanent *server-side* refusal has no representation in
+                            // `collab-protocol-v1.md`'s frozen `RejectedCode` (every variant names
+                            // a client-side cause or a transient server state), and
+                            // `ApiErrorKind::Unclassified::ws_close_code()` is `None`, so there is
+                            // no close code for it either. Inventing a wire value to fix this
+                            // would be inventing contract, so the gap is reported instead of
+                            // papered over. Note this is **not a regression**: before
+                            // `LockedOutcome::Failed` existed, the same failure arrived here as
+                            // `Ok(Rejected)` wearing the identical `server_draining`/`contention`
+                            // disguise.
                             code: RejectedCode::ServerDraining,
                             recoverable: true,
-                            // `write::accept_update` only returns `Err` from the phases that run
-                            // *before* its locked phase opens a transaction (the dedup lookup,
-                            // the tail-stats read, hydrate/apply); every failure the locked phase
-                            // itself can observe is folded into an `Ok(Rejected)` carrying its own
-                            // `write_state`. So an `Err` here provably wrote nothing.
+                            // Still `not_applied`, but **no longer for the reason this comment
+                            // used to give**. It said `accept_update` returns `Err` only from the
+                            // phases *before* the locked phase opens a transaction; that stopped
+                            // being true when `LockedOutcome::Failed` was added, which returns
+                            // `Err` from inside the locked phase for a deterministic database
+                            // refusal (`error-mapping-v1.md`, 2026-09-01). The conclusion survives
+                            // on a different footing: every `Err`-producing path either never
+                            // opened a transaction, or rolled one back before returning — the
+                            // locked phase's own `Failed` arm calls `tx.rollback()` first, and the
+                            // forced-snapshot arm returns before touching this document's tail. So
+                            // an `Err` here still provably wrote nothing, and `not_applied` is
+                            // still the honest answer.
                             write_state: WriteState::NotApplied,
                             details: Some(serde_json::json!({"reason": "contention", "retry_after_ms": 500})),
                             current_seq: None,
@@ -2233,8 +2269,12 @@ mod tests {
             let accepted = create_object(
                 state,
                 CreateObjectInput {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
                     workspace_id,
                     actor_id,
+                    actor_is_bot: false,
                     object_type: "page".to_string(),
                     project_id: None,
                     parent_object_id: None,
@@ -3293,6 +3333,9 @@ mod tests {
                     10,
                     None,
                     crate::flow::collab::write::UpdateRequest {
+                        origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                            crate::flow::event_origin::EventSurface::Rest,
+                        ),
                         document_id,
                         update_id: Uuid::new_v4(),
                         bytes,
@@ -3301,6 +3344,7 @@ mod tests {
                         origin_client_id: Some("wp16-offline".to_string()),
                         message: None,
                         actor_id,
+                        actor_is_bot: false,
                         workspace_id,
                         checked_epoch,
                         expected_frontier: None,
@@ -4052,8 +4096,12 @@ mod database_tests {
         let accepted = create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id,
                 actor_id,
+                actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
                 parent_object_id: None,
@@ -4111,6 +4159,9 @@ mod database_tests {
                 10,
                 None,
                 UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
                     document_id,
                     update_id: Uuid::new_v4(),
                     bytes,
@@ -4119,6 +4170,7 @@ mod database_tests {
                     origin_client_id: Some("gap-test".to_string()),
                     message: None,
                     actor_id,
+                    actor_is_bot: false,
                     workspace_id,
                     checked_epoch,
                     expected_frontier: None,

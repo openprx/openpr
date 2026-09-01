@@ -237,7 +237,9 @@ pub async fn set_object_lifecycle<C: ConnectionTrait>(
     object_id: Uuid,
     lifecycle_status: &str,
     archived_at: Option<DateTime<Utc>>,
-    updated_by: Uuid,
+    // `None` when the actor is a bot: this column is `REFERENCES users(id)` and a bot id is
+    // not a user id.
+    updated_by: Option<Uuid>,
 ) -> Result<(), ApiError> {
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -295,7 +297,8 @@ pub struct NewFlowObject {
     pub project_id: Option<Uuid>,
     pub object_type: String,
     pub parent_id: Option<Uuid>,
-    pub created_by: Uuid,
+    /// `None` when the actor is a bot (`REFERENCES users(id)`).
+    pub created_by: Option<Uuid>,
 }
 
 pub async fn insert_flow_object<C: ConnectionTrait>(conn: &C, object: &NewFlowObject) -> Result<(), ApiError> {
@@ -530,7 +533,9 @@ pub async fn update_flow_settings<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
     flow_enabled: bool,
-    updated_by: Uuid,
+    // `None` when the actor is a bot: this column is `REFERENCES users(id)` and a bot id is
+    // not a user id.
+    updated_by: Option<Uuid>,
 ) -> Result<(), ApiError> {
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -1180,7 +1185,9 @@ pub async fn cascade_move_subtree<C: ConnectionTrait>(
     object_id: Uuid,
     new_parent_id: Uuid,
     new_project_id: Option<Uuid>,
-    updated_by: Uuid,
+    // `None` when the actor is a bot: this column is `REFERENCES users(id)` and a bot id is
+    // not a user id.
+    updated_by: Option<Uuid>,
 ) -> Result<u64, ApiError> {
     let result = conn
         .execute(Statement::from_sql_and_values(

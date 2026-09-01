@@ -67,7 +67,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
+use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event_with_id};
 
 use super::collab::coordinator::ascending_document_lock_order;
 use super::collab::limits::MAX_REBASE_ATTEMPTS;
@@ -246,6 +246,21 @@ struct MoveContext<'a> {
     collab: &'a CollabRuntime,
     input: &'a ExecuteCommandInput,
     workspace_id: Uuid,
+    /// The id the `flow.object.moved` row will be inserted under, minted **before** any of this
+    /// command's writes run.
+    ///
+    /// `events-v1.md` requires a command's derived events to carry "直接父 event id" in
+    /// `causation_id`, and this command's derived events — one `flow.content.accepted` per
+    /// navigator document whose head advances — are written *before* the `flow.object.moved` row
+    /// that causes them, because `ADR-0013` §2.2's lock order fixes that sequence and an audit
+    /// field is not a reason to reorder a lock-ordered transaction. Pre-minting the parent id is
+    /// how the children can name a parent that does not exist yet; `insert_flow_event_with_id`
+    /// then inserts the parent under exactly this id.
+    ///
+    /// Stable across bounded-rebase retries of the same invocation (it is minted once, here), and
+    /// discarded wholesale on the `AlreadyCommitted` path, where the whole transaction — derived
+    /// rows included — rolls back.
+    primary_event_id: Uuid,
     /// The `authz_epoch` the caller's permission was first checked against, outside any
     /// transaction. Reported as the gate artifact's `checked_epoch`; the *decision* is re-made
     /// inside the transaction, so this value is evidence, not a barrier.
@@ -766,9 +781,17 @@ async fn plan_document(
         origin_client_id: Some(input.origin_client_id.clone()),
         message: input.message.clone(),
         actor_id: input.actor_id,
+        actor_is_bot: input.actor_is_bot(),
         workspace_id: ctx.workspace_id,
         checked_epoch: ctx.checked_epoch,
         expected_frontier: expected_frontier.map(<[u8]>::to_vec),
+        // `events-v1.md`: "由 command ... 导出的下一事件把直接父 event id 写 `causation_id` 并
+        // 继承 correlation". This navigator head advance exists *because* of the move, so its
+        // `flow.content.accepted` is a derived event: same surface (the caller's, not a literal),
+        // same correlation as every other event this request writes, and a `causation_id` naming
+        // the `flow.object.moved` event — `ctx.primary_event_id`, which this transaction inserts
+        // that event under further down.
+        origin: input.origin.derived_from(ctx.primary_event_id),
     };
 
     match write::hydrate_and_apply(
@@ -1013,7 +1036,7 @@ async fn run_locked_phase(
         else {
             continue;
         };
-        match write::stage_one_document(tx, request, prepared, dispatch_max_attempts, "rest").await? {
+        match write::stage_one_document(tx, request, prepared, dispatch_max_attempts).await? {
             write::StagedOutcome::Ready(staged) => advanced.push(AdvancedDocument {
                 document_id: *document_id,
                 accepted: write::Accepted {
@@ -1050,7 +1073,7 @@ async fn run_locked_phase(
         plan.object_id,
         plan.target_object_id,
         target.project_id,
-        input.actor_id,
+        crate::flow::command::actor_user_id(input.actor_id, input.actor_is_bot()),
     )
     .await?;
     if rewritten != u64::try_from(subtree_ids.len()).unwrap_or(u64::MAX) {
@@ -1094,16 +1117,21 @@ async fn run_locked_phase(
     }
 
     // [layer 4] the governance event, carrying the caller's idempotency key.
-    let outcome = insert_flow_event(
+    //
+    // `insert_flow_event_with_id` rather than `insert_flow_event`: the derived
+    // `flow.content.accepted` rows staged above already name this id as their `causation_id`, so the
+    // parent has to land under the id they were told about. See `MoveContext::primary_event_id`.
+    let outcome = insert_flow_event_with_id(
         tx,
+        ctx.primary_event_id,
         BusinessEventInput {
             workspace_id: plan.workspace_id,
             project_id: target.project_id,
             event_type: GovernanceCommandType::MoveObject.event_type().to_string(),
             aggregate_type: "flow_object".to_string(),
             aggregate_id: plan.object_id.to_string(),
-            actor_id: Some(input.actor_id),
-            source: json!({ "surface": "rest" }),
+            actor_id: crate::flow::command::actor_user_id(input.actor_id, input.actor_is_bot()),
+            source: input.origin.source_json(),
             payload: json!({
                 "object_id": plan.object_id,
                 "old_parent_id": plan.source_parent_id,
@@ -1131,8 +1159,12 @@ async fn run_locked_phase(
                 "message": input.message,
                 "affected_object_ids": subtree_ids,
             }),
-            correlation_id: None,
-            causation_id: None,
+            // The primary event of a first user request: it roots the correlation every derived
+            // `flow.content.accepted` above inherits, and its own `causation_id` is whatever
+            // caused the *command* (`None` for a first request, a parent event id when a job or
+            // retry issued it).
+            correlation_id: Some(input.origin.correlation_id),
+            causation_id: input.origin.causation_id,
             idempotency_key: Some(input.idempotency_key.clone()),
         },
         Some(FlowDispatchSpec {
@@ -1389,6 +1421,7 @@ pub async fn execute_on(
         input,
         workspace_id,
         checked_epoch,
+        primary_event_id: Uuid::new_v4(),
     };
     if input.expected_frontier.is_some() {
         return Err(ApiError::invalid_update(
@@ -2087,6 +2120,7 @@ mod database_tests {
     use crate::flow::collab::coordinator::ascending_document_lock_order;
     use crate::flow::collab::runtime::CollabRuntime;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object};
+    use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
     use crate::flow::model::AcceptedChange;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -2262,8 +2296,12 @@ mod database_tests {
         create_object(
             state,
             CreateObjectInput {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
                 workspace_id: fx.workspace_id,
                 actor_id: fx.owner_id,
+                actor_is_bot: false,
                 object_type: object_type.to_string(),
                 project_id,
                 parent_object_id: parent,
@@ -2280,6 +2318,9 @@ mod database_tests {
 
     fn move_input(object_id: Uuid, actor_id: Uuid, role: &str, payload: Value) -> ExecuteCommandInput {
         ExecuteCommandInput {
+            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                crate::flow::event_origin::EventSurface::Rest,
+            ),
             object_id,
             actor_id,
             principal_kind: "user".to_string(),
@@ -2445,6 +2486,75 @@ mod database_tests {
             vec![workspace_id.into()],
         )
         .await
+    }
+
+    /// One committed `business_events` row, read back **from the database** rather than from any
+    /// value this command returned about itself — the whole point of these assertions is that the
+    /// audit row is right, and a response body is not an audit row.
+    #[derive(Debug, FromQueryResult)]
+    struct EventRow {
+        id: Uuid,
+        event_type: String,
+        source: Value,
+        correlation_id: Option<Uuid>,
+        causation_id: Option<Uuid>,
+    }
+
+    /// Every committed event of a workspace, oldest first.
+    async fn events_of(db: &DatabaseConnection, workspace_id: Uuid) -> Vec<EventRow> {
+        EventRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, event_type, source, correlation_id, causation_id FROM business_events \
+             WHERE workspace_id = $1 ORDER BY created_at, id",
+            vec![workspace_id.into()],
+        ))
+        .all(db)
+        .await
+        .expect("business_events query runs")
+    }
+
+    /// The events one command wrote, identified by the correlation it rooted. Deliberately *not*
+    /// "every event in the workspace": the fixture's `create_object` calls write their own
+    /// `flow.object.created` rows, and a test that could not tell them apart from the command's
+    /// own rows would be asserting on the wrong set.
+    fn with_correlation(rows: &[EventRow], correlation_id: Uuid) -> Vec<&EventRow> {
+        rows.iter()
+            .filter(|row| row.correlation_id == Some(correlation_id))
+            .collect()
+    }
+
+    /// A move whose origin is an explicit, non-REST surface — the only way to tell "the producer
+    /// copied what the caller declared" apart from "the producer hardcoded the value REST happens
+    /// to use".
+    fn move_input_with_origin(
+        object_id: Uuid,
+        actor_id: Uuid,
+        role: &str,
+        payload: Value,
+        origin: crate::flow::event_origin::CommandOrigin,
+    ) -> ExecuteCommandInput {
+        let mut input = move_input(object_id, actor_id, role, payload);
+        input.origin = origin;
+        input
+    }
+
+    /// Every `collab_updates.origin_surface` value written for one document.
+    async fn origin_surfaces_of(db: &DatabaseConnection, document_id: Uuid) -> Vec<String> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            origin_surface: String,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT origin_surface FROM collab_updates WHERE document_id = $1 ORDER BY seq",
+            vec![document_id.into()],
+        ))
+        .all(db)
+        .await
+        .expect("collab_updates query runs")
+        .into_iter()
+        .map(|row| row.origin_surface)
+        .collect()
     }
 
     async fn update_count(db: &DatabaseConnection, document_id: Uuid) -> i64 {
@@ -4410,6 +4520,201 @@ mod database_tests {
             2,
             "the monitor must count both spellings of a scope mismatch"
         );
+        scratch.drop_self().await;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // `events-v1.md` origin / correlation / causation
+    // -----------------------------------------------------------------------------------------
+
+    /// `events-v1.md`: "`source` 由服务端按 Web/REST/MCP/CLI/worker 覆盖，沿用 MCP origin
+    /// contract", and `mcp-surface-v1.md`'s persisted origin shape
+    /// `{"surface":..., "session":..., "tool":..., "request":...}`.
+    ///
+    /// The move is run with an `mcp_stdio` origin — a surface REST could never produce — so the
+    /// assertion can only pass if the producer copied what its caller declared. Every event the
+    /// command wrote is checked, not just the primary one: the derived `flow.content.accepted`
+    /// rows go through `write::stage_one_document`, which had its own hardcoded surface literal.
+    #[tokio::test]
+    async fn a_move_stamps_the_surface_its_caller_declared_on_every_event_it_writes() {
+        let scratch = scratch_or_skip!("origin_surface");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let page = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+
+        // First move materialises the entry in B, so the second move advances *two* heads and
+        // therefore writes two derived `flow.content.accepted` rows.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("first move succeeds");
+
+        let origin = CommandOrigin::first_request(
+            EventSource::new(EventSurface::McpStdio)
+                .with_session("stdio-session-1")
+                .with_tool("objects.move")
+                .with_request("json-rpc-42"),
+        );
+        let correlation_id = origin.correlation_id;
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input_with_origin(page, fx.owner_id, "owner", json!({ "target_object_id": nav_a }), origin),
+        )
+        .await
+        .expect("the move succeeds");
+
+        let all = events_of(&scratch.db, fx.workspace_id).await;
+        let written = with_correlation(&all, correlation_id);
+        assert_eq!(
+            written.len(),
+            3,
+            "one cross-project move writes flow.object.moved plus one flow.content.accepted per \
+             advancing navigator; got {:?}",
+            written.iter().map(|row| row.event_type.as_str()).collect::<Vec<_>>()
+        );
+
+        let expected_source = json!({
+            "surface": "mcp_stdio",
+            "session": "stdio-session-1",
+            "tool": "objects.move",
+            "request": "json-rpc-42",
+        });
+        for row in &written {
+            assert_eq!(
+                row.source, expected_source,
+                "'{}' was written with source {:?}, but the caller declared {:?} -- a producer \
+                 that hardcodes its own surface silently mislabels every non-REST caller",
+                row.event_type, row.source, expected_source
+            );
+        }
+
+        // The same value reaches the `collab_updates` column, not only the envelope: the two are
+        // filled from one `EventSurface`, so they cannot disagree.
+        let surfaces = origin_surfaces_of(&scratch.db, document_of(&scratch.db, nav_a).await).await;
+        assert!(
+            surfaces.contains(&"mcp_stdio".to_string()),
+            "collab_updates.origin_surface must carry the caller's surface too, got {surfaces:?}"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `events-v1.md`: "首个用户请求生成 `correlation_id`；由 command、job、worker 或 retry 导出的
+    /// 下一事件把直接父 event id 写 `causation_id` 并继承 correlation".
+    ///
+    /// A cross-project move is the command that makes this checkable at all: it writes one
+    /// primary `flow.object.moved` and one derived `flow.content.accepted` per navigator whose
+    /// head advanced, so the request contains a real parent/child pair rather than a single row
+    /// that would satisfy any implementation.
+    #[tokio::test]
+    async fn a_moves_derived_content_events_share_its_correlation_and_name_it_as_their_causation() {
+        let scratch = scratch_or_skip!("origin_causation");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let page = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("first move succeeds");
+
+        let origin = CommandOrigin::first_request(EventSource::new(EventSurface::Rest).with_request("req-7"));
+        let correlation_id = origin.correlation_id;
+        let accepted = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input_with_origin(page, fx.owner_id, "owner", json!({ "target_object_id": nav_a }), origin),
+        )
+        .await
+        .expect("the move succeeds");
+
+        let all = events_of(&scratch.db, fx.workspace_id).await;
+        let written = with_correlation(&all, correlation_id);
+        assert_eq!(
+            written.len(),
+            3,
+            "the request wrote its primary event plus two derived ones"
+        );
+
+        // (a) the correlation is real and is the one the request generated -- not `NULL`, which is
+        // what every Flow producer wrote before this.
+        assert_ne!(
+            correlation_id,
+            Uuid::nil(),
+            "a generated correlation is not the nil UUID"
+        );
+
+        let moved: Vec<&&EventRow> = written
+            .iter()
+            .filter(|row| row.event_type == "flow.object.moved")
+            .collect();
+        assert_eq!(moved.len(), 1, "exactly one primary event");
+        let moved = moved[0];
+        assert_eq!(
+            moved.id, accepted.event_id,
+            "the primary row is the event the command reported"
+        );
+        assert_eq!(
+            moved.causation_id, None,
+            "a first user request roots its own causal chain and has no parent event"
+        );
+
+        // (b) every derived event names the primary as its direct parent.
+        let derived: Vec<&&EventRow> = written
+            .iter()
+            .filter(|row| row.event_type == "flow.content.accepted")
+            .collect();
+        assert_eq!(
+            derived.len(),
+            2,
+            "both navigator heads advanced, so both wrote an event"
+        );
+        for row in &derived {
+            assert_eq!(
+                row.causation_id,
+                Some(moved.id),
+                "a derived flow.content.accepted must name flow.object.moved as its causation, got {:?}",
+                row.causation_id
+            );
+        }
+
+        // (c) one request, one correlation -- asserted against the *distinct* set so an
+        // implementation that minted a fresh correlation per event cannot pass by writing three
+        // rows that merely each have some correlation.
+        let distinct: std::collections::BTreeSet<Option<Uuid>> = written.iter().map(|row| row.correlation_id).collect();
+        assert_eq!(
+            distinct,
+            std::iter::once(Some(correlation_id)).collect(),
+            "every event of one request shares exactly one correlation"
+        );
+
+        // A second, independent request must *not* land in the same chain -- otherwise "shares one
+        // correlation" would be satisfiable by a constant.
+        let other = CommandOrigin::first_request(EventSource::new(EventSurface::Rest));
+        assert_ne!(
+            other.correlation_id, correlation_id,
+            "two first requests do not share a correlation"
+        );
+
         scratch.drop_self().await;
     }
 }
