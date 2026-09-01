@@ -2106,6 +2106,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0056_flow_objects_parent_project_invariant.sql",
         include_str!("../../../migrations/0056_flow_objects_parent_project_invariant.sql"),
     ),
+    (
+        "0057_flow_objects_parent_project_scope_index.sql",
+        include_str!("../../../migrations/0057_flow_objects_parent_project_scope_index.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2388,6 +2392,15 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0056_flow_objects_parent_project_invariant.sql",
         SchemaProbe::ConstraintContains("flow_objects", "flow_objects_parent_project_fk", "project_scope_id"),
+    ),
+    // `Relation`, not `ConstraintContains`: this migration creates exactly one object and it is an
+    // index, which `to_regclass` resolves the same way it resolves a table or a view. A
+    // `ConstraintContains` probe would be wrong here in the way that matters most -- it would
+    // report "present" for a database that has `0056`'s constraint but not this index, and a probe
+    // that wrongly reports present skips its migration forever.
+    (
+        "0057_flow_objects_parent_project_scope_index.sql",
+        SchemaProbe::Relation("idx_flow_objects_parent_project_scope"),
     ),
 ];
 
@@ -2898,7 +2911,8 @@ mod tests {
                 "0053_drop_event_outbox.sql",
                 "0054_flow_data_layer.sql",
                 "0055_flow_import_jobs.sql",
-                "0056_flow_objects_parent_project_invariant.sql"
+                "0056_flow_objects_parent_project_invariant.sql",
+                "0057_flow_objects_parent_project_scope_index.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );

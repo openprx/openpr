@@ -85,19 +85,46 @@ use super::repository::{self, MovableObjectRow};
 /// There is no third — an object belongs to exactly one scope before the move and exactly one
 /// after, and this command never touches a descendant's scope.
 ///
-/// **Why a descendant's scope is not touched**: a move rewrites the moved object's own
-/// `project_id` to its new parent's and deliberately does **not** cascade that to its descendants.
-/// `ADR-0013` §1 requires a `bounded_many` command to carry a document-count ceiling, and a
-/// cascade would make the contended set proportional to subtree size — unbounded, and therefore
-/// outside what this command's own contract can promise. The visible consequence is that a moved
-/// subtree's descendants keep their old `project_id` while their `parent_id` chain now leads into
-/// another project; authorization is unaffected (it follows `parent_id`, `ADR-0012` §1), navigator
-/// scoping is. That needs a contract ruling and is recorded as an open item in this package's
-/// delivery report rather than hidden behind an implementation detail.
+/// **Why a cascade does not make it three or more** (`ADR-0013` §2.2 R17, step two): a cross-project
+/// move rewrites the `project_id` of the moved object *and every descendant*, so the ordering
+/// entries of the whole subtree leave one navigator and arrive in another. The count that matters
+/// to this ceiling is documents, not entries — and migration `0056`'s
+/// `flow_objects_parent_project_fk` makes "a subtree belongs to exactly one project scope" a
+/// database invariant, so the subtree's entries all sat in the *same* source navigator and all
+/// land in the *same* target navigator. Two documents, whatever the subtree's size. The number of
+/// entries is bounded separately by [`MOVE_SUBTREE_NODES_MAX`], and
+/// [`ensure_subtree_is_single_scoped`] keeps defending the premise on databases whose constraint
+/// was never applied.
 ///
 /// The locked phase asserts the derived set never exceeds this ceiling, and refuses rather than
 /// silently locking more.
 pub const MOVE_OBJECT_CONTENDED_DOCUMENT_MAX: u8 = 2;
+
+/// `limits-v1.md`'s `move_subtree_nodes_max`, **frozen at 100 on 2026-08-31** — the number of
+/// nodes (the moved object plus its descendants) one cross-project `move_object` may cascade.
+///
+/// Not invented here and not derivable from anything in this file: the contract froze it from a
+/// measured cost curve on a dedicated `PostgreSQL` 16, taking the largest ladder rung whose
+/// in-lock hold p95 stayed inside `document_lock_hold_ms_p95_max` (N = 100 → 12.21 ms of 25 ms).
+/// `container_count_max` is deliberately **not** reused: that is a single-document live-node
+/// ceiling, this is a single-command fan-out ceiling, and the contract rejects substituting one
+/// for the other.
+///
+/// **This command has to enforce it itself**, and the reason is *not* that nothing else would
+/// catch an oversized cascade. An earlier version of this comment claimed that, and it was wrong:
+/// `hydrate_and_apply` hands the update to `collab_core::isolation::isolated_apply`, whose worker
+/// calls `LoroCollabEngine::import_update`, whose **first line** is
+/// `InputLimits::default().validate_update(update)?` — an 80,369-byte navigator update really does
+/// come back `InputTooLarge { input: "update", actual_bytes: 80369, max_bytes: 65536 }` from
+/// there. What is missing downstream is not a ceiling, it is *this* ceiling: nothing counts
+/// **nodes**, so a subtree that is under 64 KiB but far past the measured lock-hold budget would
+/// sail straight through. `update_bytes_max` is a byte ceiling standing in for a node ceiling, and
+/// it stops being a proxy at all once the cascade gets cheaper per node.
+/// See [`enforce_move_subtree_nodes_max`].
+pub const MOVE_SUBTREE_NODES_MAX: usize = 100;
+
+/// `limits-v1.md`'s frozen `limit_kind` string for [`MOVE_SUBTREE_NODES_MAX`], verbatim.
+pub const MOVE_SUBTREE_NODES_LIMIT_KIND: &str = "move_subtree_nodes";
 
 /// `ADR-0012` §3's inheritance-chain depth ceiling (`limits-v1.md`'s frozen `tree_depth_max`),
 /// counted in `parent_id` hops with a root at depth 0 — the same counting
@@ -244,11 +271,42 @@ struct MovePlan {
     document_lock_order: Vec<Uuid>,
     /// The navigator *objects* (not documents) touched, for `affected_object_ids`.
     navigator_object_ids: Vec<Uuid>,
+    /// The moved object's **strict** descendants, ascending `id`, whose `project_id` and ordering
+    /// entries travel with it (`ADR-0013` §2.2 R17 step two). Empty unless [`Self::cascades`].
+    cascaded_ids: Vec<Uuid>,
+    /// Whether this move changes the subtree's project scope at all. A same-scope re-parent
+    /// rewrites one row and repositions one entry, exactly as it did before the cascade existed:
+    /// no descendant's `project_id` changes, so no descendant's navigator entry moves either.
+    cascades: bool,
+}
+
+impl MovePlan {
+    /// The whole subtree the cascade rewrites, ascending `id` — the moved object plus
+    /// [`Self::cascaded_ids`], which is what `move_subtree_nodes_max` counts and what the locked
+    /// phase locks. Just the moved object when the move does not cascade.
+    fn subtree_ids(&self) -> Vec<Uuid> {
+        if !self.cascades {
+            return vec![self.object_id];
+        }
+        let mut ids = self.cascaded_ids.clone();
+        ids.push(self.object_id);
+        // Load-bearing, and the only reason the locked phase may compare this against
+        // `repository::subtree_nodes`' `ORDER BY s.id` result with `!=`: without it the moved
+        // object would sit at the end instead of in id order, every cascading move would read as
+        // drift, and three attempts later the caller would get `server_draining`. It is also what
+        // makes the event envelope's `affected_object_ids[]` deterministic. Nothing about the
+        // caller-visible ordering of navigator entries depends on it — that is
+        // `observed_cascade_order`'s job, on a deliberately separate value.
+        ids.sort_unstable();
+        ids
+    }
 }
 
 /// The ordering entries an object may occupy inside a navigator document all start with the
 /// object's UUID: `"<uuid>"` for its first placement there, `"<uuid>#1"`, `"<uuid>#2"`, ... for
-/// each later one.
+/// each later one. This is the parser for that spelling, and the *only* one — the batched index
+/// below and every position query go through it, so "which object does this entry belong to" has
+/// one answer rather than two that can drift.
 ///
 /// **Why generations exist at all.** A CRDT delete is a tombstone: the engine keeps the id in its
 /// `id_to_tree` map forever, so re-creating the same node id fails `DuplicateNode`, and the loro
@@ -258,31 +316,87 @@ struct MovePlan {
 /// That is not hypothetical: it is the bug this package's atomicity test caught on its third
 /// move.
 ///
-/// The consequence, recorded honestly: a navigator document accumulates one tombstone per removed
-/// entry. `collab_core::limits`' `container_count_max` counts *live* nodes, so tombstones do not
-/// consume that ceiling, but they do grow the document. `limits-v1.md` has no number for it and
-/// this package does not invent one; the delivery report carries it as an open contract item.
-fn entry_prefix(object_id: Uuid) -> String {
-    object_id.to_string()
+/// The consequence, recorded honestly, and made worse by the cascade: a navigator document
+/// accumulates one tombstone per removed entry, and a cross-project move now removes `N` of them
+/// in one command instead of one (`limits-v1.md`'s `move_subtree_nodes_max`
+/// `tombstone_interaction`). `collab_core::limits`' `container_count_max` counts *live* nodes, so
+/// tombstones do not consume that ceiling, but they do grow the document. `limits-v1.md` has no
+/// number for it and this package does not invent one; the growth is measured by
+/// [`navigator_tombstone_growth_is_measured_on_a_cascading_command`] and carried to the delivery
+/// report as an open contract item.
+fn entry_object_of(id: &str) -> Option<Uuid> {
+    let head = id.get(..36)?;
+    let rest = id.get(36..)?;
+    let object_id = Uuid::parse_str(head).ok()?;
+    if rest.is_empty() {
+        return Some(object_id);
+    }
+    let generation = rest.strip_prefix('#')?;
+    if generation.is_empty() || !generation.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(object_id)
 }
 
-/// Whether `id` is one of `object_id`'s ordering entries (any generation).
-fn is_entry_of(id: &str, prefix: &str) -> bool {
-    id == prefix
-        || id
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_prefix('#'))
-            .is_some_and(|generation| !generation.is_empty() && generation.bytes().all(|b| b.is_ascii_digit()))
+/// Everything a batched navigator rewrite needs about one snapshot, computed in a single
+/// `O(nodes)` pass.
+///
+/// This exists because the per-node shape it replaces was `O(N^2)`: the previous
+/// `build_navigator_update` took one `semantic_snapshot()` *and* one
+/// `collab_core::limits::check_operation` per node, and both are `O(nodes)`. Measured on the
+/// contract's own ladder (`apps/api/tests/flow_v05_subtree_budget.rs`): N = 100 → 8.11 ms,
+/// N = 400 → 135.87 ms, N = 1000 → 863.10 ms per document, against 1.12 / 4.33 / 10.97 ms batched.
+/// `limits-v1.md` froze `move_subtree_nodes_max` against the **batched** curve, so this shape is
+/// part of what makes the frozen value true rather than an optimisation on top of it.
+struct NavigatorIndex {
+    /// The one *live* ordering entry each object currently occupies here, if any.
+    live_entry: std::collections::HashMap<Uuid, NodeId>,
+    /// Live root-level entries — the append index for a new entry, and the length `loro`'s
+    /// `mov_to` validates a same-parent reposition against.
+    live_roots: u32,
+    /// Live `NavigatorNode`s, for `container_count_max`.
+    live_navigator_nodes: usize,
+    /// Node ids that some node (live or tombstoned) names as its parent. A `MoveNode` of an id
+    /// that is in this set can change a descendant's depth and therefore still needs the full
+    /// `check_operation`; one that is not cannot, and skipping it is what keeps the batch linear.
+    parents: std::collections::HashSet<NodeId>,
 }
 
-/// The object's currently *live* ordering entry in this navigator, if it has one.
-fn live_entry_of(snapshot: &collab_core::SemanticSnapshot, object_id: Uuid) -> Option<NodeId> {
-    let prefix = entry_prefix(object_id);
-    snapshot
-        .nodes
-        .iter()
-        .find(|(id, node)| !node.deleted && is_entry_of(id, &prefix))
-        .map(|(id, _)| id.clone())
+impl NavigatorIndex {
+    fn build(snapshot: &collab_core::SemanticSnapshot) -> Self {
+        let mut live_entry = std::collections::HashMap::new();
+        let mut parents = std::collections::HashSet::new();
+        let mut live_roots = 0u32;
+        let mut live_navigator_nodes = 0usize;
+        for (id, node) in &snapshot.nodes {
+            if let Some(parent) = &node.parent {
+                parents.insert(parent.clone());
+            }
+            if node.deleted {
+                continue;
+            }
+            if node.parent.is_none() {
+                live_roots = live_roots.saturating_add(1);
+            }
+            if node.kind == NodeKind::NavigatorNode {
+                live_navigator_nodes = live_navigator_nodes.saturating_add(1);
+            }
+            if let Some(object_id) = entry_object_of(id) {
+                // First writer wins, deterministically: `snapshot.nodes` is a `BTreeMap`, so the
+                // iteration order is the entry ids' own order and `"<uuid>"` precedes
+                // `"<uuid>#1"`. An object with two live entries in one navigator is already a
+                // defect; picking a stable one keeps this function from being the place it turns
+                // into non-determinism.
+                live_entry.entry(object_id).or_insert_with(|| id.clone());
+            }
+        }
+        Self {
+            live_entry,
+            live_roots,
+            live_navigator_nodes,
+            parents,
+        }
+    }
 }
 
 /// A never-before-used entry id for a *new* placement: the bare UUID if this navigator has never
@@ -292,7 +406,7 @@ fn live_entry_of(snapshot: &collab_core::SemanticSnapshot, object_id: Uuid) -> O
 /// candidate ids can be taken, so the first free one is always found inside that many probes.
 /// There is no arbitrary constant here and therefore no invented limit.
 fn fresh_entry_id(snapshot: &collab_core::SemanticSnapshot, object_id: Uuid) -> Result<NodeId, ApiError> {
-    let prefix = entry_prefix(object_id);
+    let prefix = object_id.to_string();
     let bare: NodeId = Arc::from(prefix.as_str());
     if !snapshot.nodes.contains_key(&bare) {
         return Ok(bare);
@@ -308,70 +422,270 @@ fn fresh_entry_id(snapshot: &collab_core::SemanticSnapshot, object_id: Uuid) -> 
     Err(ApiError::Internal)
 }
 
-/// Builds the CRDT update bytes that put `object_id`'s ordering entry where this move says it
-/// belongs, or `None` when this document needs no change at all.
+/// One navigator document's whole share of one move: the moved object's entry, plus every
+/// descendant's entry when the move crosses a project scope.
+struct NavigatorBatch<'a> {
+    /// The moved object — the one entry whose position `after_id` governs.
+    primary: Uuid,
+    /// Its descendants, in the order their entries are appended. Empty unless the move cascades.
+    cascaded: &'a [Uuid],
+    /// `true` for the navigator the subtree is leaving (entries are removed), `false` for the one
+    /// it is joining or repositioning within.
+    remove: bool,
+    /// Place the moved object's entry immediately after this sibling's entry. Descendants always
+    /// append after it; `rest-api-v1.md` gives `after_id` one subject, not `N`.
+    after_id: Option<Uuid>,
+}
+
+/// What one navigator document's share of a move works out to.
+struct NavigatorChange {
+    /// The CRDT update bytes, or `None` when this document needs no change at all.
+    bytes: Option<Vec<u8>>,
+    /// `batch.cascaded`, reordered to the order those objects' ordering entries occupy **in this
+    /// document**. Meaningful on the source navigator, where it is the order the target has to
+    /// reproduce; ignored elsewhere. Always a permutation of the input.
+    cascade_order: Vec<Uuid>,
+}
+
+/// Builds the CRDT update bytes that put a whole subtree's ordering entries where this move says
+/// they belong, or `None` when this document needs no change at all.
 ///
-/// `remove` is the source-navigator case (drop the entry); otherwise the entry is repositioned if
-/// it is already live here, or created under a fresh generation if it is not. "No change at all"
-/// is decided by the *frontier*, not by guessing which operations are no-ops: a `MoveNode` that
-/// lands an entry exactly where it already sat may produce no operation in the engine, and
-/// shipping an empty update would advance a head with nothing in it.
+/// One `semantic_snapshot()`, one [`NavigatorIndex`], one aggregate limit check, `N` engine
+/// operations, one `export_from` — see [`NavigatorIndex`] for the measured reason that shape is
+/// mandatory rather than tidy.
+///
+/// "No change at all" is decided by the *frontier*, not by guessing which operations are no-ops: a
+/// `MoveNode` that lands an entry exactly where it already sat may produce no operation in the
+/// engine, and shipping an empty update would advance a head with nothing in it.
 fn build_navigator_update(
     engine: &mut LoroCollabEngine,
-    object_id: Uuid,
-    remove: bool,
-    after_id: Option<Uuid>,
-) -> Result<Option<Vec<u8>>, ApiError> {
+    batch: &NavigatorBatch<'_>,
+) -> Result<NavigatorChange, ApiError> {
     let base_frontier = engine.frontier();
     let snapshot = engine.semantic_snapshot().map_err(|err| map_collab_error(&err))?;
-    let live = live_entry_of(&snapshot, object_id);
+    let index = NavigatorIndex::build(&snapshot);
+    // Read off the *incoming* snapshot, before a single operation is applied, and returned
+    // whichever way this function exits — including the two "no change" exits, because a document
+    // that needs no update of its own can still be the one holding the order.
+    let cascade_order = observed_cascade_order(&snapshot, &index, batch.cascaded);
 
-    let operation = if remove {
-        let Some(entry) = live else { return Ok(None) };
-        Operation::DeleteNode { id: entry }
+    let mut operations: Vec<Operation> = Vec::with_capacity(batch.cascaded.len().saturating_add(1));
+    if batch.remove {
+        for object_id in std::iter::once(batch.primary).chain(batch.cascaded.iter().copied()) {
+            if let Some(entry) = index.live_entry.get(&object_id) {
+                operations.push(Operation::DeleteNode { id: entry.clone() });
+            }
+        }
     } else {
         // Root-level position: one past the requested predecessor, or the end of the list. The
         // engine clamps an out-of-range index itself (`LoroCollabEngine::clamp_index`), so a
         // stale `after_id` degrades to "append" rather than failing the command.
-        match live {
-            Some(entry) => Operation::MoveNode {
+        let mut roots = index.live_roots;
+        if let Some(entry) = index.live_entry.get(&batch.primary) {
+            operations.push(Operation::MoveNode {
                 // Computed over the siblings *excluding this entry*, which is what makes a
                 // same-parent reposition legal: loro's `mov_to` takes the node out of the list
                 // before re-inserting it, so the valid range is `0..=len-1`, while
                 // `LoroCollabEngine::clamp_index` only clamps to `len` — passing `len` fails with
                 // "The index(n) should be <= the length of children (n-1)". Excluding the entry
                 // makes both the create and the move case use one formula.
-                index: position_after(&snapshot, after_id, Some(&entry)),
-                id: entry,
+                index: position_after(&snapshot, &index, batch.after_id, Some(entry)),
+                id: entry.clone(),
                 new_parent: None,
-            },
-            None => Operation::CreateNode {
-                id: fresh_entry_id(&snapshot, object_id)?,
+            });
+        } else {
+            operations.push(Operation::CreateNode {
+                id: fresh_entry_id(&snapshot, batch.primary)?,
                 parent: None,
-                index: position_after(&snapshot, after_id, None),
+                index: position_after(&snapshot, &index, batch.after_id, None),
                 kind: NodeKind::NavigatorNode,
-            },
+            });
+            roots = roots.saturating_add(1);
         }
-    };
+        // Descendants append after whatever the moved object's own placement produced. `roots`
+        // tracks the live root count the engine will have when each operation is applied, because
+        // the snapshot above is from *before* any of them ran and re-snapshotting per node is
+        // exactly the quadratic shape this function exists to avoid.
+        for object_id in batch.cascaded {
+            if let Some(entry) = index.live_entry.get(object_id) {
+                operations.push(Operation::MoveNode {
+                    index: roots.saturating_sub(1),
+                    id: entry.clone(),
+                    new_parent: None,
+                });
+            } else {
+                operations.push(Operation::CreateNode {
+                    id: fresh_entry_id(&snapshot, *object_id)?,
+                    parent: None,
+                    index: roots,
+                    kind: NodeKind::NavigatorNode,
+                });
+                roots = roots.saturating_add(1);
+            }
+        }
+    }
+    if operations.is_empty() {
+        return Ok(NavigatorChange {
+            bytes: None,
+            cascade_order,
+        });
+    }
 
-    let limits = collab_limits::document_limits();
-    collab_core::limits::check_operation(&snapshot, &operation, &limits)
-        .map_err(|violation| map_collab_error(&collab_core::CollabError::from(violation)))?;
-    engine
-        .apply_operation(&operation)
-        .map_err(|err| map_collab_error(&err))?;
+    check_navigator_batch(&snapshot, &index, &operations)?;
+    for operation in &operations {
+        engine
+            .apply_operation(operation)
+            .map_err(|err| map_collab_error(&err))?;
+    }
 
     if engine.frontier().as_bytes() == base_frontier.as_bytes() {
-        // The engine merged the operation into nothing — the entry was already exactly here.
-        return Ok(None);
+        // The engine merged the operations into nothing — every entry was already exactly here.
+        return Ok(NavigatorChange {
+            bytes: None,
+            cascade_order,
+        });
     }
     let bytes = engine
         .export_from(&base_frontier)
         .map_err(|err| map_collab_error(&err))?;
     if bytes.is_empty() {
-        return Ok(None);
+        return Ok(NavigatorChange {
+            bytes: None,
+            cascade_order,
+        });
     }
-    Ok(Some(bytes))
+    // `update_bytes_max`, executed here for **error localisation**, not because the hole it once
+    // claimed to plug exists. It does not: this update goes on to
+    // `write::hydrate_and_apply` -> `collab_core::isolation::isolated_apply` -> the worker's
+    // `LoroCollabEngine::import_update`, and that function's first line is
+    // `InputLimits::default().validate_update(update)?` (`crates/collab-core/src/engine.rs`), so an
+    // oversized update is already refused one layer down. What differs is *what the caller gets*:
+    // from here it is a decidable `limit_exceeded{limit_kind:"update_bytes"}` naming this command's
+    // own input; from the worker it is a rejection about an opaque byte blob the caller never
+    // supplied. Defence in depth with a better error, and the cheaper check first.
+    //
+    // At the frozen `move_subtree_nodes_max` neither can fire (the contract measured 8,122 B at
+    // N = 100 against 65,536 — 8.07x of headroom, which is why the *binding* ceiling is the lock
+    // budget and not this one).
+    let observed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if observed > collab_limits::UPDATE_BYTES_MAX {
+        return Err(ApiError::limit_exceeded(
+            "the navigator ordering update this move produces is larger than the frozen update ceiling",
+            "update_bytes",
+            Some(json!(collab_limits::UPDATE_BYTES_MAX)),
+            Some(json!(observed)),
+            None,
+        ));
+    }
+    Ok(NavigatorChange {
+        bytes: Some(bytes),
+        cascade_order,
+    })
+}
+
+/// `objects` reordered to match the order their ordering entries occupy in this navigator.
+///
+/// `rest-api-v1.md` (2026-08-31 裁定): "`after_id` 只定位被移动对象本身……被级联的后代之间，
+/// 必须保持它们在源 navigator 里的相对顺序，不得按 id 或任何其它规则重新推导". That order is what
+/// a user looking at the tree sees, so re-deriving it during a cross-project move would silently
+/// reshuffle a subtree nobody asked to reshuffle.
+///
+/// Objects with no live root-level entry here have no order to preserve; they keep their incoming
+/// relative order, after the ones that do. The incoming order is ascending `id`
+/// (`repository::subtree_nodes`' `ORDER BY s.id`), so the result is total and deterministic in
+/// every case — including a navigator that holds no entries for this subtree at all, which is what
+/// the very first cross-project move of a freshly created subtree looks like.
+fn observed_cascade_order(
+    snapshot: &collab_core::SemanticSnapshot,
+    index: &NavigatorIndex,
+    objects: &[Uuid],
+) -> Vec<Uuid> {
+    let mut placed: Vec<(&str, Uuid)> = Vec::with_capacity(objects.len());
+    let mut unplaced: Vec<Uuid> = Vec::new();
+    for object_id in objects {
+        match index
+            .live_entry
+            .get(object_id)
+            .and_then(|entry| snapshot.nodes.get(entry))
+            .filter(|node| node.parent.is_none())
+        {
+            Some(node) => placed.push((node.order_key.as_str(), *object_id)),
+            None => unplaced.push(*object_id),
+        }
+    }
+    // `sort_by` is stable, so two entries that somehow share an `order_key` keep the incoming
+    // ascending-`id` order rather than swapping unpredictably between runs.
+    placed.sort_by(|left, right| left.0.cmp(right.0));
+    placed.into_iter().map(|(_, id)| id).chain(unplaced).collect()
+}
+
+/// The batched replacement for one `collab_core::limits::check_operation` per node.
+///
+/// Two ceilings can actually be reached by the operations [`build_navigator_update`] emits, and
+/// each is decided once for the whole batch instead of once per node:
+///
+/// * `container_count_max` — every emitted `CreateNode` is a root-level `NavigatorNode`, so the
+///   post-batch live count is simply the pre-batch count plus the number of creates. Checking it
+///   per node would also be *wrong* in the same direction the contract cares about: each call
+///   would compare `live + 1` against the ceiling and a 100-entry batch would sail past it.
+/// * `tree_depth_max` — a `CreateNode` with `parent: None` lands at depth 0 and cannot breach it,
+///   and a `MoveNode` to `new_parent: None` lands at depth 0 too, so the only way one can breach
+///   it is by carrying a subtree down with it. Navigator ordering entries are flat, so
+///   `index.parents` is normally empty of them and the loop below does nothing; when a document
+///   does hold a nested node, that node's own move is handed to the real `check_operation`.
+///   `DeleteNode` has no ceiling at all (`check_operation` returns `Ok` for it unconditionally).
+///
+/// **What the `index.parents` guard is and is not**, written down rather than left as a line no
+/// test can see. It *runs* whenever a navigator holds a nested node — navigator documents are
+/// ordinary collab documents and nothing forbids that — so it is not dead. But it cannot *fail*
+/// on a document that already satisfies `tree_depth_max`: the operation moves the entry to the
+/// root, so `deepest_after_move = 0 + subtree_height(entry)`, and in a valid document an entry at
+/// depth `d` has `d + height <= 32`, hence `height <= 32`. A move to the root only ever reduces
+/// depths. It is therefore defence in depth against a document that is **already** over the
+/// ceiling, and `a_navigator_entry_carrying_an_over_deep_subtree_is_refused_by_the_batched_depth_check`
+/// builds exactly that document so the branch is falsifiable rather than merely argued about.
+/// The guard is kept rather than replaced by an unconditional call because `check_operation`'s
+/// `MoveNode` arm is `O(nodes)` (it rebuilds a children index per call), and dropping the guard
+/// would make a batch of `N` repositions `O(N * nodes)`.
+fn check_navigator_batch(
+    snapshot: &collab_core::SemanticSnapshot,
+    index: &NavigatorIndex,
+    operations: &[Operation],
+) -> Result<(), ApiError> {
+    let limits = collab_limits::document_limits();
+    let created = operations
+        .iter()
+        .filter(|operation| {
+            matches!(
+                operation,
+                Operation::CreateNode {
+                    kind: NodeKind::NavigatorNode,
+                    ..
+                }
+            )
+        })
+        .count();
+    if created > 0 {
+        let observed = index.live_navigator_nodes.saturating_add(created);
+        if observed > limits.container_count_max {
+            return Err(map_collab_error(&collab_core::CollabError::from(
+                collab_core::limits::LimitViolation {
+                    limit_kind: "container_count",
+                    limit: u64::try_from(limits.container_count_max).unwrap_or(u64::MAX),
+                    observed: u64::try_from(observed).unwrap_or(u64::MAX),
+                },
+            )));
+        }
+    }
+    for operation in operations {
+        if let Operation::MoveNode { id, .. } = operation
+            && index.parents.contains(id)
+        {
+            collab_core::limits::check_operation(snapshot, operation, &limits)
+                .map_err(|violation| map_collab_error(&collab_core::CollabError::from(violation)))?;
+        }
+    }
+    Ok(())
 }
 
 /// Index for a new/moved root-level navigator entry: immediately after `after_id`'s entry, or at
@@ -380,7 +694,12 @@ fn build_navigator_update(
 /// `exclude` is the entry being repositioned, if it is already in this list — see
 /// [`build_navigator_update`] for why leaving it in produces an out-of-range index for a
 /// same-parent move.
-fn position_after(snapshot: &collab_core::SemanticSnapshot, after_id: Option<Uuid>, exclude: Option<&NodeId>) -> u32 {
+fn position_after(
+    snapshot: &collab_core::SemanticSnapshot,
+    index: &NavigatorIndex,
+    after_id: Option<Uuid>,
+    exclude: Option<&NodeId>,
+) -> u32 {
     let mut roots: Vec<(&str, &NodeId)> = snapshot
         .nodes
         .iter()
@@ -390,12 +709,12 @@ fn position_after(snapshot: &collab_core::SemanticSnapshot, after_id: Option<Uui
     roots.sort_unstable();
     let end = u32::try_from(roots.len()).unwrap_or(u32::MAX);
     let Some(after_id) = after_id else { return end };
-    let Some(wanted) = live_entry_of(snapshot, after_id) else {
+    let Some(wanted) = index.live_entry.get(&after_id) else {
         return end;
     };
     roots
         .iter()
-        .position(|(_, id)| **id == wanted)
+        .position(|(_, id)| *id == wanted)
         .and_then(|index| u32::try_from(index.saturating_add(1)).ok())
         .unwrap_or(end)
 }
@@ -406,11 +725,9 @@ fn position_after(snapshot: &collab_core::SemanticSnapshot, after_id: Option<Uui
 async fn plan_document(
     ctx: &MoveContext<'_>,
     document_id: Uuid,
-    object_id: Uuid,
-    remove: bool,
-    after_id: Option<Uuid>,
+    batch: &NavigatorBatch<'_>,
     expected_frontier: Option<&[u8]>,
-) -> Result<DocumentPlan, ApiError> {
+) -> Result<(DocumentPlan, Vec<Uuid>), ApiError> {
     let input = ctx.input;
     let boot = bootstrap::load(&ctx.state.db, document_id).await?;
     let mut engine = LoroCollabEngine::load(&boot.snapshot).map_err(|err| map_collab_error(&err))?;
@@ -420,13 +737,17 @@ async fn plan_document(
             .map_err(|err| map_collab_error(&err))?;
     }
 
-    let Some(bytes) = build_navigator_update(&mut engine, object_id, remove, after_id)? else {
+    let NavigatorChange { bytes, cascade_order } = build_navigator_update(&mut engine, batch)?;
+    let Some(bytes) = bytes else {
         // Locked but not advanced. `boot.head_seq` is the head the "no change" conclusion was
         // drawn against, so the locked phase can still detect a concurrent writer.
-        return Ok(DocumentPlan::Locked {
-            document_id,
-            observed_head_seq: boot.head_seq,
-        });
+        return Ok((
+            DocumentPlan::Locked {
+                document_id,
+                observed_head_seq: boot.head_seq,
+            },
+            cascade_order,
+        ));
     };
 
     // Never `Uuid::new_v4()`: this whole function is re-entered on every REST retry and on every
@@ -460,11 +781,14 @@ async fn plan_document(
     )
     .await?
     {
-        write::HydrateOutcome::Prepared(prepared) => Ok(DocumentPlan::Advance {
-            document_id,
-            request: Box::new(request),
-            prepared,
-        }),
+        write::HydrateOutcome::Prepared(prepared) => Ok((
+            DocumentPlan::Advance {
+                document_id,
+                request: Box::new(request),
+                prepared,
+            },
+            cascade_order,
+        )),
         write::HydrateOutcome::Rejected(write::AcceptOutcome::Rejected(rejected)) => {
             Err(map_write_rejection(&rejected))
         }
@@ -568,11 +892,56 @@ async fn run_locked_phase(
     // `tx`, not on a second connection: it must see the same snapshot the locked rows above came
     // from, or the rule is being checked against a state this transaction is not committing.
     check_cycle_and_depth(tx, plan, &locked_chain.ids).await?;
-    // Re-decided under the locks, for the same reason the cycle/depth rules are: the unlocked
-    // pre-check ran before this transaction existed. `lock_movable_object`'s `FOR UPDATE` on the
-    // moved object conflicts with the `FOR KEY SHARE` a concurrent child insert takes on its
-    // parent, so from here the subtree cannot gain a member behind this command's back.
-    ensure_move_keeps_the_subtree_in_one_project(tx, plan.workspace_id, plan.object_id, target.project_id).await?;
+    // [layer 2, cascade] the rest of the subtree, ascending `id`, in one statement.
+    //
+    // Taken *before* the re-derivation below and not after: `FOR UPDATE` on a row conflicts with
+    // the `FOR KEY SHARE` a concurrent `create_object` takes on its parent through the foreign
+    // key, so once these rows are held the subtree cannot gain a member under any of them. Locking
+    // after re-deriving would leave exactly that window open, and the whole point of the
+    // re-derivation is to close it.
+    let subtree_ids = plan.subtree_ids();
+    if plan.cascades {
+        let locked_subtree = repository::lock_objects_for_update(tx, &subtree_ids).await?;
+        if locked_subtree.len() != subtree_ids.len() {
+            return Ok(LockedOutcome::Drift("part of the moved subtree disappeared"));
+        }
+        // No `lifecycle_status` filter, and that is a decision rather than an omission: archiving
+        // is a flag flip that leaves `parent_id`/`project_id` alone, so an archived descendant is
+        // still a subtree member the composite foreign key applies to. Skipping it would make
+        // every cascade over a subtree containing one archived page fail the constraint.
+
+        // Membership re-derived on this transaction's own snapshot, for the same reason
+        // `derive_contended_set` is re-derived below: the unlocked prepare ran before this
+        // transaction existed. A subtree that grew past the ceiling in that window is a *refusal*,
+        // not a retry — retrying would re-prepare and re-refuse — so the limit is re-enforced here
+        // rather than reported as drift.
+        let probe = i64::try_from(TREE_DEPTH_MAX.saturating_add(1)).unwrap_or(i64::MAX);
+        let relocked = repository::subtree_nodes(
+            tx,
+            plan.workspace_id,
+            plan.object_id,
+            probe,
+            i64::try_from(MOVE_SUBTREE_NODES_MAX).unwrap_or(i64::MAX),
+        )
+        .await?;
+        enforce_move_subtree_nodes_max(relocked.total)?;
+        if relocked.ids != subtree_ids {
+            return Ok(LockedOutcome::Drift("the moved subtree changed shape concurrently"));
+        }
+
+        // The cascade's premise, re-decided on the rows this transaction holds rather than on a
+        // second read: every strict descendant must already sit in the moved object's scope, or
+        // its ordering entries are not all in the one navigator this command is about to empty.
+        // Deliberately over *every* locked row, the moved object included: its own scope was
+        // already compared against the plan above, so including it is free, and excluding it would
+        // be a filter no test could falsify.
+        refuse_if_multi_scoped(locked_subtree.iter().map(|row| row.project_id), source.project_id)?;
+    } else {
+        // A same-scope re-parent rewrites one row and cascades nothing, so there is no subtree to
+        // lock and no ceiling to re-enforce. The premise is still checked: a subtree that already
+        // spans scopes is a known inconsistency whether or not this command widens it.
+        ensure_subtree_is_single_scoped(tx, plan.workspace_id, plan.object_id, source.project_id).await?;
+    }
 
     // `ADR-0012` §4's double-sided rule, re-decided on this transaction's own snapshot rather
     // than trusted from the unlocked pre-check. `caller_before` is therefore also the level the
@@ -671,15 +1040,30 @@ async fn run_locked_phase(
         }
     }
 
-    // The governance write itself.
-    repository::set_object_parent(
+    // The governance write itself — the re-parent and the whole subtree's scope rewrite, in
+    // **one** statement. `flow_objects_parent_project_fk` is `NOT DEFERRABLE`, so a two-statement
+    // split fails at the end of the first one with the root already in the new scope and its
+    // children still in the old; see `repository::cascade_move_subtree`.
+    let rewritten = repository::cascade_move_subtree(
         tx,
+        &subtree_ids,
         plan.object_id,
         plan.target_object_id,
         target.project_id,
         input.actor_id,
     )
     .await?;
+    if rewritten != u64::try_from(subtree_ids.len()).unwrap_or(u64::MAX) {
+        // The set was locked `FOR UPDATE` above, so this cannot happen; refused rather than
+        // assumed away, because a cascade that silently rewrote fewer rows than it locked is
+        // precisely the data inconsistency `ADR-0013` §2.2 R17 exists to remove.
+        tracing::error!(
+            expected = subtree_ids.len(),
+            rewritten,
+            "move_object: the cascade rewrote a different number of rows than it locked"
+        );
+        return Err(ApiError::Internal);
+    }
 
     // `ADR-0012` §4.1, applied to the move: the caller may hold `full_access` only through the
     // *old* parent chain, and land the object under a boundary they hold nothing beneath. Computed
@@ -726,7 +1110,27 @@ async fn run_locked_phase(
                 "new_parent_id": plan.target_object_id,
                 "position_key": payload.after_id,
             }),
-            metadata: json!({ "message": input.message }),
+            // `events-v1.md`'s envelope carries `metadata.affected_object_ids[]`, and the
+            // 2026-08-31 ruling puts the cascade there rather than in the payload: the frozen
+            // `flow.object.moved` payload names only the object that was asked to move, so without
+            // this **nothing in the audit stream records that N descendants changed project**.
+            // `affected_object_ids` is an envelope field that exists for exactly this and
+            // cascading archive is the same pattern (`ADR-0012` §2).
+            //
+            // The set is exactly the `flow_objects` rows this transaction rewrote — the moved
+            // object plus every cascaded descendant, ascending `id`, bounded by
+            // `move_subtree_nodes_max`. The two navigator objects are deliberately **not** in it:
+            // their governance rows were not touched, only their document heads advanced, and each
+            // of those advances already emits its own `flow.content.accepted` carrying that
+            // document's `object_id`. One fact, one event, no overlap.
+            //
+            // No count field here on purpose (same ruling): a count is a consequence of the set,
+            // and recording it twice only creates two truths that can disagree. `command_result`
+            // carries `cascaded_node_count` for the caller.
+            metadata: json!({
+                "message": input.message,
+                "affected_object_ids": subtree_ids,
+            }),
             correlation_id: None,
             causation_id: None,
             idempotency_key: Some(input.idempotency_key.clone()),
@@ -858,55 +1262,77 @@ async fn check_cycle_and_depth<C: sea_orm::ConnectionTrait>(
     Ok(())
 }
 
-/// `details.reason` on the transitional refusal `ADR-0013` §2.2 R17 and `rest-api-v1.md`'s
-/// `move_object` clause both spell out by name.
+/// `details.reason` on the refusal `ADR-0013` §2.2 R17 and `rest-api-v1.md`'s `move_object`
+/// clause both spell out by name.
 pub const SUBTREE_SPANS_MULTIPLE_PROJECTS: &str = "subtree_spans_multiple_projects";
 
-/// The transitional fail-closed rule for `project_id` cascading (`ADR-0013` §2.2 R17).
+/// The cascade's premise, checked rather than assumed (`ADR-0013` §2.2 R17).
 ///
-/// The ruling has two steps and this is the gap between them. Step one -- migration `0056`'s
-/// `flow_objects_parent_project_fk` -- makes "a subtree belongs to one project scope" a database
-/// invariant. Step two, cascading the subtree's `project_id` and ordering entries with the moved
-/// object, is blocked on `limits-v1.md`'s `move_subtree_nodes_max`, which is still
-/// `status: unset`. Until it is frozen, this command must refuse anything the non-cascading
-/// implementation would answer wrongly, because both alternatives are explicitly rejected by the
-/// ADR: silently not cascading is a known data inconsistency, and silently cascading breaks the
-/// declared `BoundedMany(2)` document ceiling.
+/// The ruling has two steps. Step one — migration `0056`'s `flow_objects_parent_project_fk` —
+/// makes "a subtree belongs to one project scope" a database invariant. Step two, implemented
+/// here, cascades the subtree's `project_id` and ordering entries with the moved object, and it is
+/// **only** correct because of step one: the whole subtree's entries sit in one navigator before
+/// the move and one navigator after, which is what keeps
+/// [`MOVE_OBJECT_CONTENDED_DOCUMENT_MAX`] true.
 ///
-/// The rule is one predicate over the post-move subtree, computed **without** cascading: the moved
-/// object would land in `target_project_id` while every descendant keeps the scope it has, so the
-/// set of scopes that subtree would span is `{target_project_id} ∪ {descendant scopes}`. More than
-/// one entry means this move cannot be completed correctly today. That covers both reachable
-/// causes with one code:
+/// So this is no longer a transitional refusal, it is defence in depth on the premise. The
+/// predicate is one statement about the subtree **as it stands, before the move**: every strict
+/// descendant's scope must equal the moved object's own. `ADR-0013` §2.2's decisive counterexample
+/// (`P1 root → P2 child → P3 grandchild`) was a legal shape before `0056`, and this check must not
+/// depend on the constraint having been applied to the database it is running against — cascading
+/// such a subtree would touch three or four navigators and silently break the declared
+/// `bounded_many` ceiling.
 ///
-/// * **a cross-project move of an object that has descendants** -- the common case, and after
-///   `0056` also the case the database itself would refuse: rewriting the moved row's
-///   `project_id` while its children still reference the old scope violates the foreign key, so
-///   without this check the caller gets a 500 instead of a decision;
-/// * **a subtree that already spans scopes** -- pre-`0056` data. Unreachable for anything created
-///   after the constraint lands, kept because defence in depth is the point: the check must not
-///   depend on the constraint having been applied to the database it is running against.
+/// It is checked on every move, cascading or not: a subtree that already spans scopes is a known
+/// data inconsistency whether or not this particular command would widen it, and the contract
+/// rejects proceeding past it either way.
 ///
 /// `None` participates as a scope value, matching the invariant's own NULL semantics.
-async fn ensure_move_keeps_the_subtree_in_one_project<C: sea_orm::ConnectionTrait>(
+async fn ensure_subtree_is_single_scoped<C: sea_orm::ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
     object_id: Uuid,
-    target_project_id: Option<Uuid>,
+    source_project_id: Option<Uuid>,
 ) -> Result<(), ApiError> {
     let probe = i64::try_from(TREE_DEPTH_MAX.saturating_add(1)).unwrap_or(i64::MAX);
-    let mut scopes: std::collections::BTreeSet<Option<Uuid>> =
-        repository::descendant_project_scopes(conn, workspace_id, object_id, probe)
-            .await?
-            .into_iter()
-            .collect();
-    scopes.insert(target_project_id);
-    if scopes.len() > 1 {
-        return Err(ApiError::invalid_update_with_details(
-            "this move would leave the subtree spanning more than one project scope; cascading \
-             project_id across a subtree is gated on the move_subtree_nodes_max limit, which is \
-             not frozen yet",
-            json!({ "reason": SUBTREE_SPANS_MULTIPLE_PROJECTS }),
+    let scopes = repository::descendant_project_scopes(conn, workspace_id, object_id, probe).await?;
+    refuse_if_multi_scoped(scopes.into_iter(), source_project_id)
+}
+
+/// The predicate itself, over any iterator of descendant scopes, so the unlocked path (a recursive
+/// query) and the locked path (the rows it already holds `FOR UPDATE`) decide it with the *same*
+/// code instead of two copies that can disagree.
+fn refuse_if_multi_scoped(
+    descendant_scopes: impl Iterator<Item = Option<Uuid>>,
+    source_project_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    for scope in descendant_scopes {
+        if scope != source_project_id {
+            return Err(ApiError::invalid_update_with_details(
+                "this subtree already spans more than one project scope, so its ordering entries \
+                 are not all in one navigator and it cannot be cascaded",
+                json!({ "reason": SUBTREE_SPANS_MULTIPLE_PROJECTS }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `limits-v1.md`'s `move_subtree_nodes_max`, executed by this command because nothing else will
+/// (see [`MOVE_SUBTREE_NODES_MAX`]).
+///
+/// Called twice per attempt and both times *before* anything is written: once outside the
+/// transaction, so the refusal costs zero rows, zero head advances, zero events and zero dispatch;
+/// once inside it on the transaction's own snapshot, because a concurrent `create_object` can add
+/// a node to the subtree between the two.
+fn enforce_move_subtree_nodes_max(total: i64) -> Result<(), ApiError> {
+    if total > i64::try_from(MOVE_SUBTREE_NODES_MAX).unwrap_or(i64::MAX) {
+        return Err(ApiError::limit_exceeded(
+            "this move would cascade more subtree nodes than the frozen ceiling allows",
+            MOVE_SUBTREE_NODES_LIMIT_KIND,
+            Some(json!(MOVE_SUBTREE_NODES_MAX)),
+            Some(json!(total)),
+            None,
         ));
     }
     Ok(())
@@ -1059,7 +1485,12 @@ pub async fn execute_on(
         return Err(ApiError::Internal);
     }
 
-    let plan = MovePlan {
+    // `ADR-0013` §2.2 R17 step two: a scope change takes the whole subtree with it, a re-parent
+    // inside one scope takes nothing. Everything the cascade costs — the extra rows, the extra
+    // ordering entries, the extra tombstones, the frozen node ceiling — hangs off this one
+    // comparison, so it is made once and carried in the plan.
+    let cascades = source.project_id != target.project_id;
+    let mut plan = MovePlan {
         workspace_id,
         object_id: input.object_id,
         target_object_id: payload.target_object_id,
@@ -1069,9 +1500,29 @@ pub async fn execute_on(
         target_chain,
         document_lock_order,
         navigator_object_ids,
+        cascaded_ids: Vec::new(),
+        cascades,
     };
     check_cycle_and_depth(&state.db, &plan, &plan.target_chain).await?;
-    ensure_move_keeps_the_subtree_in_one_project(&state.db, workspace_id, plan.object_id, target.project_id).await?;
+    ensure_subtree_is_single_scoped(&state.db, workspace_id, plan.object_id, source.project_id).await?;
+
+    if cascades {
+        // Outside the transaction, before the coordinator: a refusal here has touched nothing at
+        // all. `subtree_nodes` truncates the id list at the ceiling but reports the real total, so
+        // `details.observed` is the subtree's actual size rather than the cap read back.
+        let probe = i64::try_from(TREE_DEPTH_MAX.saturating_add(1)).unwrap_or(i64::MAX);
+        let subtree = repository::subtree_nodes(
+            &state.db,
+            workspace_id,
+            plan.object_id,
+            probe,
+            i64::try_from(MOVE_SUBTREE_NODES_MAX).unwrap_or(i64::MAX),
+        )
+        .await?;
+        enforce_move_subtree_nodes_max(subtree.total)?;
+        plan.cascaded_ids = subtree.ids.into_iter().filter(|id| *id != plan.object_id).collect();
+    }
+    let plan = plan;
 
     // [layer 0] every contended document's admission slot, ascending, before anything else.
     let Ok(_permits) = collab.coordinator.acquire_many(&plan.document_lock_order).await else {
@@ -1082,12 +1533,37 @@ pub async fn execute_on(
         ));
     };
 
+    // Hydration order, which is **not** lock order: locking still walks
+    // `plan.document_lock_order` (ascending `document_id`, `ADR-0013` §2.1) inside the
+    // transaction, while this only decides which document is read first, outside every lock. The
+    // source navigator goes first because it is where the subtree's current ordering lives and the
+    // target has to reproduce it. `sort_by_key` is stable, so everything else keeps lock order.
+    let source_only_document = match (source_navigator, target_navigator) {
+        (Some(source), target) if Some(source) != target => Some(source),
+        _ => None,
+    };
+    let mut prepare_order = plan.document_lock_order.clone();
+    prepare_order.sort_by_key(|document_id| u8::from(Some(*document_id) != source_only_document));
+
     let mut attempts = 0u32;
     loop {
         attempts += 1;
 
+        // The order the cascaded entries are appended to the target navigator in. It starts as
+        // ascending `id` — `plan.cascaded_ids`' own order, and the only order available when the
+        // source scope has no navigator or holds no entries for this subtree — and is replaced by
+        // the source navigator's real order as soon as that document has been hydrated below.
+        //
+        // `plan.cascaded_ids` itself is never reordered, but **not** because the drift check
+        // depends on its order — it does not: `MovePlan::subtree_ids` sorts before comparing, and
+        // that `sort_unstable` is the line actually holding the comparison together. The reason is
+        // narrower and worth stating plainly: `plan` is computed once and reused across every
+        // rebase attempt, while this display order is re-derived *per attempt* from whatever the
+        // source navigator looks like now. Writing an attempt's finding back into the plan would
+        // make the plan attempt-dependent, which is exactly what a rebase must not carry over.
+        let mut cascade_order: Vec<Uuid> = plan.cascaded_ids.clone();
         let mut plans: Vec<DocumentPlan> = Vec::with_capacity(plan.document_lock_order.len());
-        for document_id in &plan.document_lock_order {
+        for document_id in &prepare_order {
             // The source navigator loses the entry; the target navigator gains it. When both
             // scopes share one navigator the single document is the target case — a reposition,
             // not a remove-then-add.
@@ -1098,17 +1574,21 @@ pub async fn execute_on(
             } else {
                 None
             };
-            plans.push(
-                plan_document(
-                    &ctx,
-                    *document_id,
-                    plan.object_id,
-                    is_source_only,
-                    payload.after_id,
-                    expected,
-                )
-                .await?,
-            );
+            let (document_plan, observed) = {
+                let batch = NavigatorBatch {
+                    primary: plan.object_id,
+                    cascaded: &cascade_order,
+                    remove: is_source_only,
+                    after_id: payload.after_id,
+                };
+                plan_document(&ctx, *document_id, &batch, expected).await?
+            };
+            plans.push(document_plan);
+            if is_source_only {
+                // `observed` is a permutation of what was passed in, so this cannot add, drop or
+                // invent a member — only reorder.
+                cascade_order = observed;
+            }
         }
 
         let tx = state.db.begin().await?;
@@ -1207,9 +1687,21 @@ async fn build_response(
         .await?
         .ok_or(ApiError::Internal)?;
     let mut change = accepted_change_from_row(view, event_id);
-    let mut affected = vec![plan.object_id, plan.target_object_id];
-    affected.extend(plan.navigator_object_ids.iter().copied());
-    affected.dedup();
+    // `rest-api-v1.md`: a cross-object command "返回全部 `affected_object_ids`". The response is
+    // wider than the event's envelope set on purpose — it also names the two navigator objects,
+    // because the caller needs to know which documents' heads it should expect to have moved,
+    // which is a client concern rather than an audit fact.
+    //
+    // De-duplicated by identity rather than with `Vec::dedup`, which only collapses *consecutive*
+    // repeats: "move to the navigator root" makes `target_object_id` equal to one of the navigator
+    // objects, and those two land in non-adjacent positions.
+    let mut seen = std::collections::HashSet::new();
+    let affected: Vec<Uuid> = [plan.object_id, plan.target_object_id]
+        .into_iter()
+        .chain(plan.navigator_object_ids.iter().copied())
+        .chain(plan.cascaded_ids.iter().copied())
+        .filter(|object_id| seen.insert(*object_id))
+        .collect();
     change.affected_object_ids = affected;
     change.command_result = Some(json!({
         "command": GovernanceCommandType::MoveObject.wire_name(),
@@ -1219,6 +1711,17 @@ async fn build_response(
         "document_lock_order": observed_lock_order,
         "old_parent_id": plan.source_parent_id,
         "new_parent_id": plan.target_object_id,
+        // `ADR-0013` §2.2 R17 step two, made observable to the caller. The *audit* record of the
+        // cascade is not here — it is the event envelope's `affected_object_ids[]`, written where
+        // the `flow.object.moved` event is inserted. This count is deliberately **not** duplicated
+        // into the event (2026-08-31 ruling): a count is a consequence of that set, and recording
+        // it in two places only creates two truths that can disagree. The frozen
+        // `flow.object.moved` payload (`object_id,old_parent_id?,new_parent_id?,position_key?`) is
+        // likewise untouched — `flow::event_policy`'s allow-list is what a delivery is filtered
+        // through, so adding a field there would be a contract change rather than extra evidence.
+        "cascaded": plan.cascades,
+        "cascaded_node_count": plan.cascaded_ids.len().saturating_add(1),
+        "move_subtree_nodes_max": MOVE_SUBTREE_NODES_MAX,
         // `ADR-0012` §3.1 point 2: "gate artifact 必须记录每次写的 checked_epoch 与
         // committed_epoch".
         "checked_epoch": ctx.checked_epoch,
@@ -1255,7 +1758,10 @@ async fn replay(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    use super::{GovernanceCommandType, MOVE_OBJECT_CONTENDED_DOCUMENT_MAX, position_after};
+    use super::{
+        GovernanceCommandType, MOVE_OBJECT_CONTENDED_DOCUMENT_MAX, MOVE_SUBTREE_NODES_MAX, NavigatorIndex,
+        entry_object_of, position_after,
+    };
     use crate::flow::command::ExistingDocumentCardinality;
     use collab_core::{NodeKind, SemanticNode, SemanticSnapshot};
     use std::sync::Arc;
@@ -1302,11 +1808,16 @@ mod tests {
         snapshot.nodes.insert(Arc::from(first.to_string()), node("0000000000"));
         snapshot.nodes.insert(Arc::from(second.to_string()), node("0000000001"));
 
-        assert_eq!(position_after(&snapshot, None, None), 2, "no predecessor means append");
-        assert_eq!(position_after(&snapshot, Some(first), None), 1);
-        assert_eq!(position_after(&snapshot, Some(second), None), 2);
+        let index = NavigatorIndex::build(&snapshot);
         assert_eq!(
-            position_after(&snapshot, Some(Uuid::from_u128(99)), None),
+            position_after(&snapshot, &index, None, None),
+            2,
+            "no predecessor means append"
+        );
+        assert_eq!(position_after(&snapshot, &index, Some(first), None), 1);
+        assert_eq!(position_after(&snapshot, &index, Some(second), None), 2);
+        assert_eq!(
+            position_after(&snapshot, &index, Some(Uuid::from_u128(99)), None),
             2,
             "a stale after_id degrades to append rather than failing the command"
         );
@@ -1315,11 +1826,232 @@ mod tests {
         // lands one past what a same-parent `MoveNode` accepts.
         let moving: super::NodeId = Arc::from(second.to_string());
         assert_eq!(
-            position_after(&snapshot, None, Some(&moving)),
+            position_after(&snapshot, &index, None, Some(&moving)),
             1,
             "appending a repositioned entry must index into the list without it"
         );
-        assert_eq!(position_after(&snapshot, Some(first), Some(&moving)), 1);
+        assert_eq!(position_after(&snapshot, &index, Some(first), Some(&moving)), 1);
+    }
+
+    /// The entry-id parser, which is the seam the batched index hangs off: every lookup of "which
+    /// object does this navigator entry belong to" goes through it, so a wrong answer here is a
+    /// cascade that silently skips or steals an entry rather than a compile error.
+    #[test]
+    fn entry_ids_are_parsed_back_to_their_object_and_nothing_else_is() {
+        let object_id = Uuid::from_u128(7);
+        let text = object_id.to_string();
+        assert_eq!(entry_object_of(&text), Some(object_id), "the bare uuid is generation 0");
+        assert_eq!(entry_object_of(&format!("{text}#1")), Some(object_id));
+        assert_eq!(entry_object_of(&format!("{text}#42")), Some(object_id));
+
+        assert_eq!(entry_object_of(&format!("{text}#")), None, "an empty generation");
+        assert_eq!(entry_object_of(&format!("{text}#a")), None, "a non-numeric generation");
+        assert_eq!(entry_object_of(&format!("{text}x")), None, "a missing separator");
+        assert_eq!(
+            entry_object_of(&format!("{text}1")),
+            None,
+            "a digit without a separator"
+        );
+        assert_eq!(entry_object_of("block-1"), None, "a content block id is not an entry");
+        assert_eq!(entry_object_of(""), None);
+        // Not a panic: `get(..36)` on a shorter or non-char-boundary string yields `None`.
+        assert_eq!(entry_object_of("短"), None, "a multi-byte prefix must not index-slice");
+    }
+
+    /// One pass, four answers. The index is what makes the cascade linear, so each field it
+    /// reports is asserted against a snapshot whose shape makes a wrong answer visible.
+    #[test]
+    fn the_navigator_index_reports_live_entries_roots_and_parents_from_one_pass() {
+        let mut snapshot = SemanticSnapshot::default();
+        let live = Uuid::from_u128(1);
+        let tombstoned = Uuid::from_u128(2);
+        let regenerated = Uuid::from_u128(3);
+
+        snapshot.nodes.insert(Arc::from(live.to_string()), node("0000000000"));
+        let mut dead = node("0000000001");
+        dead.deleted = true;
+        snapshot.nodes.insert(Arc::from(tombstoned.to_string()), dead);
+        let mut old_generation = node("0000000002");
+        old_generation.deleted = true;
+        snapshot
+            .nodes
+            .insert(Arc::from(regenerated.to_string()), old_generation);
+        snapshot
+            .nodes
+            .insert(Arc::from(format!("{regenerated}#1")), node("0000000003"));
+        let mut child = node("0000000004");
+        child.parent = Some(Arc::from(live.to_string()));
+        snapshot.nodes.insert(Arc::from("nested-child"), child);
+
+        let index = NavigatorIndex::build(&snapshot);
+        assert_eq!(
+            index.live_entry.get(&live).map(ToString::to_string),
+            Some(live.to_string())
+        );
+        assert_eq!(
+            index.live_entry.get(&tombstoned),
+            None,
+            "a tombstone is not a live entry"
+        );
+        assert_eq!(
+            index.live_entry.get(&regenerated).map(ToString::to_string),
+            Some(format!("{regenerated}#1")),
+            "the live generation wins over the tombstoned one"
+        );
+        assert_eq!(index.live_roots, 2, "one live entry plus one live regenerated entry");
+        assert_eq!(index.live_navigator_nodes, 3, "roots plus the live nested child");
+        assert!(
+            index.parents.contains(&Arc::from(live.to_string()) as &super::NodeId),
+            "an entry with a child must be recognised as a parent, or its MoveNode skips the depth check"
+        );
+        assert!(
+            !index
+                .parents
+                .contains(&Arc::from(tombstoned.to_string()) as &super::NodeId)
+        );
+    }
+
+    /// The byte ceiling this command executes for itself, shown firing.
+    ///
+    /// It is **not** the only one behind a server-generated navigator update, and an earlier
+    /// version of this comment wrongly said it was: the same update goes on to
+    /// `isolated_apply` -> `LoroCollabEngine::import_update`, which validates
+    /// `update_bytes_max` on its first line. This one exists so the caller gets a decidable
+    /// `limit_exceeded{update_bytes}` about its own command instead of a worker rejection about an
+    /// opaque blob, and so the cheap check runs before a process is spawned.
+    ///
+    /// It cannot be reached through the command itself — `move_subtree_nodes_max` (100) refuses
+    /// first, and 100 entries is about 8 KB — which is precisely why it is exercised here at the
+    /// function boundary instead of being asserted to be unreachable.
+    ///
+    /// The **target** side is the expensive one and the one this uses: `limits-v1.md` measured
+    /// 82.6 bytes per created entry (`bytes ~ 82.6 * N - 170`, over 65,536 near N = 795), while a
+    /// removal is roughly 11 bytes per entry and would not cross the ceiling until far past any
+    /// size this command can produce. 1,000 created entries produce 80,369 bytes on this engine,
+    /// within 2.5% of the contract's model.
+    #[test]
+    fn an_oversized_navigator_update_is_refused_by_the_byte_ceiling_this_command_owns() {
+        use collab_core::{CollabEngine, LoroCollabEngine};
+
+        let objects: Vec<Uuid> = (0..1_000).map(|_| Uuid::new_v4()).collect();
+        let empty = LoroCollabEngine::new_empty(9)
+            .export_snapshot()
+            .expect("an empty navigator exports");
+        let mut engine = LoroCollabEngine::load(&empty).expect("it loads back");
+
+        let err = super::build_navigator_update(
+            &mut engine,
+            &super::NavigatorBatch {
+                primary: objects[0],
+                cascaded: &objects[1..],
+                remove: false,
+                after_id: None,
+            },
+        )
+        .map(|change| change.bytes.map(|bytes| bytes.len()))
+        .expect_err("an update past update_bytes_max must be refused, not shipped");
+        let crate::error::ApiError::Typed { kind, details, .. } = &err else {
+            panic!("expected a typed limit_exceeded, got {err:?}")
+        };
+        assert_eq!(*kind, crate::error::ApiErrorKind::LimitExceeded, "got {err:?}");
+        let details = details.clone().unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            details["limit_kind"],
+            serde_json::json!("update_bytes"),
+            "got {details}"
+        );
+        assert_eq!(details["limit"], serde_json::json!(65_536), "got {details}");
+        assert!(
+            details["observed"].as_u64().unwrap_or(0) > 65_536,
+            "the reported size must be the real one, got {details}"
+        );
+    }
+
+    /// The one branch of [`check_navigator_batch`] that is not exercised by any move a caller can
+    /// make, shown firing at the function boundary.
+    ///
+    /// `check_navigator_batch` hands a `MoveNode` to the real `collab_core::limits::check_operation`
+    /// only when the entry being moved is somebody's parent (`index.parents`). Two facts about that
+    /// branch, both worth stating because "unreachable" was not an acceptable answer for it:
+    ///
+    /// * **It runs.** Navigator documents are ordinary collab documents; nothing stops a writer
+    ///   from nesting a node under an ordering entry, and then `index.parents` is non-empty and
+    ///   the guarded call happens on every reposition of that entry.
+    /// * **It cannot *fail* on a document that satisfies `tree_depth_max`.** The operation moves
+    ///   the entry to `new_parent: None`, so `check_operation` computes
+    ///   `deepest_after_move = 0 + subtree_height(entry)`. In a valid document an entry at depth
+    ///   `d` has `d + height <= 32`, hence `height <= 32`, hence the check passes. A move to the
+    ///   root can only ever *reduce* depths.
+    ///
+    /// So it is defence in depth against a document that is **already** over the ceiling — which
+    /// is what this test builds directly, since no accepted write could produce one
+    /// (`check_snapshot` in the isolated worker enforces `tree_depth_max` on the whole document).
+    /// Building it here is the only way to make the branch falsifiable instead of leaving a line
+    /// no test can see.
+    #[test]
+    fn a_navigator_entry_carrying_an_over_deep_subtree_is_refused_by_the_batched_depth_check() {
+        use collab_core::{CollabEngine, LoroCollabEngine, Operation};
+
+        let object_id = Uuid::from_u128(11);
+        let entry: super::NodeId = Arc::from(object_id.to_string().as_str());
+        let mut engine = LoroCollabEngine::new_empty(3);
+        engine
+            .apply_operation(&Operation::CreateNode {
+                id: entry.clone(),
+                parent: None,
+                index: 0,
+                kind: NodeKind::NavigatorNode,
+            })
+            .expect("the ordering entry is created");
+        // A chain one hop deeper than `tree_depth_max`, hanging off the entry. `apply_operation`
+        // does not itself enforce `DocumentLimits` — that is `check_operation`/`check_snapshot`'s
+        // job — so this builds the invalid shape the guard exists for.
+        let mut parent = entry;
+        for depth in 1..=33u32 {
+            let child: super::NodeId = Arc::from(format!("nested-{depth}").as_str());
+            engine
+                .apply_operation(&Operation::CreateNode {
+                    id: child.clone(),
+                    parent: Some(parent.clone()),
+                    index: 0,
+                    kind: NodeKind::NavigatorNode,
+                })
+                .expect("a nested node is created");
+            parent = child;
+        }
+        let snapshot_bytes = engine.export_snapshot().expect("the document exports");
+        let mut engine = LoroCollabEngine::load(&snapshot_bytes).expect("it loads back");
+
+        let err = super::build_navigator_update(
+            &mut engine,
+            &super::NavigatorBatch {
+                primary: object_id,
+                cascaded: &[],
+                remove: false,
+                after_id: None,
+            },
+        )
+        .map(|change| change.bytes.map(|bytes| bytes.len()))
+        .expect_err("repositioning an entry that carries an over-deep subtree must be refused");
+        let crate::error::ApiError::Typed { kind, details, .. } = &err else {
+            panic!("expected a typed limit_exceeded, got {err:?}")
+        };
+        assert_eq!(*kind, crate::error::ApiErrorKind::LimitExceeded, "got {err:?}");
+        let details = details.clone().unwrap_or(serde_json::Value::Null);
+        assert_eq!(details["limit_kind"], serde_json::json!("tree_depth"), "got {details}");
+        assert_eq!(details["limit"], serde_json::json!(32), "got {details}");
+        assert_eq!(details["observed"], serde_json::json!(33), "got {details}");
+    }
+
+    /// The frozen number itself. It is a contract value, not a tuning knob: a change here without
+    /// a matching change in `limits-v1.md` is the failure this asserts against.
+    #[test]
+    fn the_subtree_ceiling_is_the_value_limits_v1_froze() {
+        assert_eq!(
+            MOVE_SUBTREE_NODES_MAX, 100,
+            "limits-v1.md froze move_subtree_nodes_max at 100 on 2026-08-31"
+        );
+        assert_eq!(super::MOVE_SUBTREE_NODES_LIMIT_KIND, "move_subtree_nodes");
     }
 }
 
@@ -2635,30 +3367,6 @@ mod database_tests {
             .map(|_| ())
     }
 
-    async fn try_create(
-        state: &AppState,
-        fx: &Fixture,
-        object_type: &str,
-        project_id: Option<Uuid>,
-        parent: Option<Uuid>,
-    ) -> Result<Uuid, ApiError> {
-        create_object(
-            state,
-            CreateObjectInput {
-                workspace_id: fx.workspace_id,
-                actor_id: fx.owner_id,
-                object_type: object_type.to_string(),
-                project_id,
-                parent_object_id: parent,
-                title: "Scope Fixture".to_string(),
-                idempotency_key: Uuid::new_v4().to_string(),
-                message: None,
-            },
-        )
-        .await
-        .map(|accepted| accepted.object.id)
-    }
-
     /// Writes a `flow_objects` row straight through, bypassing `create_object`. Used to build the
     /// pre-`0056` shapes the constraint is supposed to make impossible.
     async fn try_insert_raw(
@@ -2784,180 +3492,795 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
-    /// The write path answers the same rule with a decidable error rather than letting the
-    /// foreign key surface as a 500, and writes nothing when it refuses.
+    // -----------------------------------------------------------------------------------------
+    // 8. The cascade (`ADR-0013` §2.2 R17 step two).
+    // -----------------------------------------------------------------------------------------
+
+    /// A three-level subtree crossing a project boundary: **every** descendant's `project_id`
+    /// becomes the target's, and **every** descendant's ordering entry ends up in the target
+    /// navigator with nothing left behind in the source one.
+    ///
+    /// The move is made in both directions on purpose. `create_object` does not write navigator
+    /// ordering entries — only a move does — so the first leg is what materialises the subtree's
+    /// entries at all, and the second leg is the only way to assert the *removal* half against
+    /// entries that really exist. A one-way test would assert "the old navigator is empty" against
+    /// a navigator that was empty to begin with, which is the vacuous-truth shape this suite is
+    /// supposed to avoid.
     #[tokio::test]
-    async fn create_object_refuses_a_parent_in_a_different_project_scope() {
-        let scratch = scratch_or_skip!("scope_create");
-        let state = state_for(scratch.db.clone());
-        let fx = seed_workspace(&scratch.db).await;
-
-        let root_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
-        let root_unprojected = create(&state, &fx, "navigator", None, None).await;
-        let before_objects = scalar_i64(
-            &scratch.db,
-            "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
-            vec![fx.workspace_id.into()],
-        )
-        .await;
-        let before_events = scalar_i64(
-            &scratch.db,
-            "SELECT count(*)::bigint AS value FROM business_events \
-             WHERE workspace_id = $1 AND event_type = 'flow.object.created'",
-            vec![fx.workspace_id.into()],
-        )
-        .await;
-
-        for (project, parent, label) in [
-            (Some(fx.project_b), root_a, "a child in a different project"),
-            (None, root_a, "an unprojected child of a projected parent"),
-            (
-                Some(fx.project_a),
-                root_unprojected,
-                "a projected child of an unprojected parent",
-            ),
-        ] {
-            let err = match try_create(&state, &fx, "page", project, Some(parent)).await {
-                Ok(id) => panic!("{label} must be refused, but object {id} was created"),
-                Err(err) => err,
-            };
-            assert_eq!(
-                err.kind(),
-                ApiErrorKind::InvalidUpdate,
-                "{label} must be a decidable invalid_update, not a database 500: {err:?}"
-            );
-            assert_eq!(
-                reason_of(&err).as_deref(),
-                Some(crate::flow::command::CHILD_PROJECT_MUST_MATCH_PARENT),
-                "{label}: {err:?}"
-            );
-        }
-
-        // The refusals wrote nothing: no object row, no document, no projection, no event.
-        assert_eq!(
-            scalar_i64(
-                &scratch.db,
-                "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
-                vec![fx.workspace_id.into()],
-            )
-            .await,
-            before_objects,
-            "a refused create must not leave a flow_objects row behind"
-        );
-        assert_eq!(
-            scalar_i64(
-                &scratch.db,
-                "SELECT count(*)::bigint AS value FROM business_events \
-                 WHERE workspace_id = $1 AND event_type = 'flow.object.created'",
-                vec![fx.workspace_id.into()],
-            )
-            .await,
-            before_events,
-            "a refused create must not emit flow.object.created"
-        );
-        assert_eq!(scope_violation_count(&scratch.db).await, 0);
-
-        // The three legal shapes still work, so the check is a rule and not a blanket refusal.
-        let same = try_create(&state, &fx, "page", Some(fx.project_a), Some(root_a))
-            .await
-            .expect("a child in its parent's project is legal");
-        assert_eq!(project_of(&scratch.db, same).await, Some(fx.project_a));
-        let unprojected = try_create(&state, &fx, "page", None, Some(root_unprojected))
-            .await
-            .expect("an unprojected child of an unprojected parent is legal");
-        assert_eq!(project_of(&scratch.db, unprojected).await, None);
-        let root = try_create(&state, &fx, "page", Some(fx.project_b), None)
-            .await
-            .expect("a root has no parent to agree with");
-        assert_eq!(project_of(&scratch.db, root).await, Some(fx.project_b));
-
-        scratch.drop_self().await;
-    }
-
-    /// The transitional fail-closed rule: until `limits-v1.md`'s `move_subtree_nodes_max` is
-    /// frozen, `move_object` refuses any move that would leave the subtree spanning more than one
-    /// project scope, with the reason code `ADR-0013` §2.2 R17 names.
-    #[tokio::test]
-    async fn move_object_fails_closed_on_a_subtree_that_would_span_project_scopes() {
-        let scratch = scratch_or_skip!("scope_failclosed");
+    async fn a_cross_project_move_cascades_the_whole_subtree_into_the_target_navigator() {
+        let scratch = scratch_or_skip!("cascade_subtree");
         let state = state_for(scratch.db.clone());
         let collab = CollabRuntime::default();
         let fx = seed_workspace(&scratch.db).await;
 
         let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
         let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
-        let parent = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
-        let child = create(&state, &fx, "page", Some(fx.project_a), Some(parent)).await;
-        let leaf = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let root = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let child = create(&state, &fx, "page", Some(fx.project_a), Some(root)).await;
+        let grandchild = create(&state, &fx, "page", Some(fx.project_a), Some(child)).await;
+        // Never part of the subtree: it shares the source scope and must not be dragged along.
+        let bystander = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
 
         let doc_a = document_of(&scratch.db, nav_a).await;
         let doc_b = document_of(&scratch.db, nav_b).await;
-        let before = (
-            head_seq(&scratch.db, doc_a).await,
-            head_seq(&scratch.db, doc_b).await,
-            moved_event_count(&scratch.db, fx.workspace_id).await,
-            epoch_of(&scratch.db, fx.workspace_id).await,
+
+        let change = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("a subtree may cross a project boundary now that the cascade exists");
+
+        let result = command_result(&change);
+        assert_eq!(result["cascaded"], json!(true));
+        assert_eq!(
+            result["cascaded_node_count"],
+            json!(3),
+            "the root and both descendants, not just the root"
+        );
+        assert_eq!(
+            uuid_list(&result["contended_existing_document_set"]),
+            ascending_document_lock_order(&[doc_a, doc_b]),
+            "a cascade still contends exactly two navigator documents, whatever the subtree's size"
+        );
+        for object_id in [root, child, grandchild] {
+            assert!(
+                change.affected_object_ids.contains(&object_id),
+                "every cascaded object is an affected object; {object_id} was not reported"
+            );
+        }
+
+        // `events-v1.md` (2026-08-31 裁定): the cascade is recorded in the **envelope**, because
+        // the frozen payload names only the object that was asked to move. Asserted as an exact
+        // set, not with `contains` and not by length: a `contains` loop cannot see a stray extra
+        // member, and a length check cannot see a swap.
+        let mut rewritten_rows = vec![root, child, grandchild];
+        rewritten_rows.sort();
+        assert_eq!(
+            affected_object_ids_of_event(&scratch.db, change.event_id).await,
+            rewritten_rows,
+            "the moved event's envelope must name exactly the flow_objects rows this command \
+             rewrote — the moved object and every cascaded descendant. The two navigator objects \
+             are not among them: their governance rows were untouched and their head advances are \
+             already recorded by their own flow.content.accepted events"
         );
 
-        // A subtree with descendants cannot cross a project boundary today: cascading is step two
-        // of the ruling and its node ceiling is not frozen.
+        // The governance columns: every descendant now sits in the target scope, and the shape of
+        // the subtree itself is untouched.
+        for object_id in [root, child, grandchild] {
+            assert_eq!(
+                project_of(&scratch.db, object_id).await,
+                Some(fx.project_b),
+                "the cascade must rewrite every descendant's project_id, not only the moved object's"
+            );
+        }
+        assert_eq!(parent_of(&scratch.db, root).await, Some(nav_b));
+        assert_eq!(
+            parent_of(&scratch.db, child).await,
+            Some(root),
+            "the subtree keeps its shape"
+        );
+        assert_eq!(parent_of(&scratch.db, grandchild).await, Some(child));
+        assert_eq!(
+            project_of(&scratch.db, bystander).await,
+            Some(fx.project_a),
+            "an object outside the subtree is not cascaded"
+        );
+        assert_eq!(
+            scope_violation_count(&scratch.db).await,
+            0,
+            "the cascade must land on the invariant, not merely avoid the constraint"
+        );
+
+        // The ordering entries: all three in the target navigator, none in the source one, and in
+        // a *specified* order rather than merely present as a set. The moved object's entry goes
+        // where `after_id` says (here: appended, since nothing was asked for), and the cascaded
+        // entries follow it in the order the cascade appends them, which is ascending `id` because
+        // that is the order `repository::subtree_nodes` returns. Asserting the set alone would
+        // leave the append-index bookkeeping in `build_navigator_update` unfalsifiable — every
+        // entry would still exist if all N creates landed on the same index.
+        let mut cascaded_in_order = vec![child, grandchild];
+        cascaded_in_order.sort();
+        let expected_order: Vec<Uuid> = std::iter::once(root).chain(cascaded_in_order).collect();
+        assert_eq!(
+            navigator_order(&scratch.db, nav_b).await,
+            expected_order,
+            "every cascaded object's ordering entry must be in the target navigator, in the order              the cascade appends them"
+        );
+        let mut expected = expected_order.clone();
+        expected.sort();
+        assert_eq!(
+            navigator_order(&scratch.db, nav_a).await,
+            Vec::<Uuid>::new(),
+            "and the source navigator must hold none of them"
+        );
+
+        // ---- back again: this leg is the one that exercises the removal half ----
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_a })),
+        )
+        .await
+        .expect("the same subtree moves back");
+
+        for object_id in [root, child, grandchild] {
+            assert_eq!(project_of(&scratch.db, object_id).await, Some(fx.project_a));
+        }
+        assert_eq!(
+            navigator_order(&scratch.db, nav_a).await,
+            expected_order,
+            "the whole subtree's entries came back, in the same specified order"
+        );
+        let mut back_home = navigator_order(&scratch.db, nav_a).await;
+        back_home.sort();
+        assert_eq!(back_home, expected, "and as a set, none lost and none invented");
+        assert_eq!(
+            navigator_order(&scratch.db, nav_b).await,
+            Vec::<Uuid>::new(),
+            "and every entry left the navigator the subtree left — one entry per cascaded node, \
+             not just the moved object's"
+        );
+        scratch.drop_self().await;
+    }
+
+    /// Cascaded entries arrive in the target navigator in the order they had in the **source**
+    /// navigator, not in any order this code re-derives.
+    ///
+    /// `rest-api-v1.md` (2026-08-31 裁定): "`after_id` 只定位被移动对象本身……被级联的后代之间，
+    /// 必须保持它们在源 navigator 里的相对顺序". That order is visible to whoever is looking at
+    /// the tree, so re-deriving it would silently reshuffle a subtree nobody asked to reshuffle.
+    ///
+    /// **The fixture deliberately makes the source order disagree with ascending `id`.** If it did
+    /// not, this assertion would be vacuously true against the ascending-`id` order the cascade
+    /// starts from, and the whole ordering rule could be deleted with every test still green —
+    /// which is exactly the trap the set-only assertion in
+    /// `a_cross_project_move_cascades_the_whole_subtree_into_the_target_navigator` fell into
+    /// before it was tightened.
+    #[tokio::test]
+    async fn cascaded_entries_keep_the_relative_order_they_had_in_the_source_navigator() {
+        let scratch = scratch_or_skip!("cascade_order");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let root = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let mut children = Vec::new();
+        for _ in 0..3 {
+            children.push(create(&state, &fx, "page", Some(fx.project_a), Some(root)).await);
+        }
+        children.sort();
+        let (low, middle, high) = (children[0], children[1], children[2]);
+
+        // Leg one materialises the entries. Nothing was ordered before, so they land in ascending
+        // `id` — the cascade's fallback order, and the order this test must go on to disturb.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("the subtree moves into B");
+        assert_eq!(
+            navigator_order(&scratch.db, nav_b).await,
+            vec![root, low, middle, high],
+            "setup precondition: the first cascade appends in ascending id"
+        );
+
+        // Now disturb it, through the real command: a **same-scope** re-parent of `high` under the
+        // parent it already has, positioned right after `root`. Same scope means no cascade, so
+        // this repositions exactly one entry and touches nothing else.
+        let reorder = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(
+                high,
+                fx.owner_id,
+                "owner",
+                json!({ "target_object_id": root, "after_id": root }),
+            ),
+        )
+        .await
+        .expect("a same-scope reposition is an ordinary move");
+        assert_eq!(
+            command_result(&reorder)["cascaded"],
+            json!(false),
+            "a same-scope move must not cascade, or this fixture is measuring the wrong thing"
+        );
+        assert_eq!(
+            affected_object_ids_of_event(&scratch.db, reorder.event_id).await,
+            vec![high],
+            "a non-cascading move rewrote exactly one row, so its envelope names exactly one object"
+        );
+
+        let source_order = navigator_order(&scratch.db, nav_b).await;
+        assert_eq!(
+            source_order,
+            vec![root, high, low, middle],
+            "the fixture's chosen order"
+        );
+        let source_descendants: Vec<Uuid> = source_order.iter().copied().filter(|id| *id != root).collect();
+        assert_ne!(
+            source_descendants,
+            vec![low, middle, high],
+            "the fixture must disagree with ascending id, or the assertion below is vacuous"
+        );
+
+        // Leg two: the cascade has to reproduce that order, not re-derive one.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_a })),
+        )
+        .await
+        .expect("the subtree moves back to A");
+        assert_eq!(
+            navigator_order(&scratch.db, nav_a).await,
+            source_order,
+            "the cascaded entries must arrive in the order they had in the source navigator; \
+             ascending id would have produced [root, low, middle, high]"
+        );
+        assert_eq!(navigator_order(&scratch.db, nav_b).await, Vec::<Uuid>::new());
+        scratch.drop_self().await;
+    }
+
+    /// An archived descendant is still a subtree member, and the cascade has to take it along.
+    ///
+    /// `archive` is a pure `lifecycle_status` flip — it leaves `parent_id` and `project_id` exactly
+    /// where they were — so an archived page still sits under its parent and
+    /// `flow_objects_parent_project_fk` still holds it to its parent's scope. An implementation
+    /// that cascaded only the active rows would fail the constraint on its own `UPDATE`, which is
+    /// what this asserts: not "archived rows are handled gracefully" but "the whole subtree really
+    /// is the whole subtree".
+    #[tokio::test]
+    async fn the_cascade_carries_archived_descendants_because_the_constraint_still_holds_them() {
+        let scratch = scratch_or_skip!("cascade_archived");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let root = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let child = create(&state, &fx, "page", Some(fx.project_a), Some(root)).await;
+        let archived = create(&state, &fx, "page", Some(fx.project_a), Some(child)).await;
+
+        // The same write `flow::command`'s `archive` command makes: status and timestamp only.
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET lifecycle_status = 'archived', archived_at = now() WHERE id = $1",
+            vec![archived.into()],
+        )
+        .await;
+
+        let change = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("a subtree containing an archived page still moves");
+        assert_eq!(
+            command_result(&change)["cascaded_node_count"],
+            json!(3),
+            "the archived page is counted, because the constraint counts it"
+        );
+        assert_eq!(
+            project_of(&scratch.db, archived).await,
+            Some(fx.project_b),
+            "an archived descendant's project_id must travel with its parent, or the composite \
+             foreign key would have refused the whole statement"
+        );
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM flow_objects \
+                  WHERE id = $1 AND lifecycle_status = 'archived'",
+                vec![archived.into()],
+            )
+            .await,
+            1,
+            "and the cascade must not resurrect it"
+        );
+        assert_eq!(scope_violation_count(&scratch.db).await, 0);
+        scratch.drop_self().await;
+    }
+
+    /// `affected_object_ids` must not repeat an object, and the case that repeats one is a real
+    /// request shape rather than a hypothetical: **moving to a navigator root**.
+    ///
+    /// The response list is assembled as `[object_id, target_object_id]` ++ the contended
+    /// navigators (ascending `id`, from `derive_contended_set`) ++ the cascaded descendants. When
+    /// `target_object_id` *is* one of those navigators — which is exactly what "move this page to
+    /// the top level of that project" means (`rest-api-v1.md`: "顶层移动即
+    /// `target_object_id = root_object_id`") — it occupies two slots. They are adjacent only when
+    /// the target happens to be the **smaller** of the two navigator uuids; when it is the larger
+    /// one the other navigator sits between the two copies, and `Vec::dedup`, which only collapses
+    /// *consecutive* equal elements, leaves the duplicate in.
+    ///
+    /// So the fixture picks the larger uuid on purpose and asserts the precondition, because a
+    /// coin-flip fixture would pass against the broken implementation half the time.
+    #[tokio::test]
+    async fn moving_to_a_navigator_root_does_not_report_that_navigator_twice() {
+        let scratch = scratch_or_skip!("affected_dedup");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        // The move's target is whichever navigator has the *larger* uuid, so that after
+        // `derive_contended_set` sorts the pair ascending, the target's two occurrences in the
+        // assembled list are separated by the other navigator.
+        let (target_nav, other_nav, other_project) = if nav_a > nav_b {
+            (nav_a, nav_b, fx.project_b)
+        } else {
+            (nav_b, nav_a, fx.project_a)
+        };
+        assert!(
+            target_nav > other_nav,
+            "fixture precondition: the target must be the larger uuid, or the two copies are \
+             adjacent and Vec::dedup would collapse them by luck"
+        );
+        let page = create(&state, &fx, "page", Some(other_project), Some(other_nav)).await;
+
+        let change = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": target_nav })),
+        )
+        .await
+        .expect("moving a page to a navigator root is an ordinary cross-project move");
+
+        assert_eq!(
+            change.affected_object_ids,
+            vec![page, target_nav, other_nav],
+            "the moved object, its target, and the other contended navigator — each exactly once, \
+             in first-occurrence order"
+        );
+        let mut unique = change.affected_object_ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            change.affected_object_ids.len(),
+            "affected_object_ids must not repeat an object; got {:?}",
+            change.affected_object_ids
+        );
+        scratch.drop_self().await;
+    }
+
+    /// `move_subtree_nodes_max`, on both sides of its frozen value: 100 nodes commit, 101 are
+    /// refused with the contract's exact `limit_exceeded` shape and **zero** observable effect.
+    ///
+    /// The refusal half is the one that has to be airtight, so it is asserted against a full
+    /// before/after census: both navigator heads, both `collab_updates` counts, the epoch, the
+    /// `flow.object.moved` count, the `event_dispatch` count, and every subtree row's
+    /// `parent_id`/`project_id`.
+    #[tokio::test]
+    async fn the_subtree_ceiling_admits_one_hundred_nodes_and_refuses_one_hundred_and_one() {
+        let scratch = scratch_or_skip!("cascade_ceiling");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let doc_a = document_of(&scratch.db, nav_a).await;
+        let doc_b = document_of(&scratch.db, nav_b).await;
+
+        // Exactly `MOVE_SUBTREE_NODES_MAX` nodes: the root plus 99 children, kept wide rather than
+        // deep so `tree_depth_max` (32) is not what refuses.
+        let root = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let mut subtree = vec![root];
+        for _ in 1..super::MOVE_SUBTREE_NODES_MAX {
+            subtree.push(create(&state, &fx, "page", Some(fx.project_a), Some(root)).await);
+        }
+        assert_eq!(subtree.len(), super::MOVE_SUBTREE_NODES_MAX);
+
+        let started = std::time::Instant::now();
+        let change = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect(
+            "the frozen ceiling is an inclusive maximum: a subtree of exactly move_subtree_nodes_max \
+             nodes must commit, and must not be aborted by the locked phase's statement or lock \
+             timeout budgets",
+        );
+        // `limits-v1.md`'s `per_host_authority` ruling: the frozen 12.21 ms in-lock hold is a
+        // design figure, not a per-host pass criterion — this host's own run-to-run spread (2.8x)
+        // is wider than the value's headroom (2.05x), so a hard `p95 < 25 ms` assertion here would
+        // be flaky by construction. What *is* asserted is the thing the ruling says a slow host
+        // must show: the command either completes or fails closed, never half-commits. The number
+        // is recorded rather than judged.
+        eprintln!(
+            "measured: N={} cascade, end-to-end request span {:.2} ms (in-lock hold is a strict \
+             subset of this; not a pass criterion, see limits-v1.md per_host_authority)",
+            super::MOVE_SUBTREE_NODES_MAX,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        assert_eq!(command_result(&change)["cascaded_node_count"], json!(100));
+        for object_id in &subtree {
+            assert_eq!(project_of(&scratch.db, *object_id).await, Some(fx.project_b));
+        }
+
+        // One more node, and the same move back is over the ceiling.
+        let one_too_many = create(&state, &fx, "page", Some(fx.project_b), Some(root)).await;
+        subtree.push(one_too_many);
+        assert_eq!(subtree.len(), super::MOVE_SUBTREE_NODES_MAX + 1);
+
+        let before = census(&scratch.db, &fx, doc_a, doc_b).await;
+        let mut before_rows = Vec::with_capacity(subtree.len());
+        for object_id in &subtree {
+            before_rows.push((
+                parent_of(&scratch.db, *object_id).await,
+                project_of(&scratch.db, *object_id).await,
+            ));
+        }
+
         let err = run_move(
             &state,
             &collab,
             &fx,
-            &move_input(parent, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_a })),
         )
         .await
-        .expect_err("a subtree cannot cross a project boundary before the cascade exists");
-        assert_eq!(err.kind(), ApiErrorKind::InvalidUpdate, "got {err:?}");
+        .expect_err("one node past the frozen ceiling must be refused");
+        eprintln!("over-ceiling refusal: {err:?}");
+        assert_eq!(err.kind(), ApiErrorKind::LimitExceeded, "got {err:?}");
+        let ApiError::Typed { details, .. } = &err else {
+            panic!("a limit_exceeded refusal must be a typed error carrying details; got {err:?}")
+        };
+        let details = details.clone().unwrap_or(Value::Null);
+        assert_eq!(details["limit_kind"], json!("move_subtree_nodes"), "got {details}");
+        assert_eq!(details["limit"], json!(100), "got {details}");
         assert_eq!(
-            reason_of(&err).as_deref(),
-            Some(super::SUBTREE_SPANS_MULTIPLE_PROJECTS),
-            "the refusal must carry the reason code ADR-0013 s2.2 R17 names, got {err:?}"
+            details["observed"],
+            json!(101),
+            "`observed` must be the subtree's real size, not the ceiling read back; got {details}"
         );
 
-        // Zero change: no re-parent, no head advance, no event, no epoch bump.
-        assert_eq!(parent_of(&scratch.db, parent).await, Some(nav_a), "nothing moved");
-        assert_eq!(project_of(&scratch.db, parent).await, Some(fx.project_a));
-        assert_eq!(parent_of(&scratch.db, child).await, Some(parent), "no partial cascade");
-        assert_eq!(project_of(&scratch.db, child).await, Some(fx.project_a));
         assert_eq!(
-            (
-                head_seq(&scratch.db, doc_a).await,
-                head_seq(&scratch.db, doc_b).await,
-                moved_event_count(&scratch.db, fx.workspace_id).await,
-                epoch_of(&scratch.db, fx.workspace_id).await,
-            ),
+            census(&scratch.db, &fx, doc_a, doc_b).await,
             before,
-            "the refusal must leave both navigators, the event log and the epoch untouched"
+            "a limit_exceeded refusal must leave both navigator heads, both update logs, the epoch, \
+             the move events and the dispatch rows exactly as they were"
         );
-        assert_eq!(update_count(&scratch.db, doc_a).await, 0);
-        assert_eq!(update_count(&scratch.db, doc_b).await, 0);
-
-        // The same subtree moved *within* its own scope is unaffected: the rule is about spanning
-        // scopes, not about having descendants.
-        run_move(
-            &state,
-            &collab,
-            &fx,
-            &move_input(parent, fx.owner_id, "owner", json!({ "target_object_id": leaf })),
-        )
-        .await
-        .expect("a same-scope move of a subtree is still allowed");
-        assert_eq!(parent_of(&scratch.db, parent).await, Some(leaf));
-
-        // And a childless object still crosses freely — one node, one scope, two navigators.
-        let single = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
-        run_move(
-            &state,
-            &collab,
-            &fx,
-            &move_input(single, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
-        )
-        .await
-        .expect("a leaf crossing a project boundary is the case the cascade is not needed for");
-        assert_eq!(project_of(&scratch.db, single).await, Some(fx.project_b));
+        for (object_id, was) in subtree.iter().zip(before_rows) {
+            assert_eq!(
+                (
+                    parent_of(&scratch.db, *object_id).await,
+                    project_of(&scratch.db, *object_id).await
+                ),
+                was,
+                "and not one PG row of the subtree may have changed"
+            );
+        }
         scratch.drop_self().await;
+    }
+
+    /// Atomicity of the cascade, on the one path that is actually falsifiable.
+    ///
+    /// A trigger fault aborts the `PostgreSQL` transaction outright, so `COMMIT` and `ROLLBACK`
+    /// become the same thing and such a test cannot tell a correct implementation from a broken
+    /// one (that limitation is already recorded on
+    /// `a_failure_at_the_last_write_leaves_no_trace_of_the_move`). This one uses an
+    /// **application-level** refusal instead — `ADR-0012` §4.1's unconfirmed self-lockout — which
+    /// is raised *after* the two navigator writes and after the whole cascade `UPDATE` have
+    /// already been staged, on a transaction `PostgreSQL` considers perfectly healthy. Only
+    /// `move_object`'s own rollback can undo it.
+    #[tokio::test]
+    async fn a_cascade_refused_after_it_has_written_rolls_every_descendant_back() {
+        let scratch = scratch_or_skip!("cascade_atomicity");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let open_parent = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let closed_parent = create(&state, &fx, "page", Some(fx.project_b), Some(nav_b)).await;
+        let root = create(&state, &fx, "page", Some(fx.project_a), Some(open_parent)).await;
+        let child = create(&state, &fx, "page", Some(fx.project_a), Some(root)).await;
+        let grandchild = create(&state, &fx, "page", Some(fx.project_a), Some(child)).await;
+
+        // The member reaches the subtree with `full_access` only through the *old* parent, and the
+        // target sits behind a boundary where they hold `edit`. Moving is therefore allowed on
+        // both sides of `ADR-0012` §4 and self-locking on §4.1.
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![closed_parent.into()],
+        )
+        .await;
+        for (object_id, level) in [(open_parent, "full_access"), (closed_parent, "edit")] {
+            exec(
+                &scratch.db,
+                "INSERT INTO flow_object_grants (workspace_id, object_id, principal_kind, principal_id, level) \
+                 VALUES ($1, $2, 'user', $3, $4)",
+                vec![
+                    fx.workspace_id.into(),
+                    object_id.into(),
+                    fx.member_id.into(),
+                    level.into(),
+                ],
+            )
+            .await;
+        }
+
+        let doc_a = document_of(&scratch.db, nav_a).await;
+        let doc_b = document_of(&scratch.db, nav_b).await;
+        let before = census(&scratch.db, &fx, doc_a, doc_b).await;
+        let mut before_rows = Vec::new();
+        for object_id in [root, child, grandchild] {
+            before_rows.push((
+                parent_of(&scratch.db, object_id).await,
+                project_of(&scratch.db, object_id).await,
+            ));
+        }
+
+        let err = run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(
+                root,
+                fx.member_id,
+                "member",
+                json!({ "target_object_id": closed_parent }),
+            ),
+        )
+        .await
+        .expect_err("an unconfirmed self-lockout must refuse the whole cascade");
+        eprintln!("post-write application refusal: {err:?}");
+        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "got {err:?}");
+
+        assert_eq!(
+            census(&scratch.db, &fx, doc_a, doc_b).await,
+            before,
+            "the refusal happens after both navigator writes and after the cascade UPDATE, on a \
+             healthy transaction — heads, update logs, epoch, events and dispatch must all be back"
+        );
+        for (object_id, was) in [root, child, grandchild].into_iter().zip(before_rows) {
+            assert_eq!(
+                (
+                    parent_of(&scratch.db, object_id).await,
+                    project_of(&scratch.db, object_id).await
+                ),
+                was,
+                "every descendant's parent_id and project_id must be back where they were"
+            );
+        }
+        assert_eq!(navigator_order(&scratch.db, nav_b).await, Vec::<Uuid>::new());
+
+        // Confirmed, the identical command commits — the rollback left nothing wedged, and the
+        // cascade really was the thing that got rolled back.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(
+                root,
+                fx.member_id,
+                "member",
+                json!({ "target_object_id": closed_parent, "confirm_self_lockout": true }),
+            ),
+        )
+        .await
+        .expect("with the lockout confirmed the same cascade commits");
+        for object_id in [root, child, grandchild] {
+            assert_eq!(project_of(&scratch.db, object_id).await, Some(fx.project_b));
+        }
+        scratch.drop_self().await;
+    }
+
+    /// `limits-v1.md`'s `move_subtree_nodes_max` `tombstone_interaction`: "级联把
+    /// `navigator_tombstones` 的增长从「每命令 1 个」变成「每命令 N 个」... v0.5 强制的
+    /// `navigator_tombstone_growth_measured` 取样口径应覆盖级联命令".
+    ///
+    /// So this samples the three fields that gate names — `live_entry_count`, `tombstone_count`,
+    /// `snapshot_bytes` — on a command that really does cascade, and asserts the growth is `N` and
+    /// not 1. A sample taken only on single-node moves would report 1 and be wrong by a factor of
+    /// the subtree's size.
+    #[tokio::test]
+    async fn navigator_tombstone_growth_is_measured_on_a_cascading_command() {
+        let scratch = scratch_or_skip!("cascade_tombstones");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let root = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let child = create(&state, &fx, "page", Some(fx.project_a), Some(root)).await;
+        let grandchild = create(&state, &fx, "page", Some(fx.project_a), Some(child)).await;
+        let cascaded = 3usize;
+        let _ = grandchild;
+
+        // Leg one materialises three entries in B. Nothing is removed yet, so no tombstone exists
+        // anywhere and the "growth" measured on leg two cannot be inherited from setup.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("the subtree moves into B");
+        let b_before = navigator_census(&scratch.db, nav_b).await;
+        let a_before = navigator_census(&scratch.db, nav_a).await;
+        assert_eq!(b_before.live_entry_count, cascaded);
+        assert_eq!(b_before.tombstone_count, 0, "no removal has happened yet");
+
+        // Leg two removes all three from B in **one command**.
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_a })),
+        )
+        .await
+        .expect("the subtree moves back to A");
+        let b_after = navigator_census(&scratch.db, nav_b).await;
+        let a_after = navigator_census(&scratch.db, nav_a).await;
+        eprintln!(
+            "measured navigator_tombstone_growth (cascading command, N={cascaded}): \
+             source live_entry_count {} -> {}, tombstone_count {} -> {}, snapshot_bytes {} -> {}; \
+             target live_entry_count {} -> {}, tombstone_count {} -> {}, snapshot_bytes {} -> {}",
+            b_before.live_entry_count,
+            b_after.live_entry_count,
+            b_before.tombstone_count,
+            b_after.tombstone_count,
+            b_before.snapshot_bytes,
+            b_after.snapshot_bytes,
+            a_before.live_entry_count,
+            a_after.live_entry_count,
+            a_before.tombstone_count,
+            a_after.tombstone_count,
+            a_before.snapshot_bytes,
+            a_after.snapshot_bytes,
+        );
+
+        assert_eq!(
+            b_after.tombstone_count - b_before.tombstone_count,
+            cascaded,
+            "one command removed N entries, so it left N tombstones — the per-command growth the \
+             contract says the sampling must cover is N, not 1"
+        );
+        assert_eq!(b_after.live_entry_count, 0);
+        assert_eq!(a_after.live_entry_count, cascaded);
+        assert_eq!(
+            a_after.tombstone_count, 0,
+            "the receiving navigator gains entries, not tombstones"
+        );
+        for (label, bytes) in [("source", b_after.snapshot_bytes), ("target", a_after.snapshot_bytes)] {
+            assert!(
+                bytes > 0,
+                "snapshot_bytes must be a real measurement on the {label} navigator, not a default \
+                 zero the gate would read as a missing field"
+            );
+        }
+        scratch.drop_self().await;
+    }
+
+    /// The envelope's `metadata.affected_object_ids[]`, read off the committed `business_events`
+    /// row rather than off anything the command reported about itself.
+    async fn affected_object_ids_of_event(db: &DatabaseConnection, event_id: Uuid) -> Vec<Uuid> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            metadata: Value,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT metadata FROM business_events WHERE id = $1",
+            vec![event_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("query runs")
+        .expect("the event exists");
+        row.metadata["affected_object_ids"]
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the flow.object.moved envelope must carry affected_object_ids; got {}",
+                    row.metadata
+                )
+            })
+            .iter()
+            .map(|value| Uuid::parse_str(value.as_str().expect("uuid string")).expect("uuid"))
+            .collect()
+    }
+
+    /// Every observable a refused move must leave untouched, in one comparable tuple.
+    async fn census(
+        db: &DatabaseConnection,
+        fx: &Fixture,
+        doc_a: Uuid,
+        doc_b: Uuid,
+    ) -> (i64, i64, i64, i64, i64, i64, i64) {
+        (
+            head_seq(db, doc_a).await,
+            head_seq(db, doc_b).await,
+            update_count(db, doc_a).await,
+            update_count(db, doc_b).await,
+            epoch_of(db, fx.workspace_id).await,
+            moved_event_count(db, fx.workspace_id).await,
+            scalar_i64(db, "SELECT count(*)::bigint AS value FROM event_dispatch", vec![]).await,
+        )
+    }
+
+    struct NavigatorCensus {
+        live_entry_count: usize,
+        tombstone_count: usize,
+        snapshot_bytes: i64,
+    }
+
+    /// The three fields `navigator_tombstone_growth_measured` names, read out of the committed
+    /// projection and the document row rather than out of anything this command reported about
+    /// itself.
+    async fn navigator_census(db: &DatabaseConnection, navigator_object_id: Uuid) -> NavigatorCensus {
+        #[derive(FromQueryResult)]
+        struct Row {
+            state: Value,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT state FROM flow_object_projections WHERE object_id = $1",
+            vec![navigator_object_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("query runs")
+        .expect("projection exists");
+        let nodes = row.state["nodes"].as_object().expect("state has a nodes map").clone();
+        let live_entry_count = nodes.values().filter(|node| node["deleted"] == json!(false)).count();
+        let tombstone_count = nodes.values().filter(|node| node["deleted"] == json!(true)).count();
+        let snapshot_bytes = scalar_i64(
+            db,
+            "SELECT octet_length(cd.snapshot)::bigint AS value FROM collab_documents cd WHERE cd.object_id = $1",
+            vec![navigator_object_id.into()],
+        )
+        .await;
+        NavigatorCensus {
+            live_entry_count,
+            tombstone_count,
+            snapshot_bytes,
+        }
     }
 
     /// Defence in depth: the same refusal on data that already violates the invariant, i.e. rows

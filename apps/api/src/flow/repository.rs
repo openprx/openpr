@@ -1055,23 +1055,166 @@ pub async fn project_scope_violation_count<C: ConnectionTrait>(conn: &C) -> Resu
     Ok(row.map_or(0, |r| r.violations))
 }
 
-/// Rewrites the two governance columns a cross-parent move owns, in one parameterized statement.
+/// The moved object and every descendant of it, ascending `id`, plus the **true** total.
 ///
-/// `project_id` moves with `parent_id` because the object's scope *is* its parent's scope; keeping
-/// the old value would leave the object listed under a navigator whose subtree it is no longer in.
-pub async fn set_object_parent<C: ConnectionTrait>(
+/// `ids` is truncated to `id_limit` rows; `total` is not. That asymmetry is the point: a subtree
+/// past `move_subtree_nodes_max` must be refused with its real size in `details.observed`, and a
+/// plain `LIMIT` would report the cap back as if it were the measurement. `count(*) OVER ()` is
+/// evaluated before `LIMIT` in `PostgreSQL`, so one statement gives both.
+///
+/// Same recursion and same `probe_depth` termination as [`subtree_height`] and
+/// [`descendant_project_scopes`], for the same reason: a corrupted `parent_id` cycle below the
+/// object must end the query rather than spin.
+pub async fn subtree_nodes<C: ConnectionTrait>(
     conn: &C,
+    workspace_id: Uuid,
     object_id: Uuid,
-    parent_id: Uuid,
-    project_id: Option<Uuid>,
-    updated_by: Uuid,
-) -> Result<(), ApiError> {
-    conn.execute(Statement::from_sql_and_values(
+    probe_depth: i64,
+    id_limit: i64,
+) -> Result<SubtreeNodes, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        id: Uuid,
+        total: i64,
+    }
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "UPDATE flow_objects SET parent_id = $2, project_id = $3, updated_at = now(), updated_by = $4 \
-         WHERE id = $1",
-        vec![object_id.into(), parent_id.into(), project_id.into(), updated_by.into()],
+        "WITH RECURSIVE subtree AS ( \
+             SELECT o.id, 0 AS depth FROM flow_objects o \
+              WHERE o.id = $1 AND o.workspace_id = $2 \
+             UNION ALL \
+             SELECT c.id, s.depth + 1 FROM subtree s \
+               JOIN flow_objects c ON c.parent_id = s.id AND c.workspace_id = $2 \
+              WHERE s.depth < $3::int \
+         ) \
+         SELECT s.id, count(*) OVER ()::bigint AS total FROM subtree s ORDER BY s.id LIMIT $4",
+        vec![
+            object_id.into(),
+            workspace_id.into(),
+            probe_depth.into(),
+            id_limit.into(),
+        ],
     ))
+    .all(conn)
     .await?;
-    Ok(())
+    let total = rows.first().map_or(0, |row| row.total);
+    Ok(SubtreeNodes {
+        ids: rows.into_iter().map(|row| row.id).collect(),
+        total,
+    })
+}
+
+/// [`subtree_nodes`]'s result: the (possibly truncated) id list and the untruncated node count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtreeNodes {
+    /// Ascending `id`, at most the `id_limit` rows the caller asked for.
+    pub ids: Vec<Uuid>,
+    /// Every node in the subtree, including the ones `ids` was truncated past.
+    pub total: i64,
+}
+
+/// The governance columns of a set of objects under `FOR UPDATE`, ascending `id`.
+///
+/// `ADR-0013` §2.1 R17 admits both lock spellings — a per-id loop or
+/// `WHERE id = ANY(..) ORDER BY id FOR UPDATE` — and this is the second one, chosen here for a
+/// measured reason rather than a stylistic one: the cascade locks up to
+/// `move_subtree_nodes_max` (100) rows *inside* the lock-hold budget, and a per-id loop would pay
+/// one client/server round trip each (0.080 ms measured, ~8 ms at N = 100) against a
+/// `document_lock_hold_ms_p95_max` of 25 ms with only 2.05x headroom. The document layer keeps its
+/// per-id loop, where the count is two and the order is the thing under test.
+///
+/// The array travels as one `text` bind parameter split server-side, so nothing is concatenated
+/// into SQL.
+pub async fn lock_objects_for_update<C: ConnectionTrait>(
+    conn: &C,
+    ids: &[Uuid],
+) -> Result<Vec<LockedObjectRow>, ApiError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(LockedObjectRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id, project_id FROM flow_objects \
+          WHERE id = ANY(string_to_array($1, ',')::uuid[]) ORDER BY id FOR UPDATE",
+        vec![uuid_list(ids).into()],
+    ))
+    .all(conn)
+    .await?)
+}
+
+/// One row of [`lock_objects_for_update`].
+///
+/// Two columns and no `lifecycle_status`, deliberately: the caller's decision does not depend on
+/// it. `archive` is a pure `lifecycle_status` flip that leaves `parent_id` and `project_id`
+/// untouched (`flow::command::execute_lifecycle_command`), so an archived object is still a member
+/// of its parent's subtree and `flow_objects_parent_project_fk` still applies to it — a cascade
+/// that skipped archived rows would fail the constraint on its own statement.
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct LockedObjectRow {
+    pub id: Uuid,
+    pub project_id: Option<Uuid>,
+}
+
+/// Re-parents the moved object **and** rewrites the whole subtree's `project_id`, in exactly one
+/// statement.
+///
+/// **One statement, and it has to be one statement.** Migration `0056`'s
+/// `flow_objects_parent_project_fk` is `(parent_id, project_scope_id) REFERENCES flow_objects (id,
+/// project_scope_id)` and is `NOT DEFERRABLE`, so `PostgreSQL` validates it at the end of *every*
+/// statement. Splitting this into "re-parent the root" + "rewrite the descendants" fails at the
+/// end of the first one, with the root already in the new scope and its children still in the old
+/// one: measured, every forward move comes back
+/// `violates foreign key constraint "flow_objects_parent_project_fk"`. The previous
+/// `set_object_parent` two-step shape is therefore not merely slower, it is unusable for a
+/// cascade, which is why it no longer exists.
+///
+/// `ids` must be the whole subtree (the moved object first or not, order is irrelevant to the
+/// statement); the caller is responsible for having derived and locked it. `new_project_id` is
+/// applied to every row, `new_parent_id` only to `object_id`.
+///
+/// Returns the number of rows actually rewritten, so the caller can refuse rather than assume when
+/// the set it locked and the set it updated disagree.
+pub async fn cascade_move_subtree<C: ConnectionTrait>(
+    conn: &C,
+    ids: &[Uuid],
+    object_id: Uuid,
+    new_parent_id: Uuid,
+    new_project_id: Option<Uuid>,
+    updated_by: Uuid,
+) -> Result<u64, ApiError> {
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE flow_objects \
+                SET project_id = $2, \
+                    parent_id = CASE WHEN id = $4 THEN $5 ELSE parent_id END, \
+                    updated_at = now(), updated_by = $3 \
+              WHERE id = ANY(string_to_array($1, ',')::uuid[])",
+            vec![
+                uuid_list(ids).into(),
+                new_project_id.into(),
+                updated_by.into(),
+                object_id.into(),
+                new_parent_id.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// A `uuid[]` bind value, as the comma-separated text `string_to_array(.., ',')::uuid[]` parses.
+///
+/// A `Uuid`'s `Display` is 36 hex/dash characters and nothing else, so the separator can never
+/// appear inside an element and this is a total encoding, not an escaping problem. It exists
+/// because the value still travels as a single **bind parameter** — no identifier, value or
+/// separator is concatenated into the statement text.
+fn uuid_list(ids: &[Uuid]) -> String {
+    let mut out = String::with_capacity(ids.len().saturating_mul(37));
+    for (index, id) in ids.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&id.to_string());
+    }
+    out
 }

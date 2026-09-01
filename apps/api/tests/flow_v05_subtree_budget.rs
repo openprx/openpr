@@ -1125,14 +1125,18 @@ async fn measure_rung(db: &DatabaseConnection, n: usize) -> RungResult {
     let mut notes = Vec::new();
     let fixture = seed_fixture(db, n).await;
     if add_fk_index_requested() {
+        // `IF NOT EXISTS` since migration `0057` now creates this index by this exact name, which
+        // is the outcome this counterfactual argued for. The flag is kept so the pre-`0057` curve
+        // can still be re-measured by reverting that one migration, and a plain `CREATE INDEX`
+        // would now fail against a migrated database rather than measure anything.
         db.execute_unprepared(
-            "CREATE INDEX idx_flow_objects_parent_project_scope ON flow_objects (parent_id, project_scope_id)",
+            "CREATE INDEX IF NOT EXISTS idx_flow_objects_parent_project_scope ON flow_objects (parent_id, project_scope_id)",
         )
         .await
         .expect("the counterfactual foreign-key index is created");
         notes.push(
-            "measured WITH the counterfactual index idx_flow_objects_parent_project_scope \
-             (parent_id, project_scope_id), which migration 0056 does not create"
+            "measured WITH the index idx_flow_objects_parent_project_scope \
+             (parent_id, project_scope_id), created by migration 0057"
                 .to_string(),
         );
     }
