@@ -44,24 +44,34 @@ fn validate_client_id(client_id: &str) -> Result<(), ApiError> {
 }
 
 /// Issues a one-time ticket. Callers must already have rejected `BotAuthContext` (`ADR-0007`:
-/// "handler 在 `BotAuthContext` 存在时返回 forbidden") and validated `flow_enabled` before calling
-/// this — this function does the checks specific to ticket issuance: the strict Origin allowlist,
-/// workspace membership, the document's membership *of that same workspace*, and its effective
-/// permission.
+/// "handler 在 `BotAuthContext` 存在时返回 forbidden"); everything else `ADR-0007` requires
+/// "签发前" happens here: the strict Origin allowlist, workspace membership, the workspace's
+/// `flow_enabled` rollout flag, the document's membership *of that same workspace*, and its
+/// effective permission.
 ///
-/// The checks run in that order on purpose. Membership in `workspace_id` is settled before the
-/// document is looked up at all, so a caller who is not a member learns nothing about which
-/// documents live there; and the document lookup itself is scoped to `workspace_id`, so a member
-/// asking about a document in some *other* workspace gets the same `NotFound` as one asking about
-/// a document that does not exist. Neither error can be used to enumerate another tenant's
-/// documents.
+/// `flow_enabled` is checked *here* and not left to the caller. The previous wording of this
+/// comment claimed the caller had "validated `flow_enabled` before calling this" — no caller ever
+/// did (`routes::collab::create_ticket` went straight from the bot check to `issue`), so a
+/// workspace with the rollout flag off still got a signed ticket and still completed the
+/// WebSocket upgrade; the first thing that actually refused it was the `open` frame, several
+/// round trips past where `ADR-0007` and `collab-protocol-v1.md` §3 put the gate. Putting the
+/// check inside `issue` rather than in the handler is what makes it unskippable: `issue` is the
+/// only way a `collab_tickets` row is ever written.
+///
+/// The checks run in that order on purpose. Membership in `workspace_id` is settled before
+/// anything else about the workspace is revealed, so a caller who is not a member learns neither
+/// whether Flow is enabled there nor which documents live there; and the document lookup itself
+/// is scoped to `workspace_id`, so a member asking about a document in some *other* workspace
+/// gets the same `NotFound` as one asking about a document that does not exist. Neither error can
+/// be used to enumerate another tenant's documents.
 ///
 /// # Errors
 /// `BadRequest` for a malformed `client_id`/`origin`; `Forbidden` when the origin is not
-/// allowlisted, the caller is not a member of `workspace_id`, or the effective permission is
-/// below `edit` (`ADR-0007`: "document read+write ACL"); `NotFound` when `document_id` does not
-/// resolve to a `collab_documents` row whose object belongs to `workspace_id`. Propagates a
-/// database failure otherwise.
+/// allowlisted, the caller is not a member of `workspace_id`, Flow is not enabled for that
+/// workspace (`error-mapping-v1.md`'s `feature_disabled`: `Forbidden` / 403 / HTTP 200), or the
+/// effective permission is below `edit` (`ADR-0007`: "document read+write ACL"); `NotFound` when
+/// `document_id` does not resolve to a `collab_documents` row whose object belongs to
+/// `workspace_id`. Propagates a database failure otherwise.
 pub async fn issue<C: ConnectionTrait>(
     conn: &C,
     input: IssueTicketInput,
@@ -89,6 +99,15 @@ pub async fn issue<C: ConnectionTrait>(
     .await?
     .map(|r| r.role)
     .ok_or_else(|| ApiError::Forbidden("not a member of this workspace".to_string()))?;
+
+    // `ADR-0007`: "签发前验证 `flow_enabled`、workspace membership、object/document read+write ACL
+    // 和 user token type". A workspace with the rollout flag off must not be able to obtain a
+    // ticket at all — not merely be stopped later, at the `open` frame.
+    //
+    // Deliberately *after* the membership read above and *before* the document lookup below: a
+    // non-member must not be able to probe another tenant's rollout state, and a member must not
+    // learn whether a document exists in a workspace where Flow is switched off.
+    super::super::policy::require_flow_enabled_on(conn, input.workspace_id).await?;
 
     // `collab_documents` has no `workspace_id` column of its own (migration
     // `0054_flow_data_layer.sql`); a document's tenant is reachable only through

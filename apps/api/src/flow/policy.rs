@@ -76,8 +76,25 @@ pub async fn require_flow_workspace_admin_access(
 /// is provisioned lazily (nothing in this package inserts a default row), so "never turned on" and
 /// "turned off" must fail exactly the same way (fail closed, not fail open on absence).
 pub async fn require_flow_enabled(state: &AppState, workspace_id: Uuid) -> Result<(), ApiError> {
-    let enabled = repository::fetch_flow_enabled(&state.db, workspace_id).await?;
-    if enabled {
+    require_flow_enabled_on(&state.db, workspace_id).await
+}
+
+/// [`require_flow_enabled`] against a bare connection instead of the whole [`AppState`].
+///
+/// The collab ticket and WebSocket-upgrade paths (`flow::collab::ticket`, `routes::collab`) need
+/// the identical gate but sit below `AppState` — `ticket::issue` is generic over
+/// `ConnectionTrait` so it can run inside a transaction. Both entry points share this one body so
+/// the rejection stays a single `feature_disabled` shape (`error-mapping-v1.md`: `Forbidden` /
+/// 403 / HTTP 200) rather than each caller re-spelling the message.
+///
+/// # Errors
+/// `Forbidden` when the workspace has no `flow_workspace_settings` row or has one with
+/// `flow_enabled = false`. Propagates a database failure otherwise.
+pub async fn require_flow_enabled_on<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<(), ApiError> {
+    if repository::fetch_flow_enabled(conn, workspace_id).await? {
         Ok(())
     } else {
         Err(ApiError::Forbidden(

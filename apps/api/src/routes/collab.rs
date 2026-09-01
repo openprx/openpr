@@ -151,6 +151,20 @@ pub fn trace_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
 /// `GET /api/v1/collab/ws?ticket=...&client_id=...`: WebSocket upgrade, ticket-only auth
 /// (`ADR-0007`) — no `bot_or_user_auth_middleware` on this route, matching the contract's "no
 /// long-lived JWT/bot token over WS" rule.
+///
+/// `collab-protocol-v1.md` §3: "Upgrade 前原子消费 ticket，并验证其
+/// `user`/`workspace`/`document`/`client_id`/`Origin` 绑定与 `flow_enabled`". The bindings are all enforced
+/// inside [`ticket::consume`]'s single conditional `UPDATE`; `flow_enabled` is the one clause that
+/// is not on the ticket row, so it is read here — after the consume (the ticket carries the only
+/// `workspace_id` this request has) and before `on_upgrade`, so a workspace whose rollout flag was
+/// switched off during the ticket's 60s TTL never reaches a 101.
+///
+/// The rejection is `feature_disabled`'s frozen mapping (`error-mapping-v1.md`: `Forbidden` / 403
+/// / HTTP 200), rendered through the same `ApiError::into_response` the sibling ticket failure
+/// already uses. Distinguishing it from `invalid ticket` leaks nothing: reaching this line
+/// required presenting an unexpired, unconsumed ticket bound to this caller's own `client_id` and
+/// `Origin`, so the caller is already the workspace member the ticket was issued to. The ticket is
+/// consumed either way — `ADR-0007`: "ticket 一经消费，即使 handshake 随后断开也不可重用".
 pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -163,15 +177,14 @@ pub async fn ws_upgrade(
         .unwrap_or("")
         .to_string();
 
-    ticket::consume(&state.db, &params.ticket, &params.client_id, &origin)
-        .await
-        .map_or_else(
-            |_| ApiError::Unauthorized("invalid ticket".to_string()).into_response(),
-            |consumed| {
-                ws.on_upgrade(move |socket| session::run(socket, state, consumed))
-                    .into_response()
-            },
-        )
+    let Ok(consumed) = ticket::consume(&state.db, &params.ticket, &params.client_id, &origin).await else {
+        return ApiError::Unauthorized("invalid ticket".to_string()).into_response();
+    };
+    if let Err(err) = crate::flow::policy::require_flow_enabled_on(&state.db, consumed.workspace_id).await {
+        return err.into_response();
+    }
+    ws.on_upgrade(move |socket| session::run(socket, state, consumed))
+        .into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -1452,6 +1465,464 @@ mod collab_database_tests {
         assert!(
             !row.details_redacted.to_string().contains("Corrupt me"),
             "details_redacted must never carry document content"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// Flips the workspace's rollout flag. `seed_workspace` always inserts the row enabled, so
+    /// this is how the disabled half of every `feature_disabled` assertion below is set up.
+    async fn set_flow_enabled(state: &AppState, workspace_id: Uuid, enabled: bool) {
+        exec(
+            state,
+            "UPDATE flow_workspace_settings SET flow_enabled = $2 WHERE workspace_id = $1",
+            vec![workspace_id.into(), enabled.into()],
+        )
+        .await;
+    }
+
+    /// A workspace + owner member with **no** `flow_workspace_settings` row at all — unlike
+    /// [`seed_workspace`], which always inserts one. Nothing in the product provisions that row
+    /// except `PUT /workspaces/{id}/features/flow` (`flow::command::set_flow_feature` ->
+    /// `repository::ensure_flow_settings_row`), so "the admin has never touched the Flow toggle"
+    /// is a real, and in a rollout the *most common*, state — and it is a different state from an
+    /// explicit `flow_enabled = false`.
+    async fn seed_bare_workspace(state: &AppState) -> (Uuid, Uuid) {
+        let workspace_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        exec(
+            state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'test', 'user', true)",
+            vec![owner_id.into(), format!("{owner_id}@collab.test").into()],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspaces (id, slug, name, created_by) VALUES ($1, $2, 'collab ws bare', $3)",
+            vec![
+                workspace_id.into(),
+                format!("ws-{workspace_id}").into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+        exec(
+            state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        (workspace_id, owner_id)
+    }
+
+    async fn count_tickets(state: &AppState, workspace_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct N {
+            n: i64,
+        }
+        N::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM collab_tickets WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("ticket count query runs")
+        .expect("count() always returns a row")
+        .n
+    }
+
+    /// Sends a genuine WebSocket upgrade request without a WebSocket client, so the HTTP response
+    /// to a *refused* upgrade can be inspected. `tokio_tungstenite::connect_async` collapses every
+    /// non-101 answer into an opaque `Err`, which cannot tell "rejected with `feature_disabled`"
+    /// apart from "rejected with `invalid ticket`" — and that distinction is the whole assertion.
+    ///
+    /// The four headers are exactly what `axum`'s `WebSocketUpgrade` extractor requires; without
+    /// them the extractor rejects the request itself (426) and the handler body never runs, so the
+    /// test would pass for the wrong reason.
+    async fn raw_upgrade_request(addr: SocketAddr, ticket: &str, client_id: &str) -> (reqwest::StatusCode, Value) {
+        let response = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/api/v1/collab/ws?ticket={ticket}&client_id={client_id}"
+            ))
+            .header("Origin", TEST_ORIGIN)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .send()
+            .await
+            .expect("the upgrade request completes");
+        let status = response.status();
+        let body = response.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// `ADR-0007`: "签发前验证 `flow_enabled`、workspace membership、object/document read+write ACL
+    /// 和 user token type".
+    ///
+    /// Before this test existed, `POST /collab/tickets` on a workspace with the rollout flag off
+    /// answered `code: 0` with a live ticket, wrote the `collab_tickets` row, and let the caller
+    /// reach a 101; the first refusal came from the `open` frame. `feature_disabled`'s frozen
+    /// wire shape is `error-mapping-v1.md`'s `Forbidden` / 403 / HTTP 200 — the same shape
+    /// `routes::flow`'s own `create_on_a_workspace_without_flow_enabled_is_forbidden_via_body_code`
+    /// asserts for every other Flow endpoint.
+    #[tokio::test]
+    async fn a_flow_disabled_workspace_cannot_obtain_a_collab_ticket() {
+        let scratch = scratch_or_skip!("ticket-flow-disabled");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        set_flow_enabled(&state, workspace_id, false).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/collab/tickets"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "workspace_id": workspace_id,
+                "document_id": document_id,
+                "client_id": "disabled-client",
+                "origin": TEST_ORIGIN,
+            }))
+            .send()
+            .await
+            .expect("ticket request completes");
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "errors must not change the transport status code"
+        );
+        let body: Value = response.json().await.expect("ticket response is JSON");
+        assert_eq!(
+            body["code"], 403,
+            "feature_disabled is Forbidden/403 in the envelope: {body}"
+        );
+        // Not `body["data"].is_null()`: `ApiResponse::error` sets `data: None` and the field
+        // carries `#[serde(skip_serializing_if = "Option::is_none")]`, so it is omitted from every
+        // error body and that assertion is true of *any* rejection — zero discriminating power.
+        // What actually has to hold is that no secret rode along with the refusal, so assert on
+        // the whole serialized body instead: it must not mention a ticket anywhere, in `data` or
+        // in a `websocket_url` (which embeds the raw ticket in its query string).
+        assert!(
+            !body.to_string().contains("ticket"),
+            "a refused issuance must not carry a ticket anywhere in the body: {body}"
+        );
+
+        // Not merely "the response says no": nothing was persisted either, so there is no row a
+        // later `consume` could ever match.
+        assert_eq!(
+            count_tickets(&state, workspace_id).await,
+            0,
+            "a flow-disabled workspace must not leave a collab_tickets row behind"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The no-over-fix guard: with the flag on, issuance and the upgrade both still work.
+    ///
+    /// Without this, "reject when `flow_enabled` is false" is satisfiable by rejecting
+    /// unconditionally — and the negative tests above and below would stay green while every real
+    /// session broke.
+    #[tokio::test]
+    async fn a_flow_enabled_workspace_still_issues_a_ticket_and_still_upgrades() {
+        let scratch = scratch_or_skip!("ticket-flow-enabled");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        let client_id = "enabled-client";
+        // `issue_ticket` itself asserts `code == 0`.
+        let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+        assert_eq!(
+            count_tickets(&state, workspace_id).await,
+            1,
+            "the ticket row must be written when the flag is on"
+        );
+
+        let (status, body) = raw_upgrade_request(addr, &ticket, client_id).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SWITCHING_PROTOCOLS,
+            "an enabled workspace must still reach 101, got {status} / {body}"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `collab-protocol-v1.md` §3: "Upgrade 前原子消费 ticket，并验证其
+    /// `user`/`workspace`/`document`/`client_id`/`Origin` 绑定与 `flow_enabled`".
+    ///
+    /// The ticket's 60s TTL is a window in which an admin can switch the rollout flag off. The
+    /// bindings are all frozen onto the ticket row and re-checked by `consume`; `flow_enabled` is
+    /// not, so it has to be re-read at upgrade time. Asserting on the response *body code* rather
+    /// than only on "not 101" is what makes this distinguishable from a plain `invalid ticket`
+    /// refusal — otherwise deleting the `flow_enabled` read and breaking the `consume` call would
+    /// look identical.
+    #[tokio::test]
+    async fn disabling_flow_after_issuance_refuses_the_upgrade_before_101() {
+        let scratch = scratch_or_skip!("upgrade-flow-disabled");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        let client_id = "tick-then-off";
+        let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+        // The gap the contract cares about: valid ticket in hand, flag revoked before the upgrade.
+        set_flow_enabled(&state, workspace_id, false).await;
+
+        let (status, body) = raw_upgrade_request(addr, &ticket, client_id).await;
+        assert_ne!(
+            status,
+            reqwest::StatusCode::SWITCHING_PROTOCOLS,
+            "the upgrade must not complete once the rollout flag is off"
+        );
+        assert_eq!(status, reqwest::StatusCode::OK, "the envelope carries the code: {body}");
+        assert_eq!(
+            body["code"], 403,
+            "feature_disabled is Forbidden/403, and must not be reported as 401 invalid-ticket: {body}"
+        );
+
+        // `ADR-0007`: "ticket 一经消费，即使 handshake 随后断开也不可重用" — the refusal happens
+        // after the atomic consume, so the ticket is spent and cannot be replayed if the flag is
+        // switched back on.
+        #[derive(FromQueryResult)]
+        struct Consumed {
+            consumed: bool,
+        }
+        let consumed = Consumed::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT consumed_at IS NOT NULL AS consumed FROM collab_tickets WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("ticket lookup runs")
+        .expect("the ticket row exists")
+        .consumed;
+        assert!(
+            consumed,
+            "the refused upgrade must still have burned the one-time ticket"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The reason the `open`-frame `flow_enabled` re-check (`flow::collab::session::reverify_open`)
+    /// is kept rather than folded into the two checks above.
+    ///
+    /// A client chooses when to send `open`; the upgrade only proves the flag was on at the moment
+    /// of the handshake. Everything between the 101 and the first `open` — and every later `open`
+    /// on a long-lived connection — is covered by nothing but this layer. Here the flag is revoked
+    /// *after* a completed upgrade, which neither the issuance check nor the pre-upgrade check can
+    /// see, and the session must still refuse with `feature_disabled`.
+    #[tokio::test]
+    async fn disabling_flow_after_the_upgrade_is_still_caught_by_the_open_frame() {
+        let scratch = scratch_or_skip!("open-flow-disabled");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+
+        let client_id = "open-after-off";
+        let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+        // Upgrade first, with the flag still on: `connect` asserts the 101.
+        let mut ws = connect(addr, &ticket, client_id).await;
+        send_frame(
+            &mut ws,
+            &Frame::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: vec![],
+                client_id: client_id.to_string(),
+                session_id: Uuid::new_v4(),
+            },
+        )
+        .await;
+        let hello_reply = recv_frame(&mut ws).await;
+        assert!(
+            matches!(hello_reply, Frame::Hello { .. }),
+            "expected a hello reply, got {hello_reply:?}"
+        );
+
+        // Only now is the flag revoked — past both earlier gates.
+        set_flow_enabled(&state, workspace_id, false).await;
+
+        send_frame(
+            &mut ws,
+            &Frame::Open {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                known_seq: None,
+                known_frontier: None,
+            },
+        )
+        .await;
+        let frame = recv_frame(&mut ws).await;
+        let Frame::Rejected { code, recoverable, .. } = frame else {
+            panic!(
+                "expected a feature_disabled rejection, got {frame:?} — an established session must not keep serving a document whose workspace had Flow switched off"
+            );
+        };
+        assert_eq!(
+            code,
+            RejectedCode::FeatureDisabled,
+            "the open frame must name the real reason"
+        );
+        assert!(
+            !recoverable,
+            "error-mapping-v1.md freezes feature_disabled as recoverable=false"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The seam nothing else pins: *where* in `ticket::issue` the `flow_enabled` read sits.
+    ///
+    /// Moving it above the `workspace_members` lookup keeps every other assertion in this file
+    /// green — the disabled workspace is still refused, the enabled one still works — while
+    /// turning `POST /collab/tickets` into an oracle a non-member can use to read another
+    /// tenant's rollout state: both refusals are `Forbidden`/403, but `ApiError::legacy_response`
+    /// puts the message on the wire, so "flow is not enabled for this workspace" and "not a member
+    /// of this workspace" are trivially distinguishable. Membership must be settled first, so an
+    /// outsider always gets the membership refusal regardless of the flag.
+    #[tokio::test]
+    async fn a_non_member_cannot_probe_another_workspaces_rollout_flag() {
+        let scratch = scratch_or_skip!("ticket-nonmember-probe");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        // A second workspace, only so its owner is a real authenticated user who happens not to
+        // be a member of the first one.
+        let (_outsider_workspace, outsider_id) = seed_workspace(&state).await;
+        let addr = spawn_server(state.clone()).await;
+
+        // Asked twice, with the target workspace's flag off and then on: the outsider must get
+        // the identical answer both times, i.e. learn nothing about the flag.
+        let mut messages = Vec::new();
+        for enabled in [false, true] {
+            set_flow_enabled(&state, workspace_id, enabled).await;
+            let response = reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/collab/tickets"))
+                .bearer_auth(jwt_for(outsider_id))
+                .json(&serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "document_id": document_id,
+                    "client_id": "outsider",
+                    "origin": TEST_ORIGIN,
+                }))
+                .send()
+                .await
+                .expect("ticket request completes");
+            let body: Value = response.json().await.expect("ticket response is JSON");
+            assert_eq!(body["code"], 403, "a non-member is always refused: {body}");
+            messages.push(body["message"].as_str().unwrap_or_default().to_string());
+        }
+
+        assert_eq!(
+            messages[0], messages[1],
+            "the refusal a non-member sees must not change with the target workspace's rollout \
+             flag, or the endpoint becomes a cross-tenant probe for it"
+        );
+        assert_eq!(
+            messages[0], "not a member of this workspace",
+            "membership must be the check that fires first"
+        );
+        assert_eq!(
+            count_tickets(&state, workspace_id).await,
+            0,
+            "no ticket may be written for a non-member either"
+        );
+
+        scratch.drop_self().await;
+    }
+    /// The fail-**closed** half of the gate: a workspace that has never had a
+    /// `flow_workspace_settings` row written at all.
+    ///
+    /// `repository::fetch_flow_enabled` ends in `Ok(row.is_some_and(|r| r.flow_enabled))` — a
+    /// missing row reads as "off". Both `policy::require_flow_enabled` and
+    /// `policy::require_flow_enabled_on` document that as an invariant ("a missing row is
+    /// deliberately treated the same as an explicit `false` ... fail closed, not fail open on
+    /// absence"), and all three of the `flow_enabled` gates on the collab path — ticket issuance,
+    /// the WebSocket upgrade, and the `open` frame — bottom out in that single `is_some_and`.
+    ///
+    /// Nothing tested it. Flipping that one call to `is_none_or` left the entire `-p api --lib`
+    /// suite green, because every seed helper in this crate unconditionally inserts a settings row
+    /// and nothing anywhere deletes one, so the row-absent state was never exercised. The
+    /// consequence of that mutation is the worst case for a rollout flag: a never-provisioned
+    /// workspace — the default state of every workspace that predates Flow — walks straight
+    /// through all three gates.
+    ///
+    /// Only the issuance gate is reachable in this state by design, and that is the point rather
+    /// than a gap: doors two and three sit behind a ticket, and a ticket can only exist if
+    /// issuance already saw `flow_enabled = true`, which requires the row. Absence is therefore
+    /// naturally reachable at this door and at no other.
+    #[tokio::test]
+    async fn a_never_provisioned_workspace_cannot_obtain_a_collab_ticket() {
+        let scratch = scratch_or_skip!("ticket-never-provisioned");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_bare_workspace(&state).await;
+        // Object creation deliberately does not provision the row either, so the workspace is
+        // still bare when the ticket is requested.
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct N {
+            n: i64,
+        }
+        let settings_rows = N::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM flow_workspace_settings WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("settings count query runs")
+        .expect("count() always returns a row")
+        .n;
+        assert_eq!(
+            settings_rows, 0,
+            "the premise of this test is that the row is absent; if something started \
+             provisioning it lazily, this test would silently stop covering absence"
+        );
+
+        let token = jwt_for(owner_id);
+        let addr = spawn_server(state.clone()).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/collab/tickets"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "workspace_id": workspace_id,
+                "document_id": document_id,
+                "client_id": "never-provisioned-client",
+                "origin": TEST_ORIGIN,
+            }))
+            .send()
+            .await
+            .expect("ticket request completes");
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.expect("ticket response is JSON");
+        assert_eq!(
+            body["code"], 403,
+            "an absent settings row must fail exactly like an explicit flow_enabled=false: {body}"
+        );
+        assert!(
+            !body.to_string().contains("ticket"),
+            "a refused issuance must not carry a ticket anywhere in the body: {body}"
+        );
+        assert_eq!(
+            count_tickets(&state, workspace_id).await,
+            0,
+            "a never-provisioned workspace must not leave a collab_tickets row behind"
         );
 
         scratch.drop_self().await;
