@@ -1499,6 +1499,16 @@ pub(super) fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
                 retry_after_ms,
             )
         }
+        // `error-mapping-v1.md`'s `server_rejected` row: `Internal` / 500 / HTTP 200. The
+        // `details.reason` the write path classified is carried through verbatim rather than
+        // re-derived, and a rejection that somehow arrives without one still must not be reported
+        // as retryable -- the whole point of this code is that it is not.
+        RejectedCode::ServerRejected => ApiError::server_rejected(
+            details
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("unclassified"),
+        ),
         RejectedCode::ServerDraining => {
             let reason = details
                 .and_then(|details| details.get("reason"))
@@ -1926,6 +1936,93 @@ mod typed_error_mapping_tests {
         assert_eq!(details["limit_kind"], "semantic_patch_bytes");
         assert_eq!(details["limit"], limit);
         assert_eq!(details["observed"], limit + 1);
+    }
+
+    /// `server_rejected` and `server_draining` are the two codes that both mean "the server, not
+    /// you" and differ only in whether a retry can ever work — so the REST mapping getting them
+    /// the wrong way round is the failure mode with the highest cost and the lowest visibility.
+    #[test]
+    fn server_rejected_maps_to_a_permanent_500_and_never_to_a_retryable_draining() {
+        let mapped = map_write_rejection(&rejected(
+            RejectedCode::ServerRejected,
+            Some(json!({ "reason": "deterministic_database_refusal" })),
+        ));
+
+        assert_eq!(mapped.kind(), ApiErrorKind::ServerRejected);
+        assert_eq!(mapped.kind().stable_code(), "server_rejected");
+        assert_eq!(mapped.kind().http_status_code(), 500);
+        assert_eq!(mapped.kind().cli_exit_code(), 11);
+        assert_ne!(
+            mapped.kind().cli_exit_code(),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention).cli_exit_code(),
+            "exit 9 means temporary; a permanent refusal must not borrow it"
+        );
+        assert_ne!(
+            mapped.kind().cli_exit_code(),
+            10,
+            "exit 10 is the verify/integrity mismatch; a permanent refusal must not borrow it either"
+        );
+        assert!(
+            !mapped.kind().recoverable(),
+            "`server_rejected` must never be advertised as retryable"
+        );
+        assert_ne!(
+            mapped.kind(),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
+            "a permanent refusal must not collapse onto the transient-contention discriminant"
+        );
+
+        let ApiError::Typed { details, .. } = mapped else {
+            panic!("`server_rejected` must be a typed rejection, not a legacy string one");
+        };
+        let details = details.expect("`server_rejected` carries its classification");
+        assert_eq!(details["reason"], "deterministic_database_refusal");
+    }
+
+    /// The fallback nobody looks at until it is wrong.
+    ///
+    /// A `server_rejected` whose producer supplied no `details` still has to render a `reason`,
+    /// and the value chosen there is a wire value like any other: if it ever reads `contention` or
+    /// `drain`, the REST envelope carries a permanent refusal that *names itself* as transient,
+    /// and a consumer branching on `details.reason` — which is the one field
+    /// `error-mapping-v1.md` freezes for this purpose — retries forever. The `error_code` being
+    /// correct does not save it, because the reason is the finer-grained thing clients read.
+    #[test]
+    fn a_server_rejected_without_details_falls_back_to_a_reason_that_is_not_a_retry_hint() {
+        let mapped = map_write_rejection(&rejected(RejectedCode::ServerRejected, None));
+
+        assert_eq!(mapped.kind(), ApiErrorKind::ServerRejected);
+        let ApiError::Typed { details, .. } = mapped else {
+            panic!("`server_rejected` must stay typed even without producer details");
+        };
+        let details = details.expect("the fallback still carries a reason");
+        let reason = details["reason"].as_str().expect("reason is a string");
+        assert_eq!(reason, "unclassified");
+        for transient in ["contention", "drain"] {
+            assert_ne!(
+                reason, transient,
+                "a permanent refusal must never describe itself with a `server_draining` reason"
+            );
+        }
+    }
+
+    /// And the same rule for the value the write path actually produces: it must not collide with
+    /// `server_draining`'s frozen discriminator set either.
+    #[test]
+    fn the_produced_server_rejected_reason_is_not_a_server_draining_discriminator() {
+        let mapped = map_write_rejection(&rejected(
+            RejectedCode::ServerRejected,
+            Some(json!({ "reason": crate::flow::collab::frame::SERVER_REJECTED_REASON_DATABASE })),
+        ));
+        let ApiError::Typed { details, .. } = mapped else {
+            panic!("must stay typed");
+        };
+        let details = details.expect("carries a reason");
+        let reason = details["reason"].as_str().expect("reason is a string");
+        assert_eq!(reason, "deterministic_database_refusal");
+        for transient in ["contention", "drain"] {
+            assert_ne!(reason, transient);
+        }
     }
 
     /// `error-mapping-v1.md`'s central invariant this package's typed discriminant exists to

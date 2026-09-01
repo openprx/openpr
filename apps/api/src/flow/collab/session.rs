@@ -17,7 +17,9 @@ use uuid::Uuid;
 use super::authz::{self, PermissionLevel};
 use super::bootstrap;
 use super::egress::{EgressSequencer, SeqDecision};
-use super::frame::{DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, TailUpdate, WriteState};
+use super::frame::{
+    DrainSignal, Frame, PROTOCOL_VERSION, RejectedCode, SERVER_REJECTED_REASON_DATABASE, TailUpdate, WriteState,
+};
 use super::limits::{
     CONNECTION_LIMIT_RETRY_AFTER_MS, FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND,
     OPEN_DOCUMENTS_PER_CONNECTION_MAX, PRESENCE_PAYLOAD_BYTES_MAX, PRESENCE_TTL_SECONDS_DEFAULT,
@@ -28,7 +30,7 @@ use super::registry::{ConnectionLimit, OutboundEvent, PresenceLimit};
 use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
-use crate::error::ApiErrorKind;
+use crate::error::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK};
 use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,6 +75,119 @@ const LIMIT_EXCEEDED_CLOSE_CODE: u16 = match ApiErrorKind::LimitExceeded.ws_clos
     Some(code) => code,
     None => CLOSE_POLICY_VIOLATION,
 };
+
+/// `collab-protocol-v1.md`'s `server_rejected` close code, taken from `error-mapping-v1.md`'s one
+/// table the same way [`LIMIT_EXCEEDED_CLOSE_CODE`] is, so the frozen `4500` exists in exactly one
+/// place in this repository. Reached only after [`REPEATED_FAILURE_CLOSE_STREAK`] consecutive
+/// permanently-refused updates — a single `server_rejected` never closes anything.
+const SERVER_REJECTED_CLOSE_CODE: u16 = match ApiErrorKind::ServerRejected.repeated_failure_close_code() {
+    Some(code) => code,
+    None => CLOSE_POLICY_VIOLATION,
+};
+
+/// What one inbound text message does to [`ServerRejectedStreak`].
+///
+/// `collab-protocol-v1.md` (2026-09-01) freezes the meaning of "连续" as **每一个被答复的 `update`
+/// 帧**, and calls out that "「被答复的」这个限定词是承重的": the first implementation of this rule
+/// scattered a reset at each early return, and the paths that returned *before* producing an
+/// answer — a rate-limited update, an unparseable one — simply had no such line, so a permanent
+/// refusal run walked straight across them and closed a connection the rule says to keep. "缺一行
+/// 而非写错一行，所以任何变异都测不出来" is exactly right, which is why this is now a value the
+/// message loop must produce **once, on every path**, rather than a side effect each path may
+/// forget: the default below is what an early return gets, and it is the safe one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreakEffect {
+    /// This message was answered `server_rejected`. Extends the run.
+    PermanentRefusal,
+    /// This message was answered some other way — accepted, or refused with any other code, at
+    /// any layer. Ends the run.
+    ///
+    /// Also the answer for every refusal produced **before this connection can know the frame's
+    /// type**: an over-long frame and a rate-limited one are refused before parsing, and a frame
+    /// whose JSON does not parse has no type at all. The type is genuinely unknowable there, and
+    /// the contract's stated default is to keep the connection ("杀掉健康会话会把局部失败放大成
+    /// 全量重连"), so an undecidable refusal breaks the run rather than being carried across it.
+    OtherAnswer,
+    /// This message was identified as something other than an `update` (`presence`, `ack`,
+    /// `ping`/`pong`, a post-handshake `open`, a binary frame — which this protocol's "every frame
+    /// is one JSON text message" rule means can never be an update). Contract: those "完全不参与"
+    /// — a `ping` is not evidence that the client recovered, and it is not evidence that it did
+    /// not either.
+    NotAnUpdate,
+}
+
+/// Counts **consecutive** `update` frames this connection answered with `server_rejected`.
+///
+/// `collab-protocol-v1.md`: "**默认保持连接**：被永久拒绝的是**那一条 update，不是那个会话**...
+/// **连续 3 次**（与 `invalid_update` 同一模式）才以 **close 4500** 关闭". Both halves are load
+/// bearing, and each is the other's failure mode: closing on the first refusal amplifies one bad
+/// update into a full reconnect for a session that is otherwise healthy, while never closing lets
+/// a client that ignores `recoverable=false` hammer a write that can never land.
+///
+/// The count lives only inside one connection, never decays, and is never shared across
+/// connections. When it reaches the threshold the third `rejected` frame has **already been
+/// sent** — the close happens after it, so the client can see the refusal it is being hung up
+/// for.
+#[derive(Debug, Clone, Copy)]
+struct ServerRejectedStreak {
+    consecutive: u32,
+}
+
+impl ServerRejectedStreak {
+    const fn new() -> Self {
+        Self { consecutive: 0 }
+    }
+
+    /// Applies one message's [`StreakEffect`]. The single mutation point: every inbound text
+    /// message reaches exactly this call, whichever layer answered it, so a future early return
+    /// cannot leak a run across itself by forgetting a line.
+    const fn apply(&mut self, effect: StreakEffect) {
+        match effect {
+            StreakEffect::PermanentRefusal => self.consecutive = self.consecutive.saturating_add(1),
+            StreakEffect::OtherAnswer => self.consecutive = 0,
+            StreakEffect::NotAnUpdate => {}
+        }
+    }
+
+    /// [`SERVER_REJECTED_CLOSE_CODE`] once the streak reaches the frozen threshold, `None` before
+    /// that — so the caller's close is expressed as "the contract says close now, with this code",
+    /// never as a local `if count == 3` with a hand-written number next to it.
+    const fn close_code_if_exhausted(self) -> Option<u16> {
+        if self.consecutive >= REPEATED_FAILURE_CLOSE_STREAK {
+            Some(SERVER_REJECTED_CLOSE_CODE)
+        } else {
+            None
+        }
+    }
+}
+
+/// How an `Err` out of [`write::accept_update`] is reported on the wire.
+///
+/// `accept_update` returns `Err` only for a database failure it reached no verdict on — every
+/// failure it *did* classify, permanent ones included, comes back as `Ok(AcceptOutcome::Rejected)`
+/// carrying that verdict. An unclassified failure is therefore reported as recoverable
+/// contention, which is the honest answer: "this may well work next time" is exactly what not
+/// knowing means, and `classify_db_failure` deliberately defaults the same way.
+///
+/// The one exception is a database error that *is* classifiable as deterministic but reached this
+/// path from outside the locked phase (a `?` on a read, say). Retrying it can no more help than
+/// retrying the locked-phase one, so it must not be dressed as contention either — this is the
+/// same rule `write::accept_update` applies internally, applied once more at the surface so a
+/// future `?` cannot quietly re-open the hole `server_rejected` exists to close.
+fn write_error_rejection(err: &ApiError) -> (RejectedCode, bool, serde_json::Value) {
+    if err.kind() == ApiErrorKind::ServerRejected || err.is_deterministic_database_failure() {
+        return (
+            RejectedCode::ServerRejected,
+            ApiErrorKind::ServerRejected.recoverable(),
+            serde_json::json!({"reason": SERVER_REJECTED_REASON_DATABASE}),
+        );
+    }
+    (
+        RejectedCode::ServerDraining,
+        true,
+        serde_json::json!({"reason": "contention", "retry_after_ms": 500}),
+    )
+}
 
 /// `hello.capabilities` this server understands (`collab-protocol-v1.md`: "未知 required
 /// capability... 必须失败关闭,不得部分应用"). The wire shape carries no required/optional
@@ -132,6 +247,7 @@ const fn rejected_code_to_api_kind(code: RejectedCode) -> ApiErrorKind {
         RejectedCode::PolicyRejected => ApiErrorKind::PolicyRejected,
         RejectedCode::LimitExceeded => ApiErrorKind::LimitExceeded,
         RejectedCode::ResyncRequired => ApiErrorKind::ResyncRequired,
+        RejectedCode::ServerRejected => ApiErrorKind::ServerRejected,
         // A handshake-time close always reports `drain`, never `contention`: there is no document
         // lock/rebase/snapshot contention to report about a session that has not reached `open`
         // yet (`collab-protocol-v1.md`: "两者不得互换"). The one real `contention` rejection this
@@ -682,6 +798,9 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     // on this socket, but counting repeated `open` abuse still makes the frozen
     // `open_documents` limit_kind observable on the ninth attempted subscription.
     let mut open_attempts = 1u64;
+    // `collab-protocol-v1.md`'s "连续 3 次" for `server_rejected`. Lives here, per connection, for
+    // the same reason `open_attempts` does: it is a property of this socket's history.
+    let mut server_rejected_streak = ServerRejectedStreak::new();
     // `collab-protocol-v1.md`'s `ping/pong` heartbeat, server side. A half-open TCP connection
     // produces neither a `Close` frame nor a read error, so without this the `select!` below would
     // park forever on a peer that is already gone while still holding its `limits-v1.md` connection
@@ -694,7 +813,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     // happens one full period in, not at connection time.
     heartbeat_ticks.tick().await;
 
-    loop {
+    'session: loop {
         tokio::select! {
             biased;
             _ = heartbeat_ticks.tick() => {
@@ -758,9 +877,15 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                 match message {
                     Message::Close(_) => break,
                     Message::Text(text) => {
+                        // `collab-protocol-v1.md`'s "「被答复的」这个限定词是承重的". The default is
+                        // what every early return below inherits without saying anything, and it
+                        // is the one that keeps the connection; the two paths that mean something
+                        // else say so explicitly.
+                        let mut streak_effect = StreakEffect::OtherAnswer;
+                        'answered: {
                         if text.len() > WEBSOCKET_FRAME_BYTES_MAX {
                             send(&mut socket, &limit_exceeded_frame(document_id, "websocket_frame_bytes", WEBSOCKET_FRAME_BYTES_MAX as u64, Some(text.len() as u64), None)).await;
-                            continue;
+                            break 'answered;
                         }
                         // `limits-v1.md`: "frames_per_connection_per_second... 持续洪泛在 decode 前
                         // 限流" -- checked before the frame is even parsed.
@@ -770,15 +895,18 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                         }
                         if frame_outcome.force_close {
                             close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "sustained frame rate exceeded").await;
-                            break;
+                            break 'session;
                         }
                         if !frame_outcome.admitted {
-                            continue;
+                            break 'answered;
                         }
                         let Ok(frame) = serde_json::from_str::<Frame>(text.as_str()) else {
                             send(&mut socket, &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None)).await;
-                            continue;
+                            break 'answered;
                         };
+                        if !matches!(frame, Frame::Update { .. }) {
+                            streak_effect = StreakEffect::NotAnUpdate;
+                        }
                         if matches!(frame, Frame::Update { .. }) {
                             // `error-mapping-v1.md`'s `drain` reason: "实例/workspace 正在停止接收
                             // 或排空连接". `reverify_open` already refuses a *handshake* against a
@@ -792,7 +920,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             // take on every `ping`/`presence` frame at 30/s per connection.
                             if let Some(signal) = collab.workspace_drain_signal(consumed.workspace_id) {
                                 reject_drain_and_close(&mut socket, document_id, signal).await;
-                                break;
+                                break 'session;
                             }
                             let update_outcome = update_limiter.take();
                             if !update_outcome.admitted {
@@ -800,10 +928,15 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             }
                             if update_outcome.force_close {
                                 close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "sustained update rate exceeded").await;
-                                break;
+                                break 'session;
                             }
                             if !update_outcome.admitted {
-                                continue;
+                                // The path `collab-protocol-v1.md` names first among the leaks:
+                                // this update was refused by the rate limiter, which is an answer
+                                // like any other, so the run ends here. It reaches the streak
+                                // through the *same* statement every other pre-answer refusal
+                                // does — see `StreakEffect::OtherAnswer`.
+                                break 'answered;
                             }
                         }
                         handle_client_frame(
@@ -820,8 +953,24 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             &mut sequencer,
                             &mut pending_updates,
                             &mut open_attempts,
+                            &mut streak_effect,
                         )
                         .await;
+                        }
+                        server_rejected_streak.apply(streak_effect);
+                        // The connection survives any single `server_rejected` -- what was refused
+                        // is the update, not the session -- and is given up on only once the
+                        // frozen streak is unbroken. The third `rejected` frame has already left
+                        // the socket at this point (contract: "先把第 3 条 rejected 帧发出去再关").
+                        if let Some(close_code) = server_rejected_streak.close_code_if_exhausted() {
+                            close(
+                                &mut socket,
+                                close_code,
+                                "three consecutive updates were permanently refused",
+                            )
+                            .await;
+                            break 'session;
+                        }
                     }
                     Message::Binary(bytes) => {
                         if bytes.len() > WEBSOCKET_FRAME_BYTES_MAX {
@@ -829,7 +978,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                         } else {
                             send(&mut socket, &rejected_frame(document_id, RejectedCode::UnsupportedProtocol, false, None)).await;
                             close(&mut socket, ws_close_code_for(RejectedCode::UnsupportedProtocol), "binary frames are not supported").await;
-                            break;
+                            break 'session;
                         }
                     }
                     Message::Ping(_) | Message::Pong(_) => {}
@@ -1216,6 +1365,12 @@ async fn handle_client_frame(
     sequencer: &mut EgressSequencer,
     pending_updates: &mut HashMap<Uuid, Frame>,
     open_attempts: &mut u64,
+    // Pre-set by the caller to `StreakEffect::OtherAnswer` for an `update` and to
+    // `StreakEffect::NotAnUpdate` for everything else, so this function only ever has to speak up
+    // for the one outcome that *extends* a run. There is deliberately no "reset" call anywhere in
+    // here: the reset is the default the caller already holds, which is what makes it impossible
+    // for a new early return in this function to leak a run across itself.
+    streak_effect: &mut StreakEffect,
 ) {
     // `open_documents_per_connection_max`'s structural guarantee (see [`is_reopen_attempt`]): a
     // client sending `open` again after the handshake must never be treated as opening a second
@@ -1354,6 +1509,9 @@ async fn handle_client_frame(
                     handle_outbound_frame(&state.db, document_id, socket, sequencer, pending_updates, frame).await;
                 }
                 Ok(AcceptOutcome::Rejected(rejected)) => {
+                    if rejected.code == RejectedCode::ServerRejected {
+                        *streak_effect = StreakEffect::PermanentRefusal;
+                    }
                     send(
                         socket,
                         &Frame::Rejected {
@@ -1375,41 +1533,32 @@ async fn handle_client_frame(
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "collab session: accept_update failed");
+                    // The gap this branch used to *document* rather than fix: before
+                    // `server_rejected` existed on the wire, a deterministic refusal reaching this
+                    // surface could only be sent as `server_draining`/`contention` — a retryable
+                    // verdict on a write that can never land — because no `RejectedCode` variant
+                    // expressed a permanent server-side refusal and no close code was allocated
+                    // for one. `collab-protocol-v1.md` (2026-09-01) allocated both, so the
+                    // classification is now made instead of described.
+                    let (code, recoverable, details) = write_error_rejection(&err);
+                    if code == RejectedCode::ServerRejected {
+                        *streak_effect = StreakEffect::PermanentRefusal;
+                    }
                     send(
                         socket,
                         &Frame::Rejected {
                             protocol_version: PROTOCOL_VERSION,
                             document_id,
                             update_id: Some(update_id),
-                            // ⚠️ **A deterministic refusal is still dressed as retryable
-                            // contention here.** `error-mapping-v1.md` (2026-09-01) forbids that,
-                            // and the REST surface now obeys it — but this surface cannot: a
-                            // permanent *server-side* refusal has no representation in
-                            // `collab-protocol-v1.md`'s frozen `RejectedCode` (every variant names
-                            // a client-side cause or a transient server state), and
-                            // `ApiErrorKind::Unclassified::ws_close_code()` is `None`, so there is
-                            // no close code for it either. Inventing a wire value to fix this
-                            // would be inventing contract, so the gap is reported instead of
-                            // papered over. Note this is **not a regression**: before
-                            // `LockedOutcome::Failed` existed, the same failure arrived here as
-                            // `Ok(Rejected)` wearing the identical `server_draining`/`contention`
-                            // disguise.
-                            code: RejectedCode::ServerDraining,
-                            recoverable: true,
-                            // Still `not_applied`, but **no longer for the reason this comment
-                            // used to give**. It said `accept_update` returns `Err` only from the
-                            // phases *before* the locked phase opens a transaction; that stopped
-                            // being true when `LockedOutcome::Failed` was added, which returns
-                            // `Err` from inside the locked phase for a deterministic database
-                            // refusal (`error-mapping-v1.md`, 2026-09-01). The conclusion survives
-                            // on a different footing: every `Err`-producing path either never
-                            // opened a transaction, or rolled one back before returning — the
-                            // locked phase's own `Failed` arm calls `tx.rollback()` first, and the
-                            // forced-snapshot arm returns before touching this document's tail. So
-                            // an `Err` here still provably wrote nothing, and `not_applied` is
-                            // still the honest answer.
+                            code,
+                            recoverable,
+                            // Every `Err`-producing path either never opened a transaction, or
+                            // rolled one back before returning: the locked phase's deterministic
+                            // arm calls `tx.rollback()` first, and the forced-snapshot arm returns
+                            // before touching this document's tail. So an `Err` here provably
+                            // wrote nothing, whichever way it classifies above.
                             write_state: WriteState::NotApplied,
-                            details: Some(serde_json::json!({"reason": "contention", "retry_after_ms": 500})),
+                            details: Some(details),
                             current_seq: None,
                             current_frontier: None,
                             audit_event_id: None,
@@ -1609,13 +1758,194 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{Frame, RateLimiter, bootstrap, is_reopen_attempt};
-    use crate::error::{ApiError, ApiErrorKind};
+    use super::{
+        Frame, RateLimiter, RejectedCode, SERVER_REJECTED_CLOSE_CODE, ServerRejectedStreak, StreakEffect, bootstrap,
+        is_reopen_attempt, rejected_code_to_api_kind, write_error_rejection,
+    };
+    use crate::error::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK};
     use crate::flow::collab::limits;
 
     use super::{
         FRAME_BURST_MAX, FRAMES_PER_CONNECTION_PER_SECOND, UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND,
     };
+
+    /// The seam with no behaviour of its own, and therefore the one nothing else would catch: a
+    /// swapped arm in [`rejected_code_to_api_kind`] compiles, type-checks, and produces a
+    /// perfectly well-formed close code for the *wrong* error. Pinned by comparing each wire
+    /// value against the `stable_code()` of the kind it maps to, so the check is the property
+    /// ("these two vocabularies are the same vocabulary") rather than a hand-copied second table.
+    #[test]
+    fn every_rejected_code_maps_to_the_api_kind_that_shares_its_stable_code() {
+        for code in [
+            RejectedCode::Unauthenticated,
+            RejectedCode::Forbidden,
+            RejectedCode::FeatureDisabled,
+            RejectedCode::NotFound,
+            RejectedCode::UnsupportedProtocol,
+            RejectedCode::StaleFrontier,
+            RejectedCode::InvalidUpdate,
+            RejectedCode::PolicyRejected,
+            RejectedCode::LimitExceeded,
+            RejectedCode::ResyncRequired,
+            RejectedCode::ServerRejected,
+            RejectedCode::ServerDraining,
+        ] {
+            let wire = serde_json::to_value(code).expect("a rejected code serializes");
+            let wire = wire.as_str().expect("a rejected code serializes to a string");
+            assert_eq!(
+                rejected_code_to_api_kind(code).stable_code(),
+                wire,
+                "{code:?} maps to an ApiErrorKind naming a different stable code"
+            );
+        }
+    }
+
+    /// `collab-protocol-v1.md`: "**默认保持连接**...**连续 3 次**...才以 **close 4500** 关闭".
+    ///
+    /// The first two refusals must leave the connection alone — the contract's own reason is that
+    /// killing a healthy session turns one local failure into a full reconnect — and only the
+    /// third asks for a close, at the frozen code.
+    #[test]
+    fn a_server_rejected_streak_keeps_the_connection_until_the_third_consecutive_refusal() {
+        let mut streak = ServerRejectedStreak::new();
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            None,
+            "a fresh connection never closes"
+        );
+
+        streak.apply(StreakEffect::PermanentRefusal);
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            None,
+            "one permanently refused update must not cost the client its session"
+        );
+        streak.apply(StreakEffect::PermanentRefusal);
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            None,
+            "two permanently refused updates must not cost the client its session"
+        );
+        streak.apply(StreakEffect::PermanentRefusal);
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            Some(4500),
+            "the third consecutive refusal closes, at the contract's own 4500"
+        );
+        assert_eq!(SERVER_REJECTED_CLOSE_CODE, 4500);
+        assert_eq!(REPEATED_FAILURE_CLOSE_STREAK, 3);
+    }
+
+    /// "连续" is the whole of the rule: an update that was *not* permanently refused proves this
+    /// connection is not in an unbroken run, so the count restarts rather than accumulating. A
+    /// cumulative counter would eventually close every long-lived session that ever saw three
+    /// scattered refusals, which is the amplification the contract forbids.
+    #[test]
+    fn any_other_update_outcome_restarts_the_streak_rather_than_accumulating() {
+        let mut streak = ServerRejectedStreak::new();
+        streak.apply(StreakEffect::PermanentRefusal);
+        streak.apply(StreakEffect::PermanentRefusal);
+        // One accepted (or otherwise-refused, at any layer) update in the middle.
+        streak.apply(StreakEffect::OtherAnswer);
+        assert_eq!(streak.close_code_if_exhausted(), None);
+
+        streak.apply(StreakEffect::PermanentRefusal);
+        streak.apply(StreakEffect::PermanentRefusal);
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            None,
+            "two refusals after the break must not inherit the two before it"
+        );
+        streak.apply(StreakEffect::PermanentRefusal);
+        assert_eq!(streak.close_code_if_exhausted(), Some(4500));
+    }
+
+    /// The third of the three effects, and the reason it is not just "reset": a `ping` between two
+    /// permanent refusals must neither end the run nor extend it (`collab-protocol-v1.md`: "ping
+    /// 不能当作客户端已恢复的证据"). Collapsing `NotAnUpdate` into `OtherAnswer` would make any
+    /// heartbeat keep a hammering client alive forever; collapsing it into `PermanentRefusal`
+    /// would close sessions for being idle.
+    #[test]
+    fn a_non_update_frame_neither_extends_nor_ends_the_run() {
+        let mut streak = ServerRejectedStreak::new();
+        streak.apply(StreakEffect::PermanentRefusal);
+        streak.apply(StreakEffect::NotAnUpdate);
+        streak.apply(StreakEffect::PermanentRefusal);
+        streak.apply(StreakEffect::NotAnUpdate);
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            None,
+            "two refusals plus any number of pings is still only two refusals"
+        );
+        streak.apply(StreakEffect::PermanentRefusal);
+        assert_eq!(
+            streak.close_code_if_exhausted(),
+            Some(4500),
+            "the pings must not have reset the run either"
+        );
+
+        // And on its own it can never close anything.
+        let mut idle = ServerRejectedStreak::new();
+        for _ in 0..10 {
+            idle.apply(StreakEffect::NotAnUpdate);
+        }
+        assert_eq!(idle.close_code_if_exhausted(), None);
+    }
+
+    /// [`write_error_rejection`]'s two directions, and why neither may be the default for the
+    /// other: an unclassified failure reported as permanent throws away a write that would have
+    /// landed, and a classified permanent refusal reported as contention tells the client to
+    /// retry forever.
+    ///
+    /// **Not covered here**: the `is_deterministic_database_failure()` half of that predicate. A
+    /// `sqlx::Error::Database` cannot be constructed outside a live driver (the same limitation
+    /// `error::sqlstate_tests` records), so the `SQLSTATE` decision itself is pinned by
+    /// `error::classify_sqlstate` and the deterministic-refusal path is proven end to end over a
+    /// real socket by `live_ws::a_deterministic_refusal_arrives_as_server_rejected_and_the_session_survives`.
+    #[test]
+    fn an_unclassified_write_failure_stays_contention_and_a_classified_one_does_not() {
+        let (code, recoverable, details) = write_error_rejection(&ApiError::server_rejected("x"));
+        assert_eq!(code, RejectedCode::ServerRejected);
+        assert!(!recoverable, "a permanent refusal is never advertised as retryable");
+        assert_eq!(details["reason"], "deterministic_database_refusal");
+
+        for unclassified in [
+            ApiError::Internal,
+            ApiError::Database(sea_orm::DbErr::Conn(sea_orm::RuntimeErr::Internal(
+                "pool checkout timed out".to_string(),
+            ))),
+            ApiError::Conflict("something else entirely".to_string()),
+        ] {
+            let (code, recoverable, details) = write_error_rejection(&unclassified);
+            assert_eq!(
+                code,
+                RejectedCode::ServerDraining,
+                "an unclassified failure must stay retryable: {unclassified:?}"
+            );
+            assert!(recoverable);
+            // `error-mapping-v1.md` makes BOTH of `server_draining`'s details required
+            // ("details required `{reason,retry_after_ms}`") and makes a missing one a producer
+            // contract violation the tests "必须失败" on. Asserting only `reason` let this
+            // producer drop `retry_after_ms` silently, which is what `flow::command`'s REST
+            // mapping then reads back as `0`.
+            let object = details.as_object().expect("details is a JSON object");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["reason", "retry_after_ms"],
+                "`server_draining` details are required to carry exactly the frozen pair, got {object:?}"
+            );
+            assert_eq!(details["reason"], "contention");
+            let retry_after_ms = details["retry_after_ms"]
+                .as_u64()
+                .expect("`retry_after_ms` must be a number, not a string or null");
+            assert!(
+                retry_after_ms > 0,
+                "a retry hint of {retry_after_ms}ms tells a client to hammer the server immediately"
+            );
+        }
+    }
 
     /// The three `limits-v1.md` connection ceilings, each driven to refusal by the *real*
     /// [`SessionRegistry::try_register`] admission path and then rendered through the *same*
@@ -2124,7 +2454,9 @@ mod tests {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use uuid::Uuid;
 
+        use crate::error::REPEATED_FAILURE_CLOSE_STREAK;
         use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
+        use crate::flow::collab::limits::{UPDATE_BURST_MAX, WEBSOCKET_FRAME_BYTES_MAX};
         use crate::routes::collab::{create_ticket, ws_upgrade};
 
         const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -3921,6 +4253,834 @@ mod tests {
                 "a replayed older ack must never rewind the recorded frontier"
             );
             assert_eq!(recorded.frontier, head_frontier);
+
+            scratch.drop_self().await;
+        }
+
+        /// A second real user on the workspace, whose `users` row these tests then delete to make
+        /// the write path hit a deterministic foreign-key refusal.
+        ///
+        /// Why a second user rather than the workspace owner: `workspaces.created_by` references
+        /// `users(id)`, so deleting the owner would fail before the test could begin. Deleting a
+        /// plain member cascades away only that member row, which nothing in the `update` path
+        /// reads — a session's authorization was already resolved at `open` and is fenced from
+        /// there on by `authz_epoch`, which a member deletion does not move.
+        async fn seed_second_member(state: &AppState, workspace_id: Uuid) -> Uuid {
+            let user_id = Uuid::new_v4();
+            exec(
+                state,
+                "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+                 VALUES ($1, $2, '!', 'test', 'user', true)",
+                vec![user_id.into(), format!("{user_id}@session-live-ws.test").into()],
+            )
+            .await;
+            exec(
+                state,
+                "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'admin')",
+                vec![workspace_id.into(), user_id.into()],
+            )
+            .await;
+            user_id
+        }
+
+        /// Reinstates a `users` row deleted by [`delete_user`], with the same id, so a write whose
+        /// actor was missing can succeed on a later attempt over the same socket.
+        async fn restore_user(state: &AppState, user_id: Uuid) {
+            exec(
+                state,
+                "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+                 VALUES ($1, $2, '!', 'test', 'user', true)",
+                vec![
+                    user_id.into(),
+                    format!("{user_id}@restored-session-live-ws.test").into(),
+                ],
+            )
+            .await;
+        }
+
+        async fn delete_user(state: &AppState, user_id: Uuid) {
+            exec(state, "DELETE FROM users WHERE id = $1", vec![user_id.into()]).await;
+        }
+
+        /// One real CRDT update against this document's *current* canonical snapshot, ready to be
+        /// put in a `Frame::Update`. Re-read per call so consecutive updates in one test are each
+        /// based on the head the previous one left behind.
+        async fn next_update_frame(state: &AppState, document_id: Uuid) -> Frame {
+            use collab_core::{CollabEngine, LoroCollabEngine};
+            #[derive(sea_orm::FromQueryResult)]
+            struct SnapshotRow {
+                snapshot: Vec<u8>,
+            }
+            let row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT snapshot FROM collab_documents WHERE id = $1",
+                vec![document_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("snapshot query runs")
+            .expect("document row exists");
+            let mut engine = LoroCollabEngine::load(&row.snapshot).expect("snapshot loads");
+            let base_frontier = engine.frontier();
+            engine
+                .set_title(&format!("server-rejected-test-{}", Uuid::new_v4()))
+                .expect("set_title succeeds");
+            let bytes = engine.export_from(&base_frontier).expect("export succeeds");
+            Frame::Update {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                update_id: Uuid::new_v4(),
+                // Ignored by the server on this surface (`UpdateRequest::expected_frontier` is
+                // `None` for WebSocket updates), but sent honestly all the same.
+                base_frontier: crate::flow::projection::encode_frontier(&base_frontier),
+                bytes: encode_b64(&bytes),
+                idempotency_key: None,
+                origin: "server-rejected-test".to_string(),
+                message: None,
+            }
+        }
+
+        /// What the socket produced next: a control frame, or the server hanging up.
+        #[derive(Debug)]
+        enum Received {
+            Frame(Box<Frame>),
+            Closed(Option<u16>),
+        }
+
+        async fn recv_frame_or_close(ws: &mut WsStream) -> Received {
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(10), ws.next())
+                    .await
+                    .expect("something arrives before the timeout");
+                let Some(message) = message else {
+                    return Received::Closed(None);
+                };
+                match message.expect("the frame is not a transport error") {
+                    TMessage::Text(text) => {
+                        return Received::Frame(Box::new(
+                            serde_json::from_str(text.as_str()).expect("frame deserializes"),
+                        ));
+                    }
+                    TMessage::Close(frame) => return Received::Closed(frame.map(|frame| frame.code.into())),
+                    TMessage::Ping(_) | TMessage::Pong(_) => {}
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        }
+
+        /// One `rejected` frame, unpacked. `update_id` is part of it because it is the only
+        /// thing tying a rejection back to the write that caused it: the client keeps one pending
+        /// waiter per `update_id`, and a rejection that arrives without one settles nothing —
+        /// the write hangs rather than fails.
+        struct Rejection {
+            update_id: Option<Uuid>,
+            code: RejectedCode,
+            recoverable: bool,
+            write_state: crate::flow::collab::frame::WriteState,
+            details: Option<serde_json::Value>,
+        }
+
+        fn expect_rejection(received: Received) -> Rejection {
+            let Received::Frame(frame) = received else {
+                panic!("expected a rejected frame, got {received:?}");
+            };
+            let Frame::Rejected {
+                update_id,
+                code,
+                recoverable,
+                write_state,
+                details,
+                ..
+            } = *frame
+            else {
+                panic!("expected a rejected frame, got {frame:?}");
+            };
+            Rejection {
+                update_id,
+                code,
+                recoverable,
+                write_state,
+                details,
+            }
+        }
+
+        /// Bookkeeping for the interleaving
+        /// `a_rate_limited_update_ends_the_run_like_any_other_answer` builds: how many permanent
+        /// refusals arrived, how many rate-limited ones separated them, and how many *maximal runs*
+        /// of permanent refusals that adds up to.
+        ///
+        /// `groups` is the number that matters: it is exactly what a leaking implementation would
+        /// have been counting, so `groups >= 3` is the point at which a leak must already have
+        /// closed the connection.
+        #[derive(Debug, Default)]
+        struct Interleaving {
+            groups: u32,
+            permanent: u32,
+            rate_limited: u32,
+            in_group: bool,
+        }
+
+        impl Interleaving {
+            fn record(&mut self, rejection: Rejection) {
+                match rejection.code {
+                    RejectedCode::ServerRejected => {
+                        self.permanent += 1;
+                        self.groups += u32::from(!self.in_group);
+                        self.in_group = true;
+                    }
+                    RejectedCode::LimitExceeded => {
+                        assert_eq!(
+                            rejection.details.expect("limit_exceeded carries details")["limit_kind"],
+                            "update_rate",
+                            "this test must be tripping the update limiter, not another ceiling"
+                        );
+                        self.rate_limited += 1;
+                        self.in_group = false;
+                    }
+                    other => panic!("unexpected rejection while interleaving: {other:?}"),
+                }
+            }
+        }
+
+        /// The `update_id` a `Frame::Update` carries, so a test can hold onto it and require the
+        /// rejection to name it back.
+        fn update_id_of(frame: &Frame) -> Uuid {
+            let Frame::Update { update_id, .. } = frame else {
+                panic!("not an update frame: {frame:?}");
+            };
+            *update_id
+        }
+
+        /// **`server_rejected` reaches a WebSocket client, and the session survives it.**
+        ///
+        /// `error-mapping-v1.md`'s frozen rule is "永远不可能成功的失败，不得报成可重试". A write
+        /// whose actor has no `users` row violates `business_events.actor_id`'s foreign key —
+        /// deterministically, identically, forever — and before `server_rejected` existed it
+        /// arrived here wearing `server_draining{reason:"contention",retry_after_ms}`, telling a
+        /// compliant client to retry a write that can never land.
+        ///
+        /// The refusal is produced *naturally*, not by mutating the server: the actor is a real
+        /// user of this workspace whose row is deleted between `open` and the `update`, which is
+        /// also a thing that genuinely happens (an account removed while a tab is open).
+        ///
+        /// The second half is the half that is easy to write as a tautology: "the connection was
+        /// kept" is not proven by the absence of a close frame, because a socket can be open and
+        /// useless. It is proven by putting the connection back to work — restoring the actor and
+        /// committing a real update over the *same* socket, whose `accepted` advances the
+        /// document's canonical head.
+        #[tokio::test]
+        async fn a_deterministic_refusal_arrives_as_server_rejected_and_the_session_survives() {
+            let scratch = scratch_or_skip!("server-rejected-wire");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let member_id = seed_second_member(&state, workspace_id).await;
+            let token = jwt_for(member_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "server-rejected-wire-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+
+            // The actor's row goes away. Nothing else about this connection changes.
+            delete_user(&state, member_id).await;
+
+            let update = next_update_frame(&state, document_id).await;
+            let sent_update_id = update_id_of(&update);
+            send_frame(&mut ws, &update).await;
+            let Rejection {
+                update_id,
+                code,
+                recoverable,
+                write_state,
+                details,
+            } = expect_rejection(recv_frame_or_close(&mut ws).await);
+
+            assert_eq!(
+                code,
+                RejectedCode::ServerRejected,
+                "a foreign-key violation can never succeed on a retry; reporting it as {code:?} is the \
+                 disguise `error-mapping-v1.md` forbids (details={details:?})"
+            );
+            // Without this the rejection settles nothing: the client keys its pending writes by
+            // `update_id`, so a refusal that does not name one leaves the write it refused
+            // hanging rather than failing. `Frame::Rejected::update_id` is `Option` because the
+            // handshake-phase refusals genuinely have no update to name — which is exactly why a
+            // producer that *does* have one and drops it is invisible to the type system.
+            assert_eq!(
+                update_id,
+                Some(sent_update_id),
+                "the rejection must name the update it refused, or the client cannot settle it"
+            );
+            assert!(
+                !recoverable,
+                "`server_rejected` is recoverable=false by contract, not by circumstance"
+            );
+            assert_eq!(
+                write_state,
+                crate::flow::collab::frame::WriteState::NotApplied,
+                "the locked phase rolled back before COMMIT, so the client may safely re-encode"
+            );
+            let details = details.expect("`server_rejected` carries its classification");
+            assert_eq!(details["reason"], "deterministic_database_refusal");
+            assert_eq!(
+                details.as_object().expect("details is an object").len(),
+                1,
+                "details must not carry the driver's own error text: {details:?}"
+            );
+
+            // Nothing was written.
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+            assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_before);
+
+            // The session is not merely un-closed, it is still working: the same socket commits a
+            // real update the moment the deterministic cause is gone.
+            restore_user(&state, member_id).await;
+            let good = next_update_frame(&state, document_id).await;
+            send_frame(&mut ws, &good).await;
+            let Received::Frame(frame) = recv_frame_or_close(&mut ws).await else {
+                panic!("the session must still accept writes after one permanent refusal");
+            };
+            let Frame::Accepted { head_seq, .. } = *frame else {
+                panic!("expected the follow-up update to be accepted, got {frame:?}");
+            };
+            assert_eq!(
+                head_seq,
+                head_seq_before + 1,
+                "the surviving session must advance the canonical head exactly once"
+            );
+
+            scratch.drop_self().await;
+        }
+
+        /// **Three in a row, then 4500 — and not before.**
+        ///
+        /// `collab-protocol-v1.md`: "**连续 3 次**（与 `invalid_update` 同一模式）才以 **close
+        /// 4500** 关闭". Both bounds are asserted from the client's side of a real socket: the
+        /// first two refusals are followed by the *next rejection*, which can only be read if the
+        /// connection was still there to carry it, and the third is followed by a close whose code
+        /// is read off the wire rather than off the server's own constant.
+        #[tokio::test]
+        async fn three_consecutive_permanent_refusals_close_at_4500_and_two_do_not() {
+            let scratch = scratch_or_skip!("server-rejected-streak");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let member_id = seed_second_member(&state, workspace_id).await;
+            let token = jwt_for(member_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "server-rejected-streak-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+            delete_user(&state, member_id).await;
+
+            for attempt in 1..=3u32 {
+                let update = next_update_frame(&state, document_id).await;
+                let sent_update_id = update_id_of(&update);
+                send_frame(&mut ws, &update).await;
+                let rejection = expect_rejection(recv_frame_or_close(&mut ws).await);
+                assert_eq!(
+                    rejection.code,
+                    RejectedCode::ServerRejected,
+                    "refusal {attempt} of 3 must be reported as a permanent refusal"
+                );
+                assert_eq!(
+                    rejection.update_id,
+                    Some(sent_update_id),
+                    "refusal {attempt} of 3 must name the update it refused"
+                );
+            }
+
+            // Only now. The two reads above each *required* an open connection to complete, which
+            // is what rules out an early close rather than merely failing to observe one.
+            let closed = recv_frame_or_close(&mut ws).await;
+            let Received::Closed(code) = closed else {
+                panic!("the third consecutive permanent refusal must close the connection, got {closed:?}");
+            };
+            assert_eq!(
+                code,
+                Some(4500),
+                "`collab-protocol-v1.md` freezes 4500 for this close, taken from 5xx semantics"
+            );
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+
+            scratch.drop_self().await;
+        }
+
+        /// **The streak is *consecutive*, proven at every layer that can answer an update.**
+        ///
+        /// `ServerRejectedStreak::apply` is unit-tested, but which effect each path *produces* is
+        /// the part with no visible logic. `collab-protocol-v1.md` (2026-09-01) freezes the rule
+        /// as "每一个**被答复的** `update` 帧" and records what the first implementation got wrong:
+        /// the paths that answer an update **before it is ever parsed** — over-length, rate
+        /// limited, unparseable JSON — had no reset line at all, so a run of permanent refusals
+        /// walked across them and closed a connection the rule says to keep. "缺一行而非写错一行，
+        /// 所以任何变异都测不出来."
+        ///
+        /// The implementation answer is structural: every inbound text message now produces one
+        /// [`StreakEffect`] and reaches `apply` through a single statement, with the *reset* as
+        /// the default an early return inherits. So the phases below do not have to enumerate
+        /// every early return — they have to prove the shared default is the reset. Phases 1, 2
+        /// and 4 exercise it from three different layers (post-parse `invalid_update`, pre-parse
+        /// JSON failure, pre-parse length refusal); phase 5 exercises the accepted path; phase 3
+        /// exercises the write path's own non-permanent rejection.
+        ///
+        /// Each phase drives the streak to two, breaks it one way, drives it to two again, and
+        /// then requires the connection to answer a `ping`. With the shared default flipped, the
+        /// second pair's later refusal is the third in an unbroken run and the server hangs up —
+        /// so the `pong` cannot arrive.
+        #[tokio::test]
+        async fn every_other_update_outcome_breaks_the_streak_on_a_real_connection() {
+            let scratch = scratch_or_skip!("server-rejected-reset");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let member_id = seed_second_member(&state, workspace_id).await;
+            let token = jwt_for(member_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "server-rejected-reset-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+
+            async fn refuse_twice(state: &AppState, ws: &mut WsStream, document_id: Uuid, phase: &str) {
+                for attempt in 1..=2u32 {
+                    let update = next_update_frame(state, document_id).await;
+                    let sent_update_id = update_id_of(&update);
+                    send_frame(ws, &update).await;
+                    let rejection = expect_rejection(recv_frame_or_close(ws).await);
+                    assert_eq!(
+                        rejection.code,
+                        RejectedCode::ServerRejected,
+                        "{phase}: refusal {attempt} must be a permanent refusal"
+                    );
+                    assert_eq!(rejection.update_id, Some(sent_update_id), "{phase}: refusal {attempt}");
+                }
+            }
+
+            /// A `ping`/`pong` round trip the server can only complete while the connection is
+            /// open — the assertion that no close was sent, made positively.
+            async fn require_still_open(ws: &mut WsStream, phase: &str) {
+                let nonce = Uuid::new_v4().to_string();
+                send_frame(
+                    ws,
+                    &Frame::Ping {
+                        protocol_version: PROTOCOL_VERSION,
+                        nonce: nonce.clone(),
+                    },
+                )
+                .await;
+                let received = recv_frame_or_close(ws).await;
+                let Received::Frame(frame) = received else {
+                    panic!("{phase}: the streak was not reset -- the connection was closed at four scattered refusals");
+                };
+                let Frame::Pong { nonce: echoed, .. } = *frame else {
+                    panic!("{phase}: expected a pong, got {frame:?}");
+                };
+                assert_eq!(echoed, nonce);
+            }
+
+            delete_user(&state, member_id).await;
+            refuse_twice(&state, &mut ws, document_id, "before an undecodable update").await;
+
+            // Break 1: an update frame that parses, but whose bytes are not base64 ->
+            // `invalid_update`, decided inside `handle_client_frame`.
+            let mut malformed = next_update_frame(&state, document_id).await;
+            if let Frame::Update { ref mut bytes, .. } = malformed {
+                "not base64 ***".clone_into(bytes);
+            }
+            send_frame(&mut ws, &malformed).await;
+            assert_eq!(
+                expect_rejection(recv_frame_or_close(&mut ws).await).code,
+                RejectedCode::InvalidUpdate
+            );
+
+            refuse_twice(&state, &mut ws, document_id, "after an undecodable update").await;
+            require_still_open(&mut ws, "after an undecodable update").await;
+
+            // Break 2: an update naming a document this connection did not open.
+            let mut foreign = next_update_frame(&state, document_id).await;
+            if let Frame::Update {
+                document_id: ref mut named,
+                ..
+            } = foreign
+            {
+                *named = Uuid::new_v4();
+            }
+            send_frame(&mut ws, &foreign).await;
+            assert_eq!(
+                expect_rejection(recv_frame_or_close(&mut ws).await).code,
+                RejectedCode::InvalidUpdate
+            );
+
+            refuse_twice(&state, &mut ws, document_id, "after a foreign document id").await;
+            require_still_open(&mut ws, "after a foreign document id").await;
+
+            // Break 3: text that is not JSON at all. Refused *before* the frame is parsed, so
+            // this connection never learns whether it was an update — the class
+            // `collab-protocol-v1.md` names as having leaked, and the one that shares its
+            // statement with the rate-limited update this test cannot reach deterministically
+            // (reaching `update_rate` costs 20 admitted updates, each of which would itself
+            // resolve the streak long before the limiter fires).
+            send_raw_text(&mut ws, "{ this is not a frame".to_string()).await;
+            assert_eq!(
+                expect_rejection(recv_frame_or_close(&mut ws).await).code,
+                RejectedCode::InvalidUpdate
+            );
+
+            refuse_twice(&state, &mut ws, document_id, "after unparseable JSON").await;
+            require_still_open(&mut ws, "after unparseable JSON").await;
+
+            // Break 4: a frame past `websocket_frame_bytes_max`. Refused on length alone, before
+            // even the JSON parse above — the earliest layer that can answer at all.
+            send_raw_text(&mut ws, "x".repeat(WEBSOCKET_FRAME_BYTES_MAX + 1)).await;
+            let oversize = expect_rejection(recv_frame_or_close(&mut ws).await);
+            assert_eq!(oversize.code, RejectedCode::LimitExceeded);
+            assert_eq!(
+                oversize.details.expect("limit_exceeded carries details")["limit_kind"],
+                "websocket_frame_bytes"
+            );
+
+            refuse_twice(&state, &mut ws, document_id, "after an over-length frame").await;
+            require_still_open(&mut ws, "after an over-length frame").await;
+
+            // Break 5: a write that actually lands.
+            restore_user(&state, member_id).await;
+            let good = next_update_frame(&state, document_id).await;
+            send_frame(&mut ws, &good).await;
+            let Received::Frame(frame) = recv_frame_or_close(&mut ws).await else {
+                panic!("the session must still accept writes after six scattered refusals");
+            };
+            assert!(
+                matches!(*frame, Frame::Accepted { .. }),
+                "expected the restored write to be accepted, got {frame:?}"
+            );
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before + 1);
+
+            delete_user(&state, member_id).await;
+            refuse_twice(&state, &mut ws, document_id, "after an accepted update").await;
+            require_still_open(&mut ws, "after an accepted update").await;
+
+            // A `ping` is the one thing that must NOT break the run
+            // (`collab-protocol-v1.md`: "ping 不能当作客户端已恢复的证据"). The streak stands at
+            // two here; one more refusal after any number of pings is the third.
+            require_still_open(&mut ws, "pings do not reset").await;
+            require_still_open(&mut ws, "pings do not reset").await;
+            let last = next_update_frame(&state, document_id).await;
+            send_frame(&mut ws, &last).await;
+            assert_eq!(
+                expect_rejection(recv_frame_or_close(&mut ws).await).code,
+                RejectedCode::ServerRejected
+            );
+            let closed = recv_frame_or_close(&mut ws).await;
+            let Received::Closed(code) = closed else {
+                panic!("a ping must not have reset the run: expected the third refusal to close, got {closed:?}");
+            };
+            assert_eq!(code, Some(4500));
+
+            scratch.drop_self().await;
+        }
+
+        /// **The path the contract names first, and the only one a test can barely reach: an
+        /// update refused by the rate limiter.**
+        ///
+        /// `collab-protocol-v1.md` (2026-09-01) names `update_rate` as the first of the two leaks:
+        /// the limiter answers the update and returns before the write path ever sees it, so the
+        /// first implementation carried a run of permanent refusals straight across it.
+        ///
+        /// Reaching it while a run is standing is genuinely awkward, and the awkwardness is the
+        /// bug's camouflage: the limiter only fires once ~20 update tokens are spent, and *every*
+        /// spent token is an answered update that either ends the run or (at the third) closes the
+        /// connection. The way through is to stop trying to build a run first and instead
+        /// interleave — drain the bucket with updates that are refused before any database work,
+        /// then let it trickle back one token at a time so each admitted update is a permanent
+        /// refusal and the sends behind it are rate-limited.
+        ///
+        /// The distinguisher is then structural rather than temporal: **three permanent refusals
+        /// separated by rate-limited ones**. Correct behaviour treats each rate-limited update as
+        /// the answer it is, so the run restarts and the connection lives. A leak carries the
+        /// count across them, reaches three, and hangs up — which this test observes as a close
+        /// where a `rejected` frame was due.
+        ///
+        /// `collab_updates` is dropped so each admitted update is refused by the very first query
+        /// of the write path. That is not decoration: a refusal that took a hydrate + isolated
+        /// apply would spend more than the limiter's 100 ms-per-token refill, and the bucket would
+        /// never be empty when the next send arrived.
+        #[tokio::test]
+        async fn a_rate_limited_update_ends_the_run_like_any_other_answer() {
+            let scratch = scratch_or_skip!("server-rejected-ratelimit");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "server-rejected-ratelimit-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+
+            // Built up front: constructing one costs a query plus a CRDT export, which is far more
+            // wall-clock than the limiter's refill period -- doing it inside the loop would hand
+            // the bucket a fresh token before every send.
+            const ROUNDS: usize = 8;
+            const PER_ROUND: usize = 4;
+            let mut prepared = Vec::new();
+            for _ in 0..(ROUNDS * PER_ROUND) {
+                prepared.push(next_update_frame(&state, document_id).await);
+            }
+            state
+                .db
+                .execute_unprepared("DROP TABLE collab_updates CASCADE")
+                .await
+                .expect("the scratch schema can be broken");
+
+            // Drain the update bucket with frames refused before any database work at all
+            // (`update_burst_max` = 20). These are answered `invalid_update`, so the run is zero
+            // when the interesting part starts -- the test does not depend on carrying one in.
+            let mut drain = next_update_frame(&state, document_id).await;
+            if let Frame::Update { ref mut bytes, .. } = drain {
+                "not base64 ***".clone_into(bytes);
+            }
+            for _ in 0..UPDATE_BURST_MAX {
+                send_frame(&mut ws, &drain).await;
+            }
+            for _ in 0..UPDATE_BURST_MAX {
+                assert_eq!(
+                    expect_rejection(recv_frame_or_close(&mut ws).await).code,
+                    RejectedCode::InvalidUpdate,
+                    "the bucket drain must be refused before the write path, not by it"
+                );
+            }
+
+            // Three runs of permanent refusals separated by rate-limited ones is exactly the
+            // condition a leaking implementation closes on.
+            let mut seen = Interleaving::default();
+            let mut sent = 0usize;
+
+            'rounds: for _ in 0..ROUNDS {
+                // One token's worth plus a little; enough for roughly one admitted update per
+                // round, with the rest of the round's sends finding an empty bucket.
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                for _ in 0..PER_ROUND {
+                    send_frame(&mut ws, &prepared[sent]).await;
+                    sent += 1;
+                }
+                for _ in 0..PER_ROUND {
+                    let received = recv_frame_or_close(&mut ws).await;
+                    assert!(
+                        matches!(received, Received::Frame(_)),
+                        "the connection was closed at {seen:?} -- a rate-limited update is an answer, \
+                         so it must have ended the run rather than been carried across ({received:?})"
+                    );
+                    seen.record(expect_rejection(received));
+                }
+                if seen.groups >= REPEATED_FAILURE_CLOSE_STREAK {
+                    break 'rounds;
+                }
+            }
+
+            // Not a formality: if the interleaving never happened, the assertion above proved
+            // nothing and this test must say so rather than pass quietly.
+            assert!(
+                seen.groups >= REPEATED_FAILURE_CLOSE_STREAK,
+                "could not construct the interleaving this test exists to check: {seen:?}"
+            );
+            assert!(
+                seen.rate_limited >= 2,
+                "the runs must actually have been separated by the limiter: {seen:?}"
+            );
+
+            // Still open, after three runs of permanent refusals that a leak would have closed on.
+            let nonce = Uuid::new_v4().to_string();
+            send_frame(
+                &mut ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: nonce.clone(),
+                },
+            )
+            .await;
+            let Received::Frame(frame) = recv_frame_or_close(&mut ws).await else {
+                panic!("the connection must survive runs that a rate-limited update broke");
+            };
+            let Frame::Pong { nonce: echoed, .. } = *frame else {
+                panic!("expected a pong, got {frame:?}");
+            };
+            assert_eq!(echoed, nonce);
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+
+            scratch.drop_self().await;
+        }
+
+        /// **The other way in: a refusal that reaches the surface as an `Err`, not as a decided
+        /// rejection.**
+        ///
+        /// `write::accept_update` classifies the failures it recognises and returns them as
+        /// `Ok(Rejected)`, but a database error raised *outside* the locked phase — on the
+        /// `update_id` replay lookup, say — propagates through `?` as a plain `ApiError::Database`
+        /// with no verdict attached. `SQLSTATE` class 42 (a missing relation) is as permanent as
+        /// class 23, so this path has to make the same call, and it is a genuinely separate line
+        /// of code from the one the locked phase uses.
+        ///
+        /// Reproduced by removing `collab_updates` from this scratch database, which is what a
+        /// half-applied migration looks like from the session's point of view. Three in a row then
+        /// close at 4500 exactly as the locked-phase refusals do — the streak is a property of the
+        /// connection, not of which internal path decided the refusal.
+        #[tokio::test]
+        async fn a_schema_level_refusal_arriving_as_an_error_is_also_permanent_and_streaks() {
+            let scratch = scratch_or_skip!("server-rejected-schema");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "server-rejected-schema-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+
+            // Built while the table still exists; the update itself is perfectly valid.
+            let mut updates = Vec::new();
+            for _ in 0..3u32 {
+                updates.push(next_update_frame(&state, document_id).await);
+            }
+            state
+                .db
+                .execute_unprepared("DROP TABLE collab_updates CASCADE")
+                .await
+                .expect("the scratch schema can be broken");
+
+            for (attempt, update) in updates.iter().enumerate() {
+                let sent_update_id = update_id_of(update);
+                send_frame(&mut ws, update).await;
+                let Rejection {
+                    update_id,
+                    code,
+                    recoverable,
+                    write_state,
+                    details,
+                } = expect_rejection(recv_frame_or_close(&mut ws).await);
+                assert_eq!(
+                    code,
+                    RejectedCode::ServerRejected,
+                    "a missing relation cannot be fixed by retrying; refusal {} was reported as {code:?}",
+                    attempt + 1
+                );
+                assert_eq!(
+                    update_id,
+                    Some(sent_update_id),
+                    "the `Err` path must name the update it refused too"
+                );
+                assert!(!recoverable);
+                assert_eq!(write_state, crate::flow::collab::frame::WriteState::NotApplied);
+                assert_eq!(
+                    details.expect("carries its classification")["reason"],
+                    "deterministic_database_refusal"
+                );
+            }
+
+            let closed = recv_frame_or_close(&mut ws).await;
+            let Received::Closed(code) = closed else {
+                panic!("three consecutive permanent refusals must close the connection, got {closed:?}");
+            };
+            assert_eq!(code, Some(4500));
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+
+            scratch.drop_self().await;
+        }
+
+        /// **The regression this change is most likely to cause: transient contention misread as
+        /// permanent.**
+        ///
+        /// A real writer holding `FOR UPDATE` on this workspace's `flow_workspace_settings` row
+        /// blocks the locked phase's `authz_epoch` `FOR SHARE` fence until `lock_timeout`
+        /// (`document_lock_wait_ms_max` = 100 ms) cancels it — `SQLSTATE` `55P03`, which
+        /// `error::classify_sqlstate` classifies as transient, and which the bounded-rebase loop
+        /// spends `MAX_REBASE_ATTEMPTS` on before reporting recoverable
+        /// `server_draining{contention}`.
+        ///
+        /// That is exactly the shape a too-eager `server_rejected` would swallow: a lock timeout
+        /// is a database error raised inside the same locked phase as the constraint violation,
+        /// distinguishable *only* by `SQLSTATE`. Reported as permanent it would tell the client to
+        /// discard a write that the very next attempt accepts — which the second half of this test
+        /// then performs, over the same socket, to show the write was never impossible at all.
+        #[tokio::test]
+        async fn a_genuine_lock_timeout_stays_retryable_contention_and_is_never_server_rejected() {
+            use sea_orm::TransactionTrait;
+
+            let scratch = scratch_or_skip!("server-rejected-contention");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let client_id = "server-rejected-contention-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, head_seq_before) = open_session(addr, &ticket, client_id, document_id).await;
+
+            // A second, genuinely concurrent writer holds the row the epoch fence must read.
+            let blocker = state.db.begin().await.expect("blocking transaction opens");
+            blocker
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE",
+                    vec![workspace_id.into()],
+                ))
+                .await
+                .expect("the blocking lock is taken");
+
+            let update = next_update_frame(&state, document_id).await;
+            let sent_update_id = update_id_of(&update);
+            send_frame(&mut ws, &update).await;
+            let Rejection {
+                update_id,
+                code,
+                recoverable,
+                write_state,
+                details,
+            } = expect_rejection(recv_frame_or_close(&mut ws).await);
+
+            assert_eq!(
+                update_id,
+                Some(sent_update_id),
+                "a contention rejection must name its update as well"
+            );
+            assert_ne!(
+                code,
+                RejectedCode::ServerRejected,
+                "a lock timeout is transient; calling it permanent discards a write that would land \
+                 (details={details:?})"
+            );
+            assert_eq!(code, RejectedCode::ServerDraining);
+            assert!(recoverable, "contention is retryable by contract");
+            assert_eq!(write_state, crate::flow::collab::frame::WriteState::NotApplied);
+            let details = details.expect("`server_draining` must carry its required reason");
+            assert_eq!(details["reason"], "contention");
+            assert!(
+                details["retry_after_ms"].is_number(),
+                "the contention discriminator carries retry advice: {details:?}"
+            );
+
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq_before);
+
+            // The proof that it really was transient: with the blocker gone, the same socket
+            // commits the same kind of write.
+            blocker.rollback().await.expect("the blocking transaction rolls back");
+            let retry = next_update_frame(&state, document_id).await;
+            send_frame(&mut ws, &retry).await;
+            let Received::Frame(frame) = recv_frame_or_close(&mut ws).await else {
+                panic!("the retry of a contended write must be accepted once the contention clears");
+            };
+            let Frame::Accepted { head_seq, .. } = *frame else {
+                panic!("expected the retry to be accepted, got {frame:?}");
+            };
+            assert_eq!(head_seq, head_seq_before + 1);
 
             scratch.drop_self().await;
         }

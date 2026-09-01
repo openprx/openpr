@@ -57,7 +57,7 @@ use sea_orm::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ApiErrorKind};
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 use crate::flow::event_origin::CommandOrigin;
 use crate::flow::projection;
@@ -66,7 +66,7 @@ use super::authz::fence_epoch_for_share;
 use super::bootstrap::{self, content_hash};
 use super::cache::WarmCache;
 use super::coordinator::DocumentCoordinator;
-use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, WriteState, encode_bytes};
+use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, SERVER_REJECTED_REASON_DATABASE, WriteState, encode_bytes};
 use super::limits::{DOCUMENT_LOCK_HOLD_MS_MAX, DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS};
 use super::registry::SessionRegistry;
 use super::snapshot::{self, SnapshotAdvancer, Trigger};
@@ -226,6 +226,35 @@ impl TapReason for AcceptOutcome {
         tracing::warn!(reason, "collab write: contention, returning a recoverable rejection");
         self
     }
+}
+
+/// `error-mapping-v1.md`'s `server_rejected` row: a **deterministic, permanent** server-side
+/// refusal. This update will be refused identically on every attempt, so the wire says so once
+/// instead of dressing it as [`contention`] and instructing the client to keep trying — the exact
+/// disguise the contract's "永远不可能成功的失败,不得报成可重试" forbids.
+///
+/// `recoverable` is read off [`ApiErrorKind::ServerRejected`] rather than written as a literal
+/// here. The contract fixes it at `false`, and taking it from the one table that encodes the
+/// contract means this producer cannot drift away from what REST/MCP/CLI report for the same code.
+///
+/// `write_state` is an explicit argument for the same reason [`contention`]'s is: only the call
+/// site knows how far this update got before the refusal, and `collab-protocol-v1.md` forbids
+/// guessing it. `details` carries the safe classification `reason` and nothing else — never the
+/// driver's own error text, which is logged server-side instead.
+fn server_rejected(update_id: Option<Uuid>, reason: &'static str, write_state: WriteState) -> AcceptOutcome {
+    tracing::warn!(
+        reason,
+        "collab write: permanent server-side refusal; this update can never be accepted"
+    );
+    AcceptOutcome::Rejected(Rejected {
+        update_id,
+        code: RejectedCode::ServerRejected,
+        recoverable: ApiErrorKind::ServerRejected.recoverable(),
+        write_state,
+        details: Some(serde_json::json!({"reason": reason})),
+        current_seq: None,
+        current_frontier: None,
+    })
 }
 
 fn reject_from_collab_error(update_id: Option<Uuid>, err: &CollabError) -> AcceptOutcome {
@@ -608,7 +637,11 @@ enum LockedOutcome {
     /// Rolled back, nothing written, and deliberately *not* a [`Self::NotApplied`]: that variant
     /// feeds the bounded-rebase loop, and a deterministic refusal must leave the loop at once
     /// rather than be spent `MAX_REBASE_ATTEMPTS` times and then dressed up as `contention`.
-    Failed(ApiError),
+    ///
+    /// Carries no payload: the driver's error is logged where it is classified
+    /// ([`run_locked_phase`]) and must not travel any further, because the only thing left to do
+    /// with it is put it on a wire that `error-mapping-v1.md` forbids echoing it onto.
+    DeterministicRefusal,
 }
 
 /// What [`stage_locked_writes`] concluded, before `COMMIT` is issued.
@@ -902,7 +935,7 @@ async fn run_locked_phase(
                     error = %err,
                     "collab write: locked phase hit a deterministic database refusal, not retrying"
                 );
-                return LockedOutcome::Failed(err);
+                return LockedOutcome::DeterministicRefusal;
             }
             tracing::warn!(error = %err, "collab write: locked phase failed before commit, rolling back");
             return LockedOutcome::NotApplied("locked phase failed before commit");
@@ -944,9 +977,12 @@ async fn run_locked_phase(
 /// permit for `request.document_id`.
 ///
 /// # Errors
-/// Only for a database failure the caller cannot recover from by retrying the same request later
-/// (everything recoverable — contention, epoch mismatch, limit/decode rejection — comes back as
-/// `Ok(AcceptOutcome::Rejected(..))` instead).
+/// Only for a database failure with no decided verdict for the caller to act on. Every failure
+/// this path *has* classified — recoverable (contention, epoch mismatch, limit/decode rejection)
+/// and permanent alike (a deterministic database refusal, `RejectedCode::ServerRejected`) — comes
+/// back as `Ok(AcceptOutcome::Rejected(..))` carrying that verdict, because the surfaces above
+/// need the frozen `code`/`recoverable`/`write_state` triple and cannot re-derive it from an
+/// `ApiError`.
 // `_permit` is intentionally held for the entire bounded-rebase loop below, not dropped as soon
 // as it is last read: releasing it between rebase attempts would let a second writer for the same
 // document interleave mid-retry, which is exactly what the coordinator exists to prevent.
@@ -1014,26 +1050,45 @@ pub async fn accept_update(
                     // Same rule as the locked phase below: a deterministic refusal is reported as
                     // itself, never as a retryable `contention`.
                     //
-                    // ⚠️ **No test executes this branch.** Reaching it needs a document already at
-                    // a *hard* snapshot boundary (`SNAPSHOT_TAIL_UPDATES_HARD_MAX` = 1,024 tail
-                    // rows, or `SNAPSHOT_TAIL_BYTES_HARD_MAX` = 4 MiB) **and** a database error out
-                    // of `snapshot::advance` on top of that; a fabricated tail cheap enough to
-                    // build fails inside the candidate *build* (a decode error, not a database
-                    // one) before it can reach the write this arm is about. Verified by injecting
-                    // an unconditional `panic!` here: the full suite stayed green.
+                    // ⚠️ **No test executes this branch, and its behaviour changed on
+                    // 2026-09-01.** Reaching it needs a document already at a *hard* snapshot
+                    // boundary (`SNAPSHOT_TAIL_UPDATES_HARD_MAX` = 1,024 tail rows, or
+                    // `SNAPSHOT_TAIL_BYTES_HARD_MAX` = 4 MiB) **and** a database error out of
+                    // `snapshot::advance` on top of that; a fabricated tail cheap enough to build
+                    // fails inside the candidate *build* (a decode error, not a database one)
+                    // before it can reach the write this arm is about. Verified by injecting an
+                    // unconditional `panic!` here: the full suite stayed green.
+                    //
+                    // **What changed**: this arm used to `return Err(err)`, which the WebSocket
+                    // surface then dressed as retryable `server_draining{contention}` and the REST
+                    // surface rendered as an untyped `500 database error`. It now returns a
+                    // decided `Ok(server_rejected(..))` — a different `code`, a different
+                    // `recoverable`, a different REST envelope, and a contribution to the
+                    // connection's `server_rejected` streak that it never used to make. The
+                    // coverage did not change with it: it was zero before and it is zero now, so
+                    // this is a **behaviour change shipped unproven**, not merely an old blind
+                    // spot carried forward. Re-verified by mutation on 2026-09-01 (swapping this
+                    // back to `contention`): the whole suite stayed green.
                     //
                     // It is kept rather than dropped because the classification it applies is the
-                    // same one the locked phase applies and is exercised there — but the fact that
-                    // *this* call site is unproven is recorded here rather than left for a reader
-                    // to discover. It is production-reachable, not structurally dead: a real
-                    // `advance` failure at a real hard boundary lands here.
+                    // same one the locked phase applies, and *that* one is proven end to end
+                    // (`a_deterministic_constraint_violation_is_reported_once_not_retried_as_contention`
+                    // plus the live WebSocket tests). Production-reachable, not structurally dead:
+                    // a real `advance` failure at a real hard boundary lands here.
                     if err.is_deterministic_database_failure() {
                         tracing::warn!(
                             error = %err,
                             document_id = %request.document_id,
                             "collab write: forced snapshot checkpoint hit a deterministic database refusal"
                         );
-                        return Err(err);
+                        // Nothing of *this* update was staged: the hard trigger runs before the
+                        // update is even hydrated, and snapshot advancement never touches the
+                        // canonical head or the `collab_updates` tail.
+                        return Ok(server_rejected(
+                            Some(request.update_id),
+                            SERVER_REJECTED_REASON_DATABASE,
+                            WriteState::NotApplied,
+                        ));
                     }
                     tracing::warn!(
                         error = %err,
@@ -1142,7 +1197,19 @@ pub async fn accept_update(
                     WriteState::Unknown,
                 ));
             }
-            LockedOutcome::Failed(err) => return Err(err),
+            LockedOutcome::DeterministicRefusal => {
+                // Leaves the bounded-rebase loop on the *first* occurrence, by construction: this
+                // arm returns rather than falling through to the `attempts >= MAX_REBASE_ATTEMPTS`
+                // check the way `NotApplied` does. Retrying a constraint violation is pure loss,
+                // and spending the attempts first is what used to turn it into `contention`.
+                return Ok(server_rejected(
+                    Some(request.update_id),
+                    SERVER_REJECTED_REASON_DATABASE,
+                    // `run_locked_phase` issued an explicit `ROLLBACK` before returning this, and
+                    // no `COMMIT` was ever put on the wire for that transaction.
+                    WriteState::NotApplied,
+                ));
+            }
             LockedOutcome::NotApplied(reason) => {
                 if attempts >= MAX_REBASE_ATTEMPTS {
                     return Ok(contention(Some(request.update_id), reason, WriteState::NotApplied));
@@ -1307,7 +1374,7 @@ mod database_tests {
     use crate::flow::collab::bootstrap::fetch_update_range;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
-    use crate::flow::collab::frame::RejectedCode;
+    use crate::flow::collab::frame::{RejectedCode, SERVER_REJECTED_REASON_DATABASE, WriteState};
     use crate::flow::collab::registry::SessionRegistry;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
 
@@ -1511,10 +1578,11 @@ mod database_tests {
     /// a **retryable** verdict on a write that could never succeed, with the constraint name
     /// discarded. A client that believes it retries forever.
     ///
-    /// Note what is asserted: `Err`, i.e. the error is *reported*, not that it carries any
-    /// particular HTTP shape. The contract's requirement is that a permanent failure stops being
-    /// advertised as temporary; how `ApiError::Database` then renders is `error-mapping-v1.md`'s
-    /// business, not this module's.
+    /// What is asserted is the whole frozen `server_rejected` row as this path produces it
+    /// (`error-mapping-v1.md`, 2026-09-01): the stable `code`, `recoverable=false`, the required
+    /// `write_state`, and a `details` that classifies without echoing the driver's text. Before
+    /// `server_rejected` existed this could only assert `Err` — "the error is reported at all" —
+    /// because the vocabulary to say *what* had been decided did not exist on the wire.
     #[tokio::test]
     async fn a_deterministic_constraint_violation_is_reported_once_not_retried_as_contention() {
         let scratch = scratch_or_skip!("deterministic-refusal");
@@ -1569,16 +1637,39 @@ mod database_tests {
         .await;
 
         match outcome {
-            Err(err) => {
+            Ok(AcceptOutcome::Rejected(rejected)) => {
+                assert_eq!(
+                    rejected.code,
+                    RejectedCode::ServerRejected,
+                    "a permanent constraint violation must be reported as `server_rejected`, not as \
+                     {:?} (details={:?}) — reporting it as `server_draining`/`contention` is exactly \
+                     the disguise the contract forbids",
+                    rejected.code,
+                    rejected.details
+                );
                 assert!(
-                    err.is_deterministic_database_failure(),
-                    "the constraint violation must be classified as deterministic, got {err:?}"
+                    !rejected.recoverable,
+                    "`server_rejected` is never recoverable (`error-mapping-v1.md`: recoverable=false)"
+                );
+                assert_eq!(
+                    rejected.write_state,
+                    WriteState::NotApplied,
+                    "the locked phase rolled back before `COMMIT`, so the write provably did not land"
+                );
+                let details = rejected.details.as_ref().expect("`server_rejected` carries details");
+                assert_eq!(details["reason"], SERVER_REJECTED_REASON_DATABASE);
+                // "details 只含安全的分类信息,不回显驱动错误原文": the classification, and nothing
+                // that could carry the constraint name or the driver's message.
+                let object = details.as_object().expect("details is a JSON object");
+                assert_eq!(
+                    object.keys().collect::<Vec<_>>(),
+                    vec!["reason"],
+                    "details must carry the classification only, got {object:?}"
                 );
             }
-            Ok(AcceptOutcome::Rejected(rejected)) => panic!(
-                "a permanent constraint violation was reported as a retryable rejection \
-                 (code={:?}, details={:?}) — this is exactly the `contention` disguise the contract forbids",
-                rejected.code, rejected.details
+            Err(err) => panic!(
+                "a classified permanent refusal must come back as a decided rejection the wire can \
+                 render, not as an undifferentiated error: {err:?}"
             ),
             Ok(AcceptOutcome::Accepted(_)) => {
                 panic!("the write must not succeed: its actor has no `users` row")
@@ -3382,16 +3473,16 @@ mod database_tests {
                     "a committed write must leave the head it reported"
                 );
             }
-            super::LockedOutcome::Failed(ref err) => {
+            super::LockedOutcome::DeterministicRefusal => {
                 // A deterministic refusal is rolled back exactly as `NotApplied` is; the only
                 // difference is that it never re-enters the rebase loop.
                 assert_eq!(
                     rows, 0,
-                    "the locked phase failed deterministically (`{err}`), but the update is in collab_updates"
+                    "the locked phase refused deterministically, but the update is in collab_updates"
                 );
                 assert_eq!(
                     head_after, head_before,
-                    "the locked phase failed deterministically (`{err}`), but the canonical head moved"
+                    "the locked phase refused deterministically, but the canonical head moved"
                 );
             }
             super::LockedOutcome::NotApplied(reason) => {

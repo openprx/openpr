@@ -27,6 +27,17 @@ pub mod exit {
     pub const LIMIT: i32 = 8;
     pub const TEMPORARY: i32 = 9;
     pub const MISMATCH: i32 = 10;
+    /// A permanent server-side refusal (`server_rejected`), split off [`TEMPORARY`] on 2026-09-01
+    /// because `9` is defined table-wide as *temporary* and a caller reading only `$?` would retry
+    /// forever.
+    ///
+    /// `11` rather than `10`: the split first took `10`, which [`MISMATCH`] already held, so it
+    /// moved the ambiguity onto a different number instead of removing it. Every code the frozen
+    /// table allocates (`0`–`10`) is spoken for, so this is the first free one. It is now distinct
+    /// from **both** neighbours it could be confused with, which is the whole point — a script
+    /// reading only the status can tell "retry" (9), "the verify found a mismatch" (10) and "this
+    /// will never work" (11) apart.
+    pub const PERMANENT_REFUSAL: i32 = 11;
 }
 
 /// A typed `sylvode` failure: the stable `code`/`message`/`recoverable`/`details` the JSON
@@ -104,6 +115,12 @@ impl CliError {
             "policy_rejected" => Self::from_kind(ApiErrorKind::PolicyRejected, message, details),
             "limit_exceeded" => Self::from_kind(ApiErrorKind::LimitExceeded, message, details),
             "resync_required" => Self::from_kind(ApiErrorKind::ResyncRequired, message, details),
+            // Without this arm a `server_rejected` response falls through to the numeric
+            // fallback below, which has no `500` case and therefore reports it as
+            // `Self::network` -- stable code `server_draining`, `recoverable: true`. The exit
+            // code would still be 9 by coincidence, and every other channel a caller reads would
+            // be telling it to retry a write that can never succeed.
+            "server_rejected" => Self::from_kind(ApiErrorKind::ServerRejected, message, details),
             "server_draining" => Self::from_server_draining(&message, details),
             "checksum_mismatch" => Self::from_kind(ApiErrorKind::ChecksumMismatch, message, details),
             "unsupported_format" => Self::from_kind(ApiErrorKind::UnsupportedFormat, message, details),
@@ -296,6 +313,11 @@ mod tests {
             exit::INVALID
         );
         assert_eq!(
+            CliError::from_structured(typed(500, "server_rejected", None)).exit,
+            exit::PERMANENT_REFUSAL
+        );
+        assert_eq!(exit::PERMANENT_REFUSAL, 11);
+        assert_eq!(
             CliError::from_structured(typed(400, "unsupported_format", None)).exit,
             exit::INVALID
         );
@@ -384,5 +406,82 @@ mod tests {
     fn unrecognised_stable_code_falls_back_to_numeric_mapping() {
         let future_code = typed(404, "some_future_stable_code", None);
         assert_eq!(CliError::from_structured(future_code).exit, exit::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod server_rejected_tests {
+    use super::{CliError, exit};
+    use crate::cli_app::api_client::StructuredApiError;
+    use serde_json::json;
+
+    /// The whole point of the CLI mapping, in the one form a shell script can see.
+    ///
+    /// `error-mapping-v1.md` (2026-09-01) split `server_rejected` off exit `9` precisely because
+    /// `9` means "temporary" table-wide: a `bash` caller doing `sylvode ... || retry` has no JSON
+    /// to read, so sharing the number told it to retry a request that can never succeed. Both the
+    /// `code`/`recoverable` fields *and* the status have to say permanent, and the status is the
+    /// one a script actually reads.
+    #[test]
+    fn server_rejected_is_reported_as_permanent_and_not_as_a_temporary_service_failure() {
+        let error = CliError::from_structured(StructuredApiError {
+            code: Some(500),
+            message: "server_rejected".to_string(),
+            error_code: Some("server_rejected".to_string()),
+            details: Some(json!({"reason": "deterministic_database_refusal"})),
+        });
+
+        assert_eq!(error.code, "server_rejected");
+        assert!(
+            !error.recoverable,
+            "a permanent refusal must not be handed to a script as retryable"
+        );
+        assert_eq!(error.exit, exit::PERMANENT_REFUSAL);
+        assert_eq!(
+            error.details.get("reason").and_then(serde_json::Value::as_str),
+            Some("deterministic_database_refusal")
+        );
+
+        // The separation a `$?`-only caller depends on, over all three meanings that are easy to
+        // confuse. The first attempt at this split satisfied only the first of these two
+        // assertions, because it moved `server_rejected` onto the number `MISMATCH` already held.
+        let draining = CliError::from_structured(StructuredApiError {
+            code: Some(409),
+            message: "server_draining".to_string(),
+            error_code: Some("server_draining".to_string()),
+            details: Some(json!({"reason": "contention", "retry_after_ms": 200})),
+        });
+        assert_eq!(draining.exit, exit::TEMPORARY);
+        assert_ne!(
+            error.exit, draining.exit,
+            "a script that only reads the exit status must be able to tell `retry` from `never`"
+        );
+        assert_ne!(
+            error.exit,
+            exit::MISMATCH,
+            "and must be able to tell `never` from a verify command that ran fine and found a mismatch"
+        );
+        assert_ne!(draining.exit, exit::MISMATCH);
+        // Stated as the three-way property rather than three separate numbers, so a future
+        // reallocation that collapses any pair goes red here.
+        let mut allocated = [exit::TEMPORARY, exit::MISMATCH, exit::PERMANENT_REFUSAL];
+        allocated.sort_unstable();
+        assert_eq!(
+            allocated,
+            [9, 10, 11],
+            "temporary / verify-mismatch / permanent-refusal must be three distinct exit codes"
+        );
+
+        // The shape it used to fall into before the mapping arm existed: `network()`'s
+        // temporary-failure report, exit 9, recoverable.
+        let unrecognised = CliError::from_structured(StructuredApiError {
+            code: Some(500),
+            message: "boom".to_string(),
+            error_code: Some("some_future_code".to_string()),
+            details: None,
+        });
+        assert_eq!(unrecognised.code, "server_draining");
+        assert!(unrecognised.recoverable);
+        assert_eq!(unrecognised.exit, exit::TEMPORARY);
     }
 }

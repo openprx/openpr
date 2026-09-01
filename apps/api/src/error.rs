@@ -272,6 +272,12 @@ impl ServerDrainingReason {
     }
 }
 
+/// How many *consecutive* rejections of the same kind end the connection, for the codes that keep
+/// it on a single rejection (`error-mapping-v1.md`/`collab-protocol-v1.md`, both spelling it
+/// "连续 3 次"). Paired with [`ApiErrorKind::repeated_failure_close_code`], which says *with which
+/// close code*.
+pub const REPEATED_FAILURE_CLOSE_STREAK: u32 = 3;
+
 /// Stable, transport-independent error discriminant -- one variant per frozen "Stable semantic"
 /// row of `contracts/error-mapping-v1.md`'s "稳定错误的五层映射" table, plus [`Self::Unclassified`]
 /// for the pre-existing string-typed [`ApiError`] variants this type is layered on top of without
@@ -300,6 +306,18 @@ pub enum ApiErrorKind {
     PolicyRejected,
     LimitExceeded,
     ResyncRequired,
+    /// A deterministic, permanent **server-side** refusal: the operation will be refused
+    /// identically on every attempt, so advertising it as retryable is a lie the caller acts on
+    /// (`error-mapping-v1.md`, 2026-09-01: "永远不可能成功的失败,不得报成可重试").
+    ///
+    /// Distinct from [`Self::InvalidUpdate`]/[`Self::LimitExceeded`], which also never succeed on
+    /// a retry but name a *caller-side* cause the caller can fix; and from
+    /// [`Self::ServerDraining`], which names a *transient* server state a retry does clear. This
+    /// variant is the one that says "the server refused, permanently, and it was not your input".
+    ///
+    /// Producers must keep its `details` to safe classification only -- the contract forbids
+    /// echoing the driver's own error text back to a caller.
+    ServerRejected,
     /// Carries the required `reason` discriminant (`error-mapping-v1.md`: "`server_draining.
     /// details.reason` 在 REST、MCP、CLI 与 WS control/close metadata 中都是 required") --
     /// deliberately part of the enum's own shape, not a side-channel string, so a caller cannot
@@ -328,6 +346,7 @@ impl ApiErrorKind {
             Self::PolicyRejected => "policy_rejected",
             Self::LimitExceeded => "limit_exceeded",
             Self::ResyncRequired => "resync_required",
+            Self::ServerRejected => "server_rejected",
             Self::ServerDraining(_) => "server_draining",
             Self::ChecksumMismatch => "checksum_mismatch",
             Self::UnsupportedFormat => "unsupported_format",
@@ -341,10 +360,13 @@ impl ApiErrorKind {
     /// [`Self::Unclassified`] returns `500` as a conservative placeholder; it is never actually
     /// read for that variant because [`ApiError::into_response`] only calls this method inside
     /// the `Typed` arm, and legacy variants compute their own status directly.
+    /// [`Self::ServerRejected`] shares the number for a real reason rather than a placeholder one
+    /// (`error-mapping-v1.md`: "`Internal` / 500 / HTTP 200"); the two are one arm only because
+    /// `clippy::match_same_arms` forbids writing the identical body twice.
     #[must_use]
     pub const fn http_status_code(self) -> i32 {
         match self {
-            Self::Unclassified => 500,
+            Self::Unclassified | Self::ServerRejected => 500,
             Self::Unauthenticated => 401,
             Self::Forbidden | Self::FeatureDisabled | Self::PolicyRejected => 403,
             Self::NotFound => 404,
@@ -373,6 +395,7 @@ impl ApiErrorKind {
             Self::PolicyRejected => "policy rejected",
             Self::LimitExceeded => "limit exceeded",
             Self::ResyncRequired => "resync required",
+            Self::ServerRejected => "server rejected",
             Self::ServerDraining(ServerDrainingReason::Drain) => "server draining",
             Self::ServerDraining(ServerDrainingReason::Contention) => "server busy",
             Self::ChecksumMismatch => "checksum mismatch",
@@ -393,9 +416,25 @@ impl ApiErrorKind {
             Self::StaleFrontier | Self::ResyncRequired => 6,
             Self::UnsupportedProtocol | Self::InvalidUpdate | Self::ChecksumMismatch | Self::UnsupportedFormat => 7,
             Self::LimitExceeded => 8,
-            // Both reasons share exit 9 (`error-mapping-v1.md`: "两种 reason 不拆退出码，JSON 保留
-            // discriminator") -- the discriminator survives in the JSON body's `details.reason`,
-            // not in the exit code.
+            // `server_rejected` is deliberately **not** 9 (`error-mapping-v1.md`, 2026-09-01).
+            // 9's meaning in that table is "draining/network/**temporary** service failure —— 仅
+            // 临时，读到它即可安全重试", so sharing it handed a permanent request defect to every
+            // caller that reads only `$?` as a network blip to retry — reintroducing, at the
+            // shell, exactly the infinite retry this code exists to end. A JSON discriminator
+            // cannot reach a caller consuming an exit status, so the split has to be in the
+            // number itself.
+            //
+            // And **not 10 either**, which is where the split first landed: `10` was already
+            // "verify/integrity 命令执行成功但发现不一致" in the same table, so that move only
+            // carried the ambiguity onto a different number instead of removing it
+            // (`error-mapping-v1.md`, 2026-09-01 二次订正). `11` is the first code the frozen set
+            // 0–10 leaves free. The lesson the contract records with it is the one worth keeping:
+            // enumerate the whole allocated set before taking a number, rather than reading the
+            // neighbouring rows.
+            Self::ServerRejected => 11,
+            // Both `server_draining` reasons *do* share 9 ("两种 reason 不拆退出码，JSON 保留
+            // discriminator"), and that sharing is sound where the split above is not: both
+            // reasons are retryable, so it never crosses the boundary `$?` is read for.
             Self::ServerDraining(_) => 9,
         }
     }
@@ -424,7 +463,44 @@ impl ApiErrorKind {
             | Self::StaleFrontier
             | Self::InvalidUpdate
             | Self::ResyncRequired
+            // `server_rejected` refuses the *update*, not the session: the contract's own reason
+            // is that killing a healthy connection turns one local failure into a full reconnect.
+            // Its close is the repeated-failure one below, never a single-rejection close.
+            | Self::ServerRejected
             | Self::ServerDraining(ServerDrainingReason::Contention)
+            | Self::ChecksumMismatch
+            | Self::UnsupportedFormat => None,
+        }
+    }
+
+    /// The WS close code used when the *same* rejection repeats [`REPEATED_FAILURE_CLOSE_STREAK`]
+    /// times in a row, for the two codes whose contract row keeps the connection on a single
+    /// rejection but gives up after a streak: `invalid_update` ("连续 3 次后 4400") and
+    /// `server_rejected` ("保持连接；**连续 3 次**关闭 4500").
+    ///
+    /// Deliberately *not* folded into [`Self::ws_close_code`]: that method answers "what code does
+    /// this rejection close with", and for both of these the answer on any single rejection is
+    /// "it does not close at all". Merging them would make a one-off `invalid_update` look like a
+    /// connection-terminating event to every caller of that method.
+    ///
+    /// `4500` rather than another `44xx` because the meaning is server-side and not the caller's
+    /// fault (`collab-protocol-v1.md`: "4500 取自 5xx 语义...44xx 段已分配至 4410").
+    #[must_use]
+    pub const fn repeated_failure_close_code(self) -> Option<u16> {
+        match self {
+            Self::InvalidUpdate => Some(4400),
+            Self::ServerRejected => Some(4500),
+            Self::Unclassified
+            | Self::Unauthenticated
+            | Self::Forbidden
+            | Self::FeatureDisabled
+            | Self::NotFound
+            | Self::UnsupportedProtocol
+            | Self::StaleFrontier
+            | Self::PolicyRejected
+            | Self::LimitExceeded
+            | Self::ResyncRequired
+            | Self::ServerDraining(_)
             | Self::ChecksumMismatch
             | Self::UnsupportedFormat => None,
         }
@@ -448,6 +524,8 @@ impl ApiErrorKind {
             | Self::InvalidUpdate
             | Self::PolicyRejected
             | Self::LimitExceeded
+            // `error-mapping-v1.md`: "recoverable=**false**" -- fixed, not context-dependent.
+            | Self::ServerRejected
             | Self::ChecksumMismatch
             | Self::UnsupportedFormat => false,
         }
@@ -471,6 +549,7 @@ impl ApiErrorKind {
             Self::PolicyRejected => "flow.error.policy_rejected",
             Self::LimitExceeded => "flow.error.limit_exceeded",
             Self::ResyncRequired => "flow.error.resync_required",
+            Self::ServerRejected => "flow.error.server_rejected",
             Self::ServerDraining(ServerDrainingReason::Drain) => "flow.error.server_draining.drain",
             Self::ServerDraining(ServerDrainingReason::Contention) => "flow.error.server_draining.contention",
             Self::ChecksumMismatch => "flow.error.checksum_mismatch",
@@ -552,6 +631,20 @@ impl ApiError {
 
     pub fn invalid_update(message: impl Into<String>) -> Self {
         Self::typed(ApiErrorKind::InvalidUpdate, message)
+    }
+
+    /// A deterministic, permanent server-side refusal, carrying only the safe classification
+    /// `reason` (`error-mapping-v1.md`: "details 只含安全的分类信息,不回显驱动错误原文" -- the
+    /// driver's own text is logged server-side and never travels).
+    ///
+    /// Field name `reason` reuses the spelling `server_draining` already froze, per the contract's
+    /// own "不为同一个概念造第二种拼写".
+    pub fn server_rejected(reason: &str) -> Self {
+        Self::typed_with_details(
+            ApiErrorKind::ServerRejected,
+            "server_rejected",
+            json!({ "reason": reason }),
+        )
     }
 
     /// `invalid_update` carrying a machine-readable `details.reason`.
@@ -734,5 +827,156 @@ impl IntoResponse for ApiError {
                 Self::legacy_response(500, "database error", "database error")
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod server_rejected_row_tests {
+    use super::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK, ServerDrainingReason};
+
+    /// `error-mapping-v1.md`'s `server_rejected` row, transcribed cell by cell.
+    ///
+    /// Every number here is frozen contract, and none of them is derivable from the others — a
+    /// wrong `cli_exit_code` or a wrong close code is invisible to any behavioural test that does
+    /// not happen to read that particular cell, which is why the row is pinned as a row.
+    #[test]
+    fn the_server_rejected_row_matches_the_frozen_contract_cell_for_cell() {
+        let kind = ApiErrorKind::ServerRejected;
+
+        // | `server_rejected` | `Internal` / 500 / HTTP 200 | ... | 11 | ... |
+        assert_eq!(kind.stable_code(), "server_rejected");
+        assert_eq!(kind.http_status_code(), 500);
+        // 11, not 9 and not 10: see `cli_exit_code`. A caller that reads only the status must
+        // not be told "temporary" about a refusal that is permanent (9), and must not be unable to
+        // tell it from a verify command that ran fine and found a mismatch (10).
+        assert_eq!(kind.cli_exit_code(), 11);
+        assert_ne!(
+            kind.cli_exit_code(),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Drain).cli_exit_code(),
+            "sharing 9 with server_draining is what made a shell retry a permanent refusal"
+        );
+        // `10` has a frozen meaning of its own in the same table. No `ApiErrorKind` produces it
+        // (it belongs to a verify command's own outcome, not to an error), so it is written as a
+        // literal here on purpose: this asserts the *number* stays free of this code, which is the
+        // thing the second correction was about.
+        assert_ne!(
+            kind.cli_exit_code(),
+            10,
+            "10 is `verify/integrity 命令执行成功但发现不一致`; taking it moved the ambiguity rather \
+             than removing it"
+        );
+        assert_eq!(kind.ui_key(), "flow.error.server_rejected");
+        // "recoverable=**false**" -- fixed by the contract, not context-dependent.
+        assert!(!kind.recoverable());
+        // "保持连接；**连续 3 次**关闭 4500": no close on a single rejection...
+        assert_eq!(kind.ws_close_code(), None);
+        // ...and 4500 only after the streak.
+        assert_eq!(kind.repeated_failure_close_code(), Some(4500));
+        assert_eq!(REPEATED_FAILURE_CLOSE_STREAK, 3);
+    }
+
+    /// The confusion this code exists to end: `server_draining` says "try again",
+    /// `server_rejected` says "this will never work". A client that reads the wrong one either
+    /// gives up on a write that would have landed, or retries one that never will.
+    ///
+    /// The exit code is part of that separation as of 2026-09-01: `server_rejected` is `11` and
+    /// `server_draining` is `9`, because `9` is defined for the whole CLI as *temporary* and a
+    /// caller reading only `$?` has no JSON to disambiguate with.
+    ///
+    /// One cell still does **not** separate them, and assuming it does is how a consumer ends up
+    /// telling the two apart by accident: `ws_close_code` is `None` for both `server_rejected` and
+    /// `server_draining{contention}` — neither closes on a single rejection, so **close behaviour
+    /// is not a discriminator** until a streak has accumulated.
+    #[test]
+    fn server_rejected_is_separable_from_server_draining_on_every_channel_a_client_branches_on() {
+        let rejected = ApiErrorKind::ServerRejected;
+        for draining in [
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Drain),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
+        ] {
+            assert_ne!(rejected, draining);
+            assert_ne!(rejected.stable_code(), draining.stable_code());
+            assert_ne!(rejected.ui_key(), draining.ui_key());
+            assert_ne!(
+                rejected.recoverable(),
+                draining.recoverable(),
+                "{draining:?} is retryable and server_rejected is not; collapsing that is the whole defect"
+            );
+            assert_ne!(
+                rejected.repeated_failure_close_code(),
+                draining.repeated_failure_close_code(),
+                "only server_rejected gives up on the connection after a streak"
+            );
+            assert_ne!(
+                rejected.cli_exit_code(),
+                draining.cli_exit_code(),
+                "a shell reading only the exit status must be able to tell a permanent refusal \
+                 from a temporary one"
+            );
+        }
+        // Spelled out rather than left implicit: on a single rejection, close behaviour tells a
+        // client nothing about which of these two it just received.
+        assert_eq!(
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention).ws_close_code(),
+            rejected.ws_close_code()
+        );
+        assert_ne!(
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Drain).ws_close_code(),
+            rejected.ws_close_code()
+        );
+    }
+
+    /// `repeated_failure_close_code` answers a different question from `ws_close_code`, and the
+    /// two must not be conflated: the codes that have a streak close have *no* single-rejection
+    /// close, and every code that closes on a single rejection has no streak close.
+    #[test]
+    fn a_streak_close_code_exists_exactly_where_a_single_rejection_close_does_not() {
+        for kind in [ApiErrorKind::InvalidUpdate, ApiErrorKind::ServerRejected] {
+            assert_eq!(kind.ws_close_code(), None, "{kind:?} must not close on one rejection");
+            assert!(
+                kind.repeated_failure_close_code().is_some(),
+                "{kind:?} must close after a streak"
+            );
+        }
+        assert_eq!(ApiErrorKind::InvalidUpdate.repeated_failure_close_code(), Some(4400));
+        for kind in [
+            ApiErrorKind::Unauthenticated,
+            ApiErrorKind::Forbidden,
+            ApiErrorKind::FeatureDisabled,
+            ApiErrorKind::NotFound,
+            ApiErrorKind::UnsupportedProtocol,
+            ApiErrorKind::LimitExceeded,
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Drain),
+            ApiErrorKind::StaleFrontier,
+            ApiErrorKind::ResyncRequired,
+            ApiErrorKind::PolicyRejected,
+            ApiErrorKind::ChecksumMismatch,
+            ApiErrorKind::UnsupportedFormat,
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
+            ApiErrorKind::Unclassified,
+        ] {
+            assert_eq!(
+                kind.repeated_failure_close_code(),
+                None,
+                "{kind:?} has no streak close in the frozen table"
+            );
+        }
+    }
+
+    /// "details 只含安全的分类信息，不回显驱动错误原文": the constructor must carry the
+    /// classification and refuse to become a channel for anything else.
+    #[test]
+    fn the_constructor_carries_only_the_classification_reason() {
+        let err = ApiError::server_rejected("deterministic_database_refusal");
+        assert_eq!(err.kind(), ApiErrorKind::ServerRejected);
+        let ApiError::Typed { details, message, .. } = err else {
+            panic!("server_rejected must be a typed error");
+        };
+        assert_eq!(message, "server_rejected");
+        let details = details.expect("carries details");
+        let object = details.as_object().expect("details is an object");
+        assert_eq!(object.keys().collect::<Vec<_>>(), vec!["reason"]);
+        assert_eq!(object["reason"], "deterministic_database_refusal");
     }
 }

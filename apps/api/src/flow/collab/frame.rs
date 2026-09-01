@@ -57,8 +57,23 @@ pub enum RejectedCode {
     PolicyRejected,
     LimitExceeded,
     ResyncRequired,
+    /// A deterministic, permanent server-side refusal of **this one update**
+    /// (`collab-protocol-v1.md`, 2026-09-01). `recoverable` is always `false` and the connection
+    /// is kept: what is permanently refused is the update, not the session.
+    ServerRejected,
     ServerDraining,
 }
+
+/// The one `server_rejected.details.reason` value this package produces: the database refused the
+/// write with a `SQLSTATE` that classifies as deterministic (`error::classify_sqlstate`) -- a
+/// constraint violation, a data exception, or a schema error.
+///
+/// `error-mapping-v1.md` freezes no `details` shape for `server_rejected` beyond "只含安全的分类
+/// 信息,不回显驱动错误原文", so this is a *classification*, deliberately coarse: it names the
+/// family the refusal belongs to and nothing a caller could use to read back the offending data,
+/// the constraint name, or the driver's message. The field name reuses the `reason` spelling
+/// `server_draining` already froze (contract: "不为同一个概念造第二种拼写").
+pub const SERVER_REJECTED_REASON_DATABASE: &str = "deterministic_database_refusal";
 
 /// `rejected.write_state` — the required "did the server change anything?" discriminant
 /// (`collab-protocol-v1.md`, 2026-08-30: "`recoverable` 只回答「能不能重试」，不回答「服务端状态改了
@@ -280,6 +295,17 @@ mod tests {
         assert_eq!(
             serde_json::to_value(RejectedCode::ServerDraining).unwrap(),
             json!("server_draining")
+        );
+        // The 2026-09-01 addition. `server_rejected` and `server_draining` share a prefix and
+        // opposite recovery semantics, so a wire value that drifted onto the wrong one of the two
+        // would be the single most damaging typo in this enum.
+        assert_eq!(
+            serde_json::to_value(RejectedCode::ServerRejected).unwrap(),
+            json!("server_rejected")
+        );
+        assert_ne!(
+            serde_json::to_value(RejectedCode::ServerRejected).unwrap(),
+            serde_json::to_value(RejectedCode::ServerDraining).unwrap()
         );
         assert_eq!(
             serde_json::to_value(DrainReason::Contention).unwrap(),
