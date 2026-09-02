@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://openpr.local/schemas/sylvode-flow-binary-provenance-v1.schema.json",
+  "title": "Sylvode Flow deployed binary provenance result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "checked_at",
+    "source_head",
+    "source_dirty",
+    "deployment",
+    "binary",
+    "build_metadata_available",
+    "build_metadata",
+    "build_metadata_error",
+    "container_identity",
+    "status",
+    "reason",
+    "passed"
+  ],
+  "properties": {
+    "schema_version": { "const": "openpr.flow.binary-provenance.v1" },
+    "checked_at": { "type": "string", "format": "date-time" },
+    "source_head": { "type": ["string", "null"] },
+    "source_dirty": { "type": ["boolean", "null"] },
+    "deployment": { "type": "object" },
+    "binary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "sha256", "error"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "sha256": { "type": ["string", "null"] },
+        "error": { "type": ["string", "null"] }
+      }
+    },
+    "build_metadata_available": { "type": "boolean" },
+    "build_metadata": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "git_commit", "git_dirty", "git_committer_date", "source"],
+          "properties": {
+            "schema_version": { "type": "string" },
+            "git_commit": { "type": ["string", "null"] },
+            "git_dirty": {},
+            "git_committer_date": {
+              "type": ["string", "null"],
+              "format": "date-time"
+            },
+            "source": { "type": ["string", "null"] }
+          }
+        }
+      ]
+    },
+    "build_metadata_error": { "type": ["string", "null"] },
+    "container_identity": { "type": ["object", "null"] },
+    "status": {
+      "enum": [
+        "passed",
+        "source_head_missing",
+        "source_clean_unproven",
+        "source_dirty",
+        "producer_unspecified",
+        "binary_unavailable",
+        "binary_digest_malformed",
+        "build_metadata_unavailable",
+        "build_metadata_malformed",
+        "build_source_unknown",
+        "source_head_mismatch"
+      ]
+    },
+    "reason": { "type": "string", "minLength": 1 },
+    "passed": { "type": "boolean" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "status": { "const": "passed" } },
+        "required": ["status"]
+      },
+      "then": {
+        "properties": {
+          "source_head": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+          "source_dirty": { "const": false },
+          "binary": {
+            "properties": {
+              "available": { "const": true },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+            }
+          },
+          "build_metadata_available": { "const": true },
+          "build_metadata": {
+            "type": "object",
+            "properties": {
+              "schema_version": { "const": "openpr.build-info.v1" },
+              "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "git_dirty": { "const": false },
+              "git_committer_date": { "type": "string", "format": "date-time" },
+              "source": { "enum": ["git", "environment"] }
+            }
+          },
+          "passed": { "const": true }
+        }
+      }
+    }
+  ]
+}

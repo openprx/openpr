@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
 
@@ -96,6 +97,105 @@ def load_json(path: str):
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def validate_deployed_binary_provenance(
+    evidence_root: str, repo_root: str, gates: dict, reasons: dict
+) -> bool:
+    """Independently reject a deployed artifact whose binary identity is absent or stale."""
+    path = os.path.join(evidence_root, "deployed-chain-websocket-result.json")
+    data = load_json(path)
+    if not isinstance(data, dict):
+        return False
+
+    failures = []
+    self_test = data.get("self_test")
+    if not isinstance(self_test, dict):
+        failures.append("binary provenance self-test record missing")
+    elif self_test.get("ran") is not True:
+        failures.append("binary provenance self-test did not run")
+    else:
+        if self_test.get("exit") != 0:
+            failures.append(f"binary provenance self-test exit is {self_test.get('exit')!r}")
+        duration_ms = self_test.get("duration_ms")
+        if not isinstance(duration_ms, int) or isinstance(duration_ms, bool) or duration_ms < 0:
+            failures.append("binary provenance self-test duration is missing or malformed")
+    provenance = data.get("binary_provenance")
+    if not isinstance(provenance, dict):
+        failures.append("binary_provenance object missing")
+        provenance = {}
+    binary = provenance.get("binary")
+    metadata = provenance.get("build_metadata")
+    source_head = data.get("source_head")
+    current = subprocess.run(
+        ["git", "-C", repo_root, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    current_head = current.stdout.strip() if current.returncode == 0 else None
+    current_status = subprocess.run(
+        ["git", "-C", repo_root, "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if not isinstance(source_head, str) or re.fullmatch(r"[0-9a-f]{40}", source_head) is None:
+        failures.append("artifact source_head missing or malformed")
+    elif source_head != current_head:
+        failures.append("artifact source_head does not match verifier repo HEAD")
+    if current_status.returncode != 0 or current_status.stdout.strip():
+        failures.append("verifier source tree is dirty or cleanliness is unproven")
+    if data.get("source_dirty") is not False:
+        failures.append("artifact does not prove a clean source tree")
+    if provenance.get("schema_version") != "openpr.flow.binary-provenance.v1":
+        failures.append("binary provenance schema missing or wrong")
+    if provenance.get("status") != "passed" or provenance.get("passed") is not True:
+        failures.append(f"binary provenance status is {provenance.get('status')!r}")
+    if not isinstance(binary, dict) or binary.get("available") is not True:
+        failures.append("deployed binary unavailable")
+    elif not isinstance(binary.get("sha256"), str) or re.fullmatch(r"[0-9a-f]{64}", binary["sha256"]) is None:
+        failures.append("deployed binary sha256 missing or malformed")
+    if provenance.get("build_metadata_available") is not True or not isinstance(metadata, dict):
+        failures.append("build metadata unavailable")
+    else:
+        if metadata.get("schema_version") != "openpr.build-info.v1":
+            failures.append("build metadata schema missing or wrong")
+        if metadata.get("source") not in ("git", "environment"):
+            failures.append("build metadata source unknown")
+        if (
+            not isinstance(metadata.get("git_committer_date"), str)
+            or re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+                metadata["git_committer_date"],
+            )
+            is None
+        ):
+            failures.append("build metadata committer date missing or malformed")
+        if metadata.get("git_dirty") is not False:
+            failures.append("binary clean build is unproven")
+        if metadata.get("git_commit") != source_head:
+            failures.append("binary commit does not match artifact source_head")
+        if metadata.get("git_commit") != current_head:
+            failures.append("binary commit does not match verifier repo HEAD")
+    provenance_check = next(
+        (
+            item
+            for item in data.get("checks", [])
+            if isinstance(item, dict) and item.get("name") == "binary_provenance_matches_source_head"
+        ),
+        None,
+    )
+    if not isinstance(provenance_check, dict) or provenance_check.get("passed") is not True:
+        failures.append("binary provenance check missing or failed")
+
+    gate_name = "deployed_chain_websocket_upgrade"
+    if failures:
+        gates[gate_name] = "failed"
+        reasons[gate_name] = f"{os.path.basename(path)}: " + "; ".join(failures)
+        return False
+    return True
 
 
 class EvidenceFormatError(Exception):
@@ -595,7 +695,9 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
     # ---- deployed three-hop WebSocket verifier: backs 1 gate ----
     # A missing/unreachable real deployment is written as an explicit failed
     # verdict. The bridge copies it verbatim; wiring can never make the gate
-    # green without all 13 live checks passing.
+    # green without all 14 live checks passing. Then independently re-check
+    # the binary digest/build metadata/source-HEAD relation so hand-editing the
+    # producer's gate status cannot turn stale deployment evidence green.
     bridge_verifier_gates(
         evidence_root,
         "deployed-chain-websocket-result.json",
@@ -603,6 +705,7 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         gates,
         reasons,
     )
+    validate_deployed_binary_provenance(evidence_root, repo_root, gates, reasons)
 
     # ---- frontend v0.4 aggregate: backs 4 web gates ----
     # Per-gate status is based only on failed automated checks. Named skips

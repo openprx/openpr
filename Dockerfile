@@ -2,6 +2,9 @@
 
 FROM rust:1-bookworm AS builder
 ARG APP_BIN
+ARG OPENPR_BUILD_GIT_COMMIT=unknown
+ARG OPENPR_BUILD_GIT_DIRTY=unknown
+ARG OPENPR_BUILD_GIT_COMMITTER_DATE=unknown
 WORKDIR /work
 
 # Install build dependencies
@@ -19,8 +22,13 @@ COPY apps apps
 COPY crates crates
 COPY migrations migrations
 
-# Build the specified binary
-RUN cargo build --release -p ${APP_BIN}
+# The Docker build context excludes .git. Release automation must pass all three
+# provenance args; omitted metadata stays explicit "unknown" and is rejected by
+# the deployed provenance gate rather than being mistaken for a clean build.
+RUN OPENPR_BUILD_GIT_COMMIT="${OPENPR_BUILD_GIT_COMMIT}" \
+    OPENPR_BUILD_GIT_DIRTY="${OPENPR_BUILD_GIT_DIRTY}" \
+    OPENPR_BUILD_GIT_COMMITTER_DATE="${OPENPR_BUILD_GIT_COMMITTER_DATE}" \
+    cargo build --release -p ${APP_BIN}
 
 # Runtime stage
 FROM debian:bookworm-slim

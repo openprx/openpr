@@ -60,8 +60,14 @@ set -euo pipefail
 #                    so a deployment that does not log them fails the correlation
 #                    checks rather than silently skipping them.
 #
-# WHAT IS ACTUALLY MEASURED (13 checks; `passed` is the AND of all of them):
+# WHAT IS ACTUALLY MEASURED (14 checks; `passed` is the AND of all of them):
 #
+#   binary_provenance_matches_source_head
+#                                      the exact API binary in the named API
+#                                      container is sha256-hashed and queried
+#                                      with --build-info; its embedded clean
+#                                      commit must equal this artifact's source
+#                                      HEAD. Missing/unknown metadata is red.
 #   chain_argument_matches_deployment  --chain names, in order, equal the hop names.
 #   public_endpoint_tls_hostname       real TLS handshake to the published hostname,
 #                                      certificate verified and hostname-matched (SNI
@@ -211,6 +217,32 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
+
+# The frozen v0.4 command ledger already invokes this deployed verifier. Keep
+# the provenance self-test on that required-command path so a broken checker,
+# build-info constant, recompute bridge, or container probe cannot be bypassed
+# merely because nobody remembered to run its standalone test script.
+SELF_TEST_RAN=false
+SELF_TEST_RC_JSON=null
+SELF_TEST_DURATION_MS_JSON=null
+if [[ "${FLOW_BINARY_PROVENANCE_SELF_TESTED:-0}" != 1 ]]; then
+  SELF_TEST_RAN=true
+  SELF_TEST_STARTED_NS="$(date +%s%N)"
+  set +e
+  SELF_TEST_OUTPUT="$("$ROOT_DIR/scripts/test-flow-binary-provenance.sh" 2>&1)"
+  SELF_TEST_RC=$?
+  set -e
+  SELF_TEST_DURATION_MS=$((($(date +%s%N) - SELF_TEST_STARTED_NS) / 1000000))
+  SELF_TEST_RC_JSON=$SELF_TEST_RC
+  SELF_TEST_DURATION_MS_JSON=$SELF_TEST_DURATION_MS
+  if [[ $SELF_TEST_RC -ne 0 ]]; then
+    echo "FAIL: binary provenance self-test failed exit=$SELF_TEST_RC duration_ms=$SELF_TEST_DURATION_MS" >&2
+    echo "$SELF_TEST_OUTPUT" >&2
+    exit 2
+  fi
+  echo "PASS: binary provenance self-test is wired through required_commands.deployed_chain_websocket_upgrade duration_ms=$SELF_TEST_DURATION_MS" >&2
+  echo "$SELF_TEST_OUTPUT" >&2
+fi
 if [[ -z "$DEPLOYMENT_PATH" ]]; then
   DEPLOYMENT_PATH="$REPO_ROOT/deploy/flow-deployed-websocket.json"
 fi
@@ -220,14 +252,42 @@ SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 SOURCE_DIRTY=false
 if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then SOURCE_DIRTY=true; fi
 
-python3 - "$DEPLOYMENT_PATH" "$CHAIN" "$EVIDENCE_ROOT" "$SOURCE_HEAD" "$SOURCE_DIRTY" "$IDLE_SECONDS" <<'PYEOF'
+set +e
+PROVENANCE_JSON="$("$ROOT_DIR/scripts/verify-flow-binary-provenance.sh" \
+  --json --repo-root "$REPO_ROOT" --deployment "$DEPLOYMENT_PATH")"
+PROVENANCE_RC=$?
+set -e
+if [[ $PROVENANCE_RC -eq 2 ]]; then
+  echo "FAIL: binary provenance checker could not run" >&2
+  exit 2
+fi
+
+python3 - "$DEPLOYMENT_PATH" "$CHAIN" "$EVIDENCE_ROOT" "$SOURCE_HEAD" "$SOURCE_DIRTY" "$IDLE_SECONDS" \
+  "$PROVENANCE_JSON" "$SELF_TEST_RAN" "$SELF_TEST_RC_JSON" "$SELF_TEST_DURATION_MS_JSON" <<'PYEOF'
 import base64, hashlib, json, os, re, socket, ssl, subprocess, sys, time, uuid
 import urllib.request, urllib.error
 from datetime import datetime, timezone
 
-DEPLOYMENT_PATH, CHAIN, EVIDENCE_ROOT, SOURCE_HEAD, SOURCE_DIRTY, IDLE_SECONDS = sys.argv[1:7]
+(
+    DEPLOYMENT_PATH,
+    CHAIN,
+    EVIDENCE_ROOT,
+    SOURCE_HEAD,
+    SOURCE_DIRTY,
+    IDLE_SECONDS,
+    PROVENANCE_JSON,
+    SELF_TEST_RAN,
+    SELF_TEST_EXIT,
+    SELF_TEST_DURATION_MS,
+) = sys.argv[1:11]
 IDLE_SECONDS = int(IDLE_SECONDS)
 CHAIN_NAMES = [p.strip() for p in CHAIN.split(",") if p.strip()]
+PROVENANCE = json.loads(PROVENANCE_JSON)
+SELF_TEST = {
+    "ran": SELF_TEST_RAN == "true",
+    "exit": None if SELF_TEST_EXIT == "null" else int(SELF_TEST_EXIT),
+    "duration_ms": None if SELF_TEST_DURATION_MS == "null" else int(SELF_TEST_DURATION_MS),
+}
 
 # `contracts/limits-v1.md`: warm_cache_idle_ttl_seconds = 120. The gate's "document idle TTL".
 IDLE_TTL_SECONDS = 120
@@ -253,7 +313,7 @@ def write_evidence(payload, ok):
         "deployed_chain_websocket_upgrade": {
             "status": "passed" if ok else "failed",
             "reason": (
-                "all 13 deployed-chain WebSocket checks passed"
+                "all 14 deployed-chain WebSocket checks passed"
                 if ok else "failed checks: %s" % (", ".join(failed_checks) or "verifier did not complete")
             ),
         }
@@ -289,9 +349,20 @@ def bail(reason, detail):
         "source_dirty": SOURCE_DIRTY == "true",
         "requested_chain": CHAIN_NAMES,
         "deployment_descriptor": DEPLOYMENT_PATH,
+        "self_test": SELF_TEST,
+        "binary_provenance": PROVENANCE,
         "checks": checks,
         "notes": notes,
     }, False)
+
+check(
+    "binary_provenance_matches_source_head",
+    PROVENANCE.get("passed") is True and PROVENANCE.get("status") == "passed",
+    PROVENANCE.get("reason", "binary provenance checker returned no reason"),
+    status=PROVENANCE.get("status"),
+    binary_sha256=(PROVENANCE.get("binary") or {}).get("sha256"),
+    build_metadata=PROVENANCE.get("build_metadata"),
+)
 
 # ---------------------------------------------------------------- descriptor
 if not os.path.isfile(DEPLOYMENT_PATH):
@@ -914,6 +985,8 @@ write_evidence({
     "source_head": SOURCE_HEAD,
     "source_dirty": SOURCE_DIRTY == "true",
     "deployment_descriptor": DEPLOYMENT_PATH,
+    "self_test": SELF_TEST,
+    "binary_provenance": PROVENANCE,
     "requested_chain": CHAIN_NAMES,
     "public_url": public_url,
     "public_websocket_url": WSS_URL,

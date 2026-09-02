@@ -17,6 +17,7 @@ use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, Transac
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Duration;
 use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
@@ -27,20 +28,37 @@ struct HealthResponse {
     service: String,
 }
 
+#[derive(Serialize)]
+struct BuildInfo {
+    schema_version: &'static str,
+    git_commit: Option<&'static str>,
+    git_dirty: Option<bool>,
+    git_committer_date: Option<&'static str>,
+    source: &'static str,
+}
+
 /// Command line surface of the API binary.
 ///
-/// The only thing the process accepts from outside the configuration file is where that file is.
+/// The process accepts a configuration path or a side-effect-free build identity query.
 #[derive(Parser)]
 #[command(name = "api", about = "OpenPR API server")]
 struct Args {
     /// Path to the configuration file. Defaults to config/openpr.toml
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Print embedded build provenance as JSON and exit before loading configuration.
+    #[arg(long)]
+    build_info: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.build_info {
+        write_build_info()?;
+        return Ok(());
+    }
     let config = OpenPrConfig::load(args.config.as_deref())?;
     // Installed before the logger so that a configuration this process cannot publish aborts
     // startup rather than leaving half the service reading the fallback settings.
@@ -1810,6 +1828,60 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(drain_then_shutdown())
         .await?;
     Ok(())
+}
+
+fn write_build_info() -> anyhow::Result<()> {
+    let info = embedded_build_info();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, &info)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
+fn embedded_build_info() -> BuildInfo {
+    let commit = env!("OPENPR_EMBEDDED_GIT_COMMIT");
+    let dirty = env!("OPENPR_EMBEDDED_GIT_DIRTY");
+    let committer_date = env!("OPENPR_EMBEDDED_GIT_COMMITTER_DATE");
+    BuildInfo {
+        schema_version: "openpr.build-info.v1",
+        git_commit: (commit != "unknown").then_some(commit),
+        git_dirty: embedded_git_dirty(dirty),
+        git_committer_date: (committer_date != "unknown").then_some(committer_date),
+        source: env!("OPENPR_EMBEDDED_PROVENANCE_SOURCE"),
+    }
+}
+
+fn embedded_git_dirty(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod build_info_tests {
+    use super::{embedded_build_info, embedded_git_dirty};
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn embedded_build_info_preserves_dirty_true() {
+        assert_eq!(embedded_git_dirty("true"), Some(true));
+        if std::env::var_os("OPENPR_PROVENANCE_VERIFY_GIT_DIRTY").is_some() {
+            let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["status", "--porcelain", "--untracked-files=normal"])
+                .output()
+                .expect("git status must be executable for the targeted provenance test");
+            assert!(status.status.success());
+            assert!(!status.stdout.is_empty(), "targeted test requires a dirty fixture");
+            assert_eq!(embedded_build_info().git_dirty, Some(true));
+        }
+    }
 }
 
 /// Graceful shutdown: the production trigger for `server_draining` with
