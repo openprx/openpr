@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sole supported writer for the four v0.5 manual-signoff rows. The shared jq
+# Sole supported writer for the two v0.5 manual-signoff rows. The shared jq
 # program recomputes all derived receipt state after an atomic row update.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,14 +14,16 @@ EVIDENCE_NOTE=""
 FORCE=0
 DRY_RUN=0
 STATE_LIBRARY="$ROOT_DIR/scripts/lib/flow_gate_v0_5_receipt_state.jq"
-VALID_KEYS="audit_causation multi_user offline_recovery permission_revocation"
+# ADR-0017: multi_user and offline_recovery moved to gates/vF-frontend-gate.yaml.
+VALID_KEYS="audit_causation permission_revocation"
 VALID_STATUSES="pending passed failed needs_rework"
 
 usage() {
   cat <<'EOF'
 Usage: scripts/record-flow-v0.5-manual-signoff.sh --key KEY --status STATUS --reviewer NAME --evidence NOTE [OPTIONS]
 
-Keys: audit_causation, multi_user, offline_recovery, permission_revocation
+Keys: audit_causation, permission_revocation
+      (multi_user and offline_recovery moved to the frontend track, ADR-0017)
 Statuses: pending, passed, failed, needs_rework
 
 Options:
@@ -85,7 +87,7 @@ if ! jq -e '
   echo "FAIL: gate-result has malformed receipt-state collections" >&2
   exit 2
 fi
-EXPECTED_KEYS='["audit_causation","multi_user","offline_recovery","permission_revocation"]'
+EXPECTED_KEYS='["audit_causation","permission_revocation"]'
 if [[ "$(jq -c '.manual_signoffs|keys' "$GATE_RESULT_PATH")" != "$EXPECTED_KEYS" ]]; then
   echo "FAIL: manual_signoffs keys do not exactly match the v0.5 contract" >&2
   exit 2

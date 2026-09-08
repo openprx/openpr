@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # v0.5 final gate. Automated truth comes only from the independent verifier.
-# Strict mode requires all four manual rows passed. --allow-pending permits
+# Strict mode requires both manual rows passed. --allow-pending permits
 # only the handoff state where automation is green and every manual row is
 # either passed or pending; failed/needs_rework is never accepted.
 
@@ -14,7 +14,8 @@ GATE_YAML=""
 GATE_RESULT_PATH=""
 ALLOW_PENDING=0
 JSON_MODE=0
-MANUAL_KEYS="audit_causation multi_user offline_recovery permission_revocation"
+# ADR-0017: multi_user and offline_recovery moved to gates/vF-frontend-gate.yaml.
+MANUAL_KEYS="audit_causation permission_revocation"
 
 usage() {
   cat <<'EOF'

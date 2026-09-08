@@ -14,6 +14,16 @@ def manual_pending:
   [.manual_signoffs | to_entries[] | select(.value.status == "pending") |
     "manual-signoff-pending:" + .key];
 
+# ADR-0017: page_editor / navigator_a11y moved to the frontend track.  The rows
+# stay in the artifact so the deferral is visible and auditable; they are not
+# "passed" and must never be counted as such.  Only the two keys named by
+# ADR-0017 may hold this status -- the schema enforces that structurally, so a
+# bad criterion (feature_flag) cannot be laundered through it.
+def manual_deferred:
+  [.manual_signoffs | to_entries[] |
+    select(.value.status == "deferred_to_frontend_track") |
+    "manual-signoff-deferred:" + .key];
+
 def manual_blocking:
   [.manual_signoffs | to_entries[] |
     select(.value.status == "failed" or .value.status == "needs_rework") |
@@ -38,11 +48,14 @@ def source_blocking:
 
 (check_failures + hard_gate_failures + manual_blocking + uncovered_environment + source_blocking) as $blocking
 | manual_pending as $pending
+| manual_deferred as $deferred
 | .counts.automated = (.checks | length)
 | .counts.passed = ([.checks[] | select(.status == "passed")] | length)
 | .counts.failed = ([.checks[] | select(.status == "failed")] | length)
 | .counts.environment_unavailable = ([.checks[] | select(.status == "environment_unavailable")] | length)
 | .counts.manual_pending = ($pending | length)
+| .counts.manual_deferred_to_frontend_track = ($deferred | length)
+| .deferred_signoffs = $deferred
 | .blockers = ($blocking + $pending)
 | .counts.unresolved = (.blockers | length)
 | .gate_passed = (.blockers | length == 0)

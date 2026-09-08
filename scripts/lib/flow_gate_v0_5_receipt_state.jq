@@ -3,12 +3,15 @@
 # report-flow-v0.5-json.sh and record-flow-v0.5-manual-signoff.sh are the two
 # writers of gate-result.json.  Both apply this program so blockers, counts,
 # mode, candidate readiness and final acceptance cannot drift between writers.
-# verify-flow-v0.5-json.sh also uses the same 32-entry wiring table while
+# verify-flow-v0.5-json.sh also uses the same 31-entry wiring table while
 # independently rebuilding artifact states from files on disk.
 
 def flow_gate_wiring:
   {
-    rest_mcp_cli_ui_surface_parity:
+    # ADR-0017: the UI face moved to the frontend track
+    # (gates/vF-frontend-gate.yaml#ui_surface_parity_v0_5). This asserts
+    # REST/MCP/CLI parity only -- three-face parity does not imply four-face.
+    rest_mcp_cli_surface_parity:
       {artifact:"surface_coverage_result", top_level_fallback:true},
     mcp_default_rest_coverage_three_adr_threat_exceptions_only:
       {artifact:"surface_coverage_result", top_level_fallback:true},
@@ -20,8 +23,9 @@ def flow_gate_wiring:
       {artifact:"collab_architecture_result", top_level_fallback:false},
     warm_cache_eviction_restart_semantic_equivalence:
       {artifact:"collab_architecture_result", top_level_fallback:false},
-    offline_accepted_zero_loss_and_recovery_draft:
-      {artifact:"offline_recovery_result", top_level_fallback:true},
+    # ADR-0017: offline_accepted_zero_loss_and_recovery_draft moved to the
+    # frontend track with its offline_recovery_result artifact. Its evidence is
+    # the IndexedDB outbox and the recovery draft, both browser-only.
     token_expiry_and_permission_revocation:
       {artifact:"authz_result", top_level_fallback:false},
     permission_inheritance_and_break:
@@ -64,7 +68,8 @@ def flow_gate_wiring:
       {artifact:"mcp_cli_equivalence_result", top_level_fallback:false},
     legacy_search_contract_unchanged:
       {artifact:"search_contract_result", top_level_fallback:false},
-    mcp_cli_web_semantic_equivalence:
+    # ADR-0017: web face -> gates/vF-frontend-gate.yaml#web_semantic_equivalence_v0_5
+    mcp_cli_semantic_equivalence:
       {artifact:"mcp_cli_equivalence_result", top_level_fallback:false},
     tool_registry_expected_119_or_rebased:
       {artifact:"mcp_cli_equivalence_result", top_level_fallback:false},

@@ -30,7 +30,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECEIPT_STATE_FILTER="$ROOT_DIR/scripts/lib/flow_gate_v0_4_receipt_state.jq"
 
 VALID_KEYS="page_editor navigator_a11y restart_recovery feature_flag forms_regression"
-VALID_STATUSES="pending passed failed needs_rework"
+VALID_STATUSES="pending passed failed needs_rework deferred_to_frontend_track"
+# ADR-0017: only these two rows may hold deferred_to_frontend_track. Every other
+# row rejects it, so a criterion that is merely broken (feature_flag) cannot be
+# retired through the frontend track.
+DEFERRABLE_KEYS="page_editor navigator_a11y"
 
 usage() {
   local key_count
@@ -43,14 +47,19 @@ manual_signoffs block. This is the only script allowed to write that block.
 
 Keys (sylvode-flow-gate-v0.4.schema.json manual_signoffs):
   page_editor            Page editor manual review (v0.4 content commands
-                          exercised through the real editor UI)
-  navigator_a11y          Navigator keyboard/a11y equivalence review
+                          exercised through the real editor UI).
+                          ADR-0017: moved to the frontend track; seeded as
+                          deferred_to_frontend_track.
+  navigator_a11y          Navigator keyboard/a11y equivalence review.
+                          ADR-0017: moved to the frontend track; seeded as
+                          deferred_to_frontend_track.
   restart_recovery         Server restart / snapshot-tail recovery review
   feature_flag             Flow feature-flag navigation + direct-URL review
   forms_regression          Forms UI regression review (no degradation from
                           Flow landing alongside existing Forms)
 
-Statuses: pending, passed, failed, needs_rework
+Statuses: pending, passed, failed, needs_rework,
+          deferred_to_frontend_track (page_editor / navigator_a11y only)
 
 Required options:
   --key KEY           One of the ${key_count} keys above.
@@ -146,6 +155,17 @@ done
 if [[ $STATUS_VALID -ne 1 ]]; then
   echo "FAIL: invalid status: $STATUS_VALUE (valid: $VALID_STATUSES)" >&2
   exit 1
+fi
+
+if [[ "$STATUS_VALUE" == "deferred_to_frontend_track" ]]; then
+  DEFERRABLE=0
+  for k in $DEFERRABLE_KEYS; do
+    [[ "$KEY" == "$k" ]] && DEFERRABLE=1
+  done
+  if [[ $DEFERRABLE -ne 1 ]]; then
+    echo "FAIL: status deferred_to_frontend_track is only valid for: $DEFERRABLE_KEYS (ADR-0017); got key $KEY" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -f "$GATE_RESULT_PATH" ]]; then

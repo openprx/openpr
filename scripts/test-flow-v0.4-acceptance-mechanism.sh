@@ -45,8 +45,8 @@ jq -n '{
   },
   artifacts: {},
   manual_signoffs: {
-    page_editor:{status:"pending",reviewer:"",evidence:""},
-    navigator_a11y:{status:"pending",reviewer:"",evidence:""},
+    page_editor:{status:"deferred_to_frontend_track",reviewer:"",evidence:"ADR-0017"},
+    navigator_a11y:{status:"deferred_to_frontend_track",reviewer:"",evidence:"ADR-0017"},
     restart_recovery:{status:"pending",reviewer:"",evidence:""},
     feature_flag:{status:"pending",reviewer:"",evidence:""},
     forms_regression:{status:"pending",reviewer:"",evidence:""}
@@ -54,18 +54,25 @@ jq -n '{
   blockers: []
 }' | jq -f "$STATE_FILTER" > "$BASE"
 
-assert_jq "pre-signoff receipt has the five real pending blockers" \
-  '.mode == "pre_signoff" and .gate_passed == false and .counts.manual_pending == 5 and .counts.unresolved == 5 and (.blockers | length) == 5' "$BASE"
+assert_jq "pre-signoff receipt has the three real pending blockers after ADR-0017" \
+  '.mode == "pre_signoff" and .gate_passed == false and .counts.manual_pending == 3 and .counts.unresolved == 3 and (.blockers | length) == 3' "$BASE"
+
+# ADR-0017 must defer, not launder: the two moved rows stay visible in the
+# artifact, are counted separately, and are never reported as passed.
+assert_jq "deferred rows stay visible, are counted, and are not passed" \
+  '.counts.manual_deferred_to_frontend_track == 2
+   and (.deferred_signoffs | sort) == ["manual-signoff-deferred:navigator_a11y","manual-signoff-deferred:page_editor"]
+   and ([.manual_signoffs[] | select(.status == "passed")] | length) == 0' "$BASE"
 
 FAILED="$TMP_DIR/failed.json"
 jq '.checks[0].status="failed" | .checks[0].exit_code=1' "$BASE" | jq -f "$STATE_FILTER" > "$FAILED"
 assert_jq "an automated failure is named in blockers and blocks the receipt" \
-  '.mode == "blocked" and .gate_passed == false and .counts.failed == 1 and .counts.unresolved == 6 and (.blockers | index("automated-check-failed:generic.test_mcp")) != null' "$FAILED"
+  '.mode == "blocked" and .gate_passed == false and .counts.failed == 1 and .counts.unresolved == 4 and (.blockers | index("automated-check-failed:generic.test_mcp")) != null' "$FAILED"
 
 DIRTY="$TMP_DIR/dirty.json"
 jq '.source={dirty:true}' "$BASE" | jq -f "$STATE_FILTER" > "$DIRTY"
 assert_jq "a dirty source is explicit and cannot claim release after signoff" \
-  '.mode == "blocked" and .gate_passed == false and (.blockers | index("source-dirty")) != null and .counts.unresolved == 6' "$DIRTY"
+  '.mode == "blocked" and .gate_passed == false and (.blockers | index("source-dirty")) != null and .counts.unresolved == 4' "$DIRTY"
 
 ENV_COVERED="$TMP_DIR/environment-covered.json"
 jq '.checks[0].status="environment_unavailable" | .checks[0].exit_code=69' "$BASE" | jq -f "$STATE_FILTER" > "$ENV_COVERED"
@@ -81,12 +88,34 @@ PENDING="$TMP_DIR/pending.json"
 cp "$BASE" "$PENDING"
 RELEASE="$TMP_DIR/release.json"
 cp "$BASE" "$RELEASE"
-for key in page_editor navigator_a11y restart_recovery feature_flag forms_regression; do
+for key in restart_recovery feature_flag forms_regression; do
   "$RECORD_SCRIPT" --gate-result "$RELEASE" --key "$key" --status passed \
     --reviewer "acceptance-test" --evidence "synthetic:$key" >/dev/null
 done
-assert_jq "five real record transitions reach release and clear every derived blocker" \
-  '.mode == "release" and .gate_passed == true and .counts.manual_pending == 0 and .counts.unresolved == 0 and .blockers == [] and ([.manual_signoffs[].status] | all(. == "passed"))' "$RELEASE"
+assert_jq "three real record transitions reach release and clear every derived blocker" \
+  '.mode == "release" and .gate_passed == true and .counts.manual_pending == 0 and .counts.unresolved == 0 and .blockers == []
+   and ([.manual_signoffs | to_entries[] | select(.key != "page_editor" and .key != "navigator_a11y") | .value.status] | all(. == "passed"))
+   and .counts.manual_deferred_to_frontend_track == 2' "$RELEASE"
+
+# The deferral must not become a way to retire a criterion that is merely
+# broken. feature_flag is exactly that case (ADR-0017 section 4), so the writer
+# must refuse it.
+set +e
+# Point at a real receipt so a refusal can only come from the key/status rule,
+# not from a missing file (that would exit 2, not 1).
+LAUNDER="$TMP_DIR/launder.json"
+cp "$BASE" "$LAUNDER"
+"$RECORD_SCRIPT" --gate-result "$LAUNDER" --key feature_flag \
+  --status deferred_to_frontend_track --reviewer "acceptance-test" \
+  --evidence "synthetic" > "$TMP_DIR/launder.log" 2>&1
+LAUNDER_EXIT=$?
+set -e
+[[ $LAUNDER_EXIT -eq 1 ]] || fail "deferring feature_flag exit=$LAUNDER_EXIT, expected 1"
+jq -e '.manual_signoffs.feature_flag.status == "pending"' "$LAUNDER" >/dev/null \
+  || fail "refused deferral still mutated the receipt"
+grep -Fq "only valid for: page_editor navigator_a11y" "$TMP_DIR/launder.log" \
+  || fail "deferring feature_flag was refused for the wrong reason"
+echo "PASS: deferred_to_frontend_track is refused for every key ADR-0017 did not name"
 
 # Run the actual gate aggregator with only its automated verifier replaced by a
 # deterministic green stub. This isolates and proves the manual-state/exit-code

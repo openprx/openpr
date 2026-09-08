@@ -12,7 +12,7 @@ set -euo pipefail
 # Unlike the old structural failure where a missing producer prevented any
 # gate-result.json from existing, this report always writes an honest blocked
 # receipt for semantic non-pass states. Malformed JSON/tool/usage remains exit
-# 2. The shared jq library owns the 32 gate wiring and all derived receipt
+# 2. The shared jq library owns the 31 gate wiring and all derived receipt
 # state.
 #
 # Exit codes: 0 = automated candidate rule satisfied (manual rows may remain
@@ -89,8 +89,8 @@ if [[ ! -f "$STATE_LIBRARY" ]]; then
   echo "FAIL: shared receipt-state library not found: $STATE_LIBRARY" >&2
   exit 2
 fi
-if ! jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; flow_gate_wiring | length == 32' >/dev/null; then
-  echo "FAIL: shared v0.5 gate wiring is malformed or not exactly 32 entries" >&2
+if ! jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; flow_gate_wiring | length == 31' >/dev/null; then
+  echo "FAIL: shared v0.5 gate wiring is malformed or not exactly 31 entries" >&2
   exit 2
 fi
 mkdir -p "$EVIDENCE_ROOT/logs"
@@ -119,8 +119,8 @@ YAML_HARD_GATES="$(yaml_map_json hard_gates | jq 'with_entries(.value="pending")
 PREDECESSOR_REQUIREMENT="$(yaml_map_json required_predecessor)"
 SOURCE_BASELINE="$(yaml_map_json source_baseline)"
 
-if [[ "$(jq 'length' <<<"$YAML_HARD_GATES")" -ne 32 ]]; then
-  echo "FAIL: $GATE_YAML hard_gates count is not 32" >&2
+if [[ "$(jq 'length' <<<"$YAML_HARD_GATES")" -ne 31 ]]; then
+  echo "FAIL: $GATE_YAML hard_gates count is not 31" >&2
   exit 2
 fi
 WIRING_KEYS="$(jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; flow_gate_wiring | keys')"
@@ -307,8 +307,8 @@ ARTIFACT_STATES="$(jq -cn -L "$ROOT_DIR/scripts/lib" --argjson inputs "$ARTIFACT
 HARD_GATES="$(jq -cn -L "$ROOT_DIR/scripts/lib" --argjson states "$ARTIFACT_STATES" \
   'include "flow_gate_v0_5_receipt_state"; flow_compute_hard_gates($states)')"
 if ! jq -e --argjson expected "$(jq 'keys' <<<"$YAML_HARD_GATES")" \
-  'length==32 and keys==$expected' >/dev/null <<<"$HARD_GATES"; then
-  echo "FAIL: computed hard gates do not exactly match the 32 YAML keys" >&2
+  'length==31 and keys==$expected' >/dev/null <<<"$HARD_GATES"; then
+  echo "FAIL: computed hard gates do not exactly match the 31 YAML keys" >&2
   exit 2
 fi
 
@@ -424,8 +424,6 @@ BASE_RECEIPT="$(jq -cn \
     artifacts:$artifacts,artifact_states:$artifact_states,artifact_wiring:$wiring,
     hard_gates:$hard_gates,predecessor:$predecessor,budgets:$budgets,
     manual_signoffs:{
-      multi_user:{status:"pending",reviewer:"",evidence:""},
-      offline_recovery:{status:"pending",reviewer:"",evidence:""},
       permission_revocation:{status:"pending",reviewer:"",evidence:""},
       audit_causation:{status:"pending",reviewer:"",evidence:""}
     },

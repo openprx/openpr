@@ -832,10 +832,10 @@
       ],
       "properties": {
         "page_editor": {
-          "$ref": "#/$defs/manual_entry"
+          "$ref": "#/$defs/manual_entry_deferrable"
         },
         "navigator_a11y": {
-          "$ref": "#/$defs/manual_entry"
+          "$ref": "#/$defs/manual_entry_deferrable"
         },
         "restart_recovery": {
           "$ref": "#/$defs/manual_entry"
@@ -970,6 +970,33 @@
         },
         "sha256": {
           "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "manual_entry_deferrable": {
+      "description": "ADR-0017: only page_editor and navigator_a11y may carry deferred_to_frontend_track. Every other manual row uses manual_entry, whose enum has no such value, so a bad criterion cannot be laundered through this status.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reviewer",
+        "evidence"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "pending",
+            "passed",
+            "failed",
+            "needs_rework",
+            "deferred_to_frontend_track"
+          ]
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
         }
       }
     },

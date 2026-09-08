@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # This command runs no product action. It independently reloads the v0.5 YAML,
 # evidence files, producer availability, source identity/dirty scope,
-# predecessor and named budgets; recomputes all 32 gate verdicts; verifies log
+# predecessor and named budgets; recomputes all 31 gate verdicts; verifies log
 # and artifact checksums; and compares every derived receipt field. Honest
 # blocked receipts can be internally consistent but still exit 1.
 #
@@ -25,7 +25,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/verify-flow-v0.5-json.sh GATE_RESULT_JSON [OPTIONS]
 
-Independently recomputes all 32 v0.5 gate states from on-disk evidence.
+Independently recomputes all 31 v0.5 gate states from on-disk evidence.
 
 Options:
   --evidence-root DIR   Artifact/log root. Default:
@@ -115,9 +115,9 @@ YAML_HARD_GATES="$(yaml_map_json hard_gates | jq 'with_entries(.value="pending")
 PREDECESSOR_REQUIREMENT="$(yaml_map_json required_predecessor)"
 SOURCE_BASELINE="$(yaml_map_json source_baseline)"
 WIRING="$(jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; flow_gate_wiring')"
-if [[ "$(jq 'length' <<<"$YAML_HARD_GATES")" -ne 32 ]] || \
+if [[ "$(jq 'length' <<<"$YAML_HARD_GATES")" -ne 31 ]] || \
    ! jq -e --argjson wiring "$(jq 'keys' <<<"$WIRING")" 'keys==$wiring' >/dev/null <<<"$YAML_HARD_GATES"; then
-  echo "FAIL: YAML hard_gates and shared 32-entry wiring do not match" >&2
+  echo "FAIL: YAML hard_gates and shared 31-entry wiring do not match" >&2
   exit 2
 fi
 
@@ -168,7 +168,8 @@ for section in artifacts required_commands hard_gates; do
   actual="$(jq ".$section|keys" "$GATE_RESULT_PATH")"
   [[ "$actual" == "$expected" ]] || add_drift "$section keys do not exactly match v0.5-gate.yaml"
 done
-MANUAL_KEYS='["audit_causation","multi_user","offline_recovery","permission_revocation"]'
+# ADR-0017: multi_user and offline_recovery moved to the frontend track.
+MANUAL_KEYS='["audit_causation","permission_revocation"]'
 [[ "$(jq -c '.manual_signoffs|keys' "$GATE_RESULT_PATH")" == "$MANUAL_KEYS" ]] || add_drift "manual_signoffs keys mismatch"
 while IFS= read -r manual_key; do
   manual_status="$(jq -r --arg k "$manual_key" '.manual_signoffs[$k].status // "missing"' "$GATE_RESULT_PATH")"

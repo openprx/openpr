@@ -539,8 +539,8 @@ jq -n \
     hard_gates: $hard_gates,
     artifacts: $artifacts,
     manual_signoffs: {
-      page_editor: {status:"pending", reviewer:"", evidence:""},
-      navigator_a11y: {status:"pending", reviewer:"", evidence:""},
+      page_editor: {status:"deferred_to_frontend_track", reviewer:"", evidence:"ADR-0017: gates/vF-frontend-gate.yaml#page_editor"},
+      navigator_a11y: {status:"deferred_to_frontend_track", reviewer:"", evidence:"ADR-0017: gates/vF-frontend-gate.yaml#navigator_a11y"},
       restart_recovery: {status:"pending", reviewer:"", evidence:""},
       feature_flag: {status:"pending", reviewer:"", evidence:""},
       forms_regression: {status:"pending", reviewer:"", evidence:""}

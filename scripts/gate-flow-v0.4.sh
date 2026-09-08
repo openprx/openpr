@@ -38,8 +38,10 @@ Usage: scripts/gate-flow-v0.4.sh --json [--allow-pending] [OPTIONS]
 Aggregates the verified v0.4 report with the recorded manual signoffs.
 Strict mode (default) exits 0 only when every automated hard gate
 (verified independently via scripts/verify-flow-v0.4-json.sh, not trusted
-from gate-result.json's self-report) AND all five manual signoffs
-($MANUAL_KEYS) are "passed". --allow-pending additionally accepts the
+from gate-result.json's self-report) AND every manual signoff in
+($MANUAL_KEYS) is "passed" -- except rows carrying
+"deferred_to_frontend_track", which ADR-0017 moved out of this release
+(page_editor, navigator_a11y); those are neither passed nor blocking. --allow-pending additionally accepts the
 pre-signoff handoff state: automation fully green, manual signoffs still
 "pending" (never "failed" or "needs_rework").
 
@@ -125,6 +127,7 @@ fi
 
 MANUAL_ALL_PASSED=true
 MANUAL_ANY_BLOCKING=false
+MANUAL_DEFERRED=0
 MANUAL_SUMMARY="{}"
 for key in $MANUAL_KEYS; do
   status="$(jq -r --arg k "$key" '.manual_signoffs[$k].status // empty' "$GATE_RESULT_PATH")"
@@ -133,7 +136,12 @@ for key in $MANUAL_KEYS; do
     exit 2
   fi
   MANUAL_SUMMARY="$(jq -c --arg k "$key" --arg s "$status" '. + {($k): $s}' <<<"$MANUAL_SUMMARY")"
-  if [[ "$status" != "passed" ]]; then
+  # ADR-0017: a row deferred to the frontend track is not passed and is never
+  # counted as passed; it is simply no longer this release's business. The
+  # schema restricts the status to page_editor / navigator_a11y.
+  if [[ "$status" == "deferred_to_frontend_track" ]]; then
+    MANUAL_DEFERRED=$((MANUAL_DEFERRED + 1))
+  elif [[ "$status" != "passed" ]]; then
     MANUAL_ALL_PASSED=false
   fi
   if [[ "$status" == "failed" || "$status" == "needs_rework" ]]; then
@@ -150,6 +158,9 @@ elif [[ "$MANUAL_ANY_BLOCKING" == "true" ]]; then
 elif [[ "$MANUAL_ALL_PASSED" == "true" ]]; then
   GATE_PASSED=true
   REASON="automation green and all manual signoffs passed"
+  if [[ $MANUAL_DEFERRED -gt 0 ]]; then
+    REASON="$REASON ($MANUAL_DEFERRED deferred to the frontend track per ADR-0017)"
+  fi
 elif [[ $ALLOW_PENDING -eq 1 ]]; then
   GATE_PASSED=true
   REASON="automation green; manual signoffs pending, accepted under --allow-pending"
@@ -162,6 +173,7 @@ SUMMARY="$(jq -n \
   --argjson automation_passed "$AUTOMATION_PASSED" \
   --argjson verify_exit_code "$VERIFY_EXIT" \
   --argjson manual "$MANUAL_SUMMARY" \
+  --argjson manual_deferred "$MANUAL_DEFERRED" \
   --argjson allow_pending "$([[ $ALLOW_PENDING -eq 1 ]] && echo true || echo false)" \
   --argjson gate_passed "$GATE_PASSED" \
   --arg reason "$REASON" \
@@ -170,6 +182,7 @@ SUMMARY="$(jq -n \
     automation_passed: $automation_passed,
     verify_exit_code: $verify_exit_code,
     manual_signoffs: $manual,
+    manual_deferred_to_frontend_track: $manual_deferred,
     allow_pending: $allow_pending,
     gate_passed: $gate_passed,
     reason: $reason
