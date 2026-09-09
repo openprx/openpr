@@ -669,10 +669,115 @@ mod database_tests {
     use crate::flow::collab::bootstrap;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
+    use crate::flow::collab::frame::{RejectedCode, WriteState};
     use crate::flow::collab::write::{self, AcceptOutcome, UpdateRequest};
     use crate::flow::command::{CreateObjectInput, create_object};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+    /// One request-level retry for each bounded internal rebase attempt. This keeps the race test
+    /// tolerant of the protocol's explicitly retryable lock outcome without retrying forever.
+    const RACING_WRITE_CONTENTION_RETRIES: u32 = super::super::limits::MAX_REBASE_ATTEMPTS;
+
+    fn contention_retry_after_ms(rejected: &write::Rejected) -> Option<u64> {
+        if rejected.code != RejectedCode::ServerDraining
+            || !rejected.recoverable
+            || rejected.write_state != WriteState::NotApplied
+        {
+            return None;
+        }
+        let details = rejected.details.as_ref()?;
+        if details.get("reason").and_then(serde_json::Value::as_str) != Some("contention") {
+            return None;
+        }
+        details.get("retry_after_ms").and_then(serde_json::Value::as_u64)
+    }
+
+    struct RacingWrite {
+        state: AppState,
+        advancer: SnapshotAdvancer,
+        document_id: Uuid,
+        update_id: Uuid,
+        bytes: Vec<u8>,
+        owner_id: Uuid,
+        workspace_id: Uuid,
+        checked_epoch: i64,
+    }
+
+    async fn accept_racing_write_with_retries(
+        input: RacingWrite,
+    ) -> Result<(AcceptOutcome, u32), crate::error::ApiError> {
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let registry = crate::flow::collab::registry::SessionRegistry::new();
+        let mut contention_retries = 0_u32;
+        loop {
+            let outcome = write::accept_update(
+                &input.state.db,
+                &cache,
+                &coordinator,
+                &registry,
+                &input.advancer,
+                10,
+                None,
+                UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
+                    document_id: input.document_id,
+                    update_id: input.update_id,
+                    bytes: input.bytes.clone(),
+                    idempotency_key: None,
+                    event_idempotency_key: None,
+                    origin_client_id: Some("race-writer".to_string()),
+                    message: None,
+                    actor_id: input.owner_id,
+                    actor_is_bot: false,
+                    workspace_id: input.workspace_id,
+                    checked_epoch: input.checked_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await?;
+            match outcome {
+                AcceptOutcome::Rejected(rejected) => {
+                    let Some(retry_after_ms) = contention_retry_after_ms(&rejected) else {
+                        return Ok((AcceptOutcome::Rejected(rejected), contention_retries));
+                    };
+                    if contention_retries >= RACING_WRITE_CONTENTION_RETRIES {
+                        return Ok((AcceptOutcome::Rejected(rejected), contention_retries));
+                    }
+                    contention_retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
+                }
+                accepted @ AcceptOutcome::Accepted(_) => return Ok((accepted, contention_retries)),
+            }
+        }
+    }
+
+    #[test]
+    fn racing_write_retries_only_safe_contention_rejections() {
+        let mut rejected = write::Rejected {
+            update_id: Some(Uuid::new_v4()),
+            code: RejectedCode::ServerDraining,
+            recoverable: true,
+            write_state: WriteState::NotApplied,
+            details: Some(serde_json::json!({"reason": "contention", "retry_after_ms": 200})),
+            current_seq: None,
+            current_frontier: None,
+        };
+        assert_eq!(contention_retry_after_ms(&rejected), Some(200));
+
+        rejected.write_state = WriteState::Unknown;
+        assert_eq!(contention_retry_after_ms(&rejected), None);
+        rejected.write_state = WriteState::NotApplied;
+        rejected.recoverable = false;
+        assert_eq!(contention_retry_after_ms(&rejected), None);
+        rejected.recoverable = true;
+        rejected.details = Some(serde_json::json!({"reason": "drain", "retry_after_ms": 200}));
+        assert_eq!(contention_retry_after_ms(&rejected), None);
+        rejected.details = Some(serde_json::json!({"reason": "contention"}));
+        assert_eq!(contention_retry_after_ms(&rejected), None);
+    }
 
     struct Scratch {
         db: DatabaseConnection,
@@ -1354,6 +1459,12 @@ mod database_tests {
     /// this test issues is still present and verifiable afterward, and `snapshot_seq` never
     /// exceeds `head_seq` (the same invariant `collab_documents_seq_check` enforces in the
     /// schema, checked here from the application side too).
+    ///
+    /// The protocol defines `server_draining{reason="contention",recoverable=true,
+    /// write_state=not_applied}` as a normal retryable lock outcome. Each racing write therefore
+    /// waits the returned `retry_after_ms` and retries at most [`RACING_WRITE_CONTENTION_RETRIES`]
+    /// (three, matching `MAX_REBASE_ATTEMPTS`). Any rejection with a different shape, or safe
+    /// contention after that bound, remains a hard test failure and reports the retry count.
     #[tokio::test]
     async fn advancement_stays_correct_when_racing_a_concurrent_write() {
         let scratch = scratch_or_skip!("advance-race");
@@ -1409,51 +1520,31 @@ mod database_tests {
             engine.set_title(&write_label).expect("set_title succeeds");
             let bytes = engine.export_from(&base_frontier).expect("export succeeds");
             let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
-            let write_task = tokio::spawn({
-                let cache = WarmCache::new();
-                let coordinator = DocumentCoordinator::new();
-                let registry = crate::flow::collab::registry::SessionRegistry::new();
-                let advancer_for_write = advancer.clone();
-                async move {
-                    write::accept_update(
-                        &state_for_write.db,
-                        &cache,
-                        &coordinator,
-                        &registry,
-                        &advancer_for_write,
-                        10,
-                        None,
-                        UpdateRequest {
-                            origin: crate::flow::event_origin::CommandOrigin::first_request_from(
-                                crate::flow::event_origin::EventSurface::Rest,
-                            ),
-                            document_id,
-                            update_id: Uuid::new_v4(),
-                            bytes,
-                            idempotency_key: None,
-                            event_idempotency_key: None,
-                            origin_client_id: Some("race-writer".to_string()),
-                            message: None,
-                            actor_id: owner_id,
-                            actor_is_bot: false,
-                            workspace_id,
-                            checked_epoch,
-                            expected_frontier: None,
-                        },
-                    )
-                    .await
-                }
-            });
+            let update_id = Uuid::new_v4();
+            let write_task = tokio::spawn(accept_racing_write_with_retries(RacingWrite {
+                state: state_for_write,
+                advancer: advancer.clone(),
+                document_id,
+                update_id,
+                bytes,
+                owner_id,
+                workspace_id,
+                checked_epoch,
+            }));
 
             let (advance_result, write_result) = tokio::join!(advance_task, write_task);
             let _ = advance_result.expect("advance task joins");
-            let outcome = write_result
+            let (outcome, contention_retries) = write_result
                 .expect("write task joins")
                 .expect("accept_update does not hit a hard database error");
             match outcome {
                 AcceptOutcome::Accepted(_) => {}
                 AcceptOutcome::Rejected(rejected) => {
-                    panic!("round {round}: the racing write must still be accepted, got {rejected:?}")
+                    panic!(
+                        "round {round}: the racing write must be accepted after at most \
+                         {RACING_WRITE_CONTENTION_RETRIES} safe contention retries; used \
+                         {contention_retries}, got {rejected:?}"
+                    )
                 }
             }
 

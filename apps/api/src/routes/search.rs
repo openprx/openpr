@@ -688,7 +688,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no results array in {body}"));
         assert_eq!(results.len(), expected_count, "unexpected legacy result count: {body}");
         assert_eq!(
-            body["data"]["total"], expected_count,
+            body.pointer("/data/total"),
+            Some(&JsonValue::from(expected_count)),
             "total drifted from fixture: {body}"
         );
         for result in results {
