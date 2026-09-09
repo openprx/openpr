@@ -11,7 +11,9 @@ pub mod error;
 pub mod render;
 
 use crate::client::{OpenPrClient, encode_query_component};
-use command::{Cli, CollabAction, Commands, FeaturesAction, FlowFeatureAction, ObjectsAction};
+use command::{
+    Cli, CollabAction, Commands, FeaturesAction, FlowFeatureAction, GrantsAction, InheritanceAction, ObjectsAction,
+};
 use error::CliError;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -45,6 +47,21 @@ fn command_name(command: &Commands) -> String {
             },
         },
         Commands::Objects(cmd) => match &cmd.action {
+            ObjectsAction::Create { .. } => "objects.create".to_string(),
+            ObjectsAction::Patch { .. } => "objects.patch".to_string(),
+            ObjectsAction::Move { .. } => "objects.move".to_string(),
+            ObjectsAction::Grants(grants) => match &grants.action {
+                GrantsAction::Get { .. } => "objects.grants.get".to_string(),
+                GrantsAction::Set { .. } => "objects.grants.set".to_string(),
+            },
+            ObjectsAction::Inheritance(inheritance) => match &inheritance.action {
+                InheritanceAction::Set { .. } => "objects.inheritance.set".to_string(),
+            },
+            ObjectsAction::Link { .. } => "objects.link".to_string(),
+            ObjectsAction::Unlink { .. } => "objects.unlink".to_string(),
+            ObjectsAction::Diff { .. } => "objects.diff".to_string(),
+            ObjectsAction::Relations { .. } => "objects.relations".to_string(),
+            ObjectsAction::Search { .. } => "objects.search".to_string(),
             ObjectsAction::Get { .. } => "objects.get".to_string(),
             ObjectsAction::Query { .. } => "objects.query".to_string(),
             ObjectsAction::History { .. } => "objects.history".to_string(),
@@ -52,6 +69,7 @@ fn command_name(command: &Commands) -> String {
         Commands::Collab(cmd) => match &cmd.action {
             CollabAction::Inspect { .. } => "collab.inspect".to_string(),
             CollabAction::Verify { .. } => "collab.verify".to_string(),
+            CollabAction::ProjectionLag { .. } => "collab.projection-lag".to_string(),
         },
     }
 }
@@ -97,6 +115,258 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
             },
         },
         Commands::Objects(cmd) => match &cmd.action {
+            ObjectsAction::Create {
+                workspace,
+                project,
+                object_type,
+                title,
+                parent,
+                idempotency_key,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                checked_idempotency_key(idempotency_key)?;
+                if title.trim().is_empty() {
+                    return Err(CliError::usage("--title must not be empty"));
+                }
+                let mut body = json!({
+                    "object_type": object_type,
+                    "title": title,
+                    "idempotency_key": idempotency_key,
+                });
+                if let Some(object) = body.as_object_mut() {
+                    if let Some(project) = project {
+                        object.insert("project_id".to_string(), json!(checked_uuid("--project", project)?));
+                    }
+                    if let Some(parent) = parent {
+                        object.insert("parent_object_id".to_string(), json!(checked_uuid("--parent", parent)?));
+                    }
+                }
+                let path = format!("/api/v1/workspaces/{workspace}/flow/objects");
+                api_data(client.post_structured::<Value, _>(&path, &body).await)
+            }
+            ObjectsAction::Patch {
+                id,
+                patch_file,
+                expected_frontier,
+                idempotency_key,
+            } => {
+                let id = checked_uuid("object id", id)?;
+                checked_idempotency_key(idempotency_key)?;
+                let patch = read_json_file(patch_file)?;
+                let operations = match patch {
+                    Value::Array(operations) => operations,
+                    Value::Object(mut object) => object
+                        .remove("operations")
+                        .and_then(|value| value.as_array().cloned())
+                        .ok_or_else(|| {
+                            CliError::usage(
+                                "--patch-file must contain a JSON array or an object with an operations array",
+                            )
+                        })?,
+                    _ => {
+                        return Err(CliError::usage(
+                            "--patch-file must contain a JSON array or an object with an operations array",
+                        ));
+                    }
+                };
+                if !(1..=100).contains(&operations.len()) {
+                    return Err(CliError::usage(
+                        "--patch-file must contain between 1 and 100 operations",
+                    ));
+                }
+                let mut body = flow_command("semantic_patch", json!({ "operations": operations }), idempotency_key);
+                if let (Some(frontier), Some(object)) = (expected_frontier, body.as_object_mut()) {
+                    object.insert("expected_frontier".to_string(), json!(frontier));
+                }
+                let path = format!("/api/v1/flow/objects/{id}/commands");
+                api_data(client.post_structured::<Value, _>(&path, &body).await)
+            }
+            ObjectsAction::Move {
+                id,
+                parent,
+                after,
+                expected_target_frontier,
+                confirm_self_lockout,
+                idempotency_key,
+            } => {
+                let id = checked_uuid("object id", id)?;
+                let parent = checked_uuid("--parent", parent)?;
+                checked_idempotency_key(idempotency_key)?;
+                let mut payload = json!({
+                    "target_object_id": parent,
+                    "confirm_self_lockout": confirm_self_lockout,
+                });
+                if let Some(object) = payload.as_object_mut() {
+                    if let Some(after) = after {
+                        object.insert("after_id".to_string(), json!(checked_uuid("--after", after)?));
+                    }
+                    if let Some(frontier) = expected_target_frontier {
+                        object.insert("expected_target_frontier".to_string(), json!(frontier));
+                    }
+                }
+                let body = flow_command("move_object", payload, idempotency_key);
+                let path = format!("/api/v1/flow/objects/{id}/commands");
+                api_data(client.post_structured::<Value, _>(&path, &body).await)
+            }
+            ObjectsAction::Grants(grants) => match &grants.action {
+                GrantsAction::Get { id } => {
+                    let id = checked_uuid("object id", id)?;
+                    let path = format!("/api/v1/flow/objects/{id}/grants");
+                    api_data(client.get_structured::<Value>(&path).await)
+                }
+                GrantsAction::Set {
+                    id,
+                    grants,
+                    confirm_self_lockout,
+                    dry_run,
+                    idempotency_key,
+                } => {
+                    let id = checked_uuid("object id", id)?;
+                    checked_idempotency_key(idempotency_key)?;
+                    if grants.len() > 100 {
+                        return Err(CliError::usage("at most 100 --grant values may be supplied"));
+                    }
+                    let parsed = grants
+                        .iter()
+                        .map(|grant| parse_grant(grant))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let body = json!({
+                        "grants": parsed,
+                        "confirm_self_lockout": confirm_self_lockout,
+                        "dry_run": dry_run,
+                        "idempotency_key": idempotency_key,
+                    });
+                    let path = format!("/api/v1/flow/objects/{id}/grants");
+                    api_data(client.put_structured::<Value, _>(&path, &body).await)
+                }
+            },
+            ObjectsAction::Inheritance(inheritance) => match &inheritance.action {
+                InheritanceAction::Set {
+                    id,
+                    inherit_from_parent,
+                    confirm_self_lockout,
+                    dry_run,
+                    idempotency_key,
+                } => {
+                    let id = checked_uuid("object id", id)?;
+                    checked_idempotency_key(idempotency_key)?;
+                    let body = json!({
+                        "inherit_from_parent": inherit_from_parent,
+                        "confirm_self_lockout": confirm_self_lockout,
+                        "dry_run": dry_run,
+                        "idempotency_key": idempotency_key,
+                    });
+                    let path = format!("/api/v1/flow/objects/{id}/inheritance");
+                    api_data(client.put_structured::<Value, _>(&path, &body).await)
+                }
+            },
+            ObjectsAction::Link {
+                source,
+                target,
+                relation_type,
+                idempotency_key,
+            } => {
+                let source = checked_uuid("source object id", source)?;
+                let target = checked_uuid("target object id", target)?;
+                checked_idempotency_key(idempotency_key)?;
+                let body = flow_command(
+                    "link",
+                    json!({ "target_object_id": target, "relation_type": relation_type }),
+                    idempotency_key,
+                );
+                let path = format!("/api/v1/flow/objects/{source}/commands");
+                api_data(client.post_structured::<Value, _>(&path, &body).await)
+            }
+            ObjectsAction::Unlink {
+                source,
+                relation_id,
+                idempotency_key,
+            } => {
+                let source = checked_uuid("source object id", source)?;
+                let relation_id = checked_uuid("--relation", relation_id)?;
+                checked_idempotency_key(idempotency_key)?;
+                let body = flow_command("unlink", json!({ "relation_id": relation_id }), idempotency_key);
+                let path = format!("/api/v1/flow/objects/{source}/commands");
+                api_data(client.post_structured::<Value, _>(&path, &body).await)
+            }
+            ObjectsAction::Diff {
+                id,
+                from_seq,
+                to_seq,
+                render,
+            } => {
+                let id = checked_uuid("object id", id)?;
+                if from_seq > to_seq {
+                    return Err(CliError::usage("--from must not exceed --to"));
+                }
+                let mut query = vec![format!("from_seq={from_seq}"), format!("to_seq={to_seq}")];
+                if let Some(render) = render {
+                    query.push(format!("render={}", render.replace('-', "_")));
+                }
+                let path = format!("/api/v1/flow/objects/{id}/diff{}", query_suffix(&query));
+                api_data(client.get_structured::<Value>(&path).await)
+            }
+            ObjectsAction::Relations {
+                id,
+                direction,
+                relation_type,
+                cursor,
+                limit,
+            } => {
+                let id = checked_uuid("object id", id)?;
+                let mut query = Vec::new();
+                if let Some(direction) = direction {
+                    query.push(format!("direction={direction}"));
+                }
+                if let Some(relation_type) = relation_type {
+                    query.push(format!("relation_type={}", encode_query_component(relation_type)));
+                }
+                if let Some(cursor) = cursor {
+                    query.push(format!("cursor={}", encode_query_component(cursor)));
+                }
+                append_limit(&mut query, *limit)?;
+                let path = format!("/api/v1/flow/objects/{id}/relations{}", query_suffix(&query));
+                api_data(client.get_structured::<Value>(&path).await)
+            }
+            ObjectsAction::Search {
+                workspace,
+                project,
+                unprojected,
+                query: q,
+                object_type,
+                freshness,
+                cursor,
+                limit,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                if project.is_some() == *unprojected {
+                    return Err(CliError::usage(
+                        "exactly one of --project or --unprojected must be supplied",
+                    ));
+                }
+                if q.is_empty() || q.chars().count() > 256 {
+                    return Err(CliError::usage("--query must contain between 1 and 256 characters"));
+                }
+                let mut query = vec![format!("q={}", encode_query_component(q))];
+                if let Some(project) = project {
+                    query.push(format!("project_id={}", checked_uuid("--project", project)?));
+                }
+                if *unprojected {
+                    query.push("unprojected=true".to_string());
+                }
+                if let Some(object_type) = object_type {
+                    query.push(format!("object_type={}", encode_query_component(object_type)));
+                }
+                if let Some(freshness) = freshness {
+                    query.push(format!("freshness={}", freshness.replace('-', "_")));
+                }
+                if let Some(cursor) = cursor {
+                    query.push(format!("cursor={}", encode_query_component(cursor)));
+                }
+                append_limit(&mut query, *limit)?;
+                let path = format!("/api/v1/workspaces/{workspace}/flow/search{}", query_suffix(&query));
+                api_data(client.get_structured::<Value>(&path).await)
+            }
             ObjectsAction::Get { id, at_seq, render } => {
                 let id = checked_uuid("object id", id)?;
                 let mut query = Vec::new();
@@ -196,8 +466,85 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 }
                 Ok(data)
             }
+            CollabAction::ProjectionLag {
+                workspace,
+                project,
+                cursor,
+                limit,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                let mut query = Vec::new();
+                if let Some(project) = project {
+                    query.push(format!("project_id={}", checked_uuid("--project", project)?));
+                }
+                if let Some(cursor) = cursor {
+                    query.push(format!("cursor={}", encode_query_component(cursor)));
+                }
+                append_limit(&mut query, *limit)?;
+                let path = format!(
+                    "/api/v1/workspaces/{workspace}/flow/projection-lag{}",
+                    query_suffix(&query)
+                );
+                api_data(client.get_structured::<Value>(&path).await)
+            }
         },
     }
+}
+
+fn checked_idempotency_key(value: &str) -> Result<(), CliError> {
+    if (1..=128).contains(&value.len()) {
+        Ok(())
+    } else {
+        Err(CliError::usage(
+            "--idempotency-key must contain between 1 and 128 bytes",
+        ))
+    }
+}
+
+fn flow_command(command_type: &str, payload: Value, idempotency_key: &str) -> Value {
+    json!({
+        "command": { "type": command_type, "payload": payload },
+        "idempotency_key": idempotency_key,
+    })
+}
+
+fn read_json_file(path: &std::path::Path) -> Result<Value, CliError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| CliError::usage(format!("failed to read {}: {error}", path.display())))?;
+    serde_json::from_str(&text)
+        .map_err(|error| CliError::usage(format!("{} is not valid JSON: {error}", path.display())))
+}
+
+fn parse_grant(value: &str) -> Result<Value, CliError> {
+    let (principal, level) = value
+        .split_once('=')
+        .ok_or_else(|| CliError::usage("--grant must use KIND:ID=LEVEL"))?;
+    let (kind, id) = principal
+        .split_once(':')
+        .ok_or_else(|| CliError::usage("--grant must use KIND:ID=LEVEL"))?;
+    if !matches!(kind, "user" | "bot") {
+        return Err(CliError::usage("--grant KIND must be user or bot"));
+    }
+    if !matches!(level, "full_access" | "edit" | "comment" | "view") {
+        return Err(CliError::usage(
+            "--grant LEVEL must be full_access, edit, comment, or view",
+        ));
+    }
+    Ok(json!({
+        "principal_kind": kind,
+        "principal_id": checked_uuid("--grant principal id", id)?,
+        "level": level,
+    }))
+}
+
+fn append_limit(query: &mut Vec<String>, limit: Option<u64>) -> Result<(), CliError> {
+    if let Some(limit) = limit {
+        if !(1..=100).contains(&limit) {
+            return Err(CliError::usage("--limit must be between 1 and 100"));
+        }
+        query.push(format!("limit={limit}"));
+    }
+    Ok(())
 }
 
 /// Unwraps a structured API call's `{code, message, data}` envelope down to its `data`, which

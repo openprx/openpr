@@ -11,7 +11,7 @@ Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL 16**.
 - **Universal forms** — project-defined business data types with grid/detail views, decimal-safe amounts, record links and child tables, formulas, per-role permissions, import/export, electronic signatures.
 - **WASM plugins** — per-project sandboxed plugins for field validation, formulas, and event handlers.
 - **Events** — transactional business-event ledger and HMAC-signed webhooks.
-- **MCP server** — 107 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
+- **MCP server** — 119 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
 - **Scenario templates** — 6 ready-to-start setups: `code_delivery_default`, `contract_review_default`, `equipment_maintenance_default`, `quality_corrective_action_default`, `customer_delivery_default`, `restaurant_ordering_default`.
 
 ## Architecture
@@ -289,9 +289,9 @@ curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 
-### Tools (107)
+### Tools (119)
 
-Per-domain counts; the total is pinned by an `assert_eq!(tools.len(), 107)` test
+Per-domain counts; the total is parsed from the frozen Flow MCP contract and compared with the live registry
 in `apps/mcp-server/src/tools/mod.rs`.
 
 | Domain                    | Count | Representative tools                                                      |
@@ -299,7 +299,7 @@ in `apps/mcp-server/src/tools/mod.rs`.
 | Universal forms & events  |    34 | `forms.create`, `forms.update_schema`, `form_records.create`, `events.tail` |
 | Work items                |    11 | `work_items.create`, `work_items.get_by_identifier`, `work_items.search`   |
 | Scenario tools            |     9 | `code.change_proposal.create`, `documents.review_risk`, `approval.request` |
-| Flow (v0.4)               |     9 | `objects.get`, `objects.query`, `flow.feature_set`, `legacy_pages.inventory` |
+| Flow (v0.5)               |    21 | `objects.create`, `objects.move`, `objects.grants_set`, `collab.projection_lag` |
 | Project types & resources |     6 | `project_types.get`, `project_resources.create`                            |
 | Projects                  |     5 | `projects.list`, `projects.create`                                         |
 | Labels                    |     5 | `labels.create`, `labels.list_by_project`                                  |
@@ -332,10 +332,11 @@ templates via `resources/templates/list`, including
 Besides `serve`, `mcp-server` exposes 9 command groups: `projects`,
 `work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`,
 `operation-logs list`, and `tools call`. The global `--format json|table` selects the output shape, and
-`tools call` reaches any of the 107 tools by name — a complete escape hatch for
+`tools call` reaches any of the 119 tools by name — a complete escape hatch for
 anything without a dedicated subcommand. A second `[[bin]]` in this same
 package, `sylvode`, is the native Flow CLI (`sylvode features flow get|set`,
-`sylvode objects get|query|history`, `sylvode collab inspect|verify`); it
+`sylvode objects create|patch|move|grants|get|inheritance|link|unlink|diff|relations|search` and
+`sylvode collab inspect|verify|projection-lag`); it
 shares this same `OpenPrClient`/config resolver and carries no `serve`.
 
 ```bash
@@ -386,7 +387,7 @@ All under `scripts/`.
 | ----------- | ------------------------------------------------------------------------- |
 | Lifecycle   | `start.sh` (first-run `config/openpr.compose.toml` + `config/openpr.compose.mcp.toml` + compose `.env`, random bootstrap secrets, build release binaries, `compose up -d`), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
 | Database    | `init-db.sh` (apply migrations in order), `backup-db.sh` (gzipped dump into `backups/`), `restore-db.sh`                                                                                                                              |
-| Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (asserts the 107 tool count), `verify.sh` (component health check)                                                                           |
+| Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (legacy v0.4 integration checks), `verify.sh` (component health check)                                                                            |
 | Development | `dev-check.sh` (`cargo fmt --check`, `check`, `clippy -D warnings`, `test`), `ci-universal-forms-gates.sh` (reproduce the CI-only `Universal Forms Gates` bundle locally)                                                              |
 | Demo data   | `bootstrap-restaurant-demo.sh`, `bun --cwd frontend run smoke:restaurant-ordering`                                                                                                                                                   |
 | Other       | `benchmark.sh` (API latency/throughput), `bump-version.sh` (`major\|minor\|patch`, syncs `Cargo.toml` and `frontend/package.json`)                                                                                                     |
