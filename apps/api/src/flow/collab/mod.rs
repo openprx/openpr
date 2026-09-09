@@ -42,6 +42,17 @@ pub mod snapshot;
 pub mod ticket;
 pub mod write;
 
+/// The minimum effective permission shared by ticket issuance, WebSocket `open`, and post-commit
+/// revocation. The value remains `edit` until the contract conflict between ADR-0007's read+write
+/// admission and `collab-protocol-v1.md`'s view-only subscription is resolved by the contract
+/// owner; all three production decisions must move together when that happens.
+pub const MINIMUM_COLLAB_SESSION_LEVEL: authz::PermissionLevel = authz::PermissionLevel::Edit;
+
+/// Collab tickets are user-only, so every admitted session is evaluated as the same principal
+/// kind during `open` and revocation. `routes::collab::database_tests::a_bot_token_cannot_issue_a_collab_ticket`
+/// is the end-to-end negative assertion guarding this invariant.
+pub const COLLAB_SESSION_PRINCIPAL_KIND: &str = "user";
+
 pub(super) fn cache_db_permission(
     cache: &permission_cache::PermissionCache,
     workspace_id: uuid::Uuid,
@@ -59,4 +70,30 @@ pub(super) fn cache_db_permission(
         level,
         authz_epoch,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authz::PermissionLevel;
+
+    #[test]
+    fn collab_admission_and_revocation_share_one_permission_threshold() {
+        assert_eq!(super::MINIMUM_COLLAB_SESSION_LEVEL, PermissionLevel::Edit);
+        for level in [
+            PermissionLevel::Denied,
+            PermissionLevel::View,
+            PermissionLevel::Comment,
+            PermissionLevel::Edit,
+            PermissionLevel::FullAccess,
+        ] {
+            let ticket_admits = super::ticket::permission_admits_session(level);
+            let open_admits = super::session::permission_admits_session(level);
+            let revocation_disconnects = super::revocation::permission_requires_revocation(level);
+            assert_eq!(ticket_admits, open_admits, "ticket/open drifted at {level:?}");
+            assert_eq!(
+                ticket_admits, !revocation_disconnects,
+                "admission/revocation drifted at {level:?}"
+            );
+        }
+    }
 }

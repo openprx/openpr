@@ -30,10 +30,15 @@ use super::registry::{ConnectionLimit, OutboundEvent, PresenceLimit, Registratio
 use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
+use super::{COLLAB_SESSION_PRINCIPAL_KIND, MINIMUM_COLLAB_SESSION_LEVEL};
 use crate::error::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK};
 use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(super) fn permission_admits_session(level: PermissionLevel) -> bool {
+    level >= MINIMUM_COLLAB_SESSION_LEVEL
+}
 
 /// How long a connection may go without producing an inbound frame before the server sends its
 /// own `ping`, and — once that `ping` is outstanding — how long it then waits for any inbound
@@ -1344,7 +1349,7 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         &state.db,
         consumed.workspace_id,
         object_id,
-        "user",
+        COLLAB_SESSION_PRINCIPAL_KIND,
         consumed.user_id,
         &role,
     )
@@ -1353,7 +1358,7 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         reject_and_close(socket, document_id, RejectedCode::Forbidden, "permission check failed").await;
         return None;
     };
-    if level < PermissionLevel::Edit {
+    if !permission_admits_session(level) {
         reject_and_close(socket, document_id, RejectedCode::Forbidden, "insufficient permission").await;
         return None;
     }

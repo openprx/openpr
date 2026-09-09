@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::authz::{self, PermissionLevel};
 use super::registry::{ActiveSession, SessionRegistry};
+use super::{COLLAB_SESSION_PRINCIPAL_KIND, MINIMUM_COLLAB_SESSION_LEVEL};
 use crate::error::ApiErrorKind;
 use crate::flow::repository;
 
@@ -27,6 +28,10 @@ const FEATURE_DISABLED_CLOSE_CODE: u16 = match ApiErrorKind::FeatureDisabled.ws_
 const AUTHORIZATION_CLOSE_REASON: &str = "authorization revoked";
 const FEATURE_DISABLED_CLOSE_REASON: &str = "feature disabled";
 const SUBTREE_DEPTH_PROBE: i64 = 33;
+
+pub(super) fn permission_requires_revocation(level: PermissionLevel) -> bool {
+    level < MINIMUM_COLLAB_SESSION_LEVEL
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RevocationStats {
@@ -106,8 +111,15 @@ async fn revalidate_candidates(
         let mut object_ids: Vec<Uuid> = user_sessions.iter().map(|session| session.object_id).collect();
         object_ids.sort_unstable();
         object_ids.dedup();
-        let levels = match authz::effective_permissions(&state.db, workspace_id, &object_ids, "user", user_id, role)
-            .await
+        let levels = match authz::effective_permissions(
+            &state.db,
+            workspace_id,
+            &object_ids,
+            COLLAB_SESSION_PRINCIPAL_KIND,
+            user_id,
+            role,
+        )
+        .await
         {
             Ok(levels) => levels.into_iter().collect::<HashMap<_, _>>(),
             Err(err) => {
@@ -119,7 +131,7 @@ async fn revalidate_candidates(
         revoked.extend(user_sessions.into_iter().filter(|session| {
             levels
                 .get(&session.object_id)
-                .is_none_or(|level| *level < PermissionLevel::Edit)
+                .is_none_or(|level| permission_requires_revocation(*level))
         }));
     }
     apply_revocations(registry, candidate_count, &revoked)

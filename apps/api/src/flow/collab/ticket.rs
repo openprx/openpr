@@ -12,6 +12,11 @@ use crate::error::ApiError;
 
 use super::limits::TICKET_TTL_SECONDS;
 use super::origin;
+use super::{COLLAB_SESSION_PRINCIPAL_KIND, MINIMUM_COLLAB_SESSION_LEVEL};
+
+pub(super) fn permission_admits_session(level: super::authz::PermissionLevel) -> bool {
+    level >= MINIMUM_COLLAB_SESSION_LEVEL
+}
 
 fn sha256_hex(raw: &str) -> String {
     let mut hasher = Sha256::new();
@@ -161,10 +166,16 @@ pub async fn issue(
     .await?
     .ok_or_else(|| ApiError::NotFound("document not found".to_string()))?;
 
-    let level =
-        super::authz::effective_permission(&tx, input.workspace_id, doc.object_id, "user", input.user_id, &role)
-            .await?;
-    if level < super::authz::PermissionLevel::Edit {
+    let level = super::authz::effective_permission(
+        &tx,
+        input.workspace_id,
+        doc.object_id,
+        COLLAB_SESSION_PRINCIPAL_KIND,
+        input.user_id,
+        &role,
+    )
+    .await?;
+    if !permission_admits_session(level) {
         return Err(ApiError::Forbidden(
             "document read+write access is required to open a collab session".to_string(),
         ));
