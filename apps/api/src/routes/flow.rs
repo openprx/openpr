@@ -8,6 +8,7 @@
 //! GET  /api/v1/workspaces/{workspace_id}/flow/objects
 //! GET  /api/v1/flow/objects/{object_id}
 //! POST /api/v1/flow/objects/{object_id}/commands
+//! GET  /api/v1/flow/objects/{object_id}/relations
 //! GET  /api/v1/flow/objects/{object_id}/bootstrap
 //! GET  /api/v1/flow/objects/{object_id}/grants
 //! PUT  /api/v1/flow/objects/{object_id}/grants
@@ -41,6 +42,7 @@ use crate::{
         grants::{self, Caller, GrantRequest, SetGrantsInput, SetInheritanceInput},
         policy, query,
         query::Render,
+        relations,
     },
     response::ApiResponse,
 };
@@ -357,6 +359,62 @@ pub async fn post_flow_object_command(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct FlowRelationsQuery {
+    pub direction: Option<String>,
+    pub relation_type: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u64>,
+}
+
+/// `GET /api/v1/flow/objects/{object_id}/relations`.
+///
+/// The root object is authorized here through the standard `OwnedBy(FlowObject)` read context;
+/// `flow::relations` reauthorizes every opposite endpoint at the same epoch and performs the
+/// final epoch check before exposing the page.
+pub async fn get_flow_object_relations(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Query(params): Query<FlowRelationsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let direction = relations::RelationDirection::parse(params.direction.as_deref())?;
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = policy::require_flow_object_access(
+            &state,
+            &extensions,
+            workspace_id,
+            object_id,
+            crate::flow::collab::authz::PermissionLevel::View,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(page) = relations::list_relations(
+            &state,
+            &access,
+            relations::ListRelationsParams {
+                direction,
+                relation_type: params.relation_type.clone(),
+                cursor: params.cursor.clone(),
+                limit: params.limit,
+            },
+        )
+        .await?
+        else {
+            continue;
+        };
+        return Ok(ApiResponse::success(page));
+    }
+    Err(policy::authorization_read_unstable())
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FlowObjectHistoryQuery {
     pub before_seq: Option<i64>,
     pub limit: Option<u64>,
@@ -484,10 +542,11 @@ mod flow_database_tests {
 
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectHistoryQuery,
-        GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, SetFlowFeatureRequest,
-        SetInheritanceRequest, create_flow_object, get_flow_feature, get_flow_object, get_flow_object_bootstrap,
-        get_flow_object_grants, get_flow_object_history, list_flow_objects, post_flow_object_command,
-        put_flow_object_grants, put_flow_object_inheritance, set_flow_feature,
+        FlowRelationsQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery,
+        SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, get_flow_feature, get_flow_object,
+        get_flow_object_bootstrap, get_flow_object_grants, get_flow_object_history, get_flow_object_relations,
+        list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
+        set_flow_feature,
     };
     use crate::error::ApiError;
     use crate::flow::collab::{
@@ -4138,6 +4197,67 @@ mod flow_database_tests {
             vec!["rest".to_string()],
             "a REST content command must be recorded as a REST write, not a WebSocket one"
         );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn relations_handler_returns_a_real_link_through_the_rest_shape() {
+        let scratch = scratch_or_skip!("relations-handler");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let source = create_page_as_owner(&state, workspace_id, owner_id, "Source").await;
+        let target = create_page_as_owner(&state, workspace_id, owner_id, "Target").await;
+
+        let linked = body_json(to_response(
+            post_flow_object_command(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source),
+                Json(ExecuteFlowCommandRequest {
+                    command: FlowCommandEnvelope {
+                        command_type: "link".to_string(),
+                        payload: json!({
+                            "target_object_id": target,
+                            "relation_type": "related_to",
+                            "properties": {"label": "visible"},
+                        }),
+                    },
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(linked["code"], 0, "{linked}");
+
+        let page = body_json(to_response(
+            get_flow_object_relations(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source),
+                Query(FlowRelationsQuery {
+                    direction: Some("outgoing".to_string()),
+                    relation_type: Some("related_to".to_string()),
+                    cursor: None,
+                    limit: Some(50),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(page["code"], 0, "{page}");
+        assert_eq!(page["data"]["items"].as_array().map(Vec::len), Some(1));
+        assert_eq!(page["data"]["items"][0]["visibility"], "visible");
+        assert_eq!(page["data"]["items"][0]["other_object"]["id"], target.to_string());
+        assert_eq!(page["data"]["items"][0]["relation_type"], "related_to");
+        assert!(page["data"].get("total").is_none());
+        assert!(page["data"].get("filtered_count").is_none());
+        assert!(page["data"].get("examined").is_none());
 
         scratch.drop_self().await;
     }

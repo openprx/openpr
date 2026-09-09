@@ -1407,6 +1407,13 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route(
+            "/api/v1/flow/objects/{object_id}/relations",
+            get(routes::flow::get_flow_object_relations).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
             "/api/v1/flow/objects/{object_id}/bootstrap",
             get(routes::flow::get_flow_object_bootstrap).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),

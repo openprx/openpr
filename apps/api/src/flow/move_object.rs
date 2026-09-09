@@ -131,8 +131,9 @@ pub const MOVE_SUBTREE_NODES_LIMIT_KIND: &str = "move_subtree_nodes";
 /// `authz::ensure_parent_can_adopt_child` uses.
 const TREE_DEPTH_MAX: usize = 32;
 
-/// The v0.5 governance command family: commands that change `flow_objects` governance columns and
-/// may advance document heads while doing so.
+/// The v0.5 governance command family: server-owned structural/metadata writes rather than
+/// caller-authored CRDT content. `MoveObject` is implemented in this module; `Link`/`Unlink` are
+/// PostgreSQL-only relation writes implemented by `flow::relations`.
 ///
 /// Deliberately declared here rather than in `flow::command`: the wire name lives with the
 /// implementation, and `flow::command` stays the v0.4-frozen content/lifecycle registry it already
@@ -140,6 +141,8 @@ const TREE_DEPTH_MAX: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GovernanceCommandType {
     MoveObject,
+    Link,
+    Unlink,
 }
 
 impl GovernanceCommandType {
@@ -147,6 +150,8 @@ impl GovernanceCommandType {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "move_object" => Some(Self::MoveObject),
+            "link" => Some(Self::Link),
+            "unlink" => Some(Self::Unlink),
             _ => None,
         }
     }
@@ -155,6 +160,8 @@ impl GovernanceCommandType {
     pub const fn wire_name(self) -> &'static str {
         match self {
             Self::MoveObject => "move_object",
+            Self::Link => "link",
+            Self::Unlink => "unlink",
         }
     }
 
@@ -163,6 +170,8 @@ impl GovernanceCommandType {
     pub const fn event_type(self) -> &'static str {
         match self {
             Self::MoveObject => "flow.object.moved",
+            Self::Link => "flow.relation.linked",
+            Self::Unlink => "flow.relation.unlinked",
         }
     }
 
@@ -173,6 +182,7 @@ impl GovernanceCommandType {
     pub const fn existing_document_cardinality(self) -> ExistingDocumentCardinality {
         match self {
             Self::MoveObject => ExistingDocumentCardinality::BoundedMany(MOVE_OBJECT_CONTENDED_DOCUMENT_MAX),
+            Self::Link | Self::Unlink => ExistingDocumentCardinality::Zero,
         }
     }
 }

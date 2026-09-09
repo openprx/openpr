@@ -32,4 +32,5 @@ pub mod move_object;
 pub mod policy;
 pub mod projection;
 pub mod query;
+pub mod relations;
 pub mod repository;

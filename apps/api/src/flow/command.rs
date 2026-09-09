@@ -136,8 +136,13 @@ pub fn v0_4_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
 /// bound keeps being asserted against the v0.4 list alone.
 pub fn v0_5_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
     let mut registry = v0_4_command_cardinality_registry();
-    let governance = GovernanceCommandType::MoveObject;
-    registry.push((governance.wire_name(), governance.existing_document_cardinality()));
+    for governance in [
+        GovernanceCommandType::MoveObject,
+        GovernanceCommandType::Link,
+        GovernanceCommandType::Unlink,
+    ] {
+        registry.push((governance.wire_name(), governance.existing_document_cardinality()));
+    }
     registry
 }
 
@@ -959,6 +964,9 @@ impl CommandKind {
             // (`edit` on the new parent), which is a different authorization domain whenever the
             // two sides sit under different boundaries.
             Self::Governance(GovernanceCommandType::MoveObject) => authz::PermissionLevel::FullAccess,
+            Self::Governance(GovernanceCommandType::Link | GovernanceCommandType::Unlink) => {
+                authz::PermissionLevel::Edit
+            }
             _ => authz::PermissionLevel::Edit,
         }
     }
@@ -1169,6 +1177,14 @@ async fn execute_command_authorized(
     document_id: Uuid,
     object_type: &str,
 ) -> Result<AcceptedChange, ApiError> {
+    // Relation commands have a relation id (not the source object id) as their event aggregate,
+    // and their replay identity also includes the target/relation id from the payload. Let their
+    // module perform that richer replay check before the generic object/document aggregate check.
+    if let CommandKind::Governance(kind @ (GovernanceCommandType::Link | GovernanceCommandType::Unlink)) = kind {
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
+        return super::relations::execute_command(state, input, workspace_id, checked_epoch, kind).await;
+    }
+
     if let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await? {
         if existing.event_type != kind.event_type() {
             return Err(ApiError::Conflict(
@@ -1237,6 +1253,7 @@ async fn execute_command_authorized(
         CommandKind::Governance(GovernanceCommandType::MoveObject) => {
             super::move_object::execute(state, input, workspace_id, checked_epoch).await
         }
+        CommandKind::Governance(GovernanceCommandType::Link | GovernanceCommandType::Unlink) => Err(ApiError::Internal),
     }
 }
 

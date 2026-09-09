@@ -64,6 +64,14 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.object.moved",
         public_payload(&["object_id", "old_parent_id", "new_parent_id", "position_key"]),
     ),
+    (
+        "flow.relation.linked",
+        public_payload(&["relation_id", "source_object_id", "target_object_id", "relation_type"]),
+    ),
+    (
+        "flow.relation.unlinked",
+        public_payload(&["relation_id", "source_object_id", "target_object_id", "relation_type"]),
+    ),
     ("flow.feature.enabled", public_payload(&["workspace_id"])),
     ("flow.feature.disabled", public_payload(&["workspace_id"])),
     (
@@ -244,8 +252,9 @@ mod tests {
         let write_rs = include_str!("collab/write.rs");
         let grants_rs = include_str!("grants.rs");
         let move_object_rs = include_str!("move_object.rs");
+        let relations_rs = include_str!("relations.rs");
         let mut literals = BTreeSet::new();
-        for source in [command_rs, write_rs, grants_rs, move_object_rs] {
+        for source in [command_rs, write_rs, grants_rs, move_object_rs, relations_rs] {
             let cut = source.find("\n#[cfg(test)]").unwrap_or(source.len());
             literals.extend(event_type_literals(&source[..cut]));
         }
@@ -262,5 +271,22 @@ mod tests {
             undeclared.is_empty(),
             "these event types are emitted by flow::command/flow::collab::write/flow::grants but declare no payload policy: {undeclared:?}"
         );
+    }
+
+    #[test]
+    fn relation_policy_exposes_only_frozen_ids_and_type() {
+        let payload = json!({
+            "relation_id": "r",
+            "source_object_id": "s",
+            "target_object_id": "t",
+            "relation_type": "depends_on",
+            "properties": {"secret": "must not be delivered"},
+        });
+        for event_type in ["flow.relation.linked", "flow.relation.unlinked"] {
+            let filtered = redact_flow_event_payload_for_delivery(event_type, &payload);
+            assert_eq!(filtered.as_object().map(serde_json::Map::len), Some(4));
+            assert!(filtered.get("properties").is_none());
+            assert_eq!(filtered.get("relation_type"), Some(&json!("depends_on")));
+        }
     }
 }

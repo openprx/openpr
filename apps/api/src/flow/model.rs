@@ -93,6 +93,46 @@ pub struct FlowObjectListResponse {
     pub next_cursor: Option<String>,
 }
 
+/// The object summary nested in a visible [`RelationView`].
+#[derive(Debug, Clone, Serialize)]
+pub struct RelatedObjectView {
+    pub id: Uuid,
+    pub object_type: String,
+    pub title: String,
+    pub lifecycle_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+}
+
+/// The exact discriminated union frozen by `rest-api-v1.md` for relation reads.
+///
+/// In particular, the `Unavailable` variant has no fields besides the serde tag. Keeping it as a
+/// fieldless enum variant makes an accidental identifier/type/property leak a type-level change,
+/// not merely a convention at each call site.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "visibility", rename_all = "snake_case")]
+pub enum RelationView {
+    Visible {
+        relation_id: Uuid,
+        relation_type: String,
+        direction: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        position_key: Option<String>,
+        properties: Value,
+        created_at: String,
+        other_object: Box<RelatedObjectView>,
+    },
+    Unavailable,
+}
+
+/// `{items:[RelationView],next_cursor?}` from the relation endpoint.
+#[derive(Debug, Serialize)]
+pub struct RelationListResponse {
+    pub items: Vec<RelationView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// One row of `{items:[{seq,actor,origin,message,semantic_summary,created_at}],next_before_seq?}`
 /// from the history endpoint.
 #[derive(Debug, Serialize)]
