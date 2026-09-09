@@ -3241,6 +3241,55 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
+    /// HTML snippets must encode source text injectively. If ampersands are left untouched, the
+    /// literal text `&lt;img&gt;` and a real `<img>` element collapse to the same wire bytes; an HTML
+    /// renderer then decodes attacker-controlled markup from an apparently escaped snippet.
+    #[tokio::test]
+    async fn flow_search_snippet_distinguishes_literal_entity_text_from_real_markup() {
+        let scratch = scratch_or_skip!("flow-search-snippet-escape");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let literal = create_page_as_owner(&state, workspace_id, owner_id, "shared &lt;img&gt; suffix").await;
+        let markup = create_page_as_owner(&state, workspace_id, owner_id, "shared <img> suffix").await;
+        for object_id in [literal, markup] {
+            index_accepted_projection(&state, object_id).await;
+        }
+
+        let response = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(search_query("shared")),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(response["code"], 0, "{response}");
+        let items = response["data"]["items"].as_array().expect("items");
+        assert_eq!(items.len(), 2, "both fixtures must match: {response}");
+        let snippet_for = |object_id: Uuid| {
+            items
+                .iter()
+                .find(|item| item["object"]["id"] == object_id.to_string())
+                .and_then(|item| item["snippets"]["title"].as_str())
+                .unwrap_or_else(|| panic!("missing title snippet for {object_id}: {response}"))
+        };
+        let literal_snippet = snippet_for(literal);
+        let markup_snippet = snippet_for(markup);
+        assert_ne!(
+            literal_snippet, markup_snippet,
+            "literal entity text and real markup must not collapse to identical HTML"
+        );
+        assert!(literal_snippet.contains("&amp;lt;"), "{literal_snippet}");
+        assert!(markup_snippet.contains("&lt;"), "{markup_snippet}");
+        assert!(!literal_snippet.contains("<img"), "{literal_snippet}");
+        assert!(!markup_snippet.contains("<img"), "{markup_snippet}");
+
+        scratch.drop_self().await;
+    }
+
     /// The visible object's old accepted index remains the only source of title/snippet while
     /// lagging. `require_current` refuses the same scope, and a stale no-grant object cannot make
     /// a member's policy-filtered frontier stale.

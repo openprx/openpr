@@ -434,11 +434,11 @@ async fn fetch_search_batch(
                        to_tsvector('simple', si.title) @@ sq.terms AS title_matches,
                        to_tsvector('simple', si.plain_text) @@ sq.terms AS body_matches,
                        ts_headline(
-                           'simple', replace(replace(si.title, '<', '&lt;'), '>', '&gt;'), sq.terms,
+                           'simple', replace(replace(replace(si.title, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), sq.terms,
                            'StartSel=<mark>, StopSel=</mark>, MaxFragments=1, MinWords=1, MaxWords=12'
                        ) AS title_snippet,
                        ts_headline(
-                           'simple', replace(replace(si.plain_text, '<', '&lt;'), '>', '&gt;'), sq.terms,
+                           'simple', replace(replace(replace(si.plain_text, '&', '&amp;'), '<', '&lt;'), '>', '&gt;'), sq.terms,
                            'StartSel=<mark>, StopSel=</mark>, MaxFragments=2, MinWords=3, MaxWords=24'
                        ) AS body_snippet,
                        ts_rank_cd(si.search_vector, sq.terms) AS rank
