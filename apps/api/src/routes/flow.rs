@@ -1319,6 +1319,42 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
+    /// Migration 0054 defines `flow_object_projections.state` as the valid empty JSON object.
+    /// Markdown rendering must interpret that persisted default as an empty semantic snapshot,
+    /// not turn a legal row into an internal error.
+    #[tokio::test]
+    async fn markdown_render_accepts_the_empty_projection_state_default() {
+        let scratch = scratch_or_skip!("markdown-empty-state");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "Empty state").await;
+        exec(
+            &state,
+            "UPDATE flow_object_projections SET state = '{}'::jsonb WHERE object_id = $1",
+            vec![object_id.into()],
+        )
+        .await;
+
+        let response = body_json(to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: Some("markdown".to_string()),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(response["code"], 0, "{response}");
+        assert_eq!(response["data"]["semantic_content"]["rendered"], "# Empty state\n");
+
+        scratch.drop_self().await;
+    }
+
     #[tokio::test]
     async fn create_rejects_an_unregistered_object_type_via_body_code_not_http_status() {
         let scratch = scratch_or_skip!("bad-object-type");

@@ -26,6 +26,7 @@ pub struct SemanticNode {
 /// and yrs-yjs candidates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SemanticSnapshot {
+    #[serde(default)]
     pub nodes: BTreeMap<NodeId, SemanticNode>,
 }
 
