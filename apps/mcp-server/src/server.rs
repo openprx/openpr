@@ -2285,6 +2285,20 @@ mod tests {
     const RESOURCE: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const PLUGIN: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
+    /// ADR-0009 freezes the pre-Flow `search.all` contract: it stays workspace-wide and its
+    /// result selector exposes only project/issue/comment. Flow search is a distinct surface.
+    #[test]
+    fn legacy_search_all_remains_workspace_wide_and_non_flow() {
+        assert_eq!(tool_policy_scope("search.all"), PolicyScope::WorkspaceWide);
+        let tool = crate::tools::search::search_all_tool();
+        assert_eq!(tool.name, "search.all");
+        assert_eq!(
+            tool.input_schema.pointer("/properties/type/enum"),
+            Some(&json!(["issue", "project", "comment"]))
+        );
+        assert!(!tool.input_schema.to_string().contains("flow"));
+    }
+
     fn server(base_url: String) -> Result<super::McpServer, String> {
         Ok(super::McpServer::new(crate::client::test_api::client(base_url)?))
     }

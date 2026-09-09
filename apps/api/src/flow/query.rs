@@ -31,6 +31,13 @@ use super::repository::{
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
 pub const MAX_LIST_LIMIT: u64 = 100;
 
+/// Computes lag for both the projection-lag and search surfaces. Keeping the subtraction here
+/// prevents the two public APIs from silently acquiring different negative/corrupt-row behavior.
+#[must_use]
+pub(crate) const fn projection_lag(head_seq: i64, projection_seq: i64) -> i64 {
+    head_seq.saturating_sub(projection_seq)
+}
+
 /// Each authorized-scan batch is one `page_limit_max`-sized page of *candidate* rows —
 /// `limits-v1.md`'s own reasoning for `authorized_scan_rows_max` ("最多 overfetch 10 个最大页")
 /// is ten of these, not an independently chosen tuning constant.
@@ -701,7 +708,7 @@ pub async fn get_projection_lag(
             object_id: row.object_id,
             head_seq: row.head_seq,
             projection_seq: row.projection_seq,
-            lag: row.head_seq - row.projection_seq,
+            lag: projection_lag(row.head_seq, row.projection_seq),
         })
         .collect();
     let (max_lag, p95_lag) = projection_lag_aggregates(&items);

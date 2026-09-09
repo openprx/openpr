@@ -5,6 +5,8 @@
 //! response shapes assembled by [`crate::flow::query`] and [`crate::flow::command`] and returned
 //! through the existing `ApiResponse` envelope.
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -191,6 +193,50 @@ pub struct ProjectionLagResponse {
     pub items: Vec<ProjectionLagItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// The compact object identity embedded in a Flow full-text hit.
+///
+/// The contract names this `FlowObjectSummary` without separately spelling its fields; this is
+/// the same object-summary shape already used by relation reads, plus no authorization-sensitive
+/// metadata.
+#[derive(Debug, Serialize)]
+pub struct FlowObjectSummary {
+    pub id: Uuid,
+    pub object_type: String,
+    pub title: String,
+    pub lifecycle_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+}
+
+/// One accepted-index search result from `rest-api-v1.md`.
+#[derive(Debug, Serialize)]
+pub struct FlowSearchHit {
+    pub object: FlowObjectSummary,
+    pub matched_fields: Vec<String>,
+    pub snippets: BTreeMap<String, String>,
+    pub indexed_seq: i64,
+    pub head_seq: i64,
+    pub projection_lag: i64,
+    pub stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SearchIndexFrontier {
+    pub indexed_seq: i64,
+    pub head_seq: i64,
+    pub lag: i64,
+    pub stale: bool,
+}
+
+/// The Flow search page deliberately has no total or pre-authorization count field.
+#[derive(Debug, Serialize)]
+pub struct FlowSearchResponse {
+    pub items: Vec<FlowSearchHit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub index_frontier: SearchIndexFrontier,
 }
 
 /// `{flow_enabled,default_member_level,authz_epoch,updated_at,updated_by}` from `rest-api-v1.md`

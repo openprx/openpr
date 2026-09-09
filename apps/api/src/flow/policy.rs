@@ -61,6 +61,11 @@ impl FlowReadContext {
     pub const fn workspace_id(&self) -> Uuid {
         self.workspace_id
     }
+
+    #[must_use]
+    pub const fn is_bot(&self) -> bool {
+        matches!(self.principal_kind, PrincipalKind::Bot)
+    }
 }
 
 /// Workspace membership (`unauthenticated`/`forbidden`/`not_found` per `error-mapping-v1.md`)

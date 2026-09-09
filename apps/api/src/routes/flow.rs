@@ -16,6 +16,7 @@
 //! GET  /api/v1/flow/objects/{object_id}/history
 //! GET  /api/v1/flow/objects/{object_id}/diff
 //! GET  /api/v1/workspaces/{workspace_id}/flow/projection-lag
+//! GET  /api/v1/workspaces/{workspace_id}/flow/search
 //! GET  /api/v1/workspaces/{workspace_id}/features/flow
 //! PUT  /api/v1/workspaces/{workspace_id}/features/flow
 //! ```
@@ -44,7 +45,7 @@ use crate::{
         grants::{self, Caller, GrantRequest, SetGrantsInput, SetInheritanceInput},
         policy, query,
         query::Render,
-        relations,
+        relations, search,
     },
     response::ApiResponse,
 };
@@ -545,6 +546,59 @@ pub async fn get_flow_projection_lag(
     Err(policy::authorization_read_unstable())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FlowSearchQuery {
+    pub q: String,
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub unprojected: bool,
+    #[serde(default)]
+    pub all_visible: bool,
+    pub object_type: Option<String>,
+    pub freshness: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u64>,
+}
+
+/// `GET /api/v1/workspaces/{workspace_id}/flow/search`.
+///
+/// The domain service validates the exclusive scope, evaluates a policy-filtered frontier, then
+/// reauthorizes every matching candidate. An epoch change restarts the entire request so no page
+/// can combine authorization decisions from two policy states.
+pub async fn get_flow_search(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Query(params): Query<FlowSearchQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let access = policy::begin_flow_read(&state, &extensions, workspace_id).await?;
+        let Some(response) = search::search(
+            &state,
+            &access,
+            search::SearchParams {
+                workspace_id,
+                q: params.q.clone(),
+                project_id: params.project_id,
+                unprojected: params.unprojected,
+                all_visible: params.all_visible,
+                object_type: params.object_type.clone(),
+                freshness: params.freshness.clone(),
+                cursor: params.cursor.clone(),
+                limit: params.limit,
+            },
+        )
+        .await?
+        else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response));
+    }
+    Err(policy::authorization_read_unstable())
+}
+
 /// `GET /api/v1/workspaces/{workspace_id}/features/flow`.
 ///
 /// Plain workspace membership (`policy::require_flow_feature_read_access`), *not*
@@ -635,11 +689,12 @@ mod flow_database_tests {
 
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectDiffQuery,
-        FlowObjectHistoryQuery, FlowRelationsQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery,
+        FlowObjectHistoryQuery, FlowRelationsQuery, FlowSearchQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery,
         ListFlowObjectsQuery, ProjectionLagQuery, SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object,
         get_flow_feature, get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
-        get_flow_object_history, get_flow_object_relations, get_flow_projection_lag, list_flow_objects,
-        post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance, set_flow_feature,
+        get_flow_object_history, get_flow_object_relations, get_flow_projection_lag, get_flow_search,
+        list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
+        set_flow_feature,
     };
     use crate::error::ApiError;
     use crate::flow::collab::{
@@ -2982,6 +3037,344 @@ mod flow_database_tests {
         );
         assert_eq!(over_limit["details"]["limit"], 100, "{over_limit}");
         assert_eq!(over_limit["details"]["observed"], 101, "{over_limit}");
+
+        scratch.drop_self().await;
+    }
+
+    async fn index_accepted_projection(state: &AppState, object_id: Uuid) {
+        exec(
+            state,
+            "INSERT INTO flow_search_index (object_id, indexed_seq, indexed_frontier, title, plain_text) \
+             SELECT object_id, document_seq, document_frontier, title, plain_text \
+               FROM flow_object_projections WHERE object_id = $1",
+            vec![object_id.into()],
+        )
+        .await;
+    }
+
+    fn search_query(q: &str) -> FlowSearchQuery {
+        FlowSearchQuery {
+            q: q.to_string(),
+            project_id: None,
+            unprojected: false,
+            all_visible: true,
+            object_type: None,
+            freshness: None,
+            cursor: None,
+            limit: None,
+        }
+    }
+
+    /// Hidden candidates sit between two visible hits in rank order. The test asserts directly
+    /// on both returned pages and their wire keys, so a pre-authorization total/cursor or a
+    /// reader that applies a second filter cannot hide the regression.
+    #[tokio::test]
+    async fn flow_search_filters_before_cardinality_cursor_snippet_and_frontier() {
+        let scratch = scratch_or_skip!("flow-search-policy");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let visible_a = create_page_as_owner(&state, workspace_id, owner_id, "needle needle needle").await;
+        let hidden = create_page_as_owner(&state, workspace_id, owner_id, "needle needle hidden-secret").await;
+        let visible_b = create_page_as_owner(&state, workspace_id, owner_id, "needle visible-last").await;
+        for object_id in [visible_a, hidden, visible_b] {
+            index_accepted_projection(&state, object_id).await;
+        }
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![hidden.into()],
+        )
+        .await;
+
+        let mut first_query = search_query("needle");
+        first_query.limit = Some(1);
+        let first = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(first_query),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(first["code"], 0, "{first}");
+        let data = first["data"].as_object().expect("search data is an object");
+        assert_eq!(
+            data.keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["index_frontier", "items", "next_cursor"].into_iter().collect(),
+            "no pre-filter count may enter the response: {first}"
+        );
+        assert_eq!(first["data"]["items"].as_array().expect("items").len(), 1);
+        assert_eq!(first["data"]["items"][0]["object"]["id"], visible_a.to_string());
+        assert_eq!(first["data"]["index_frontier"]["stale"], false);
+        let cursor = first["data"]["next_cursor"]
+            .as_str()
+            .expect("another visible hit exists")
+            .to_string();
+        let cursor_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&cursor)
+            .expect("cursor is base64url");
+        let cursor_text = String::from_utf8_lossy(&cursor_bytes);
+        for forbidden in [
+            visible_a.to_string(),
+            visible_b.to_string(),
+            hidden.to_string(),
+            "needle".to_string(),
+        ] {
+            assert!(
+                !cursor_text.contains(&forbidden),
+                "cursor leaked `{forbidden}`: {cursor_text}"
+            );
+        }
+
+        let mut second_query = search_query("needle");
+        second_query.limit = Some(1);
+        second_query.cursor = Some(cursor);
+        let second = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(second_query),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(second["code"], 0, "{second}");
+        assert_eq!(second["data"]["items"].as_array().expect("items").len(), 1);
+        assert_eq!(second["data"]["items"][0]["object"]["id"], visible_b.to_string());
+        assert!(second["data"]["next_cursor"].is_null(), "{second}");
+        let serialized = format!("{first}{second}");
+        for forbidden in [
+            hidden.to_string(),
+            "hidden-secret".to_string(),
+            "total".to_string(),
+            "examined".to_string(),
+        ] {
+            assert!(
+                !serialized.contains(&forbidden),
+                "search leaked `{forbidden}`: {serialized}"
+            );
+        }
+
+        scratch.drop_self().await;
+    }
+
+    /// The visible object's old accepted index remains the only source of title/snippet while
+    /// lagging. `require_current` refuses the same scope, and a stale no-grant object cannot make
+    /// a member's policy-filtered frontier stale.
+    #[tokio::test]
+    async fn flow_search_stale_projection_is_explicit_and_require_current_fails_closed() {
+        let scratch = scratch_or_skip!("flow-search-stale");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let visible = create_page_as_owner(&state, workspace_id, owner_id, "old accepted needle").await;
+        let hidden = create_page_as_owner(&state, workspace_id, owner_id, "hidden old needle").await;
+        for object_id in [visible, hidden] {
+            index_accepted_projection(&state, object_id).await;
+            exec(
+                &state,
+                "UPDATE collab_documents SET head_seq = 1, head_frontier = $2 WHERE object_id = $1",
+                vec![object_id.into(), vec![1_u8].into()],
+            )
+            .await;
+            exec(
+                &state,
+                "UPDATE flow_object_projections SET document_seq = 1, document_frontier = $2, \
+                 title = 'new projection without the query', plain_text = 'new accepted body' WHERE object_id = $1",
+                vec![object_id.into(), vec![1_u8].into()],
+            )
+            .await;
+        }
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![hidden.into()],
+        )
+        .await;
+
+        let allowed = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(search_query("needle")),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(allowed["code"], 0, "{allowed}");
+        assert_eq!(
+            allowed["data"]["items"].as_array().expect("items").len(),
+            1,
+            "{allowed}"
+        );
+        assert_eq!(allowed["data"]["items"][0]["object"]["id"], visible.to_string());
+        assert_eq!(allowed["data"]["items"][0]["object"]["title"], "old accepted needle");
+        assert_eq!(allowed["data"]["items"][0]["indexed_seq"], 0);
+        assert_eq!(allowed["data"]["items"][0]["head_seq"], 1);
+        assert_eq!(allowed["data"]["items"][0]["projection_lag"], 1);
+        assert_eq!(allowed["data"]["items"][0]["stale"], true);
+        assert_eq!(allowed["data"]["index_frontier"]["indexed_seq"], 0);
+        assert_eq!(allowed["data"]["index_frontier"]["head_seq"], 1);
+        assert_eq!(allowed["data"]["index_frontier"]["lag"], 1);
+        assert_eq!(allowed["data"]["index_frontier"]["stale"], true);
+        assert!(!allowed.to_string().contains("hidden old needle"), "{allowed}");
+        assert!(!allowed.to_string().contains("new accepted body"), "{allowed}");
+
+        let mut current = search_query("needle");
+        current.freshness = Some("require_current".to_string());
+        let member_current = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(current),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(member_current["error_code"], "stale_frontier", "{member_current}");
+
+        // Make the visible row current. The hidden row stays stale, but cannot affect the
+        // member's frontier. The owner can see it and therefore still fails closed.
+        exec(
+            &state,
+            "UPDATE flow_search_index si SET indexed_seq = p.document_seq, indexed_frontier = p.document_frontier, \
+             title = p.title, plain_text = p.plain_text FROM flow_object_projections p \
+             WHERE si.object_id = p.object_id AND si.object_id = $1",
+            vec![visible.into()],
+        )
+        .await;
+        let mut member_fresh = search_query("accepted");
+        member_fresh.freshness = Some("require_current".to_string());
+        let member_fresh = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(member_fresh),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            member_fresh["code"], 0,
+            "hidden lag altered the visible frontier: {member_fresh}"
+        );
+        assert_eq!(member_fresh["data"]["index_frontier"]["stale"], false);
+
+        let mut owner_current = search_query("accepted");
+        owner_current.freshness = Some("require_current".to_string());
+        let owner_current = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(owner_current),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(owner_current["error_code"], "stale_frontier", "{owner_current}");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_search_rejects_each_invalid_scope_and_bot_all_visible_but_allows_bot_single_scope() {
+        let scratch = scratch_or_skip!("flow-search-scope");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "bot searchable needle").await;
+        index_accepted_projection(&state, object_id).await;
+
+        let none = FlowSearchQuery {
+            all_visible: false,
+            ..search_query("needle")
+        };
+        let none = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(none),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(none["error_code"], "invalid_update", "{none}");
+
+        let both = FlowSearchQuery {
+            project_id: Some(Uuid::new_v4()),
+            unprojected: true,
+            all_visible: false,
+            ..search_query("needle")
+        };
+        let both = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(both),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(both["error_code"], "invalid_update", "{both}");
+
+        let bot = Extension(crate::middleware::bot_auth::BotAuthContext {
+            bot_id: Uuid::new_v4(),
+            workspace_id,
+            permissions: vec!["read".to_string()],
+            surface: crate::flow::event_origin::EventSurface::McpHttp,
+            tool_name: Some("objects.search".to_string()),
+            request_id: Uuid::new_v4(),
+        });
+        let bot_all = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                Some(bot.clone()),
+                Path(workspace_id),
+                Query(search_query("needle")),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(bot_all["code"], 403, "{bot_all}");
+
+        let bot_single = FlowSearchQuery {
+            unprojected: true,
+            all_visible: false,
+            ..search_query("needle")
+        };
+        let bot_single = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                Some(bot),
+                Path(workspace_id),
+                Query(bot_single),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(bot_single["code"], 0, "{bot_single}");
+        assert_eq!(bot_single["data"]["items"].as_array().expect("items").len(), 1);
 
         scratch.drop_self().await;
     }

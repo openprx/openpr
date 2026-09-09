@@ -323,7 +323,10 @@ async fn search_comments(
     clippy::nursery
 )]
 mod tests {
-    use super::{BotAuthContext, SCOPE_FILTER_SQL, SearchScope};
+    use super::{
+        BotAuthContext, CommentSearchResult, IssueSearchResult, ProjectSearchResult, SCOPE_FILTER_SQL, SearchResult,
+        SearchScope,
+    };
     use crate::error::ApiError;
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use uuid::Uuid;
@@ -359,6 +362,50 @@ mod tests {
         assert!(SCOPE_FILTER_SQL.contains("wm.user_id = $1"));
         assert!(SCOPE_FILTER_SQL.contains("p.workspace_id = $2"));
         assert!(SCOPE_FILTER_SQL.contains("$3::uuid IS NULL OR p.id = $3"));
+    }
+
+    /// ADR-0009 keeps legacy `/api/v1/search` as the original three-way union. This exhaustive
+    /// construction fails loudly if a Flow variant is added or any legacy discriminator drifts.
+    #[test]
+    fn legacy_search_result_union_remains_project_issue_comment_only() {
+        let id = Uuid::new_v4();
+        let values = [
+            serde_json::to_value(SearchResult::Issue(IssueSearchResult {
+                id,
+                title: "issue".to_string(),
+                description: None,
+                state: "open".to_string(),
+                project_id: id,
+                workspace_id: id,
+            }))
+            .expect("issue serializes"),
+            serde_json::to_value(SearchResult::Project(ProjectSearchResult {
+                id,
+                key: "LEG".to_string(),
+                name: "project".to_string(),
+                description: None,
+                workspace_id: id,
+            }))
+            .expect("project serializes"),
+            serde_json::to_value(SearchResult::Comment(CommentSearchResult {
+                id,
+                body: "comment".to_string(),
+                issue_id: id,
+                project_id: id,
+                workspace_id: id,
+                author_id: None,
+                created_at: chrono::DateTime::UNIX_EPOCH,
+            }))
+            .expect("comment serializes"),
+        ];
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value["type"].as_str().expect("type discriminator"))
+                .collect::<Vec<_>>(),
+            ["issue", "project", "comment"]
+        );
+        assert!(values.iter().all(|value| value.get("flow").is_none()));
     }
 
     // ---- Real-database tests (opt-in via OPENPR_TEST_DATABASE_URL) ----
