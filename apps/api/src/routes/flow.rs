@@ -465,6 +465,7 @@ mod flow_database_tests {
     };
     use crate::error::ApiError;
     use crate::flow::collab::{authz::PermissionLevel, permission_cache::PermissionCache};
+    use crate::routes::bot::{CreateBotRequest, create_bot};
     use crate::routes::member::{
         AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
     };
@@ -1758,6 +1759,33 @@ mod flow_database_tests {
             .expect("settings count query runs")
             .expect("settings count exists");
         assert_eq!(settings_count.try_get::<i64>("", "n").expect("count reads"), 0);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn bot_creation_member_write_advances_existing_flow_epoch() {
+        let scratch = scratch_or_skip!("bot-member-epoch");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+
+        let created = body_json(to_response(
+            create_bot(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(CreateBotRequest {
+                    name: "epoch bot".to_string(),
+                    permissions: Some(vec!["read".to_string()]),
+                    expires_at: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(created["code"], 0, "{created}");
+        assert_eq!(read_epoch(&state, workspace_id).await, 1);
 
         scratch.drop_self().await;
     }
