@@ -132,6 +132,15 @@ fn check_scan_budget(examined: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn candidate_is_policy_visible(is_visible: bool) -> bool {
+    #[cfg(test)]
+    if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_SEARCH_AUTHORIZE_ALL").is_some() {
+        eprintln!("WP28_MUTATION_SEARCH_AUTHORIZE_ALL_ACTIVE");
+        return true;
+    }
+    is_visible
+}
+
 fn add_scope_predicate(sql: &mut String, values: &mut Vec<sea_orm::Value>, scope: SearchScope, object_alias: &str) {
     match scope {
         SearchScope::Project(project_id) => {
@@ -538,7 +547,7 @@ pub async fn search(
             examined = examined.saturating_add(1);
             check_scan_budget(examined)?;
             after = Some((row.rank, row.object_id));
-            if is_visible {
+            if candidate_is_policy_visible(is_visible) {
                 accepted.push(row);
                 if accepted.len() >= needed {
                     break;
