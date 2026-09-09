@@ -7,9 +7,9 @@
 //! `move_object.rs`) must never read this cache: they continue to call
 //! [`super::authz::effective_permission`] against the database under the required fencing locks.
 //!
-//! Epoch advancement is the immediate logical invalidation mechanism. The explicit object,
-//! subtree, and workspace invalidators only reclaim memory after a successful commit; correctness
-//! never depends on an exhaustive physical sweep.
+//! Epoch advancement is the immediate logical invalidation mechanism. The explicit object and
+//! workspace invalidators only reclaim memory after a successful commit; correctness never
+//! depends on an exhaustive physical sweep.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +20,6 @@ use platform::app::AppState;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::flow::repository;
 
 use super::authz::PermissionLevel;
 use super::limits::WARM_CACHE_IDLE_TTL_SECONDS;
@@ -177,26 +176,6 @@ impl PermissionCache {
             .lock()
             .entries
             .retain(|key, _| key.workspace_id != workspace_id || key.object_id != object_id);
-    }
-
-    /// Physically removes every cached entry in `root_object_id`'s current subtree.
-    ///
-    /// The downward recursive CTE is the existing [`repository::subtree_nodes`] implementation
-    /// used by `move_object`; no third tree walker is introduced. The query is not contract-bounded
-    /// because this is best-effort memory reclamation. Its depth probe is one beyond the legal tree
-    /// depth so corrupt data terminates safely.
-    pub async fn invalidate_subtree(
-        &self,
-        state: &AppState,
-        workspace_id: Uuid,
-        root_object_id: Uuid,
-    ) -> Result<(), ApiError> {
-        let subtree = repository::subtree_nodes(&state.db, workspace_id, root_object_id, 33, i64::MAX).await?;
-        self.registry
-            .lock()
-            .entries
-            .retain(|key, _| key.workspace_id != workspace_id || !subtree.ids.contains(&key.object_id));
-        Ok(())
     }
 
     /// Physically removes all cached permissions for a workspace after a membership or baseline

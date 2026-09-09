@@ -781,23 +781,20 @@ async fn apply(
             tx.commit().await?;
             match super::collab::permission_cache::PermissionCache::for_state(state) {
                 Ok(cache) => {
-                    if let Err(err) = cache.invalidate_subtree(state, workspace_id, object_id).await {
-                        tracing::warn!(%workspace_id, %object_id, %err, "permission cache subtree cleanup failed after commit");
-                    }
+                    cache.invalidate_workspace(workspace_id);
                 }
                 Err(err) => {
                     tracing::warn!(%workspace_id, %object_id, %err, "permission cache unavailable after authorization commit");
                 }
             }
             if let Some(committed_epoch) = outcome.committed_epoch {
-                let revocation_stats = super::collab::revocation::revalidate_subtree_after_commit(
+                let revocation_stats = super::collab::revocation::revalidate_authorization_change_after_commit(
                     state,
                     workspace_id,
-                    object_id,
                     committed_epoch,
                 )
                 .await;
-                tracing::debug!(%workspace_id, %object_id, ?revocation_stats, "authorization subtree sessions re-evaluated after commit");
+                tracing::debug!(%workspace_id, %object_id, ?revocation_stats, "authorization sessions re-evaluated after commit");
             }
             Ok(outcome)
         }
@@ -1863,11 +1860,10 @@ mod database_tests {
         let committed_epoch = authz::read_epoch(&scratch.db, fx.workspace_id)
             .await
             .expect("committed epoch reads");
-        let revocation_stats = crate::flow::collab::revocation::revalidate_subtree_with_registry(
+        let revocation_stats = crate::flow::collab::revocation::revalidate_authorization_change_with_registry(
             &state,
             &registry,
             fx.workspace_id,
-            parent,
             committed_epoch,
         )
         .await;

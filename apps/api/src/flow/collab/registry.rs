@@ -6,10 +6,10 @@
 //! (`slow_consumer_queue_frames_max`/`_bytes_max`).
 //!
 //! `ADR-0012` §5's v0.5 scope is single-instance: this module maintains both document fan-out and
-//! a distinct `object_id → active sessions` reverse index. [`super::revocation`] reuses
-//! `repository::subtree_nodes` and the batch permission evaluator after grant, inheritance,
-//! parent, membership, baseline, and feature changes; it deletes revoked presence independently,
-//! removes the session from fan-out, then best-effort sends the frozen close. Cross-instance
+//! a distinct `object_id → active sessions` reverse index. [`super::revocation`] re-evaluates the
+//! workspace's bounded live-session set after grant, inheritance, parent, membership, baseline,
+//! and feature changes; it deletes revoked presence independently, removes the session from
+//! fan-out, then best-effort sends the frozen close. Cross-instance
 //! broadcast and durable revocation logs belong to v0.8/ADR-0016 and are intentionally absent.
 //! Correctness never depends on the close path: `authz::fence_epoch_for_share` remains the
 //! commit-time barrier.
@@ -667,6 +667,42 @@ impl SessionRegistry {
         closed
     }
 
+    /// Recoverably drains only the supplied active sessions. Authorization revalidation uses
+    /// this when the database cannot determine whether those sessions remain authorized: 4403
+    /// would falsely claim a permanent denial, while the existing structured 4410 drain tells
+    /// clients to reconnect and re-run ticket/open authorization.
+    pub fn drain_sessions(&self, candidates: &[ActiveSession], retry_after_ms: u64) -> usize {
+        if candidates.is_empty() {
+            return 0;
+        }
+        let sessions = self.sessions.lock();
+        let handles: Vec<(Uuid, SessionHandle)> = candidates
+            .iter()
+            .filter_map(|candidate| {
+                sessions
+                    .get(&candidate.document_id)?
+                    .get(&candidate.session_id)
+                    .cloned()
+                    .map(|handle| (candidate.document_id, handle))
+            })
+            .collect();
+        drop(sessions);
+
+        let signal = DrainSignal::new(retry_after_ms);
+        let reason = signal.close_reason();
+        for (document_id, handle) in &handles {
+            handle.send(OutboundEvent::ControlFrame(Box::new(drain_rejected_frame(
+                *document_id,
+                signal,
+            ))));
+            handle.send(OutboundEvent::Close {
+                code: DRAIN_CLOSE_CODE,
+                reason: reason.clone(),
+            });
+        }
+        handles.len()
+    }
+
     #[must_use]
     pub fn session_count(&self, document_id: Uuid) -> usize {
         self.sessions.lock().get(&document_id).map_or(0, HashMap::len)
@@ -1249,6 +1285,72 @@ mod tests {
         assert!(
             other.receiver.try_recv().is_err(),
             "a different workspace's session must not be touched"
+        );
+    }
+
+    #[test]
+    fn recoverable_drain_is_limited_to_uncertain_authorization_sessions() {
+        let registry = SessionRegistry::new();
+        let workspace_id = Uuid::new_v4();
+        let uncertain_object = Uuid::new_v4();
+        let healthy_object = Uuid::new_v4();
+        let uncertain_document = Uuid::new_v4();
+        let healthy_document = Uuid::new_v4();
+        let uncertain_session = Uuid::new_v4();
+        let mut uncertain = registry
+            .try_register_authorized(
+                uncertain_document,
+                uncertain_object,
+                Uuid::new_v4(),
+                workspace_id,
+                uncertain_session,
+                1,
+            )
+            .expect("uncertain fixture registers");
+        let mut healthy = registry
+            .try_register_authorized(
+                healthy_document,
+                healthy_object,
+                Uuid::new_v4(),
+                workspace_id,
+                Uuid::new_v4(),
+                1,
+            )
+            .expect("healthy fixture registers");
+
+        let candidates = registry.observe_epoch_and_workspace_sessions(workspace_id, 2);
+        let uncertain_candidate = candidates
+            .into_iter()
+            .find(|candidate| candidate.session_id == uncertain_session)
+            .expect("uncertain session is observable");
+        assert_eq!(registry.drain_sessions(&[uncertain_candidate], 5_000), 1);
+
+        let OutboundEvent::ControlFrame(frame) = uncertain.receiver.try_recv().expect("drain control frame is queued")
+        else {
+            panic!("expected structured drain control frame")
+        };
+        let Frame::Rejected {
+            code,
+            recoverable,
+            details,
+            ..
+        } = *frame
+        else {
+            panic!("expected server_draining rejection")
+        };
+        assert_eq!(code, RejectedCode::ServerDraining);
+        assert!(recoverable);
+        assert_eq!(
+            details,
+            Some(serde_json::json!({"reason": "drain", "retry_after_ms": 5_000}))
+        );
+        assert!(matches!(
+            uncertain.receiver.try_recv(),
+            Ok(OutboundEvent::Close { code: 4410, .. })
+        ));
+        assert!(
+            healthy.receiver.try_recv().is_err(),
+            "a known-healthy session must not be drained with the uncertain object"
         );
     }
 

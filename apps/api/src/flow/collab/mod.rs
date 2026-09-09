@@ -43,13 +43,17 @@ pub mod ticket;
 pub mod write;
 
 /// The minimum effective permission shared by ticket issuance, WebSocket `open`, and post-commit
-/// revocation. The value remains `edit` until the contract conflict between ADR-0007's read+write
+/// revocation.
+///
+/// The value remains `edit` until the contract conflict between ADR-0007's read+write
 /// admission and `collab-protocol-v1.md`'s view-only subscription is resolved by the contract
 /// owner; all three production decisions must move together when that happens.
 pub const MINIMUM_COLLAB_SESSION_LEVEL: authz::PermissionLevel = authz::PermissionLevel::Edit;
 
 /// Collab tickets are user-only, so every admitted session is evaluated as the same principal
-/// kind during `open` and revocation. `routes::collab::database_tests::a_bot_token_cannot_issue_a_collab_ticket`
+/// kind during `open` and revocation.
+///
+/// `routes::collab::database_tests::a_bot_token_cannot_issue_a_collab_ticket`
 /// is the end-to-end negative assertion guarding this invariant.
 pub const COLLAB_SESSION_PRINCIPAL_KIND: &str = "user";
 
