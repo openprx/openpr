@@ -2047,8 +2047,10 @@ mod database_tests {
         let fx = seed_workspace(&scratch.db).await;
         let member = user(fx.member_id, "member");
 
-        // A member whose only permission is the `edit` baseline -- no grant anywhere.
-        let page = create(&state, &fx, "page", None).await;
+        // A member whose only permission is the `edit` baseline -- no grant anywhere. Keep the
+        // page below a navigator so the fixture exercises the ordinary non-root tier it claims.
+        let navigator = create(&state, &fx, "navigator", None).await;
+        let page = create(&state, &fx, "page", Some(navigator)).await;
         assert_eq!(level_for(&scratch.db, &fx, page, &member).await, PermissionLevel::Edit);
 
         run_command(&state, page, &member, "archive")
@@ -2061,7 +2063,6 @@ mod database_tests {
         assert_eq!(lifecycle_of(&scratch.db, page).await, "active");
 
         // Second tier row: a `navigator` is a root object and needs `full_access`.
-        let navigator = create(&state, &fx, "navigator", None).await;
         assert_eq!(
             level_for(&scratch.db, &fx, navigator, &member).await,
             PermissionLevel::Edit,
