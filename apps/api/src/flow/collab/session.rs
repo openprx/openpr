@@ -1263,6 +1263,10 @@ async fn plan_resume(
         if known_frontier != BASE64.encode(&boot.head_frontier) {
             return Err(ResumeRefusal::FrontierMismatch);
         }
+        #[cfg(test)]
+        if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_EMPTY_RESUME_ZERO_FRAMES").is_some() {
+            return Ok(Vec::new());
+        }
         return Ok(vec![confirmation]);
     }
 
@@ -4372,6 +4376,24 @@ mod tests {
             assert_eq!(confirmed_document, document_id);
             assert_eq!(confirmed_seq, head_seq);
             assert_eq!(confirmed_frontier, head_frontier);
+            if let Some(path) = std::env::var_os("OPENPR_FLOW_RESUME_AT_HEAD_EVIDENCE_OUT") {
+                let evidence = serde_json::json!({
+                    "request_position": {
+                        "document_id": document_id,
+                        "known_seq": head_seq,
+                        "known_frontier": head_frontier,
+                    },
+                    "first_observable_response": {
+                        "type": "ack",
+                        "document_id": confirmed_document,
+                        "seq": confirmed_seq,
+                        "frontier": confirmed_frontier,
+                    },
+                    "confirmation_exact": true,
+                });
+                std::fs::write(path, serde_json::to_vec_pretty(&evidence).expect("evidence serializes"))
+                    .expect("resume evidence writes");
+            }
 
             sync(&mut resumed).await;
             scratch.drop_self().await;

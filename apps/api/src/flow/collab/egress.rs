@@ -73,7 +73,13 @@ impl EgressSequencer {
             return SeqDecision::ResyncPending;
         }
         match seq.cmp(&self.next_expected_seq) {
-            Ordering::Less => SeqDecision::Duplicate,
+            Ordering::Less => {
+                #[cfg(test)]
+                if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_FORWARD_EGRESS_DUPLICATE").is_some() {
+                    return SeqDecision::InOrder;
+                }
+                SeqDecision::Duplicate
+            }
             Ordering::Equal => {
                 self.next_expected_seq += 1;
                 SeqDecision::InOrder

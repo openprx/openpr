@@ -241,6 +241,8 @@ if [[ "$RELEASE" == "0.5" ]]; then
   V05_LOAD_DIR="$EVIDENCE_ROOT/logs/collab-load-v0.5"
   V05_LOAD_LOG="$EVIDENCE_ROOT/logs/collab-load-v0.5.log"
   V05_DYNAMIC_LOG="$EVIDENCE_ROOT/logs/collab-architecture-v0.5-tests.log"
+  V05_MUTATION_LOG="$EVIDENCE_ROOT/logs/collab-architecture-v0.5-mutations.log"
+  V05_RESUME_JSON="$EVIDENCE_ROOT/logs/resume-at-head-v0.5.json"
   V05_SURFACE_JSON="$EVIDENCE_ROOT/logs/surface-coverage-v0.5.json"
   V05_LOAD_EXIT=0
 
@@ -258,6 +260,7 @@ if [[ "$RELEASE" == "0.5" ]]; then
     --contracts-root "$CONTRACTS_ROOT" --release 0.5 >"$V05_SURFACE_JSON"
 
   : >"$V05_DYNAMIC_LOG"
+  : >"$V05_RESUME_JSON"
   V05_DYNAMIC_EXIT=0
   V05_TESTS=(
     flow::collab::session::tests::live_ws::inbound_updates_generated_from_one_base_are_accepted_in_injected_reverse_order
@@ -268,7 +271,8 @@ if [[ "$RELEASE" == "0.5" ]]; then
   for test_name in "${V05_TESTS[@]}"; do
     set +e
     (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
-      cargo test --release -p api --lib "$test_name" -- --exact --test-threads=1) \
+      OPENPR_FLOW_RESUME_AT_HEAD_EVIDENCE_OUT="$V05_RESUME_JSON" \
+      cargo test --release -p api --lib "$test_name" -- --exact --test-threads=1 --nocapture) \
       >>"$V05_DYNAMIC_LOG" 2>&1
     test_exit=$?
     set -e
@@ -276,11 +280,31 @@ if [[ "$RELEASE" == "0.5" ]]; then
   done
   set +e
   (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
-    cargo test --release -p api --lib 'flow::collab::snapshot::' -- --test-threads=1) \
+    cargo test --release -p api --lib 'flow::collab::snapshot::' -- --test-threads=1 --nocapture) \
     >>"$V05_DYNAMIC_LOG" 2>&1
   snapshot_exit=$?
   set -e
   if [[ $snapshot_exit -ne 0 ]]; then V05_DYNAMIC_EXIT=1; fi
+
+  : >"$V05_MUTATION_LOG"
+  mutation_started_ms="$(date +%s%3N)"
+  set +e
+  (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
+    OPENPR_FLOW_TEST_MUTATION_EMPTY_RESUME_ZERO_FRAMES=1 \
+    cargo test --release -p api --lib \
+      flow::collab::session::tests::live_ws::resume_at_head_returns_exact_ack_before_an_empty_replay \
+      -- --exact --test-threads=1 --nocapture) >>"$V05_MUTATION_LOG" 2>&1
+  V05_RESUME_MUTATION_EXIT=$?
+  V05_RESUME_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
+  mutation_started_ms="$(date +%s%3N)"
+  (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
+    OPENPR_FLOW_TEST_MUTATION_FORWARD_EGRESS_DUPLICATE=1 \
+    cargo test --release -p api --lib \
+      flow::collab::session::tests::live_ws::outbound_duplicates_are_dropped_and_a_gap_is_backfilled_in_strict_seq_order \
+      -- --exact --test-threads=1 --nocapture) >>"$V05_MUTATION_LOG" 2>&1
+  V05_EGRESS_MUTATION_EXIT=$?
+  V05_EGRESS_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
+  set -e
 
   V05_SOURCE_DIRTY_AFTER=false
   [[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || V05_SOURCE_DIRTY_AFTER=true
@@ -289,10 +313,13 @@ if [[ "$RELEASE" == "0.5" ]]; then
   EXECUTOR="${USER:-$(id -un)}@$(hostname)"
 
   set +e
-  python3 - "$LOAD_HARNESS_EVIDENCE" "$V05_DYNAMIC_LOG" "$V05_SURFACE_JSON" \
+  python3 - "$LOAD_HARNESS_EVIDENCE" "$V05_DYNAMIC_LOG" "$V05_MUTATION_LOG" "$V05_RESUME_JSON" "$V05_SURFACE_JSON" \
     "$SOURCE_HEAD" "$SOURCE_DIRTY" "$V05_SOURCE_DIRTY_AFTER" "$CLIENTS" \
     "$ADR_SHA256" "$LIMITS_SHA256" "$GENERATED_AT" "$EXECUTOR" \
-    "$V05_LOAD_EXIT" "$V05_DYNAMIC_EXIT" "$EVIDENCE_ROOT/collab-architecture-result.json" <<'PY'
+    "$V05_LOAD_EXIT" "$V05_DYNAMIC_EXIT" \
+    "$V05_RESUME_MUTATION_EXIT" "$V05_RESUME_MUTATION_DURATION_MS" \
+    "$V05_EGRESS_MUTATION_EXIT" "$V05_EGRESS_MUTATION_DURATION_MS" \
+    "$EVIDENCE_ROOT/collab-architecture-result.json" <<'PY'
 import hashlib
 import json
 import os
@@ -300,9 +327,11 @@ import re
 import sys
 
 (
-    load_path, test_log_path, surface_path, source_head, source_dirty,
+    load_path, test_log_path, mutation_log_path, resume_evidence_path, surface_path, source_head, source_dirty,
     source_dirty_after, clients_raw, adr_sha, limits_sha, generated_at,
-    executor, load_exit_raw, dynamic_exit_raw, output_path,
+    executor, load_exit_raw, dynamic_exit_raw, resume_mutation_exit_raw,
+    resume_mutation_duration_raw, egress_mutation_exit_raw,
+    egress_mutation_duration_raw, output_path,
 ) = sys.argv[1:]
 
 def read_json(path):
@@ -318,10 +347,18 @@ try:
     test_log = open(test_log_path, encoding="utf-8").read()
 except OSError:
     test_log = ""
+try:
+    mutation_log = open(mutation_log_path, encoding="utf-8").read()
+except OSError:
+    mutation_log = ""
 
 clients = int(clients_raw)
 load_exit = int(load_exit_raw)
 dynamic_exit = int(dynamic_exit_raw)
+resume_mutation_exit = int(resume_mutation_exit_raw)
+resume_mutation_duration_ms = int(resume_mutation_duration_raw)
+egress_mutation_exit = int(egress_mutation_exit_raw)
+egress_mutation_duration_ms = int(egress_mutation_duration_raw)
 dirty = source_dirty == "true" or source_dirty_after == "true"
 problems = []
 
@@ -350,6 +387,34 @@ expected_tests = {
 tests = {key: test_ok(name) for key, name in expected_tests.items()}
 for key, value in tests.items():
     require(f"dynamic test did not pass: {key}", value)
+
+resume_evidence = read_json(resume_evidence_path)
+resume_position = resume_evidence.get("request_position") or {}
+resume_response = resume_evidence.get("first_observable_response") or {}
+resume_evidence_exact = all((
+    bool(resume_position.get("document_id")),
+    isinstance(resume_position.get("known_seq"), int),
+    bool(resume_position.get("known_frontier")),
+    resume_response.get("type") == "ack",
+    resume_response.get("document_id") == resume_position.get("document_id"),
+    resume_response.get("seq") == resume_position.get("known_seq"),
+    resume_response.get("frontier") == resume_position.get("known_frontier"),
+    resume_evidence.get("confirmation_exact") is True,
+))
+require("resume-at-head structured evidence is missing or not exact", resume_evidence_exact)
+
+resume_mutation_detected = all((
+    resume_mutation_exit != 0,
+    re.search(r"^test " + re.escape(expected_tests["resume_at_head_ack"]) + r" \.\.\. FAILED$", mutation_log, re.M),
+    "a frame arrives before the timeout" in mutation_log,
+))
+egress_mutation_detected = all((
+    egress_mutation_exit != 0,
+    re.search(r"^test " + re.escape(expected_tests["egress_duplicate_reorder"]) + r" \.\.\. FAILED$", mutation_log, re.M),
+    "the duplicate accepted must be dropped" in mutation_log,
+))
+require("empty-resume zero-frame mutation did not make the exact gate test red", resume_mutation_detected)
+require("egress duplicate-forward mutation did not make the exact gate test red", egress_mutation_detected)
 
 environment = load.get("environment") or {}
 fixture = load.get("fixture") or {}
@@ -479,9 +544,9 @@ egress = {
     "reorder_monotonic": tests["egress_duplicate_reorder"],
     "gap_resync": tests["egress_gap_resync"],
     "saved_never_crossed_gap": tests["egress_gap_resync"],
-    "resume_at_head_ack": tests["resume_at_head_ack"],
-    "resume_request_position": "known_seq == head_seq with exact known_frontier",
-    "resume_first_observable_frame": "ack",
+    "resume_at_head_ack": tests["resume_at_head_ack"] and resume_evidence_exact,
+    "resume_request_position": resume_position,
+    "resume_first_observable_frame": resume_response,
 }
 
 surface_violations = surface.get("violations") or {}
@@ -491,7 +556,9 @@ for required_hash in ("rest_sha256", "mcp_sha256", "cli_sha256", "ui_sha256", "m
     require(f"contract hash missing: {required_hash}", bool((surface.get("contracts") or {}).get(required_hash)))
 
 budget_gate = environment_ok and fixture_ok and all(lock_flags.values()) and all(concurrency_flags.values())
-egress_gate = tests["inbound_reorder"] and all(isinstance(v, str) or v for v in egress.values())
+egress_gate = tests["inbound_reorder"] and all(egress[key] for key in (
+    "duplicates_ignored", "reorder_monotonic", "gap_resync", "saved_never_crossed_gap", "resume_at_head_ack"
+)) and resume_mutation_detected and egress_mutation_detected
 cache_gate = all(cache_flags.values()) and cache_no_loss and row_lock_authority
 snapshot_gate = all(snapshot.values())
 
@@ -583,6 +650,25 @@ result = {
         "barrier": "both concurrent updates generated before reverse-order sends; ping after each accepted",
     },
     "egress": egress,
+    "falsification": {
+        "mutation_log": os.path.abspath(mutation_log_path),
+        "empty_resume_zero_frames": {
+            "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_EMPTY_RESUME_ZERO_FRAMES=1",
+            "same_test_replayed": expected_tests["resume_at_head_ack"],
+            "exit_code": resume_mutation_exit,
+            "duration_ms": resume_mutation_duration_ms,
+            "observed": "no first response before timeout",
+            "gate_went_red": resume_mutation_detected,
+        },
+        "egress_duplicate_forwarded": {
+            "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_FORWARD_EGRESS_DUPLICATE=1",
+            "same_test_replayed": expected_tests["egress_duplicate_reorder"],
+            "exit_code": egress_mutation_exit,
+            "duration_ms": egress_mutation_duration_ms,
+            "observed": "duplicate Accepted crossed the sequencer before the marker",
+            "gate_went_red": egress_mutation_detected,
+        },
+    },
     "process_restart": restart_raw,
     "contracts": surface.get("contracts") or {},
     "counts": surface.get("counts") or {},
