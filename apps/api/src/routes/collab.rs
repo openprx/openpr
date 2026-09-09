@@ -114,37 +114,60 @@ pub struct WsQuery {
     pub client_id: String,
 }
 
-/// The path `GET /api/v1/collab/ws` is registered under -- kept as one constant so
-/// [`trace_span`]'s comparison can never silently drift from the route table in `main.rs`.
-const WS_UPGRADE_PATH: &str = "/api/v1/collab/ws";
-
-/// A `tower_http::trace::MakeSpan` that reproduces `tower_http::trace::DefaultMakeSpan`'s exact
-/// span (name `request`, level `DEBUG`, `method`/`uri`/`version` fields, no headers -- see
-/// `tower-http`'s own `DefaultMakeSpan::make_span`) for every route except this one.
+/// The path-only URI value used by the global request trace span.
 ///
-/// `GET /api/v1/collab/ws?ticket=...&client_id=...` is the one route whose query string carries a
-/// secret: the one-time WebSocket ticket (`ADR-0007`). `CLAUDE.md`: "NEVER log tokens, API keys,
-/// passwords, auth headers" / "Sanitize URLs before logging" -- `axum::http::Request::uri()`
-/// includes the full query string, so the global `TraceLayer`'s default span (which this function
-/// replaces in `main.rs`) would otherwise write the raw ticket into every request-scoped log line
-/// for the lifetime of the request, not just a one-off `tracing::info!`. For that one path, `uri`
-/// is reported with its query string stripped; every other route keeps the exact default shape.
+/// Query strings include secrets on the collab upgrade route and user content on search and
+/// filtering routes. The router has many `Query<T>` extractors, so a route allowlist is unsafe:
+/// every request span records only [`axum::http::Uri::path`].
+fn request_path_for_trace<B>(request: &axum::http::Request<B>) -> &str {
+    request.uri().path()
+}
+
+/// A `tower_http::trace::MakeSpan` with the default span name, level, and fields, except its `uri`
+/// field is sanitized globally to a path before any request-scoped log line can inherit it.
 pub fn trace_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
-    let uri = request.uri();
-    if uri.path() == WS_UPGRADE_PATH {
-        tracing::debug_span!(
-            "request",
-            method = %request.method(),
-            uri = %uri.path(),
-            version = ?request.version(),
-        )
-    } else {
-        tracing::debug_span!(
-            "request",
-            method = %request.method(),
-            uri = %uri,
-            version = ?request.version(),
-        )
+    tracing::debug_span!(
+        "request",
+        method = %request.method(),
+        uri = %request_path_for_trace(request),
+        version = ?request.version(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod trace_span_tests {
+    use super::request_path_for_trace;
+
+    #[test]
+    fn every_request_trace_uri_omits_query_strings() {
+        for (raw, expected_path) in [
+            (
+                "/api/v1/workspaces/00000000-0000-0000-0000-000000000001/flow/search?q=private+draft&all_visible=true",
+                "/api/v1/workspaces/00000000-0000-0000-0000-000000000001/flow/search",
+            ),
+            ("/api/v1/search?q=customer-secret", "/api/v1/search"),
+            (
+                "/api/v1/collab/ws?ticket=one-time-secret&client_id=browser",
+                "/api/v1/collab/ws",
+            ),
+            ("/api/v1/members/search?q=alice", "/api/v1/members/search"),
+            (
+                "/api/v1/forms/records?idempotency_key=sensitive",
+                "/api/v1/forms/records",
+            ),
+        ] {
+            let request = axum::http::Request::builder()
+                .uri(raw)
+                .body(())
+                .expect("test request builds");
+            let traced = request_path_for_trace(&request);
+            assert_eq!(traced, expected_path);
+            assert!(!traced.contains('?'));
+            assert!(!traced.contains("private"));
+            assert!(!traced.contains("secret"));
+            assert!(!traced.contains("sensitive"));
+        }
     }
 }
 
