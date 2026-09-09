@@ -8,7 +8,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use chrono::{DateTime, Utc};
-use collab_core::{CollabEngine, Frontier, LoroCollabEngine};
+use collab_core::{Frontier, SemanticSnapshot};
 use platform::app::AppState;
 use serde_json::json;
 use uuid::Uuid;
@@ -67,6 +67,19 @@ fn check_scan_budget(examined: u64) -> Result<(), ApiError> {
             "scan_budget",
             Some(json!(limits::AUTHORIZED_SCAN_ROWS_MAX)),
             Some(json!(limits::AUTHORIZED_SCAN_ROWS_MAX)),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn check_diff_history_row_budget(rows: usize) -> Result<(), ApiError> {
+    if u64::try_from(rows).unwrap_or(u64::MAX) > limits::AUTHORIZED_SCAN_ROWS_MAX {
+        return Err(ApiError::limit_exceeded(
+            "diff history replay exceeds the bounded row budget",
+            "scan_budget",
+            Some(json!(limits::AUTHORIZED_SCAN_ROWS_MAX)),
+            Some(json!(limits::AUTHORIZED_SCAN_ROWS_MAX.saturating_add(1))),
             None,
         ));
     }
@@ -291,7 +304,9 @@ pub async fn get_object(
 
     let mut view = object_view_from_row(row);
     if render == Render::Markdown {
-        view.semantic_content = json!({ "rendered": projection::render_markdown(&view.title) });
+        let snapshot: SemanticSnapshot =
+            serde_json::from_value(view.semantic_content.clone()).map_err(|_| ApiError::Internal)?;
+        view.semantic_content = json!({ "rendered": projection::render_markdown(&view.title, &snapshot) });
     }
     if !policy::ensure_epoch_current(state, access.context()).await? {
         return Ok(None);
@@ -532,7 +547,7 @@ pub async fn get_object_diff(
     }
 
     let object_id = access.object_id();
-    let rows = repository::fetch_diff_history(&state.db, object_id, to_seq)
+    let rows = repository::fetch_diff_history(&state.db, object_id, to_seq, limits::AUTHORIZED_SCAN_ROWS_MAX)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
     runtime::runtime().ensure_workspace_accepting(rows.workspace_id)?;
@@ -547,6 +562,7 @@ pub async fn get_object_diff(
             Some(&head_frontier),
         ));
     }
+    check_diff_history_row_budget(rows.updates.len())?;
 
     // Accepted history is retained in v0.5. A missing/corrupt row inside `1..=to_seq` is not an
     // alternate meaning of the requested sequence and must never be clamped to a nearby state.
@@ -556,16 +572,12 @@ pub async fn get_object_diff(
         ApiError::resync_required("requested history cannot be reconstructed", None)
     };
 
-    let mut engine = LoroCollabEngine::load(&rows.snapshot).map_err(|_| history_invalid())?;
-    if engine.frontier().as_bytes() != rows.snapshot_frontier {
-        return Err(history_invalid());
-    }
-
     let history_upper = if to_seq == 0 && rows.head_seq > 0 { 1 } else { to_seq };
     let mut expected_seq = 1_i64;
     let mut running_frontier: Option<Vec<u8>> = None;
     let mut from_frontier = None;
     let mut to_frontier = None;
+    let mut replay_updates = Vec::new();
     for row in rows.updates {
         if row.seq != expected_seq
             || running_frontier
@@ -584,13 +596,11 @@ pub async fn get_object_diff(
             }
         }
         if row.seq > rows.snapshot_seq && row.seq <= to_seq {
-            if engine.frontier().as_bytes() != row.before_frontier {
-                return Err(history_invalid());
-            }
-            engine.import_update(&row.bytes).map_err(|_| history_invalid())?;
-            if engine.frontier().as_bytes() != row.after_frontier {
-                return Err(history_invalid());
-            }
+            replay_updates.push(collab_core::isolation::wire::ReplayDiffUpdate {
+                bytes: row.bytes.clone(),
+                before_frontier: row.before_frontier.clone(),
+                after_frontier: row.after_frontier.clone(),
+            });
         }
         if row.seq == from_seq {
             from_frontier = Some(Frontier::from_bytes(row.after_frontier.clone()));
@@ -616,14 +626,63 @@ pub async fn get_object_diff(
     let Some(to_frontier) = to_frontier else {
         return Err(history_invalid());
     };
-    let from_engine = engine.fork_at_frontier(&from_frontier).map_err(|_| history_invalid())?;
-    let to_engine = engine.fork_at_frontier(&to_frontier).map_err(|_| history_invalid())?;
-    let from_snapshot = from_engine.semantic_snapshot().map_err(|_| history_invalid())?;
-    let to_snapshot = to_engine.semantic_snapshot().map_err(|_| history_invalid())?;
-    let from_title = from_engine.title().map_err(|_| history_invalid())?;
-    let to_title = to_engine.title().map_err(|_| history_invalid())?;
+    let request = collab_core::isolation::wire::ReplayDiffRequest {
+        snapshot_frontier: rows.snapshot_frontier,
+        updates: replay_updates,
+        from_frontier: from_frontier.as_bytes().to_vec(),
+        to_frontier: to_frontier.as_bytes().to_vec(),
+    };
+    let base_snapshot = rows.snapshot;
+    let isolated = tokio::task::spawn_blocking(move || collab_core::isolation::isolated_diff(&base_snapshot, &request))
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "diff replay isolation task failed");
+            ApiError::Internal
+        })?;
+    let result = match isolated {
+        Ok(result) => result,
+        Err(collab_core::isolation::IsolatedApplyError::CpuCeiling) => {
+            return Err(ApiError::limit_exceeded(
+                "diff replay exceeded the isolated CPU budget",
+                "decode_apply_cpu_ms",
+                Some(json!(collab_core::isolation::DECODE_APPLY_CPU_MS_MAX)),
+                Some(json!(collab_core::isolation::DECODE_APPLY_CPU_MS_MAX.saturating_add(1))),
+                None,
+            ));
+        }
+        Err(collab_core::isolation::IsolatedApplyError::WallCeiling) => {
+            return Err(ApiError::limit_exceeded(
+                "diff replay exceeded the isolated wall-clock budget",
+                "decode_apply_wall_ms",
+                Some(json!(collab_core::isolation::DECODE_APPLY_WALL_MS_MAX)),
+                Some(json!(
+                    collab_core::isolation::DECODE_APPLY_WALL_MS_MAX.saturating_add(1)
+                )),
+                None,
+            ));
+        }
+        Err(collab_core::isolation::IsolatedApplyError::MemoryCeiling) => {
+            return Err(ApiError::limit_exceeded(
+                "diff replay exceeded the isolated memory budget",
+                "isolated_apply_memory_bytes",
+                Some(json!(collab_core::isolation::ISOLATED_APPLY_MEMORY_BYTES_MAX)),
+                Some(json!(
+                    collab_core::isolation::ISOLATED_APPLY_MEMORY_BYTES_MAX.saturating_add(1)
+                )),
+                None,
+            ));
+        }
+        Err(collab_core::isolation::IsolatedApplyError::Collab(_)) => return Err(history_invalid()),
+        Err(collab_core::isolation::IsolatedApplyError::HostFailure(error)) => {
+            tracing::error!(%error, %object_id, "diff replay isolation host failed");
+            return Err(ApiError::Internal);
+        }
+    };
+    let from_title = result.from_title;
+    let to_title = result.to_title;
+    let to_snapshot = result.to_snapshot;
 
-    let rendered = (render == Render::Markdown).then(|| projection::render_markdown(&to_title));
+    let rendered = (render == Render::Markdown).then(|| projection::render_markdown(&to_title, &to_snapshot));
     let title_diff = (from_title != to_title).then(|| json!({ "before": from_title, "after": to_title }));
     let response = ObjectDiffResponse {
         object_id,
@@ -633,7 +692,7 @@ pub async fn get_object_diff(
         to_frontier: base64::engine::general_purpose::STANDARD.encode(to_frontier.as_bytes()),
         semantic_diff: json!({
             "title": title_diff,
-            "nodes": from_snapshot.diff(&to_snapshot),
+            "nodes": result.semantic_diff,
         }),
         rendered,
     };
@@ -813,6 +872,28 @@ mod tests {
     #[test]
     fn check_scan_budget_accepts_one_row_before_the_authorized_scan_rows_max_boundary() {
         assert!(check_scan_budget(limits::AUTHORIZED_SCAN_ROWS_MAX - 1).is_ok());
+    }
+
+    #[test]
+    fn diff_history_row_budget_accepts_1000_and_rejects_1001_without_clamping() {
+        assert!(check_diff_history_row_budget(1_000).is_ok());
+        let error = check_diff_history_row_budget(1_001).expect_err("1001 rows must be rejected");
+        assert_eq!(error.kind(), crate::error::ApiErrorKind::LimitExceeded);
+        let ApiError::Typed { details, .. } = error else {
+            panic!("expected typed limit error");
+        };
+        assert_eq!(
+            details.as_ref().and_then(|value| value.get("limit_kind")),
+            Some(&json!("scan_budget"))
+        );
+        assert_eq!(
+            details.as_ref().and_then(|value| value.get("limit")),
+            Some(&json!(1_000))
+        );
+        assert_eq!(
+            details.as_ref().and_then(|value| value.get("observed")),
+            Some(&json!(1_001))
+        );
     }
 
     fn lag_item(lag: i64) -> ProjectionLagItem {

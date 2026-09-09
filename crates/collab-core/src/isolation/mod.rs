@@ -32,7 +32,10 @@ pub mod host;
 mod limits;
 pub mod wire;
 
-pub use host::{IsolatedApplyError, IsolatedApplySuccess, WORKER_BINARY_PATH_ENV, isolated_apply};
+pub use host::{
+    IsolatedApplyError, IsolatedApplySuccess, IsolatedDiffSuccess, WORKER_BINARY_PATH_ENV, isolated_apply,
+    isolated_diff,
+};
 // Single source of truth for these three (`isolation::limits`'s own module doc explains why):
 // `host`, `alloc`, and `child_runtime` all `use` them from there rather than declaring their own
 // copies, so this re-export and every enforcement site name the identical constant.

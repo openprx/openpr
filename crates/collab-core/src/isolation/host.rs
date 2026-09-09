@@ -66,6 +66,8 @@ pub struct IsolatedApplySuccess {
     pub snapshot: Vec<u8>,
 }
 
+pub type IsolatedDiffSuccess = wire::ReplayDiffResult;
+
 /// Why [`isolated_apply`] did not return a candidate document.
 #[derive(Debug)]
 pub enum IsolatedApplyError {
@@ -145,7 +147,20 @@ fn worker_binary_path() -> Result<std::path::PathBuf, IsolatedApplyError> {
 /// # Errors
 /// See [`IsolatedApplyError`].
 pub fn isolated_apply(base_snapshot: &[u8], update: &[u8]) -> Result<IsolatedApplySuccess, IsolatedApplyError> {
-    run_isolated_apply(base_snapshot, update, &[])
+    run_isolated_apply(base_snapshot, update, wire::OPERATION_APPLY, &[])
+}
+
+/// Replays a bounded retained-history tail and computes its semantic diff inside the same
+/// killable CPU/wall/memory boundary used for untrusted apply work.
+pub fn isolated_diff(
+    base_snapshot: &[u8],
+    request: &wire::ReplayDiffRequest,
+) -> Result<IsolatedDiffSuccess, IsolatedApplyError> {
+    let encoded = wire::encode_replay_diff_request(request)
+        .map_err(|error| IsolatedApplyError::HostFailure(format!("diff request encoding failed: {error}")))?;
+    let success = run_isolated_apply(base_snapshot, &encoded, wire::OPERATION_DIFF, &[])?;
+    wire::decode_replay_diff_result(&success.snapshot)
+        .map_err(|error| IsolatedApplyError::HostFailure(format!("diff response decoding failed: {error}")))
 }
 
 /// Same as [`isolated_apply`], but additionally sets `extra_env` on the *spawned child's own*
@@ -159,6 +174,7 @@ pub fn isolated_apply(base_snapshot: &[u8], update: &[u8]) -> Result<IsolatedApp
 fn run_isolated_apply(
     base_snapshot: &[u8],
     update: &[u8],
+    operation: &'static str,
     extra_env: &[(&str, &str)],
 ) -> Result<IsolatedApplySuccess, IsolatedApplyError> {
     let worker_path = worker_binary_path()?;
@@ -167,7 +183,8 @@ fn run_isolated_apply(
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::null())
+        .env(wire::OPERATION_ENV, operation);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -605,7 +622,12 @@ mod tests {
         let base_snapshot = crate::LoroCollabEngine::new_empty(1)
             .export_snapshot()
             .expect("a fresh empty document always exports");
-        let result = run_isolated_apply(&base_snapshot, &[], &[(TEST_INJECT_ENV_VAR, env_value)]);
+        let result = run_isolated_apply(
+            &base_snapshot,
+            &[],
+            wire::OPERATION_APPLY,
+            &[(TEST_INJECT_ENV_VAR, env_value)],
+        );
         // SAFETY: same reasoning as the `set_var` call above; still held under `env_lock()`.
         unsafe {
             std::env::remove_var(WORKER_BINARY_PATH_ENV);

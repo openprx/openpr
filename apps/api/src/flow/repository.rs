@@ -113,6 +113,7 @@ pub async fn fetch_diff_history(
     db: &DatabaseConnection,
     object_id: Uuid,
     to_seq: i64,
+    row_limit: u64,
 ) -> Result<Option<DiffHistoryRows>, ApiError> {
     #[derive(FromQueryResult)]
     struct DocumentRow {
@@ -156,8 +157,13 @@ pub async fn fetch_diff_history(
         "SELECT seq, bytes, content_hash, before_frontier, after_frontier \
            FROM collab_updates \
           WHERE document_id = $1 AND seq >= 1 AND seq <= $2 \
-          ORDER BY seq ASC",
-        vec![document.document_id.into(), history_upper.into()],
+          ORDER BY seq ASC \
+          LIMIT $3",
+        vec![
+            document.document_id.into(),
+            history_upper.into(),
+            i64::try_from(row_limit.saturating_add(1)).unwrap_or(i64::MAX).into(),
+        ],
     ))
     .all(&tx)
     .await?;

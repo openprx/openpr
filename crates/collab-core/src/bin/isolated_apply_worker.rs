@@ -73,6 +73,15 @@ fn main() {
         exit_without_response(1);
     };
 
+    let operation = std::env::var(wire::OPERATION_ENV).unwrap_or_else(|_| wire::OPERATION_APPLY.to_string());
+    if operation == wire::OPERATION_DIFF {
+        write_marker_or_exit();
+        respond_and_exit(&replay_diff_check_and_encode(&base_snapshot, &update));
+    }
+    if operation != wire::OPERATION_APPLY {
+        exit_without_response(1);
+    }
+
     // `LoroCollabEngine::load`'s error is reported via the normal response frame (it is a real,
     // well-typed `CollabError` a caller-facing rejection can be built from), not treated as a
     // host failure -- so this cannot be a `let...else` (clippy's suggested rewrite): the
@@ -88,6 +97,66 @@ fn main() {
 
     write_marker_or_exit();
     respond_and_exit(&decode_apply_check_and_export(base_engine, &update));
+}
+
+fn replay_diff_check_and_encode(base_snapshot: &[u8], request_bytes: &[u8]) -> wire::Outcome {
+    child_runtime::arm_sigprof();
+    alloc::arm();
+    let outcome = replay_diff(base_snapshot, request_bytes);
+    child_runtime::disarm_sigprof();
+    alloc::disarm();
+
+    match outcome {
+        Ok(result) => match wire::encode_replay_diff_result(&result) {
+            Ok(snapshot) => wire::Outcome::Success { snapshot },
+            Err(error) => wire::Outcome::Rejected(CollabError::OperationFailed {
+                reason: format!("diff result encoding failed: {error}"),
+            }),
+        },
+        Err(error) => wire::Outcome::Rejected(error),
+    }
+}
+
+fn replay_diff(base_snapshot: &[u8], request_bytes: &[u8]) -> Result<wire::ReplayDiffResult, CollabError> {
+    let request = wire::decode_replay_diff_request(request_bytes).map_err(|error| CollabError::DecodeFailed {
+        input: "update",
+        reason: format!("diff request is invalid: {error}"),
+    })?;
+    let mut engine = LoroCollabEngine::load(base_snapshot)?;
+    if engine.frontier().as_bytes() != request.snapshot_frontier {
+        return Err(CollabError::OperationFailed {
+            reason: "snapshot frontier does not match the retained history".to_string(),
+        });
+    }
+    for update in request.updates {
+        if engine.frontier().as_bytes() != update.before_frontier {
+            return Err(CollabError::OperationFailed {
+                reason: "retained history before_frontier is discontinuous".to_string(),
+            });
+        }
+        engine.import_update(&update.bytes)?;
+        if engine.frontier().as_bytes() != update.after_frontier {
+            return Err(CollabError::OperationFailed {
+                reason: "retained history after_frontier is discontinuous".to_string(),
+            });
+        }
+    }
+
+    let from_engine = engine.fork_at_frontier(&collab_core::Frontier::from_bytes(request.from_frontier))?;
+    let to_engine = engine.fork_at_frontier(&collab_core::Frontier::from_bytes(request.to_frontier))?;
+    let from_snapshot = from_engine.semantic_snapshot()?;
+    let to_snapshot = to_engine.semantic_snapshot()?;
+    check_snapshot(&from_snapshot, &DocumentLimits::default()).map_err(CollabError::from)?;
+    check_snapshot(&to_snapshot, &DocumentLimits::default()).map_err(CollabError::from)?;
+    let semantic_diff = from_snapshot.diff(&to_snapshot);
+    let from_title = from_engine.title()?;
+    let to_title = to_engine.title()?;
+    Ok(wire::ReplayDiffResult {
+        semantic_diff,
+        to_snapshot,
+        from_title,
+        to_title,
+    })
 }
 
 /// Writes [`host::RESPONSE_MARKER_BYTE`] and flushes, marking the exact moment this process's

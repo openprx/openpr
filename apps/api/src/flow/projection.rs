@@ -42,16 +42,71 @@ pub fn plain_text(snapshot: &SemanticSnapshot) -> String {
         .join(" ")
 }
 
-/// Minimal Markdown rendering for `render=markdown`.
+/// Markdown rendering for `render=markdown`.
 ///
-/// This package ships no content commands, so every document is title-only; a heading is the only
-/// faithful rendering of that state. Block rendering is deferred to the command-endpoint package
-/// that actually populates blocks.
+/// The title is followed by every live node's text in deterministic document order. The
+/// engine-independent snapshot is the source here: rendering only the title would silently drop
+/// content that is already present in the same accepted document.
 #[must_use]
-pub fn render_markdown(title: &str) -> String {
-    if title.is_empty() {
-        String::new()
-    } else {
-        format!("# {title}\n")
+pub fn render_markdown(title: &str, snapshot: &SemanticSnapshot) -> String {
+    let mut rendered = String::new();
+    if !title.is_empty() {
+        rendered.push_str("# ");
+        rendered.push_str(title);
+        rendered.push('\n');
+    }
+
+    let mut nodes: Vec<_> = snapshot.nodes.iter().filter(|(_, node)| !node.deleted).collect();
+    nodes.sort_by(|(id_a, node_a), (id_b, node_b)| {
+        node_a
+            .parent
+            .cmp(&node_b.parent)
+            .then(node_a.order_key.cmp(&node_b.order_key))
+            .then(id_a.cmp(id_b))
+    });
+    for (_, node) in nodes {
+        if node.text.is_empty() {
+            continue;
+        }
+        if !rendered.is_empty() && !rendered.ends_with("\n\n") {
+            rendered.push('\n');
+        }
+        rendered.push_str(&node.text);
+        rendered.push('\n');
+    }
+    rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use collab_core::{NodeKind, SemanticNode};
+
+    use super::*;
+
+    #[test]
+    fn markdown_contains_live_block_text_in_document_order() {
+        let mut snapshot = SemanticSnapshot::default();
+        for (id, order_key, text, deleted) in [
+            ("later", "0000000001", "second", false),
+            ("earlier", "0000000000", "first", false),
+            ("deleted", "0000000002", "must not render", true),
+        ] {
+            snapshot.nodes.insert(
+                Arc::<str>::from(id),
+                SemanticNode {
+                    parent: None,
+                    order_key: order_key.to_string(),
+                    kind: NodeKind::Block,
+                    text: text.to_string(),
+                    properties: BTreeMap::new(),
+                    deleted,
+                },
+            );
+        }
+
+        assert_eq!(render_markdown("Title", &snapshot), "# Title\n\nfirst\n\nsecond\n");
     }
 }

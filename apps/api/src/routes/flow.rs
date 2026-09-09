@@ -479,13 +479,6 @@ pub async fn get_flow_object_diff(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    let from_seq = params
-        .from_seq
-        .ok_or_else(|| ApiError::invalid_update("from_seq is required"))?;
-    let to_seq = params
-        .to_seq
-        .ok_or_else(|| ApiError::invalid_update("to_seq is required"))?;
-    let render = Render::parse(params.render.as_deref())?;
     for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
         let Some(access) = policy::require_flow_object_access(
             &state,
@@ -498,6 +491,16 @@ pub async fn get_flow_object_diff(
         else {
             continue;
         };
+        // Parse caller-controlled query values only after object visibility is established.
+        // Otherwise malformed queries distinguish a hidden existing object (400) from an absent
+        // object (404), turning this endpoint into an existence oracle.
+        let from_seq = params
+            .from_seq
+            .ok_or_else(|| ApiError::invalid_update("from_seq is required"))?;
+        let to_seq = params
+            .to_seq
+            .ok_or_else(|| ApiError::invalid_update("to_seq is required"))?;
+        let render = Render::parse(params.render.as_deref())?;
         let Some(response) = query::get_object_diff(&state, &access, from_seq, to_seq, render).await? else {
             continue;
         };
@@ -2773,7 +2776,13 @@ mod flow_database_tests {
             diff["data"]["semantic_diff"]["nodes"]["added"]["logical-block"]["text"],
             "semantic text"
         );
-        assert_eq!(diff["data"]["rendered"], "# Current title\n");
+        assert_eq!(diff["data"]["rendered"], "# Current title\n\nsemantic text\n");
+        assert!(
+            diff["data"]["rendered"]
+                .as_str()
+                .is_some_and(|markdown| markdown.contains("semantic text")),
+            "markdown dropped the accepted block body: {diff}"
+        );
         let serialized = diff["data"].to_string();
         assert!(!serialized.contains("bytes"), "diff leaked update bytes: {serialized}");
         assert!(
@@ -2859,6 +2868,54 @@ mod flow_database_tests {
         assert_eq!(denied["code"], 404, "{denied}");
         assert_eq!(absent["code"], 404, "{absent}");
         assert_eq!(denied["message"], absent["message"]);
+
+        // Malformed query values must not run before object-level authorization. Otherwise the
+        // 400 response itself proves that a guessed UUID names a real object. Exercise both
+        // malformed branches against an absent id, a real object in another workspace, and a
+        // same-workspace object behind an inheritance boundary; compare complete JSON envelopes,
+        // not merely status codes.
+        let (other_workspace_id, other_owner_id) = seed_workspace(&state, true).await;
+        let other_workspace_object =
+            create_page_as_owner(&state, other_workspace_id, other_owner_id, "other tenant").await;
+        for malformed in [
+            FlowObjectDiffQuery {
+                from_seq: None,
+                to_seq: Some(0),
+                render: None,
+            },
+            FlowObjectDiffQuery {
+                from_seq: Some(0),
+                to_seq: Some(0),
+                render: Some("not-a-renderer".to_string()),
+            },
+        ] {
+            let mut responses = Vec::new();
+            for target in [Uuid::new_v4(), other_workspace_object, object_id] {
+                responses.push(
+                    body_json(to_response(
+                        get_flow_object_diff(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(target),
+                            Query(FlowObjectDiffQuery {
+                                from_seq: malformed.from_seq,
+                                to_seq: malformed.to_seq,
+                                render: malformed.render.clone(),
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await,
+                );
+            }
+            assert_eq!(responses[0], responses[1], "cross-tenant object existence leaked");
+            assert_eq!(
+                responses[0], responses[2],
+                "same-workspace hidden object existence leaked"
+            );
+            assert_eq!(responses[0]["code"], 404, "{responses:?}");
+        }
 
         // Hit the storage invariant itself: removing seq 1 leaves seq 2 reachable to a naive
         // reader, but the endpoint must reject the requested history instead of skipping/clamping.

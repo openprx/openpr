@@ -5,7 +5,15 @@
 
 use std::io::{self, Read, Write};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::CollabError;
+use crate::{SemanticDiff, SemanticSnapshot};
+
+/// Child-only operation selector set explicitly by the trusted host for every spawn.
+pub const OPERATION_ENV: &str = "COLLAB_ISOLATION_OPERATION";
+pub const OPERATION_APPLY: &str = "apply";
+pub const OPERATION_DIFF: &str = "diff";
 
 /// Response payload cap. Sized well above `bootstrap_response_bytes_max` (12 MiB,
 /// `contracts/limits-v1.md`) with headroom for a real exported document snapshot -- unlike
@@ -87,6 +95,49 @@ pub fn read_request<R: Read>(reader: &mut R, max_field_bytes: usize) -> io::Resu
     let base = read_field(reader, max_field_bytes)?;
     let update = read_field(reader, max_field_bytes)?;
     Ok((base, update))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDiffUpdate {
+    pub bytes: Vec<u8>,
+    pub before_frontier: Vec<u8>,
+    pub after_frontier: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDiffRequest {
+    pub snapshot_frontier: Vec<u8>,
+    pub updates: Vec<ReplayDiffUpdate>,
+    pub from_frontier: Vec<u8>,
+    pub to_frontier: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDiffResult {
+    pub semantic_diff: SemanticDiff,
+    pub to_snapshot: SemanticSnapshot,
+    pub from_title: String,
+    pub to_title: String,
+}
+
+fn json_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
+pub fn encode_replay_diff_request(request: &ReplayDiffRequest) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(request).map_err(json_error)
+}
+
+pub fn decode_replay_diff_request(bytes: &[u8]) -> io::Result<ReplayDiffRequest> {
+    serde_json::from_slice(bytes).map_err(json_error)
+}
+
+pub fn encode_replay_diff_result(result: &ReplayDiffResult) -> io::Result<Vec<u8>> {
+    serde_json::to_vec(result).map_err(json_error)
+}
+
+pub fn decode_replay_diff_result(bytes: &[u8]) -> io::Result<ReplayDiffResult> {
+    serde_json::from_slice(bytes).map_err(json_error)
 }
 
 /// What the child reports back on a run that completes without being killed by a ceiling.
@@ -277,6 +328,31 @@ mod tests {
         let (read_base, read_update) = read_request(&mut cursor, MAX_REQUEST_FIELD_BYTES).expect("read succeeds");
         assert_eq!(read_base, base);
         assert_eq!(read_update, update);
+    }
+
+    #[test]
+    fn replay_diff_request_and_result_round_trip() {
+        let request = ReplayDiffRequest {
+            snapshot_frontier: vec![1, 2],
+            updates: vec![ReplayDiffUpdate {
+                bytes: vec![3, 4],
+                before_frontier: vec![5],
+                after_frontier: vec![6],
+            }],
+            from_frontier: vec![7],
+            to_frontier: vec![8],
+        };
+        let encoded = encode_replay_diff_request(&request).expect("request encodes");
+        assert_eq!(decode_replay_diff_request(&encoded).expect("request decodes"), request);
+
+        let result = ReplayDiffResult {
+            semantic_diff: SemanticDiff::default(),
+            to_snapshot: SemanticSnapshot::default(),
+            from_title: "before".to_string(),
+            to_title: "after".to_string(),
+        };
+        let encoded = encode_replay_diff_result(&result).expect("result encodes");
+        assert_eq!(decode_replay_diff_result(&encoded).expect("result decodes"), result);
     }
 
     #[test]
