@@ -21,7 +21,7 @@
 use collab_core::{CollabEngine, CollabError, LoroCollabEngine, NodeId, NodeKind, Operation};
 use platform::app::AppState;
 use sea_orm::{ConnectionTrait, TransactionTrait};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -198,6 +198,30 @@ pub struct CreateObjectInput {
     pub origin: CommandOrigin,
 }
 
+/// The semantic request body bound to a create idempotency key. The generated object id and the
+/// transport origin are deliberately absent: neither is caller-controlled create intent. The
+/// normalized title is stored so harmless surrounding whitespace has the same meaning on replay.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct CreateObjectIdempotencyBody {
+    object_type: String,
+    project_id: Option<Uuid>,
+    parent_object_id: Option<Uuid>,
+    title: String,
+    message: Option<String>,
+}
+
+impl CreateObjectIdempotencyBody {
+    fn from_input(input: &CreateObjectInput, normalized_title: &str) -> Self {
+        Self {
+            object_type: input.object_type.clone(),
+            project_id: input.project_id,
+            parent_object_id: input.parent_object_id,
+            title: normalized_title.to_string(),
+            message: input.message.clone(),
+        }
+    }
+}
+
 fn validate(input: &CreateObjectInput) -> Result<(), ApiError> {
     if !REGISTERED_OBJECT_TYPES.contains(&input.object_type.as_str()) {
         return Err(ApiError::BadRequest(format!(
@@ -280,13 +304,14 @@ pub(super) async fn record_cross_workspace_relation_and_fail_closed(
 /// `Ok(None)` means the key is unused and the caller should go ahead and create.
 ///
 /// # Errors
-/// `Conflict` if the key was already used for a different operation or to create an object with a
-/// different title; `Internal` if the event names an object that cannot be read back.
+/// `Conflict` if the key was already used for a different operation, if any semantic request-body
+/// field drifts, or if an older event has no complete request identity to compare; `Internal` if
+/// the event names an object that cannot be read back.
 async fn replay_created_object(
     state: &AppState,
     workspace_id: Uuid,
     idempotency_key: &str,
-    title: &str,
+    requested_body: &CreateObjectIdempotencyBody,
 ) -> Result<Option<AcceptedChange>, ApiError> {
     let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, idempotency_key).await? else {
         return Ok(None);
@@ -296,15 +321,23 @@ async fn replay_created_object(
             "idempotency_key was already used for a different operation".to_string(),
         ));
     }
+    let Some(stored_body) = existing.metadata.get("idempotency_body") else {
+        return Err(ApiError::Conflict(
+            "idempotency_key belongs to a create event whose complete request body cannot be verified".to_string(),
+        ));
+    };
+    let stored_body: CreateObjectIdempotencyBody = serde_json::from_value(stored_body.clone()).map_err(|_| {
+        ApiError::Conflict("idempotency_key belongs to a create event with an invalid request identity".to_string())
+    })?;
+    if stored_body != *requested_body {
+        return Err(ApiError::Conflict(
+            "idempotency_key was already used with a different create request body".to_string(),
+        ));
+    }
     let object_id = Uuid::parse_str(&existing.aggregate_id).map_err(|_| ApiError::Internal)?;
     let view = repository::fetch_object_view(&state.db, object_id)
         .await?
         .ok_or(ApiError::Internal)?;
-    if view.projection_title != title {
-        return Err(ApiError::Conflict(
-            "idempotency_key was already used to create an object with a different title".to_string(),
-        ));
-    }
     Ok(Some(accepted_change_from_row(view, existing.id)))
 }
 
@@ -326,11 +359,14 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     runtime::runtime().ensure_workspace_accepting(input.workspace_id)?;
     validate(&input)?;
     let title = input.title.trim().to_string();
+    let idempotency_body = CreateObjectIdempotencyBody::from_input(&input, &title);
 
     // Idempotent replay: a caller retrying the exact same `idempotency_key` gets back the
     // original result instead of a unique-violation `Conflict`
     // (`business_events_idempotency` is unique on `(workspace_id, idempotency_key)`).
-    if let Some(replay) = replay_created_object(state, input.workspace_id, &input.idempotency_key, &title).await? {
+    if let Some(replay) =
+        replay_created_object(state, input.workspace_id, &input.idempotency_key, &idempotency_body).await?
+    {
         return Ok(replay);
     }
 
@@ -520,7 +556,10 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
                 "object_type": input.object_type,
                 "parent_object_id": input.parent_object_id,
             }),
-            metadata: json!({ "message": input.message }),
+            metadata: json!({
+                "message": input.message,
+                "idempotency_body": idempotency_body.clone(),
+            }),
             correlation_id: Some(input.origin.correlation_id),
             causation_id: input.origin.causation_id,
             idempotency_key: Some(input.idempotency_key.clone()),
@@ -551,7 +590,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         // server has no way to make the staged rows visible in that case either, so the caller's
         // answer is still the winner's committed object.
         let _ = tx.rollback().await;
-        return replay_created_object(state, input.workspace_id, &input.idempotency_key, &title)
+        return replay_created_object(state, input.workspace_id, &input.idempotency_key, &idempotency_body)
             .await?
             // `was_new == false` is only reachable once the conflicting row is committed and
             // visible (`ON CONFLICT DO NOTHING` waits out an in-flight speculative insertion

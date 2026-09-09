@@ -1963,7 +1963,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn repeating_the_same_idempotency_key_replays_the_original_object_instead_of_conflicting() {
+    async fn create_idempotency_replays_the_exact_body_and_rejects_every_body_field_drift() {
         let scratch = scratch_or_skip!("idempotent-replay");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
@@ -1994,7 +1994,14 @@ mod flow_database_tests {
         let first_id = first["data"]["object"]["id"].clone();
 
         let second = body_json(to_response(
-            create_flow_object(State(state.clone()), claims, None, Path(workspace_id), Json(request())).await,
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(request()),
+            )
+            .await,
         ))
         .await;
         assert_eq!(second["code"], 0, "{second}");
@@ -2002,6 +2009,61 @@ mod flow_database_tests {
             second["data"]["object"]["id"], first_id,
             "replay must return the original object id"
         );
+
+        for (field, drifted) in [
+            (
+                "type",
+                CreateFlowObjectRequest {
+                    object_type: "navigator".to_string(),
+                    ..request()
+                },
+            ),
+            (
+                "project_id",
+                CreateFlowObjectRequest {
+                    project_id: Some(Uuid::new_v4()),
+                    ..request()
+                },
+            ),
+            (
+                "parent_id",
+                CreateFlowObjectRequest {
+                    parent_object_id: Some(Uuid::new_v4()),
+                    ..request()
+                },
+            ),
+            (
+                "title",
+                CreateFlowObjectRequest {
+                    title: "Different title".to_string(),
+                    ..request()
+                },
+            ),
+            (
+                "message",
+                CreateFlowObjectRequest {
+                    message: Some("different message".to_string()),
+                    ..request()
+                },
+            ),
+        ] {
+            let body = body_json(to_response(
+                create_flow_object(
+                    State(state.clone()),
+                    claims.clone(),
+                    None,
+                    Path(workspace_id),
+                    Json(drifted),
+                )
+                .await,
+            ))
+            .await;
+            assert_eq!(body["code"], 409, "{field} drift reused the original receipt: {body}");
+            assert_eq!(
+                body["message"], "idempotency_key was already used with a different create request body",
+                "{field} drift returned the wrong conflict: {body}"
+            );
+        }
 
         // Only one row was ever written, not two.
         let count = state
