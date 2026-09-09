@@ -176,10 +176,11 @@ pub async fn list_flow_objects(
     Query(params): Query<ListFlowObjectsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let extensions = build_auth_extensions(claims, bot);
-    policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+    let access = policy::begin_flow_read(&state, &extensions, workspace_id).await?;
 
     let response = query::list_objects(
         &state,
+        &access,
         query::ListObjectsParams {
             workspace_id,
             project_id: params.project_id,
@@ -215,10 +216,17 @@ pub async fn get_flow_object(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+    let access = policy::require_flow_object_access(
+        &state,
+        &extensions,
+        workspace_id,
+        object_id,
+        crate::flow::collab::authz::PermissionLevel::View,
+    )
+    .await?;
 
     let render = Render::parse(params.render.as_deref())?;
-    let view = query::get_object(&state, object_id, params.at_seq, render).await?;
+    let view = query::get_object(&state, &access, params.at_seq, render).await?;
 
     Ok(ApiResponse::success(view))
 }
@@ -253,9 +261,16 @@ pub async fn get_flow_object_bootstrap(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+    let access = policy::require_flow_object_access(
+        &state,
+        &extensions,
+        workspace_id,
+        object_id,
+        crate::flow::collab::authz::PermissionLevel::Edit,
+    )
+    .await?;
 
-    let bootstrap = query::get_bootstrap(&state, object_id, params.known_seq, params.known_frontier).await?;
+    let bootstrap = query::get_bootstrap(&state, &access, params.known_seq, params.known_frontier).await?;
 
     Ok(ApiResponse::success(bootstrap))
 }
@@ -341,9 +356,16 @@ pub async fn get_flow_object_history(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+    let access = policy::require_flow_object_access(
+        &state,
+        &extensions,
+        workspace_id,
+        object_id,
+        crate::flow::collab::authz::PermissionLevel::View,
+    )
+    .await?;
 
-    let response = query::get_history(&state, object_id, params.before_seq, params.limit).await?;
+    let response = query::get_history(&state, &access, params.before_seq, params.limit).await?;
 
     Ok(ApiResponse::success(response))
 }
@@ -638,6 +660,30 @@ mod flow_database_tests {
         )
         .await;
         member_id
+    }
+
+    async fn create_page_as_owner(state: &AppState, workspace_id: Uuid, owner_id: Uuid, title: &str) -> Uuid {
+        let body = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: title.to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(body["code"], 0, "{body}");
+        Uuid::parse_str(body["data"]["object"]["id"].as_str().expect("object id is a string"))
+            .expect("object id is a uuid")
     }
 
     fn claims_for(user_id: Uuid) -> Extension<JwtClaims> {
@@ -1106,6 +1152,199 @@ mod flow_database_tests {
         let body = body_json(response).await;
         assert_eq!(body["code"], 404, "{body}");
         assert!(body["data"].is_null(), "{body}");
+
+        scratch.drop_self().await;
+    }
+
+    /// All four v0.5 read paths share effective object authorization. The restricted page has a
+    /// boundary and no member grant, so the DB oracle is `Denied`: it must disappear from the list
+    /// and every object-id read must collapse to the same `not_found` envelope.
+    #[tokio::test]
+    async fn effective_permission_filters_every_flow_read_path_without_count_leakage() {
+        let scratch = scratch_or_skip!("effective_read_filter");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let visible_id = create_page_as_owner(&state, workspace_id, owner_id, "Visible page").await;
+        let restricted_id = create_page_as_owner(&state, workspace_id, owner_id, "Restricted page").await;
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![restricted_id.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        )
+        .await;
+
+        let list = body_json(to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ListFlowObjectsQuery {
+                    project_id: None,
+                    unprojected: false,
+                    object_type: None,
+                    parent_id: None,
+                    q: None,
+                    cursor: None,
+                    limit: Some(50),
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(list["code"], 0, "{list}");
+        let items = list["data"]["items"].as_array().expect("items is an array");
+        assert_eq!(
+            items.len(),
+            1,
+            "the hidden candidate must not affect response cardinality"
+        );
+        assert_eq!(items[0]["id"], visible_id.to_string());
+        assert!(list["data"].get("total").is_none(), "{list}");
+        assert!(list["data"].get("filtered_count").is_none(), "{list}");
+        assert!(list["data"].get("examined").is_none(), "{list}");
+
+        let get = body_json(to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(restricted_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let bootstrap = body_json(to_response(
+            get_flow_object_bootstrap(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(restricted_id),
+                Query(GetFlowObjectBootstrapQuery {
+                    known_seq: None,
+                    known_frontier: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let history = body_json(to_response(
+            get_flow_object_history(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(restricted_id),
+                Query(FlowObjectHistoryQuery {
+                    before_seq: None,
+                    limit: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        for body in [&get, &bootstrap, &history] {
+            assert_eq!(body["code"], 404, "{body}");
+            assert!(body["data"].is_null(), "{body}");
+        }
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn foreign_and_absent_object_reads_collapse_to_the_same_answer() {
+        let scratch = scratch_or_skip!("read_existence_collapse");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let (other_workspace_id, other_owner_id) = seed_workspace(&state, true).await;
+        let foreign_id = create_page_as_owner(&state, other_workspace_id, other_owner_id, "Foreign page").await;
+
+        let read = |object_id| {
+            get_flow_object(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(object_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+        };
+        let foreign = body_json(to_response(read(foreign_id).await)).await;
+        let absent = body_json(to_response(read(Uuid::new_v4()).await)).await;
+        assert_eq!(foreign["code"], 404, "{foreign}");
+        assert_eq!(
+            foreign, absent,
+            "cross-tenant existence must not change the safe answer"
+        );
+        let _ = owner_id;
+
+        scratch.drop_self().await;
+    }
+
+    /// 1,001 hidden rows force the overfetch loop one row past the public scan ceiling. The error
+    /// must reject rather than return a misleading empty short page, and both numeric fields must
+    /// expose only the fixed ceiling, never the actual pre-filter count.
+    #[tokio::test]
+    async fn authorized_overfetch_rejects_past_scan_budget_without_revealing_examined_rows() {
+        let scratch = scratch_or_skip!("authorized_scan_budget");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, _owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        exec(
+            &state,
+            "WITH objects AS ( \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, inherit_from_parent, created_at) \
+                 SELECT gen_random_uuid(), $1, 'page', false, now() + n * interval '1 microsecond' \
+                   FROM generate_series(1, 1001) AS n RETURNING id \
+             ), documents AS ( \
+                 INSERT INTO collab_documents (object_id, format_version, snapshot, snapshot_frontier, head_frontier) \
+                 SELECT id, 'loro-1', '\\x'::bytea, '\\x'::bytea, '\\x'::bytea FROM objects \
+             ) \
+             INSERT INTO flow_object_projections (object_id, document_seq, document_frontier, title, state, plain_text) \
+             SELECT id, 0, '\\x'::bytea, 'hidden', '{}'::jsonb, '' FROM objects",
+            vec![workspace_id.into()],
+        )
+        .await;
+
+        let body = body_json(to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ListFlowObjectsQuery {
+                    project_id: None,
+                    unprojected: false,
+                    object_type: None,
+                    parent_id: None,
+                    q: None,
+                    cursor: None,
+                    limit: Some(50),
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(body["error_code"], "limit_exceeded", "{body}");
+        assert_eq!(body["details"]["limit_kind"], "scan_budget", "{body}");
+        assert_eq!(body["details"]["limit"], 1000, "{body}");
+        assert_eq!(body["details"]["observed"], 1000, "{body}");
+        assert!(body["data"].is_null(), "a partial empty page must not escape: {body}");
 
         scratch.drop_self().await;
     }

@@ -18,6 +18,7 @@ use super::collab::bootstrap;
 use super::collab::frame::TailUpdate;
 use super::collab::{limits, runtime};
 use super::model::{Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
+use super::policy::{self, AuthorizedFlowObject, FlowReadContext};
 use super::projection;
 use super::repository::{self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow};
 
@@ -64,15 +65,13 @@ fn check_scan_budget(examined: u64) -> Result<(), ApiError> {
 /// row) until either `needed` rows have been accepted, the table runs out of matching rows, or
 /// [`check_scan_budget`] rejects the scan.
 ///
-/// v0.4 has no `flow_object_grants` yet (`super::policy`'s doc comment: "collapses to plain
-/// workspace membership") — every candidate this filter already scoped to the caller's
-/// workspace/project/etc. is policy-visible, so `is_visible` below is unconditionally `true`. That
-/// is a real, load-bearing no-op, not a stub: `authorized_scan_rows_max` bounds the *scan* itself,
-/// independently of whether anything is being filtered out today, so this accounting has to be
-/// live infrastructure now — `ADR-0012`'s v0.5 grants must be able to replace the `true` below
-/// with a real per-row check without touching the budget/pagination logic around it.
+/// Each candidate batch is authorized in bulk before rows are appended. The internal scan cursor
+/// advances over every candidate, while the caller cursor is derived only from the accepted
+/// sequence in [`list_objects`]; therefore hidden rows affect neither returned cardinality nor a
+/// caller-visible count/cursor.
 async fn scan_objects_within_budget(
     state: &AppState,
+    access: &FlowReadContext,
     mut filter: ListFilter,
     needed: usize,
 ) -> Result<Vec<ObjectViewRow>, ApiError> {
@@ -85,11 +84,14 @@ async fn scan_objects_within_budget(
         if batch_len == 0 {
             return Ok(accepted);
         }
-        for row in batch {
+        let object_ids: Vec<Uuid> = batch.iter().map(|row| row.id).collect();
+        let visible =
+            policy::authorize_flow_objects(state, access, &object_ids, super::collab::authz::PermissionLevel::View)
+                .await?;
+        for (row, is_visible) in batch.into_iter().zip(visible) {
             examined += 1;
             check_scan_budget(examined)?;
             filter.after = Some((row.created_at, row.id));
-            let is_visible = true; // see doc comment above
             if is_visible {
                 accepted.push(row);
                 if accepted.len() >= needed {
@@ -201,14 +203,18 @@ impl Render {
 
 pub async fn get_object(
     state: &AppState,
-    object_id: Uuid,
+    access: &AuthorizedFlowObject,
     at_seq: Option<i64>,
     render: Render,
 ) -> Result<FlowObjectView, ApiError> {
+    let object_id = access.object_id();
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
     runtime::runtime().ensure_workspace_accepting(row.workspace_id)?;
+    if row.workspace_id != access.workspace_id() {
+        return Err(ApiError::NotFound("flow object not found".to_string()));
+    }
 
     // This package ships no content commands, so `document_seq` never advances past 0 for any
     // object it creates; `at_seq` can only ever be satisfied at the current head. A mismatch is
@@ -248,10 +254,11 @@ pub async fn get_object(
 /// back is still a correct, current view.
 pub async fn get_bootstrap(
     state: &AppState,
-    object_id: Uuid,
+    access: &AuthorizedFlowObject,
     known_seq: Option<i64>,
     known_frontier: Option<String>,
 ) -> Result<Bootstrap, ApiError> {
+    let object_id = access.object_id();
     let _ = known_seq;
     if let Some(raw) = known_frontier.as_deref() {
         base64::engine::general_purpose::STANDARD
@@ -263,6 +270,9 @@ pub async fn get_bootstrap(
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
     runtime::runtime().ensure_workspace_accepting(row.workspace_id)?;
+    if row.workspace_id != access.workspace_id() {
+        return Err(ApiError::NotFound("flow object not found".to_string()));
+    }
     let document_id = row.document_id;
 
     // The exact loader the WebSocket `snapshot` frame uses (`flow::collab::session::run`) —
@@ -324,7 +334,14 @@ pub struct ListObjectsParams {
     pub include_archived: bool,
 }
 
-pub async fn list_objects(state: &AppState, params: ListObjectsParams) -> Result<FlowObjectListResponse, ApiError> {
+pub async fn list_objects(
+    state: &AppState,
+    access: &FlowReadContext,
+    params: ListObjectsParams,
+) -> Result<FlowObjectListResponse, ApiError> {
+    if params.workspace_id != access.workspace_id() {
+        return Err(ApiError::Internal);
+    }
     runtime::runtime().ensure_workspace_accepting(params.workspace_id)?;
     if params.project_id.is_some() && params.unprojected {
         return Err(ApiError::BadRequest(
@@ -349,7 +366,8 @@ pub async fn list_objects(state: &AppState, params: ListObjectsParams) -> Result
         // Overwritten per candidate batch by `scan_objects_within_budget`.
         limit: 0,
     };
-    let mut rows = scan_objects_within_budget(state, filter, needed).await?;
+    let mut rows = scan_objects_within_budget(state, access, filter, needed).await?;
+    policy::ensure_epoch_current(state, access).await?;
 
     let next_cursor = if rows.len() > limit_usize {
         rows.truncate(limit_usize);
@@ -366,14 +384,18 @@ pub async fn list_objects(state: &AppState, params: ListObjectsParams) -> Result
 
 pub async fn get_history(
     state: &AppState,
-    object_id: Uuid,
+    access: &AuthorizedFlowObject,
     before_seq: Option<i64>,
     limit: Option<u64>,
 ) -> Result<HistoryResponse, ApiError> {
+    let object_id = access.object_id();
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
     runtime::runtime().ensure_workspace_accepting(row.workspace_id)?;
+    if row.workspace_id != access.workspace_id() {
+        return Err(ApiError::NotFound("flow object not found".to_string()));
+    }
     let limit = validate_limit(limit)?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     // Fetch one extra row to know whether a further page exists without a second query.

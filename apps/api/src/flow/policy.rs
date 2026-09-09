@@ -1,13 +1,8 @@
-//! Workspace-level gates every Flow REST handler must pass before touching `flow_objects`.
+//! Workspace and effective object gates shared by every Flow REST read path.
 //!
-//! v0.4 has no `flow_object_grants` yet (`ADR-0012` only lands the schema this version).
-//!
-//! The effective policy is exactly the workspace baseline `domain-model-v1.md` describes
-//! (workspace admin gets `full_access`; a member gets the workspace's `default_member_level`,
-//! frozen at `edit` in v0.4), which — since `flow_object_grants` is reserved-but-empty this
-//! version — collapses to plain workspace membership: any member can read, and any member can
-//! write, with zero regression from pre-Flow behavior. This module does not implement
-//! `flow_object_grants`/`inherit_from_parent` inheritance — that is `ADR-0012`'s v0.5 surface.
+//! `ADR-0012` §3 makes workspace membership and `flow_enabled` necessary but no longer sufficient:
+//! each object is evaluated through its grant/inheritance chain. The cache used here is bound to
+//! the current `authz_epoch`; cache misses are batchable, database-authoritative evaluations.
 
 use axum::http::Extensions;
 use platform::app::AppState;
@@ -17,6 +12,43 @@ use crate::error::ApiError;
 use crate::middleware::bot_auth::require_workspace_access;
 
 use super::repository;
+use super::{collab::authz, collab::permission_cache::PermissionCache};
+
+use authz::PermissionLevel;
+
+/// One read request's authenticated principal and epoch snapshot.
+pub struct FlowReadContext {
+    workspace_id: Uuid,
+    actor_id: Uuid,
+    role: String,
+    principal_kind: &'static str,
+    authz_epoch: i64,
+}
+
+/// Proof that [`require_flow_object_access`] authorized one object at `view` or above.
+pub struct AuthorizedFlowObject {
+    object_id: Uuid,
+    context: FlowReadContext,
+}
+
+impl AuthorizedFlowObject {
+    #[must_use]
+    pub const fn object_id(&self) -> Uuid {
+        self.object_id
+    }
+
+    #[must_use]
+    pub const fn workspace_id(&self) -> Uuid {
+        self.context.workspace_id
+    }
+}
+
+impl FlowReadContext {
+    #[must_use]
+    pub const fn workspace_id(&self) -> Uuid {
+        self.workspace_id
+    }
+}
 
 /// Workspace membership (`unauthenticated`/`forbidden`/`not_found` per `error-mapping-v1.md`)
 /// *and* the workspace's `flow_enabled` rollout flag.
@@ -32,6 +64,143 @@ pub async fn require_flow_workspace_access(
     let actor = require_workspace_access(state, extensions, workspace_id).await?;
     require_flow_enabled(state, workspace_id).await?;
     Ok(actor)
+}
+
+/// Starts a list/read request with workspace membership, feature flag, and a current epoch.
+pub async fn begin_flow_read(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+) -> Result<FlowReadContext, ApiError> {
+    let (actor_id, role, is_bot) = require_flow_workspace_access(state, extensions, workspace_id).await?;
+    let authz_epoch = authz::read_epoch(&state.db, workspace_id).await?;
+    Ok(FlowReadContext {
+        workspace_id,
+        actor_id,
+        role,
+        principal_kind: if is_bot { "bot" } else { "user" },
+        authz_epoch,
+    })
+}
+
+/// Object-level read entry: workspace gate, epoch-checked cache, then DB authority on a miss.
+///
+/// Membership denial and insufficient effective permission both collapse to `not_found`, matching
+/// the absent/cross-workspace answer and preventing this object-id-only route from becoming an
+/// existence oracle. Feature-disabled and unauthenticated retain their existing semantics.
+pub async fn require_flow_object_access(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+    object_id: Uuid,
+    minimum: PermissionLevel,
+) -> Result<AuthorizedFlowObject, ApiError> {
+    let actor = require_workspace_access(state, extensions, workspace_id)
+        .await
+        .map_err(collapse_object_denial)?;
+    require_flow_enabled(state, workspace_id).await?;
+    let context = FlowReadContext {
+        workspace_id,
+        actor_id: actor.0,
+        role: actor.1,
+        principal_kind: if actor.2 { "bot" } else { "user" },
+        authz_epoch: authz::read_epoch(&state.db, workspace_id).await?,
+    };
+    let visible = authorize_flow_objects(state, &context, &[object_id], minimum).await?;
+    if visible.first().copied() != Some(true) {
+        return Err(object_not_found());
+    }
+    Ok(AuthorizedFlowObject { object_id, context })
+}
+
+/// Batch-authorizes object ids against one request epoch, preserving input order.
+///
+/// Cache hits are accepted only at `context.authz_epoch`. All misses are resolved together by
+/// [`authz::effective_permissions`], then the epoch is read again before anything is cached or
+/// returned. Any epoch movement rejects the request fail closed; callers must start a new read.
+pub async fn authorize_flow_objects(
+    state: &AppState,
+    context: &FlowReadContext,
+    object_ids: &[Uuid],
+    minimum: PermissionLevel,
+) -> Result<Vec<bool>, ApiError> {
+    ensure_epoch_current(state, context).await?;
+    let cache = PermissionCache::for_state(state)?;
+    let mut levels = vec![None; object_ids.len()];
+    let mut misses = Vec::new();
+    let mut miss_positions = Vec::new();
+    for (index, object_id) in object_ids.iter().copied().enumerate() {
+        if let Some(level) = cache.get(
+            context.workspace_id,
+            context.principal_kind,
+            context.actor_id,
+            object_id,
+            context.authz_epoch,
+        ) {
+            if let Some(slot) = levels.get_mut(index) {
+                *slot = Some(level);
+            }
+        } else {
+            misses.push(object_id);
+            miss_positions.push(index);
+        }
+    }
+
+    if !misses.is_empty() {
+        let resolved = authz::effective_permissions(
+            &state.db,
+            context.workspace_id,
+            &misses,
+            context.principal_kind,
+            context.actor_id,
+            &context.role,
+        )
+        .await
+        .map_err(collapse_object_denial)?;
+        ensure_epoch_current(state, context).await?;
+        for ((object_id, level), index) in resolved.into_iter().zip(miss_positions) {
+            cache.put(
+                context.workspace_id,
+                context.principal_kind,
+                context.actor_id,
+                object_id,
+                level,
+                context.authz_epoch,
+            );
+            if let Some(slot) = levels.get_mut(index) {
+                *slot = Some(level);
+            }
+        }
+    }
+
+    levels
+        .into_iter()
+        .map(|level| level.map(|level| level >= minimum).ok_or(ApiError::Internal))
+        .collect()
+}
+
+/// Final epoch check for multi-batch list scans. A change between any earlier batch and response
+/// assembly invalidates the whole result instead of returning a mixed-epoch page.
+pub async fn ensure_epoch_current(state: &AppState, context: &FlowReadContext) -> Result<(), ApiError> {
+    let current = authz::read_epoch(&state.db, context.workspace_id).await?;
+    if current == context.authz_epoch {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "authorization changed while the read was being evaluated".to_string(),
+        ))
+    }
+}
+
+fn collapse_object_denial(err: ApiError) -> ApiError {
+    match err {
+        ApiError::Forbidden(_) | ApiError::NotFound(_) => object_not_found(),
+        other => other,
+    }
+}
+
+fn object_not_found() -> ApiError {
+    ApiError::NotFound("flow object not found".to_string())
 }
 
 /// Plain workspace membership, deliberately *not* gated on `flow_enabled`.

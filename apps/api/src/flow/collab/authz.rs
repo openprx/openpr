@@ -16,6 +16,8 @@
 
 #![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
 
+use std::collections::{HashMap, HashSet};
+
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use uuid::Uuid;
 
@@ -498,6 +500,151 @@ pub async fn effective_permission<C: ConnectionTrait>(
     }
 }
 
+/// Batch form of [`effective_permission`] for read-side candidate pages.
+///
+/// One recursive CTE resolves every requested object's complete leaf-to-root chain, and one grant
+/// query loads this principal's rows across their union. This avoids one recursive CTE plus one
+/// grant round trip per object. The implementation remains fail closed: a missing starting row,
+/// depth past `tree_depth_max`, a cycle, or an incomplete chain rejects the batch rather than
+/// returning a partial permission map. The API permission cache calls this only for misses; write
+/// paths continue to call [`effective_permission`] directly under their fencing transaction.
+///
+/// Because this is a separately optimized implementation, the real-database test
+/// `batch_and_single_effective_permissions_are_strictly_equal` pins every result to the single
+/// evaluator for the same fixture.
+pub async fn effective_permissions<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_ids: &[Uuid],
+    principal_kind: &str,
+    principal_id: Uuid,
+    role: &str,
+) -> Result<Vec<(Uuid, PermissionLevel)>, ApiError> {
+    if object_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if principal_kind == "user" && (role == "owner" || role == "admin") {
+        #[derive(FromQueryResult)]
+        struct ObjectRow {
+            id: Uuid,
+        }
+        let existing = ObjectRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM flow_objects WHERE workspace_id = $1 AND id = ANY($2)",
+            vec![workspace_id.into(), object_ids.to_vec().into()],
+        ))
+        .all(conn)
+        .await?;
+        let existing: HashSet<Uuid> = existing.into_iter().map(|row| row.id).collect();
+        if object_ids.iter().any(|id| !existing.contains(id)) {
+            return Err(ApiError::NotFound("flow object not found".to_string()));
+        }
+        return Ok(object_ids
+            .iter()
+            .copied()
+            .map(|id| (id, PermissionLevel::FullAccess))
+            .collect());
+    }
+
+    #[derive(FromQueryResult)]
+    struct Row {
+        seed_id: Uuid,
+        id: Uuid,
+        parent_id: Option<Uuid>,
+        inherit_from_parent: bool,
+        depth: i32,
+        cycle: bool,
+    }
+    let probe_depth = i64::try_from(MAX_CHAIN_NODES).unwrap_or(i64::MAX);
+    let rows = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "WITH RECURSIVE chain AS ( \
+             SELECT o.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent, 0 AS depth, \
+                    ARRAY[o.id]::uuid[] AS path, false AS cycle \
+               FROM flow_objects o \
+              WHERE o.workspace_id = $1 AND o.id = ANY($2) \
+             UNION ALL \
+             SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent, c.depth + 1, \
+                    c.path || p.id, p.id = ANY(c.path) \
+               FROM chain c \
+               JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $1 \
+              WHERE c.parent_id IS NOT NULL AND c.depth < $3::int AND NOT c.cycle \
+         ) \
+         SELECT seed_id, id, parent_id, inherit_from_parent, depth, cycle \
+           FROM chain ORDER BY seed_id, depth",
+        vec![workspace_id.into(), object_ids.to_vec().into(), probe_depth.into()],
+    ))
+    .all(conn)
+    .await?;
+
+    struct BatchNode {
+        id: Uuid,
+        parent_id: Option<Uuid>,
+        inherit_from_parent: bool,
+        depth: i32,
+        cycle: bool,
+    }
+    let mut chains: HashMap<Uuid, Vec<BatchNode>> = HashMap::new();
+    for row in rows {
+        chains.entry(row.seed_id).or_default().push(BatchNode {
+            id: row.id,
+            parent_id: row.parent_id,
+            inherit_from_parent: row.inherit_from_parent,
+            depth: row.depth,
+            cycle: row.cycle,
+        });
+    }
+
+    let mut chain_ids = HashSet::new();
+    let tree_depth_max = i32::try_from(TREE_DEPTH_MAX).map_err(|_| ApiError::Internal)?;
+    for object_id in object_ids {
+        let Some(chain) = chains.get(object_id) else {
+            return Err(ApiError::NotFound("flow object not found".to_string()));
+        };
+        let Some(top) = chain.last() else {
+            return Err(ApiError::NotFound("flow object not found".to_string()));
+        };
+        if chain.iter().any(|node| node.cycle) {
+            return Err(ApiError::Forbidden("object inheritance chain is cyclic".to_string()));
+        }
+        if chain.iter().any(|node| node.depth > tree_depth_max) {
+            return Err(ApiError::Forbidden(
+                "object inheritance chain is deeper than the frozen tree depth limit".to_string(),
+            ));
+        }
+        if top.parent_id.is_some() {
+            return Err(ApiError::Forbidden(
+                "object inheritance chain is incomplete".to_string(),
+            ));
+        }
+        chain_ids.extend(chain.iter().map(|node| node.id));
+    }
+
+    let chain_ids: Vec<Uuid> = chain_ids.into_iter().collect();
+    let grants: HashMap<Uuid, PermissionLevel> = fetch_grants(conn, &chain_ids, principal_kind, principal_id)
+        .await?
+        .into_iter()
+        .collect();
+    let baseline = workspace_baseline(conn, workspace_id, role).await?;
+    let mut resolved = Vec::with_capacity(object_ids.len());
+    for object_id in object_ids {
+        let Some(chain) = chains.get(object_id) else {
+            return Err(ApiError::NotFound("flow object not found".to_string()));
+        };
+        let boundary_index = chain.iter().position(|node| !node.inherit_from_parent);
+        let applicable = boundary_index.map_or(chain.as_slice(), |index| chain.get(..=index).unwrap_or_default());
+        let best_grant = applicable.iter().filter_map(|node| grants.get(&node.id).copied()).max();
+        let level = if boundary_index.is_some() {
+            best_grant.unwrap_or(PermissionLevel::Denied)
+        } else {
+            best_grant.map_or(baseline, |grant| grant.max(baseline))
+        };
+        resolved.push((*object_id, level));
+    }
+    Ok(resolved)
+}
+
 /// One object's inheritance chain, resolved and classified for a caller that needs to *show* it
 /// rather than just be judged against it (`GET /flow/objects/{object_id}/grants`'s `inherited[]`).
 ///
@@ -723,7 +870,7 @@ mod database_tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use uuid::Uuid;
 
-    use super::{PermissionLevel, effective_permission};
+    use super::{PermissionLevel, effective_permission, effective_permissions};
     use crate::error::ApiError;
 
     /// Nodes in the deepest chain `ADR-0012` §3 permits, written as a literal on purpose: these
@@ -1122,6 +1269,104 @@ mod database_tests {
         assert_eq!(
             member_level(&scratch.db, &fx, restricted[0]).await.expect("resolves"),
             PermissionLevel::Comment
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The optimized page evaluator is independent code, so its oracle is the DB-direct single
+    /// evaluator, never a cache read. The fixture covers baseline, a boundary with no grant, a
+    /// grant below that boundary, and an inherited grant above the baseline.
+    #[tokio::test]
+    async fn batch_and_single_effective_permissions_are_strictly_equal() {
+        let scratch = scratch_or_skip!("batch_equals_single");
+        let fx = seed_workspace(&scratch.db).await;
+        let plain = build_chain(&scratch.db, fx.workspace_id, 3, None).await;
+        let restricted = build_chain(&scratch.db, fx.workspace_id, 3, Some(1)).await;
+        grant(&scratch.db, fx.workspace_id, restricted[0], fx.member_id, "comment").await;
+        grant(&scratch.db, fx.workspace_id, plain[2], fx.member_id, "full_access").await;
+        let object_ids = vec![plain[0], plain[1], restricted[0], restricted[2]];
+
+        let batch = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &object_ids,
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await
+        .expect("the batch resolves");
+        let mut singles = Vec::new();
+        for object_id in &object_ids {
+            let level = effective_permission(&scratch.db, fx.workspace_id, *object_id, "user", fx.member_id, "member")
+                .await
+                .expect("the single evaluator resolves the same fixture");
+            singles.push((*object_id, level));
+        }
+
+        assert_eq!(
+            batch, singles,
+            "batch results must match DB-direct singles in input order"
+        );
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn batch_effective_permissions_fail_closed_for_depth_cycle_and_broken_chain() {
+        let scratch = scratch_or_skip!("batch_corrupt_chains");
+        let fx = seed_workspace(&scratch.db).await;
+
+        let too_deep = build_chain(&scratch.db, fx.workspace_id, FIRST_ILLEGAL_CHAIN_NODES, None).await;
+        let result = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &[too_deep[0]],
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "depth=33 resolved: {result:?}"
+        );
+
+        let cycle_a = insert_object(&scratch.db, fx.workspace_id, None, true).await;
+        let cycle_b = insert_object(&scratch.db, fx.workspace_id, Some(cycle_a), true).await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET parent_id = $1 WHERE id = $2",
+            vec![cycle_b.into(), cycle_a.into()],
+        )
+        .await;
+        let result =
+            effective_permissions(&scratch.db, fx.workspace_id, &[cycle_b], "user", fx.member_id, "member").await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "cycle resolved: {result:?}"
+        );
+
+        scratch
+            .db
+            .execute_unprepared("ALTER TABLE flow_objects DROP CONSTRAINT flow_objects_parent_workspace_fk")
+            .await
+            .expect("the composite parent FK can be dropped for the broken-chain fixture");
+        let foreign = seed_workspace(&scratch.db).await;
+        let foreign_parent = insert_object(&scratch.db, foreign.workspace_id, None, true).await;
+        let broken_child = insert_object(&scratch.db, fx.workspace_id, Some(foreign_parent), true).await;
+        let result = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &[broken_child],
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ApiError::Forbidden(_))),
+            "broken chain resolved: {result:?}"
         );
 
         scratch.drop_self().await;
