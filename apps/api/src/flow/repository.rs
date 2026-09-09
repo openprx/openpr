@@ -379,18 +379,17 @@ pub struct LifecycleScopeRow {
     pub invalid_tree: bool,
 }
 
-/// Reads the root and, when `cascade` is true, its complete affected subtree in ascending id order.
+/// Reads the root and its complete affected subtree in ascending id order.
 ///
-/// The recursive walk always visits strict descendants even for a non-cascading command because
-/// `ADR-0012` assigns `full_access` to an archive that affects a shared descendant. Here "shared"
+/// Lifecycle scope is server-derived; no caller wire flag may suppress or widen it. Here "shared"
 /// means a descendant with an explicit `flow_object_grants` row; workspace baseline access alone
-/// is not an object share. The walk is bounded one level past `tree_depth_max`, records cycles, and
-/// lets the caller fail closed instead of silently classifying a corrupt/truncated tree as a leaf.
+/// is not an object share. The walk is bounded one level past `tree_depth_max`, records cycles,
+/// and lets the caller fail closed instead of silently classifying a corrupt/truncated tree as a
+/// leaf.
 pub async fn lifecycle_scope<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
     object_id: Uuid,
-    cascade: bool,
     tree_depth_max: i64,
 ) -> Result<Vec<LifecycleScopeRow>, ApiError> {
     Ok(LifecycleScopeRow::find_by_statement(Statement::from_sql_and_values(
@@ -403,9 +402,9 @@ pub async fn lifecycle_scope<C: ConnectionTrait>(
              SELECT c.id, c.workspace_id, c.project_id, c.parent_id, c.object_type, \
                     c.lifecycle_status, s.depth + 1, s.path || c.id, c.id = ANY(s.path) \
                FROM subtree s JOIN flow_objects c ON c.parent_id = s.id AND c.workspace_id = $2 \
-              WHERE NOT s.cycle AND s.depth < $4::bigint + 1 \
+              WHERE NOT s.cycle AND s.depth < $3::bigint + 1 \
          ), facts AS ( \
-             SELECT COALESCE(bool_or(s.cycle OR s.depth > $4::bigint), false) AS invalid_tree, \
+             SELECT COALESCE(bool_or(s.cycle OR s.depth > $3::bigint), false) AS invalid_tree, \
                     EXISTS (SELECT 1 FROM subtree d JOIN flow_object_grants g ON g.object_id = d.id \
                              WHERE d.depth > 0) AS has_shared_descendants \
                FROM subtree s \
@@ -413,14 +412,8 @@ pub async fn lifecycle_scope<C: ConnectionTrait>(
          SELECT s.id, s.workspace_id, s.project_id, s.parent_id, s.object_type, s.lifecycle_status, \
                 f.has_shared_descendants, f.invalid_tree \
            FROM subtree s CROSS JOIN facts f \
-          WHERE $3::boolean OR s.depth = 0 \
           ORDER BY s.id",
-        vec![
-            object_id.into(),
-            workspace_id.into(),
-            cascade.into(),
-            tree_depth_max.into(),
-        ],
+        vec![object_id.into(), workspace_id.into(), tree_depth_max.into()],
     ))
     .all(conn)
     .await?)

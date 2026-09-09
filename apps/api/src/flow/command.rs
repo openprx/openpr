@@ -9,8 +9,8 @@
 //! produced locally, then calls the identical function. `archive`/`restore` never advance a
 //! document head (`existing_document_cardinality = 0`, `rest-api-v1.md`'s `move_object`/`link`
 //! commentary on the same rule), so they take no document coordinator and no document row lock.
-//! They lock the actual `flow_objects` impact set (one row by default, a subtree for an explicit
-//! cascade), re-derive that set inside the transaction, and still take the commit-time
+//! They lock the actual server-derived `flow_objects` impact set (the root and its subtree),
+//! re-derive that set inside the transaction, and still take the commit-time
 //! `authz_epoch` fence (`ADR-0012` §3.1, `authz::fence_epoch_for_share`)
 //! inside that transaction: the fence's job is authorization freshness, not document-head
 //! consistency, so "no document head to advance" does not imply "no epoch to re-verify" — see
@@ -923,15 +923,6 @@ impl LifecycleCommandType {
     }
 }
 
-/// The v0.4 payload was `{}`. v0.5 extends it with one backwards-compatible, default-false switch
-/// so a caller must explicitly request the broader impact set.
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct LifecycleCommandPayload {
-    #[serde(default)]
-    cascade: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LifecyclePlan {
     rows: Vec<repository::LifecycleScopeRow>,
@@ -939,7 +930,7 @@ struct LifecyclePlan {
 }
 
 impl LifecyclePlan {
-    fn derive(object_id: Uuid, cascade: bool, rows: Vec<repository::LifecycleScopeRow>) -> Result<Self, ApiError> {
+    fn derive(object_id: Uuid, rows: Vec<repository::LifecycleScopeRow>) -> Result<Self, ApiError> {
         if rows.is_empty() {
             return Err(ApiError::NotFound("flow object not found".to_string()));
         }
@@ -953,6 +944,7 @@ impl LifecyclePlan {
                 "the lifecycle impact set does not contain its requested root",
             ));
         }
+        let cascade = rows.len() > 1;
         Ok(Self { rows, cascade })
     }
 
@@ -1883,23 +1875,14 @@ async fn execute_content_command(
     })
 }
 
-fn parse_lifecycle_payload(payload: &Value) -> Result<LifecycleCommandPayload, ApiError> {
-    if payload.is_null() {
-        return Ok(LifecycleCommandPayload::default());
-    }
-    serde_json::from_value(payload.clone())
-        .map_err(|err| ApiError::invalid_update(format!("invalid lifecycle command payload: {err}")))
-}
-
 async fn lifecycle_plan<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
     object_id: Uuid,
-    cascade: bool,
 ) -> Result<LifecyclePlan, ApiError> {
     let depth_max = i64::try_from(collab_limits::TREE_DEPTH_MAX).unwrap_or(i64::MAX);
-    let rows = repository::lifecycle_scope(conn, workspace_id, object_id, cascade, depth_max).await?;
-    LifecyclePlan::derive(object_id, cascade, rows)
+    let rows = repository::lifecycle_scope(conn, workspace_id, object_id, depth_max).await?;
+    LifecyclePlan::derive(object_id, rows)
 }
 
 async fn authorize_lifecycle_plan<C: ConnectionTrait>(
@@ -1944,10 +1927,11 @@ fn lifecycle_replay_affected_ids(metadata: &Value, object_id: Uuid) -> Vec<Uuid>
 }
 
 /// `archive`/`restore` mutates no document head, but it is not necessarily a one-row governance
-/// operation: `payload.cascade=true` applies the reversible transition to the complete subtree.
-/// The impact set and its permission tier are prepared outside the transaction, then every member
-/// is locked and the complete plan (type, root-ness, share facts, statuses, and ids) is re-derived
-/// under the commit-time epoch fence. Any drift rolls the transaction back.
+/// operation: the server derives the complete subtree and applies one reversible transition to
+/// it. The payload remains deliberately loose for v0.4 compatibility, but no payload field can
+/// control lifecycle scope. The impact set and its permission tier are prepared outside the
+/// transaction, then every member is locked and the complete plan is re-derived under the
+/// commit-time epoch fence. Any drift rolls the transaction back.
 async fn execute_lifecycle_command(
     state: &AppState,
     input: &ExecuteCommandInput,
@@ -1961,9 +1945,8 @@ async fn execute_lifecycle_command(
         ));
     }
 
-    let payload = parse_lifecycle_payload(&input.payload)?;
     let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
-    let prepared = lifecycle_plan(&state.db, workspace_id, input.object_id, payload.cascade).await?;
+    let prepared = lifecycle_plan(&state.db, workspace_id, input.object_id).await?;
     authorize_lifecycle_plan(&state.db, input, workspace_id, &prepared).await?;
 
     let (event_type, target_status) = match kind {
@@ -1975,16 +1958,6 @@ async fn execute_lifecycle_command(
         if existing.event_type != event_type || existing.aggregate_id != input.object_id.to_string() {
             return Err(ApiError::Conflict(
                 "idempotency_key was already used for a different operation".to_string(),
-            ));
-        }
-        let existing_cascade = existing
-            .metadata
-            .get("cascade")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if existing_cascade != payload.cascade {
-            return Err(ApiError::Conflict(
-                "idempotency_key was already used with a different lifecycle scope".to_string(),
             ));
         }
         let current = repository::fetch_object_view(&state.db, input.object_id)
@@ -2033,7 +2006,7 @@ async fn execute_lifecycle_command(
         ));
     }
 
-    let rechecked = lifecycle_plan(&tx, workspace_id, input.object_id, payload.cascade).await?;
+    let rechecked = lifecycle_plan(&tx, workspace_id, input.object_id).await?;
     if rechecked != prepared {
         let _ = tx.rollback().await;
         return Err(ApiError::Conflict(
@@ -2086,7 +2059,7 @@ async fn execute_lifecycle_command(
             payload: json!({ "object_id": input.object_id, "status": target_status }),
             metadata: json!({
                 "message": input.message,
-                "cascade": payload.cascade,
+                "cascade": prepared.cascade,
                 "affected_object_ids": affected_object_ids,
             }),
             correlation_id: Some(input.origin.correlation_id),
@@ -2801,7 +2774,7 @@ mod database_tests {
         actor_id: Uuid,
         role: &str,
         command_type: &str,
-        cascade: bool,
+        legacy_cascade_hint: bool,
         idempotency_key: String,
     ) -> Result<AcceptedChange, ApiError> {
         execute_command(
@@ -2813,7 +2786,13 @@ mod database_tests {
                 principal_kind: "user".to_string(),
                 role: role.to_string(),
                 command_type: command_type.to_string(),
-                payload: serde_json::json!({ "cascade": cascade }),
+                // Both fields are intentionally outside the lifecycle wire contract. v0.4's
+                // loose payload accepted them, and the server must continue to accept but ignore
+                // them: neither value is allowed to control the derived impact set.
+                payload: serde_json::json!({
+                    "cascade": legacy_cascade_hint,
+                    "v0_4_extension": "still accepted"
+                }),
                 expected_frontier: None,
                 idempotency_key,
                 message: None,
@@ -2945,7 +2924,8 @@ mod database_tests {
         let fx = seed_workspace(&scratch.db).await;
         let navigator = create_typed_object(&state, &fx, "navigator", None).await;
 
-        // The exact v0.4 fixture: default-member edit, ordinary non-root Page, no cascade.
+        // The exact v0.4 fixture: default-member edit, ordinary non-root leaf Page. Even an old
+        // loose payload containing `cascade:true` cannot widen a leaf's server-derived scope.
         let leaf = create_typed_object(&state, &fx, "page", Some(navigator)).await;
         let archived = lifecycle_command(
             &state,
@@ -2954,7 +2934,7 @@ mod database_tests {
             fx.member_id,
             "member",
             "archive",
-            false,
+            true,
             Uuid::new_v4().to_string(),
         )
         .await
@@ -3021,11 +3001,11 @@ mod database_tests {
             fx.member_id,
             "member",
             "archive",
-            true,
+            false,
             Uuid::new_v4().to_string(),
         )
         .await
-        .expect_err("an edit-only member must not cascade");
+        .expect_err("an edit-only member must not archive a server-derived subtree");
         assert_eq!(err.kind(), ApiErrorKind::PolicyRejected);
 
         let archive_key = Uuid::new_v4().to_string();
@@ -3036,11 +3016,11 @@ mod database_tests {
             fx.owner_id,
             "owner",
             "archive",
-            true,
+            false,
             archive_key.clone(),
         )
         .await
-        .expect("the workspace owner has full_access for the cascade");
+        .expect("the workspace owner has full_access for the server-derived cascade");
         let mut expected = vec![subtree_root, child, grandchild];
         expected.sort_unstable();
         assert_eq!(cascaded.affected_object_ids, expected);
@@ -3063,7 +3043,7 @@ mod database_tests {
             fx.owner_id,
             "owner",
             "archive",
-            true,
+            false,
             archive_key,
         )
         .await
@@ -3078,7 +3058,7 @@ mod database_tests {
             fx.owner_id,
             "owner",
             "restore",
-            true,
+            false,
             Uuid::new_v4().to_string(),
         )
         .await
@@ -3090,7 +3070,7 @@ mod database_tests {
             fx.owner_id,
             "owner",
             "restore",
-            true,
+            false,
             Uuid::new_v4().to_string(),
         )
         .await
@@ -3102,7 +3082,7 @@ mod database_tests {
                 .all(|(_, status)| status == "active")
         );
 
-        // A non-cascading request still has a broader tier when a strict descendant is explicitly
+        // The server-derived subtree has a broader tier when a strict descendant is explicitly
         // shared. The fixture has a real child and asserts directly on the rejection and rows.
         let shared_root = create_typed_object(&state, &fx, "page", Some(navigator)).await;
         let shared_child = create_typed_object(&state, &fx, "page", Some(shared_root)).await;
