@@ -443,6 +443,8 @@ pub async fn set_flow_feature(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod flow_database_tests {
+    use std::time::Duration;
+
     use super::{GrantRequestBody, SetGrantsRequest};
     use axum::body::to_bytes;
     use axum::response::{IntoResponse, Response};
@@ -464,7 +466,7 @@ mod flow_database_tests {
         set_flow_feature,
     };
     use crate::error::ApiError;
-    use crate::flow::collab::{authz::PermissionLevel, permission_cache::PermissionCache};
+    use crate::flow::collab::{authz::PermissionLevel, permission_cache::PermissionCache, registry::OutboundEvent};
     use crate::routes::bot::{CreateBotRequest, create_bot};
     use crate::routes::member::{
         AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
@@ -707,6 +709,23 @@ mod flow_database_tests {
         assert_eq!(body["code"], 0, "{body}");
         Uuid::parse_str(body["data"]["object"]["id"].as_str().expect("object id is a string"))
             .expect("object id is a uuid")
+    }
+
+    async fn document_of(state: &AppState, object_id: Uuid) -> Uuid {
+        #[derive(FromQueryResult)]
+        struct DocumentRow {
+            id: Uuid,
+        }
+        DocumentRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM collab_documents WHERE object_id = $1",
+            vec![object_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("document query runs")
+        .expect("created page has a document")
+        .id
     }
 
     fn claims_for(user_id: Uuid) -> Extension<JwtClaims> {
@@ -1534,6 +1553,60 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
+    async fn disabling_flow_advances_epoch_removes_presence_and_closes_workspace_sessions() {
+        let scratch = scratch_or_skip!("feature-disable-sessions");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "feature disable session").await;
+        let document_id = document_of(&state, object_id).await;
+        let session_id = Uuid::new_v4();
+        let registry = &crate::flow::collab::runtime::runtime().registry;
+        let mut registered = registry
+            .try_register_authorized(document_id, object_id, owner_id, workspace_id, session_id, 0)
+            .expect("owner session registers");
+        registry
+            .upsert_presence(
+                document_id,
+                session_id,
+                json!({"cursor": "owner"}),
+                Duration::from_secs(30),
+            )
+            .expect("presence registers");
+
+        let response = to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: Some(false),
+                    default_member_level: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["flow_enabled"], false, "{body}");
+        assert_eq!(
+            body["data"]["authz_epoch"], 1,
+            "flag closure must advance the write fence"
+        );
+        let OutboundEvent::Close { code, reason } = registered.receiver.try_recv().expect("feature close is queued")
+        else {
+            panic!("expected a feature-disabled close")
+        };
+        assert_eq!(code, 4404);
+        assert_eq!(reason, "feature disabled");
+        assert_eq!(registry.presence_count(document_id), 0);
+        assert_eq!(registry.session_count(document_id), 0);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn a_non_admin_member_cannot_put_the_feature_flag_via_body_code_not_http_status() {
         let scratch = scratch_or_skip!("feature-put-forbidden");
         let state = state_for(scratch.db.clone());
@@ -1696,6 +1769,22 @@ mod flow_database_tests {
             "member mutation must physically invalidate the workspace cache"
         );
 
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "member revoke session").await;
+        let document_id = document_of(&state, object_id).await;
+        let session_id = Uuid::new_v4();
+        let registry = &crate::flow::collab::runtime::runtime().registry;
+        let mut registered = registry
+            .try_register_authorized(document_id, object_id, target_id, workspace_id, session_id, 1)
+            .expect("member session registers at epoch one");
+        registry
+            .upsert_presence(
+                document_id,
+                session_id,
+                json!({"cursor": "member"}),
+                Duration::from_secs(30),
+            )
+            .expect("member presence registers");
+
         let updated = body_json(to_response(
             update_member_role(
                 State(state.clone()),
@@ -1710,6 +1799,11 @@ mod flow_database_tests {
         .await;
         assert_eq!(updated["code"], 0, "{updated}");
         assert_eq!(read_epoch(&state, workspace_id).await, 2);
+        assert!(
+            registered.receiver.try_recv().is_err(),
+            "promotion keeps the still-authorized session connected"
+        );
+        assert_eq!(registry.presence_count(document_id), 1);
 
         let removed = body_json(to_response(
             remove_member(
@@ -1722,6 +1816,18 @@ mod flow_database_tests {
         .await;
         assert_eq!(removed["code"], 0, "{removed}");
         assert_eq!(read_epoch(&state, workspace_id).await, 3);
+        let OutboundEvent::Close { code, reason } = registered.receiver.try_recv().expect("removal closes session")
+        else {
+            panic!("expected an authorization close")
+        };
+        assert_eq!(code, 4403);
+        assert_eq!(reason, "authorization revoked");
+        assert_eq!(
+            registry.presence_count(document_id),
+            0,
+            "member removal deletes presence immediately"
+        );
+        assert_eq!(registry.session_count(document_id), 0);
 
         scratch.drop_self().await;
     }

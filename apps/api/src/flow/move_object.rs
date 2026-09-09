@@ -1656,6 +1656,20 @@ pub async fn execute_on(
                         tracing::warn!(object_id = %plan.object_id, %workspace_id, %err, "permission cache unavailable after move commit");
                     }
                 }
+                let revocation_stats = super::collab::revocation::revalidate_subtree_with_registry(
+                    state,
+                    &collab.registry,
+                    workspace_id,
+                    plan.object_id,
+                    committed_epoch,
+                )
+                .await;
+                tracing::debug!(
+                    object_id = %plan.object_id,
+                    %workspace_id,
+                    ?revocation_stats,
+                    "moved subtree sessions re-evaluated after commit"
+                );
                 finish(&ctx, &mut plans, &advanced);
                 return build_response(&ctx, &plan, event_id, &advanced, &observed_lock_order, committed_epoch).await;
             }
@@ -2128,6 +2142,7 @@ mod database_tests {
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::authz::{self, PermissionLevel};
     use crate::flow::collab::coordinator::ascending_document_lock_order;
+    use crate::flow::collab::registry::OutboundEvent;
     use crate::flow::collab::runtime::CollabRuntime;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object};
     use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
@@ -2863,6 +2878,22 @@ mod database_tests {
             PermissionLevel::Denied
         );
 
+        let document_id = document_of(&scratch.db, page).await;
+        let session_id = Uuid::new_v4();
+        let mut registered = collab
+            .registry
+            .try_register_authorized(document_id, page, fx.member_id, fx.workspace_id, session_id, 0)
+            .expect("the baseline member session registers before the move");
+        collab
+            .registry
+            .upsert_presence(
+                document_id,
+                session_id,
+                json!({"cursor": "before-move"}),
+                Duration::from_secs(30),
+            )
+            .expect("member presence registers before the move");
+
         run_move(
             &state,
             &collab,
@@ -2878,6 +2909,15 @@ mod database_tests {
             "ADR-0012 §4: inheritance flips immediately, and the boundary cuts the workspace \
              baseline entirely — the member is denied, not downgraded to view"
         );
+        let OutboundEvent::Close { code, reason } =
+            registered.receiver.try_recv().expect("move closes revoked session")
+        else {
+            panic!("expected an authorization close")
+        };
+        assert_eq!(code, 4403);
+        assert_eq!(reason, "authorization revoked");
+        assert_eq!(collab.registry.presence_count(document_id), 0);
+        assert_eq!(collab.registry.session_count(document_id), 0);
         scratch.drop_self().await;
     }
 

@@ -739,6 +739,28 @@ pub async fn read_epoch<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Res
         .ok_or_else(|| ApiError::NotFound("flow workspace settings not found".to_string()))
 }
 
+/// Reads the current authorization epoch under `FOR SHARE`, held until the caller's transaction
+/// ends. Ticket issuance uses this before its authoritative membership/object permission reads so
+/// an authorization writer cannot commit between the check and the ticket row insertion.
+///
+/// # Errors
+/// `NotFound` if the workspace has no Flow settings. Propagates database failures otherwise.
+pub async fn lock_epoch_for_share<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<i64, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        authz_epoch: i64,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR SHARE",
+        vec![workspace_id.into()],
+    ))
+    .one(conn)
+    .await?;
+    row.map(|row| row.authz_epoch)
+        .ok_or_else(|| ApiError::NotFound("flow workspace settings not found".to_string()))
+}
+
 /// The commit-time fencing barrier (`ADR-0012` §3.1, `collab-protocol-v1.md` §"鉴权与连接" point
 /// 7): takes `SELECT ... FOR SHARE` on the workspace's `authz_epoch` row — held to the caller's
 /// commit — and rejects if the epoch it reads is not the `checked_epoch` the caller computed

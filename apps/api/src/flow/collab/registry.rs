@@ -5,20 +5,14 @@
 //! `_per_workspace_max`) and slow-consumer outbound queue ceiling
 //! (`slow_consumer_queue_frames_max`/`_bytes_max`).
 //!
-//! Scope note (documented rather than silently short of the full `ADR-0012` §5 mechanism): §5
-//! calls for (a) a WS server + session registry, (b) an `object_id → active sessions` index, and
-//! (c) subtree membership (`recursive CTE`) with **cross-instance** broadcast, wired to fire on
-//! every authorization-affecting write. This module is (a), and — since v0.4 has exactly one
-//! `collab_documents` row per `flow_objects` row — `document_id` doubles as (b)'s index with no
-//! separate table. It does **not** implement (c): there is no cross-instance broadcast channel
-//! (`ADR-0010`'s "ordered egress / invalidation 通道" is itself deferred past v0.4 by that ADR),
-//! and no subtree-recompute trigger exists because v0.4 ships no grant/inheritance/membership
-//! write path to trigger it from (`ADR-0012` marks that whole surface v0.5). What *is* real here —
-//! [`SessionRegistry::disconnect_document`] — is the mechanism a v0.5 subtree-revocation path will
-//! call once it exists; today nothing calls it automatically. Correctness never depends on this
-//! module: `authz::fence_epoch_for_share` is the actual barrier (`collab-protocol-v1.md`: "撤连是
-//! 尽力而为的及时性手段;正确性由 commit-time fencing 保证"). This registry is that timeliness
-//! mechanism's single-instance slice, not the correctness guarantee.
+//! `ADR-0012` §5's v0.5 scope is single-instance: this module maintains both document fan-out and
+//! a distinct `object_id → active sessions` reverse index. [`super::revocation`] reuses
+//! `repository::subtree_nodes` and the batch permission evaluator after grant, inheritance,
+//! parent, membership, baseline, and feature changes; it deletes revoked presence independently,
+//! removes the session from fan-out, then best-effort sends the frozen close. Cross-instance
+//! broadcast and durable revocation logs belong to v0.8/ADR-0016 and are intentionally absent.
+//! Correctness never depends on the close path: `authz::fence_epoch_for_share` remains the
+//! commit-time barrier.
 //!
 //! [`SessionRegistry::drain_all`]/[`SessionRegistry::drain_workspace`] carry the same
 //! documented drain shape: they are the tested, callable `server_draining{reason:"drain"}`
@@ -189,7 +183,7 @@ pub struct AckFrontier {
 
 /// Per-session connection metadata (`limits-v1.md`'s `user_connections`/`document_connections`/
 /// `workspace_connections` accounting dimensions), keyed by `session_id` so
-/// [`SessionRegistry::try_register`]/[`SessionRegistry::unregister`] can maintain it without a
+/// [`SessionRegistry::try_register_authorized`]/[`SessionRegistry::unregister`] can maintain it without a
 /// second index.
 struct ConnMeta {
     document_id: Uuid,
@@ -221,7 +215,7 @@ pub struct ActiveSession {
     pub user_id: Uuid,
 }
 
-/// Which `limits-v1.md` connection ceiling a [`SessionRegistry::try_register`] admission refused.
+/// Which `limits-v1.md` connection ceiling a [`SessionRegistry::try_register_authorized`] admission refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionLimit {
     PerUser,
@@ -259,7 +253,7 @@ impl ConnectionLimit {
     }
 }
 
-/// What [`SessionRegistry::try_register`] hands back on success: the channel the session's
+/// What [`SessionRegistry::try_register_authorized`] hands back on success: the channel the session's
 /// outbound writer task should drain, plus the shared slow-consumer queue counters so the session
 /// loop can release each frame's charge once it is actually dequeued.
 pub struct RegisteredSession {
@@ -453,7 +447,7 @@ impl SessionRegistry {
             .entry(workspace_id)
             .and_modify(|epoch| *epoch = (*epoch).max(committed_epoch))
             .or_insert(committed_epoch);
-        object_ids
+        let active = object_ids
             .iter()
             .filter_map(|object_id| connections.by_object.get(object_id))
             .flat_map(|session_ids| session_ids.iter())
@@ -466,7 +460,9 @@ impl SessionRegistry {
                     user_id: meta.user_id,
                 })
             })
-            .collect()
+            .collect();
+        drop(connections);
+        active
     }
 
     /// Workspace-wide counterpart used for membership, baseline, and feature-flag changes.
@@ -478,7 +474,7 @@ impl SessionRegistry {
             .entry(workspace_id)
             .and_modify(|epoch| *epoch = (*epoch).max(committed_epoch))
             .or_insert(committed_epoch);
-        connections
+        let active = connections
             .by_session
             .iter()
             .filter_map(|(session_id, meta)| {
@@ -489,7 +485,9 @@ impl SessionRegistry {
                     user_id: meta.user_id,
                 })
             })
-            .collect()
+            .collect();
+        drop(connections);
+        active
     }
 
     /// Deletes revoked sessions' presence independently of close delivery. This is intentionally
@@ -575,9 +573,9 @@ impl SessionRegistry {
         }
     }
 
-    /// Force-closes every session with `document_id` open (feature disabled, `flow_enabled`
-    /// turned off, or — once a v0.5 caller exists — a subtree revocation). See the module doc
-    /// comment for what "subtree" coverage this does and does not provide today.
+    /// Force-closes every session with `document_id` open. Authorization revocation uses the
+    /// session-selective [`Self::disconnect_authorization_sessions`] path instead, because two
+    /// users on the same document can resolve to different effective grades.
     pub fn disconnect_document(&self, document_id: Uuid, code: u16, reason: &str) {
         let mut sessions = self.sessions.lock();
         if let Some(by_session) = sessions.remove(&document_id) {

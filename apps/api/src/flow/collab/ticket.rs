@@ -4,7 +4,7 @@
 #![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
 
 use rand::RngCore;
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -72,8 +72,8 @@ fn validate_client_id(client_id: &str) -> Result<(), ApiError> {
 /// effective permission is below `edit` (`ADR-0007`: "document read+write ACL"); `NotFound` when
 /// `document_id` does not resolve to a `collab_documents` row whose object belongs to
 /// `workspace_id`. Propagates a database failure otherwise.
-pub async fn issue<C: ConnectionTrait>(
-    conn: &C,
+pub async fn issue(
+    conn: &DatabaseConnection,
     input: IssueTicketInput,
     allowed_origins: &[String],
 ) -> Result<IssuedTicket, ApiError> {
@@ -86,18 +86,35 @@ pub async fn issue<C: ConnectionTrait>(
         ));
     }
 
+    let tx = conn.begin().await?;
+
     #[derive(FromQueryResult)]
     struct RoleRow {
         role: String,
     }
+    let _prechecked_role = RoleRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        vec![input.workspace_id.into(), input.user_id.into()],
+    ))
+    .one(&tx)
+    .await?
+    .map(|r| r.role)
+    .ok_or_else(|| ApiError::Forbidden("not a member of this workspace".to_string()))?;
+
+    // Hold the same epoch row authorization writers take exclusively until the ticket insert
+    // commits. The first membership read above preserves the non-enumerating error order; this
+    // second read, after the lock, is authoritative and catches a removal/demotion that completed
+    // while the share lock was being acquired.
+    let _checked_epoch = super::authz::lock_epoch_for_share(&tx, input.workspace_id).await?;
     let role = RoleRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
         vec![input.workspace_id.into(), input.user_id.into()],
     ))
-    .one(conn)
+    .one(&tx)
     .await?
-    .map(|r| r.role)
+    .map(|row| row.role)
     .ok_or_else(|| ApiError::Forbidden("not a member of this workspace".to_string()))?;
 
     // `ADR-0007`: "签发前验证 `flow_enabled`、workspace membership、object/document read+write ACL
@@ -107,7 +124,7 @@ pub async fn issue<C: ConnectionTrait>(
     // Deliberately *after* the membership read above and *before* the document lookup below: a
     // non-member must not be able to probe another tenant's rollout state, and a member must not
     // learn whether a document exists in a workspace where Flow is switched off.
-    super::super::policy::require_flow_enabled_on(conn, input.workspace_id).await?;
+    super::super::policy::require_flow_enabled_on(&tx, input.workspace_id).await?;
 
     // `collab_documents` has no `workspace_id` column of its own (migration
     // `0054_flow_data_layer.sql`); a document's tenant is reachable only through
@@ -133,12 +150,12 @@ pub async fn issue<C: ConnectionTrait>(
          WHERE d.id = $1 AND o.workspace_id = $2",
         vec![input.document_id.into(), input.workspace_id.into()],
     ))
-    .one(conn)
+    .one(&tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("document not found".to_string()))?;
 
     let level =
-        super::authz::effective_permission(conn, input.workspace_id, doc.object_id, "user", input.user_id, &role)
+        super::authz::effective_permission(&tx, input.workspace_id, doc.object_id, "user", input.user_id, &role)
             .await?;
     if level < super::authz::PermissionLevel::Edit {
         return Err(ApiError::Forbidden(
@@ -152,7 +169,7 @@ pub async fn issue<C: ConnectionTrait>(
     let ticket_hash = sha256_hex(&raw);
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(TICKET_TTL_SECONDS);
 
-    conn.execute(Statement::from_sql_and_values(
+    tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
             INSERT INTO collab_tickets
@@ -171,6 +188,7 @@ pub async fn issue<C: ConnectionTrait>(
         ],
     ))
     .await?;
+    tx.commit().await?;
 
     Ok(IssuedTicket {
         ticket: raw,

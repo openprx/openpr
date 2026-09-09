@@ -136,8 +136,12 @@ pub async fn add_member(
     ))
     .await?;
     tx.commit().await?;
-    if advanced_epoch.is_some() {
+    if let Some(committed_epoch) = advanced_epoch {
         crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+        let revocation_stats =
+            crate::flow::collab::revocation::revalidate_workspace_after_commit(&state, workspace_id, committed_epoch)
+                .await;
+        tracing::debug!(%workspace_id, ?revocation_stats, "workspace sessions re-evaluated after member add");
     }
 
     trigger_webhooks(
@@ -238,8 +242,12 @@ pub async fn update_member_role(
     ))
     .await?;
     tx.commit().await?;
-    if advanced_epoch.is_some() {
+    if let Some(committed_epoch) = advanced_epoch {
         crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+        let revocation_stats =
+            crate::flow::collab::revocation::revalidate_workspace_after_commit(&state, workspace_id, committed_epoch)
+                .await;
+        tracing::debug!(%workspace_id, ?revocation_stats, "workspace sessions re-evaluated after member role change");
     }
 
     trigger_webhooks(
@@ -386,8 +394,12 @@ pub async fn remove_member(
     ))
     .await?;
     tx.commit().await?;
-    if advanced_epoch.is_some() {
+    if let Some(committed_epoch) = advanced_epoch {
         crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+        let revocation_stats =
+            crate::flow::collab::revocation::revalidate_workspace_after_commit(&state, workspace_id, committed_epoch)
+                .await;
+        tracing::debug!(%workspace_id, ?revocation_stats, "workspace sessions re-evaluated after member removal");
     }
 
     Ok(ApiResponse::ok())

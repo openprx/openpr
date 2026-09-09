@@ -639,9 +639,10 @@ fn validate_set_flow_feature(input: &SetFlowFeatureInput) -> Result<(), ApiError
 /// `PUT /api/v1/workspaces/{workspace_id}/features/flow`.
 ///
 /// A feature-flag transition emits `flow.feature.enabled|disabled`; a baseline transition emits
-/// `flow.permission.baseline_changed`, advances `authz_epoch`, and updates settings in this one
-/// transaction. When both change, the baseline event owns the request idempotency key and the
-/// feature event is causally derived from it. A no-op still stamps the updater but emits no event.
+/// `flow.permission.baseline_changed`. Either authorization-affecting transition advances
+/// `authz_epoch`, and all settings update in this one transaction. When both change, the baseline
+/// event owns the request idempotency key and the feature event is causally derived from it. A
+/// no-op still stamps the updater but emits no event.
 pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> Result<FlowFeatureUpdateView, ApiError> {
     validate_set_flow_feature(&input)?;
 
@@ -678,6 +679,7 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
         .unwrap_or(&current.default_member_level);
     let baseline_transition = (new_member_level != current.default_member_level)
         .then(|| (current.default_member_level.clone(), new_member_level.to_string()));
+    let authorization_transition = baseline_transition.is_some() || transition.is_some();
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
 
     let baseline_event_id = if let Some((old_level, new_level)) = &baseline_transition {
@@ -764,9 +766,11 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
         None
     };
 
-    if baseline_transition.is_some() {
-        authz::advance_epoch(&tx, input.workspace_id).await?;
-    }
+    let committed_epoch = if authorization_transition {
+        Some(authz::advance_epoch(&tx, input.workspace_id).await?)
+    } else {
+        None
+    };
 
     repository::update_flow_settings(
         &tx,
@@ -778,8 +782,15 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
     .await?;
     tx.commit().await?;
 
-    if baseline_transition.is_some() {
+    if let Some(committed_epoch) = committed_epoch {
         super::collab::permission_cache::invalidate_workspace_after_commit(state, input.workspace_id);
+        let revocation_stats = if new_enabled {
+            super::collab::revocation::revalidate_workspace_after_commit(state, input.workspace_id, committed_epoch)
+                .await
+        } else {
+            super::collab::revocation::disconnect_workspace_for_disabled_feature(input.workspace_id, committed_epoch)
+        };
+        tracing::debug!(workspace_id = %input.workspace_id, ?revocation_stats, "workspace sessions handled after Flow feature change");
     }
 
     let updated = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;

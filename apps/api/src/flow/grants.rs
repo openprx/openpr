@@ -722,6 +722,7 @@ struct Outcome {
     event_id: Option<Uuid>,
     changes: PermissionChanges,
     inherit_from_parent: bool,
+    committed_epoch: Option<i64>,
 }
 
 /// The one transaction both PUTs run.
@@ -760,7 +761,6 @@ async fn apply(
     dry_run: bool,
     idempotency_key: &str,
 ) -> Result<Outcome, ApiError> {
-    let invalidate_subtree = matches!(change, Change::SetInheritance { .. });
     let tx = state.db.begin().await?;
 
     let result = apply_in_transaction(
@@ -779,15 +779,24 @@ async fn apply(
         Ok((outcome, Disposition::Commit)) => {
             tx.commit().await?;
             match super::collab::permission_cache::PermissionCache::for_state(state) {
-                Ok(cache) if invalidate_subtree => {
+                Ok(cache) => {
                     if let Err(err) = cache.invalidate_subtree(state, workspace_id, object_id).await {
                         tracing::warn!(%workspace_id, %object_id, %err, "permission cache subtree cleanup failed after commit");
                     }
                 }
-                Ok(cache) => cache.invalidate_object(workspace_id, object_id),
                 Err(err) => {
                     tracing::warn!(%workspace_id, %object_id, %err, "permission cache unavailable after authorization commit");
                 }
+            }
+            if let Some(committed_epoch) = outcome.committed_epoch {
+                let revocation_stats = super::collab::revocation::revalidate_subtree_after_commit(
+                    state,
+                    workspace_id,
+                    object_id,
+                    committed_epoch,
+                )
+                .await;
+                tracing::debug!(%workspace_id, %object_id, ?revocation_stats, "authorization subtree sessions re-evaluated after commit");
             }
             Ok(outcome)
         }
@@ -949,6 +958,7 @@ async fn apply_in_transaction(
                 event_id: None,
                 changes,
                 inherit_from_parent: inherit_after,
+                committed_epoch: None,
             },
             Disposition::Rollback,
         ));
@@ -1012,7 +1022,7 @@ async fn apply_in_transaction(
     // `fence_epoch_for_share` afterwards. Unconditional, including for a request that changed no
     // row: a no-op that skipped the bump would be indistinguishable on the wire from one that did
     // not, and the cost of an extra epoch is a resync, never a wrong answer.
-    authz::advance_epoch(tx, workspace_id).await?;
+    let committed_epoch = authz::advance_epoch(tx, workspace_id).await?;
 
     Ok((
         Outcome {
@@ -1020,6 +1030,7 @@ async fn apply_in_transaction(
             event_id,
             changes,
             inherit_from_parent: inherit_after,
+            committed_epoch: Some(committed_epoch),
         },
         Disposition::Commit,
     ))
@@ -1181,6 +1192,7 @@ async fn replay(
             event_id: Some(existing.id),
             changes: permission_changes(caller_level, caller_level, &current, &current),
             inherit_from_parent,
+            committed_epoch: None,
         },
         Disposition::Rollback,
     ))
@@ -1486,6 +1498,23 @@ mod database_tests {
         .id
     }
 
+    async fn document_of(db: &DatabaseConnection, object_id: Uuid) -> Uuid {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: Uuid,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM collab_documents WHERE object_id = $1",
+            vec![object_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("document lookup runs")
+        .expect("created object has a collab document")
+        .id
+    }
+
     fn user(actor_id: Uuid, role: &str) -> Caller {
         Caller {
             origin: crate::flow::event_origin::CommandOrigin::first_request_from(
@@ -1728,6 +1757,180 @@ mod database_tests {
     // -----------------------------------------------------------------------------------------
     // 1. An authorization boundary must cut the workspace baseline, not be max'd with it
     // -----------------------------------------------------------------------------------------
+
+    /// `permission_revocation_closes_subtree_sessions`: a committed boundary change is evaluated
+    /// over the shared recursive subtree query, removes revoked presence before closing, ejects
+    /// revoked recipients from later presence fan-out, and leaves a still-authorized owner alive.
+    #[tokio::test]
+    async fn subtree_revocation_removes_presence_closes_only_insufficient_sessions_and_stops_fanout() {
+        use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION};
+        use crate::flow::collab::registry::{OutboundEvent, SessionRegistry};
+
+        let scratch = scratch_or_skip!("subtree_session_revocation");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let parent = create(&state, &fx, "page", None).await;
+        let child = create(&state, &fx, "page", Some(parent)).await;
+        let parent_document = document_of(&scratch.db, parent).await;
+        let child_document = document_of(&scratch.db, child).await;
+        let registry = SessionRegistry::new();
+        let parent_member_session = Uuid::new_v4();
+        let child_member_session = Uuid::new_v4();
+        let child_owner_session = Uuid::new_v4();
+        let mut parent_member = registry
+            .try_register_authorized(
+                parent_document,
+                parent,
+                fx.member_id,
+                fx.workspace_id,
+                parent_member_session,
+                0,
+            )
+            .expect("parent member session registers");
+        let mut child_member = registry
+            .try_register_authorized(
+                child_document,
+                child,
+                fx.member_id,
+                fx.workspace_id,
+                child_member_session,
+                0,
+            )
+            .expect("child member session registers");
+        let mut child_owner = registry
+            .try_register_authorized(
+                child_document,
+                child,
+                fx.owner_id,
+                fx.workspace_id,
+                child_owner_session,
+                0,
+            )
+            .expect("owner session registers");
+        let live_registry = &crate::flow::collab::runtime::runtime().registry;
+        let live_session_id = Uuid::new_v4();
+        let mut live_member = live_registry
+            .try_register_authorized(child_document, child, fx.member_id, fx.workspace_id, live_session_id, 0)
+            .expect("production-registry member session registers");
+        live_registry
+            .upsert_presence(
+                child_document,
+                live_session_id,
+                serde_json::json!({"cursor": "live"}),
+                Duration::from_secs(30),
+            )
+            .expect("production-registry presence registers");
+        for (document_id, session_id) in [
+            (parent_document, parent_member_session),
+            (child_document, child_member_session),
+            (child_document, child_owner_session),
+        ] {
+            registry
+                .upsert_presence(
+                    document_id,
+                    session_id,
+                    serde_json::json!({"cursor": session_id}),
+                    Duration::from_secs(30),
+                )
+                .expect("presence registers");
+        }
+
+        set_inheritance(
+            &state,
+            fx.workspace_id,
+            SetInheritanceInput {
+                object_id: parent,
+                caller: user(fx.owner_id, "owner"),
+                inherit_from_parent: false,
+                initial_grants: None,
+                confirm_self_lockout: false,
+                dry_run: false,
+                idempotency_key: Uuid::new_v4().to_string(),
+            },
+        )
+        .await
+        .expect("owner commits a boundary over the subtree");
+        let OutboundEvent::Close { code, reason } =
+            live_member.receiver.try_recv().expect("write trigger closes session")
+        else {
+            panic!("expected an automatic authorization close")
+        };
+        assert_eq!(code, 4403);
+        assert_eq!(reason, "authorization revoked");
+        assert_eq!(live_registry.presence_count(child_document), 0);
+        assert_eq!(live_registry.session_count(child_document), 0);
+        let committed_epoch = authz::read_epoch(&scratch.db, fx.workspace_id)
+            .await
+            .expect("committed epoch reads");
+        let revocation_stats = crate::flow::collab::revocation::revalidate_subtree_with_registry(
+            &state,
+            &registry,
+            fx.workspace_id,
+            parent,
+            committed_epoch,
+        )
+        .await;
+        assert_eq!(revocation_stats.candidates, 3);
+        assert_eq!(revocation_stats.revoked, 2);
+        assert_eq!(
+            revocation_stats.presence_removed, 2,
+            "revocation must remove presence immediately"
+        );
+        assert_eq!(
+            revocation_stats.disconnected, 2,
+            "both insufficient sessions must leave the registry"
+        );
+        assert_eq!(registry.presence_count(parent_document), 0);
+        assert_eq!(
+            registry.presence_count(child_document),
+            1,
+            "the authorized owner's presence remains"
+        );
+
+        for (receiver, object_id) in [
+            (&mut parent_member.receiver, parent),
+            (&mut child_member.receiver, child),
+        ] {
+            let OutboundEvent::Close { code, reason } = receiver.try_recv().expect("revoked session receives close")
+            else {
+                panic!("expected a close event")
+            };
+            assert_eq!(code, 4403);
+            assert_eq!(reason, "authorization revoked");
+            assert!(
+                !reason.contains(&object_id.to_string()),
+                "close reason leaked the object id"
+            );
+            assert!(
+                !reason.contains(&fx.member_id.to_string()),
+                "close reason leaked the principal id"
+            );
+        }
+        assert!(
+            child_owner.receiver.try_recv().is_err(),
+            "authorized owner must remain connected"
+        );
+
+        registry.broadcast(
+            child_document,
+            &Frame::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                document_id: child_document,
+                session_id: child_owner_session,
+                payload: serde_json::json!({"cursor": "later"}),
+                ttl_seconds: Some(30),
+            },
+            Some(child_owner_session),
+        );
+        assert!(
+            child_member.receiver.try_recv().is_err(),
+            "the revoked child session must not receive later presence fan-out"
+        );
+        assert_eq!(registry.session_count(parent_document), 0);
+        assert_eq!(registry.session_count(child_document), 1);
+
+        scratch.drop_self().await;
+    }
 
     /// ★ `ADR-0012` §3, R16's headline fix: "原设计写的是『有效权限 = 继承链最高档与 workspace
     /// 基线取高』。那样的话，只要 baseline 还是 `edit`，任何页面都不可能被降到 `view` 或无权，

@@ -416,7 +416,9 @@ mod collab_database_tests {
         auth::JwtManager,
         config::{AppConfig, Secret},
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    };
     use serde_json::Value;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -425,7 +427,9 @@ mod collab_database_tests {
     use uuid::Uuid;
 
     use super::{create_ticket, get_collab_diagnostics, verify_collab, ws_upgrade};
+    use crate::error::ApiErrorKind;
     use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
+    use crate::flow::collab::ticket::{self, IssueTicketInput};
     use crate::middleware::bot_auth::bot_or_user_auth_middleware;
     use crate::routes::flow::get_flow_object_bootstrap;
 
@@ -1653,6 +1657,76 @@ mod collab_database_tests {
             reqwest::StatusCode::SWITCHING_PROTOCOLS,
             "an enabled workspace must still reach 101, got {status} / {body}"
         );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn ticket_issuance_holds_current_epoch_through_insert_and_rechecks_membership() {
+        let scratch = scratch_or_skip!("ticket-epoch-fence");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let member_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'ticket member', 'user', true)",
+            vec![member_id.into(), format!("{member_id}@collab.test").into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+            vec![workspace_id.into(), member_id.into()],
+        )
+        .await;
+
+        let revocation = state.db.begin().await.expect("revocation transaction begins");
+        crate::flow::collab::authz::lock_epoch_for_update(&revocation, workspace_id)
+            .await
+            .expect("revocation holds the conflicting epoch lock");
+        let issue_state = state.clone();
+        let mut issuing = tokio::spawn(async move {
+            ticket::issue(
+                &issue_state.db,
+                IssueTicketInput {
+                    user_id: member_id,
+                    workspace_id,
+                    document_id,
+                    client_id: "epoch-fenced-client".to_string(),
+                    origin: TEST_ORIGIN.to_string(),
+                },
+                &[TEST_ORIGIN.to_string()],
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut issuing)
+                .await
+                .is_err(),
+            "ticket issuance must wait behind the revocation's exclusive epoch lock"
+        );
+
+        crate::flow::collab::authz::advance_epoch(&revocation, workspace_id)
+            .await
+            .expect("revocation advances epoch");
+        revocation
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+                vec![workspace_id.into(), member_id.into()],
+            ))
+            .await
+            .expect("membership revocation writes");
+        revocation.commit().await.expect("revocation commits");
+
+        let result = issuing.await.expect("ticket task joins");
+        let Err(err) = result else {
+            panic!("a member revoked before issuance commit received a ticket")
+        };
+        assert_eq!(err.kind(), ApiErrorKind::Forbidden, "got {err:?}");
+        assert_eq!(count_tickets(&state, workspace_id).await, 0);
 
         scratch.drop_self().await;
     }

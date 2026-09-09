@@ -35,6 +35,7 @@ pub mod limits;
 pub mod origin;
 pub mod permission_cache;
 pub mod registry;
+pub mod revocation;
 pub mod runtime;
 pub mod session;
 pub mod snapshot;
