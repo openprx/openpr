@@ -432,6 +432,19 @@ impl SessionRegistry {
         self.presence.lock().remove(&(document_id, session_id));
     }
 
+    /// Direct test-only view of the authorization reverse index. Tests that assert index cleanup
+    /// must not go through an active-session reader: those readers intentionally cross-check
+    /// `by_session` and would hide a dangling `by_object` member.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn object_index_session_count(&self, object_id: Uuid) -> usize {
+        self.connections
+            .lock()
+            .by_object
+            .get(&object_id)
+            .map_or(0, HashSet::len)
+    }
+
     /// Records the committed epoch before snapshotting sessions in `object_ids`. Holding the same
     /// lock registration uses makes the snapshot and the stale-open barrier one atomic action.
     #[must_use]
@@ -1250,6 +1263,7 @@ mod tests {
         let _registered = registry
             .try_register_authorized(document_id, object_id, user_id, workspace_id, session_id, 7)
             .expect("current authorization registers");
+        assert_eq!(registry.object_index_session_count(object_id), 1);
 
         let objects = HashSet::from([object_id]);
         let active = registry.observe_epoch_and_subtree_sessions(workspace_id, 8, &objects);
@@ -1273,10 +1287,9 @@ mod tests {
         ));
 
         registry.unregister(document_id, session_id);
-        assert!(
-            registry
-                .observe_epoch_and_subtree_sessions(workspace_id, 8, &objects)
-                .is_empty(),
+        assert_eq!(
+            registry.object_index_session_count(object_id),
+            0,
             "unregister must remove the object reverse-index member, not leave a dangling entry"
         );
         assert_eq!(registry.session_count(document_id), 0);
@@ -1338,6 +1351,17 @@ mod tests {
             registry.disconnect_authorization_sessions(&[revoked_candidate], 4403, "authorization revoked"),
             1
         );
+        assert_eq!(
+            registry.object_index_session_count(object_id),
+            1,
+            "disconnect must remove exactly the revoked reverse-index member"
+        );
+        registry.unregister(document_id, revoked_session_id);
+        assert_eq!(
+            registry.object_index_session_count(object_id),
+            1,
+            "the session loop's later unregister must keep the already-disconnected path idempotent"
+        );
         let close_event = revoked.receiver.try_recv().expect("close is queued");
         let OutboundEvent::Close { code, reason } = close_event else {
             panic!("expected an authorization close")
@@ -1363,5 +1387,12 @@ mod tests {
             "a revoked session removed from the document index must receive no later presence fan-out"
         );
         assert_eq!(registry.session_count(document_id), 1);
+
+        registry.unregister(document_id, survivor_session_id);
+        assert_eq!(
+            registry.object_index_session_count(object_id),
+            0,
+            "the last live session must remove the reverse-index bucket"
+        );
     }
 }
