@@ -45,7 +45,7 @@ done
 [[ $JSON_MODE -eq 1 ]] || { echo "FAIL: --json is required" >&2; exit 2; }
 [[ "$CLIENTS" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: --clients must be a positive integer" >&2; exit 2; }
 [[ -n "$EVIDENCE_ROOT" ]] || { echo "FAIL: --evidence-root is required" >&2; exit 2; }
-for tool in cargo git jq psql podman sha256sum nproc; do
+for tool in cargo git jq psql podman python3 sha256sum nproc; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: missing required command: $tool" >&2; exit 2; }
 done
 
@@ -183,8 +183,26 @@ REEXEC_API_SHA256=""
 if [[ $CACHE_EXIT -eq 0 ]]; then
   mkdir -p "$REEXEC_OUT_DIR"
   REEXEC_DRIVER="$EVIDENCE_ROOT/logs/v0.5-document-integrity-release-driver.sh"
+  REEXEC_API_PORT="$(python3 -c '
+import random, socket
+ports = list(range(61000, 65000))
+random.shuffle(ports)
+for port in ports:
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        sock.close()
+        continue
+    sock.close()
+    print(port)
+    break
+else:
+    raise SystemExit("no free API re-exec port in 61000..64999")
+')"
   sed \
     -e "s|^ROOT_DIR=.*|ROOT_DIR=\"$REPO_ROOT\"|" \
+    -e "s|^API_PORT=.*|API_PORT=$REEXEC_API_PORT|" \
     -e 's/cargo build -q -p api --bin api/cargo build -q --release -p api --bin api/' \
     -e 's|API_BIN="$TARGET_DIR/debug/api"|API_BIN="$TARGET_DIR/release/api"|' \
     -e 's/cargo build -q --manifest-path/cargo build -q --release --manifest-path/' \
