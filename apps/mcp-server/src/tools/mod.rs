@@ -127,6 +127,18 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         objects::get_flow_object_tool(),
         objects::query_flow_objects_tool(),
         objects::get_flow_object_history_tool(),
+        objects::create_flow_object_tool(),
+        objects::patch_flow_object_tool(),
+        objects::move_flow_object_tool(),
+        objects::link_flow_objects_tool(),
+        objects::unlink_flow_objects_tool(),
+        objects::diff_flow_object_tool(),
+        objects::get_flow_object_grants_tool(),
+        objects::set_flow_object_grants_tool(),
+        objects::set_flow_object_inheritance_tool(),
+        objects::list_flow_object_relations_tool(),
+        objects::search_flow_objects_tool(),
+        objects::get_flow_projection_lag_tool(),
         legacy_pages::legacy_pages_inventory_tool(),
         legacy_pages::legacy_pages_import_preview_tool(),
         legacy_pages::legacy_pages_import_commit_tool(),
@@ -216,6 +228,18 @@ mod tests {
             "objects.get",
             "objects.query",
             "objects.history",
+            "objects.create",
+            "objects.patch",
+            "objects.move",
+            "objects.link",
+            "objects.unlink",
+            "objects.diff",
+            "objects.grants_get",
+            "objects.grants_set",
+            "objects.inheritance_set",
+            "objects.relations",
+            "objects.search",
+            "collab.projection_lag",
             "legacy_pages.inventory",
             "legacy_pages.import_preview",
             "legacy_pages.import_commit",
@@ -226,10 +250,103 @@ mod tests {
                 "missing Phase 1 MCP tool registration: {expected}"
             );
         }
+    }
+
+    #[test]
+    fn flow_v05_registry_matches_the_authoritative_contract() {
+        let tools = get_all_tool_definitions();
+        let contract_root =
+            std::env::var("SYLVODE_FLOW_CONTRACTS_ROOT").unwrap_or_else(|_| "/opt/working/sylvode-flow".to_string());
+        let surface = std::fs::read_to_string(format!("{contract_root}/contracts/mcp-surface-v1.md"))
+            .expect("the authoritative MCP surface contract must be readable");
+        let expected = surface
+            .lines()
+            .skip_while(|line| *line != "## Tools")
+            .skip(1)
+            .take_while(|line| !line.starts_with("## "))
+            .filter_map(|line| {
+                let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+                (cells.len() > 3 && cells[2] == "0.5").then(|| cells[1].trim_matches('`'))
+            })
+            .collect::<HashSet<_>>();
+        let registered = tools.iter().map(|tool| tool.name.as_str()).collect::<HashSet<_>>();
+        let expected_total = surface
+            .lines()
+            .find_map(|line| {
+                let marker = "v0.5 `";
+                let tail = line.split_once(marker)?.1;
+                tail.split_once('`')?.0.parse::<usize>().ok()
+            })
+            .expect("mcp-surface-v1.md must declare the v0.5 expected registry total");
+
         assert_eq!(
             tools.len(),
-            107,
-            "Universal forms, plugins, operation logs, and Flow v0.4 should expose 107 MCP tools"
+            expected_total,
+            "the live registry count must equal the v0.5 total parsed from the authoritative contract"
         );
+        assert!(
+            expected.iter().all(|name| registered.contains(name)),
+            "every v0.5 contract tool must exist in the live registry"
+        );
+    }
+
+    #[test]
+    fn flow_v05_write_and_visibility_schemas_preserve_contract_boundaries() {
+        let tools = get_all_tool_definitions();
+        let by_name = tools
+            .iter()
+            .map(|tool| (tool.name.as_str(), &tool.input_schema))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        for name in [
+            "objects.create",
+            "objects.patch",
+            "objects.move",
+            "objects.link",
+            "objects.unlink",
+            "objects.grants_set",
+            "objects.inheritance_set",
+        ] {
+            let schema = by_name.get(name).unwrap_or_else(|| panic!("missing {name}"));
+            let required = schema["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} must declare required fields"));
+            assert!(
+                required.iter().any(|field| field == "idempotency_key"),
+                "{name} must require idempotency_key"
+            );
+            assert!(
+                schema["properties"].get("message").is_some(),
+                "{name} must accept an optional message"
+            );
+            assert!(
+                !required.iter().any(|field| field == "message"),
+                "{name} message must remain optional"
+            );
+        }
+
+        let move_schema = by_name["objects.move"];
+        assert!(
+            move_schema["required"]
+                .as_array()
+                .is_some_and(|required| { required.iter().any(|field| field == "target_object_id") })
+        );
+        assert!(move_schema["properties"].get("expected_target_frontier").is_some());
+        assert!(move_schema["properties"].get("expected_frontier").is_none());
+
+        let grants = by_name["objects.grants_set"];
+        assert!(grants["properties"].get("dry_run").is_some());
+        assert!(!by_name.contains_key("objects.grants_set_dry_run"));
+
+        let search = by_name["objects.search"];
+        assert!(search["properties"].get("all_visible").is_none());
+
+        let projection_lag = by_name["collab.projection_lag"];
+        for forbidden in ["content", "bytes"] {
+            assert!(
+                projection_lag["properties"].get(forbidden).is_none(),
+                "projection lag input must not expose {forbidden}"
+            );
+        }
     }
 }

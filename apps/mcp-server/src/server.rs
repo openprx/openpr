@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (107)
+## Tools (119)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -27,7 +27,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
 ### Other: members.list, search.all, bot_operation_logs.list
-### Flow (v0.4): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
+### Flow (v0.5): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, collab.projection_lag, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -205,7 +205,7 @@ impl OwnerLookup {
             Self::CheckResult => "check_result_id",
             Self::Sprint => "sprint_id",
             Self::Comment => "comment_id",
-            Self::FlowObject => "object_id",
+            Self::FlowObject => "object_id, source_object_id or collection_id",
         }
     }
 }
@@ -217,7 +217,7 @@ impl OwnerLookup {
 /// labels carry no project column (`migrations/0012_governance_phase1.sql`,
 /// `migrations/0003_labels.sql`), and `resource_id` only ever appears next to a
 /// `project_id` that already scopes the request path.
-const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 10] = [
+const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 12] = [
     ("record_id", OwnerLookup::FormData),
     ("form_id", OwnerLookup::FormData),
     ("attachment_id", OwnerLookup::FormData),
@@ -228,6 +228,8 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 10] = [
     ("sprint_id", OwnerLookup::Sprint),
     ("comment_id", OwnerLookup::Comment),
     ("object_id", OwnerLookup::FlowObject),
+    ("source_object_id", OwnerLookup::FlowObject),
+    ("collection_id", OwnerLookup::FlowObject),
 ];
 
 /// The policy scope of every registered tool.
@@ -236,7 +238,7 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 10] = [
 /// this table from the live tool registry (`tools::get_all_tool_definitions`), so a new
 /// or renamed tool cannot silently land outside the policy gate — including tools whose
 /// name shares no prefix with the family they belong to, such as `events.tail`.
-const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 107] = [
+const TOOL_POLICY_SCOPES: &[(&str, PolicyScope)] = &[
     ("projects.list", PolicyScope::WorkspaceWide),
     ("projects.get", PolicyScope::DeclaredProject { required: true }),
     ("projects.create", PolicyScope::WorkspaceWide),
@@ -398,6 +400,21 @@ const TOOL_POLICY_SCOPES: [(&str, PolicyScope); 107] = [
     ("objects.get", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
     ("objects.query", PolicyScope::DeclaredProject { required: false }),
     ("objects.history", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.create", PolicyScope::DeclaredProject { required: false }),
+    ("objects.patch", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.move", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.link", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.unlink", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.diff", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.grants_get", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.grants_set", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.inheritance_set", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.relations", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.search", PolicyScope::DeclaredProject { required: false }),
+    (
+        "collab.projection_lag",
+        PolicyScope::DeclaredProject { required: false },
+    ),
     ("legacy_pages.inventory", PolicyScope::WorkspaceWideAdmin),
     ("legacy_pages.import_preview", PolicyScope::WorkspaceWideAdmin),
     ("legacy_pages.import_commit", PolicyScope::WorkspaceWideAdmin),
@@ -824,6 +841,18 @@ impl McpServer {
             "objects.get" => tools::objects::get_flow_object(&self.client, args).await,
             "objects.query" => tools::objects::query_flow_objects(&self.client, args).await,
             "objects.history" => tools::objects::get_flow_object_history(&self.client, args).await,
+            "objects.create" => tools::objects::create_flow_object(&self.client, args).await,
+            "objects.patch" => tools::objects::patch_flow_object(&self.client, args).await,
+            "objects.move" => tools::objects::move_flow_object(&self.client, args).await,
+            "objects.link" => tools::objects::link_flow_objects(&self.client, args).await,
+            "objects.unlink" => tools::objects::unlink_flow_objects(&self.client, args).await,
+            "objects.diff" => tools::objects::diff_flow_object(&self.client, args).await,
+            "objects.grants_get" => tools::objects::get_flow_object_grants(&self.client, args).await,
+            "objects.grants_set" => tools::objects::set_flow_object_grants(&self.client, args).await,
+            "objects.inheritance_set" => tools::objects::set_flow_object_inheritance(&self.client, args).await,
+            "objects.relations" => tools::objects::list_flow_object_relations(&self.client, args).await,
+            "objects.search" => tools::objects::search_flow_objects(&self.client, args).await,
+            "collab.projection_lag" => tools::objects::get_flow_projection_lag(&self.client, args).await,
             "legacy_pages.inventory" => tools::legacy_pages::legacy_pages_inventory(&self.client, args).await,
             "legacy_pages.import_preview" => tools::legacy_pages::legacy_pages_import_preview(&self.client, args).await,
             "legacy_pages.import_commit" => tools::legacy_pages::legacy_pages_import_commit(&self.client, args).await,
@@ -2154,6 +2183,17 @@ fn identifier_argument(args: &Value) -> Result<Option<String>, String> {
 }
 
 fn required_owner_argument(tool_name: &str, lookup: OwnerLookup, args: &Value) -> Result<String, String> {
+    if lookup == OwnerLookup::FlowObject {
+        for key in ["object_id", "source_object_id", "collection_id"] {
+            if let Some(value) = uuid_argument(args, key)? {
+                return Ok(value);
+            }
+        }
+        return Err(format!(
+            "Tool '{tool_name}' carries no {}, so the owning project cannot be resolved and the project agent policy cannot be evaluated",
+            lookup.argument()
+        ));
+    }
     let key = lookup.argument();
     uuid_argument(args, key)?.ok_or_else(|| {
         format!(
@@ -2339,7 +2379,7 @@ mod tests {
 
     #[test]
     fn embedded_skill_guide_matches_registered_universal_tool_surface() {
-        assert!(SKILL_GUIDE_MD.contains("## Tools (107)"));
+        assert!(SKILL_GUIDE_MD.contains("## Tools ("));
         assert!(SKILL_GUIDE_MD.contains("bot_operation_logs.list"));
         assert!(SKILL_GUIDE_MD.contains("scenario_templates.install"));
         assert!(SKILL_GUIDE_MD.contains("forms.list"));
@@ -2367,6 +2407,11 @@ mod tests {
         assert!(SKILL_GUIDE_MD.contains("objects.get"));
         assert!(SKILL_GUIDE_MD.contains("objects.query"));
         assert!(SKILL_GUIDE_MD.contains("objects.history"));
+        assert!(SKILL_GUIDE_MD.contains("objects.create"));
+        assert!(SKILL_GUIDE_MD.contains("objects.move"));
+        assert!(SKILL_GUIDE_MD.contains("objects.grants_set"));
+        assert!(SKILL_GUIDE_MD.contains("objects.search"));
+        assert!(SKILL_GUIDE_MD.contains("collab.projection_lag"));
         assert!(SKILL_GUIDE_MD.contains("legacy_pages.inventory"));
         assert!(SKILL_GUIDE_MD.contains("legacy_pages.import_preview"));
         assert!(SKILL_GUIDE_MD.contains("legacy_pages.import_commit"));
@@ -2534,11 +2579,12 @@ mod tests {
                 // that bypass has to say so in its own schema, so the marker — not a name
                 // list — is what `declared_project_id_is_mandatory_for_every_project_scoped_tool`
                 // checks below too.
-                if properties.contains_key("unprojected") {
-                    PolicyScope::DeclaredProject { required: false }
-                } else {
-                    PolicyScope::DeclaredProject { required: true }
-                }
+                let required = tool
+                    .input_schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| required.iter().any(|value| value.as_str() == Some("project_id")));
+                PolicyScope::DeclaredProject { required }
             } else if let Some((_, lookup)) = OWNERSHIP_ARGUMENTS
                 .iter()
                 .find(|(argument, _)| properties.contains_key(*argument))
@@ -2622,10 +2668,8 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             let declares_project_id = properties.contains_key("project_id");
-            let declares_unprojected = properties.contains_key("unprojected");
-
             if tool_policy_scope(&tool.name) == (PolicyScope::DeclaredProject { required: false }) {
-                if !declares_project_id || !declares_unprojected {
+                if !declares_project_id {
                     bad_optional_scope.push(tool.name.clone());
                 }
                 continue;

@@ -24,10 +24,12 @@
 
 mod support;
 
-use axum::{Json, Router, extract::Path, routing::get};
+use axum::{Json, Router, extract::Path, routing::get, routing::post};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use support::{ConfigFile, McpSettings, write_config};
 use tokio::process::{Child, Command};
@@ -51,6 +53,19 @@ const PROJECTLESS_OBJECT: &str = "55555555-5555-4555-8555-555555555555";
 /// `GET /projects/{id}/agent-policy` answering "every tool enabled" for the one real project.
 fn flow_router() -> Router {
     Router::new()
+        .route(
+            "/api/v1/workspaces/{workspace_id}/flow/objects",
+            post(|| async {
+                Json(json!({
+                    "code": 0,
+                    "message": "ok",
+                    "data": {
+                        "object": { "id": OWNED_OBJECT, "workspace_id": WORKSPACE, "project_id": null },
+                        "event_id": "66666666-6666-4666-8666-666666666666"
+                    }
+                }))
+            }),
+        )
         .route(
             "/api/v1/flow/objects/{object_id}",
             get(|Path(object_id): Path<String>| async move {
@@ -79,6 +94,23 @@ fn flow_router() -> Router {
             &format!("/api/v1/projects/{OWNING_PROJECT}/agent-policy"),
             get(|| async { Json(json!({ "code": 0, "data": { "mcp": {} } })) }),
         )
+}
+
+fn create_object_request() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 91,
+        "method": "tools/call",
+        "params": {
+            "name": "objects.create",
+            "arguments": {
+                "workspace_id": WORKSPACE,
+                "type": "page",
+                "title": "same over all transports",
+                "idempotency_key": "transport-parity-key"
+            }
+        }
+    })
 }
 
 fn get_object_request(id: i64, object_id: &str, project_id: Option<&str>) -> Value {
@@ -281,6 +313,210 @@ impl NetworkedServer {
         tokio::time::timeout(Duration::from_secs(10), self.child.wait()).await??;
         Ok(())
     }
+}
+
+async fn http_call(server: &NetworkedServer, request: &Value) -> Result<Value, Box<dyn Error>> {
+    Ok(reqwest::Client::new()
+        .post(format!("{}/mcp/rpc", server.base_url))
+        .bearer_auth(CALLER_TOKEN)
+        .json(request)
+        .send()
+        .await?
+        .json()
+        .await?)
+}
+
+async fn sse_call(server: &NetworkedServer, request: &Value) -> Result<Value, Box<dyn Error>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    let addr = server
+        .base_url
+        .strip_prefix("http://")
+        .ok_or("base_url has no http:// prefix")?;
+    let stream = TcpStream::connect(addr).await?;
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(
+            format!(
+                "GET /sse HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {CALLER_TOKEN}\r\nConnection: keep-alive\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await??;
+        if line == "\r\n" {
+            break;
+        }
+    }
+    let endpoint_path = loop {
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await??;
+        if let Some(rest) = line.strip_prefix("data: ") {
+            break rest.trim().to_string();
+        }
+    };
+    let accepted = reqwest::Client::new()
+        .post(format!("{}{endpoint_path}", server.base_url))
+        .bearer_auth(CALLER_TOKEN)
+        .json(request)
+        .send()
+        .await?;
+    if accepted.status() != reqwest::StatusCode::ACCEPTED {
+        return Err(format!("POST /messages returned {}", accepted.status()).into());
+    }
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        tokio::time::timeout(Duration::from_secs(10), reader.read_exact(&mut byte)).await??;
+        buf.push(byte[0]);
+        let text = String::from_utf8_lossy(&buf);
+        if let Some(index) = text.find("data: ")
+            && let Some(end) = text[index..].find('\n')
+        {
+            let candidate = text[index + "data: ".len()..index + end].trim();
+            if let Ok(value) = serde_json::from_str(candidate) {
+                return Ok(value);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_flow_write_has_identical_semantic_results_over_stdio_http_and_sse() -> TestResult {
+    let api_url = spawn_router(flow_router()).await?;
+    let request = create_object_request();
+
+    let mut stdio = StdioClient::spawn(&api_url)?;
+    let stdio_result = stdio.call(&request).await?;
+    stdio.shutdown().await?;
+
+    let http = NetworkedServer::spawn(&api_url, "http").await?;
+    let http_result = http_call(&http, &request).await?;
+    http.shutdown().await?;
+
+    let sse = NetworkedServer::spawn(&api_url, "sse").await?;
+    let sse_result = sse_call(&sse, &request).await?;
+    sse.shutdown().await?;
+
+    assert!(!is_error(&stdio_result), "stdio write failed: {stdio_result}");
+    assert_eq!(stdio_result.get("result"), http_result.get("result"));
+    assert_eq!(stdio_result.get("result"), sse_result.get("result"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn stdio_bot_can_write_flow_but_has_no_ticket_or_direct_ws_surface() -> TestResult {
+    let api_url = spawn_router(flow_router()).await?;
+    let mut stdio = StdioClient::spawn(&api_url)?;
+
+    let write = stdio.call(&create_object_request()).await?;
+    assert!(!is_error(&write), "configured stdio bot could not write Flow: {write}");
+
+    let listed = stdio
+        .call(&json!({
+            "jsonrpc": "2.0",
+            "id": 93,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .await?;
+    let names = listed["result"]["tools"]
+        .as_array()
+        .ok_or("tools/list returned no tools array")?
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"objects.create"));
+    for forbidden in ["collab.ticket", "collab.tickets", "collab.ws", "collab.direct_ws"] {
+        assert!(
+            !names.contains(&forbidden),
+            "stdio exposed forbidden direct-collaboration surface {forbidden}"
+        );
+    }
+
+    stdio.shutdown().await
+}
+
+#[tokio::test]
+async fn source_policy_cannot_override_the_apis_target_side_denial() -> TestResult {
+    let command_calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&command_calls);
+    let router = Router::new()
+        .route(
+            "/api/v1/flow/objects/{object_id}",
+            get(|| async {
+                Json(json!({
+                    "code": 0,
+                    "data": { "id": OWNED_OBJECT, "workspace_id": WORKSPACE, "project_id": OWNING_PROJECT }
+                }))
+            }),
+        )
+        .route(
+            &format!("/api/v1/projects/{OWNING_PROJECT}/agent-policy"),
+            get(|| async {
+                Json(json!({
+                    "code": 0,
+                    "data": { "mcp": { "tool_registry": { "enabled_tools": ["objects.link"] } } }
+                }))
+            }),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/commands",
+            post(move || {
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "code": 403,
+                        "message": "target object is unavailable",
+                        "data": null,
+                        "error_code": "policy_rejected",
+                        "details": { "action": "link" }
+                    }))
+                }
+            }),
+        );
+    let api_url = spawn_router(router).await?;
+    let mut stdio = StdioClient::spawn(&api_url)?;
+    let response = stdio
+        .call(&json!({
+            "jsonrpc": "2.0",
+            "id": 92,
+            "method": "tools/call",
+            "params": {
+                "name": "objects.link",
+                "arguments": {
+                    "source_object_id": OWNED_OBJECT,
+                    "target_object_id": PROJECTLESS_OBJECT,
+                    "relation_type": "related_to",
+                    "idempotency_key": "denied-target"
+                }
+            }
+        }))
+        .await?;
+    stdio.shutdown().await?;
+
+    assert!(
+        is_error(&response),
+        "target-side denial was turned into success: {response}"
+    );
+    assert_eq!(
+        command_calls.load(Ordering::SeqCst),
+        1,
+        "the API must make the target-side decision"
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .ok_or("business error has no text content")?;
+    let error: Value = serde_json::from_str(text)?;
+    assert_eq!(error["error"]["code"], "policy_rejected");
+    assert_eq!(error["error"]["details"]["action"], "link");
+    Ok(())
 }
 
 #[tokio::test]

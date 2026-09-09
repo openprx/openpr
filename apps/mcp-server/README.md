@@ -16,7 +16,7 @@ The MCP Server provides AI models with tools to interact with OpenPR's project m
 
 ## Features
 
-- **107 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, scenario toolkit, and Sylvode Flow (v0.4)
+- **119 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, scenario toolkit, and Sylvode Flow (v0.5)
 - **Three Transport Modes**: stdio (for MCP clients), HTTP JSON-RPC, and SSE
 - **JSON Schema Validation**: All tool parameters are strongly typed
 - **OpenPR API Backend**: Calls the OpenPR API with workspace-scoped bot credentials
@@ -167,9 +167,12 @@ cargo build -p mcp-server --release
 - `documents.extract_summary`, `documents.review_risk`, `approval.request`
 - `inspection.report`, `corrective_action.propose`
 
-### Sylvode Flow (v0.4)
+### Sylvode Flow (v0.5)
 - `flow.feature_get`, `flow.feature_set` — the Flow workspace rollout flag
 - `objects.get`, `objects.query`, `objects.history` — Flow object read tools
+- `objects.create`, `objects.patch`, `objects.move`, `objects.link`, `objects.unlink` — idempotent Flow writes
+- `objects.diff`, `objects.relations`, `objects.search`, `collab.projection_lag` — policy-filtered derived reads
+- `objects.grants_get`, `objects.grants_set`, `objects.inheritance_set` — object authorization tools with dry-run support
 - `legacy_pages.inventory`, `legacy_pages.import_preview`, `legacy_pages.import_commit`, `legacy_pages.import_status` — ADR-0003 conditional migration tools; this deployment's inventory is zero, so the import tools always answer `not_required_zero_inventory`
 
 No new Resources ship in v0.4: Flow's first Resource templates start at v0.5. The

@@ -255,7 +255,7 @@ impl OpenPrClient {
 
     /// The same client, speaking to the API as `credential` instead of as itself.
     ///
-    /// This is how a per-request caller identity reaches all 107 tools without threading a
+    /// This is how a per-request caller identity reaches every live registry tool without threading a
     /// credential through every one of them: the request scoped client *is* the identity, so
     /// a tool cannot pick a different one, and neither can the policy gate or the audit
     /// report that run around it. The HTTP connection pool is shared because [`Client`] is
