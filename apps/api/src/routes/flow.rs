@@ -3069,8 +3069,14 @@ mod flow_database_tests {
             visible_c.to_string(),
             "{second}"
         );
-        assert_eq!(second["data"]["max_lag"], 1, "{second}");
-        assert_eq!(second["data"]["p95_lag"], 1, "{second}");
+        assert_eq!(
+            second["data"]["max_lag"], 7,
+            "the policy-filtered scope aggregate must not jump while paging: {second}"
+        );
+        assert_eq!(
+            second["data"]["p95_lag"], 7,
+            "the policy-filtered scope aggregate must not jump while paging: {second}"
+        );
         assert!(second["data"]["next_cursor"].is_null(), "{second}");
 
         let over_limit = body_json(to_response(

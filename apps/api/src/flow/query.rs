@@ -141,7 +141,6 @@ async fn scan_projection_lag_within_budget(
     state: &AppState,
     access: &FlowReadContext,
     mut filter: ProjectionLagFilter,
-    needed: usize,
 ) -> Result<Option<Vec<ProjectionLagRow>>, ApiError> {
     let mut accepted = Vec::new();
     let mut examined = 0_u64;
@@ -168,9 +167,6 @@ async fn scan_projection_lag_within_budget(
             filter.after = Some((row.created_at, row.object_id));
             if is_visible {
                 accepted.push(row);
-                if accepted.len() >= needed {
-                    return Ok(Some(accepted));
-                }
             }
         }
         if (batch_len as u64) < SCAN_BATCH_SIZE {
@@ -709,13 +705,13 @@ pub struct ProjectionLagParams {
     pub limit: Option<u64>,
 }
 
-/// Aggregates one already-policy-filtered response page.
+/// Aggregates the complete already-policy-filtered query scope.
 ///
 /// `p95_lag` uses the nearest-rank definition: sort ascending and select rank
 /// `ceil(0.95 * n)` (one-based). An empty page returns `(0, 0)`; for 1 through 19 samples that
-/// rank is the final sample, so p95 equals the page maximum. Both values are computed only after
-/// authorization and page truncation, making an inaccessible object's lag incapable of changing
-/// even an aggregate field.
+/// rank is the final sample, so p95 equals the scope maximum. Both values are computed only after
+/// authorization, but before cursor/page slicing: page navigation therefore never changes either
+/// aggregate, and an inaccessible object's lag cannot change an aggregate field.
 fn projection_lag_aggregates(items: &[ProjectionLagItem]) -> (i64, i64) {
     if items.is_empty() {
         return (0, 0);
@@ -741,27 +737,46 @@ pub async fn get_projection_lag(
     let limit = validate_limit(params.limit)?;
     let after = params.cursor.as_deref().map(decode_cursor).transpose()?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-    let needed = limit_usize.saturating_add(1);
     let filter = ProjectionLagFilter {
         workspace_id: params.workspace_id,
         project_id: params.project_id,
-        after,
+        after: None,
         limit: 0,
     };
-    let Some(mut rows) = scan_projection_lag_within_budget(state, access, filter, needed).await? else {
+    let Some(rows) = scan_projection_lag_within_budget(state, access, filter).await? else {
         return Ok(None);
     };
     if !policy::ensure_epoch_current(state, access).await? {
         return Ok(None);
     }
 
-    let next_cursor = if rows.len() > limit_usize {
-        rows.truncate(limit_usize);
-        rows.last().map(|row| encode_cursor(row.created_at, row.object_id))
+    let aggregate_items: Vec<ProjectionLagItem> = rows
+        .iter()
+        .map(|row| ProjectionLagItem {
+            object_id: row.object_id,
+            head_seq: row.head_seq,
+            projection_seq: row.projection_seq,
+            lag: projection_lag(row.head_seq, row.projection_seq),
+        })
+        .collect();
+    let (max_lag, p95_lag) = projection_lag_aggregates(&aggregate_items);
+    let page_start = after.map_or(0, |after_key| {
+        // Resume strictly after the caller cursor. A cursor row hidden by a later policy change
+        // still resumes at the first visible row whose stable key is greater than the cursor.
+        rows.partition_point(|row| (row.created_at, row.object_id) <= after_key)
+    });
+    let mut page_rows: Vec<_> = rows
+        .into_iter()
+        .skip(page_start)
+        .take(limit_usize.saturating_add(1))
+        .collect();
+    let next_cursor = if page_rows.len() > limit_usize {
+        page_rows.truncate(limit_usize);
+        page_rows.last().map(|row| encode_cursor(row.created_at, row.object_id))
     } else {
         None
     };
-    let items: Vec<ProjectionLagItem> = rows
+    let items: Vec<ProjectionLagItem> = page_rows
         .into_iter()
         .map(|row| ProjectionLagItem {
             object_id: row.object_id,
@@ -770,7 +785,6 @@ pub async fn get_projection_lag(
             lag: projection_lag(row.head_seq, row.projection_seq),
         })
         .collect();
-    let (max_lag, p95_lag) = projection_lag_aggregates(&items);
     Ok(Some(ProjectionLagResponse {
         max_lag,
         p95_lag,

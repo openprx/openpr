@@ -184,6 +184,10 @@ pub struct ProjectionLagItem {
 
 /// `GET /workspaces/{workspace_id}/flow/projection-lag` response.
 ///
+/// `max_lag` and `p95_lag` cover the complete policy-visible scope selected by
+/// `workspace_id`/`project_id`, before cursor and page slicing. They therefore remain stable while
+/// a caller pages through `items`; the cursor changes only the returned items.
+///
 /// No pre-filter cardinality is represented in this type, so `total`, `filtered_count`, and
 /// `examined` cannot accidentally become wire fields.
 #[derive(Debug, Serialize)]
