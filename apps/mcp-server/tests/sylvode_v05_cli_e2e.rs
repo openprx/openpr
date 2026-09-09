@@ -85,10 +85,16 @@ fn assert_success(output: &Output, command: &str) -> TestResult {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{command} failed: {stderr}");
     let envelope: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(envelope["schema_version"], "sylvode.cli.v1");
-    assert_eq!(envelope["ok"], true);
-    assert_eq!(envelope["command"], command);
+    assert_eq!(json_at(&envelope, "/schema_version")?, "sylvode.cli.v1");
+    assert_eq!(json_at(&envelope, "/ok")?, true);
+    assert_eq!(json_at(&envelope, "/command")?, command);
     Ok(())
+}
+
+fn json_at<'a>(value: &'a Value, pointer: &str) -> Result<&'a Value, Box<dyn Error>> {
+    value
+        .pointer(pointer)
+        .ok_or_else(|| format!("missing JSON pointer {pointer} in {value}").into())
 }
 
 fn write_patch_file(dir: &Path, contents: &str) -> Result<String, Box<dyn Error>> {
@@ -261,32 +267,49 @@ async fn all_twelve_v05_lines_map_to_the_frozen_rest_shape() -> TestResult {
 
     let calls = calls.lock().await.clone();
     assert_eq!(calls.len(), 12);
-    assert_eq!(calls[0].method, "POST");
-    assert_eq!(calls[0].uri, format!("/api/v1/workspaces/{WORKSPACE}/flow/objects"));
-    assert_eq!(calls[0].body["parent_object_id"], OTHER);
-    assert_eq!(calls[1].body["command"]["type"], "semantic_patch");
-    assert_eq!(calls[1].body["expected_frontier"], "source-frontier");
-    assert_eq!(calls[2].body["command"]["type"], "move_object");
-    assert_eq!(calls[2].body["command"]["payload"]["target_object_id"], OTHER);
+    let [
+        create,
+        patch,
+        move_object,
+        grants_get,
+        grants_set,
+        inheritance_set,
+        link,
+        unlink,
+        diff,
+        relations,
+        search,
+        projection_lag,
+    ] = calls.as_slice()
+    else {
+        return Err(format!("expected twelve captured calls, got {}", calls.len()).into());
+    };
+    assert_eq!(create.method, "POST");
+    assert_eq!(create.uri, format!("/api/v1/workspaces/{WORKSPACE}/flow/objects"));
+    assert_eq!(json_at(&create.body, "/parent_object_id")?, OTHER);
+    assert_eq!(json_at(&patch.body, "/command/type")?, "semantic_patch");
+    assert_eq!(json_at(&patch.body, "/expected_frontier")?, "source-frontier");
+    assert_eq!(json_at(&move_object.body, "/command/type")?, "move_object");
+    assert_eq!(json_at(&move_object.body, "/command/payload/target_object_id")?, OTHER);
     assert_eq!(
-        calls[2].body["command"]["payload"]["expected_target_frontier"],
+        json_at(&move_object.body, "/command/payload/expected_target_frontier")?,
         "target-frontier"
     );
-    assert!(calls[2].body.get("expected_frontier").is_none());
-    assert_eq!(calls[3].method, "GET");
-    assert_eq!(calls[4].body["dry_run"], true);
-    assert_eq!(calls[5].body["inherit_from_parent"], false);
-    assert_eq!(calls[6].body["command"]["payload"]["relation_type"], "related_to");
-    assert_eq!(calls[7].body["command"]["payload"]["relation_id"], THIRD);
-    assert!(calls[8].uri.contains("from_seq=1&to_seq=2&render=markdown"));
+    assert!(move_object.body.get("expected_frontier").is_none());
+    assert_eq!(grants_get.method, "GET");
+    assert_eq!(json_at(&grants_set.body, "/dry_run")?, true);
+    assert_eq!(json_at(&inheritance_set.body, "/inherit_from_parent")?, false);
+    assert_eq!(json_at(&link.body, "/command/payload/relation_type")?, "related_to");
+    assert_eq!(json_at(&unlink.body, "/command/payload/relation_id")?, THIRD);
+    assert!(diff.uri.contains("from_seq=1&to_seq=2&render=markdown"));
     assert!(
-        calls[9]
+        relations
             .uri
             .contains("direction=both&relation_type=related_to&limit=25")
     );
-    assert!(calls[10].uri.contains("unprojected=true"));
-    assert!(!calls[10].uri.contains("all_visible"));
-    assert!(calls[11].uri.contains("project_id="));
+    assert!(search.uri.contains("unprojected=true"));
+    assert!(!search.uri.contains("all_visible"));
+    assert!(projection_lag.uri.contains("project_id="));
     Ok(())
 }
 
@@ -311,8 +334,8 @@ async fn malformed_patch_file_exits_two_before_the_network() -> TestResult {
     .await?;
     assert_eq!(output.status.code(), Some(2));
     let envelope: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["error"]["code"], "usage_error");
+    assert_eq!(json_at(&envelope, "/ok")?, false);
+    assert_eq!(json_at(&envelope, "/error/code")?, "usage_error");
     assert!(calls.lock().await.is_empty(), "invalid local JSON reached the API");
     Ok(())
 }

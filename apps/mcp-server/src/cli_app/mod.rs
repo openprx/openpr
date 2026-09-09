@@ -152,8 +152,8 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
             } => {
                 let id = checked_uuid("object id", id)?;
                 checked_idempotency_key(idempotency_key)?;
-                let patch = read_json_file(patch_file)?;
-                let operations = match patch {
+                let patch_document = read_json_file(patch_file)?;
+                let operations = match patch_document {
                     Value::Array(operations) => operations,
                     Value::Object(mut object) => object
                         .remove("operations")
@@ -174,7 +174,7 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                         "--patch-file must contain between 1 and 100 operations",
                     ));
                 }
-                let mut body = flow_command("semantic_patch", json!({ "operations": operations }), idempotency_key);
+                let mut body = flow_command("semantic_patch", &json!({ "operations": operations }), idempotency_key);
                 if let (Some(frontier), Some(object)) = (expected_frontier, body.as_object_mut()) {
                     object.insert("expected_frontier".to_string(), json!(frontier));
                 }
@@ -204,7 +204,7 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                         object.insert("expected_target_frontier".to_string(), json!(frontier));
                     }
                 }
-                let body = flow_command("move_object", payload, idempotency_key);
+                let body = flow_command("move_object", &payload, idempotency_key);
                 let path = format!("/api/v1/flow/objects/{id}/commands");
                 api_data(client.post_structured::<Value, _>(&path, &body).await)
             }
@@ -271,7 +271,7 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 checked_idempotency_key(idempotency_key)?;
                 let body = flow_command(
                     "link",
-                    json!({ "target_object_id": target, "relation_type": relation_type }),
+                    &json!({ "target_object_id": target, "relation_type": relation_type }),
                     idempotency_key,
                 );
                 let path = format!("/api/v1/flow/objects/{source}/commands");
@@ -285,7 +285,7 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 let source = checked_uuid("source object id", source)?;
                 let relation_id = checked_uuid("--relation", relation_id)?;
                 checked_idempotency_key(idempotency_key)?;
-                let body = flow_command("unlink", json!({ "relation_id": relation_id }), idempotency_key);
+                let body = flow_command("unlink", &json!({ "relation_id": relation_id }), idempotency_key);
                 let path = format!("/api/v1/flow/objects/{source}/commands");
                 api_data(client.post_structured::<Value, _>(&path, &body).await)
             }
@@ -501,7 +501,7 @@ fn checked_idempotency_key(value: &str) -> Result<(), CliError> {
     }
 }
 
-fn flow_command(command_type: &str, payload: Value, idempotency_key: &str) -> Value {
+fn flow_command(command_type: &str, payload: &Value, idempotency_key: &str) -> Value {
     json!({
         "command": { "type": command_type, "payload": payload },
         "idempotency_key": idempotency_key,

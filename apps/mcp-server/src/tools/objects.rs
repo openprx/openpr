@@ -347,7 +347,7 @@ fn required_write_key(key: &str) -> Result<(), CallToolResult> {
     }
 }
 
-fn command_body(command_type: &str, payload: Value, idempotency_key: &str, message: Option<&str>) -> Value {
+fn command_body(command_type: &str, payload: &Value, idempotency_key: &str, message: Option<&str>) -> Value {
     let mut body = json!({
         "command": { "type": command_type, "payload": payload },
         "idempotency_key": idempotency_key,
@@ -468,7 +468,7 @@ pub async fn patch_flow_object(client: &OpenPrClient, args: Value) -> CallToolRe
     }
     let mut body = command_body(
         "semantic_patch",
-        json!({ "operations": input.operations }),
+        &json!({ "operations": input.operations }),
         &input.idempotency_key,
         input.message.as_deref(),
     );
@@ -537,7 +537,12 @@ pub async fn move_flow_object(client: &OpenPrClient, args: Value) -> CallToolRes
             object.insert("expected_target_frontier".to_string(), json!(frontier));
         }
     }
-    let body = command_body("move_object", payload, &input.idempotency_key, input.message.as_deref());
+    let body = command_body(
+        "move_object",
+        &payload,
+        &input.idempotency_key,
+        input.message.as_deref(),
+    );
     let path = format!(
         "/api/v1/flow/objects/{}/commands",
         encode_query_component(&input.object_id)
@@ -589,7 +594,7 @@ pub async fn link_flow_objects(client: &OpenPrClient, args: Value) -> CallToolRe
         "relation_type": input.relation_type,
         "properties": input.properties.unwrap_or_else(|| json!({})),
     });
-    let body = command_body("link", payload, &input.idempotency_key, input.message.as_deref());
+    let body = command_body("link", &payload, &input.idempotency_key, input.message.as_deref());
     let path = format!(
         "/api/v1/flow/objects/{}/commands",
         encode_query_component(&input.source_object_id)
@@ -634,7 +639,7 @@ pub async fn unlink_flow_objects(client: &OpenPrClient, args: Value) -> CallTool
     }
     let body = command_body(
         "unlink",
-        json!({ "relation_id": input.relation_id }),
+        &json!({ "relation_id": input.relation_id }),
         &input.idempotency_key,
         input.message.as_deref(),
     );

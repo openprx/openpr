@@ -266,7 +266,10 @@ mod tests {
             .take_while(|line| !line.starts_with("## "))
             .filter_map(|line| {
                 let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
-                (cells.len() > 3 && cells[2] == "0.5").then(|| cells[1].trim_matches('`'))
+                match (cells.get(1), cells.get(2)) {
+                    (Some(name), Some(&"0.5")) => Some(name.trim_matches('`')),
+                    _ => None,
+                }
             })
             .collect::<HashSet<_>>();
         let registered = tools.iter().map(|tool| tool.name.as_str()).collect::<HashSet<_>>();
@@ -325,7 +328,7 @@ mod tests {
             );
         }
 
-        let move_schema = by_name["objects.move"];
+        let move_schema = by_name.get("objects.move").expect("missing objects.move");
         assert!(
             move_schema["required"]
                 .as_array()
@@ -334,14 +337,16 @@ mod tests {
         assert!(move_schema["properties"].get("expected_target_frontier").is_some());
         assert!(move_schema["properties"].get("expected_frontier").is_none());
 
-        let grants = by_name["objects.grants_set"];
+        let grants = by_name.get("objects.grants_set").expect("missing objects.grants_set");
         assert!(grants["properties"].get("dry_run").is_some());
         assert!(!by_name.contains_key("objects.grants_set_dry_run"));
 
-        let search = by_name["objects.search"];
+        let search = by_name.get("objects.search").expect("missing objects.search");
         assert!(search["properties"].get("all_visible").is_none());
 
-        let projection_lag = by_name["collab.projection_lag"];
+        let projection_lag = by_name
+            .get("collab.projection_lag")
+            .expect("missing collab.projection_lag");
         for forbidden in ["content", "bytes"] {
             assert!(
                 projection_lag["properties"].get(forbidden).is_none(),

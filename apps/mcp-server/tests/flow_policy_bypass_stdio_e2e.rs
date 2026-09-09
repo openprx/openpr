@@ -149,6 +149,12 @@ fn is_error(response: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn json_at<'a>(value: &'a Value, pointer: &str) -> Result<&'a Value, Box<dyn Error>> {
+    value
+        .pointer(pointer)
+        .ok_or_else(|| format!("missing JSON pointer {pointer} in {value}").into())
+}
+
 // ---- stdio: all four scenarios ----
 
 struct StdioClient {
@@ -425,11 +431,11 @@ async fn stdio_bot_can_write_flow_but_has_no_ticket_or_direct_ws_surface() -> Te
             "params": {}
         }))
         .await?;
-    let names = listed["result"]["tools"]
+    let names = json_at(&listed, "/result/tools")?
         .as_array()
         .ok_or("tools/list returned no tools array")?
         .iter()
-        .filter_map(|tool| tool["name"].as_str())
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
     assert!(names.contains(&"objects.create"));
     for forbidden in ["collab.ticket", "collab.tickets", "collab.ws", "collab.direct_ws"] {
@@ -510,12 +516,12 @@ async fn source_policy_cannot_override_the_apis_target_side_denial() -> TestResu
         1,
         "the API must make the target-side decision"
     );
-    let text = response["result"]["content"][0]["text"]
+    let text = json_at(&response, "/result/content/0/text")?
         .as_str()
         .ok_or("business error has no text content")?;
     let error: Value = serde_json::from_str(text)?;
-    assert_eq!(error["error"]["code"], "policy_rejected");
-    assert_eq!(error["error"]["details"]["action"], "link");
+    assert_eq!(json_at(&error, "/error/code")?, "policy_rejected");
+    assert_eq!(json_at(&error, "/error/details/action")?, "link");
     Ok(())
 }
 
