@@ -2146,7 +2146,7 @@ mod database_tests {
     use uuid::Uuid;
 
     use super::execute_on;
-    use crate::error::{ApiError, ApiErrorKind};
+    use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
     use crate::flow::collab::authz::{self, PermissionLevel};
     use crate::flow::collab::coordinator::ascending_document_lock_order;
     use crate::flow::collab::registry::OutboundEvent;
@@ -2156,6 +2156,24 @@ mod database_tests {
     use crate::flow::model::AcceptedChange;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+    /// One request-level retry for each bounded internal rebase attempt. The race test accepts
+    /// only the protocol's explicit, safe contention result and never retries indefinitely.
+    const RACING_MOVE_CONTENTION_RETRIES: u32 = super::MAX_REBASE_ATTEMPTS;
+
+    fn move_contention_retry_after_ms(error: &ApiError) -> Option<u64> {
+        let ApiError::Typed {
+            kind: ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
+            details: Some(details),
+            ..
+        } = error
+        else {
+            return None;
+        };
+        details
+            .get("retry_after_ms")
+            .and_then(Value::as_u64)
+            .filter(|retry_after_ms| *retry_after_ms > 0)
+    }
 
     struct Scratch {
         db: DatabaseConnection,
@@ -2369,7 +2387,7 @@ mod database_tests {
 
     /// Runs `move_object` through its real entry point against an explicit runtime, taking the
     /// `checked_epoch` the same way `flow::command::execute_command_authorized` does.
-    async fn run_move(
+    async fn run_move_once(
         state: &AppState,
         collab: &CollabRuntime,
         fx: &Fixture,
@@ -2377,6 +2395,63 @@ mod database_tests {
     ) -> Result<AcceptedChange, ApiError> {
         let checked_epoch = authz::read_epoch(&state.db, fx.workspace_id).await?;
         execute_on(state, collab, input, fx.workspace_id, checked_epoch).await
+    }
+
+    async fn run_move_with_contention_retries(
+        state: &AppState,
+        collab: &CollabRuntime,
+        fx: &Fixture,
+        input: &ExecuteCommandInput,
+    ) -> Result<(AcceptedChange, u32), ApiError> {
+        let mut contention_retries = 0_u32;
+        loop {
+            match run_move_once(state, collab, fx, input).await {
+                Ok(change) => return Ok((change, contention_retries)),
+                Err(error) => {
+                    let Some(retry_after_ms) = move_contention_retry_after_ms(&error) else {
+                        return Err(error);
+                    };
+                    if contention_retries >= RACING_MOVE_CONTENTION_RETRIES {
+                        return Err(error);
+                    }
+                    contention_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
+                }
+            }
+        }
+    }
+
+    /// Every database test goes through the same bounded safe-contention handling. This matters
+    /// even for logically sequential scenarios: the test runner exercises many isolated scratch
+    /// databases concurrently, so scheduler pressure can spend the command's short lock/statement
+    /// budget without creating a product correctness failure.
+    async fn run_move(
+        state: &AppState,
+        collab: &CollabRuntime,
+        fx: &Fixture,
+        input: &ExecuteCommandInput,
+    ) -> Result<AcceptedChange, ApiError> {
+        run_move_with_contention_retries(state, collab, fx, input)
+            .await
+            .map(|(change, _)| change)
+    }
+
+    #[test]
+    fn racing_move_retries_only_safe_contention_errors() {
+        let contention = ApiError::server_draining(ServerDrainingReason::Contention, 200, "server_draining");
+        assert_eq!(move_contention_retry_after_ms(&contention), Some(200));
+
+        let draining = ApiError::server_draining(ServerDrainingReason::Drain, 200, "server_draining");
+        assert_eq!(move_contention_retry_after_ms(&draining), None);
+        let missing_hint = ApiError::Typed {
+            kind: ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
+            message: "server_draining".to_string(),
+            details: Some(json!({})),
+        };
+        assert_eq!(move_contention_retry_after_ms(&missing_hint), None);
+        let immediate_retry = ApiError::server_draining(ServerDrainingReason::Contention, 0, "server_draining");
+        assert_eq!(move_contention_retry_after_ms(&immediate_retry), None);
+        assert_eq!(move_contention_retry_after_ms(&ApiError::Internal), None);
     }
 
     async fn scalar_i64(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
@@ -2784,6 +2859,11 @@ mod database_tests {
     /// half-applied move. Both do in fact succeed here — the exclusive `authz_epoch` lock
     /// serializes them at layer 1, and because this command *re-verifies* permission under that
     /// lock instead of comparing epochs, the second one is delayed rather than rejected.
+    ///
+    /// `ServerDraining{reason=contention}` is the command's explicit not-applied, retryable result
+    /// after its internal rebase budget is exhausted. The test waits the returned hint and retries
+    /// at most [`RACING_MOVE_CONTENTION_RETRIES`] times. Every other error, and contention beyond
+    /// that bound, remains a hard failure with the used retry count in the assertion.
     #[tokio::test]
     async fn two_concurrent_moves_with_reversed_contended_sets_both_complete_cleanly() {
         let scratch = scratch_or_skip!("concurrent_reversed");
@@ -2801,29 +2881,13 @@ mod database_tests {
 
         let left = {
             let (state, fx, runtime) = (state.clone(), fx.clone(), left_runtime.clone());
-            tokio::spawn(async move {
-                run_move(
-                    &state,
-                    &runtime,
-                    &fx,
-                    &move_input(one, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
-                )
-                .await
-                .map(|_| ())
-            })
+            let input = move_input(one, fx.owner_id, "owner", json!({ "target_object_id": nav_b }));
+            tokio::spawn(async move { run_move_with_contention_retries(&state, &runtime, &fx, &input).await })
         };
         let right = {
             let (state, fx, runtime) = (state.clone(), fx.clone(), right_runtime.clone());
-            tokio::spawn(async move {
-                run_move(
-                    &state,
-                    &runtime,
-                    &fx,
-                    &move_input(two, fx.owner_id, "owner", json!({ "target_object_id": nav_a })),
-                )
-                .await
-                .map(|_| ())
-            })
+            let input = move_input(two, fx.owner_id, "owner", json!({ "target_object_id": nav_a }));
+            tokio::spawn(async move { run_move_with_contention_retries(&state, &runtime, &fx, &input).await })
         };
 
         let left = tokio::time::timeout(Duration::from_secs(30), left)
@@ -2837,8 +2901,14 @@ mod database_tests {
 
         for (label, outcome) in [("left", &left), ("right", &right)] {
             match outcome {
-                Ok(()) => {}
-                Err(err) => panic!("{label} move failed instead of serializing cleanly: {err:?}"),
+                Ok((_, contention_retries)) => assert!(
+                    *contention_retries <= RACING_MOVE_CONTENTION_RETRIES,
+                    "{label} move exceeded the bounded contention retry budget"
+                ),
+                Err(err) => panic!(
+                    "{label} move failed instead of serializing cleanly after at most \
+                     {RACING_MOVE_CONTENTION_RETRIES} safe contention retries: {err:?}"
+                ),
             }
         }
         assert_eq!(parent_of(&scratch.db, one).await, Some(nav_b));
