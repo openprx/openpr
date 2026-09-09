@@ -7,7 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use platform::{app::AppState, auth::JwtClaims};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -67,8 +67,8 @@ pub async fn add_member(
         return Err(ApiError::BadRequest("role must be 'admin' or 'member'".to_string()));
     }
 
-    // Check permission (only owner and admin can add members)
-    let operator_role = get_workspace_role(&state, workspace_id, user_id).await?;
+    // Preserve the route's existing error ordering, then repeat this check under the epoch lock.
+    let operator_role = get_workspace_role(&state.db, workspace_id, user_id).await?;
     if operator_role == "member" {
         return Err(ApiError::Forbidden(
             "only owners and admins can add members".to_string(),
@@ -94,9 +94,20 @@ pub async fn add_member(
     .await?
     .ok_or_else(|| ApiError::NotFound("user not found".to_string()))?;
 
-    // Check if already a member
-    let existing = state
-        .db
+    let tx = state.db.begin().await?;
+    let advanced_epoch = crate::flow::collab::authz::advance_epoch_if_present(&tx, workspace_id).await?;
+
+    // Recheck the operator after taking the epoch's conflicting lock, so a concurrent demotion
+    // cannot commit first and leave this mutation authorized by a stale pre-transaction read.
+    let operator_role = get_workspace_role(&tx, workspace_id, user_id).await?;
+    if operator_role == "member" {
+        return Err(ApiError::Forbidden(
+            "only owners and admins can add members".to_string(),
+        ));
+    }
+
+    // Check if already a member inside the epoch-fenced transaction.
+    let existing = tx
         .query_one(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT user_id FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
@@ -113,19 +124,21 @@ pub async fn add_member(
     let now = chrono::Utc::now();
 
     // Add member
-    state
-        .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, $3, $4)",
-            vec![
-                workspace_id.into(),
-                target_user.id.into(),
-                req.role.clone().into(),
-                now.into(),
-            ],
-        ))
-        .await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES ($1, $2, $3, $4)",
+        vec![
+            workspace_id.into(),
+            target_user.id.into(),
+            req.role.clone().into(),
+            now.into(),
+        ],
+    ))
+    .await?;
+    tx.commit().await?;
+    if advanced_epoch.is_some() {
+        crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+    }
 
     trigger_webhooks(
         state.clone(),
@@ -178,7 +191,16 @@ pub async fn update_member_role(
         return Err(ApiError::BadRequest("role must be 'admin' or 'member'".to_string()));
     }
 
-    let operator_role = get_workspace_role(&state, workspace_id, user_id).await?;
+    let operator_role = get_workspace_role(&state.db, workspace_id, user_id).await?;
+    if operator_role == "member" {
+        return Err(ApiError::Forbidden(
+            "only owners and admins can update member roles".to_string(),
+        ));
+    }
+
+    let tx = state.db.begin().await?;
+    let advanced_epoch = crate::flow::collab::authz::advance_epoch_if_present(&tx, workspace_id).await?;
+    let operator_role = get_workspace_role(&tx, workspace_id, user_id).await?;
     if operator_role == "member" {
         return Err(ApiError::Forbidden(
             "only owners and admins can update member roles".to_string(),
@@ -192,10 +214,10 @@ pub async fn update_member_role(
 
     let target_role = RoleRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE",
         vec![workspace_id.into(), target_user_id.into()],
     ))
-    .one(&state.db)
+    .one(&tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("member not found in workspace".to_string()))?;
 
@@ -209,14 +231,16 @@ pub async fn update_member_role(
         ));
     }
 
-    state
-        .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE workspace_members SET role = $3 WHERE workspace_id = $1 AND user_id = $2",
-            vec![workspace_id.into(), target_user_id.into(), req.role.into()],
-        ))
-        .await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE workspace_members SET role = $3 WHERE workspace_id = $1 AND user_id = $2",
+        vec![workspace_id.into(), target_user_id.into(), req.role.into()],
+    ))
+    .await?;
+    tx.commit().await?;
+    if advanced_epoch.is_some() {
+        crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+    }
 
     trigger_webhooks(
         state.clone(),
@@ -309,8 +333,20 @@ pub async fn remove_member(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
-    // Check permission (only owner and admin can remove members)
-    let remover_role = get_workspace_role(&state, workspace_id, user_id).await?;
+    // Preserve the pre-transaction authorization/error ordering, then recheck under the epoch
+    // lock to close the concurrent-demotion window.
+    let remover_role = get_workspace_role(&state.db, workspace_id, user_id).await?;
+    if remover_role == "member" {
+        return Err(ApiError::Forbidden(
+            "only owners and admins can remove members".to_string(),
+        ));
+    }
+
+    let tx = state.db.begin().await?;
+    let advanced_epoch = crate::flow::collab::authz::advance_epoch_if_present(&tx, workspace_id).await?;
+
+    // Check permission after taking the epoch's conflicting lock.
+    let remover_role = get_workspace_role(&tx, workspace_id, user_id).await?;
     if remover_role == "member" {
         return Err(ApiError::Forbidden(
             "only owners and admins can remove members".to_string(),
@@ -325,10 +361,10 @@ pub async fn remove_member(
 
     let target_role = RoleRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE",
         vec![workspace_id.into(), target_user_id.into()],
     ))
-    .one(&state.db)
+    .one(&tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("member not found in workspace".to_string()))?;
 
@@ -343,14 +379,16 @@ pub async fn remove_member(
     }
 
     // Remove member
-    state
-        .db
-        .execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
-            vec![workspace_id.into(), target_user_id.into()],
-        ))
-        .await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        vec![workspace_id.into(), target_user_id.into()],
+    ))
+    .await?;
+    tx.commit().await?;
+    if advanced_epoch.is_some() {
+        crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+    }
 
     Ok(ApiResponse::ok())
 }
@@ -364,7 +402,7 @@ pub async fn search_users(
 ) -> Result<impl IntoResponse, ApiError> {
     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
 
-    let role = get_workspace_role(&state, workspace_id, user_id).await?;
+    let role = get_workspace_role(&state.db, workspace_id, user_id).await?;
     if role == "member" {
         return Err(ApiError::Forbidden(
             "only owners and admins can search users".to_string(),
@@ -407,7 +445,11 @@ pub async fn search_users(
 }
 
 /// Helper: Get user's role in workspace
-async fn get_workspace_role(state: &AppState, workspace_id: Uuid, user_id: Uuid) -> Result<String, ApiError> {
+async fn get_workspace_role<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> Result<String, ApiError> {
     #[derive(Debug, sea_orm::FromQueryResult)]
     struct RoleRow {
         role: String,
@@ -418,7 +460,7 @@ async fn get_workspace_role(state: &AppState, workspace_id: Uuid, user_id: Uuid)
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
         vec![workspace_id.into(), user_id.into()],
     ))
-    .one(&state.db)
+    .one(conn)
     .await?
     .ok_or_else(|| ApiError::NotFound("workspace not found or access denied".to_string()))?;
 

@@ -1,18 +1,16 @@
 //! `ADR-0012` §3 effective-permission computation and §3.1 commit-time `authz_epoch` fencing.
 //!
-//! v0.4 ships no application surface that writes `flow_object_grants` / flips
-//! `inherit_from_parent` / changes `default_member_level` (that is `ADR-0012`'s v0.5 authorization
-//! surface — the migration comment on `flow_object_grants` calls it out explicitly as reserved).
-//! This module still has a real job in v0.4: the collab WebSocket layer must (a) compute the
+//! The v0.5 authorization surface writes `flow_object_grants`, inheritance, workspace baselines,
+//! and workspace membership. This module supplies both their effective-permission evaluator and
+//! their commit-time epoch fencing primitives. The collab WebSocket layer must (a) compute the
 //! *read* side of the same effective-permission rule so ticket issuance and `open` gate on it
 //! today, using whatever `flow_object_grants` rows/`inherit_from_parent` flags a v0.5 admin
 //! surface — or a direct SQL seed in a test — puts there, and (b) enforce the commit-time fencing
 //! barrier so that whenever *something* advances `flow_workspace_settings.authz_epoch` (the v0.5
-//! `grant/membership/parent_id` write path, someday), an in-flight content write cannot straddle
-//! that change and land after the revocation. [`advance_epoch`] is the minimal internal
-//! primitive that stands in for "an authorization-changing transaction" in this package: it is not
-//! reachable from any route, but it is the exact same one-line `UPDATE ... RETURNING authz_epoch`
-//! v0.5's grant-revoke endpoint will call, so exercising it here is not exercising a fake.
+//! `grant/membership/parent_id` write path), an in-flight content write cannot straddle that change
+//! and land after the revocation. [`advance_epoch`] is the strict primitive for Flow-native
+//! authorization changes, while [`advance_epoch_if_present`] lets general workspace-member routes
+//! participate without creating Flow settings for workspaces that have never enabled Flow.
 
 #![allow(clippy::items_after_statements, clippy::too_long_first_doc_paragraph)]
 
@@ -812,6 +810,34 @@ pub async fn advance_epoch<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> 
     .await?;
     row.map(|r| r.authz_epoch)
         .ok_or_else(|| ApiError::NotFound("flow workspace settings not found".to_string()))
+}
+
+/// Advances `authz_epoch` when this workspace already has Flow settings.
+///
+/// General workspace membership routes are not Flow provisioning routes. They call this as the
+/// first statement in the same transaction as their membership mutation: an existing settings row
+/// is locked and advanced before any member row is touched, while an absent row is a successful
+/// `None` and is never created as a side effect.
+///
+/// # Errors
+/// Propagates a database write failure.
+pub async fn advance_epoch_if_present<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<Option<i64>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        authz_epoch: i64,
+    }
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1, updated_at = now() \
+         WHERE workspace_id = $1 RETURNING authz_epoch",
+        vec![workspace_id.into()],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map(|row| row.authz_epoch))
 }
 
 #[cfg(test)]

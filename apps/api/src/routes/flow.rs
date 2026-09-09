@@ -464,6 +464,10 @@ mod flow_database_tests {
         set_flow_feature,
     };
     use crate::error::ApiError;
+    use crate::flow::collab::{authz::PermissionLevel, permission_cache::PermissionCache};
+    use crate::routes::member::{
+        AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
+    };
     use axum::extract::{Path, Query, State};
     use axum::{Extension, Json};
 
@@ -660,6 +664,24 @@ mod flow_database_tests {
         )
         .await;
         member_id
+    }
+
+    async fn seed_user(state: &AppState) -> Uuid {
+        let user_id = Uuid::new_v4();
+        exec(
+            state,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'test', 'user', true)",
+            vec![user_id.into(), format!("{user_id}@flow.test").into()],
+        )
+        .await;
+        user_id
+    }
+
+    async fn read_epoch(state: &AppState, workspace_id: Uuid) -> i64 {
+        crate::flow::collab::authz::read_epoch(&state.db, workspace_id)
+            .await
+            .expect("flow authz epoch reads")
     }
 
     async fn create_page_as_owner(state: &AppState, workspace_id: Uuid, owner_id: Uuid, title: &str) -> Uuid {
@@ -1542,11 +1564,21 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn put_with_a_non_edit_default_member_level_is_rejected_via_body_code() {
-        let scratch = scratch_or_skip!("feature-put-bad-level");
+    async fn baseline_change_advances_epoch_emits_event_and_physically_invalidates_cache() {
+        let scratch = scratch_or_skip!("feature-put-baseline");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_bare_workspace(&state).await;
         let claims = claims_for(owner_id);
+        let poisoned_object_id = Uuid::new_v4();
+        let cache = PermissionCache::for_state(&state).expect("permission cache is available");
+        cache.put(
+            workspace_id,
+            "user",
+            owner_id,
+            poisoned_object_id,
+            PermissionLevel::FullAccess,
+            1,
+        );
 
         let response = to_response(
             set_flow_feature(
@@ -1563,14 +1595,169 @@ mod flow_database_tests {
             .await,
         );
 
-        assert_eq!(
-            response.status(),
-            axum::http::StatusCode::OK,
-            "errors must not change the transport status code"
-        );
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = body_json(response).await;
-        assert_eq!(body["code"], 400, "{body}");
-        assert!(body["data"].is_null(), "{body}");
+        assert_eq!(body["code"], 0, "{body}");
+        assert_eq!(body["data"]["default_member_level"], "full_access", "{body}");
+        assert_eq!(body["data"]["authz_epoch"], 1, "{body}");
+        assert_eq!(
+            cache.get(workspace_id, "user", owner_id, poisoned_object_id, 1),
+            None,
+            "workspace cleanup must remove even a future-epoch poisoned entry"
+        );
+
+        let event = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id, event_type, payload FROM business_events WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("event query runs")
+            .expect("baseline event exists");
+        let event_id: Uuid = event.try_get("", "id").expect("event id reads");
+        let event_type: String = event.try_get("", "event_type").expect("event type reads");
+        let payload: Value = event.try_get("", "payload").expect("event payload reads");
+        assert_eq!(event_type, "flow.permission.baseline_changed");
+        assert_eq!(payload["workspace_id"], workspace_id.to_string());
+        assert_eq!(payload["old_level"], "edit");
+        assert_eq!(payload["new_level"], "full_access");
+        assert_eq!(body["data"]["event_id"], event_id.to_string());
+
+        let dispatch = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM event_dispatch WHERE event_id = $1",
+                vec![event_id.into()],
+            ))
+            .await
+            .expect("dispatch query runs")
+            .expect("dispatch count exists");
+        assert_eq!(dispatch.try_get::<i64>("", "n").expect("count reads"), 1);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn member_add_role_change_and_remove_advance_epoch_in_their_transactions() {
+        let scratch = scratch_or_skip!("member-epoch-lifecycle");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let target_id = seed_user(&state).await;
+        let poisoned_object_id = Uuid::new_v4();
+        let cache = PermissionCache::for_state(&state).expect("permission cache is available");
+        cache.put(
+            workspace_id,
+            "user",
+            target_id,
+            poisoned_object_id,
+            PermissionLevel::FullAccess,
+            1,
+        );
+
+        let rejected = body_json(to_response(
+            remove_member(
+                State(state.clone()),
+                claims_for(owner_id),
+                Path((workspace_id, owner_id)),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(rejected["code"], 403, "{rejected}");
+        assert_eq!(
+            read_epoch(&state, workspace_id).await,
+            0,
+            "a rejected member mutation must roll its epoch advance back"
+        );
+
+        let added = body_json(to_response(
+            add_member(
+                State(state.clone()),
+                claims_for(owner_id),
+                Path(workspace_id),
+                Json(AddMemberRequest {
+                    user_id: target_id,
+                    role: "member".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(added["code"], 0, "{added}");
+        assert_eq!(added["data"]["role"], "member", "response shape changed: {added}");
+        assert_eq!(read_epoch(&state, workspace_id).await, 1);
+        assert_eq!(
+            cache.get(workspace_id, "user", target_id, poisoned_object_id, 1),
+            None,
+            "member mutation must physically invalidate the workspace cache"
+        );
+
+        let updated = body_json(to_response(
+            update_member_role(
+                State(state.clone()),
+                claims_for(owner_id),
+                Path((workspace_id, target_id)),
+                Json(UpdateMemberRoleRequest {
+                    role: "admin".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(updated["code"], 0, "{updated}");
+        assert_eq!(read_epoch(&state, workspace_id).await, 2);
+
+        let removed = body_json(to_response(
+            remove_member(
+                State(state.clone()),
+                claims_for(owner_id),
+                Path((workspace_id, target_id)),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(removed["code"], 0, "{removed}");
+        assert_eq!(read_epoch(&state, workspace_id).await, 3);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn member_mutation_without_flow_settings_succeeds_without_creating_them() {
+        let scratch = scratch_or_skip!("member-no-flow-settings");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_bare_workspace(&state).await;
+        let target_id = seed_user(&state).await;
+
+        let added = body_json(to_response(
+            add_member(
+                State(state.clone()),
+                claims_for(owner_id),
+                Path(workspace_id),
+                Json(AddMemberRequest {
+                    user_id: target_id,
+                    role: "member".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(added["code"], 0, "{added}");
+
+        let settings_count = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM flow_workspace_settings WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("settings count query runs")
+            .expect("settings count exists");
+        assert_eq!(settings_count.try_get::<i64>("", "n").expect("count reads"), 0);
 
         scratch.drop_self().await;
     }

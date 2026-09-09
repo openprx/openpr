@@ -523,25 +523,31 @@ pub async fn fetch_flow_settings_for_update<C: ConnectionTrait>(
     .await?)
 }
 
-/// Writes the new `flow_enabled` value and stamps `updated_at`/`updated_by`.
+/// Writes the new `flow_enabled` and `default_member_level` values and stamps the updater.
 ///
-/// `default_member_level` is never written here: v0.4 accepts only its existing default value
-/// (`command::set_flow_feature` rejects anything else before touching this function), so the
-/// column's own `DEFAULT 'edit'` is always the truth and `authz_epoch` — which only advances for
-/// an actual baseline change — is correctly left untouched.
+/// The caller advances `authz_epoch` in the same transaction before invoking this function when
+/// the baseline changes. Keeping that decision in the command layer lets a pure feature-flag
+/// transition leave the authorization epoch untouched.
 pub async fn update_flow_settings<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
     flow_enabled: bool,
+    default_member_level: &str,
     // `None` when the actor is a bot: this column is `REFERENCES users(id)` and a bot id is
     // not a user id.
     updated_by: Option<Uuid>,
 ) -> Result<(), ApiError> {
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "UPDATE flow_workspace_settings SET flow_enabled = $2, updated_at = now(), updated_by = $3 \
+        "UPDATE flow_workspace_settings SET flow_enabled = $2, default_member_level = $3, \
+         updated_at = now(), updated_by = $4 \
          WHERE workspace_id = $1",
-        vec![workspace_id.into(), flow_enabled.into(), updated_by.into()],
+        vec![
+            workspace_id.into(),
+            flow_enabled.into(),
+            default_member_level.into(),
+            updated_by.into(),
+        ],
     ))
     .await?;
     Ok(())

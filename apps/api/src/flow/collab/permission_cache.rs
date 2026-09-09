@@ -217,6 +217,17 @@ impl PermissionCache {
     }
 }
 
+/// Best-effort physical cleanup after a committed workspace-wide permission change.
+///
+/// The committed epoch is already the logical authority, so cache allocation/type errors are
+/// logged and must never rewrite a successful mutation response into an error.
+pub fn invalidate_workspace_after_commit(state: &AppState, workspace_id: Uuid) {
+    match PermissionCache::for_state(state) {
+        Ok(cache) => cache.invalidate_workspace(workspace_id),
+        Err(error) => tracing::warn!(%workspace_id, %error, "flow permission cache cleanup failed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread;

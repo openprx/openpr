@@ -173,6 +173,7 @@ pub async fn create_bot(
     let bot_name = req.name.clone();
 
     let tx = state.db.begin().await?;
+    let advanced_epoch = crate::flow::collab::authz::advance_epoch_if_present(&tx, workspace_id).await?;
 
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -221,6 +222,9 @@ pub async fn create_bot(
     .await?;
 
     tx.commit().await?;
+    if advanced_epoch.is_some() {
+        crate::flow::collab::permission_cache::invalidate_workspace_after_commit(&state, workspace_id);
+    }
 
     Ok(ApiResponse::success(CreateBotResponse {
         id: bot_id,

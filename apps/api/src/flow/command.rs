@@ -620,21 +620,12 @@ fn validate_set_flow_feature(input: &SetFlowFeatureInput) -> Result<(), ApiError
             "at least one of enabled or default_member_level must be supplied".to_string(),
         ));
     }
-    if let Some(level) = input.default_member_level.as_deref() {
-        if !MEMBER_LEVELS.contains(&level) {
-            return Err(ApiError::BadRequest(format!(
-                "default_member_level must be one of {MEMBER_LEVELS:?}"
-            )));
-        }
-        // `v0.4-flow-alpha.md` / `rest-api-v1.md`: "default_member_level 在 v0.5 授权面上线前只
-        // 接受默认值 edit" — the column's own default is 'edit' and nothing in this version can
-        // move it, so any other (otherwise-valid) level is rejected here rather than silently
-        // ignored.
-        if level != "edit" {
-            return Err(ApiError::BadRequest(
-                "default_member_level only accepts 'edit' before the v0.5 authorization surface ships".to_string(),
-            ));
-        }
+    if let Some(level) = input.default_member_level.as_deref()
+        && !MEMBER_LEVELS.contains(&level)
+    {
+        return Err(ApiError::BadRequest(format!(
+            "default_member_level must be one of {MEMBER_LEVELS:?}"
+        )));
     }
     let key_bytes = input.idempotency_key.len();
     if !(IDEMPOTENCY_KEY_MIN_BYTES..=IDEMPOTENCY_KEY_MAX_BYTES).contains(&key_bytes) {
@@ -647,21 +638,20 @@ fn validate_set_flow_feature(input: &SetFlowFeatureInput) -> Result<(), ApiError
 
 /// `PUT /api/v1/workspaces/{workspace_id}/features/flow`.
 ///
-/// Only `enabled` can actually change anything in v0.4 (`default_member_level` is validated above
-/// to always already equal the column default); a change is `flow.feature.enabled`/
-/// `flow.feature.disabled` (`events-v1.md`), written in the same transaction as the settings row
-/// update and dispatched exactly like every other Flow business event
-/// (`repository::insert_event_dispatch`). A request whose `enabled` already matches the current
-/// value still succeeds and still stamps `updated_at`/`updated_by` (the caller's admin action is
-/// real even when it changes nothing observable) but produces no event — see
-/// [`FlowFeatureUpdateView`]'s doc comment.
+/// A feature-flag transition emits `flow.feature.enabled|disabled`; a baseline transition emits
+/// `flow.permission.baseline_changed`, advances `authz_epoch`, and updates settings in this one
+/// transaction. When both change, the baseline event owns the request idempotency key and the
+/// feature event is causally derived from it. A no-op still stamps the updater but emits no event.
 pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> Result<FlowFeatureUpdateView, ApiError> {
     validate_set_flow_feature(&input)?;
 
     if let Some(existing) =
         repository::find_idempotent_event(&state.db, input.workspace_id, &input.idempotency_key).await?
     {
-        if existing.event_type != "flow.feature.enabled" && existing.event_type != "flow.feature.disabled" {
+        if existing.event_type != "flow.feature.enabled"
+            && existing.event_type != "flow.feature.disabled"
+            && existing.event_type != "flow.permission.baseline_changed"
+        {
             return Err(ApiError::Conflict(
                 "idempotency_key was already used for a different operation".to_string(),
             ));
@@ -682,25 +672,30 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
 
     let new_enabled = input.enabled.unwrap_or(current.flow_enabled);
     let transition = input.enabled.filter(|&enabled| enabled != current.flow_enabled);
+    let new_member_level = input
+        .default_member_level
+        .as_deref()
+        .unwrap_or(&current.default_member_level);
+    let baseline_transition = (new_member_level != current.default_member_level)
+        .then(|| (current.default_member_level.clone(), new_member_level.to_string()));
+    let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
 
-    let event_id = if let Some(enabled) = transition {
-        let event_type = if enabled {
-            "flow.feature.enabled"
-        } else {
-            "flow.feature.disabled"
-        };
-        let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
-        let id = insert_flow_event(
+    let baseline_event_id = if let Some((old_level, new_level)) = &baseline_transition {
+        let outcome = insert_flow_event(
             &tx,
             BusinessEventInput {
                 workspace_id: input.workspace_id,
                 project_id: None,
-                event_type: event_type.to_string(),
-                aggregate_type: "flow_feature".to_string(),
+                event_type: "flow.permission.baseline_changed".to_string(),
+                aggregate_type: "flow_permission".to_string(),
                 aggregate_id: input.workspace_id.to_string(),
                 actor_id: actor_user_id(input.actor_id, input.actor_is_bot),
                 source: input.origin.source_json(),
-                payload: json!({ "workspace_id": input.workspace_id }),
+                payload: json!({
+                    "workspace_id": input.workspace_id,
+                    "old_level": old_level,
+                    "new_level": new_level,
+                }),
                 metadata: json!({}),
                 correlation_id: Some(input.origin.correlation_id),
                 causation_id: input.origin.causation_id,
@@ -712,26 +707,85 @@ pub async fn set_flow_feature(state: &AppState, input: SetFlowFeatureInput) -> R
                 accepted_seq: None,
             }),
         )
-        .await?
-        .event_id;
-        Some(id)
+        .await?;
+        if !outcome.was_new {
+            tx.rollback().await?;
+            let row = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;
+            return Ok(FlowFeatureUpdateView {
+                feature: feature_view_from_row(row),
+                event_id: Some(outcome.event_id),
+            });
+        }
+        Some(outcome.event_id)
     } else {
         None
     };
+
+    let feature_event_id = if let Some(enabled) = transition {
+        let event_type = if enabled {
+            "flow.feature.enabled"
+        } else {
+            "flow.feature.disabled"
+        };
+        let feature_origin = baseline_event_id.map_or_else(|| input.origin.clone(), |id| input.origin.derived_from(id));
+        let outcome = insert_flow_event(
+            &tx,
+            BusinessEventInput {
+                workspace_id: input.workspace_id,
+                project_id: None,
+                event_type: event_type.to_string(),
+                aggregate_type: "flow_feature".to_string(),
+                aggregate_id: input.workspace_id.to_string(),
+                actor_id: actor_user_id(input.actor_id, input.actor_is_bot),
+                source: feature_origin.source_json(),
+                payload: json!({ "workspace_id": input.workspace_id }),
+                metadata: json!({}),
+                correlation_id: Some(feature_origin.correlation_id),
+                causation_id: feature_origin.causation_id,
+                idempotency_key: baseline_event_id.is_none().then(|| input.idempotency_key.clone()),
+            },
+            Some(FlowDispatchSpec {
+                max_attempts: dispatch_max_attempts,
+                document_id: None,
+                accepted_seq: None,
+            }),
+        )
+        .await?;
+        if !outcome.was_new {
+            tx.rollback().await?;
+            let row = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;
+            return Ok(FlowFeatureUpdateView {
+                feature: feature_view_from_row(row),
+                event_id: Some(outcome.event_id),
+            });
+        }
+        Some(outcome.event_id)
+    } else {
+        None
+    };
+
+    if baseline_transition.is_some() {
+        authz::advance_epoch(&tx, input.workspace_id).await?;
+    }
 
     repository::update_flow_settings(
         &tx,
         input.workspace_id,
         new_enabled,
+        new_member_level,
         actor_user_id(input.actor_id, input.actor_is_bot),
     )
     .await?;
     tx.commit().await?;
 
+    if baseline_transition.is_some() {
+        super::collab::permission_cache::invalidate_workspace_after_commit(state, input.workspace_id);
+    }
+
     let updated = repository::fetch_flow_settings(&state.db, input.workspace_id).await?;
     Ok(FlowFeatureUpdateView {
         feature: feature_view_from_row(updated),
-        event_id,
+        event_id: baseline_event_id.or(feature_event_id),
     })
 }
 
