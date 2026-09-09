@@ -241,7 +241,8 @@ if [[ "$RELEASE" == "0.5" ]]; then
   V05_LOAD_DIR="$EVIDENCE_ROOT/logs/collab-load-v0.5"
   V05_LOAD_LOG="$EVIDENCE_ROOT/logs/collab-load-v0.5.log"
   V05_DYNAMIC_LOG="$EVIDENCE_ROOT/logs/collab-architecture-v0.5-tests.log"
-  V05_MUTATION_LOG="$EVIDENCE_ROOT/logs/collab-architecture-v0.5-mutations.log"
+  V05_RESUME_MUTATION_LOG="$EVIDENCE_ROOT/logs/resume-at-head-zero-frame-mutation.log"
+  V05_EGRESS_MUTATION_LOG="$EVIDENCE_ROOT/logs/egress-duplicate-forward-mutation.log"
   V05_RESUME_JSON="$EVIDENCE_ROOT/logs/resume-at-head-v0.5.json"
   V05_SURFACE_JSON="$EVIDENCE_ROOT/logs/surface-coverage-v0.5.json"
   V05_LOAD_EXIT=0
@@ -286,14 +287,15 @@ if [[ "$RELEASE" == "0.5" ]]; then
   set -e
   if [[ $snapshot_exit -ne 0 ]]; then V05_DYNAMIC_EXIT=1; fi
 
-  : >"$V05_MUTATION_LOG"
+  : >"$V05_RESUME_MUTATION_LOG"
+  : >"$V05_EGRESS_MUTATION_LOG"
   mutation_started_ms="$(date +%s%3N)"
   set +e
   (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
     OPENPR_FLOW_TEST_MUTATION_EMPTY_RESUME_ZERO_FRAMES=1 \
     cargo test --release -p api --lib \
       flow::collab::session::tests::live_ws::resume_at_head_returns_exact_ack_before_an_empty_replay \
-      -- --exact --test-threads=1 --nocapture) >>"$V05_MUTATION_LOG" 2>&1
+      -- --exact --test-threads=1 --nocapture) >>"$V05_RESUME_MUTATION_LOG" 2>&1
   V05_RESUME_MUTATION_EXIT=$?
   V05_RESUME_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
   mutation_started_ms="$(date +%s%3N)"
@@ -301,7 +303,7 @@ if [[ "$RELEASE" == "0.5" ]]; then
     OPENPR_FLOW_TEST_MUTATION_FORWARD_EGRESS_DUPLICATE=1 \
     cargo test --release -p api --lib \
       flow::collab::session::tests::live_ws::outbound_duplicates_are_dropped_and_a_gap_is_backfilled_in_strict_seq_order \
-      -- --exact --test-threads=1 --nocapture) >>"$V05_MUTATION_LOG" 2>&1
+      -- --exact --test-threads=1 --nocapture) >>"$V05_EGRESS_MUTATION_LOG" 2>&1
   V05_EGRESS_MUTATION_EXIT=$?
   V05_EGRESS_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
   set -e
@@ -313,7 +315,8 @@ if [[ "$RELEASE" == "0.5" ]]; then
   EXECUTOR="${USER:-$(id -un)}@$(hostname)"
 
   set +e
-  python3 - "$LOAD_HARNESS_EVIDENCE" "$V05_DYNAMIC_LOG" "$V05_MUTATION_LOG" "$V05_RESUME_JSON" "$V05_SURFACE_JSON" \
+  python3 - "$LOAD_HARNESS_EVIDENCE" "$V05_DYNAMIC_LOG" \
+    "$V05_RESUME_MUTATION_LOG" "$V05_EGRESS_MUTATION_LOG" "$V05_RESUME_JSON" "$V05_SURFACE_JSON" \
     "$SOURCE_HEAD" "$SOURCE_DIRTY" "$V05_SOURCE_DIRTY_AFTER" "$CLIENTS" \
     "$ADR_SHA256" "$LIMITS_SHA256" "$GENERATED_AT" "$EXECUTOR" \
     "$V05_LOAD_EXIT" "$V05_DYNAMIC_EXIT" \
@@ -327,7 +330,8 @@ import re
 import sys
 
 (
-    load_path, test_log_path, mutation_log_path, resume_evidence_path, surface_path, source_head, source_dirty,
+    load_path, test_log_path, resume_mutation_log_path, egress_mutation_log_path,
+    resume_evidence_path, surface_path, source_head, source_dirty,
     source_dirty_after, clients_raw, adr_sha, limits_sha, generated_at,
     executor, load_exit_raw, dynamic_exit_raw, resume_mutation_exit_raw,
     resume_mutation_duration_raw, egress_mutation_exit_raw,
@@ -348,9 +352,13 @@ try:
 except OSError:
     test_log = ""
 try:
-    mutation_log = open(mutation_log_path, encoding="utf-8").read()
+    resume_mutation_log = open(resume_mutation_log_path, encoding="utf-8").read()
 except OSError:
-    mutation_log = ""
+    resume_mutation_log = ""
+try:
+    egress_mutation_log = open(egress_mutation_log_path, encoding="utf-8").read()
+except OSError:
+    egress_mutation_log = ""
 
 clients = int(clients_raw)
 load_exit = int(load_exit_raw)
@@ -405,13 +413,15 @@ require("resume-at-head structured evidence is missing or not exact", resume_evi
 
 resume_mutation_detected = all((
     resume_mutation_exit != 0,
-    re.search(r"^test " + re.escape(expected_tests["resume_at_head_ack"]) + r" \.\.\. FAILED$", mutation_log, re.M),
-    "a frame arrives before the timeout" in mutation_log,
+    expected_tests["resume_at_head_ack"] in resume_mutation_log,
+    "test result: FAILED. 0 passed; 1 failed;" in resume_mutation_log,
+    "a frame arrives before the timeout" in resume_mutation_log,
 ))
 egress_mutation_detected = all((
     egress_mutation_exit != 0,
-    re.search(r"^test " + re.escape(expected_tests["egress_duplicate_reorder"]) + r" \.\.\. FAILED$", mutation_log, re.M),
-    "the duplicate accepted must be dropped" in mutation_log,
+    expected_tests["egress_duplicate_reorder"] in egress_mutation_log,
+    "test result: FAILED. 0 passed; 1 failed;" in egress_mutation_log,
+    "the duplicate accepted must be dropped" in egress_mutation_log,
 ))
 require("empty-resume zero-frame mutation did not make the exact gate test red", resume_mutation_detected)
 require("egress duplicate-forward mutation did not make the exact gate test red", egress_mutation_detected)
@@ -651,8 +661,8 @@ result = {
     },
     "egress": egress,
     "falsification": {
-        "mutation_log": os.path.abspath(mutation_log_path),
         "empty_resume_zero_frames": {
+            "mutation_log": os.path.abspath(resume_mutation_log_path),
             "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_EMPTY_RESUME_ZERO_FRAMES=1",
             "same_test_replayed": expected_tests["resume_at_head_ack"],
             "exit_code": resume_mutation_exit,
@@ -661,6 +671,7 @@ result = {
             "gate_went_red": resume_mutation_detected,
         },
         "egress_duplicate_forwarded": {
+            "mutation_log": os.path.abspath(egress_mutation_log_path),
             "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_FORWARD_EGRESS_DUPLICATE=1",
             "same_test_replayed": expected_tests["egress_duplicate_reorder"],
             "exit_code": egress_mutation_exit,
