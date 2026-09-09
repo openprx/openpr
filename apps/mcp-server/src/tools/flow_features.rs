@@ -21,10 +21,10 @@ fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolR
 
 fn respond_data(result: Result<Value, String>) -> CallToolResult {
     match result {
-        Ok(value) => match value.get("data") {
-            Some(data) => CallToolResult::success(serde_json::to_string_pretty(data).unwrap_or_default()),
-            None => CallToolResult::error("Malformed successful API envelope: missing data".to_string()),
-        },
+        Ok(value) => value.get("data").map_or_else(
+            || CallToolResult::error("Malformed successful API envelope: missing data".to_string()),
+            |data| CallToolResult::success(serde_json::to_string_pretty(data).unwrap_or_default()),
+        ),
         Err(error) => CallToolResult::error(error),
     }
 }
