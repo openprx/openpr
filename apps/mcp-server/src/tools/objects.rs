@@ -141,6 +141,10 @@ fn respond(result: Result<Value, StructuredApiError>) -> CallToolResult {
     }
 }
 
+fn respond_data(result: Result<Value, StructuredApiError>) -> CallToolResult {
+    respond(result.map(|envelope| envelope.get("data").cloned().unwrap_or(Value::Null)))
+}
+
 /// Keeps the pre-existing public client helpers part of the compiled client surface while these
 /// tools use the richer envelope reader. Downstream code may still call the String-returning
 /// helpers directly.
@@ -423,7 +427,7 @@ pub async fn create_flow_object(client: &OpenPrClient, args: Value) -> CallToolR
         "/api/v1/workspaces/{}/flow/objects",
         encode_query_component(&input.workspace_id)
     );
-    respond(post_structured(client, &path, &body).await)
+    respond_data(post_structured(client, &path, &body).await)
 }
 
 pub fn patch_flow_object_tool() -> ToolDefinition {
@@ -479,7 +483,7 @@ pub async fn patch_flow_object(client: &OpenPrClient, args: Value) -> CallToolRe
         "/api/v1/flow/objects/{}/commands",
         encode_query_component(&input.object_id)
     );
-    respond(post_structured(client, &path, &body).await)
+    respond_data(post_structured(client, &path, &body).await)
 }
 
 pub fn move_flow_object_tool() -> ToolDefinition {
@@ -547,7 +551,7 @@ pub async fn move_flow_object(client: &OpenPrClient, args: Value) -> CallToolRes
         "/api/v1/flow/objects/{}/commands",
         encode_query_component(&input.object_id)
     );
-    respond(post_structured(client, &path, &body).await)
+    respond_data(post_structured(client, &path, &body).await)
 }
 
 pub fn link_flow_objects_tool() -> ToolDefinition {
@@ -599,7 +603,7 @@ pub async fn link_flow_objects(client: &OpenPrClient, args: Value) -> CallToolRe
         "/api/v1/flow/objects/{}/commands",
         encode_query_component(&input.source_object_id)
     );
-    respond(post_structured(client, &path, &body).await)
+    respond_data(post_structured(client, &path, &body).await)
 }
 
 pub fn unlink_flow_objects_tool() -> ToolDefinition {
@@ -647,7 +651,7 @@ pub async fn unlink_flow_objects(client: &OpenPrClient, args: Value) -> CallTool
         "/api/v1/flow/objects/{}/commands",
         encode_query_component(&input.source_object_id)
     );
-    respond(post_structured(client, &path, &body).await)
+    respond_data(post_structured(client, &path, &body).await)
 }
 
 pub fn diff_flow_object_tool() -> ToolDefinition {
@@ -700,7 +704,7 @@ pub async fn diff_flow_object(client: &OpenPrClient, args: Value) -> CallToolRes
         encode_query_component(&input.object_id),
         query_suffix(&query)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 pub fn get_flow_object_grants_tool() -> ToolDefinition {
@@ -733,7 +737,7 @@ pub async fn get_flow_object_grants(client: &OpenPrClient, args: Value) -> CallT
         "/api/v1/flow/objects/{}/grants",
         encode_query_component(&input.object_id)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 fn grant_schema() -> Value {
@@ -834,7 +838,7 @@ pub async fn set_flow_object_grants(client: &OpenPrClient, args: Value) -> CallT
         "/api/v1/flow/objects/{}/grants",
         encode_query_component(&input.object_id)
     );
-    respond(put_structured(client, &path, &body).await)
+    respond_data(put_structured(client, &path, &body).await)
 }
 
 pub fn set_flow_object_inheritance_tool() -> ToolDefinition {
@@ -904,7 +908,7 @@ pub async fn set_flow_object_inheritance(client: &OpenPrClient, args: Value) -> 
         "/api/v1/flow/objects/{}/inheritance",
         encode_query_component(&input.object_id)
     );
-    respond(put_structured(client, &path, &body).await)
+    respond_data(put_structured(client, &path, &body).await)
 }
 
 pub fn list_flow_object_relations_tool() -> ToolDefinition {
@@ -965,7 +969,7 @@ pub async fn list_flow_object_relations(client: &OpenPrClient, args: Value) -> C
         encode_query_component(&input.object_id),
         query_suffix(&query)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 pub fn search_flow_objects_tool() -> ToolDefinition {
@@ -1046,7 +1050,7 @@ pub async fn search_flow_objects(client: &OpenPrClient, args: Value) -> CallTool
         encode_query_component(&input.workspace_id),
         query_suffix(&query)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 pub fn get_flow_projection_lag_tool() -> ToolDefinition {
@@ -1100,7 +1104,7 @@ pub async fn get_flow_projection_lag(client: &OpenPrClient, args: Value) -> Call
         encode_query_component(&input.workspace_id),
         query_suffix(&query)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 fn query_suffix(params: &[String]) -> String {
@@ -1290,8 +1294,12 @@ mod tests {
             return Err("missing MCP text content".into());
         };
         let output: serde_json::Value = serde_json::from_str(text)?;
-        assert_eq!(output["data"]["applied"], false);
-        assert!(output["data"].get("event_id").is_none());
+        assert_eq!(output["applied"], false);
+        assert!(output.get("event_id").is_none());
+        assert!(
+            output.get("data").is_none(),
+            "MCP must expose REST data, not its envelope"
+        );
         Ok(())
     }
 
