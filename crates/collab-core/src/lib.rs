@@ -49,4 +49,4 @@ pub use error::{CollabError, InputLimits};
 pub use frontier::Frontier;
 pub use limits::{DocumentLimits, LimitViolation};
 pub use operation::{NodeId, NodeKind, Operation};
-pub use semantic::{SemanticNode, SemanticSnapshot};
+pub use semantic::{SemanticDiff, SemanticNode, SemanticNodeChange, SemanticSnapshot};

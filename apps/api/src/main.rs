@@ -1427,6 +1427,13 @@ async fn main() -> anyhow::Result<()> {
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
+        .route(
+            "/api/v1/flow/objects/{object_id}/diff",
+            get(routes::flow::get_flow_object_diff).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
         // `ADR-0012`'s v0.5 authorization surface. Both PUTs demand object-level `full_access`,
         // which `flow::grants` checks inside the transaction it would commit — the middleware
         // here only establishes workspace membership, exactly as it does for `commands`.

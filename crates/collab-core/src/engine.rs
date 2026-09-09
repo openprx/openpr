@@ -304,6 +304,45 @@ impl LoroCollabEngine {
             .unwrap_or_default())
     }
 
+    /// Creates an independent read-only historical view at an opaque version-vector frontier.
+    ///
+    /// Loro full snapshots retain operation history, so this remains valid after the server has
+    /// advanced its canonical snapshot pointer. The returned engine contains only history up to
+    /// `frontier`; callers cannot accidentally expose Loro peer ids because the input and output
+    /// boundary remains [`Frontier`] plus the semantic accessors on this type.
+    ///
+    /// # Errors
+    /// `DecodeFailed` when `frontier` is not an encoded version vector, or `OperationFailed` when
+    /// it is not represented by this document's retained history.
+    pub fn fork_at_frontier(&self, frontier: &Frontier) -> Result<Self, CollabError> {
+        let vv = if frontier.is_empty() {
+            VersionVector::default()
+        } else {
+            VersionVector::decode(frontier.as_bytes()).map_err(|error| CollabError::DecodeFailed {
+                input: "frontier",
+                reason: error.to_string(),
+            })?
+        };
+        let frontiers = self.doc.vv_to_frontiers(&vv);
+        let doc = self
+            .doc
+            .fork_at(&frontiers)
+            .map_err(|error| CollabError::OperationFailed {
+                reason: error.to_string(),
+            })?;
+        let tree = Self::attach_tree(&doc);
+        let meta = Self::attach_meta(&doc);
+        let mut fork = Self {
+            doc,
+            tree,
+            meta,
+            id_to_tree: HashMap::new(),
+            tree_to_id: HashMap::new(),
+        };
+        fork.rebuild_id_cache()?;
+        Ok(fork)
+    }
+
     /// Sets the document-level title and commits the change.
     ///
     /// # Errors
@@ -581,6 +620,35 @@ mod tests {
         let snapshot = engine.export_snapshot().expect("export succeeds");
         let reloaded = LoroCollabEngine::load(&snapshot).expect("load succeeds");
         assert_eq!(reloaded.title().expect("title reads"), "Untitled Page");
+    }
+
+    #[test]
+    fn full_snapshot_can_fork_back_to_an_earlier_semantic_frontier() {
+        let mut engine = LoroCollabEngine::new_empty(1);
+        engine.set_title("before").expect("initial title writes");
+        let before = engine.frontier();
+        engine.set_title("after").expect("second title writes");
+        engine
+            .apply_operation(&Operation::CreateNode {
+                id: NodeId::from("later-node"),
+                parent: None,
+                index: 0,
+                kind: NodeKind::Block,
+            })
+            .expect("later node writes");
+
+        let full = engine.export_snapshot().expect("full snapshot exports");
+        let loaded = LoroCollabEngine::load(&full).expect("full snapshot loads");
+        let historical = loaded
+            .fork_at_frontier(&before)
+            .expect("historical frontier is retained");
+
+        assert_eq!(historical.title().expect("title reads"), "before");
+        assert!(
+            historical.semantic_snapshot().expect("snapshot reads").nodes.is_empty(),
+            "the fork must not contain an operation that happened after its frontier"
+        );
+        assert_eq!(loaded.title().expect("source engine stays current"), "after");
     }
 
     #[test]

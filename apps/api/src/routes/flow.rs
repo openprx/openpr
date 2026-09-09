@@ -14,6 +14,7 @@
 //! PUT  /api/v1/flow/objects/{object_id}/grants
 //! PUT  /api/v1/flow/objects/{object_id}/inheritance
 //! GET  /api/v1/flow/objects/{object_id}/history
+//! GET  /api/v1/flow/objects/{object_id}/diff
 //! GET  /api/v1/workspaces/{workspace_id}/features/flow
 //! PUT  /api/v1/workspaces/{workspace_id}/features/flow
 //! ```
@@ -452,6 +453,57 @@ pub async fn get_flow_object_history(
     Err(policy::authorization_read_unstable())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FlowObjectDiffQuery {
+    pub from_seq: Option<i64>,
+    pub to_seq: Option<i64>,
+    pub render: Option<String>,
+}
+
+/// `GET /api/v1/flow/objects/{object_id}/diff`.
+///
+/// This is a history read: object visibility is established through WP-10's shared
+/// `require_flow_object_access` context and the query service rechecks its epoch after the
+/// historical state has been reconstructed. An absent object and an object the caller cannot
+/// view both produce the same `not_found` answer.
+pub async fn get_flow_object_diff(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Query(params): Query<FlowObjectDiffQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let from_seq = params
+        .from_seq
+        .ok_or_else(|| ApiError::invalid_update("from_seq is required"))?;
+    let to_seq = params
+        .to_seq
+        .ok_or_else(|| ApiError::invalid_update("to_seq is required"))?;
+    let render = Render::parse(params.render.as_deref())?;
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = policy::require_flow_object_access(
+            &state,
+            &extensions,
+            workspace_id,
+            object_id,
+            crate::flow::collab::authz::PermissionLevel::View,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(response) = query::get_object_diff(&state, &access, from_seq, to_seq, render).await? else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response));
+    }
+    Err(policy::authorization_read_unstable())
+}
+
 /// `GET /api/v1/workspaces/{workspace_id}/features/flow`.
 ///
 /// Plain workspace membership (`policy::require_flow_feature_read_access`), *not*
@@ -541,12 +593,12 @@ mod flow_database_tests {
     use uuid::Uuid;
 
     use super::{
-        CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectHistoryQuery,
-        FlowRelationsQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery,
-        SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, get_flow_feature, get_flow_object,
-        get_flow_object_bootstrap, get_flow_object_grants, get_flow_object_history, get_flow_object_relations,
-        list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
-        set_flow_feature,
+        CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectDiffQuery,
+        FlowObjectHistoryQuery, FlowRelationsQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery,
+        ListFlowObjectsQuery, SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, get_flow_feature,
+        get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
+        get_flow_object_history, get_flow_object_relations, list_flow_objects, post_flow_object_command,
+        put_flow_object_grants, put_flow_object_inheritance, set_flow_feature,
     };
     use crate::error::ApiError;
     use crate::flow::collab::{
@@ -2536,6 +2588,206 @@ mod flow_database_tests {
             body["code"], 400,
             "an unregistered command type must surface as body code 400: {body}"
         );
+
+        scratch.drop_self().await;
+    }
+
+    /// WP-09's decisive branches against real accepted history: seq-zero retains the creation
+    /// title, semantic JSON contains logical nodes but no update/peer representation, markdown
+    /// comes back on demand, all three range failures are typed and never clamped, and a policy
+    /// boundary makes an existing object indistinguishable from an absent one.
+    #[tokio::test]
+    async fn diff_is_semantic_range_strict_and_policy_collapsed() {
+        let scratch = scratch_or_skip!("diff-contract");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let claims = claims_for(owner_id);
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "Created at seq zero").await;
+
+        async fn command(
+            state: &AppState,
+            claims: &Extension<JwtClaims>,
+            object_id: Uuid,
+            command_type: &str,
+            payload: Value,
+        ) -> Value {
+            body_json(to_response(
+                post_flow_object_command(
+                    State(state.clone()),
+                    claims.clone(),
+                    None,
+                    Path(object_id),
+                    Json(ExecuteFlowCommandRequest {
+                        command: FlowCommandEnvelope {
+                            command_type: command_type.to_string(),
+                            payload,
+                        },
+                        expected_frontier: None,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        message: None,
+                    }),
+                )
+                .await,
+            ))
+            .await
+        }
+
+        let renamed = command(
+            &state,
+            &claims,
+            object_id,
+            "set_title",
+            json!({"title": "Current title"}),
+        )
+        .await;
+        assert_eq!(renamed["data"]["accepted_seq"], 1, "{renamed}");
+        let inserted = command(
+            &state,
+            &claims,
+            object_id,
+            "insert_block",
+            json!({"block_id": "logical-block", "index": 0, "text": "semantic text"}),
+        )
+        .await;
+        assert_eq!(inserted["data"]["accepted_seq"], 2, "{inserted}");
+
+        let diff = body_json(to_response(
+            get_flow_object_diff(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(object_id),
+                Query(FlowObjectDiffQuery {
+                    from_seq: Some(0),
+                    to_seq: Some(2),
+                    render: Some("markdown".to_string()),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(diff["code"], 0, "{diff}");
+        assert_eq!(diff["data"]["from_seq"], 0);
+        assert_eq!(diff["data"]["to_seq"], 2);
+        assert_eq!(diff["data"]["semantic_diff"]["title"]["before"], "Created at seq zero");
+        assert_eq!(diff["data"]["semantic_diff"]["title"]["after"], "Current title");
+        assert_eq!(
+            diff["data"]["semantic_diff"]["nodes"]["added"]["logical-block"]["text"],
+            "semantic text"
+        );
+        assert_eq!(diff["data"]["rendered"], "# Current title\n");
+        let serialized = diff["data"].to_string();
+        assert!(!serialized.contains("bytes"), "diff leaked update bytes: {serialized}");
+        assert!(
+            !serialized.contains("peer_id"),
+            "diff leaked an engine peer id: {serialized}"
+        );
+
+        for (from_seq, to_seq) in [(2, 1), (-1, 1)] {
+            let rejected = body_json(to_response(
+                get_flow_object_diff(
+                    State(state.clone()),
+                    claims.clone(),
+                    None,
+                    Path(object_id),
+                    Query(FlowObjectDiffQuery {
+                        from_seq: Some(from_seq),
+                        to_seq: Some(to_seq),
+                        render: None,
+                    }),
+                )
+                .await,
+            ))
+            .await;
+            assert_eq!(
+                rejected["error_code"], "invalid_update",
+                "range was silently clamped: {rejected}"
+            );
+        }
+        let beyond_head = body_json(to_response(
+            get_flow_object_diff(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(object_id),
+                Query(FlowObjectDiffQuery {
+                    from_seq: Some(0),
+                    to_seq: Some(3),
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(beyond_head["error_code"], "stale_frontier", "{beyond_head}");
+        assert_eq!(beyond_head["details"]["current_seq"], 2, "{beyond_head}");
+
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![object_id.into()],
+        )
+        .await;
+        let denied = body_json(to_response(
+            get_flow_object_diff(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(object_id),
+                Query(FlowObjectDiffQuery {
+                    from_seq: Some(0),
+                    to_seq: Some(0),
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let absent = body_json(to_response(
+            get_flow_object_diff(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(Uuid::new_v4()),
+                Query(FlowObjectDiffQuery {
+                    from_seq: Some(0),
+                    to_seq: Some(0),
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(denied["code"], 404, "{denied}");
+        assert_eq!(absent["code"], 404, "{absent}");
+        assert_eq!(denied["message"], absent["message"]);
+
+        // Hit the storage invariant itself: removing seq 1 leaves seq 2 reachable to a naive
+        // reader, but the endpoint must reject the requested history instead of skipping/clamping.
+        let document_id = document_of(&state, object_id).await;
+        exec(
+            &state,
+            "DELETE FROM collab_updates WHERE document_id = $1 AND seq = 1",
+            vec![document_id.into()],
+        )
+        .await;
+        let missing_seq = body_json(to_response(
+            get_flow_object_diff(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(object_id),
+                Query(FlowObjectDiffQuery {
+                    from_seq: Some(0),
+                    to_seq: Some(2),
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(missing_seq["error_code"], "resync_required", "{missing_seq}");
 
         scratch.drop_self().await;
     }

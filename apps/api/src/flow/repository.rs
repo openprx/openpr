@@ -6,7 +6,10 @@
 use std::fmt::Write as _;
 
 use chrono::{DateTime, Utc};
-use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use sea_orm::{
+    AccessMode, ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, IsolationLevel, Statement,
+    TransactionTrait,
+};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -75,6 +78,101 @@ pub async fn fetch_object_workspace<C: ConnectionTrait>(conn: &C, object_id: Uui
     .one(conn)
     .await?;
     Ok(row.map(|r| r.workspace_id))
+}
+
+/// Immutable accepted update needed to reconstruct the semantic state at a historical seq.
+#[derive(Debug, FromQueryResult)]
+pub struct DiffUpdateRow {
+    pub seq: i64,
+    pub bytes: Vec<u8>,
+    pub content_hash: String,
+    pub before_frontier: Vec<u8>,
+    pub after_frontier: Vec<u8>,
+}
+
+/// One MVCC-consistent view of an object's document head and all retained updates through the
+/// caller's requested upper sequence.
+pub struct DiffHistoryRows {
+    pub workspace_id: Uuid,
+    pub document_id: Uuid,
+    pub snapshot: Vec<u8>,
+    pub snapshot_seq: i64,
+    pub snapshot_frontier: Vec<u8>,
+    pub head_seq: i64,
+    pub head_frontier: Vec<u8>,
+    pub updates: Vec<DiffUpdateRow>,
+}
+
+/// Loads the data needed by `GET .../diff` in one `REPEATABLE READ READ ONLY` snapshot.
+///
+/// v0.5 retains every `collab_updates` row, including rows older than the document's advanced
+/// snapshot pointer. Those rows provide the exact seq-to-frontier index while Loro's full
+/// snapshot retains the operation history needed to fork at either frontier; using only the
+/// current snapshot state would silently substitute `snapshot_seq` for older requests.
+pub async fn fetch_diff_history(
+    db: &DatabaseConnection,
+    object_id: Uuid,
+    to_seq: i64,
+) -> Result<Option<DiffHistoryRows>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct DocumentRow {
+        workspace_id: Uuid,
+        document_id: Uuid,
+        snapshot: Vec<u8>,
+        snapshot_seq: i64,
+        snapshot_frontier: Vec<u8>,
+        head_seq: i64,
+        head_frontier: Vec<u8>,
+    }
+
+    let tx = db
+        .begin_with_config(Some(IsolationLevel::RepeatableRead), Some(AccessMode::ReadOnly))
+        .await?;
+    let document = DocumentRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT fo.workspace_id, cd.id AS document_id, cd.snapshot, cd.snapshot_seq, \
+                cd.snapshot_frontier, cd.head_seq, cd.head_frontier \
+           FROM flow_objects fo \
+           JOIN collab_documents cd ON cd.object_id = fo.id \
+          WHERE fo.id = $1",
+        vec![object_id.into()],
+    ))
+    .one(&tx)
+    .await?;
+    let Some(document) = document else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+
+    let history_upper = if to_seq > document.head_seq {
+        0
+    } else if to_seq == 0 && document.head_seq > 0 {
+        1
+    } else {
+        to_seq
+    };
+    let updates = DiffUpdateRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT seq, bytes, content_hash, before_frontier, after_frontier \
+           FROM collab_updates \
+          WHERE document_id = $1 AND seq >= 1 AND seq <= $2 \
+          ORDER BY seq ASC",
+        vec![document.document_id.into(), history_upper.into()],
+    ))
+    .all(&tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(Some(DiffHistoryRows {
+        workspace_id: document.workspace_id,
+        document_id: document.document_id,
+        snapshot: document.snapshot,
+        snapshot_seq: document.snapshot_seq,
+        snapshot_frontier: document.snapshot_frontier,
+        head_seq: document.head_seq,
+        head_frontier: document.head_frontier,
+        updates,
+    }))
 }
 
 pub struct ListFilter {

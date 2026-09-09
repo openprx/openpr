@@ -29,7 +29,58 @@ pub struct SemanticSnapshot {
     pub nodes: BTreeMap<NodeId, SemanticNode>,
 }
 
+/// One node whose engine-independent state differs between two accepted document sequences.
+///
+/// Both sides use [`SemanticNode`], deliberately keeping engine update bytes, version-vector
+/// entries, and peer ids outside the public diff vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticNodeChange {
+    pub before: SemanticNode,
+    pub after: SemanticNode,
+}
+
+/// Deterministic semantic delta between two [`SemanticSnapshot`]s.
+///
+/// Logical [`NodeId`] values are caller/application ids, not CRDT peer ids. `BTreeMap` keeps the
+/// JSON representation stable while the value types make it impossible for an engine's binary
+/// update representation to leak through this structure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SemanticDiff {
+    pub added: BTreeMap<NodeId, SemanticNode>,
+    pub removed: BTreeMap<NodeId, SemanticNode>,
+    pub changed: BTreeMap<NodeId, SemanticNodeChange>,
+}
+
 impl SemanticSnapshot {
+    /// Computes an engine-independent semantic delta from `self` to `after`.
+    #[must_use]
+    pub fn diff(&self, after: &Self) -> SemanticDiff {
+        let mut diff = SemanticDiff::default();
+        for (id, before_node) in &self.nodes {
+            match after.nodes.get(id) {
+                None => {
+                    diff.removed.insert(id.clone(), before_node.clone());
+                }
+                Some(after_node) if after_node != before_node => {
+                    diff.changed.insert(
+                        id.clone(),
+                        SemanticNodeChange {
+                            before: before_node.clone(),
+                            after: after_node.clone(),
+                        },
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        for (id, after_node) in &after.nodes {
+            if !self.nodes.contains_key(id) {
+                diff.added.insert(id.clone(), after_node.clone());
+            }
+        }
+        diff
+    }
+
     /// Canonical JSON bytes: sorted map keys, no insertion-order dependence.
     ///
     /// # Errors
@@ -179,5 +230,28 @@ mod tests {
 
         assert!(!snap.is_reachable(&NodeId::from("still-under")));
         assert!(snap.is_reachable(&NodeId::from("moved-out")));
+    }
+
+    #[test]
+    fn semantic_diff_reports_added_removed_and_changed_nodes_without_engine_identifiers() {
+        let mut before = SemanticSnapshot::default();
+        before.nodes.insert(NodeId::from("removed"), node(None, "a"));
+        before.nodes.insert(NodeId::from("changed"), node(None, "b"));
+
+        let mut after = SemanticSnapshot::default();
+        let mut changed = node(None, "b");
+        changed.text = "new text".to_string();
+        after.nodes.insert(NodeId::from("changed"), changed);
+        after.nodes.insert(NodeId::from("added"), node(None, "c"));
+
+        let diff = before.diff(&after);
+        assert_eq!(diff.added.keys().map(AsRef::as_ref).collect::<Vec<_>>(), ["added"]);
+        assert_eq!(diff.removed.keys().map(AsRef::as_ref).collect::<Vec<_>>(), ["removed"]);
+        assert_eq!(diff.changed.keys().map(AsRef::as_ref).collect::<Vec<_>>(), ["changed"]);
+
+        let wire = serde_json::to_value(diff).expect("semantic diff serializes");
+        assert!(wire.get("bytes").is_none());
+        assert!(wire.get("peer_id").is_none());
+        assert!(!wire.to_string().contains("peer_id"));
     }
 }

@@ -8,6 +8,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use chrono::{DateTime, Utc};
+use collab_core::{CollabEngine, Frontier, LoroCollabEngine};
 use platform::app::AppState;
 use serde_json::json;
 use uuid::Uuid;
@@ -17,7 +18,10 @@ use crate::error::ApiError;
 use super::collab::bootstrap;
 use super::collab::frame::TailUpdate;
 use super::collab::{limits, runtime};
-use super::model::{Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse};
+use super::model::{
+    Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse,
+    ObjectDiffResponse,
+};
 use super::policy::{self, AuthorizedFlowObject, FlowReadContext};
 use super::projection;
 use super::repository::{self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow};
@@ -443,6 +447,141 @@ pub async fn get_history(
             })
             .collect(),
         next_before_seq,
+    };
+    if !policy::ensure_epoch_current(state, access.context()).await? {
+        return Ok(None);
+    }
+    Ok(Some(response))
+}
+
+/// Reconstructs and compares two accepted document sequences using `collab_core`'s canonical
+/// semantic representation.
+///
+/// The history UI contract is the privacy precedent: semantic fields and application `NodeId`s
+/// are readable, while CRDT update bytes and engine peer ids are not. Consequently only
+/// [`SemanticSnapshot::diff`] reaches `semantic_diff`; the retained bytes are consumed locally
+/// and discarded. Markdown uses [`projection::render_markdown`] rather than a second renderer.
+pub async fn get_object_diff(
+    state: &AppState,
+    access: &AuthorizedFlowObject,
+    from_seq: i64,
+    to_seq: i64,
+    render: Render,
+) -> Result<Option<ObjectDiffResponse>, ApiError> {
+    if from_seq < 0 || to_seq < 0 {
+        return Err(ApiError::invalid_update("from_seq and to_seq must be non-negative"));
+    }
+    if from_seq > to_seq {
+        return Err(ApiError::invalid_update(
+            "from_seq must be less than or equal to to_seq",
+        ));
+    }
+
+    let object_id = access.object_id();
+    let rows = repository::fetch_diff_history(&state.db, object_id, to_seq)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    runtime::runtime().ensure_workspace_accepting(rows.workspace_id)?;
+    if rows.workspace_id != access.workspace_id() {
+        return Err(ApiError::NotFound("flow object not found".to_string()));
+    }
+    if to_seq > rows.head_seq {
+        let head_frontier = base64::engine::general_purpose::STANDARD.encode(&rows.head_frontier);
+        return Err(ApiError::stale_frontier(
+            "to_seq is beyond the current document head",
+            Some(rows.head_seq),
+            Some(&head_frontier),
+        ));
+    }
+
+    // Accepted history is retained in v0.5. A missing/corrupt row inside `1..=to_seq` is not an
+    // alternate meaning of the requested sequence and must never be clamped to a nearby state.
+    let document_id = rows.document_id;
+    let history_invalid = || {
+        tracing::error!(%object_id, %document_id, "diff history is missing or corrupt");
+        ApiError::resync_required("requested history cannot be reconstructed", None)
+    };
+
+    let mut engine = LoroCollabEngine::load(&rows.snapshot).map_err(|_| history_invalid())?;
+    if engine.frontier().as_bytes() != rows.snapshot_frontier {
+        return Err(history_invalid());
+    }
+
+    let history_upper = if to_seq == 0 && rows.head_seq > 0 { 1 } else { to_seq };
+    let mut expected_seq = 1_i64;
+    let mut running_frontier: Option<Vec<u8>> = None;
+    let mut from_frontier = None;
+    let mut to_frontier = None;
+    for row in rows.updates {
+        if row.seq != expected_seq
+            || running_frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier != &row.before_frontier)
+            || super::collab::bootstrap::content_hash(&row.bytes) != row.content_hash
+        {
+            return Err(history_invalid());
+        }
+        if row.seq == 1 {
+            if from_seq == 0 {
+                from_frontier = Some(Frontier::from_bytes(row.before_frontier.clone()));
+            }
+            if to_seq == 0 {
+                to_frontier = Some(Frontier::from_bytes(row.before_frontier.clone()));
+            }
+        }
+        if row.seq > rows.snapshot_seq && row.seq <= to_seq {
+            if engine.frontier().as_bytes() != row.before_frontier {
+                return Err(history_invalid());
+            }
+            engine.import_update(&row.bytes).map_err(|_| history_invalid())?;
+            if engine.frontier().as_bytes() != row.after_frontier {
+                return Err(history_invalid());
+            }
+        }
+        if row.seq == from_seq {
+            from_frontier = Some(Frontier::from_bytes(row.after_frontier.clone()));
+        }
+        if row.seq == to_seq {
+            to_frontier = Some(Frontier::from_bytes(row.after_frontier.clone()));
+        }
+        running_frontier = Some(row.after_frontier);
+        expected_seq = expected_seq.saturating_add(1);
+    }
+    if expected_seq != history_upper.saturating_add(1) {
+        return Err(history_invalid());
+    }
+    if rows.head_seq == 0 {
+        let initial = Frontier::from_bytes(rows.head_frontier);
+        from_frontier = Some(initial.clone());
+        to_frontier = Some(initial);
+    }
+
+    let Some(from_frontier) = from_frontier else {
+        return Err(history_invalid());
+    };
+    let Some(to_frontier) = to_frontier else {
+        return Err(history_invalid());
+    };
+    let from_engine = engine.fork_at_frontier(&from_frontier).map_err(|_| history_invalid())?;
+    let to_engine = engine.fork_at_frontier(&to_frontier).map_err(|_| history_invalid())?;
+    let from_snapshot = from_engine.semantic_snapshot().map_err(|_| history_invalid())?;
+    let to_snapshot = to_engine.semantic_snapshot().map_err(|_| history_invalid())?;
+    let from_title = from_engine.title().map_err(|_| history_invalid())?;
+    let to_title = to_engine.title().map_err(|_| history_invalid())?;
+
+    let rendered = (render == Render::Markdown).then(|| projection::render_markdown(&to_title));
+    let title_diff = (from_title != to_title).then(|| json!({ "before": from_title, "after": to_title }));
+    let response = ObjectDiffResponse {
+        object_id,
+        from_seq,
+        to_seq,
+        from_frontier: base64::engine::general_purpose::STANDARD.encode(from_frontier.as_bytes()),
+        to_frontier: base64::engine::general_purpose::STANDARD.encode(to_frontier.as_bytes()),
+        semantic_diff: json!({
+            "title": title_diff,
+            "nodes": from_snapshot.diff(&to_snapshot),
+        }),
+        rendered,
     };
     if !policy::ensure_epoch_current(state, access.context()).await? {
         return Ok(None);

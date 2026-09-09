@@ -154,6 +154,23 @@ pub struct HistoryResponse {
     pub next_before_seq: Option<i64>,
 }
 
+/// `GET /flow/objects/{object_id}/diff` response.
+///
+/// `semantic_diff` is assembled exclusively from `collab_core::SemanticSnapshot` values. It can
+/// contain logical node ids and semantic fields, but its type has no place for update bytes or
+/// engine peer ids. `rendered` is present only for `render=markdown`.
+#[derive(Debug, Serialize)]
+pub struct ObjectDiffResponse {
+    pub object_id: Uuid,
+    pub from_seq: i64,
+    pub to_seq: i64,
+    pub from_frontier: String,
+    pub to_frontier: String,
+    pub semantic_diff: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered: Option<String>,
+}
+
 /// `{flow_enabled,default_member_level,authz_epoch,updated_at,updated_by}` from `rest-api-v1.md`
 /// (`GET|PUT /workspaces/{workspace_id}/features/flow`).
 ///
