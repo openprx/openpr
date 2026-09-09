@@ -29,7 +29,7 @@
 
 #![allow(clippy::too_long_first_doc_paragraph, clippy::struct_field_names)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -193,10 +193,32 @@ pub struct AckFrontier {
 /// second index.
 struct ConnMeta {
     document_id: Uuid,
+    object_id: Uuid,
     user_id: Uuid,
     workspace_id: Uuid,
     /// The highest `ack` this session has sent, or `None` until it sends its first one.
     acked: Option<AckFrontier>,
+}
+
+#[derive(Default)]
+struct ConnectionRegistry {
+    by_session: HashMap<Uuid, ConnMeta>,
+    /// `object_id -> session_id`. This is deliberately separate from the document index: the two
+    /// UUIDs name different rows, and authorization mutations are addressed to the object.
+    by_object: HashMap<Uuid, HashSet<Uuid>>,
+    /// Highest committed authorization epoch this instance's post-commit revocation path has
+    /// observed for each workspace. It closes the open/revoke race: an open checked before a
+    /// revoke cannot register after the revoker has snapshotted the active set.
+    observed_workspace_epochs: HashMap<Uuid, i64>,
+}
+
+/// Immutable identity needed to re-evaluate and, if necessary, remove one active subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveSession {
+    pub session_id: Uuid,
+    pub document_id: Uuid,
+    pub object_id: Uuid,
+    pub user_id: Uuid,
 }
 
 /// Which `limits-v1.md` connection ceiling a [`SessionRegistry::try_register`] admission refused.
@@ -205,6 +227,15 @@ pub enum ConnectionLimit {
     PerUser,
     PerDocument,
     PerWorkspace,
+}
+
+/// Why an otherwise valid WebSocket open could not reserve a registry slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationError {
+    Limit(ConnectionLimit),
+    /// A permission check completed before a committed authorization change this process has
+    /// already observed. The caller must re-check instead of registering stale authority.
+    StaleAuthorization,
 }
 
 impl ConnectionLimit {
@@ -252,8 +283,9 @@ impl RegisteredSession {
 pub struct SessionRegistry {
     // document_id -> session_id -> handle
     sessions: Mutex<HashMap<Uuid, HashMap<Uuid, SessionHandle>>>,
-    // session_id -> connection metadata (`limits-v1.md` connection-ceiling accounting)
-    connections: Mutex<HashMap<Uuid, ConnMeta>>,
+    // Connection accounting, authorization reverse index, and observed epochs share one lock so
+    // registration/unregistration cannot expose a half-updated object index.
+    connections: Mutex<ConnectionRegistry>,
     // (document_id, session_id) -> presence
     presence: Mutex<HashMap<(Uuid, Uuid), PresenceEntry>>,
 }
@@ -299,38 +331,46 @@ impl SessionRegistry {
     /// against an at-capacity ceiling cannot both observe "room" and both be admitted.
     ///
     /// # Errors
-    /// The specific ceiling that was hit, so the caller can map it to the matching `limit_kind`.
+    /// The specific ceiling that was hit, or `StaleAuthorization` when a revocation committed
+    /// after this open's permission check.
     #[allow(clippy::significant_drop_tightening)] // guard held across check-then-insert by design
-    pub fn try_register(
+    pub fn try_register_authorized(
         &self,
         document_id: Uuid,
+        object_id: Uuid,
         user_id: Uuid,
         workspace_id: Uuid,
         session_id: Uuid,
-    ) -> Result<RegisteredSession, ConnectionLimit> {
+        checked_epoch: i64,
+    ) -> Result<RegisteredSession, RegistrationError> {
         let mut connections = self.connections.lock();
-        let per_user = connections.values().filter(|c| c.user_id == user_id).count();
+        if connections
+            .observed_workspace_epochs
+            .get(&workspace_id)
+            .is_some_and(|observed| checked_epoch < *observed)
+        {
+            return Err(RegistrationError::StaleAuthorization);
+        }
+        let per_user = connections.by_session.values().filter(|c| c.user_id == user_id).count();
         if u64::try_from(per_user).unwrap_or(u64::MAX) >= CONNECTIONS_PER_USER_MAX {
-            return Err(ConnectionLimit::PerUser);
+            return Err(RegistrationError::Limit(ConnectionLimit::PerUser));
         }
-        let per_document = connections.values().filter(|c| c.document_id == document_id).count();
+        let per_document = connections
+            .by_session
+            .values()
+            .filter(|c| c.document_id == document_id)
+            .count();
         if u64::try_from(per_document).unwrap_or(u64::MAX) >= CONNECTIONS_PER_DOCUMENT_MAX {
-            return Err(ConnectionLimit::PerDocument);
+            return Err(RegistrationError::Limit(ConnectionLimit::PerDocument));
         }
-        let per_workspace = connections.values().filter(|c| c.workspace_id == workspace_id).count();
+        let per_workspace = connections
+            .by_session
+            .values()
+            .filter(|c| c.workspace_id == workspace_id)
+            .count();
         if u64::try_from(per_workspace).unwrap_or(u64::MAX) >= CONNECTIONS_PER_WORKSPACE_MAX {
-            return Err(ConnectionLimit::PerWorkspace);
+            return Err(RegistrationError::Limit(ConnectionLimit::PerWorkspace));
         }
-        connections.insert(
-            session_id,
-            ConnMeta {
-                document_id,
-                user_id,
-                workspace_id,
-                acked: None,
-            },
-        );
-        drop(connections);
 
         let (sender, receiver) = mpsc::unbounded_channel();
         let queue = Arc::new(QueueState::default());
@@ -342,11 +382,50 @@ impl SessionRegistry {
                 queue: queue.clone(),
             },
         );
+        connections.by_session.insert(
+            session_id,
+            ConnMeta {
+                document_id,
+                object_id,
+                user_id,
+                workspace_id,
+                acked: None,
+            },
+        );
+        connections.by_object.entry(object_id).or_default().insert(session_id);
         Ok(RegisteredSession { receiver, queue })
+    }
+
+    /// Compact test-only adapter for the registry's pre-v0.5 call shape. Production must always
+    /// pass the real object id and checked epoch through [`Self::try_register_authorized`].
+    #[cfg(test)]
+    pub fn try_register(
+        &self,
+        document_id: Uuid,
+        user_id: Uuid,
+        workspace_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<RegisteredSession, ConnectionLimit> {
+        match self.try_register_authorized(document_id, document_id, user_id, workspace_id, session_id, 0) {
+            Ok(registered) => Ok(registered),
+            Err(RegistrationError::Limit(limit)) => Err(limit),
+            Err(RegistrationError::StaleAuthorization) => {
+                panic!("a fresh test registry unexpectedly rejected epoch zero as stale")
+            }
+        }
     }
 
     #[allow(clippy::significant_drop_tightening)] // guard used for two related mutations, not idle
     pub fn unregister(&self, document_id: Uuid, session_id: Uuid) {
+        let mut connections = self.connections.lock();
+        if let Some(meta) = connections.by_session.remove(&session_id)
+            && let Some(by_session) = connections.by_object.get_mut(&meta.object_id)
+        {
+            by_session.remove(&session_id);
+            if by_session.is_empty() {
+                connections.by_object.remove(&meta.object_id);
+            }
+        }
         let mut sessions = self.sessions.lock();
         if let Some(by_session) = sessions.get_mut(&document_id) {
             by_session.remove(&session_id);
@@ -355,8 +434,116 @@ impl SessionRegistry {
             }
         }
         drop(sessions);
-        self.connections.lock().remove(&session_id);
+        drop(connections);
         self.presence.lock().remove(&(document_id, session_id));
+    }
+
+    /// Records the committed epoch before snapshotting sessions in `object_ids`. Holding the same
+    /// lock registration uses makes the snapshot and the stale-open barrier one atomic action.
+    #[must_use]
+    pub fn observe_epoch_and_subtree_sessions(
+        &self,
+        workspace_id: Uuid,
+        committed_epoch: i64,
+        object_ids: &HashSet<Uuid>,
+    ) -> Vec<ActiveSession> {
+        let mut connections = self.connections.lock();
+        connections
+            .observed_workspace_epochs
+            .entry(workspace_id)
+            .and_modify(|epoch| *epoch = (*epoch).max(committed_epoch))
+            .or_insert(committed_epoch);
+        object_ids
+            .iter()
+            .filter_map(|object_id| connections.by_object.get(object_id))
+            .flat_map(|session_ids| session_ids.iter())
+            .filter_map(|session_id| {
+                let meta = connections.by_session.get(session_id)?;
+                (meta.workspace_id == workspace_id).then_some(ActiveSession {
+                    session_id: *session_id,
+                    document_id: meta.document_id,
+                    object_id: meta.object_id,
+                    user_id: meta.user_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Workspace-wide counterpart used for membership, baseline, and feature-flag changes.
+    #[must_use]
+    pub fn observe_epoch_and_workspace_sessions(&self, workspace_id: Uuid, committed_epoch: i64) -> Vec<ActiveSession> {
+        let mut connections = self.connections.lock();
+        connections
+            .observed_workspace_epochs
+            .entry(workspace_id)
+            .and_modify(|epoch| *epoch = (*epoch).max(committed_epoch))
+            .or_insert(committed_epoch);
+        connections
+            .by_session
+            .iter()
+            .filter_map(|(session_id, meta)| {
+                (meta.workspace_id == workspace_id).then_some(ActiveSession {
+                    session_id: *session_id,
+                    document_id: meta.document_id,
+                    object_id: meta.object_id,
+                    user_id: meta.user_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Deletes revoked sessions' presence independently of close delivery. This is intentionally
+    /// a separate operation so a failed/missing disconnect cannot retain presence until TTL.
+    pub fn remove_presence_for_sessions(&self, revoked: &[ActiveSession]) -> usize {
+        let mut presence = self.presence.lock();
+        revoked
+            .iter()
+            .filter(|session| presence.remove(&(session.document_id, session.session_id)).is_some())
+            .count()
+    }
+
+    /// Removes revoked subscriptions from every live-session index, then best-effort sends the
+    /// fixed close. Once removed, they cannot receive later document/presence broadcasts even if
+    /// their socket writer has already disappeared.
+    pub fn disconnect_authorization_sessions(&self, revoked: &[ActiveSession], code: u16, reason: &str) -> usize {
+        let mut connections = self.connections.lock();
+        let mut sessions = self.sessions.lock();
+        let mut handles = Vec::with_capacity(revoked.len());
+        for revoked_session in revoked {
+            let matches = connections
+                .by_session
+                .get(&revoked_session.session_id)
+                .is_some_and(|meta| {
+                    meta.document_id == revoked_session.document_id && meta.object_id == revoked_session.object_id
+                });
+            if !matches {
+                continue;
+            }
+            connections.by_session.remove(&revoked_session.session_id);
+            if let Some(by_session) = connections.by_object.get_mut(&revoked_session.object_id) {
+                by_session.remove(&revoked_session.session_id);
+                if by_session.is_empty() {
+                    connections.by_object.remove(&revoked_session.object_id);
+                }
+            }
+            if let Some(by_session) = sessions.get_mut(&revoked_session.document_id) {
+                if let Some(handle) = by_session.remove(&revoked_session.session_id) {
+                    handles.push(handle);
+                }
+                if by_session.is_empty() {
+                    sessions.remove(&revoked_session.document_id);
+                }
+            }
+        }
+        drop(sessions);
+        drop(connections);
+        for handle in &handles {
+            handle.send(OutboundEvent::Close {
+                code,
+                reason: reason.to_string(),
+            });
+        }
+        handles.len()
     }
 
     /// Sends `frame` to every session with `document_id` open other than `exclude`, each through
@@ -440,6 +627,7 @@ impl SessionRegistry {
         let member_sessions: HashMap<Uuid, Uuid> = self
             .connections
             .lock()
+            .by_session
             .iter()
             .filter(|(_, meta)| meta.workspace_id == workspace_id)
             .map(|(session_id, meta)| (*session_id, meta.document_id))
@@ -486,7 +674,7 @@ impl SessionRegistry {
     #[allow(clippy::significant_drop_tightening)] // guard held across the read-then-update by design
     pub fn record_ack(&self, session_id: Uuid, seq: i64, frontier: String) -> bool {
         let mut connections = self.connections.lock();
-        let Some(meta) = connections.get_mut(&session_id) else {
+        let Some(meta) = connections.by_session.get_mut(&session_id) else {
             return false;
         };
         if meta.acked.as_ref().is_some_and(|current| seq <= current.seq) {
@@ -500,7 +688,7 @@ impl SessionRegistry {
     /// is no longer registered).
     #[must_use]
     pub fn acked(&self, session_id: Uuid) -> Option<AckFrontier> {
-        self.connections.lock().get(&session_id)?.acked.clone()
+        self.connections.lock().by_session.get(&session_id)?.acked.clone()
     }
 
     /// The live presence entries for `document_id`, excluding `exclude` (the session that is about
@@ -577,10 +765,12 @@ impl SessionRegistry {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{
         CONNECTIONS_PER_DOCUMENT_MAX, CONNECTIONS_PER_USER_MAX, CONNECTIONS_PER_WORKSPACE_MAX, ConnectionLimit,
         OutboundEvent, PRESENCE_ENTRIES_PER_CONNECTION_MAX, PRESENCE_ENTRIES_PER_DOCUMENT_MAX, PresenceLimit,
-        SLOW_CONSUMER_QUEUE_BYTES_MAX, SLOW_CONSUMER_QUEUE_FRAMES_MAX, SessionRegistry,
+        RegistrationError, SLOW_CONSUMER_QUEUE_BYTES_MAX, SLOW_CONSUMER_QUEUE_FRAMES_MAX, SessionRegistry,
     };
     use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
     use serde_json::{Value, json};
@@ -1049,5 +1239,131 @@ mod tests {
             other.receiver.try_recv().is_err(),
             "a different workspace's session must not be touched"
         );
+    }
+
+    #[test]
+    fn object_reverse_index_and_stale_open_barrier_follow_the_connection_lifecycle() {
+        let registry = SessionRegistry::new();
+        let workspace_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let _registered = registry
+            .try_register_authorized(document_id, object_id, user_id, workspace_id, session_id, 7)
+            .expect("current authorization registers");
+
+        let objects = HashSet::from([object_id]);
+        let active = registry.observe_epoch_and_subtree_sessions(workspace_id, 8, &objects);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].object_id, object_id);
+        assert_eq!(
+            active[0].document_id, document_id,
+            "object and document ids stay distinct"
+        );
+
+        assert!(matches!(
+            registry.try_register_authorized(
+                Uuid::new_v4(),
+                object_id,
+                Uuid::new_v4(),
+                workspace_id,
+                Uuid::new_v4(),
+                7,
+            ),
+            Err(RegistrationError::StaleAuthorization)
+        ));
+
+        registry.unregister(document_id, session_id);
+        assert!(
+            registry
+                .observe_epoch_and_subtree_sessions(workspace_id, 8, &objects)
+                .is_empty(),
+            "unregister must remove the object reverse-index member, not leave a dangling entry"
+        );
+        assert_eq!(registry.session_count(document_id), 0);
+    }
+
+    #[test]
+    fn authorization_presence_cleanup_is_independent_and_revoked_session_leaves_fanout() {
+        let registry = SessionRegistry::new();
+        let workspace_id = Uuid::new_v4();
+        let object_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let revoked_session_id = Uuid::new_v4();
+        let survivor_session_id = Uuid::new_v4();
+        let mut revoked = registry
+            .try_register_authorized(
+                document_id,
+                object_id,
+                Uuid::new_v4(),
+                workspace_id,
+                revoked_session_id,
+                3,
+            )
+            .expect("revoked fixture registers");
+        let _survivor = registry
+            .try_register_authorized(
+                document_id,
+                object_id,
+                Uuid::new_v4(),
+                workspace_id,
+                survivor_session_id,
+                3,
+            )
+            .expect("survivor fixture registers");
+        for session_id in [revoked_session_id, survivor_session_id] {
+            registry
+                .upsert_presence(
+                    document_id,
+                    session_id,
+                    json!({"cursor": session_id}),
+                    Duration::from_secs(30),
+                )
+                .expect("presence is accepted");
+        }
+
+        let candidates = registry.observe_epoch_and_workspace_sessions(workspace_id, 4);
+        let revoked_candidate = candidates
+            .into_iter()
+            .find(|candidate| candidate.session_id == revoked_session_id)
+            .expect("reverse index finds the revoked session");
+
+        assert_eq!(registry.remove_presence_for_sessions(&[revoked_candidate]), 1);
+        assert_eq!(registry.presence_count(document_id), 1);
+        assert!(
+            revoked.receiver.try_recv().is_err(),
+            "presence deletion must happen before and independently of close delivery"
+        );
+
+        assert_eq!(
+            registry.disconnect_authorization_sessions(&[revoked_candidate], 4403, "authorization revoked"),
+            1
+        );
+        let close_event = revoked.receiver.try_recv().expect("close is queued");
+        let OutboundEvent::Close { code, reason } = close_event else {
+            panic!("expected an authorization close")
+        };
+        assert_eq!(code, 4403);
+        assert_eq!(reason, "authorization revoked");
+        assert!(!reason.contains(&object_id.to_string()));
+        assert!(!reason.contains(&revoked_session_id.to_string()));
+
+        registry.broadcast(
+            document_id,
+            &Frame::Presence {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                session_id: survivor_session_id,
+                payload: json!({"cursor": "later"}),
+                ttl_seconds: Some(30),
+            },
+            Some(survivor_session_id),
+        );
+        assert!(
+            revoked.receiver.try_recv().is_err(),
+            "a revoked session removed from the document index must receive no later presence fan-out"
+        );
+        assert_eq!(registry.session_count(document_id), 1);
     }
 }

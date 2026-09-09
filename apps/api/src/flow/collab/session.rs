@@ -26,7 +26,7 @@ use super::limits::{
     PRESENCE_TTL_SECONDS_MAX, RATE_LIMIT_RETRY_AFTER_MS, UPDATE_BURST_MAX, UPDATES_PER_CONNECTION_PER_SECOND,
     WEBSOCKET_FRAME_BYTES_MAX,
 };
-use super::registry::{ConnectionLimit, OutboundEvent, PresenceLimit};
+use super::registry::{ConnectionLimit, OutboundEvent, PresenceLimit, RegistrationError};
 use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
@@ -746,18 +746,31 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     // no counting to do: v0.4 scopes one WebSocket connection to exactly the one `document_id` its
     // ticket was issued for (`frame.rs`'s own doc comment), so that ceiling is met structurally by
     // every connection, not enforced by counting.
-    let mut registered =
-        match collab
-            .registry
-            .try_register(document_id, consumed.user_id, consumed.workspace_id, session_id)
-        {
-            Ok(registered) => registered,
-            Err(limit) => {
-                send(&mut socket, &connection_limit_frame(document_id, limit)).await;
-                close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
-                return;
-            }
-        };
+    let mut registered = match collab.registry.try_register_authorized(
+        document_id,
+        ctx.object_id,
+        consumed.user_id,
+        consumed.workspace_id,
+        session_id,
+        ctx.checked_epoch,
+    ) {
+        Ok(registered) => registered,
+        Err(RegistrationError::Limit(limit)) => {
+            send(&mut socket, &connection_limit_frame(document_id, limit)).await;
+            close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
+            return;
+        }
+        Err(RegistrationError::StaleAuthorization) => {
+            reject_and_close(
+                &mut socket,
+                document_id,
+                RejectedCode::Forbidden,
+                "authorization changed",
+            )
+            .await;
+            return;
+        }
+    };
     // The "join" half of presence fan-out. `SessionRegistry::broadcast` only reaches sessions that
     // were already connected when a peer's `presence` frame arrived, so without this a session
     // joining a document sees an empty document until every peer happens to refresh — up to a full
