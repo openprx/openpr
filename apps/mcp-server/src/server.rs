@@ -2379,7 +2379,20 @@ mod tests {
 
     #[test]
     fn embedded_skill_guide_matches_registered_universal_tool_surface() {
-        assert!(SKILL_GUIDE_MD.contains("## Tools ("));
+        let heading = SKILL_GUIDE_MD
+            .lines()
+            .find(|line| line.starts_with("## Tools ("))
+            .expect("the embedded guide must declare its tool count heading");
+        let declared_count = heading
+            .strip_prefix("## Tools (")
+            .and_then(|tail| tail.strip_suffix(')'))
+            .and_then(|count| count.parse::<usize>().ok())
+            .expect("the embedded guide tool heading must contain one integer");
+        assert_eq!(
+            declared_count,
+            crate::tools::get_all_tool_definitions().len(),
+            "the embedded guide heading must equal the live MCP registry count"
+        );
         assert!(SKILL_GUIDE_MD.contains("bot_operation_logs.list"));
         assert!(SKILL_GUIDE_MD.contains("scenario_templates.install"));
         assert!(SKILL_GUIDE_MD.contains("forms.list"));
