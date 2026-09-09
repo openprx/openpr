@@ -20,11 +20,13 @@ use super::collab::frame::TailUpdate;
 use super::collab::{limits, runtime};
 use super::model::{
     Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse,
-    ObjectDiffResponse,
+    ObjectDiffResponse, ProjectionLagItem, ProjectionLagResponse,
 };
 use super::policy::{self, AuthorizedFlowObject, FlowReadContext};
 use super::projection;
-use super::repository::{self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow};
+use super::repository::{
+    self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow, ProjectionLagFilter, ProjectionLagRow,
+};
 
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
 pub const MAX_LIST_LIMIT: u64 = 100;
@@ -99,6 +101,51 @@ async fn scan_objects_within_budget(
             examined += 1;
             check_scan_budget(examined)?;
             filter.after = Some((row.created_at, row.id));
+            if is_visible {
+                accepted.push(row);
+                if accepted.len() >= needed {
+                    return Ok(Some(accepted));
+                }
+            }
+        }
+        if (batch_len as u64) < SCAN_BATCH_SIZE {
+            return Ok(Some(accepted));
+        }
+    }
+}
+
+/// Projection-lag counterpart of [`scan_objects_within_budget`]. Every candidate batch is sent
+/// through the shared batch evaluator before a row can reach either `items` or the aggregate
+/// input. Hidden rows advance only the internal scan cursor and candidate budget.
+async fn scan_projection_lag_within_budget(
+    state: &AppState,
+    access: &FlowReadContext,
+    mut filter: ProjectionLagFilter,
+    needed: usize,
+) -> Result<Option<Vec<ProjectionLagRow>>, ApiError> {
+    let mut accepted = Vec::new();
+    let mut examined = 0_u64;
+    loop {
+        filter.limit = SCAN_BATCH_SIZE;
+        let batch = repository::list_projection_lag_candidates(&state.db, &filter).await?;
+        let batch_len = batch.len();
+        if batch_len == 0 {
+            return Ok(Some(accepted));
+        }
+        let object_ids: Vec<Uuid> = batch.iter().map(|row| row.object_id).collect();
+        let Some(visible) =
+            policy::authorize_flow_objects(state, access, &object_ids, super::collab::authz::PermissionLevel::View)
+                .await?
+        else {
+            return Ok(None);
+        };
+        if visible.len() != batch_len {
+            return Err(ApiError::Internal);
+        }
+        for (row, is_visible) in batch.into_iter().zip(visible) {
+            examined = examined.saturating_add(1);
+            check_scan_budget(examined)?;
+            filter.after = Some((row.created_at, row.object_id));
             if is_visible {
                 accepted.push(row);
                 if accepted.len() >= needed {
@@ -589,6 +636,83 @@ pub async fn get_object_diff(
     Ok(Some(response))
 }
 
+pub struct ProjectionLagParams {
+    pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub cursor: Option<String>,
+    pub limit: Option<u64>,
+}
+
+/// Aggregates one already-policy-filtered response page.
+///
+/// `p95_lag` uses the nearest-rank definition: sort ascending and select rank
+/// `ceil(0.95 * n)` (one-based). An empty page returns `(0, 0)`; for 1 through 19 samples that
+/// rank is the final sample, so p95 equals the page maximum. Both values are computed only after
+/// authorization and page truncation, making an inaccessible object's lag incapable of changing
+/// even an aggregate field.
+fn projection_lag_aggregates(items: &[ProjectionLagItem]) -> (i64, i64) {
+    if items.is_empty() {
+        return (0, 0);
+    }
+    let mut lags: Vec<i64> = items.iter().map(|item| item.lag).collect();
+    lags.sort_unstable();
+    let max_lag = lags.last().copied().unwrap_or(0);
+    let rank = lags.len().saturating_mul(95).div_ceil(100);
+    let p95_lag = lags.get(rank.saturating_sub(1)).copied().unwrap_or(0);
+    (max_lag, p95_lag)
+}
+
+/// `GET /workspaces/{workspace_id}/flow/projection-lag` domain read.
+pub async fn get_projection_lag(
+    state: &AppState,
+    access: &FlowReadContext,
+    params: ProjectionLagParams,
+) -> Result<Option<ProjectionLagResponse>, ApiError> {
+    if params.workspace_id != access.workspace_id() {
+        return Err(ApiError::Internal);
+    }
+    runtime::runtime().ensure_workspace_accepting(params.workspace_id)?;
+    let limit = validate_limit(params.limit)?;
+    let after = params.cursor.as_deref().map(decode_cursor).transpose()?;
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let needed = limit_usize.saturating_add(1);
+    let filter = ProjectionLagFilter {
+        workspace_id: params.workspace_id,
+        project_id: params.project_id,
+        after,
+        limit: 0,
+    };
+    let Some(mut rows) = scan_projection_lag_within_budget(state, access, filter, needed).await? else {
+        return Ok(None);
+    };
+    if !policy::ensure_epoch_current(state, access).await? {
+        return Ok(None);
+    }
+
+    let next_cursor = if rows.len() > limit_usize {
+        rows.truncate(limit_usize);
+        rows.last().map(|row| encode_cursor(row.created_at, row.object_id))
+    } else {
+        None
+    };
+    let items: Vec<ProjectionLagItem> = rows
+        .into_iter()
+        .map(|row| ProjectionLagItem {
+            object_id: row.object_id,
+            head_seq: row.head_seq,
+            projection_seq: row.projection_seq,
+            lag: row.head_seq - row.projection_seq,
+        })
+        .collect();
+    let (max_lag, p95_lag) = projection_lag_aggregates(&items);
+    Ok(Some(ProjectionLagResponse {
+        max_lag,
+        p95_lag,
+        items,
+        next_cursor,
+    }))
+}
+
 /// Row-to-wire mapping shared by the `GET` handler and `command::set_flow_feature`'s response.
 ///
 /// `None` (never-provisioned workspace) maps to the column defaults with `updated_at`/`updated_by`
@@ -682,5 +806,33 @@ mod tests {
     #[test]
     fn check_scan_budget_accepts_one_row_before_the_authorized_scan_rows_max_boundary() {
         assert!(check_scan_budget(limits::AUTHORIZED_SCAN_ROWS_MAX - 1).is_ok());
+    }
+
+    fn lag_item(lag: i64) -> ProjectionLagItem {
+        ProjectionLagItem {
+            object_id: Uuid::nil(),
+            head_seq: lag,
+            projection_seq: 0,
+            lag,
+        }
+    }
+
+    #[test]
+    fn projection_lag_p95_is_nearest_rank_with_explicit_small_sample_behavior() {
+        assert_eq!(projection_lag_aggregates(&[]), (0, 0));
+        assert_eq!(projection_lag_aggregates(&[lag_item(7)]), (7, 7));
+        assert_eq!(
+            projection_lag_aggregates(&(0..19).map(lag_item).collect::<Vec<_>>()),
+            (18, 18),
+            "fewer than twenty samples use the maximum as nearest-rank p95"
+        );
+
+        let mut twenty: Vec<ProjectionLagItem> = (0..19).map(lag_item).collect();
+        twenty.push(lag_item(10_000));
+        assert_eq!(
+            projection_lag_aggregates(&twenty),
+            (10_000, 18),
+            "at twenty samples the single largest outlier is above nearest-rank p95"
+        );
     }
 }

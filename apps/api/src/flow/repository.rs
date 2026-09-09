@@ -233,6 +233,62 @@ pub async fn list_objects<C: ConnectionTrait>(conn: &C, filter: &ListFilter) -> 
     )
 }
 
+/// Candidate metadata for the projection-lag endpoint. Deliberately contains no projection
+/// content, document bytes, or filtering counts.
+#[derive(Debug, FromQueryResult)]
+pub struct ProjectionLagRow {
+    pub object_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub head_seq: i64,
+    pub projection_seq: i64,
+}
+
+pub struct ProjectionLagFilter {
+    pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub after: Option<(DateTime<Utc>, Uuid)>,
+    pub limit: u64,
+}
+
+/// Reads one stable keyset page of projection-lag candidates before policy filtering.
+///
+/// `DeclaredProject?` is fail-closed: a declared project selects exactly that project; omission
+/// selects only `project_id IS NULL` objects rather than silently widening to the whole workspace.
+pub async fn list_projection_lag_candidates<C: ConnectionTrait>(
+    conn: &C,
+    filter: &ProjectionLagFilter,
+) -> Result<Vec<ProjectionLagRow>, ApiError> {
+    let mut sql = String::from(
+        "SELECT fo.id AS object_id, fo.created_at, cd.head_seq, p.document_seq AS projection_seq \
+           FROM flow_objects fo \
+           JOIN collab_documents cd ON cd.object_id = fo.id \
+           JOIN flow_object_projections p ON p.object_id = fo.id \
+          WHERE fo.workspace_id = $1",
+    );
+    let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
+    if let Some(project_id) = filter.project_id {
+        values.push(project_id.into());
+        let _ = write!(sql, " AND fo.project_id = ${}", values.len());
+    } else {
+        sql.push_str(" AND fo.project_id IS NULL");
+    }
+    if let Some((created_at, id)) = filter.after {
+        values.push(created_at.into());
+        let created_at_index = values.len();
+        values.push(id.into());
+        let id_index = values.len();
+        let _ = write!(sql, " AND (fo.created_at, fo.id) > (${created_at_index}, ${id_index})");
+    }
+    values.push(i64::try_from(filter.limit).unwrap_or(i64::MAX).into());
+    let _ = write!(sql, " ORDER BY fo.created_at, fo.id LIMIT ${}", values.len());
+
+    Ok(
+        ProjectionLagRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .all(conn)
+            .await?,
+    )
+}
+
 pub async fn fetch_flow_enabled<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<bool, ApiError> {
     #[derive(FromQueryResult)]
     struct Row {

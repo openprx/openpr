@@ -15,6 +15,7 @@
 //! PUT  /api/v1/flow/objects/{object_id}/inheritance
 //! GET  /api/v1/flow/objects/{object_id}/history
 //! GET  /api/v1/flow/objects/{object_id}/diff
+//! GET  /api/v1/workspaces/{workspace_id}/flow/projection-lag
 //! GET  /api/v1/workspaces/{workspace_id}/features/flow
 //! PUT  /api/v1/workspaces/{workspace_id}/features/flow
 //! ```
@@ -504,6 +505,46 @@ pub async fn get_flow_object_diff(
     Err(policy::authorization_read_unstable())
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ProjectionLagQuery {
+    pub project_id: Option<Uuid>,
+    pub cursor: Option<String>,
+    pub limit: Option<u64>,
+}
+
+/// `GET /api/v1/workspaces/{workspace_id}/flow/projection-lag`.
+///
+/// Workspace membership starts WP-10's shared read context; the domain layer batch-authorizes
+/// every candidate object and rechecks the epoch before returning any page or aggregate.
+pub async fn get_flow_projection_lag(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Query(params): Query<ProjectionLagQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let access = policy::begin_flow_read(&state, &extensions, workspace_id).await?;
+        let Some(response) = query::get_projection_lag(
+            &state,
+            &access,
+            query::ProjectionLagParams {
+                workspace_id,
+                project_id: params.project_id,
+                cursor: params.cursor.clone(),
+                limit: params.limit,
+            },
+        )
+        .await?
+        else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response));
+    }
+    Err(policy::authorization_read_unstable())
+}
+
 /// `GET /api/v1/workspaces/{workspace_id}/features/flow`.
 ///
 /// Plain workspace membership (`policy::require_flow_feature_read_access`), *not*
@@ -595,10 +636,10 @@ mod flow_database_tests {
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectDiffQuery,
         FlowObjectHistoryQuery, FlowRelationsQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery,
-        ListFlowObjectsQuery, SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, get_flow_feature,
-        get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
-        get_flow_object_history, get_flow_object_relations, list_flow_objects, post_flow_object_command,
-        put_flow_object_grants, put_flow_object_inheritance, set_flow_feature,
+        ListFlowObjectsQuery, ProjectionLagQuery, SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object,
+        get_flow_feature, get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
+        get_flow_object_history, get_flow_object_relations, get_flow_projection_lag, list_flow_objects,
+        post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance, set_flow_feature,
     };
     use crate::error::ApiError;
     use crate::flow::collab::{
@@ -2597,6 +2638,7 @@ mod flow_database_tests {
     /// comes back on demand, all three range failures are typed and never clamped, and a policy
     /// boundary makes an existing object indistinguishable from an absent one.
     #[tokio::test]
+    #[allow(clippy::items_after_statements)]
     async fn diff_is_semantic_range_strict_and_policy_collapsed() {
         let scratch = scratch_or_skip!("diff-contract");
         let state = state_for(scratch.db.clone());
@@ -2788,6 +2830,158 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(missing_seq["error_code"], "resync_required", "{missing_seq}");
+
+        scratch.drop_self().await;
+    }
+
+    /// WP-12's side-channel regression fixture deliberately puts a no-grant authorization
+    /// boundary on the highest-lag object. It also places that hidden candidate between the last
+    /// returned object and the overfetched next visible object, so a cursor derived from internal
+    /// scan progress (instead of the actual returned row) makes page two skip data and fail.
+    #[tokio::test]
+    #[allow(clippy::items_after_statements)]
+    async fn projection_lag_filters_before_aggregating_and_cursors_from_returned_rows() {
+        let scratch = scratch_or_skip!("projection-lag-contract");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+
+        let visible_a = create_page_as_owner(&state, workspace_id, owner_id, "visible a").await;
+        let visible_b = create_page_as_owner(&state, workspace_id, owner_id, "visible b").await;
+        let hidden = create_page_as_owner(&state, workspace_id, owner_id, "hidden huge lag").await;
+        let visible_c = create_page_as_owner(&state, workspace_id, owner_id, "visible c").await;
+
+        async fn set_lag(state: &AppState, object_id: Uuid, head_seq: i64, projection_seq: i64, ordinal: i64) {
+            exec(
+                state,
+                "UPDATE collab_documents SET head_seq = $2 WHERE object_id = $1",
+                vec![object_id.into(), head_seq.into()],
+            )
+            .await;
+            exec(
+                state,
+                "UPDATE flow_object_projections SET document_seq = $2 WHERE object_id = $1",
+                vec![object_id.into(), projection_seq.into()],
+            )
+            .await;
+            exec(
+                state,
+                "UPDATE flow_objects SET created_at = TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => $2::int) WHERE id = $1",
+                vec![object_id.into(), ordinal.into()],
+            )
+            .await;
+        }
+
+        set_lag(&state, visible_a, 5, 3, 1).await;
+        set_lag(&state, visible_b, 10, 3, 2).await;
+        set_lag(&state, hidden, 10_000, 0, 3).await;
+        set_lag(&state, visible_c, 9, 8, 4).await;
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![hidden.into()],
+        )
+        .await;
+
+        let first = body_json(to_response(
+            get_flow_projection_lag(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ProjectionLagQuery {
+                    project_id: None,
+                    cursor: None,
+                    limit: Some(2),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(first["code"], 0, "{first}");
+        let first_data = first["data"].as_object().expect("response data is an object");
+        let first_keys: std::collections::BTreeSet<&str> = first_data.keys().map(String::as_str).collect();
+        assert_eq!(
+            first_keys,
+            ["items", "max_lag", "next_cursor", "p95_lag"].into_iter().collect(),
+            "pre-filter totals/counts must not become response fields: {first}"
+        );
+        assert_eq!(first["data"]["max_lag"], 7, "hidden lag leaked into max: {first}");
+        assert_eq!(first["data"]["p95_lag"], 7, "hidden lag leaked into p95: {first}");
+        assert_eq!(first["data"]["items"].as_array().expect("items").len(), 2);
+        assert_eq!(first["data"]["items"][0]["object_id"], visible_a.to_string());
+        assert_eq!(first["data"]["items"][0]["head_seq"], 5);
+        assert_eq!(first["data"]["items"][0]["projection_seq"], 3);
+        assert_eq!(first["data"]["items"][0]["lag"], 2);
+        assert_eq!(first["data"]["items"][1]["object_id"], visible_b.to_string());
+        assert_eq!(first["data"]["items"][1]["lag"], 7);
+        let serialized = first["data"].to_string();
+        let hidden_text = hidden.to_string();
+        for forbidden in [
+            "content",
+            "bytes",
+            "total",
+            "filtered_count",
+            "examined",
+            hidden_text.as_str(),
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "projection lag leaked `{forbidden}`: {serialized}"
+            );
+        }
+
+        let cursor = first["data"]["next_cursor"]
+            .as_str()
+            .expect("overfetch found another visible row")
+            .to_string();
+        let second = body_json(to_response(
+            get_flow_projection_lag(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ProjectionLagQuery {
+                    project_id: None,
+                    cursor: Some(cursor),
+                    limit: Some(2),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(second["code"], 0, "{second}");
+        assert_eq!(second["data"]["items"].as_array().expect("items").len(), 1, "{second}");
+        assert_eq!(
+            second["data"]["items"][0]["object_id"],
+            visible_c.to_string(),
+            "{second}"
+        );
+        assert_eq!(second["data"]["max_lag"], 1, "{second}");
+        assert_eq!(second["data"]["p95_lag"], 1, "{second}");
+        assert!(second["data"]["next_cursor"].is_null(), "{second}");
+
+        let over_limit = body_json(to_response(
+            get_flow_projection_lag(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ProjectionLagQuery {
+                    project_id: None,
+                    cursor: None,
+                    limit: Some(101),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            over_limit["error_code"], "limit_exceeded",
+            "limit was silently clamped: {over_limit}"
+        );
+        assert_eq!(over_limit["details"]["limit"], 100, "{over_limit}");
+        assert_eq!(over_limit["details"]["observed"], 101, "{over_limit}");
 
         scratch.drop_self().await;
     }

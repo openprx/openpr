@@ -171,6 +171,28 @@ pub struct ObjectDiffResponse {
     pub rendered: Option<String>,
 }
 
+/// Policy-visible metadata for one object in `GET .../projection-lag`.
+#[derive(Debug, Serialize)]
+pub struct ProjectionLagItem {
+    pub object_id: Uuid,
+    pub head_seq: i64,
+    pub projection_seq: i64,
+    pub lag: i64,
+}
+
+/// `GET /workspaces/{workspace_id}/flow/projection-lag` response.
+///
+/// No pre-filter cardinality is represented in this type, so `total`, `filtered_count`, and
+/// `examined` cannot accidentally become wire fields.
+#[derive(Debug, Serialize)]
+pub struct ProjectionLagResponse {
+    pub max_lag: i64,
+    pub p95_lag: i64,
+    pub items: Vec<ProjectionLagItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 /// `{flow_enabled,default_member_level,authz_epoch,updated_at,updated_by}` from `rest-api-v1.md`
 /// (`GET|PUT /workspaces/{workspace_id}/features/flow`).
 ///
