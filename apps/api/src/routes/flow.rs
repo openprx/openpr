@@ -3166,6 +3166,81 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
+    /// Frontier computation is a database aggregate, not candidate overfetch. A large active
+    /// scope with one actual full-text match must remain searchable; applying the 1,000-row
+    /// overfetch budget to every object in the scope makes this fixture fail with
+    /// `limit_exceeded` before it can return the one hit.
+    #[tokio::test]
+    async fn flow_search_large_scope_with_one_match_does_not_spend_candidate_scan_budget_on_frontier() {
+        let scratch = scratch_or_skip!("flow-search-large-scope");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let matching = create_page_as_owner(&state, workspace_id, owner_id, "unique-frontier-needle").await;
+        index_accepted_projection(&state, matching).await;
+
+        exec(
+            &state,
+            "CREATE TABLE flow_search_bulk_ids AS \
+             SELECT gen_random_uuid() AS id FROM generate_series(1, $1::int)",
+            vec![1_001_i64.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO flow_objects (id, workspace_id, object_type, created_by, updated_by) \
+             SELECT id, $1, 'page', $2, $2 FROM flow_search_bulk_ids",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO collab_documents \
+                (object_id, format_version, snapshot, snapshot_frontier, head_frontier) \
+             SELECT b.id, d.format_version, d.snapshot, d.snapshot_frontier, d.head_frontier \
+               FROM flow_search_bulk_ids b \
+               CROSS JOIN collab_documents d \
+              WHERE d.object_id = $1",
+            vec![matching.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO flow_object_projections \
+                (object_id, document_seq, document_frontier, title, plain_text) \
+             SELECT id, 0, $1, 'filler object', 'does not match the query' \
+               FROM flow_search_bulk_ids",
+            vec![Vec::<u8>::new().into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO flow_search_index \
+                (object_id, indexed_seq, indexed_frontier, title, plain_text) \
+             SELECT object_id, document_seq, document_frontier, title, plain_text \
+               FROM flow_object_projections \
+              WHERE object_id IN (SELECT id FROM flow_search_bulk_ids)",
+            Vec::new(),
+        )
+        .await;
+
+        let response = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(search_query("unique-frontier-needle")),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(response["code"], 0, "{response}");
+        assert_eq!(response["data"]["items"].as_array().expect("items").len(), 1);
+        assert_eq!(response["data"]["items"][0]["object"]["id"], matching.to_string());
+
+        scratch.drop_self().await;
+    }
+
     /// The visible object's old accepted index remains the only source of title/snippet while
     /// lagging. `require_current` refuses the same scope, and a stale no-grant object cannot make
     /// a member's policy-filtered frontier stale.

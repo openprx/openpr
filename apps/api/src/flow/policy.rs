@@ -66,6 +66,21 @@ impl FlowReadContext {
     pub const fn is_bot(&self) -> bool {
         matches!(self.principal_kind, PrincipalKind::Bot)
     }
+
+    #[must_use]
+    pub(super) const fn actor_id(&self) -> Uuid {
+        self.actor_id
+    }
+
+    #[must_use]
+    pub(super) const fn principal_kind(&self) -> PrincipalKind {
+        self.principal_kind
+    }
+
+    #[must_use]
+    pub(super) fn is_human_admin(&self) -> bool {
+        self.principal_kind == PrincipalKind::User && matches!(self.role.as_str(), "owner" | "admin")
+    }
 }
 
 /// Workspace membership (`unauthenticated`/`forbidden`/`not_found` per `error-mapping-v1.md`)

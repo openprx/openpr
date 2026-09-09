@@ -99,13 +99,13 @@ pub const OBJECT_GRANTS_MAX: usize = 100;
 /// `tree_depth_max`. Depth is counted the way `collab_core::limits::depth_of` counts it — a root
 /// object has depth 0 and its direct child depth 1 — so this is a bound on `parent_id` *hops*,
 /// not on nodes.
-const TREE_DEPTH_MAX: usize = 32;
+pub(crate) const TREE_DEPTH_MAX: usize = 32;
 
 /// Nodes in a chain that sits exactly at [`TREE_DEPTH_MAX`]: depths `0..=32`, i.e. 33 rows joined
 /// by 32 hops. `gates/gate-commands.md` requires `depth=32` — and an authorization boundary
 /// landing exactly on the deepest node — to be evaluated *in full*, so this many nodes is legal
 /// and must never be truncated ("不得以性能为由把鉴权深度降回 20").
-const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 1;
+pub(crate) const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 1;
 
 struct ChainNode {
     id: Uuid,

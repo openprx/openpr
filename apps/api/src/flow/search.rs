@@ -2,16 +2,14 @@
 //!
 //! Candidate snippets are read only from `flow_search_index`, which the worker copies from
 //! accepted `flow_object_projections`. Every candidate is reauthorized at the request epoch and
-//! the caller cursor is derived only from returned rows. This module intentionally contains no
-//! tracing call: query text, snippets, candidate ids, and pre-filter cardinality must not enter
-//! logs.
+//! the caller cursor is derived only from returned rows. Request-span logging is sanitized by the
+//! global trace layer; this module adds no content, candidate-id, or pre-filter cardinality logs.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
-use chrono::{DateTime, Utc};
 use platform::app::AppState;
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
@@ -160,110 +158,118 @@ fn add_object_type_predicate(
 }
 
 #[derive(Debug, FromQueryResult)]
-struct FrontierRow {
-    object_id: Uuid,
-    created_at: DateTime<Utc>,
+struct FrontierAggregateRow {
+    indexed_seq: i64,
     head_seq: i64,
-    projection_seq: i64,
-    projection_frontier: Vec<u8>,
-    indexed_seq: Option<i64>,
-    indexed_frontier: Option<Vec<u8>>,
-    indexed_title: Option<String>,
-    indexed_plain_text: Option<String>,
-    projection_title: String,
-    projection_plain_text: String,
-}
-
-async fn fetch_frontier_batch(
-    state: &AppState,
-    search: &ValidatedSearch,
-    after: Option<(DateTime<Utc>, Uuid)>,
-) -> Result<Vec<FrontierRow>, ApiError> {
-    let mut values: Vec<sea_orm::Value> = vec![search.workspace_id.into()];
-    let mut sql = String::from(
-        "SELECT fo.id AS object_id, fo.created_at, cd.head_seq, \
-                p.document_seq AS projection_seq, p.document_frontier AS projection_frontier, \
-                p.title AS projection_title, p.plain_text AS projection_plain_text, \
-                si.indexed_seq, si.indexed_frontier, si.title AS indexed_title, \
-                si.plain_text AS indexed_plain_text \
-           FROM flow_objects fo \
-           JOIN collab_documents cd ON cd.object_id = fo.id \
-           JOIN flow_object_projections p ON p.object_id = fo.id \
-      LEFT JOIN flow_search_index si ON si.object_id = fo.id \
-          WHERE fo.workspace_id = $1 AND fo.lifecycle_status = 'active'",
-    );
-    add_scope_predicate(&mut sql, &mut values, search.scope, "fo");
-    add_object_type_predicate(&mut sql, &mut values, search.object_type.as_deref(), "fo");
-    if let Some((created_at, object_id)) = after {
-        values.push(created_at.into());
-        let created_at_index = values.len();
-        values.push(object_id.into());
-        let object_id_index = values.len();
-        let _ = write!(
-            sql,
-            " AND (fo.created_at, fo.id) > (${created_at_index}, ${object_id_index})"
-        );
-    }
-    values.push(i64::try_from(SEARCH_SCAN_BATCH_SIZE).unwrap_or(i64::MAX).into());
-    let _ = write!(sql, " ORDER BY fo.created_at, fo.id LIMIT ${}", values.len());
-    Ok(
-        FrontierRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
-            .all(&state.db)
-            .await?,
-    )
-}
-
-fn row_is_stale(row: &FrontierRow) -> bool {
-    row.indexed_seq != Some(row.projection_seq)
-        || row.indexed_frontier.as_deref() != Some(row.projection_frontier.as_slice())
-        || row.indexed_title.as_deref() != Some(row.projection_title.as_str())
-        || row.indexed_plain_text.as_deref() != Some(row.projection_plain_text.as_str())
-        || row.indexed_seq != Some(row.head_seq)
+    stale: bool,
 }
 
 async fn policy_filtered_frontier(
     state: &AppState,
     access: &FlowReadContext,
     search: &ValidatedSearch,
-) -> Result<Option<SearchIndexFrontier>, ApiError> {
-    let mut after = None;
-    let mut examined = 0_u64;
-    let mut indexed_seq = 0_i64;
-    let mut head_seq = 0_i64;
-    let mut frontier_stale = false;
-    loop {
-        let batch = fetch_frontier_batch(state, search, after).await?;
-        let batch_len = batch.len();
-        if batch_len == 0 {
-            break;
-        }
-        let ids: Vec<Uuid> = batch.iter().map(|row| row.object_id).collect();
-        let Some(visible) = policy::authorize_flow_objects(state, access, &ids, PermissionLevel::View).await? else {
-            return Ok(None);
-        };
-        if visible.len() != batch_len {
-            return Err(ApiError::Internal);
-        }
-        for (row, is_visible) in batch.into_iter().zip(visible) {
-            examined = examined.saturating_add(1);
-            check_scan_budget(examined)?;
-            after = Some((row.created_at, row.object_id));
-            if is_visible {
-                indexed_seq = indexed_seq.saturating_add(row.indexed_seq.unwrap_or(0));
-                head_seq = head_seq.saturating_add(row.head_seq);
-                frontier_stale |= row_is_stale(&row);
-            }
-        }
-        if (batch_len as u64) < SEARCH_SCAN_BATCH_SIZE {
-            break;
-        }
-    }
-    Ok(Some(SearchIndexFrontier {
-        indexed_seq,
-        head_seq,
-        lag: query::projection_lag(head_seq, indexed_seq),
-        stale: frontier_stale,
-    }))
+) -> Result<SearchIndexFrontier, ApiError> {
+    let mut values: Vec<sea_orm::Value> = vec![search.workspace_id.into()];
+    let mut scope_predicate = String::from("fo.workspace_id = $1 AND fo.lifecycle_status = 'active'");
+    add_scope_predicate(&mut scope_predicate, &mut values, search.scope, "fo");
+    add_object_type_predicate(&mut scope_predicate, &mut values, search.object_type.as_deref(), "fo");
+
+    values.push(access.actor_id().into());
+    let actor_index = values.len();
+    values.push(access.principal_kind().as_str().into());
+    let principal_kind_index = values.len();
+    values.push(access.is_human_admin().into());
+    let human_admin_index = values.len();
+    values.push(
+        i64::try_from(super::collab::authz::MAX_CHAIN_NODES)
+            .unwrap_or(i64::MAX)
+            .into(),
+    );
+    let probe_depth_index = values.len();
+    values.push(
+        i64::try_from(super::collab::authz::TREE_DEPTH_MAX)
+            .unwrap_or(i64::MAX)
+            .into(),
+    );
+    let tree_depth_index = values.len();
+
+    // Authorization is evaluated inside the aggregate statement. This preserves the boundary
+    // semantics of `authz::effective_permissions` without shipping every scope row to Rust. The
+    // fixed scan budget remains reserved for query candidates that are actually overfetched.
+    let sql = format!(
+        r"
+        WITH RECURSIVE scoped AS (
+            SELECT fo.id
+              FROM flow_objects fo
+             WHERE {scope_predicate}
+        ), chain AS (
+            SELECT s.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent, 0 AS depth,
+                   ARRAY[o.id]::uuid[] AS path, false AS cycle
+              FROM scoped s
+              JOIN flow_objects o ON o.id = s.id
+            UNION ALL
+            SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent, c.depth + 1,
+                   c.path || p.id, p.id = ANY(c.path)
+              FROM chain c
+              JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $1
+             WHERE c.parent_id IS NOT NULL
+               AND c.depth < ${probe_depth_index}::int
+               AND NOT c.cycle
+        ), chain_state AS (
+            SELECT seed_id,
+                   bool_or(cycle OR depth > ${tree_depth_index}::int) AS invalid,
+                   (array_agg(parent_id ORDER BY depth DESC))[1] IS NOT NULL AS incomplete,
+                   min(depth) FILTER (WHERE NOT inherit_from_parent) AS boundary_depth
+              FROM chain
+             GROUP BY seed_id
+        ), visible AS (
+            SELECT s.id
+              FROM scoped s
+              JOIN chain_state cs ON cs.seed_id = s.id
+             WHERE ${human_admin_index}
+                OR (
+                    NOT cs.invalid
+                    AND NOT cs.incomplete
+                    AND (
+                        cs.boundary_depth IS NULL
+                        OR EXISTS (
+                            SELECT 1
+                              FROM chain c
+                              JOIN flow_object_grants g ON g.object_id = c.id
+                             WHERE c.seed_id = s.id
+                               AND c.depth <= cs.boundary_depth
+                               AND g.principal_id = ${actor_index}
+                               AND g.principal_kind = ${principal_kind_index}
+                        )
+                    )
+                )
+        )
+        SELECT COALESCE(MAX(si.indexed_seq), 0) AS indexed_seq,
+               COALESCE(MAX(cd.head_seq), 0) AS head_seq,
+               COALESCE(bool_or(
+                   si.object_id IS NULL
+                   OR si.indexed_seq IS DISTINCT FROM p.document_seq
+                   OR si.indexed_frontier IS DISTINCT FROM p.document_frontier
+                   OR si.title IS DISTINCT FROM p.title
+                   OR si.plain_text IS DISTINCT FROM p.plain_text
+                   OR si.indexed_seq IS DISTINCT FROM cd.head_seq
+               ), false) AS stale
+          FROM visible v
+          JOIN collab_documents cd ON cd.object_id = v.id
+          JOIN flow_object_projections p ON p.object_id = v.id
+     LEFT JOIN flow_search_index si ON si.object_id = v.id
+        "
+    );
+    let row = FrontierAggregateRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+        .one(&state.db)
+        .await?
+        .ok_or(ApiError::Internal)?;
+    Ok(SearchIndexFrontier {
+        indexed_seq: row.indexed_seq,
+        head_seq: row.head_seq,
+        lag: query::projection_lag(row.head_seq, row.indexed_seq),
+        stale: row.stale,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -497,9 +503,7 @@ pub async fn search(
     }
     runtime::runtime().ensure_workspace_accepting(params.workspace_id)?;
     let search = validate(params, access.is_bot())?;
-    let Some(frontier) = policy_filtered_frontier(state, access, &search).await? else {
-        return Ok(None);
-    };
+    let frontier = policy_filtered_frontier(state, access, &search).await?;
     if search.freshness == Freshness::RequireCurrent && frontier.stale {
         return Err(ApiError::stale_frontier(
             "Flow search index is behind the accepted projection frontier",

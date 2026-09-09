@@ -22,9 +22,10 @@ Archived objects are removed by the worker and excluded by the API even before c
 Restored objects are rebuilt from their accepted projection. Deleted objects disappear through the
 search table's `ON DELETE CASCADE` foreign key.
 
-The response `index_frontier` is policy-filtered. It is aggregated only from objects in the
-declared request scope that pass request-time object authorization; inaccessible objects cannot
-change its sequence, lag, or stale flag. The aggregate uses sums of per-object indexed and head
-sequences, so `lag = head_seq - indexed_seq` remains meaningful across a multi-object scope.
-Objects without an index row make the frontier stale even when both sequences are zero. A fixed
-authorized-scan budget bounds both frontier evaluation and result overfetch.
+The response `index_frontier` is policy-filtered. It is aggregated in PostgreSQL only from objects
+in the declared request scope that pass request-time object authorization; inaccessible objects
+cannot change its sequence, lag, or stale flag. `indexed_seq` and `head_seq` are the respective
+maximum per-object sequences across that visible scope, and `lag` is their saturating difference.
+Objects without an index row make the frontier stale even when both sequences are zero. The fixed
+authorized-scan budget applies only to candidate overfetch, matching its contract definition; it
+does not turn frontier aggregation into an application-side full-scope scan.
