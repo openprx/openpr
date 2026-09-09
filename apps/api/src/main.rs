@@ -2214,6 +2214,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0057_flow_objects_parent_project_scope_index.sql",
         include_str!("../../../migrations/0057_flow_objects_parent_project_scope_index.sql"),
     ),
+    (
+        "0058_flow_search_index.sql",
+        include_str!("../../../migrations/0058_flow_search_index.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2506,6 +2510,7 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         "0057_flow_objects_parent_project_scope_index.sql",
         SchemaProbe::Relation("idx_flow_objects_parent_project_scope"),
     ),
+    ("0058_flow_search_index.sql", SchemaProbe::Relation("flow_search_index")),
 ];
 
 /// One recorded migration outcome.
@@ -3016,7 +3021,8 @@ mod tests {
                 "0054_flow_data_layer.sql",
                 "0055_flow_import_jobs.sql",
                 "0056_flow_objects_parent_project_invariant.sql",
-                "0057_flow_objects_parent_project_scope_index.sql"
+                "0057_flow_objects_parent_project_scope_index.sql",
+                "0058_flow_search_index.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
