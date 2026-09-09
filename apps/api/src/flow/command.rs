@@ -136,6 +136,10 @@ pub fn v0_4_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
 /// bound keeps being asserted against the v0.4 list alone.
 pub fn v0_5_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
     let mut registry = v0_4_command_cardinality_registry();
+    registry.extend([
+        ("grants_set", ExistingDocumentCardinality::Zero),
+        ("inheritance_set", ExistingDocumentCardinality::Zero),
+    ]);
     for governance in [
         GovernanceCommandType::MoveObject,
         GovernanceCommandType::Link,
@@ -1914,7 +1918,7 @@ async fn execute_lifecycle_command(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod cardinality_gate_tests {
-    use super::{ExistingDocumentCardinality, v0_4_command_cardinality_registry};
+    use super::{ExistingDocumentCardinality, v0_4_command_cardinality_registry, v0_5_command_cardinality_registry};
 
     /// `command_contended_document_cardinality` (`ADR-0013` §1, v0.4): "v0.4 的竞争文档集合恒
     /// ≤ 1". Every command this package registers — content, lifecycle, and the two
@@ -1958,6 +1962,42 @@ mod cardinality_gate_tests {
             );
         }
         assert_eq!(names.len(), 10, "registry must not silently gain or lose commands");
+    }
+
+    #[test]
+    fn v0_5_registry_covers_every_registered_command_name_and_cardinality() {
+        let registry = v0_5_command_cardinality_registry();
+        assert_eq!(
+            registry.len(),
+            15,
+            "the v0.5 registry must not silently gain or lose commands"
+        );
+        for (expected_name, expected_cardinality) in [
+            ("create_object", ExistingDocumentCardinality::Zero),
+            ("set_flow_feature", ExistingDocumentCardinality::Zero),
+            ("set_title", ExistingDocumentCardinality::One),
+            ("insert_block", ExistingDocumentCardinality::One),
+            ("update_block", ExistingDocumentCardinality::One),
+            ("delete_block", ExistingDocumentCardinality::One),
+            ("move_block", ExistingDocumentCardinality::One),
+            ("semantic_patch", ExistingDocumentCardinality::One),
+            ("archive", ExistingDocumentCardinality::Zero),
+            ("restore", ExistingDocumentCardinality::Zero),
+            ("grants_set", ExistingDocumentCardinality::Zero),
+            ("inheritance_set", ExistingDocumentCardinality::Zero),
+            ("move_object", ExistingDocumentCardinality::BoundedMany(2)),
+            ("link", ExistingDocumentCardinality::Zero),
+            ("unlink", ExistingDocumentCardinality::Zero),
+        ] {
+            assert_eq!(
+                registry
+                    .iter()
+                    .find(|(name, _)| *name == expected_name)
+                    .map(|(_, cardinality)| *cardinality),
+                Some(expected_cardinality),
+                "command '{expected_name}' is missing or has the wrong v0.5 cardinality"
+            );
+        }
     }
 
     #[test]

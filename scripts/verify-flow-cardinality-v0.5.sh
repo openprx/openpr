@@ -43,10 +43,11 @@ Options:
   --repo-root DIR               Default: this checkout.
   --json                        Required by the gate command.
   --test-drop-declaration NAME  Test-only fault injection. NAME must be one of
-                                move_object, grants_set, inheritance_set. The
+                                move_object, grants_set, inheritance_set, link,
+                                unlink. The
                                 artifact records the injection and cannot pass.
   --test-drop-producer NAME     Test-only missing-producer injection for one of
-                                the same three names; can never pass.
+                                the same five names; can never pass.
   --test-parser-error           Test-only parser-error injection; can never pass.
   -h, --help                    Show this help and exit 0.
 
@@ -94,11 +95,11 @@ if [[ $JSON_MODE -ne 1 ]]; then
   exit 2
 fi
 case "$TEST_DROP_DECLARATION" in
-  ""|move_object|grants_set|inheritance_set) ;;
+  ""|move_object|grants_set|inheritance_set|link|unlink) ;;
   *) echo "FAIL: unsupported --test-drop-declaration value: $TEST_DROP_DECLARATION" >&2; exit 2 ;;
 esac
 case "$TEST_DROP_PRODUCER" in
-  ""|move_object|grants_set|inheritance_set) ;;
+  ""|move_object|grants_set|inheritance_set|link|unlink) ;;
   *) echo "FAIL: unsupported --test-drop-producer value: $TEST_DROP_PRODUCER" >&2; exit 2 ;;
 esac
 TEST_FAULT_COUNT=0
@@ -153,11 +154,15 @@ EXPECTED_V04 = {
     "update_block", "delete_block", "move_block", "semantic_patch",
     "archive", "restore",
 }
-EXPECTED_NEW = {"move_object", "grants_set", "inheritance_set"}
+# rest-api-v1.md:163 enumerates link/unlink as v0.5 commands and :173 freezes
+# both at existing_document_cardinality=0. Keep the exact delta fail closed.
+EXPECTED_NEW = {"move_object", "grants_set", "inheritance_set", "link", "unlink"}
 EXPECTED_CARDINALITY = {
     "move_object": ("BoundedMany", 2),
     "grants_set": ("Zero", 0),
     "inheritance_set": ("Zero", 0),
+    "link": ("Zero", 0),
+    "unlink": ("Zero", 0),
 }
 DIRTY_SCOPE = ["apps/", "crates/", "spikes/", "migrations/", ".cargo/", "Cargo.toml", "Cargo.lock"]
 
@@ -605,6 +610,8 @@ producer_functions = {
     "move_object": ["execute_on"],
     "grants_set": ["set_grants", "put_flow_object_grants"],
     "inheritance_set": ["set_inheritance", "put_flow_object_inheritance"],
+    "link": ["execute_link"],
+    "unlink": ["execute_unlink"],
 }
 producer_evidence = {}
 for command_name, function_names in producer_functions.items():
@@ -745,24 +752,27 @@ batch_check = check(
     [] if not unapproved else [f"unapproved batch/merge command declarations: {unapproved}"],
 )
 
-grant_owner_paths = sorted({
-    occurrence["file"]
-    for command_name in ("grants_set", "inheritance_set")
-    for producer in producer_evidence[command_name]
-    if producer["function"] in {"set_grants", "set_inheritance"}
-    for occurrence in producer["occurrences"]
+zero_producer_occurrences = [
+    occurrence
+    for function_name in ("set_grants", "set_inheritance", "execute_link", "execute_unlink")
+    for occurrence in function_occurrences(sources, function_name)
+    if "error" not in occurrence
+]
+zero_owner_paths = sorted({
+    occurrence["path"]
+    for occurrence in zero_producer_occurrences
 })
-grants_source = "\n".join(sources[path]["code"] for path in grant_owner_paths)
+zero_source = "\n".join(occurrence["body"] for occurrence in zero_producer_occurrences)
 zero_path_facts = {
-    "producer_implementation_files": grant_owner_paths,
-    "producer_implementation_found": bool(grant_owner_paths),
+    "producer_implementation_files": zero_owner_paths,
+    "producer_implementation_found": bool(zero_owner_paths),
     "postgres_metadata_mutation_observed": bool(re.search(
         r"(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:flow_object_grants|flow_objects|flow_relations)\b",
-        grants_source,
+        zero_source,
         re.IGNORECASE,
     )),
-    "collab_head_advance_tokens_absent": not bool(re.search(r"collab_documents|head_seq|advance.*head", grants_source, re.IGNORECASE)),
-    "document_coordinator_tokens_absent": not bool(re.search(r"\.coordinator\b|acquire_many\s*\(", grants_source)),
+    "collab_head_advance_tokens_absent": not bool(re.search(r"collab_documents|head_seq|advance.*head", zero_source, re.IGNORECASE)),
+    "document_coordinator_tokens_absent": not bool(re.search(r"\.coordinator\b|acquire_many\s*\(", zero_source)),
     "database_transaction_does_not_raise_cardinality": True,
 }
 zero_reasons = [

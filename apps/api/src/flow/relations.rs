@@ -19,9 +19,20 @@
 //! The relation identity is the schema's unique key `(workspace, source, target, relation_type)`.
 //! A same-key replay of the same identity returns the original event id through the existing
 //! `business_events` idempotency index. A different idempotency key attempting that identity is a
-//! request conflict, not an idempotent success: it returns `Conflict`, so a caller can re-read the
-//! existing relation or choose a different semantic identity. A same key reused for another
-//! identity is also `Conflict`.
+//! non-recoverable invalid request, not an idempotent success. `error-mapping-v1.md` freezes no
+//! dedicated duplicate-link semantic (a contract gap), so both that case and reuse of one key for
+//! another identity use the existing typed `invalid_update`; they never use legacy `Conflict`,
+//! whose error kind is `Unclassified`.
+//!
+//! ## Opaque pagination and bounded scanning
+//!
+//! Stable keyset order remains `(created_at,id)`, but the pair is encrypted and authenticated with
+//! ChaCha20-Poly1305 under a key derived from the deployment JWT secret. Thus even when a page ends
+//! on an `Unavailable` placeholder, its cursor reveals neither the relation id nor creation time.
+//! With `limit <= 100`, `needed <= 101`: fixed batches of 100 mean at most two batches and 200 rows
+//! are examined today. The 1000-row authorization budget is retained as defense in depth for future
+//! policy filtering. Its `observed` detail intentionally reports the fixed safe limit, not the real
+//! examined count, matching WP-10's non-disclosure convention.
 
 use std::fmt::Write as _;
 
@@ -29,9 +40,14 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use chrono::{DateTime, Utc};
 use platform::app::AppState;
+use ring::{
+    aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::{SecureRandom, SystemRandom},
+};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -44,6 +60,8 @@ use super::move_object::GovernanceCommandType;
 use super::{policy, repository};
 
 const RELATION_SCAN_BATCH_SIZE: u64 = 100;
+const CURSOR_VERSION: u8 = 1;
+const CURSOR_AAD: &[u8] = b"openpr.flow.relations.cursor.v1";
 
 fn check_relation_scan_budget(examined: u64) -> Result<(), ApiError> {
     if examined > limits::AUTHORIZED_SCAN_ROWS_MAX {
@@ -167,8 +185,8 @@ async fn replay(
     });
     if event.event_type != kind.event_type() || !source_matches || !target_matches || !type_matches || !relation_matches
     {
-        return Err(ApiError::Conflict(
-            "idempotency_key was already used for a different operation".to_string(),
+        return Err(ApiError::invalid_update(
+            "idempotency_key was already used for a different operation",
         ));
     }
     let relation_id = payload_uuid(&event.payload, "relation_id").ok_or(ApiError::Internal)?;
@@ -313,20 +331,10 @@ async fn execute_link(
         return Ok(change);
     }
 
-    let target_workspace = repository::fetch_object_workspace(&state.db, payload.target_object_id)
+    repository::fetch_object_workspace(&state.db, payload.target_object_id)
         .await?
+        .filter(|target_workspace| *target_workspace == workspace_id)
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    if target_workspace != workspace_id {
-        return Err(super::command::record_cross_workspace_relation_and_fail_closed(
-            state,
-            workspace_id,
-            "flow_relation",
-            payload.target_object_id,
-            target_workspace,
-            "flow.command.link", // detected_by: integrity producer, not a business event type
-        )
-        .await);
-    }
     authorize_both(&state.db, input, workspace_id, payload.target_object_id).await?;
 
     let tx = state.db.begin().await?;
@@ -381,7 +389,7 @@ async fn execute_link(
         if let Some(change) = concurrent_replay {
             return Ok(change);
         }
-        return Err(ApiError::Conflict("relation already exists".to_string()));
+        return Err(ApiError::invalid_update("relation already exists"));
     }
     debug_assert_eq!(inserted.map(|row| row.id), Some(relation_id));
 
@@ -641,15 +649,53 @@ struct RelationReadRow {
     other_project_id: Option<Uuid>,
 }
 
-fn encode_cursor(created_at: DateTime<Utc>, id: Uuid) -> String {
-    BASE64_URL.encode(format!("{}|{id}", created_at.to_rfc3339()))
+fn cursor_key(secret: &str) -> Result<LessSafeKey, ApiError> {
+    let mut digest = Sha256::new();
+    digest.update(CURSOR_AAD);
+    digest.update([0]);
+    digest.update(secret.as_bytes());
+    UnboundKey::new(&aead::CHACHA20_POLY1305, &digest.finalize())
+        .map(LessSafeKey::new)
+        .map_err(|_| ApiError::Internal)
 }
 
-fn decode_cursor(raw: &str) -> Result<(DateTime<Utc>, Uuid), ApiError> {
-    let bytes = BASE64_URL
+fn encode_cursor(secret: &str, created_at: DateTime<Utc>, id: Uuid) -> Result<String, ApiError> {
+    let mut nonce_bytes = [0u8; aead::NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| ApiError::Internal)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut encrypted = format!("{}|{id}", created_at.to_rfc3339()).into_bytes();
+    cursor_key(secret)?
+        .seal_in_place_append_tag(nonce, Aad::from(CURSOR_AAD), &mut encrypted)
+        .map_err(|_| ApiError::Internal)?;
+    let mut token = Vec::with_capacity(1 + aead::NONCE_LEN + encrypted.len());
+    token.push(CURSOR_VERSION);
+    token.extend_from_slice(&nonce_bytes);
+    token.extend_from_slice(&encrypted);
+    Ok(BASE64_URL.encode(token))
+}
+
+fn decode_cursor(secret: &str, raw: &str) -> Result<(DateTime<Utc>, Uuid), ApiError> {
+    let token = BASE64_URL
         .decode(raw)
         .map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
-    let text = String::from_utf8(bytes).map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    let (version, payload) = token
+        .split_first()
+        .ok_or_else(|| ApiError::invalid_update("cursor is not valid"))?;
+    if *version != CURSOR_VERSION {
+        return Err(ApiError::invalid_update("cursor is not valid"));
+    }
+    let (nonce_bytes, ciphertext) = payload
+        .split_at_checked(aead::NONCE_LEN)
+        .ok_or_else(|| ApiError::invalid_update("cursor is not valid"))?;
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    let mut in_out = ciphertext.to_vec();
+    let plaintext = cursor_key(secret)?
+        .open_in_place(nonce, Aad::from(CURSOR_AAD), &mut in_out)
+        .map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    let text = std::str::from_utf8(plaintext).map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
     let (created_at, id) = text
         .split_once('|')
         .ok_or_else(|| ApiError::invalid_update("cursor is not valid"))?;
@@ -732,8 +778,10 @@ async fn record_relation_integrity(state: &AppState, workspace_id: Uuid, relatio
 ///
 /// Candidate rows are fetched in fixed batches and counted before authorization. The current
 /// relation contract preserves denied targets as `Unavailable`, so today a row is never silently
-/// discarded; retaining the bounded scanner makes that safety invariant explicit and prevents a
-/// future policy-filtering rule from turning into unbounded overfetch or a silently short page.
+/// discarded. Since `limit <= 100`, at most two 100-row batches (200 rows total) can be examined;
+/// retaining the 1000-row guard makes that safety invariant explicit and prevents a future
+/// policy-filtering rule from turning into unbounded overfetch or a silently short page. As in
+/// WP-10, a violation reports the fixed limit as `observed`, never the actual scan count.
 pub async fn list_relations(
     state: &AppState,
     access: &policy::AuthorizedFlowObject,
@@ -742,7 +790,11 @@ pub async fn list_relations(
     let limit = super::query::validate_limit(params.limit)?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let needed = limit_usize.saturating_add(1);
-    let mut after = params.cursor.as_deref().map(decode_cursor).transpose()?;
+    let mut after = params
+        .cursor
+        .as_deref()
+        .map(|cursor| decode_cursor(state.cfg.jwt_secret.expose(), cursor))
+        .transpose()?;
     let mut examined = 0u64;
     let mut accepted: Vec<(RelationReadRow, bool)> = Vec::with_capacity(needed);
     while accepted.len() < needed {
@@ -793,7 +845,10 @@ pub async fn list_relations(
     }
     let next_cursor = if accepted.len() > limit_usize {
         accepted.truncate(limit_usize);
-        accepted.last().map(|(row, _)| encode_cursor(row.created_at, row.id))
+        accepted
+            .last()
+            .map(|(row, _)| encode_cursor(state.cfg.jwt_secret.expose(), row.created_at, row.id))
+            .transpose()?
     } else {
         None
     };
@@ -831,6 +886,36 @@ pub async fn list_relations(
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_cursor_round_trips_and_rejects_tampering_or_another_key() {
+        let created_at = DateTime::parse_from_rfc3339("2026-09-09T12:34:56Z")
+            .expect("fixture time parses")
+            .with_timezone(&Utc);
+        let relation_id = Uuid::new_v4();
+        let cursor = encode_cursor("cursor-secret-a", created_at, relation_id).expect("cursor encrypts");
+        assert_eq!(
+            decode_cursor("cursor-secret-a", &cursor).expect("cursor decrypts"),
+            (created_at, relation_id)
+        );
+        assert_eq!(
+            decode_cursor("cursor-secret-b", &cursor)
+                .expect_err("a cursor is bound to the deployment key")
+                .kind(),
+            crate::error::ApiErrorKind::InvalidUpdate
+        );
+
+        let mut tampered = BASE64_URL.decode(cursor).expect("cursor is base64url");
+        let last = tampered.last_mut().expect("cursor has authenticated ciphertext");
+        *last ^= 1;
+        let tampered = BASE64_URL.encode(tampered);
+        assert_eq!(
+            decode_cursor("cursor-secret-a", &tampered)
+                .expect_err("ciphertext mutation must fail authentication")
+                .kind(),
+            crate::error::ApiErrorKind::InvalidUpdate
+        );
+    }
 
     #[test]
     fn relation_type_validation_matches_the_database_constraint() {
@@ -878,7 +963,8 @@ mod tests {
     clippy::too_many_lines
 )]
 mod database_tests {
-    use axum::http::Extensions;
+    use axum::{body::to_bytes, http::Extensions, response::IntoResponse};
+    use base64::Engine as _;
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
@@ -888,7 +974,7 @@ mod database_tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    use super::{ListRelationsParams, RelationDirection, list_relations};
+    use super::{BASE64_URL, CURSOR_VERSION, ListRelationsParams, RelationDirection, list_relations};
     use crate::error::ApiErrorKind;
     use crate::flow::collab::authz::PermissionLevel;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
@@ -1108,6 +1194,11 @@ mod database_tests {
         causation_id: Option<Uuid>,
     }
 
+    #[derive(FromQueryResult)]
+    struct RelationCursorProbe {
+        created_at: chrono::DateTime<chrono::Utc>,
+    }
+
     async fn event(state: &AppState, event_type: &str) -> EventProbe {
         EventProbe::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -1119,6 +1210,13 @@ mod database_tests {
         .await
         .expect("event query succeeds")
         .expect("event exists")
+    }
+
+    async fn error_wire(error: crate::error::ApiError) -> Vec<u8> {
+        to_bytes(error.into_response().into_body(), usize::MAX)
+            .await
+            .expect("error body is readable")
+            .to_vec()
     }
 
     #[tokio::test]
@@ -1241,7 +1339,7 @@ mod database_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_link_conflicts_and_target_permission_is_a_real_second_gate() {
+    async fn duplicate_link_is_typed_invalid_update_and_target_permission_is_a_real_second_gate() {
         let scratch = scratch_or_skip!("double_auth");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id, member_id) = seed_workspace(&state).await;
@@ -1299,8 +1397,8 @@ mod database_tests {
             ),
         )
         .await
-        .expect_err("different-key duplicate relation is a conflict");
-        assert!(matches!(duplicate, crate::error::ApiError::Conflict(_)));
+        .expect_err("different-key duplicate relation is invalid");
+        assert_eq!(duplicate.kind(), ApiErrorKind::InvalidUpdate);
         assert_ne!(first.event_id, Uuid::nil());
 
         let forbidden_frontier = ExecuteCommandInput {
@@ -1342,6 +1440,66 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
+    #[tokio::test]
+    async fn caller_supplied_foreign_target_matches_missing_and_records_no_integrity_alert() {
+        let scratch = scratch_or_skip!("foreign_input");
+        let state = state_for(scratch.db.clone());
+        let (workspace_a, owner_a, _) = seed_workspace(&state).await;
+        let (workspace_b, owner_b, _) = seed_workspace(&state).await;
+        let source = page(&state, workspace_a, owner_a, "Source").await;
+        let foreign_target = page(&state, workspace_b, owner_b, "Foreign target").await;
+        let missing_target = Uuid::new_v4();
+
+        let foreign = execute_command(
+            &state,
+            relation_command(
+                source,
+                owner_a,
+                "owner",
+                "link",
+                json!({"target_object_id":foreign_target,"relation_type":"blocks"}),
+                Uuid::new_v4().to_string(),
+            ),
+        )
+        .await
+        .expect_err("a caller-supplied target from another workspace must be hidden");
+        let missing = execute_command(
+            &state,
+            relation_command(
+                source,
+                owner_a,
+                "owner",
+                "link",
+                json!({"target_object_id":missing_target,"relation_type":"blocks"}),
+                Uuid::new_v4().to_string(),
+            ),
+        )
+        .await
+        .expect_err("a missing target must be hidden");
+        assert_eq!(foreign.kind(), ApiErrorKind::NotFound);
+        assert_eq!(missing.kind(), ApiErrorKind::NotFound);
+        assert_eq!(
+            error_wire(foreign).await,
+            error_wire(missing).await,
+            "foreign and missing targets must have byte-identical response bodies"
+        );
+
+        let alerts = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS count FROM flow_integrity_records WHERE workspace_id=$1",
+            vec![workspace_a.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("integrity query runs")
+        .expect("count row");
+        assert_eq!(
+            alerts.count, 0,
+            "ordinary caller input must not create integrity records"
+        );
+        scratch.drop_self().await;
+    }
+
     fn claims(user_id: Uuid) -> JwtClaims {
         JwtClaims {
             sub: user_id.to_string(),
@@ -1374,21 +1532,62 @@ mod database_tests {
         let source = page(&state, workspace_id, owner_id, "Source").await;
         let visible_target = page(&state, workspace_id, owner_id, "Visible").await;
         let hidden_target = page(&state, workspace_id, owner_id, "Hidden").await;
-        for (target, relation_type) in [(visible_target, "alpha"), (hidden_target, "beta")] {
-            execute_command(
-                &state,
-                relation_command(
-                    source,
-                    owner_id,
-                    "owner",
-                    "link",
-                    json!({"target_object_id":target,"relation_type":relation_type,"properties":{"secret":target}}),
-                    Uuid::new_v4().to_string(),
-                ),
-            )
-            .await
-            .expect("fixture relation links");
-        }
+        let hidden_link = execute_command(
+            &state,
+            relation_command(
+                source,
+                owner_id,
+                "owner",
+                "link",
+                json!({"target_object_id":hidden_target,"relation_type":"beta","properties":{"secret":hidden_target}}),
+                Uuid::new_v4().to_string(),
+            ),
+        )
+        .await
+        .expect("hidden fixture relation links");
+        let hidden_relation_id = hidden_link.command_result.as_ref().expect("link result")["relation"]["relation_id"]
+            .as_str()
+            .expect("relation id is text")
+            .parse::<Uuid>()
+            .expect("relation id is a UUID");
+        let visible_link = execute_command(
+            &state,
+            relation_command(
+                source,
+                owner_id,
+                "owner",
+                "link",
+                json!({"target_object_id":visible_target,"relation_type":"alpha","properties":{"secret":visible_target}}),
+                Uuid::new_v4().to_string(),
+            ),
+        )
+        .await
+        .expect("visible fixture relation links");
+        let visible_relation_id = visible_link.command_result.as_ref().expect("link result")["relation"]["relation_id"]
+            .as_str()
+            .expect("relation id is text")
+            .parse::<Uuid>()
+            .expect("relation id is a UUID");
+        exec(
+            &state,
+            "UPDATE flow_relations SET created_at = CASE WHEN id=$1 THEN '2026-01-01T00:00:00Z'::timestamptz \
+             WHEN id=$2 THEN '2026-01-01T00:00:01Z'::timestamptz ELSE created_at END WHERE id=ANY($3)",
+            vec![
+                hidden_relation_id.into(),
+                visible_relation_id.into(),
+                vec![hidden_relation_id, visible_relation_id].into(),
+            ],
+        )
+        .await;
+        let hidden_cursor = RelationCursorProbe::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT created_at FROM flow_relations WHERE id=$1",
+            vec![hidden_relation_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("relation cursor query runs")
+        .expect("hidden relation exists");
         exec(
             &state,
             "UPDATE flow_objects SET inherit_from_parent=false WHERE id=$1",
@@ -1417,6 +1616,27 @@ mod database_tests {
         .expect("epoch stable");
         assert_eq!(first.items.len(), 1);
         let cursor = first.next_cursor.expect("another row exists");
+        assert_eq!(
+            serde_json::to_value(&first.items[0]).expect("unavailable item serializes"),
+            json!({"visibility":"unavailable"}),
+            "the page boundary must exercise an unavailable relation"
+        );
+        let raw_cursor = BASE64_URL.decode(&cursor).expect("cursor is base64url");
+        assert_eq!(raw_cursor.first().copied(), Some(CURSOR_VERSION));
+        let hidden_id_text = hidden_relation_id.to_string();
+        let hidden_time_text = hidden_cursor.created_at.to_rfc3339();
+        assert!(
+            !raw_cursor
+                .windows(hidden_id_text.len())
+                .any(|window| window == hidden_id_text.as_bytes()),
+            "opaque cursor must not contain the unavailable relation id"
+        );
+        assert!(
+            !raw_cursor
+                .windows(hidden_time_text.len())
+                .any(|window| window == hidden_time_text.as_bytes()),
+            "opaque cursor must not contain the unavailable relation creation time"
+        );
         let access = read_access(&state, workspace_id, source, member_id).await;
         let second = list_relations(
             &state,
@@ -1470,6 +1690,77 @@ mod database_tests {
     }
 
     #[tokio::test]
+    async fn relation_read_covers_incoming_and_both_directions() {
+        let scratch = scratch_or_skip!("read_directions");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id, _) = seed_workspace(&state).await;
+        let root = page(&state, workspace_id, owner_id, "Root").await;
+        let outgoing_target = page(&state, workspace_id, owner_id, "Outgoing target").await;
+        let incoming_source = page(&state, workspace_id, owner_id, "Incoming source").await;
+        for (source, target, relation_type) in [
+            (root, outgoing_target, "outgoing_test"),
+            (incoming_source, root, "incoming_test"),
+        ] {
+            execute_command(
+                &state,
+                relation_command(
+                    source,
+                    owner_id,
+                    "owner",
+                    "link",
+                    json!({"target_object_id":target,"relation_type":relation_type}),
+                    Uuid::new_v4().to_string(),
+                ),
+            )
+            .await
+            .expect("direction fixture relation links");
+        }
+
+        let incoming = list_relations(
+            &state,
+            &read_access(&state, workspace_id, root, owner_id).await,
+            ListRelationsParams {
+                direction: RelationDirection::Incoming,
+                relation_type: None,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .expect("incoming query succeeds")
+        .expect("epoch is stable");
+        assert_eq!(incoming.items.len(), 1);
+        let incoming_value = serde_json::to_value(&incoming.items[0]).expect("incoming item serializes");
+        assert_eq!(incoming_value["direction"], "incoming");
+        assert_eq!(incoming_value["other_object"]["id"], incoming_source.to_string());
+
+        let both = list_relations(
+            &state,
+            &read_access(&state, workspace_id, root, owner_id).await,
+            ListRelationsParams {
+                direction: RelationDirection::Both,
+                relation_type: None,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .expect("both-direction query succeeds")
+        .expect("epoch is stable");
+        assert_eq!(both.items.len(), 2);
+        let directions: std::collections::BTreeSet<String> = both
+            .items
+            .iter()
+            .map(|item| serde_json::to_value(item).expect("relation serializes")["direction"].to_string())
+            .collect();
+        assert_eq!(
+            directions,
+            ["\"incoming\"".to_string(), "\"outgoing\"".to_string()].into()
+        );
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn concurrent_same_key_different_links_commit_exactly_one_relation() {
         let scratch = scratch_or_skip!("idempotency_race");
         let state = state_for(scratch.db.clone());
@@ -1507,7 +1798,7 @@ mod database_tests {
         } else {
             right.expect_err("exactly one command loses the idempotency race")
         };
-        assert!(matches!(loser, crate::error::ApiError::Conflict(_)));
+        assert_eq!(loser.kind(), ApiErrorKind::InvalidUpdate);
 
         let relations = CountRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,

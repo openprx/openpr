@@ -24,6 +24,7 @@ parking_lot = "0.12"
 platform = { path = "../../crates/platform" }
 rand = "0.8"
 reqwest.workspace = true
+ring.workspace = true
 rust_decimal.workspace = true
 sea-orm.workspace = true
 serde.workspace = true
