@@ -660,6 +660,11 @@ fn cursor_key(secret: &str) -> Result<LessSafeKey, ApiError> {
 }
 
 fn encode_cursor(secret: &str, created_at: DateTime<Utc>, id: Uuid) -> Result<String, ApiError> {
+    #[cfg(test)]
+    if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_RELATION_CURSOR_PLAINTEXT").is_some() {
+        eprintln!("WP28_MUTATION_RELATION_CURSOR_PLAINTEXT_ACTIVE");
+        return Ok(BASE64_URL.encode(format!("{}|{id}", created_at.to_rfc3339())));
+    }
     let mut nonce_bytes = [0u8; aead::NONCE_LEN];
     SystemRandom::new()
         .fill(&mut nonce_bytes)
@@ -974,7 +979,7 @@ mod database_tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    use super::{BASE64_URL, CURSOR_VERSION, ListRelationsParams, RelationDirection, list_relations};
+    use super::{BASE64_URL, CURSOR_VERSION, ListRelationsParams, RelationDirection, decode_cursor, list_relations};
     use crate::error::ApiErrorKind;
     use crate::flow::collab::authz::PermissionLevel;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
@@ -1620,6 +1625,13 @@ mod database_tests {
             serde_json::to_value(&first.items[0]).expect("unavailable item serializes"),
             json!({"visibility":"unavailable"}),
             "the page boundary must exercise an unavailable relation"
+        );
+        let decoded_cursor = decode_cursor(state.cfg.jwt_secret.expose(), &cursor)
+            .expect("the server must authenticate and decrypt the opaque relation cursor");
+        assert_eq!(
+            decoded_cursor,
+            (hidden_cursor.created_at, hidden_relation_id),
+            "the opaque cursor must resume after the unavailable row without exposing it"
         );
         let raw_cursor = BASE64_URL.decode(&cursor).expect("cursor is base64url");
         assert_eq!(raw_cursor.first().copied(), Some(CURSOR_VERSION));
