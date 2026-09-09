@@ -364,30 +364,37 @@ mod tests {
         assert!(SCOPE_FILTER_SQL.contains("$3::uuid IS NULL OR p.id = $3"));
     }
 
-    /// ADR-0009 keeps legacy `/api/v1/search` as the original three-way union. This exhaustive
-    /// construction fails loudly if a Flow variant is added or any legacy discriminator drifts.
+    fn legacy_result_discriminator(result: &SearchResult) -> &'static str {
+        match result {
+            SearchResult::Issue(_) => "issue",
+            SearchResult::Project(_) => "project",
+            SearchResult::Comment(_) => "comment",
+        }
+    }
+
+    /// ADR-0009 keeps legacy `/api/v1/search` as the original three-way union. The exhaustive
+    /// match above makes an added variant a compile failure, while this test pins the three wire
+    /// discriminators. Real handler responses are checked independently below.
     #[test]
     fn legacy_search_result_union_remains_project_issue_comment_only() {
         let id = Uuid::new_v4();
-        let values = [
-            serde_json::to_value(SearchResult::Issue(IssueSearchResult {
+        let results = [
+            SearchResult::Issue(IssueSearchResult {
                 id,
                 title: "issue".to_string(),
                 description: None,
                 state: "open".to_string(),
                 project_id: id,
                 workspace_id: id,
-            }))
-            .expect("issue serializes"),
-            serde_json::to_value(SearchResult::Project(ProjectSearchResult {
+            }),
+            SearchResult::Project(ProjectSearchResult {
                 id,
                 key: "LEG".to_string(),
                 name: "project".to_string(),
                 description: None,
                 workspace_id: id,
-            }))
-            .expect("project serializes"),
-            serde_json::to_value(SearchResult::Comment(CommentSearchResult {
+            }),
+            SearchResult::Comment(CommentSearchResult {
                 id,
                 body: "comment".to_string(),
                 issue_id: id,
@@ -395,9 +402,16 @@ mod tests {
                 workspace_id: id,
                 author_id: None,
                 created_at: chrono::DateTime::UNIX_EPOCH,
-            }))
-            .expect("comment serializes"),
+            }),
         ];
+        assert_eq!(
+            results.iter().map(legacy_result_discriminator).collect::<Vec<_>>(),
+            ["issue", "project", "comment"]
+        );
+        let values = results
+            .iter()
+            .map(|result| serde_json::to_value(result).expect("result serializes"))
+            .collect::<Vec<_>>();
         assert_eq!(
             values
                 .iter()
@@ -405,7 +419,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["issue", "project", "comment"]
         );
-        assert!(values.iter().all(|value| value.get("flow").is_none()));
     }
 
     // ---- Real-database tests (opt-in via OPENPR_TEST_DATABASE_URL) ----
@@ -665,6 +678,30 @@ mod tests {
         ids
     }
 
+    /// Pins ADR-0009 on the actual handler response. The exact count catches an appended result;
+    /// the independent type whitelist catches a replacement or a future non-legacy variant.
+    fn assert_legacy_result_contract(body: &JsonValue, expected_count: usize) {
+        let results = body
+            .get("data")
+            .and_then(|data| data.get("results"))
+            .and_then(JsonValue::as_array)
+            .unwrap_or_else(|| panic!("no results array in {body}"));
+        assert_eq!(results.len(), expected_count, "unexpected legacy result count: {body}");
+        assert_eq!(
+            body["data"]["total"], expected_count,
+            "total drifted from fixture: {body}"
+        );
+        for result in results {
+            assert!(
+                matches!(
+                    result.get("type").and_then(JsonValue::as_str),
+                    Some("issue" | "project" | "comment")
+                ),
+                "legacy search returned a non-ADR-0009 result: {result}"
+            );
+        }
+    }
+
     fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
         ids.sort_unstable();
         ids
@@ -682,6 +719,7 @@ mod tests {
         let body = call_search(&fx, alice, &format!("/api/v1/search?q={}", fx.token))
             .await
             .unwrap_or_else(|err| panic!("search failed: {err}"));
+        assert_legacy_result_contract(&body, 6);
         let expected_a = sorted(vec![fx.project_a1, fx.project_a2]);
         assert_eq!(ids_of(&body, "issue", "project_id"), expected_a);
         assert_eq!(ids_of(&body, "comment", "project_id"), expected_a);
@@ -695,6 +733,7 @@ mod tests {
         )
         .await
         .unwrap_or_else(|err| panic!("filtered search failed: {err}"));
+        assert_legacy_result_contract(&body, 3);
         assert_eq!(ids_of(&body, "issue", "project_id"), vec![fx.project_a1]);
         assert_eq!(ids_of(&body, "comment", "project_id"), vec![fx.project_a1]);
         assert_eq!(ids_of(&body, "project", "id"), vec![fx.project_a1]);
@@ -724,6 +763,7 @@ mod tests {
         let body = call_search(&fx, Caller::User(fx.bob_id), &format!("/api/v1/search?q={}", fx.token))
             .await
             .unwrap_or_else(|err| panic!("search failed: {err}"));
+        assert_legacy_result_contract(&body, 3);
         assert_eq!(ids_of(&body, "issue", "project_id"), vec![fx.project_b1]);
         assert_eq!(ids_of(&body, "project", "id"), vec![fx.project_b1]);
 
@@ -743,6 +783,7 @@ mod tests {
         let body = call_search(&fx, bot_a, &format!("/api/v1/search?q={}", fx.token))
             .await
             .unwrap_or_else(|err| panic!("bot search failed: {err}"));
+        assert_legacy_result_contract(&body, 6);
         assert_eq!(
             ids_of(&body, "issue", "project_id"),
             sorted(vec![fx.project_a1, fx.project_a2])
@@ -756,6 +797,7 @@ mod tests {
         )
         .await
         .unwrap_or_else(|err| panic!("filtered bot search failed: {err}"));
+        assert_legacy_result_contract(&body, 3);
         assert_eq!(ids_of(&body, "issue", "project_id"), vec![fx.project_a1]);
         assert_eq!(ids_of(&body, "comment", "project_id"), vec![fx.project_a1]);
 
@@ -780,6 +822,7 @@ mod tests {
         )
         .await
         .unwrap_or_else(|err| panic!("bot search failed: {err}"));
+        assert_legacy_result_contract(&body, 3);
         assert_eq!(ids_of(&body, "issue", "project_id"), vec![fx.project_b1]);
 
         cleanup(&fx).await;
