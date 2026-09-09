@@ -2580,18 +2580,12 @@ mod tests {
                 .unwrap_or_default();
 
             let expected = if properties.contains_key("project_id") {
-                // Deliberately *not* `required: required.contains("project_id")`. Deriving
-                // the flag from the schema would let an optional `project_id` make the
-                // caller choose whether project policy applies, degrading an omitted id
-                // into a workspace-wide read. A tool that accepts a `project_id` is always
-                // gated on one *unless* its schema also carries the explicit `unprojected`
-                // marker, which is Flow's one deliberate exception
-                // (`mcp-surface-v1.md`: "project_id=None：降级 WorkspaceWide" for
-                // `objects.query`): a caller may address a project directly, or opt into
-                // the workspace-wide, no-project-policy branch by name. Any tool that wants
-                // that bypass has to say so in its own schema, so the marker — not a name
-                // list — is what `declared_project_id_is_mandatory_for_every_project_scoped_tool`
-                // checks below too.
+                // The required bit is the schema's actual contract. A required project id must
+                // always enter project policy; an optional one may resolve to no project and then
+                // use the tool's documented workspace/projectless semantics. There is no separate
+                // schema-marker gate: `objects.create` and `collab.projection_lag` legitimately
+                // omit `unprojected`, while `objects.query`/`objects.search` expose it because they
+                // need an explicit query-filter choice.
                 let required = tool
                     .input_schema
                     .get("required")
@@ -2653,24 +2647,21 @@ mod tests {
         );
     }
 
-    /// `PolicyScope::DeclaredProject { required: false }` is a bypass, not a relaxation:
+    /// `PolicyScope::DeclaredProject { required: false }` is the declared no-project branch:
     /// `resolve_policy_project_id` answers `Ok(None)` for it and `enforce_project_tool_policy`
     /// then returns `Ok(())` without reading any policy, while the tool itself still runs
-    /// against a workspace addressed endpoint. Flow's `objects.query` is the one deliberate
-    /// use of it (`mcp-surface-v1.md` describes this as `project_id=None` falling back to
-    /// `WorkspaceWide`), and it is only
-    /// legitimate because its schema says so explicitly with the `unprojected` marker
-    /// alongside `project_id` — a tool that used the bypass without also declaring both
-    /// properties would be indistinguishable from a hole and is still refused here.
+    /// against a workspace-addressed endpoint. The v0.5 contract deliberately uses this for
+    /// several Flow tools: omission means workspace/projectless scope, while an actual project id
+    /// is checked normally. `unprojected` is a query filter on the tools that publish it, not a
+    /// universal authorization marker.
     ///
     /// The invariant is checked against the *live registry*, not against a name list, so a
-    /// tool added later with an optional `project_id` fails here instead of shipping as a
-    /// hole. Three things matter: a `required: true` tool's scope table must say so and its
-    /// published schema must require `project_id`; a `required: false` tool must declare
-    /// both `project_id` and `unprojected` in its schema.
+    /// tool added later with a mismatched required bit fails here instead of silently changing
+    /// policy semantics. Two things matter: a `required: true` tool's schema must require
+    /// `project_id`; a `required: false` tool must publish `project_id` but must not require it.
     #[test]
     fn declared_project_id_is_mandatory_for_every_project_scoped_tool() {
-        let mut bad_optional_scope = Vec::new();
+        let mut optional_scope_without_project_id = Vec::new();
         let mut optional_schema = Vec::new();
 
         for tool in &crate::tools::get_all_tool_definitions() {
@@ -2683,7 +2674,7 @@ mod tests {
             let declares_project_id = properties.contains_key("project_id");
             if tool_policy_scope(&tool.name) == (PolicyScope::DeclaredProject { required: false }) {
                 if !declares_project_id {
-                    bad_optional_scope.push(tool.name.clone());
+                    optional_scope_without_project_id.push(tool.name.clone());
                 }
                 continue;
             }
@@ -2702,8 +2693,8 @@ mod tests {
         }
 
         assert!(
-            bad_optional_scope.is_empty(),
-            "these tools use the projectless bypass without declaring both project_id and unprojected in their schema, so the bypass is not visible to a caller reading the schema: {bad_optional_scope:?}"
+            optional_scope_without_project_id.is_empty(),
+            "these tools declare optional project policy without publishing project_id in their schema: {optional_scope_without_project_id:?}"
         );
         assert!(
             optional_schema.is_empty(),
