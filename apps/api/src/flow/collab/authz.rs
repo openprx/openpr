@@ -373,7 +373,8 @@ async fn fetch_grants<C: ConnectionTrait>(
 }
 
 /// The workspace baseline (`ADR-0012` §3: admin ⇒ `full_access`; member ⇒
-/// `default_member_level`, frozen at `edit` in v0.4).
+/// `default_member_level`). Missing or invalid settings fail closed rather than manufacturing a
+/// minimum permission.
 async fn workspace_baseline<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
@@ -393,9 +394,9 @@ async fn workspace_baseline<C: ConnectionTrait>(
     ))
     .one(conn)
     .await?;
-    Ok(row
-        .and_then(|r| PermissionLevel::parse(&r.default_member_level))
-        .unwrap_or(PermissionLevel::View))
+    let row = row.ok_or_else(|| ApiError::NotFound("flow workspace settings not found".to_string()))?;
+    PermissionLevel::parse(&row.default_member_level)
+        .ok_or_else(|| ApiError::Forbidden("flow workspace baseline is invalid".to_string()))
 }
 
 /// `ADR-0012` §3's effective-permission rule.
@@ -1334,6 +1335,39 @@ mod database_tests {
         assert_eq!(
             batch, singles,
             "batch results must match DB-direct singles in input order"
+        );
+
+        exec(
+            &scratch.db,
+            "DELETE FROM flow_workspace_settings WHERE workspace_id = $1",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        let single_missing = effective_permission(
+            &scratch.db,
+            fx.workspace_id,
+            object_ids[0],
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await;
+        let batch_missing = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &object_ids,
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await;
+        assert!(
+            matches!(single_missing, Err(ApiError::NotFound(_))),
+            "single evaluator manufactured a baseline: {single_missing:?}"
+        );
+        assert!(
+            matches!(batch_missing, Err(ApiError::NotFound(_))),
+            "batch evaluator manufactured a baseline: {batch_missing:?}"
         );
         scratch.drop_self().await;
     }
