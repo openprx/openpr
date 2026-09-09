@@ -2429,6 +2429,14 @@ mod database_tests {
         }
     }
 
+    async fn run_without_contention_retries<T, Attempt, AttemptFuture>(mut attempt: Attempt) -> Result<T, ApiError>
+    where
+        Attempt: FnMut() -> AttemptFuture,
+        AttemptFuture: std::future::Future<Output = Result<T, ApiError>>,
+    {
+        attempt().await
+    }
+
     /// Every database test goes through the same bounded safe-contention handling. This matters
     /// even for logically sequential scenarios: the test runner exercises many isolated scratch
     /// databases concurrently, so scheduler pressure can spend the command's short lock/statement
@@ -2503,6 +2511,26 @@ mod database_tests {
             RACING_MOVE_CONTENTION_RETRIES + 1,
             "the initial attempt plus the exact retry budget must run, then stop"
         );
+    }
+
+    #[tokio::test]
+    async fn sequential_move_scenario_propagates_first_contention_without_retrying() {
+        let mut attempts = 0_u32;
+        let result: Result<(), ApiError> = run_without_contention_retries(|| {
+            attempts += 1;
+            std::future::ready(Err(ApiError::server_draining(
+                ServerDrainingReason::Contention,
+                1,
+                "server_draining",
+            )))
+        })
+        .await;
+        let error = result.expect_err("a sequential contention must remain visible");
+        assert_eq!(
+            error.kind(),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention)
+        );
+        assert_eq!(attempts, 1, "the sequential path must not retry contention");
     }
 
     async fn scalar_i64(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
@@ -2872,22 +2900,14 @@ mod database_tests {
 
         // This deliberately bypasses the race-only retry helper. A logically sequential lock
         // order scenario producing contention is a regression signal, not an event to mask.
-        let a_to_b = run_move_once(
-            &state,
-            &collab,
-            &fx,
-            &move_input(one, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
-        )
-        .await
-        .expect("A -> B move succeeds");
-        let b_to_a = run_move_once(
-            &state,
-            &collab,
-            &fx,
-            &move_input(two, fx.owner_id, "owner", json!({ "target_object_id": nav_a })),
-        )
-        .await
-        .expect("B -> A move succeeds");
+        let a_input = move_input(one, fx.owner_id, "owner", json!({ "target_object_id": nav_b }));
+        let a_to_b = run_without_contention_retries(|| run_move_once(&state, &collab, &fx, &a_input))
+            .await
+            .expect("A -> B move succeeds");
+        let b_input = move_input(two, fx.owner_id, "owner", json!({ "target_object_id": nav_a }));
+        let b_to_a = run_without_contention_retries(|| run_move_once(&state, &collab, &fx, &b_input))
+            .await
+            .expect("B -> A move succeeds");
 
         let expected = ascending_document_lock_order(&[doc_a, doc_b]);
         assert_eq!(uuid_list(&command_result(&a_to_b)["document_lock_order"]), expected);
