@@ -23,7 +23,7 @@ pub mod work_items;
 use crate::protocol::ToolDefinition;
 
 pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
-    vec![
+    let mut tools = vec![
         projects::list_projects_tool(),
         projects::get_project_tool(),
         projects::create_project_tool(),
@@ -127,6 +127,22 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         objects::get_flow_object_tool(),
         objects::query_flow_objects_tool(),
         objects::get_flow_object_history_tool(),
+    ];
+    tools.extend(flow_v05_tool_definitions());
+    tools.extend([
+        legacy_pages::legacy_pages_inventory_tool(),
+        legacy_pages::legacy_pages_import_preview_tool(),
+        legacy_pages::legacy_pages_import_commit_tool(),
+        legacy_pages::legacy_pages_import_status_tool(),
+    ]);
+    tools
+}
+
+/// The live v0.5 registration set. Keeping the version boundary explicit lets the contract test
+/// compare both directions without inferring a version from tool ordering or from the snapshot it
+/// is meant to verify.
+fn flow_v05_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
         objects::create_flow_object_tool(),
         objects::patch_flow_object_tool(),
         objects::move_flow_object_tool(),
@@ -139,17 +155,52 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         objects::list_flow_object_relations_tool(),
         objects::search_flow_objects_tool(),
         objects::get_flow_projection_lag_tool(),
-        legacy_pages::legacy_pages_inventory_tool(),
-        legacy_pages::legacy_pages_import_preview_tool(),
-        legacy_pages::legacy_pages_import_commit_tool(),
-        legacy_pages::legacy_pages_import_status_tool(),
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::get_all_tool_definitions;
+    use super::{flow_v05_tool_definitions, get_all_tool_definitions};
     use std::collections::HashSet;
+
+    const FLOW_V05_SURFACE_SNAPSHOT: &str = include_str!("mcp-surface-v05.snapshot.md");
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct FlowV05Surface {
+        baseline_total: usize,
+        expected_total: usize,
+        tool_names: HashSet<String>,
+    }
+
+    fn registry_total(surface: &str, version: &str) -> Option<usize> {
+        surface.lines().find_map(|line| {
+            let marker = format!("v{version} `");
+            let tail = line.split_once(&marker)?.1;
+            tail.split_once('`')?.0.parse::<usize>().ok()
+        })
+    }
+
+    fn parse_flow_v05_surface(surface: &str) -> FlowV05Surface {
+        let tool_names = surface
+            .lines()
+            .skip_while(|line| *line != "## Tools")
+            .skip(1)
+            .take_while(|line| !line.starts_with("## "))
+            .filter_map(|line| {
+                let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+                match (cells.get(1), cells.get(2)) {
+                    (Some(name), Some(&"0.5")) => Some(name.trim_matches('`').to_string()),
+                    _ => None,
+                }
+            })
+            .collect::<HashSet<_>>();
+        FlowV05Surface {
+            baseline_total: registry_total(surface, "0.4")
+                .expect("the surface must declare the v0.4 registry baseline"),
+            expected_total: registry_total(surface, "0.5").expect("the surface must declare the v0.5 registry total"),
+            tool_names,
+        }
+    }
 
     #[test]
     fn project_type_and_resource_tools_are_registered_once() {
@@ -253,43 +304,62 @@ mod tests {
     }
 
     #[test]
-    fn flow_v05_registry_matches_the_authoritative_contract() {
+    fn flow_v05_registry_matches_the_embedded_contract_snapshot() {
         let tools = get_all_tool_definitions();
-        let contract_root =
-            std::env::var("SYLVODE_FLOW_CONTRACTS_ROOT").unwrap_or_else(|_| "/opt/working/sylvode-flow".to_string());
-        let surface = std::fs::read_to_string(format!("{contract_root}/contracts/mcp-surface-v1.md"))
-            .expect("the authoritative MCP surface contract must be readable");
-        let expected = surface
-            .lines()
-            .skip_while(|line| *line != "## Tools")
-            .skip(1)
-            .take_while(|line| !line.starts_with("## "))
-            .filter_map(|line| {
-                let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
-                match (cells.get(1), cells.get(2)) {
-                    (Some(name), Some(&"0.5")) => Some(name.trim_matches('`')),
-                    _ => None,
-                }
-            })
-            .collect::<HashSet<_>>();
-        let registered = tools.iter().map(|tool| tool.name.as_str()).collect::<HashSet<_>>();
-        let expected_total = surface
-            .lines()
-            .find_map(|line| {
-                let marker = "v0.5 `";
-                let tail = line.split_once(marker)?.1;
-                tail.split_once('`')?.0.parse::<usize>().ok()
-            })
-            .expect("mcp-surface-v1.md must declare the v0.5 expected registry total");
-
+        let snapshot = parse_flow_v05_surface(FLOW_V05_SURFACE_SNAPSHOT);
+        let expected_v05_count = snapshot
+            .expected_total
+            .checked_sub(snapshot.baseline_total)
+            .expect("the v0.5 total must not be below the v0.4 baseline");
+        assert_ne!(expected_v05_count, 0, "the v0.5 delta must not be empty");
+        assert_eq!(
+            snapshot.tool_names.len(),
+            expected_v05_count,
+            "the snapshot must contain exactly total(v0.5)-total(v0.4) tool rows"
+        );
         assert_eq!(
             tools.len(),
-            expected_total,
-            "the live registry count must equal the v0.5 total parsed from the authoritative contract"
+            snapshot.expected_total,
+            "the live registry count must equal the embedded v0.5 total"
+        );
+
+        // The live side is independently enumerable from the registration function used by the
+        // server. Comparing only `snapshot.iter().all(live.contains)` would make an empty or
+        // incomplete parsed table vacuously pass.
+        let live_v05 = flow_v05_tool_definitions()
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<HashSet<_>>();
+        let registered = tools.iter().map(|tool| tool.name.as_str()).collect::<HashSet<_>>();
+        assert_eq!(
+            live_v05.len(),
+            expected_v05_count,
+            "the live v0.5 registry suffix must contain the declared delta"
         );
         assert!(
-            expected.iter().all(|name| registered.contains(name)),
-            "every v0.5 contract tool must exist in the live registry"
+            snapshot
+                .tool_names
+                .iter()
+                .all(|name| registered.contains(name.as_str())),
+            "every embedded v0.5 contract tool must exist in the live registry"
+        );
+        assert!(
+            live_v05.iter().all(|name| snapshot.tool_names.contains(name)),
+            "every live v0.5 tool must exist in the embedded contract snapshot"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual contract-drift check; set SYLVODE_FLOW_CONTRACTS_ROOT explicitly"]
+    fn flow_v05_embedded_snapshot_matches_the_authoritative_contract() {
+        let contract_root = std::env::var("SYLVODE_FLOW_CONTRACTS_ROOT")
+            .expect("set SYLVODE_FLOW_CONTRACTS_ROOT to an explicit Sylvode Flow checkout");
+        let surface = std::fs::read_to_string(format!("{contract_root}/contracts/mcp-surface-v1.md"))
+            .expect("the explicitly selected authoritative MCP surface contract must be readable");
+        assert_eq!(
+            parse_flow_v05_surface(FLOW_V05_SURFACE_SNAPSHOT),
+            parse_flow_v05_surface(&surface),
+            "refresh the embedded snapshot after an approved contract change"
         );
     }
 

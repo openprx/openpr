@@ -159,6 +159,17 @@ Write tests that:
 - Cover edge cases
 - Use descriptive names
 
+The ordinary MCP registry tests use the repository-owned Sylvode Flow v0.5 surface snapshot and
+do not require a private checkout. To perform the second, manual contract-drift check, point to an
+explicit contract checkout and run the ignored test:
+
+```bash
+SYLVODE_FLOW_CONTRACTS_ROOT=/path/to/sylvode-flow \
+  cargo test -p mcp-server \
+  tools::tests::flow_v05_embedded_snapshot_matches_the_authoritative_contract \
+  -- --ignored --exact
+```
+
 ## Documentation
 
 - **Code comments**: Explain *why*, not *what*
