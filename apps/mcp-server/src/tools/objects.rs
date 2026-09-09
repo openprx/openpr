@@ -142,7 +142,12 @@ fn respond(result: Result<Value, StructuredApiError>) -> CallToolResult {
 }
 
 fn respond_data(result: Result<Value, StructuredApiError>) -> CallToolResult {
-    respond(result.map(|envelope| envelope.get("data").cloned().unwrap_or(Value::Null)))
+    respond(result.and_then(|envelope| {
+        envelope
+            .get("data")
+            .cloned()
+            .ok_or_else(|| StructuredApiError::transport("Malformed successful API envelope: missing data".to_string()))
+    }))
 }
 
 /// Keeps the pre-existing public client helpers part of the compiled client surface while these
@@ -1213,6 +1218,23 @@ mod tests {
                 "nested REST data wrapper leaked into MCP: {output}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn object_tools_fail_when_a_success_envelope_omits_data() -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new().route(
+            "/api/v1/flow/objects/{object_id}",
+            get(|| async { Json(json!({"code": 0, "message": "ok"})) }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let result = get_flow_object(&client, json!({"object_id": "object"})).await;
+        assert_eq!(result.is_error, Some(true), "missing data was reported as success");
+        let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+            return Err("missing MCP error text".into());
+        };
+        assert!(text.contains("missing data"), "{text}");
         Ok(())
     }
 

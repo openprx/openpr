@@ -21,9 +21,10 @@ fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolR
 
 fn respond_data(result: Result<Value, String>) -> CallToolResult {
     match result {
-        Ok(value) => CallToolResult::success(
-            serde_json::to_string_pretty(value.get("data").unwrap_or(&Value::Null)).unwrap_or_default(),
-        ),
+        Ok(value) => match value.get("data") {
+            Some(data) => CallToolResult::success(serde_json::to_string_pretty(data).unwrap_or_default()),
+            None => CallToolResult::error("Malformed successful API envelope: missing data".to_string()),
+        },
         Err(error) => CallToolResult::error(error),
     }
 }
@@ -205,6 +206,23 @@ mod tests {
             let output: serde_json::Value = serde_json::from_str(text)?;
             assert_eq!(output, json!({"shape": "semantic-data"}));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_tools_fail_when_a_success_envelope_omits_data() -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new().route(
+            "/api/v1/workspaces/{workspace_id}/features/flow",
+            get(|| async { Json(json!({"code": 0, "message": "ok"})) }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let result = get_flow_feature(&client, json!({"workspace_id": "workspace"})).await;
+        assert_eq!(result.is_error, Some(true), "missing data was reported as success");
+        let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+            return Err("missing MCP error text".into());
+        };
+        assert!(text.contains("missing data"), "{text}");
         Ok(())
     }
 }
