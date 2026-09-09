@@ -411,6 +411,7 @@ fn state_for(db: DatabaseConnection) -> AppState {
             collab_allowed_origins: Vec::new(),
         },
         db,
+        flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
     }
 }
 

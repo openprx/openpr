@@ -746,7 +746,11 @@ mod tests {
             allow_insecure_cookies: false,
             collab_allowed_origins: Vec::new(),
         };
-        Some(AppState { cfg, db })
+        Some(AppState {
+            cfg,
+            db,
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
+        })
     }
 
     async fn exec(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) {

@@ -525,6 +525,7 @@ mod collab_database_tests {
                 collab_allowed_origins: vec![TEST_ORIGIN.to_string()],
             },
             db,
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
     }
 

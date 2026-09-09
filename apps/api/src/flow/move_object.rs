@@ -1646,6 +1646,16 @@ pub async fn execute_on(
                 committed_epoch,
             } => {
                 tx.commit().await?;
+                match super::collab::permission_cache::PermissionCache::for_state(state) {
+                    Ok(cache) => {
+                        if let Err(err) = cache.invalidate_subtree(state, workspace_id, plan.object_id).await {
+                            tracing::warn!(object_id = %plan.object_id, %workspace_id, %err, "permission cache subtree cleanup failed after move commit");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(object_id = %plan.object_id, %workspace_id, %err, "permission cache unavailable after move commit");
+                    }
+                }
                 finish(&ctx, &mut plans, &advanced);
                 return build_response(&ctx, &plan, event_id, &advanced, &observed_lock_order, committed_epoch).await;
             }
@@ -2212,6 +2222,7 @@ mod database_tests {
                 collab_allowed_origins: Vec::new(),
             },
             db,
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
     }
 

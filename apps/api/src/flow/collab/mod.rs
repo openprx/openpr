@@ -33,6 +33,7 @@ pub mod egress;
 pub mod frame;
 pub mod limits;
 pub mod origin;
+pub mod permission_cache;
 pub mod registry;
 pub mod runtime;
 pub mod session;

@@ -71,7 +71,11 @@ async fn main() -> anyhow::Result<()> {
     let db = connect_db(&config.database_runtime()?).await?;
     run_migrations(&db, config.migrations).await?;
     verify_governance_schema(&db).await?;
-    let state = AppState { cfg: cfg.clone(), db };
+    let state = AppState {
+        cfg: cfg.clone(),
+        db,
+        flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
+    };
     let auth_state = state.clone();
     // Proposal settlement deliberately does not run here. It used to run both as an API
     // background task and inline on `GET /api/v1/proposals*`, which made a read request write
@@ -3886,6 +3890,7 @@ mod proposal_scope_database_tests {
                 collab_allowed_origins: Vec::new(),
             },
             db: scratch.connection().clone(),
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
     }
 

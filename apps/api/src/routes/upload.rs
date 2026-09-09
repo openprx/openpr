@@ -1021,6 +1021,7 @@ mod tests {
                 collab_allowed_origins: Vec::new(),
             },
             db: DatabaseConnection::default(),
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
     }
 

@@ -352,6 +352,7 @@ mod decision_scope_database_tests {
                 collab_allowed_origins: Vec::new(),
             },
             db: scratch.db.clone(),
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
     }
 

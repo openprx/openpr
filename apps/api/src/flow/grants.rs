@@ -760,6 +760,7 @@ async fn apply(
     dry_run: bool,
     idempotency_key: &str,
 ) -> Result<Outcome, ApiError> {
+    let invalidate_subtree = matches!(change, Change::SetInheritance { .. });
     let tx = state.db.begin().await?;
 
     let result = apply_in_transaction(
@@ -777,6 +778,17 @@ async fn apply(
     match result {
         Ok((outcome, Disposition::Commit)) => {
             tx.commit().await?;
+            match super::collab::permission_cache::PermissionCache::for_state(state) {
+                Ok(cache) if invalidate_subtree => {
+                    if let Err(err) = cache.invalidate_subtree(state, workspace_id, object_id).await {
+                        tracing::warn!(%workspace_id, %object_id, %err, "permission cache subtree cleanup failed after commit");
+                    }
+                }
+                Ok(cache) => cache.invalidate_object(workspace_id, object_id),
+                Err(err) => {
+                    tracing::warn!(%workspace_id, %object_id, %err, "permission cache unavailable after authorization commit");
+                }
+            }
             Ok(outcome)
         }
         // A successful answer that must not persist: the `dry_run` path. The rollback is checked
@@ -1384,6 +1396,7 @@ mod database_tests {
                 collab_allowed_origins: Vec::new(),
             },
             db,
+            flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
     }
 

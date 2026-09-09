@@ -1,5 +1,8 @@
+use std::any::Any;
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use sea_orm::{ConnectOptions, Database, DatabaseConnection};
 
 use crate::config::{AppConfig, DatabaseRuntime};
@@ -8,6 +11,39 @@ use crate::config::{AppConfig, DatabaseRuntime};
 pub struct AppState {
     pub cfg: AppConfig,
     pub db: DatabaseConnection,
+    /// Per-process Flow effective-permission cache, type-erased here to keep the generic
+    /// `platform` crate independent of the API crate that owns the authorization types.
+    pub flow_permission_cache: FlowPermissionCacheSlot,
+}
+
+/// A cloneable, per-[`AppState`] slot for the API crate's effective-permission cache.
+///
+/// The slot is deliberately not a global registry. The concrete cache remains in
+/// `apps/api/src/flow/collab/permission_cache.rs`; type erasure avoids a dependency from this
+/// lower-level crate back to the API crate.
+#[derive(Clone, Default)]
+pub struct FlowPermissionCacheSlot {
+    inner: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl FlowPermissionCacheSlot {
+    /// Returns the slot's concrete service, initializing it exactly once. A type mismatch is
+    /// reported as `None` so callers can fail closed instead of panicking on an internal wiring
+    /// error.
+    pub fn get_or_init<T, F>(&self, init: F) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce() -> T,
+    {
+        let mut stored = self.inner.lock();
+        if let Some(service) = stored.as_ref() {
+            return Arc::clone(service).downcast::<T>().ok();
+        }
+        let service = Arc::new(init());
+        *stored = Some(service.clone());
+        drop(stored);
+        Some(service)
+    }
 }
 
 /// Opens the connection pool described by the `[database]` section.
