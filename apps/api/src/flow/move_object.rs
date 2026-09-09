@@ -2403,10 +2403,18 @@ mod database_tests {
         fx: &Fixture,
         input: &ExecuteCommandInput,
     ) -> Result<(AcceptedChange, u32), ApiError> {
+        retry_safe_contention(|| run_move_once(state, collab, fx, input)).await
+    }
+
+    async fn retry_safe_contention<T, Attempt, AttemptFuture>(mut attempt: Attempt) -> Result<(T, u32), ApiError>
+    where
+        Attempt: FnMut() -> AttemptFuture,
+        AttemptFuture: std::future::Future<Output = Result<T, ApiError>>,
+    {
         let mut contention_retries = 0_u32;
         loop {
-            match run_move_once(state, collab, fx, input).await {
-                Ok(change) => return Ok((change, contention_retries)),
+            match attempt().await {
+                Ok(value) => return Ok((value, contention_retries)),
                 Err(error) => {
                     let Some(retry_after_ms) = move_contention_retry_after_ms(&error) else {
                         return Err(error);
@@ -2452,6 +2460,49 @@ mod database_tests {
         let immediate_retry = ApiError::server_draining(ServerDrainingReason::Contention, 0, "server_draining");
         assert_eq!(move_contention_retry_after_ms(&immediate_retry), None);
         assert_eq!(move_contention_retry_after_ms(&ApiError::Internal), None);
+    }
+
+    #[tokio::test]
+    async fn racing_move_retry_count_matches_injected_contention_and_exhausts_the_bound() {
+        let mut attempts = 0_u32;
+        let (value, contention_retries) = retry_safe_contention(|| {
+            attempts += 1;
+            std::future::ready(if attempts <= 2 {
+                Err(ApiError::server_draining(
+                    ServerDrainingReason::Contention,
+                    1,
+                    "server_draining",
+                ))
+            } else {
+                Ok("accepted")
+            })
+        })
+        .await
+        .expect("two injected contention results are retried");
+        assert_eq!(value, "accepted");
+        assert_eq!(contention_retries, 2, "the observed count must equal the injections");
+        assert_eq!(attempts, 3, "two retries require exactly three attempts");
+
+        let mut exhausted_attempts = 0_u32;
+        let exhausted: Result<((), u32), ApiError> = retry_safe_contention(|| {
+            exhausted_attempts += 1;
+            std::future::ready(Err(ApiError::server_draining(
+                ServerDrainingReason::Contention,
+                1,
+                "server_draining",
+            )))
+        })
+        .await;
+        let error = exhausted.expect_err("contention beyond the retry bound must fail");
+        assert_eq!(
+            error.kind(),
+            ApiErrorKind::ServerDraining(ServerDrainingReason::Contention)
+        );
+        assert_eq!(
+            exhausted_attempts,
+            RACING_MOVE_CONTENTION_RETRIES + 1,
+            "the initial attempt plus the exact retry budget must run, then stop"
+        );
     }
 
     async fn scalar_i64(db: &DatabaseConnection, sql: &str, values: Vec<sea_orm::Value>) -> i64 {
@@ -2819,7 +2870,9 @@ mod database_tests {
         let one = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
         let two = create(&state, &fx, "page", Some(fx.project_b), Some(nav_b)).await;
 
-        let a_to_b = run_move(
+        // This deliberately bypasses the race-only retry helper. A logically sequential lock
+        // order scenario producing contention is a regression signal, not an event to mask.
+        let a_to_b = run_move_once(
             &state,
             &collab,
             &fx,
@@ -2827,7 +2880,7 @@ mod database_tests {
         )
         .await
         .expect("A -> B move succeeds");
-        let b_to_a = run_move(
+        let b_to_a = run_move_once(
             &state,
             &collab,
             &fx,
@@ -2863,7 +2916,9 @@ mod database_tests {
     /// `ServerDraining{reason=contention}` is the command's explicit not-applied, retryable result
     /// after its internal rebase budget is exhausted. The test waits the returned hint and retries
     /// at most [`RACING_MOVE_CONTENTION_RETRIES`] times. Every other error, and contention beyond
-    /// that bound, remains a hard failure with the used retry count in the assertion.
+    /// that bound, remains a hard failure. A deterministic injection test above asserts the exact
+    /// retry count and exhaustion point; this scheduler-dependent race only requires both logical
+    /// moves to complete.
     #[tokio::test]
     async fn two_concurrent_moves_with_reversed_contended_sets_both_complete_cleanly() {
         let scratch = scratch_or_skip!("concurrent_reversed");
@@ -2899,18 +2954,12 @@ mod database_tests {
             .expect("the second concurrent move must not hang")
             .expect("task joins");
 
-        for (label, outcome) in [("left", &left), ("right", &right)] {
-            match outcome {
-                Ok((_, contention_retries)) => assert!(
-                    *contention_retries <= RACING_MOVE_CONTENTION_RETRIES,
-                    "{label} move exceeded the bounded contention retry budget"
-                ),
-                Err(err) => panic!(
-                    "{label} move failed instead of serializing cleanly after at most \
-                     {RACING_MOVE_CONTENTION_RETRIES} safe contention retries: {err:?}"
-                ),
-            }
-        }
+        let (_left_change, _left_retries) = left.unwrap_or_else(|err| {
+            panic!("left move failed instead of serializing cleanly after bounded safe retries: {err:?}")
+        });
+        let (_right_change, _right_retries) = right.unwrap_or_else(|err| {
+            panic!("right move failed instead of serializing cleanly after bounded safe retries: {err:?}")
+        });
         assert_eq!(parent_of(&scratch.db, one).await, Some(nav_b));
         assert_eq!(parent_of(&scratch.db, two).await, Some(nav_a));
         assert_eq!(
