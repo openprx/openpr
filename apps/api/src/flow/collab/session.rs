@@ -35,6 +35,7 @@ use crate::error::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK};
 use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const STALE_OPEN_RECHECK_ATTEMPTS: usize = 3;
 
 pub(super) fn permission_admits_session(level: PermissionLevel) -> bool {
     level >= MINIMUM_COLLAB_SESSION_LEVEL
@@ -523,7 +524,22 @@ struct DocumentContext {
     checked_epoch: i64,
 }
 
-async fn fetch_document_object_id(db: &sea_orm::DatabaseConnection, document_id: Uuid) -> Option<Uuid> {
+enum OpenReverifyFailure {
+    Rejected { code: RejectedCode, reason: &'static str },
+    Draining(DrainSignal),
+    Indeterminate(&'static str),
+}
+
+enum RegisterAfterBootstrapFailure {
+    Limit(ConnectionLimit),
+    Reverify(OpenReverifyFailure),
+    RepeatedStale,
+}
+
+async fn fetch_document_object_id(
+    db: &sea_orm::DatabaseConnection,
+    document_id: Uuid,
+) -> Result<Option<Uuid>, sea_orm::DbErr> {
     #[derive(FromQueryResult)]
     struct Row {
         object_id: Uuid,
@@ -535,12 +551,14 @@ async fn fetch_document_object_id(db: &sea_orm::DatabaseConnection, document_id:
     ))
     .one(db)
     .await
-    .ok()
-    .flatten()
-    .map(|r| r.object_id)
+    .map(|row| row.map(|r| r.object_id))
 }
 
-async fn fetch_role(db: &sea_orm::DatabaseConnection, workspace_id: Uuid, user_id: Uuid) -> Option<String> {
+async fn fetch_role(
+    db: &sea_orm::DatabaseConnection,
+    workspace_id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<String>, sea_orm::DbErr> {
     #[derive(FromQueryResult)]
     struct Row {
         role: String,
@@ -552,9 +570,7 @@ async fn fetch_role(db: &sea_orm::DatabaseConnection, workspace_id: Uuid, user_i
     ))
     .one(db)
     .await
-    .ok()
-    .flatten()
-    .map(|r| r.role)
+    .map(|row| row.map(|r| r.role))
 }
 
 fn encode(frame: &Frame) -> Option<Message> {
@@ -685,8 +701,12 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
         return;
     }
 
-    let Some(ctx) = reverify_open(&state, &consumed, &mut socket).await else {
-        return;
+    let ctx = match reverify_open(&state, &consumed).await {
+        Ok(ctx) => ctx,
+        Err(failure) => {
+            reject_open_failure(&mut socket, document_id, failure).await;
+            return;
+        }
     };
 
     // ---- snapshot ----
@@ -700,16 +720,14 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
         .await;
         return;
     };
+
     // `collab-protocol-v1.md`'s `open known_seq/known_frontier`: a reconnecting client that still
     // holds the document up to a seq this server can continue from gets the accepted stream it
     // missed instead of the whole snapshot. Any refusal falls back to the full bootstrap below,
-    // which is always a correct answer to `open`.
-    match plan_resume(&state.db, document_id, &boot, known_seq, known_frontier.as_deref()).await {
-        Ok(frames) => {
-            for frame in &frames {
-                send(&mut socket, frame).await;
-            }
-        }
+    // which is always a correct answer to `open`. Build the answer before registration so a
+    // commit cannot both appear in this direct replay and be queued through the registry.
+    let opening_frames = match plan_resume(&state.db, document_id, &boot, known_seq, known_frontier.as_deref()).await {
+        Ok(frames) => frames,
         Err(refusal) => {
             if refusal != ResumeRefusal::NotRequested {
                 tracing::debug!(
@@ -717,65 +735,65 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                     "collab session: resume refused, falling back to a full snapshot"
                 );
             }
-            send(
-                &mut socket,
-                &Frame::Snapshot {
-                    protocol_version: PROTOCOL_VERSION,
-                    document_id,
-                    snapshot_seq: boot.snapshot_seq,
-                    head_seq: boot.head_seq,
-                    snapshot: BASE64.encode(&boot.snapshot),
-                    tail_updates: boot
-                        .tail_updates
-                        .iter()
-                        .map(|u| TailUpdate {
-                            seq: u.seq,
-                            update_id: u.update_id,
-                            bytes: BASE64.encode(&u.bytes),
-                            before_frontier: BASE64.encode(&u.before_frontier),
-                            after_frontier: BASE64.encode(&u.after_frontier),
-                        })
-                        .collect(),
-                    head_frontier: BASE64.encode(&boot.head_frontier),
-                },
-            )
-            .await;
+            vec![Frame::Snapshot {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                snapshot_seq: boot.snapshot_seq,
+                head_seq: boot.head_seq,
+                snapshot: BASE64.encode(&boot.snapshot),
+                tail_updates: boot
+                    .tail_updates
+                    .iter()
+                    .map(|u| TailUpdate {
+                        seq: u.seq,
+                        update_id: u.update_id,
+                        bytes: BASE64.encode(&u.bytes),
+                        before_frontier: BASE64.encode(&u.before_frontier),
+                        after_frontier: BASE64.encode(&u.after_frontier),
+                    })
+                    .collect(),
+                head_frontier: BASE64.encode(&boot.head_frontier),
+            }]
         }
+    };
+
+    // Register before any document content is sent. If authorization changed while the bounded
+    // bootstrap and resume planning were running, re-check it against the new epoch and retry the
+    // atomic registry admission; a still-authorized open proceeds, a confirmed revocation gets
+    // 4403, and repeated churn or a database failure gets the existing recoverable 4410 drain.
+    let (mut registered, ctx) =
+        match register_after_bootstrap(&state, &collab.registry, &consumed, session_id, ctx).await {
+            Ok(registered) => registered,
+            Err(RegisterAfterBootstrapFailure::Limit(limit)) => {
+                send(&mut socket, &connection_limit_frame(document_id, limit)).await;
+                close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
+                return;
+            }
+            Err(RegisterAfterBootstrapFailure::Reverify(failure)) => {
+                reject_open_failure(&mut socket, document_id, failure).await;
+                return;
+            }
+            Err(RegisterAfterBootstrapFailure::RepeatedStale) => {
+                reject_drain_and_close(
+                    &mut socket,
+                    document_id,
+                    DrainSignal::new(CONNECTION_LIMIT_RETRY_AFTER_MS),
+                )
+                .await;
+                return;
+            }
+        };
+    for frame in &opening_frames {
+        send(&mut socket, frame).await;
     }
 
     // ---- steady state ----
     // `limits-v1.md`'s three connection ceilings (`connections_per_user_max`/`_per_document_max`/
-    // `_per_workspace_max`) are checked and reserved atomically here, as late as possible (after
-    // the ticket/permission/flag reverification above, so an over-ceiling caller never pays for a
-    // database round trip whose result it cannot use). `open_documents_per_connection_max = 8` has
-    // no counting to do: v0.4 scopes one WebSocket connection to exactly the one `document_id` its
+    // `_per_workspace_max`) were checked and reserved atomically above, after bootstrap load but
+    // before any document content was sent. `open_documents_per_connection_max = 8` has no
+    // counting to do: v0.4 scopes one WebSocket connection to exactly the one `document_id` its
     // ticket was issued for (`frame.rs`'s own doc comment), so that ceiling is met structurally by
     // every connection, not enforced by counting.
-    let mut registered = match collab.registry.try_register_authorized(
-        document_id,
-        ctx.object_id,
-        consumed.user_id,
-        consumed.workspace_id,
-        session_id,
-        ctx.checked_epoch,
-    ) {
-        Ok(registered) => registered,
-        Err(RegistrationError::Limit(limit)) => {
-            send(&mut socket, &connection_limit_frame(document_id, limit)).await;
-            close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
-            return;
-        }
-        Err(RegistrationError::StaleAuthorization) => {
-            reject_and_close(
-                &mut socket,
-                document_id,
-                RejectedCode::Forbidden,
-                "authorization changed",
-            )
-            .await;
-            return;
-        }
-    };
     // The "join" half of presence fan-out. `SessionRegistry::broadcast` only reaches sessions that
     // were already connected when a peer's `presence` frame arrived, so without this a session
     // joining a document sees an empty document until every peer happens to refresh — up to a full
@@ -1299,39 +1317,49 @@ async fn plan_resume(
     Ok(frames)
 }
 
-async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut WebSocket) -> Option<DocumentContext> {
+async fn reverify_open(state: &AppState, consumed: &ConsumedTicket) -> Result<DocumentContext, OpenReverifyFailure> {
     let document_id = consumed.document_id;
-    let Some(object_id) = fetch_document_object_id(&state.db, document_id).await else {
-        reject_and_close(socket, document_id, RejectedCode::NotFound, "document not found").await;
-        return None;
+    let object_id = match fetch_document_object_id(&state.db, document_id).await {
+        Ok(Some(object_id)) => object_id,
+        Ok(None) => {
+            return Err(OpenReverifyFailure::Rejected {
+                code: RejectedCode::NotFound,
+                reason: "document not found",
+            });
+        }
+        Err(err) => {
+            tracing::warn!(%document_id, %err, "collab open document lookup failed");
+            return Err(OpenReverifyFailure::Indeterminate("document lookup failed"));
+        }
     };
     if let Some(signal) = runtime::runtime().workspace_drain_signal(consumed.workspace_id) {
-        reject_drain_and_close(socket, document_id, signal).await;
-        return None;
+        return Err(OpenReverifyFailure::Draining(signal));
     }
-    let Ok(flow_enabled) = crate::flow::repository::fetch_flow_enabled(&state.db, consumed.workspace_id).await else {
-        reject_and_close(
-            socket,
-            document_id,
-            RejectedCode::FeatureDisabled,
-            "flow is not enabled",
-        )
-        .await;
-        return None;
+    let flow_enabled = match crate::flow::repository::fetch_flow_enabled(&state.db, consumed.workspace_id).await {
+        Ok(flow_enabled) => flow_enabled,
+        Err(err) => {
+            tracing::warn!(workspace_id = %consumed.workspace_id, %err, "collab open feature lookup failed");
+            return Err(OpenReverifyFailure::Indeterminate("feature lookup failed"));
+        }
     };
     if !flow_enabled {
-        reject_and_close(
-            socket,
-            document_id,
-            RejectedCode::FeatureDisabled,
-            "flow is not enabled",
-        )
-        .await;
-        return None;
+        return Err(OpenReverifyFailure::Rejected {
+            code: RejectedCode::FeatureDisabled,
+            reason: "flow is not enabled",
+        });
     }
-    let Some(role) = fetch_role(&state.db, consumed.workspace_id, consumed.user_id).await else {
-        reject_and_close(socket, document_id, RejectedCode::Forbidden, "not a workspace member").await;
-        return None;
+    let role = match fetch_role(&state.db, consumed.workspace_id, consumed.user_id).await {
+        Ok(Some(role)) => role,
+        Ok(None) => {
+            return Err(OpenReverifyFailure::Rejected {
+                code: RejectedCode::Forbidden,
+                reason: "not a workspace member",
+            });
+        }
+        Err(err) => {
+            tracing::warn!(workspace_id = %consumed.workspace_id, user_id = %consumed.user_id, %err, "collab open membership lookup failed");
+            return Err(OpenReverifyFailure::Indeterminate("membership lookup failed"));
+        }
     };
     // `ADR-0012` §3.1: `checked_epoch` is "the epoch permission was computed against", and every
     // update this connection later commits is fenced against it (`write::run_locked_phase` ->
@@ -1341,11 +1369,14 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
     // compared the post-revocation epoch against itself and every subsequent write on this
     // connection sailed through on permission that had already been taken away. The fence only
     // compares epochs, so the order of these two reads is the entire barrier.
-    let Ok(checked_epoch) = authz::read_epoch(&state.db, consumed.workspace_id).await else {
-        reject_and_close(socket, document_id, RejectedCode::Forbidden, "epoch read failed").await;
-        return None;
+    let checked_epoch = match authz::read_epoch(&state.db, consumed.workspace_id).await {
+        Ok(epoch) => epoch,
+        Err(err) => {
+            tracing::warn!(workspace_id = %consumed.workspace_id, %err, "collab open epoch lookup failed");
+            return Err(OpenReverifyFailure::Indeterminate("epoch lookup failed"));
+        }
     };
-    let Ok(level) = authz::effective_permission(
+    let level = match authz::effective_permission(
         &state.db,
         consumed.workspace_id,
         object_id,
@@ -1354,18 +1385,70 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket, socket: &mut
         &role,
     )
     .await
-    else {
-        reject_and_close(socket, document_id, RejectedCode::Forbidden, "permission check failed").await;
-        return None;
+    {
+        Ok(level) => level,
+        Err(err) => {
+            tracing::warn!(workspace_id = %consumed.workspace_id, user_id = %consumed.user_id, %object_id, ?err, "collab open permission lookup failed");
+            return Err(OpenReverifyFailure::Indeterminate("permission lookup failed"));
+        }
     };
     if !permission_admits_session(level) {
-        reject_and_close(socket, document_id, RejectedCode::Forbidden, "insufficient permission").await;
-        return None;
+        return Err(OpenReverifyFailure::Rejected {
+            code: RejectedCode::Forbidden,
+            reason: "insufficient permission",
+        });
     }
-    Some(DocumentContext {
+    Ok(DocumentContext {
         object_id,
         checked_epoch,
     })
+}
+
+async fn register_after_bootstrap(
+    state: &AppState,
+    registry: &super::registry::SessionRegistry,
+    consumed: &ConsumedTicket,
+    session_id: Uuid,
+    mut context: DocumentContext,
+) -> Result<(super::registry::RegisteredSession, DocumentContext), RegisterAfterBootstrapFailure> {
+    let mut stale_rechecks = 0usize;
+    loop {
+        match registry.try_register_authorized(
+            consumed.document_id,
+            context.object_id,
+            consumed.user_id,
+            consumed.workspace_id,
+            session_id,
+            context.checked_epoch,
+        ) {
+            Ok(registered) => return Ok((registered, context)),
+            Err(RegistrationError::Limit(limit)) => return Err(RegisterAfterBootstrapFailure::Limit(limit)),
+            Err(RegistrationError::StaleAuthorization) => {
+                if stale_rechecks >= STALE_OPEN_RECHECK_ATTEMPTS {
+                    return Err(RegisterAfterBootstrapFailure::RepeatedStale);
+                }
+                stale_rechecks += 1;
+                context = reverify_open(state, consumed)
+                    .await
+                    .map_err(RegisterAfterBootstrapFailure::Reverify)?;
+            }
+        }
+    }
+}
+
+async fn reject_open_failure(socket: &mut WebSocket, document_id: Uuid, failure: OpenReverifyFailure) {
+    match failure {
+        OpenReverifyFailure::Rejected { code, reason } => {
+            reject_and_close(socket, document_id, code, reason).await;
+        }
+        OpenReverifyFailure::Draining(signal) => {
+            reject_drain_and_close(socket, document_id, signal).await;
+        }
+        OpenReverifyFailure::Indeterminate(operation) => {
+            tracing::warn!(%document_id, operation, "collab open authorization indeterminate; draining for retry");
+            reject_drain_and_close(socket, document_id, DrainSignal::new(CONNECTION_LIMIT_RETRY_AFTER_MS)).await;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3472,12 +3555,12 @@ mod tests {
                 open_sessions.push(ws);
             }
 
-            // The seventeenth completes the same `hello`/`open`/`snapshot` handshake: `run`
-            // reserves the connection slot only after the snapshot has been sent (the ceiling
-            // bounds *steady-state* sessions), so the refusal is the frame right after it.
+            // The seventeenth completes `hello`/`open`, but must be refused before any snapshot:
+            // authorization and the connection slot are now reserved before document content is
+            // sent, closing the stale-open disclosure window.
             let client_id = "user-connections-overflow";
             let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
-            let (mut ws, _) = open_session(addr, &ticket, client_id, document_id).await;
+            let (mut ws, _) = handshake(addr, &ticket, client_id, document_id, None, None).await;
 
             let rejected = recv_frame(&mut ws).await;
             let Frame::Rejected { code, details, .. } = rejected else {
@@ -5127,13 +5210,14 @@ mod database_tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, FromQueryResult};
     use uuid::Uuid;
 
-    use super::{Frame, GapResolution, PROTOCOL_VERSION, plan_gap_resolution};
+    use super::{Frame, GapResolution, PROTOCOL_VERSION, plan_gap_resolution, register_after_bootstrap, reverify_open};
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::authz;
     use crate::flow::collab::cache::WarmCache;
     use crate::flow::collab::coordinator::DocumentCoordinator;
-    use crate::flow::collab::registry::SessionRegistry;
+    use crate::flow::collab::registry::{RegistrationError, SessionRegistry};
     use crate::flow::collab::snapshot::SnapshotAdvancer;
+    use crate::flow::collab::ticket::ConsumedTicket;
     use crate::flow::collab::write::{self, AcceptOutcome, UpdateRequest};
     use crate::flow::collab::{bootstrap, limits};
     use crate::flow::command::{CreateObjectInput, create_object};
@@ -5293,6 +5377,66 @@ mod database_tests {
         .await
         .expect("object creation succeeds");
         (accepted.object.id, accepted.object.document_id)
+    }
+
+    #[tokio::test]
+    async fn stale_but_still_authorized_open_rechecks_and_registers_before_snapshot() {
+        let scratch = scratch_or_skip!("stale-open-recheck");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        exec(
+            &state,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        let (object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let consumed = ConsumedTicket {
+            user_id: owner_id,
+            workspace_id,
+            document_id,
+            client_id: "stale-open-recheck".to_string(),
+        };
+        let Ok(initial) = reverify_open(&state, &consumed).await else {
+            panic!("initial authorization must be decidable and sufficient")
+        };
+
+        exec(
+            &state,
+            "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        )
+        .await;
+        let registry = SessionRegistry::new();
+        let next_epoch = initial.checked_epoch + 1;
+        assert!(
+            registry
+                .observe_epoch_and_workspace_sessions(workspace_id, next_epoch)
+                .is_empty()
+        );
+        let session_id = Uuid::new_v4();
+        assert!(matches!(
+            registry.try_register_authorized(
+                document_id,
+                object_id,
+                owner_id,
+                workspace_id,
+                session_id,
+                initial.checked_epoch,
+            ),
+            Err(RegistrationError::StaleAuthorization)
+        ));
+
+        let Ok((_registered, refreshed)) =
+            register_after_bootstrap(&state, &registry, &consumed, session_id, initial).await
+        else {
+            panic!("an unrelated epoch bump must re-check and admit this authorized open")
+        };
+        assert_eq!(refreshed.checked_epoch, next_epoch);
+        assert_eq!(refreshed.object_id, object_id);
+        assert_eq!(registry.session_count(document_id), 1);
+        registry.unregister(document_id, session_id);
+        scratch.drop_self().await;
     }
 
     /// Commits `count` real, sequential updates through the exact production write path, returning
