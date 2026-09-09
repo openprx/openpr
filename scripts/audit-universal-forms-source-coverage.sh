@@ -1079,7 +1079,7 @@ contains "delivery manifest includes restore script" "scripts/prepare-universal-
 contains "delivery manifest includes stop script" "scripts/prepare-universal-forms-delivery-manifest.sh" "stop script"
 contains "delivery manifest includes clean script" "scripts/prepare-universal-forms-delivery-manifest.sh" "clean script"
 contains "MCP test script requires exact expected tool count" "scripts/test-mcp.sh" 'expected exactly $EXPECTED_TOOL_COUNT'
-contains "MCP test script accepts an explicit expected tool count" "scripts/test-mcp.sh" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-'
+contains "MCP test script derives its strict default tool count" "scripts/test-mcp.sh" 'EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-$(python3 "$PROJECT_ROOT/skills/openpr-mcp/scripts/expected-tool-count.py")}"'
 contains "MCP test script requires scenario template install" "scripts/test-mcp.sh" "scenario_templates.install"
 contains "MCP test script requires forms.duplicate" "scripts/test-mcp.sh" "forms.duplicate"
 contains "MCP test script requires form metadata tools" "scripts/test-mcp.sh" "forms.schema_summary"

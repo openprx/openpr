@@ -19,7 +19,6 @@ set -euo pipefail
 #      reinterpret this as product success without stronger live coverage.
 
 MCP_URL="${MCP_URL:-http://localhost:8090}"
-EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-107}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${OPENPR_CONFIG_FILE:-$PROJECT_ROOT/config/openpr.compose.mcp.toml}"
 
@@ -35,6 +34,11 @@ for required_tool in curl python3 grep sed wc tr; do
     exit 2
   fi
 done
+
+# Keep the default coupled to the repository-owned registry snapshot. An explicit override is
+# still useful when testing a deliberately rebased external deployment, but stale source defaults
+# must fail the same exact-count comparison below instead of silently weakening it.
+EXPECTED_TOOL_COUNT="${EXPECTED_TOOL_COUNT:-$(python3 "$PROJECT_ROOT/skills/openpr-mcp/scripts/expected-tool-count.py")}"
 
 # Probe the external runtime before reading credentials. A closed compose port
 # is an environment precondition failure, not evidence that MCP product code
