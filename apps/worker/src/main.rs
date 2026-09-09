@@ -5,7 +5,7 @@ use api::outbound::validate_outbound_url;
 use api::webhook_trigger::{WEBHOOK_SIGNATURE_HEADER, sign_payload};
 use clap::Parser;
 use platform::{
-    app::{AppState, connect_db},
+    app::{AppState, FlowPermissionCacheSlot, connect_db},
     config::{AppConfig, OpenPrConfig},
     logging,
 };
@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         cfg: cfg.clone(),
         db: db.clone(),
+        flow_permission_cache: FlowPermissionCacheSlot::default(),
     };
     // Redirects are disabled so a validated public endpoint cannot bounce the request into the
     // internal network after the target checks have already passed.
