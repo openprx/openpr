@@ -3222,6 +3222,108 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
+    /// Scope aggregation and item pagination have different work shapes. More than 1000 visible
+    /// objects must not make page one fail merely because the aggregate covers the whole scope;
+    /// the aggregate stays scope-wide in SQL while the item scan advances from the caller cursor
+    /// and stops after `limit + 1` visible rows.
+    #[tokio::test]
+    async fn projection_lag_large_scope_remains_usable_and_pageable() {
+        let scratch = scratch_or_skip!("projection-lag-large-scope");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let source = create_page_as_owner(&state, workspace_id, owner_id, "aggregate seed").await;
+
+        exec(
+            &state,
+            "CREATE TABLE flow_projection_lag_bulk_ids AS \
+             SELECT gen_random_uuid() AS id, n \
+               FROM generate_series(1, 1001) AS n",
+            Vec::new(),
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO flow_objects \
+                (id, workspace_id, object_type, created_by, updated_by, created_at, updated_at) \
+             SELECT id, $1, 'page', $2, $2, \
+                    TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => n), \
+                    TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => n) \
+               FROM flow_projection_lag_bulk_ids",
+            vec![workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO collab_documents \
+                (object_id, format_version, snapshot, snapshot_frontier, head_seq, \
+                 head_frontier) \
+             SELECT b.id, d.format_version, d.snapshot, d.snapshot_frontier, b.n % 17, \
+                    d.head_frontier \
+               FROM flow_projection_lag_bulk_ids b \
+               CROSS JOIN collab_documents d \
+              WHERE d.object_id = $1",
+            vec![source.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO flow_object_projections \
+                (object_id, document_seq, document_frontier, title, plain_text) \
+             SELECT id, 0, ''::bytea, 'bulk projection lag', '' \
+               FROM flow_projection_lag_bulk_ids",
+            Vec::new(),
+        )
+        .await;
+
+        let first = body_json(to_response(
+            get_flow_projection_lag(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ProjectionLagQuery {
+                    project_id: None,
+                    cursor: None,
+                    limit: Some(50),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(first["code"], 0, "large-scope first page failed: {first}");
+        assert_eq!(first["data"]["items"].as_array().expect("items").len(), 50);
+        assert_eq!(first["data"]["max_lag"], 16, "{first}");
+        assert_eq!(first["data"]["p95_lag"], 16, "{first}");
+        let cursor = first["data"]["next_cursor"]
+            .as_str()
+            .expect("large scope has a second page")
+            .to_string();
+
+        let second = body_json(to_response(
+            get_flow_projection_lag(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(workspace_id),
+                Query(ProjectionLagQuery {
+                    project_id: None,
+                    cursor: Some(cursor),
+                    limit: Some(50),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(second["code"], 0, "large-scope second page failed: {second}");
+        assert_eq!(second["data"]["items"].as_array().expect("items").len(), 50);
+        assert_eq!(second["data"]["max_lag"], first["data"]["max_lag"]);
+        assert_eq!(second["data"]["p95_lag"], first["data"]["p95_lag"]);
+        assert!(second["data"]["next_cursor"].is_string(), "{second}");
+
+        scratch.drop_self().await;
+    }
+
     async fn index_accepted_projection(state: &AppState, object_id: Uuid) {
         exec(
             state,

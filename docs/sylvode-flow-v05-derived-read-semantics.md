@@ -8,11 +8,12 @@ scope selected by `workspace_id` and the optional `project_id`, before cursor/pa
 Consequently, following `next_cursor` changes `items` but does not make either aggregate jump.
 
 This interpretation follows `contracts/mcp-surface-v1.md`, which calls the fields
-“policy-filtered max/p95”, rather than “page max/p95”. Candidate rows are authorized before they
-can contribute. The full scan is bounded by the frozen `authorized_scan_rows_max=1000`; crossing
-that ceiling fails with `limit_exceeded`/`scan_budget` instead of returning a partial aggregate.
-The response deliberately exposes no pre-policy total, examined-row count, or hidden-object
-metadata.
+“policy-filtered max/p95”, rather than “page max/p95”. A database aggregate evaluates effective
+`view` permission inside the statement, so hidden objects cannot contribute and a scope larger
+than `authorized_scan_rows_max=1000` remains usable. The separate items query retains keyset
+pagination and stops after `limit + 1` policy-visible rows; only that candidate overfetch is
+charged to the frozen scan budget. The response deliberately exposes no pre-policy total,
+examined-row count, or hidden-object metadata.
 
 ## Diff replay boundary
 

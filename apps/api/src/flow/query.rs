@@ -25,7 +25,8 @@ use super::model::{
 use super::policy::{self, AuthorizedFlowObject, FlowReadContext};
 use super::projection;
 use super::repository::{
-    self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow, ProjectionLagFilter, ProjectionLagRow,
+    self, FlowSettingsRow, HistoryFilter, HistoryRow, ListFilter, ObjectViewRow, ProjectionLagAggregateFilter,
+    ProjectionLagFilter, ProjectionLagRow,
 };
 
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
@@ -141,6 +142,7 @@ async fn scan_projection_lag_within_budget(
     state: &AppState,
     access: &FlowReadContext,
     mut filter: ProjectionLagFilter,
+    needed: usize,
 ) -> Result<Option<Vec<ProjectionLagRow>>, ApiError> {
     let mut accepted = Vec::new();
     let mut examined = 0_u64;
@@ -167,6 +169,9 @@ async fn scan_projection_lag_within_budget(
             filter.after = Some((row.created_at, row.object_id));
             if is_visible {
                 accepted.push(row);
+                if accepted.len() >= needed {
+                    return Ok(Some(accepted));
+                }
             }
         }
         if (batch_len as u64) < SCAN_BATCH_SIZE {
@@ -712,6 +717,7 @@ pub struct ProjectionLagParams {
 /// rank is the final sample, so p95 equals the scope maximum. Both values are computed only after
 /// authorization, but before cursor/page slicing: page navigation therefore never changes either
 /// aggregate, and an inaccessible object's lag cannot change an aggregate field.
+#[cfg(test)]
 fn projection_lag_aggregates(items: &[ProjectionLagItem]) -> (i64, i64) {
     if items.is_empty() {
         return (0, 0);
@@ -740,43 +746,37 @@ pub async fn get_projection_lag(
     let filter = ProjectionLagFilter {
         workspace_id: params.workspace_id,
         project_id: params.project_id,
-        after: None,
+        after,
         limit: 0,
     };
-    let Some(rows) = scan_projection_lag_within_budget(state, access, filter).await? else {
+    let Some(mut rows) =
+        scan_projection_lag_within_budget(state, access, filter, limit_usize.saturating_add(1)).await?
+    else {
         return Ok(None);
     };
+    let aggregate = repository::aggregate_projection_lag(
+        &state.db,
+        &ProjectionLagAggregateFilter {
+            workspace_id: params.workspace_id,
+            project_id: params.project_id,
+            actor_id: access.actor_id(),
+            principal_kind: access.principal_kind().as_str(),
+            is_human_admin: access.is_human_admin(),
+            max_chain_nodes: i64::try_from(super::collab::authz::MAX_CHAIN_NODES).unwrap_or(i64::MAX),
+            tree_depth_max: i64::try_from(super::collab::authz::TREE_DEPTH_MAX).unwrap_or(i64::MAX),
+        },
+    )
+    .await?;
     if !policy::ensure_epoch_current(state, access).await? {
         return Ok(None);
     }
-
-    let aggregate_items: Vec<ProjectionLagItem> = rows
-        .iter()
-        .map(|row| ProjectionLagItem {
-            object_id: row.object_id,
-            head_seq: row.head_seq,
-            projection_seq: row.projection_seq,
-            lag: projection_lag(row.head_seq, row.projection_seq),
-        })
-        .collect();
-    let (max_lag, p95_lag) = projection_lag_aggregates(&aggregate_items);
-    let page_start = after.map_or(0, |after_key| {
-        // Resume strictly after the caller cursor. A cursor row hidden by a later policy change
-        // still resumes at the first visible row whose stable key is greater than the cursor.
-        rows.partition_point(|row| (row.created_at, row.object_id) <= after_key)
-    });
-    let mut page_rows: Vec<_> = rows
-        .into_iter()
-        .skip(page_start)
-        .take(limit_usize.saturating_add(1))
-        .collect();
-    let next_cursor = if page_rows.len() > limit_usize {
-        page_rows.truncate(limit_usize);
-        page_rows.last().map(|row| encode_cursor(row.created_at, row.object_id))
+    let next_cursor = if rows.len() > limit_usize {
+        rows.truncate(limit_usize);
+        rows.last().map(|row| encode_cursor(row.created_at, row.object_id))
     } else {
         None
     };
-    let items: Vec<ProjectionLagItem> = page_rows
+    let items: Vec<ProjectionLagItem> = rows
         .into_iter()
         .map(|row| ProjectionLagItem {
             object_id: row.object_id,
@@ -786,8 +786,8 @@ pub async fn get_projection_lag(
         })
         .collect();
     Ok(Some(ProjectionLagResponse {
-        max_lag,
-        p95_lag,
+        max_lag: aggregate.max_lag,
+        p95_lag: aggregate.p95_lag,
         items,
         next_cursor,
     }))

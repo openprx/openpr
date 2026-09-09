@@ -256,6 +256,115 @@ pub struct ProjectionLagFilter {
     pub limit: u64,
 }
 
+pub struct ProjectionLagAggregateFilter<'a> {
+    pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub actor_id: Uuid,
+    pub principal_kind: &'a str,
+    pub is_human_admin: bool,
+    pub max_chain_nodes: i64,
+    pub tree_depth_max: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+pub struct ProjectionLagAggregate {
+    pub max_lag: i64,
+    pub p95_lag: i64,
+}
+
+/// Computes scope-wide projection-lag aggregates without spending the candidate overfetch budget.
+///
+/// Authorization is evaluated inside the aggregate statement with the same inheritance-boundary
+/// rules as `authz::effective_permissions`. This is intentionally separate from the keyset page:
+/// scope cardinality can be arbitrarily larger than one response page without making the endpoint
+/// unusable, while invisible objects still cannot affect either aggregate.
+pub async fn aggregate_projection_lag<C: ConnectionTrait>(
+    conn: &C,
+    filter: &ProjectionLagAggregateFilter<'_>,
+) -> Result<ProjectionLagAggregate, ApiError> {
+    let mut scope_predicate = String::from("fo.workspace_id = $1");
+    let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
+    if let Some(project_id) = filter.project_id {
+        values.push(project_id.into());
+        let _ = write!(scope_predicate, " AND fo.project_id = ${}", values.len());
+    } else {
+        scope_predicate.push_str(" AND fo.project_id IS NULL");
+    }
+    values.push(filter.actor_id.into());
+    let actor_index = values.len();
+    values.push(filter.principal_kind.to_owned().into());
+    let principal_kind_index = values.len();
+    values.push(filter.is_human_admin.into());
+    let human_admin_index = values.len();
+    values.push(filter.max_chain_nodes.into());
+    let probe_depth_index = values.len();
+    values.push(filter.tree_depth_max.into());
+    let tree_depth_index = values.len();
+
+    let sql = format!(
+        r"
+        WITH RECURSIVE scoped AS (
+            SELECT fo.id
+              FROM flow_objects fo
+             WHERE {scope_predicate}
+        ), chain AS (
+            SELECT s.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent, 0 AS depth,
+                   ARRAY[o.id]::uuid[] AS path, false AS cycle
+              FROM scoped s
+              JOIN flow_objects o ON o.id = s.id
+            UNION ALL
+            SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent, c.depth + 1,
+                   c.path || p.id, p.id = ANY(c.path)
+              FROM chain c
+              JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $1
+             WHERE c.parent_id IS NOT NULL
+               AND c.depth < ${probe_depth_index}::int
+               AND NOT c.cycle
+        ), chain_state AS (
+            SELECT seed_id,
+                   bool_or(cycle OR depth > ${tree_depth_index}::int) AS invalid,
+                   (array_agg(parent_id ORDER BY depth DESC))[1] IS NOT NULL AS incomplete,
+                   min(depth) FILTER (WHERE NOT inherit_from_parent) AS boundary_depth
+              FROM chain
+             GROUP BY seed_id
+        ), visible AS (
+            SELECT s.id
+              FROM scoped s
+              JOIN chain_state cs ON cs.seed_id = s.id
+             WHERE ${human_admin_index}
+                OR (
+                    NOT cs.invalid
+                    AND NOT cs.incomplete
+                    AND (
+                        cs.boundary_depth IS NULL
+                        OR EXISTS (
+                            SELECT 1
+                              FROM chain c
+                              JOIN flow_object_grants g ON g.object_id = c.id
+                             WHERE c.seed_id = s.id
+                               AND c.depth <= cs.boundary_depth
+                               AND g.principal_id = ${actor_index}
+                               AND g.principal_kind = ${principal_kind_index}
+                        )
+                    )
+                )
+        ), lags AS (
+            SELECT cd.head_seq - p.document_seq AS lag
+              FROM visible v
+              JOIN collab_documents cd ON cd.object_id = v.id
+              JOIN flow_object_projections p ON p.object_id = v.id
+        )
+        SELECT COALESCE(MAX(lag), 0)::bigint AS max_lag,
+               COALESCE(PERCENTILE_DISC(0.95) WITHIN GROUP (ORDER BY lag), 0)::bigint AS p95_lag
+          FROM lags
+        "
+    );
+    ProjectionLagAggregate::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+        .one(conn)
+        .await?
+        .ok_or(ApiError::Internal)
+}
+
 /// Reads one stable keyset page of projection-lag candidates before policy filtering.
 ///
 /// `DeclaredProject?` is fail-closed: a declared project selects exactly that project; omission
