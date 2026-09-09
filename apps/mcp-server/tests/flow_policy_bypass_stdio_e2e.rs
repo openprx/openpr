@@ -24,7 +24,11 @@
 
 mod support;
 
-use axum::{Json, Router, extract::Path, routing::get, routing::post};
+use axum::{
+    Json, Router,
+    extract::Path,
+    routing::{MethodRouter, any, get, post},
+};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::process::Stdio;
@@ -93,6 +97,51 @@ fn flow_router() -> Router {
         .route(
             &format!("/api/v1/projects/{OWNING_PROJECT}/agent-policy"),
             get(|| async { Json(json!({ "code": 0, "data": { "mcp": {} } })) }),
+        )
+}
+
+fn counted_forbidden_collab_route(counter: &Arc<AtomicUsize>) -> MethodRouter {
+    let counter = Arc::clone(counter);
+    any(move || {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "code": 500,
+                "message": "the MCP stdio client reached a forbidden collaboration endpoint",
+                "data": null
+            }))
+        }
+    })
+}
+
+/// The regular stand-in Flow API plus traps for every user/browser-only collaboration route.
+/// A real MCP tool call reaching any trap is a policy-surface escape, regardless of the response.
+fn flow_router_with_collab_endpoint_traps(counter: &Arc<AtomicUsize>) -> Router {
+    flow_router()
+        .route(
+            "/api/v1/workspaces/{workspace_id}/flow/projection-lag",
+            get(|| async {
+                Json(json!({
+                    "code": 0,
+                    "message": "ok",
+                    "data": { "max_lag": 0, "p95_lag": 0, "items": [], "next_cursor": null }
+                }))
+            }),
+        )
+        .route("/api/v1/collab/tickets", counted_forbidden_collab_route(counter))
+        .route("/api/v1/collab/ws", counted_forbidden_collab_route(counter))
+        .route(
+            "/api/v1/flow/objects/{object_id}/collab",
+            counted_forbidden_collab_route(counter),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/collab/verify",
+            counted_forbidden_collab_route(counter),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/bootstrap",
+            counted_forbidden_collab_route(counter),
         )
 }
 
@@ -416,8 +465,9 @@ async fn one_flow_write_has_identical_semantic_results_over_stdio_http_and_sse()
 }
 
 #[tokio::test]
-async fn stdio_bot_can_write_flow_but_has_no_ticket_or_direct_ws_surface() -> TestResult {
-    let api_url = spawn_router(flow_router()).await?;
+async fn stdio_real_tools_cannot_smuggle_ticket_ws_or_bootstrap_access() -> TestResult {
+    let forbidden_endpoint_calls = Arc::new(AtomicUsize::new(0));
+    let api_url = spawn_router(flow_router_with_collab_endpoint_traps(&forbidden_endpoint_calls)).await?;
     let mut stdio = StdioClient::spawn(&api_url)?;
 
     let write = stdio.call(&create_object_request()).await?;
@@ -437,13 +487,54 @@ async fn stdio_bot_can_write_flow_but_has_no_ticket_or_direct_ws_surface() -> Te
         .iter()
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    assert!(names.contains(&"objects.create"));
-    for forbidden in ["collab.ticket", "collab.tickets", "collab.ws", "collab.direct_ws"] {
-        assert!(
-            !names.contains(&forbidden),
-            "stdio exposed forbidden direct-collaboration surface {forbidden}"
-        );
+    for registered in ["objects.create", "objects.get", "collab.projection_lag"] {
+        assert!(names.contains(&registered), "missing real Flow tool {registered}");
     }
+
+    let read = stdio.call(&get_object_request(94, OWNED_OBJECT, None)).await?;
+    assert!(!is_error(&read), "real objects.get call failed: {read}");
+
+    let lag = stdio
+        .call(&json!({
+            "jsonrpc": "2.0",
+            "id": 95,
+            "method": "tools/call",
+            "params": {
+                "name": "collab.projection_lag",
+                "arguments": { "workspace_id": WORKSPACE }
+            }
+        }))
+        .await?;
+    assert!(!is_error(&lag), "real collab.projection_lag call failed: {lag}");
+
+    // Attempt to smuggle the ticket/WS/bootstrap vocabulary through a real, registered
+    // `collab.*` tool. Its closed schema must reject the request before the API sees it.
+    let smuggling_attempt = stdio
+        .call(&json!({
+            "jsonrpc": "2.0",
+            "id": 96,
+            "method": "tools/call",
+            "params": {
+                "name": "collab.projection_lag",
+                "arguments": {
+                    "workspace_id": WORKSPACE,
+                    "ticket": "attacker-controlled-ticket",
+                    "client_id": "attacker-client",
+                    "object_id": OWNED_OBJECT,
+                    "bootstrap": true
+                }
+            }
+        }))
+        .await?;
+    assert!(
+        is_error(&smuggling_attempt),
+        "real collab.projection_lag accepted collaboration-only fields: {smuggling_attempt}"
+    );
+    assert_eq!(
+        forbidden_endpoint_calls.load(Ordering::SeqCst),
+        0,
+        "stdio Flow tools must never reach ticket, WS, diagnostics, verify, or bootstrap routes"
+    );
 
     stdio.shutdown().await
 }
