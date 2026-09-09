@@ -9,6 +9,7 @@ MCP_URL="${1:-http://localhost:8090}"
 PROJECT_ID="${2:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${OPENPR_CONFIG_FILE:-$SCRIPT_DIR/../../../config/openpr.compose.mcp.toml}"
+EXPECTED_TOOL_COUNT="$(python3 "$SCRIPT_DIR/expected-tool-count.py")"
 
 # Reads one dotted key out of the TOML configuration file, using the tomllib parser in python3
 # (3.11+) rather than a grep that would mis-handle quoting and section scoping. Prints nothing
@@ -83,10 +84,10 @@ TOOLS_RESPONSE=$(curl -s -X POST "$MCP_URL/mcp/rpc" \
 TOOLS=$(printf '%s' "$TOOLS_RESPONSE" | \
   python3 -c "import sys,json; print(len(json.load(sys.stdin)['result']['tools']))" 2>/dev/null)
 
-if [ "${TOOLS:-0}" -eq 107 ] 2>/dev/null; then
+if [ "${TOOLS:-0}" -eq "$EXPECTED_TOOL_COUNT" ] 2>/dev/null; then
   echo "✅ tools/list: $TOOLS tools available"
 else
-  echo "❌ tools/list expected exactly 107 tools, got ${TOOLS:-0}"
+  echo "❌ tools/list expected exactly $EXPECTED_TOOL_COUNT tools, got ${TOOLS:-0}"
   exit 1
 fi
 
