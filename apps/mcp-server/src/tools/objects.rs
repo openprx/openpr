@@ -199,7 +199,7 @@ pub async fn get_flow_object(client: &OpenPrClient, args: Value) -> CallToolResu
         "/api/v1/flow/objects/{}{suffix}",
         encode_query_component(&input.object_id)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 // ---- objects.query ----
@@ -281,7 +281,7 @@ pub async fn query_flow_objects(client: &OpenPrClient, args: Value) -> CallToolR
         "/api/v1/workspaces/{}/flow/objects{suffix}",
         encode_query_component(&input.workspace_id)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 // ---- objects.history ----
@@ -336,7 +336,7 @@ pub async fn get_flow_object_history(client: &OpenPrClient, args: Value) -> Call
         "/api/v1/flow/objects/{}/history{suffix}",
         encode_query_component(&input.object_id)
     );
-    respond(get_structured(client, &path).await)
+    respond_data(get_structured(client, &path).await)
 }
 
 // ---- Flow v0.5 write and derived read tools ----
@@ -1119,8 +1119,8 @@ fn query_suffix(params: &[String]) -> String {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::{
-        get_flow_object, get_flow_object_history, move_flow_object, query_flow_objects, search_flow_objects,
-        set_flow_object_grants,
+        diff_flow_object, get_flow_object, get_flow_object_history, move_flow_object, query_flow_objects,
+        search_flow_objects, set_flow_object_grants,
     };
     use crate::client::test_api;
     use axum::{Json, Router, extract::State, routing::get, routing::post, routing::put};
@@ -1181,6 +1181,38 @@ mod tests {
         let client = test_api::client("http://127.0.0.1:1".to_string())?;
         let result = get_flow_object_history(&client, json!({})).await;
         assert_eq!(result.is_error, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_v04_object_read_returns_rest_data_like_the_v05_tools() -> Result<(), Box<dyn std::error::Error>> {
+        let response = || async { Json(json!({"code": 0, "message": "ok", "data": {"shape": "semantic-data"}})) };
+        let router = Router::new()
+            .route("/api/v1/flow/objects/{object_id}", get(response))
+            .route("/api/v1/flow/objects/{object_id}/history", get(response))
+            .route("/api/v1/flow/objects/{object_id}/diff", get(response))
+            .route("/api/v1/workspaces/{workspace_id}/flow/objects", get(response));
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let calls = [
+            get_flow_object(&client, json!({"object_id": "object"})).await,
+            query_flow_objects(&client, json!({"workspace_id": "workspace"})).await,
+            get_flow_object_history(&client, json!({"object_id": "object"})).await,
+            diff_flow_object(&client, json!({"object_id": "object", "from_seq": 0, "to_seq": 1})).await,
+        ];
+        for result in calls {
+            assert_ne!(result.is_error, Some(true), "Flow read failed: {result:?}");
+            let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+                return Err("missing MCP text content".into());
+            };
+            let output: serde_json::Value = serde_json::from_str(text)?;
+            assert_eq!(output, json!({"shape": "semantic-data"}));
+            assert!(output.get("code").is_none(), "REST envelope leaked into MCP: {output}");
+            assert!(
+                output.get("data").is_none(),
+                "nested REST data wrapper leaked into MCP: {output}"
+            );
+        }
         Ok(())
     }
 

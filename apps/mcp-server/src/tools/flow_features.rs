@@ -19,9 +19,11 @@ fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolR
     serde_json::from_value(args).map_err(|err| CallToolResult::error(format!("Invalid input: {err}")))
 }
 
-fn respond(result: Result<Value, String>) -> CallToolResult {
+fn respond_data(result: Result<Value, String>) -> CallToolResult {
     match result {
-        Ok(value) => CallToolResult::success(serde_json::to_string_pretty(&value).unwrap_or_default()),
+        Ok(value) => CallToolResult::success(
+            serde_json::to_string_pretty(value.get("data").unwrap_or(&Value::Null)).unwrap_or_default(),
+        ),
         Err(error) => CallToolResult::error(error),
     }
 }
@@ -54,7 +56,7 @@ pub async fn get_flow_feature(client: &OpenPrClient, args: Value) -> CallToolRes
         Ok(value) => value,
         Err(result) => return result,
     };
-    respond(client.get_flow_feature(&input.workspace_id).await)
+    respond_data(client.get_flow_feature(&input.workspace_id).await)
 }
 
 pub fn set_flow_feature_tool() -> ToolDefinition {
@@ -117,13 +119,14 @@ pub async fn set_flow_feature(client: &OpenPrClient, args: Value) -> CallToolRes
         }
     }
 
-    respond(client.set_flow_feature(&input.workspace_id, body).await)
+    respond_data(client.set_flow_feature(&input.workspace_id, body).await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{get_flow_feature, set_flow_feature};
     use crate::client::test_api;
+    use axum::{Json, Router, routing::get};
     use serde_json::json;
 
     #[tokio::test]
@@ -174,6 +177,34 @@ mod tests {
         )
         .await;
         assert_eq!(result.is_error, Some(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn feature_tools_return_rest_data_without_the_envelope() -> Result<(), Box<dyn std::error::Error>> {
+        let response = || async { Json(json!({"code": 0, "message": "ok", "data": {"shape": "semantic-data"}})) };
+        let router = Router::new().route(
+            "/api/v1/workspaces/{workspace_id}/features/flow",
+            get(response).put(response),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let calls = [
+            get_flow_feature(&client, json!({"workspace_id": "workspace"})).await,
+            set_flow_feature(
+                &client,
+                json!({"workspace_id": "workspace", "enabled": true, "idempotency_key": "key"}),
+            )
+            .await,
+        ];
+        for result in calls {
+            assert_ne!(result.is_error, Some(true), "Flow feature call failed: {result:?}");
+            let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+                return Err("missing MCP text content".into());
+            };
+            let output: serde_json::Value = serde_json::from_str(text)?;
+            assert_eq!(output, json!({"shape": "semantic-data"}));
+        }
         Ok(())
     }
 }
