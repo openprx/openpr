@@ -132,6 +132,7 @@ fn check_scan_budget(examined: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
+#[allow(clippy::missing_const_for_fn, clippy::print_stderr)]
 fn candidate_is_policy_visible(is_visible: bool) -> bool {
     #[cfg(test)]
     if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_SEARCH_AUTHORIZE_ALL").is_some() {

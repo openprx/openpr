@@ -659,6 +659,7 @@ fn cursor_key(secret: &str) -> Result<LessSafeKey, ApiError> {
         .map_err(|_| ApiError::Internal)
 }
 
+#[allow(clippy::print_stderr)]
 fn encode_cursor(secret: &str, created_at: DateTime<Utc>, id: Uuid) -> Result<String, ApiError> {
     #[cfg(test)]
     if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_RELATION_CURSOR_PLAINTEXT").is_some() {

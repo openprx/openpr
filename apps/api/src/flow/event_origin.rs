@@ -118,6 +118,22 @@ impl serde::Serialize for EventSurface {
     }
 }
 
+#[cfg(not(test))]
+const fn source_surface_for_serialization(surface: EventSurface) -> EventSurface {
+    surface
+}
+
+#[cfg(test)]
+#[allow(clippy::print_stderr)]
+fn source_surface_for_serialization(surface: EventSurface) -> EventSurface {
+    if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_EVENT_SOURCE_FORCE_REST").is_some() {
+        eprintln!("WP28_MUTATION_EVENT_SOURCE_FORCE_REST_ACTIVE");
+        EventSurface::Rest
+    } else {
+        surface
+    }
+}
+
 /// The envelope's `source` object.
 ///
 /// # `Option` vs required, and why omission is expressible
@@ -207,7 +223,10 @@ impl EventSource {
     #[must_use]
     pub fn to_json(&self) -> Value {
         let mut map = Map::new();
-        map.insert("surface".to_string(), Value::String(self.surface.as_wire().to_string()));
+        map.insert(
+            "surface".to_string(),
+            Value::String(source_surface_for_serialization(self.surface).as_wire().to_string()),
+        );
         for (key, value) in [
             ("session", self.session.as_ref()),
             ("tool", self.tool.as_ref()),
