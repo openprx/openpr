@@ -3008,6 +3008,62 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
+    /// The endpoint and storage query must enforce the same one-past boundary. A pure helper test
+    /// cannot prove that SQL fetched row 1001; this real history fixture does. If `LIMIT` is
+    /// mutated from `row_limit + 1` to `row_limit`, the endpoint sees only 1000 rows and falls
+    /// through to a misleading `resync_required` instead of this typed budget rejection.
+    #[tokio::test]
+    async fn diff_endpoint_rejects_real_1001_row_history_as_limit_exceeded() {
+        let scratch = scratch_or_skip!("diff-row-budget");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "large history").await;
+        let document_id = document_of(&state, object_id).await;
+
+        exec(
+            &state,
+            "INSERT INTO collab_updates \
+                (document_id, seq, update_id, content_hash, before_frontier, after_frontier, \
+                 bytes, actor_id, origin_surface, origin_client_id, projection_seq, event_id) \
+             SELECT $1, n, gen_random_uuid(), lpad(n::text, 64, '0'), ''::bytea, ''::bytea, \
+                    ''::bytea, $2, 'rest', 'diff-budget-fixture', n, \
+                    (SELECT id FROM business_events WHERE aggregate_id = $3 ORDER BY id LIMIT 1) \
+               FROM generate_series(1, 1001) AS n",
+            vec![document_id.into(), owner_id.into(), object_id.to_string().into()],
+        )
+        .await;
+        exec(
+            &state,
+            "UPDATE collab_documents \
+                SET head_seq = 1001, update_count = 1001, head_frontier = ''::bytea \
+              WHERE id = $1",
+            vec![document_id.into()],
+        )
+        .await;
+
+        let response = body_json(to_response(
+            get_flow_object_diff(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_id),
+                Query(FlowObjectDiffQuery {
+                    from_seq: Some(0),
+                    to_seq: Some(1001),
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(response["error_code"], "limit_exceeded", "{response}");
+        assert_eq!(response["details"]["limit_kind"], "scan_budget", "{response}");
+        assert_eq!(response["details"]["limit"], 1000, "{response}");
+        assert_eq!(response["details"]["observed"], 1001, "{response}");
+
+        scratch.drop_self().await;
+    }
+
     /// WP-12's side-channel regression fixture deliberately puts a no-grant authorization
     /// boundary on the highest-lag object. It also places that hidden candidate between the last
     /// returned object and the overfetched next visible object, so a cursor derived from internal
