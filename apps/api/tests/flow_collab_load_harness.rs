@@ -222,6 +222,7 @@ const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 const PG_LOG_ENGINE_ENV: &str = "OPENPR_FLOW_PG_LOG_ENGINE";
 const DEDICATED_PG_CONTAINER_ENV: &str = "OPENPR_FLOW_DEDICATED_PG_CONTAINER";
 const PG_LOG_CONTAINER_ENV: &str = "OPENPR_FLOW_PG_LOG_CONTAINER";
+const QUIET_PG_QUALIFIED_ENV: &str = "OPENPR_FLOW_QUIET_PG_QUALIFIED";
 const EVIDENCE_OUT_ENV: &str = "OPENPR_FLOW_LOAD_HARNESS_OUT";
 const TEST_ORIGIN: &str = "http://collab-load.local";
 const JWT_SECRET: &str = "collab-load-harness-secret";
@@ -254,10 +255,14 @@ fn load_environment_problem() -> Option<(&'static str, String)> {
         ));
     }
     let normalized = dedicated.to_ascii_lowercase();
-    if normalized == "flow-test-pg" || normalized.contains("shared") {
+    let quiet_pg_qualified = std::env::var(QUIET_PG_QUALIFIED_ENV).as_deref() == Ok("1");
+    if (normalized == "flow-test-pg" || normalized.contains("shared")) && !quiet_pg_qualified {
         return Some((
             "known_shared_postgresql_instance",
-            format!("PostgreSQL container {dedicated:?} is shared; the load distribution was not run"),
+            format!(
+                "PostgreSQL container {dedicated:?} is shared and no quiet-run preflight attestation was supplied; \
+                 the load distribution was not run"
+            ),
         ));
     }
     None
@@ -1373,6 +1378,7 @@ impl Report {
                 "build_profile": self.build_profile,
                 "postgres_version": self.postgres_version,
                 "pg_log_container": std::env::var(PG_LOG_CONTAINER_ENV).unwrap_or_default(),
+                "quiet_pg_preflight_qualified": std::env::var(QUIET_PG_QUALIFIED_ENV).as_deref() == Ok("1"),
                 "hold_ms_resolution": "±1ms (PostgreSQL %m log prefix is millisecond-quantized)",
                 "measurement_authority": "postgresql server statement log (log_min_duration_statement=0), not an in-process timer",
             },

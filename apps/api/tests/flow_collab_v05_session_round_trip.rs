@@ -65,6 +65,7 @@
     clippy::too_many_lines
 )]
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -84,6 +85,7 @@ use platform::{
 };
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
 use serde_json::{Value, json};
+use tokio::sync::Barrier;
 use tokio_tungstenite::tungstenite::Message as TMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
@@ -131,6 +133,7 @@ const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 /// when the caller has explicitly declared the `PostgreSQL` instance dedicated. Never inferred
 /// from `OPENPR_TEST_DATABASE_URL` being present.
 const DEDICATED_PG_CONTAINER_ENV: &str = "OPENPR_FLOW_DEDICATED_PG_CONTAINER";
+const QUIET_PG_QUALIFIED_ENV: &str = "OPENPR_FLOW_QUIET_PG_QUALIFIED";
 const EVIDENCE_OUT_ENV: &str = "OPENPR_FLOW_V05_SESSION_ROUND_TRIP_OUT";
 const TEST_ORIGIN: &str = "http://collab-v05-session.local";
 const JWT_SECRET: &str = "collab-v05-session-round-trip-secret";
@@ -154,7 +157,8 @@ fn load_environment_problem() -> Option<(&'static str, String)> {
         ));
     }
     let normalized = dedicated.to_ascii_lowercase();
-    if KNOWN_SHARED_INSTANCES.contains(&normalized.as_str()) || normalized.contains("shared") {
+    let quiet_pg_qualified = std::env::var(QUIET_PG_QUALIFIED_ENV).as_deref() == Ok("1");
+    if (KNOWN_SHARED_INSTANCES.contains(&normalized.as_str()) || normalized.contains("shared")) && !quiet_pg_qualified {
         return Some((
             "known_shared_postgresql_instance",
             format!("PostgreSQL container {dedicated:?} is shared; the v0.5 session round trip was not measured"),
@@ -228,6 +232,9 @@ struct Report {
     presence_frames_observed: usize,
     acks_sent: usize,
     resumes_completed: usize,
+    peer_updates_observed: usize,
+    peer_accepted_observed: usize,
+    fanout_rounds_complete: usize,
     head_seq_final: i64,
     rejections: Vec<String>,
     violations: Vec<String>,
@@ -247,6 +254,7 @@ impl Report {
             "environment": {
                 "declared_dedicated_pg_container": std::env::var(DEDICATED_PG_CONTAINER_ENV).ok(),
                 "known_shared_instances_rejected": KNOWN_SHARED_INSTANCES,
+                "quiet_pg_preflight_qualified": std::env::var(QUIET_PG_QUALIFIED_ENV).as_deref() == Ok("1"),
                 "postgres_version": self.postgres_version,
                 "build_profile": self.build_profile,
             },
@@ -275,6 +283,9 @@ impl Report {
                 "presence_frames_observed": self.presence_frames_observed,
                 "acks_sent": self.acks_sent,
                 "resumes_completed": self.resumes_completed,
+                "peer_updates_observed": self.peer_updates_observed,
+                "peer_accepted_observed": self.peer_accepted_observed,
+                "fanout_rounds_complete": self.fanout_rounds_complete,
                 "head_seq_final": self.head_seq_final,
             },
             "rejections": self.rejections,
@@ -704,6 +715,9 @@ struct AcceptedWait {
     /// Peer `presence` frames seen while waiting — the evidence that presence fan-out really was
     /// live during the measured window rather than merely configured.
     presence_observed: usize,
+    peer_updates: HashSet<Uuid>,
+    peer_accepted: HashSet<Uuid>,
+    latest_position: Option<Position>,
     rejections: Vec<String>,
 }
 
@@ -714,6 +728,9 @@ async fn await_own_accepted(ws: &mut WsStream, update_id: Uuid, index: usize, ro
     let mut wait = AcceptedWait {
         own: None,
         presence_observed: 0,
+        peer_updates: HashSet::new(),
+        peer_accepted: HashSet::new(),
+        latest_position: None,
         rejections: Vec::new(),
     };
     loop {
@@ -724,13 +741,20 @@ async fn await_own_accepted(ws: &mut WsStream, update_id: Uuid, index: usize, ro
                 head_frontier,
                 ..
             } => {
+                wait.latest_position = Some(Position {
+                    seq: head_seq,
+                    frontier: head_frontier.clone(),
+                });
                 if got == update_id {
                     wait.own = Some((head_seq, head_frontier));
                     return wait;
                 }
+                wait.peer_accepted.insert(got);
             }
             // Peer traffic; deliberately not timed.
-            Frame::Update { .. } => {}
+            Frame::Update { update_id: got, .. } => {
+                wait.peer_updates.insert(got);
+            }
             Frame::Presence { .. } => wait.presence_observed += 1,
             Frame::Rejected { code, details, .. } => {
                 wait.rejections
@@ -747,6 +771,45 @@ async fn await_own_accepted(ws: &mut WsStream, update_id: Uuid, index: usize, ro
     }
 }
 
+/// Drains every frame queued before a controlled registry marker. The marker is broadcast only
+/// after all ten clients have received their own acceptance, so seeing it proves this session has
+/// crossed every peer fan-out for the round. This is a deterministic barrier, not a scheduler
+/// race or a sleep-based guess.
+async fn drain_fanout_barrier(
+    ws: &mut WsStream,
+    marker_nonce: &str,
+    own_update_id: Uuid,
+    wait: &mut AcceptedWait,
+) -> Result<(), String> {
+    loop {
+        match recv_frame(ws).await {
+            Frame::Ping { nonce, .. } if nonce == marker_nonce => return Ok(()),
+            Frame::Update { update_id, .. } if update_id != own_update_id => {
+                wait.peer_updates.insert(update_id);
+            }
+            Frame::Accepted {
+                update_id,
+                head_seq,
+                head_frontier,
+                ..
+            } if update_id != own_update_id => {
+                wait.peer_accepted.insert(update_id);
+                wait.latest_position = Some(Position {
+                    seq: head_seq,
+                    frontier: head_frontier,
+                });
+            }
+            Frame::Presence { .. } => wait.presence_observed += 1,
+            Frame::Rejected { code, details, .. } => {
+                return Err(format!("rejected before fan-out barrier: {code:?} {details:?}"));
+            }
+            Frame::Resync { reason, .. } => return Err(format!("resync before fan-out barrier: {reason}")),
+            Frame::Ping { nonce, .. } => return Err(format!("unexpected ping marker before {marker_nonce}: {nonce}")),
+            other => return Err(format!("unexpected frame before fan-out barrier: {other:?}")),
+        }
+    }
+}
+
 struct ClientOutcome {
     round_trip_ms: Vec<f64>,
     accepted: usize,
@@ -756,6 +819,9 @@ struct ClientOutcome {
     resumes: usize,
     rejections: Vec<String>,
     resume_failures: Vec<String>,
+    peer_updates_observed: usize,
+    peer_accepted_observed: usize,
+    fanout_rounds_complete: usize,
 }
 
 struct Fixture {
@@ -763,6 +829,7 @@ struct Fixture {
     workspace_id: Uuid,
     document_id: Uuid,
     tokens: Vec<String>,
+    round_barrier: Arc<Barrier>,
 }
 
 impl Fixture {
@@ -794,7 +861,15 @@ impl Fixture {
             resumes: 0,
             rejections: Vec::new(),
             resume_failures: Vec::new(),
+            peer_updates_observed: 0,
+            peer_accepted_observed: 0,
+            fanout_rounds_complete: 0,
         };
+
+        // No round begins until all ten sockets are registered. Without this barrier, early
+        // clients could commit while late clients were still handshaking and a partial fan-out
+        // implementation would be indistinguishable from a scheduling accident.
+        self.round_barrier.wait().await;
 
         for round in 0..(WARMUP_ROUNDS + MEASURED_ROUNDS) {
             let measured = round >= WARMUP_ROUNDS;
@@ -838,10 +913,10 @@ impl Fixture {
             .await;
 
             // ---- wait for this client's own accepted ----
-            let wait = await_own_accepted(&mut ws, update_id, index, round).await;
-            outcome.presence_observed += wait.presence_observed;
-            let Some((head_seq, head_frontier)) = wait.own else {
-                outcome.rejections.extend(wait.rejections);
+            let mut wait = await_own_accepted(&mut ws, update_id, index, round).await;
+            let Some((head_seq, head_frontier)) = wait.own.clone() else {
+                outcome.presence_observed += wait.presence_observed;
+                outcome.rejections.append(&mut wait.rejections);
                 break;
             };
             let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
@@ -849,24 +924,66 @@ impl Fixture {
                 outcome.round_trip_ms.push(elapsed);
             }
             outcome.accepted += 1;
-            outcome.rejections.extend(wait.rejections);
+
+            // Every commit's registry broadcasts have completed before its submitter receives
+            // `accepted`. Once all submitters reach this barrier, one leader queues a marker
+            // behind all 10 commits on every live session. Each client must observe exactly the
+            // other nine update/accepted pairs before that marker.
+            let marker_nonce = format!("fanout-round-{round}");
+            let barrier = self.round_barrier.wait().await;
+            if barrier.is_leader() {
+                api::flow::collab::runtime::runtime().registry.broadcast(
+                    self.document_id,
+                    &Frame::Ping {
+                        protocol_version: PROTOCOL_VERSION,
+                        nonce: marker_nonce.clone(),
+                    },
+                    None,
+                );
+            }
+            if let Err(problem) = drain_fanout_barrier(&mut ws, &marker_nonce, update_id, &mut wait).await {
+                outcome
+                    .rejections
+                    .push(format!("client {index} round {round}: {problem}"));
+                break;
+            }
+            outcome.presence_observed += wait.presence_observed;
+            outcome.rejections.append(&mut wait.rejections);
+            let expected_peers = CONCURRENT_CLIENTS - 1;
+            if wait.peer_updates.len() != expected_peers || wait.peer_accepted.len() != expected_peers {
+                outcome.rejections.push(format!(
+                    "client {index} round {round}: fan-out incomplete before barrier: updates={} accepted={} expected_each={expected_peers}",
+                    wait.peer_updates.len(),
+                    wait.peer_accepted.len(),
+                ));
+                break;
+            }
+            if wait.peer_updates != wait.peer_accepted {
+                outcome.rejections.push(format!(
+                    "client {index} round {round}: peer update ids differ from peer accepted ids"
+                ));
+                break;
+            }
+            outcome.peer_updates_observed += wait.peer_updates.len();
+            outcome.peer_accepted_observed += wait.peer_accepted.len();
+            outcome.fanout_rounds_complete += 1;
 
             // ---- v0.5 traffic: ack the position just reached ----
+            let position = wait.latest_position.unwrap_or(Position {
+                seq: head_seq,
+                frontier: head_frontier,
+            });
             send_frame(
                 &mut ws,
                 &Frame::Ack {
                     protocol_version: PROTOCOL_VERSION,
                     document_id: self.document_id,
-                    seq: head_seq,
-                    frontier: head_frontier.clone(),
+                    seq: position.seq,
+                    frontier: position.frontier.clone(),
                 },
             )
             .await;
             outcome.acks_sent += 1;
-            let position = Position {
-                seq: head_seq,
-                frontier: head_frontier,
-            };
 
             // ---- v0.5 traffic: the "offline" half — drop and come back through resume ----
             if resuming {
@@ -892,6 +1009,11 @@ impl Fixture {
                     }
                 }
             }
+
+            // Resuming clients must finish reconnecting before anybody begins the next round;
+            // otherwise an update legitimately sent during their offline interval would make the
+            // next round's exact nine-peer fan-out count ambiguous.
+            self.round_barrier.wait().await;
 
             tokio::time::sleep(Duration::from_millis(ROUND_PACING_MS)).await;
         }
@@ -983,6 +1105,7 @@ async fn v05_multi_user_session_workload_round_trip_p95() {
         workspace_id,
         document_id,
         tokens: members.iter().map(|user_id| jwt_for(*user_id)).collect(),
+        round_barrier: Arc::new(Barrier::new(CONCURRENT_CLIENTS)),
     });
 
     let mut handles = Vec::with_capacity(CONCURRENT_CLIENTS);
@@ -1001,6 +1124,9 @@ async fn v05_multi_user_session_workload_round_trip_p95() {
         report.presence_frames_observed += outcome.presence_observed;
         report.acks_sent += outcome.acks_sent;
         report.resumes_completed += outcome.resumes;
+        report.peer_updates_observed += outcome.peer_updates_observed;
+        report.peer_accepted_observed += outcome.peer_accepted_observed;
+        report.fanout_rounds_complete += outcome.fanout_rounds_complete;
         report.rejections.extend(outcome.rejections);
         resume_failures.extend(outcome.resume_failures);
     }
@@ -1063,6 +1189,22 @@ async fn v05_multi_user_session_workload_round_trip_p95() {
              measure alongside was not actually live",
         );
     }
+    let expected_fanout_rounds = CONCURRENT_CLIENTS * (WARMUP_ROUNDS + MEASURED_ROUNDS);
+    let expected_peer_frames = expected_fanout_rounds * (CONCURRENT_CLIENTS - 1);
+    if report.fanout_rounds_complete != expected_fanout_rounds
+        || report.peer_updates_observed != expected_peer_frames
+        || report.peer_accepted_observed != expected_peer_frames
+    {
+        report.fail(format!(
+            "controlled fan-out barriers incomplete: rounds={}/{} peer_updates={}/{} peer_accepted={}/{}",
+            report.fanout_rounds_complete,
+            expected_fanout_rounds,
+            report.peer_updates_observed,
+            expected_peer_frames,
+            report.peer_accepted_observed,
+            expected_peer_frames,
+        ));
+    }
     let expected_resumes = RESUMING_CLIENTS * (WARMUP_ROUNDS + MEASURED_ROUNDS);
     if report.resumes_completed != expected_resumes {
         report.fail(format!(
@@ -1071,9 +1213,9 @@ async fn v05_multi_user_session_workload_round_trip_p95() {
         ));
     }
     report.notes.push(format!(
-        "measured with {} peer presence frames observed, {} acks recorded and {} resumes completed inside the \
-         measured window",
-        report.presence_frames_observed, report.acks_sent, report.resumes_completed
+        "measured with {} exact peer update/accepted pairs behind controlled barriers, {} peer presence frames, \
+         {} acks and {} resumes inside the measured window",
+        report.peer_accepted_observed, report.presence_frames_observed, report.acks_sent, report.resumes_completed
     ));
 
     report.emit();
