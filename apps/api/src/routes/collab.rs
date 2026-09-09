@@ -1731,6 +1731,78 @@ mod collab_database_tests {
         scratch.drop_self().await;
     }
 
+    /// The ticket TTL is measured entirely by PostgreSQL's transaction clock. In particular, a
+    /// transaction that waits behind the epoch fence must not combine that old `created_at` with
+    /// a later Rust wall-clock expiry and overshoot the frozen 60-second constraint.
+    #[tokio::test]
+    async fn ticket_issuance_after_epoch_lock_delay_uses_one_database_clock() {
+        let scratch = scratch_or_skip!("ticket-expiry-clock");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        let blocker = state.db.begin().await.expect("blocking transaction begins");
+        crate::flow::collab::authz::lock_epoch_for_update(&blocker, workspace_id)
+            .await
+            .expect("blocker holds the conflicting epoch lock");
+
+        let issue_state = state.clone();
+        let mut issuing = tokio::spawn(async move {
+            ticket::issue(
+                &issue_state.db,
+                IssueTicketInput {
+                    user_id: owner_id,
+                    workspace_id,
+                    document_id,
+                    client_id: "delayed-expiry-client".to_string(),
+                    origin: TEST_ORIGIN.to_string(),
+                },
+                &[TEST_ORIGIN.to_string()],
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut issuing)
+                .await
+                .is_err(),
+            "ticket issuance must spend measurable time waiting behind the epoch lock"
+        );
+        blocker.commit().await.expect("blocker releases the epoch lock");
+
+        let issued = issuing
+            .await
+            .expect("ticket task joins")
+            .expect("a delayed, still-authorized issuance succeeds");
+        assert!(!issued.ticket.is_empty());
+
+        #[derive(FromQueryResult)]
+        struct TtlRow {
+            ttl_seconds: i64,
+            returned_expiry_matches: bool,
+        }
+        let ttl = TtlRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT EXTRACT(EPOCH FROM (expires_at - created_at))::BIGINT AS ttl_seconds, \
+                    expires_at = $2 AS returned_expiry_matches \
+             FROM collab_tickets WHERE workspace_id = $1",
+            vec![workspace_id.into(), issued.expires_at.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("ticket timestamps can be read")
+        .expect("the successful issuance wrote one ticket row");
+        assert_eq!(
+            ttl.ttl_seconds, 60,
+            "the persisted TTL must stay at the frozen boundary"
+        );
+        assert!(
+            ttl.returned_expiry_matches,
+            "IssuedTicket must return the database-generated expiry"
+        );
+
+        scratch.drop_self().await;
+    }
+
     /// `collab-protocol-v1.md` §3: "Upgrade 前原子消费 ticket，并验证其
     /// `user`/`workspace`/`document`/`client_id`/`Origin` 绑定与 `flow_enabled`".
     ///

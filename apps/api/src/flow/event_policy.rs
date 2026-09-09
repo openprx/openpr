@@ -86,6 +86,10 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.permission.inheritance_changed",
         public_payload(&["object_id", "inherit_from_parent"]),
     ),
+    (
+        "flow.permission.baseline_changed",
+        public_payload(&["workspace_id", "old_level", "new_level"]),
+    ),
 ];
 
 /// Event type prefix owned by the Flow module, for the same completeness-scan role

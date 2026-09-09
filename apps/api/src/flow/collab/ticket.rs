@@ -102,6 +102,11 @@ pub async fn issue(
     .map(|r| r.role)
     .ok_or_else(|| ApiError::Forbidden("not a member of this workspace".to_string()))?;
 
+    // Check the rollout flag before trying to lock its settings row. A missing settings row is
+    // deliberately the same `feature_disabled` answer as an explicit false value; asking the
+    // epoch-lock helper first would instead turn absence into a distinguishable 404.
+    super::super::policy::require_flow_enabled_on(&tx, input.workspace_id).await?;
+
     // Hold the same epoch row authorization writers take exclusively until the ticket insert
     // commits. The first membership read above preserves the non-enumerating error order; this
     // second read, after the lock, is authoritative and catches a removal/demotion that completed
@@ -121,9 +126,11 @@ pub async fn issue(
     // 和 user token type". A workspace with the rollout flag off must not be able to obtain a
     // ticket at all — not merely be stopped later, at the `open` frame.
     //
-    // Deliberately *after* the membership read above and *before* the document lookup below: a
-    // non-member must not be able to probe another tenant's rollout state, and a member must not
-    // learn whether a document exists in a workspace where Flow is switched off.
+    // Deliberately *after* the membership and epoch-lock checks above and *before* the document
+    // lookup below: a non-member must not be able to probe another tenant's rollout state, a
+    // member must not learn whether a document exists in a workspace where Flow is switched off,
+    // and a concurrent disable that committed between the first flag read and the share lock must
+    // still be observed. The share lock keeps the value stable from this re-read through commit.
     super::super::policy::require_flow_enabled_on(&tx, input.workspace_id).await?;
 
     // `collab_documents` has no `workspace_id` column of its own (migration
@@ -167,14 +174,18 @@ pub async fn issue(
     rand::rngs::OsRng.fill_bytes(&mut secret);
     let raw = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, secret);
     let ticket_hash = sha256_hex(&raw);
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(TICKET_TTL_SECONDS);
-
-    tx.execute(Statement::from_sql_and_values(
+    #[derive(FromQueryResult)]
+    struct ExpiryRow {
+        expires_at: chrono::DateTime<chrono::Utc>,
+    }
+    let expiry = ExpiryRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
             INSERT INTO collab_tickets
-                (id, ticket_hash, user_id, workspace_id, document_id, client_id, origin, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (id, ticket_hash, user_id, workspace_id, document_id, client_id, origin,
+                 created_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now() + $8 * interval '1 second')
+            RETURNING expires_at
         ",
         vec![
             Uuid::new_v4().into(),
@@ -184,15 +195,17 @@ pub async fn issue(
             input.document_id.into(),
             input.client_id.trim().to_string().into(),
             normalized_origin.into(),
-            expires_at.into(),
+            TICKET_TTL_SECONDS.into(),
         ],
     ))
-    .await?;
+    .one(&tx)
+    .await?
+    .ok_or(ApiError::Internal)?;
     tx.commit().await?;
 
     Ok(IssuedTicket {
         ticket: raw,
-        expires_at,
+        expires_at: expiry.expires_at,
     })
 }
 
