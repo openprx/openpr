@@ -379,41 +379,25 @@ pub struct LifecycleScopeRow {
     pub invalid_tree: bool,
 }
 
-/// Reads the root and its complete affected subtree in ascending id order.
+/// Reads the one object affected by the v0.4 `archive|restore` request semantics.
 ///
-/// Lifecycle scope is server-derived; no caller wire flag may suppress or widen it. Here "shared"
-/// means a descendant with an explicit `flow_object_grants` row; workspace baseline access alone
-/// is not an object share. The walk is bounded one level past `tree_depth_max`, records cycles,
-/// and lets the caller fail closed instead of silently classifying a corrupt/truncated tree as a
-/// leaf.
+/// The frozen command payload has no cascade operation, so descendants are not part of this
+/// request's impact set merely because they exist. The boolean fact columns remain in the row
+/// shape so the permission classifier can continue to describe the broader lifecycle tiers that
+/// a future, explicitly registered cascade command would use.
 pub async fn lifecycle_scope<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
     object_id: Uuid,
-    tree_depth_max: i64,
+    _tree_depth_max: i64,
 ) -> Result<Vec<LifecycleScopeRow>, ApiError> {
     Ok(LifecycleScopeRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "WITH RECURSIVE subtree AS ( \
-             SELECT o.id, o.workspace_id, o.project_id, o.parent_id, o.object_type, \
-                    o.lifecycle_status, 0::bigint AS depth, ARRAY[o.id]::uuid[] AS path, false AS cycle \
-               FROM flow_objects o WHERE o.id = $1 AND o.workspace_id = $2 \
-             UNION ALL \
-             SELECT c.id, c.workspace_id, c.project_id, c.parent_id, c.object_type, \
-                    c.lifecycle_status, s.depth + 1, s.path || c.id, c.id = ANY(s.path) \
-               FROM subtree s JOIN flow_objects c ON c.parent_id = s.id AND c.workspace_id = $2 \
-              WHERE NOT s.cycle AND s.depth < $3::bigint + 1 \
-         ), facts AS ( \
-             SELECT COALESCE(bool_or(s.cycle OR s.depth > $3::bigint), false) AS invalid_tree, \
-                    EXISTS (SELECT 1 FROM subtree d JOIN flow_object_grants g ON g.object_id = d.id \
-                             WHERE d.depth > 0) AS has_shared_descendants \
-               FROM subtree s \
-         ) \
-         SELECT s.id, s.workspace_id, s.project_id, s.parent_id, s.object_type, s.lifecycle_status, \
-                f.has_shared_descendants, f.invalid_tree \
-           FROM subtree s CROSS JOIN facts f \
-          ORDER BY s.id",
-        vec![object_id.into(), workspace_id.into(), tree_depth_max.into()],
+        "SELECT o.id, o.workspace_id, o.project_id, o.parent_id, o.object_type, \
+                o.lifecycle_status, false AS has_shared_descendants, false AS invalid_tree \
+           FROM flow_objects o \
+          WHERE o.id = $1 AND o.workspace_id = $2",
+        vec![object_id.into(), workspace_id.into()],
     ))
     .all(conn)
     .await?)

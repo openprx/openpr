@@ -983,7 +983,11 @@ impl LifecyclePlan {
                 "the lifecycle impact set does not contain its requested root",
             ));
         }
-        let cascade = rows.len() > 1;
+        // `rest-api-v1.md` freezes the v0.4 `archive|restore` payload without a cascade
+        // operation. Unknown payload fields remain tolerated for wire compatibility, but cannot
+        // change semantics. A future cascade must be a separately registered request semantic;
+        // the mere presence of descendants is not such a request.
+        let cascade = false;
         Ok(Self { rows, cascade })
     }
 
@@ -1965,12 +1969,12 @@ fn lifecycle_replay_affected_ids(metadata: &Value, object_id: Uuid) -> Vec<Uuid>
     if ids.is_empty() { vec![object_id] } else { ids }
 }
 
-/// `archive`/`restore` mutates no document head, but it is not necessarily a one-row governance
-/// operation: the server derives the complete subtree and applies one reversible transition to
-/// it. The payload remains deliberately loose for v0.4 compatibility, but no payload field can
-/// control lifecycle scope. The impact set and its permission tier are prepared outside the
-/// transaction, then every member is locked and the complete plan is re-derived under the
-/// commit-time epoch fence. Any drift rolls the transaction back.
+/// `archive`/`restore` mutates no document head and the frozen v0.4 request means a reversible,
+/// non-cascading transition of the addressed object. The payload remains deliberately loose for
+/// wire compatibility, but no unknown payload field can invent the separate cascade operation
+/// that the current command registry does not expose. The one-row impact set and its permission
+/// tier are prepared outside the transaction, then locked and re-derived under the commit-time
+/// epoch fence. Any drift rolls the transaction back.
 async fn execute_lifecycle_command(
     state: &AppState,
     input: &ExecuteCommandInput,
@@ -2954,8 +2958,8 @@ mod database_tests {
     }
 
     /// `archive_tier_by_object_scope` plus the v0.4 baseline fixture named by the gate. The member
-    /// has only `default_member_level=edit`; every broader case must therefore be constructively
-    /// rejected while the ordinary non-root leaf succeeds through both transitions.
+    /// has only `default_member_level=edit`; the ordinary non-root Page must succeed through both
+    /// transitions even when it has a child, because tree shape does not request a cascade.
     #[tokio::test]
     async fn lifecycle_tier_uses_the_real_impact_set_and_preserves_the_edit_baseline() {
         let scratch = scratch_or_skip!("lifecycle_tiers");
@@ -2963,13 +2967,15 @@ mod database_tests {
         let fx = seed_workspace(&scratch.db).await;
         let navigator = create_typed_object(&state, &fx, "navigator", None).await;
 
-        // The exact v0.4 fixture: default-member edit, ordinary non-root leaf Page. Even an old
-        // loose payload containing `cascade:true` cannot widen a leaf's server-derived scope.
-        let leaf = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        // The non-minimal v0.4 fixture: default-member edit and an ordinary non-root Page that
+        // already has a child. Even a loose extension field named `cascade` cannot invent request
+        // semantics absent from the frozen command payload.
+        let ordinary_page = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        let child = create_typed_object(&state, &fx, "page", Some(ordinary_page)).await;
         let archived = lifecycle_command(
             &state,
             &fx,
-            leaf,
+            ordinary_page,
             fx.member_id,
             "member",
             "archive",
@@ -2977,17 +2983,34 @@ mod database_tests {
             Uuid::new_v4().to_string(),
         )
         .await
-        .expect("an edit member keeps the v0.4 non-root leaf archive capability");
-        assert_eq!(archived.affected_object_ids, vec![leaf]);
+        .expect("an edit member keeps the v0.4 non-cascading Page archive capability");
+        assert_eq!(archived.affected_object_ids, vec![ordinary_page]);
         assert_eq!(
             event_metadata(&scratch.db, archived.event_id).await["affected_object_ids"],
-            serde_json::json!([leaf])
+            serde_json::json!([ordinary_page])
+        );
+        assert_eq!(event_metadata(&scratch.db, archived.event_id).await["cascade"], false);
+        let statuses = lifecycle_statuses(&scratch.db, &[ordinary_page, child]).await;
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|(id, _)| *id == ordinary_page)
+                .map(|(_, status)| status.as_str()),
+            Some("archived")
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|(id, _)| *id == child)
+                .map(|(_, status)| status.as_str()),
+            Some("active"),
+            "non-cascading archive must not mutate a child"
         );
 
         lifecycle_command(
             &state,
             &fx,
-            leaf,
+            ordinary_page,
             fx.member_id,
             "member",
             "restore",
@@ -2999,7 +3022,7 @@ mod database_tests {
         lifecycle_command(
             &state,
             &fx,
-            leaf,
+            ordinary_page,
             fx.member_id,
             "member",
             "restore",
@@ -3008,7 +3031,7 @@ mod database_tests {
         )
         .await
         .expect("restore is idempotent even with a fresh request key");
-        assert_eq!(lifecycle_statuses(&scratch.db, &[leaf]).await[0].1, "active");
+        assert_eq!(lifecycle_statuses(&scratch.db, &[ordinary_page]).await[0].1, "active");
 
         // `object_type` alone cannot distinguish a root page from the ordinary page above.
         let root_page = create_typed_object(&state, &fx, "page", None).await;
@@ -3028,139 +3051,13 @@ mod database_tests {
             assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "{label}: {err:?}");
         }
 
-        // A real subtree makes the same Page command full_access. The owner can perform it and the
-        // committed event/response must both enumerate every changed row.
-        let subtree_root = create_typed_object(&state, &fx, "page", Some(navigator)).await;
-        let child = create_typed_object(&state, &fx, "page", Some(subtree_root)).await;
-        let grandchild = create_typed_object(&state, &fx, "page", Some(child)).await;
-        let err = lifecycle_command(
-            &state,
-            &fx,
-            subtree_root,
-            fx.member_id,
-            "member",
-            "archive",
-            false,
-            Uuid::new_v4().to_string(),
-        )
-        .await
-        .expect_err("an edit-only member must not archive a server-derived subtree");
-        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected);
-
-        let archive_key = Uuid::new_v4().to_string();
-        let cascaded = lifecycle_command(
-            &state,
-            &fx,
-            subtree_root,
-            fx.owner_id,
-            "owner",
-            "archive",
-            false,
-            archive_key.clone(),
-        )
-        .await
-        .expect("the workspace owner has full_access for the server-derived cascade");
-        let mut expected = vec![subtree_root, child, grandchild];
-        expected.sort_unstable();
-        assert_eq!(cascaded.affected_object_ids, expected);
-        assert_eq!(
-            event_metadata(&scratch.db, cascaded.event_id).await["affected_object_ids"],
-            serde_json::json!(expected),
-            "the event envelope must name the complete impact set"
-        );
-        assert!(
-            lifecycle_statuses(&scratch.db, &expected)
-                .await
-                .iter()
-                .all(|(_, status)| status == "archived")
-        );
-
-        let replayed = lifecycle_command(
-            &state,
-            &fx,
-            subtree_root,
-            fx.owner_id,
-            "owner",
-            "archive",
-            false,
-            archive_key,
-        )
-        .await
-        .expect("same-key cascade replays");
-        assert_eq!(replayed.event_id, cascaded.event_id);
-        assert_eq!(replayed.affected_object_ids, expected);
-
-        lifecycle_command(
-            &state,
-            &fx,
-            subtree_root,
-            fx.owner_id,
-            "owner",
-            "restore",
-            false,
-            Uuid::new_v4().to_string(),
-        )
-        .await
-        .expect("cascade restore succeeds");
-        lifecycle_command(
-            &state,
-            &fx,
-            subtree_root,
-            fx.owner_id,
-            "owner",
-            "restore",
-            false,
-            Uuid::new_v4().to_string(),
-        )
-        .await
-        .expect("cascade restore is idempotent");
-        assert!(
-            lifecycle_statuses(&scratch.db, &expected)
-                .await
-                .iter()
-                .all(|(_, status)| status == "active")
-        );
-
-        // The server-derived subtree has a broader tier when a strict descendant is explicitly
-        // shared. The fixture has a real child and asserts directly on the rejection and rows.
-        let shared_root = create_typed_object(&state, &fx, "page", Some(navigator)).await;
-        let shared_child = create_typed_object(&state, &fx, "page", Some(shared_root)).await;
-        exec(
-            &scratch.db,
-            "INSERT INTO flow_object_grants \
-             (workspace_id, object_id, principal_kind, principal_id, level) \
-             VALUES ($1, $2, 'user', $3, 'edit')",
-            vec![fx.workspace_id.into(), shared_child.into(), fx.member_id.into()],
-        )
-        .await;
-        let err = lifecycle_command(
-            &state,
-            &fx,
-            shared_root,
-            fx.member_id,
-            "member",
-            "archive",
-            false,
-            Uuid::new_v4().to_string(),
-        )
-        .await
-        .expect_err("a Page affecting an explicitly shared descendant requires full_access");
-        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected);
-        assert!(
-            lifecycle_statuses(&scratch.db, &[shared_root, shared_child])
-                .await
-                .iter()
-                .all(|(_, status)| status == "active")
-        );
-
         scratch.drop_self().await;
     }
 
-    /// The unlocked set is not authority. A concurrent insert is hidden from the prepare snapshot,
-    /// then becomes visible after the lifecycle transaction obtains the root lock; the recheck must
-    /// reject and leave every row/event untouched.
+    /// Descendant growth cannot silently widen a non-cascading request. A child inserted after the
+    /// prepare read remains active while the addressed Page completes its one-row transition.
     #[tokio::test]
-    async fn lifecycle_impact_drift_rolls_back_instead_of_committing_the_prepared_subset() {
+    async fn lifecycle_descendant_growth_does_not_turn_a_plain_archive_into_a_cascade() {
         let scratch = scratch_or_skip!("lifecycle_drift");
         let state = state_for(scratch.db.clone());
         let fx = seed_workspace(&scratch.db).await;
@@ -3220,16 +3117,25 @@ mod database_tests {
             .await
             .expect("B commits the new child and releases the root");
 
-        let err = a_task
+        let archived = a_task
             .await
             .expect("A joins")
-            .expect_err("the locked impact set differs from the prepared set");
-        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
-        assert!(
-            lifecycle_statuses(&scratch.db, &[root, child])
-                .await
+            .expect("descendant growth does not alter the one-object request");
+        assert_eq!(archived.affected_object_ids, vec![root]);
+        let statuses = lifecycle_statuses(&scratch.db, &[root, child]).await;
+        assert_eq!(
+            statuses
                 .iter()
-                .all(|(_, status)| status == "active")
+                .find(|(id, _)| *id == root)
+                .map(|(_, status)| status.as_str()),
+            Some("archived")
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|(id, _)| *id == child)
+                .map(|(_, status)| status.as_str()),
+            Some("active")
         );
         assert_eq!(
             scalar_i64(
@@ -3239,8 +3145,8 @@ mod database_tests {
                 vec![root.to_string().into()],
             )
             .await,
-            0,
-            "a drift rejection must not emit the lifecycle event"
+            1,
+            "the addressed-object transition emits exactly one lifecycle event"
         );
 
         scratch.drop_self().await;
