@@ -8,9 +8,10 @@
 //! turns a command payload into the same shape of CRDT update bytes a WebSocket client would have
 //! produced locally, then calls the identical function. `archive`/`restore` never advance a
 //! document head (`existing_document_cardinality = 0`, `rest-api-v1.md`'s `move_object`/`link`
-//! commentary on the same rule), so they take no document coordinator and no document row lock —
-//! a plain `flow_objects` row transaction, matching `create_object`'s own shape below. They *do*
-//! still take the commit-time `authz_epoch` fence (`ADR-0012` §3.1, `authz::fence_epoch_for_share`)
+//! commentary on the same rule), so they take no document coordinator and no document row lock.
+//! They lock the actual `flow_objects` impact set (one row by default, a subtree for an explicit
+//! cascade), re-derive that set inside the transaction, and still take the commit-time
+//! `authz_epoch` fence (`ADR-0012` §3.1, `authz::fence_epoch_for_share`)
 //! inside that transaction: the fence's job is authorization freshness, not document-head
 //! consistency, so "no document head to advance" does not imply "no epoch to re-verify" — see
 //! `execute_lifecycle_command`'s own doc comment for the TOCTOU window this closes.
@@ -19,7 +20,7 @@
 
 use collab_core::{CollabEngine, CollabError, LoroCollabEngine, NodeId, NodeKind, Operation};
 use platform::app::AppState;
-use sea_orm::TransactionTrait;
+use sea_orm::{ConnectionTrait, TransactionTrait};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -922,6 +923,91 @@ impl LifecycleCommandType {
     }
 }
 
+/// The v0.4 payload was `{}`. v0.5 extends it with one backwards-compatible, default-false switch
+/// so a caller must explicitly request the broader impact set.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LifecycleCommandPayload {
+    #[serde(default)]
+    cascade: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecyclePlan {
+    rows: Vec<repository::LifecycleScopeRow>,
+    cascade: bool,
+}
+
+impl LifecyclePlan {
+    fn derive(object_id: Uuid, cascade: bool, rows: Vec<repository::LifecycleScopeRow>) -> Result<Self, ApiError> {
+        if rows.is_empty() {
+            return Err(ApiError::NotFound("flow object not found".to_string()));
+        }
+        if rows.iter().any(|row| row.invalid_tree) {
+            return Err(ApiError::invalid_update(
+                "the lifecycle impact set is cyclic or exceeds tree_depth_max",
+            ));
+        }
+        if !rows.iter().any(|row| row.id == object_id) {
+            return Err(ApiError::invalid_update(
+                "the lifecycle impact set does not contain its requested root",
+            ));
+        }
+        Ok(Self { rows, cascade })
+    }
+
+    fn root(&self, object_id: Uuid) -> Result<&repository::LifecycleScopeRow, ApiError> {
+        self.rows
+            .iter()
+            .find(|row| row.id == object_id)
+            .ok_or_else(|| ApiError::invalid_update("the lifecycle impact root drifted"))
+    }
+
+    fn affected_object_ids(&self) -> Vec<Uuid> {
+        self.rows.iter().map(|row| row.id).collect()
+    }
+
+    fn required_permission_level(&self, object_id: Uuid) -> Result<authz::PermissionLevel, ApiError> {
+        let root = self.root(object_id)?;
+        Ok(lifecycle_required_permission_level(LifecycleTierFacts {
+            object_type: &root.object_type,
+            parent_id: root.parent_id,
+            affected_count: if self.cascade { self.rows.len() } else { 1 },
+            has_shared_descendants: root.has_shared_descendants,
+            durability: LifecycleDurability::Reversible,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleDurability {
+    Reversible,
+    Irreversible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleTierFacts<'a> {
+    object_type: &'a str,
+    parent_id: Option<Uuid>,
+    affected_count: usize,
+    has_shared_descendants: bool,
+    durability: LifecycleDurability,
+}
+
+fn lifecycle_required_permission_level(facts: LifecycleTierFacts<'_>) -> authz::PermissionLevel {
+    if facts.object_type == "navigator"
+        || facts.object_type == "collection"
+        || facts.parent_id.is_none()
+        || facts.affected_count > 1
+        || facts.has_shared_descendants
+        || facts.durability == LifecycleDurability::Irreversible
+    {
+        authz::PermissionLevel::FullAccess
+    } else {
+        authz::PermissionLevel::Edit
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandKind {
     Content(ContentCommandType),
@@ -954,15 +1040,11 @@ impl CommandKind {
         }
     }
 
-    /// `rest-api-v1.md`'s archive-tier table (`ADR-0012` §2): a non-cascading, non-root
-    /// archive/restore needs only `edit` — exactly the v0.4-frozen command set's first row. A
-    /// `navigator` (root) object needs `full_access`; v0.4 ships no `flow_object_grants`, so in
-    /// practice only a workspace admin (who always holds `full_access` via
-    /// `authz::effective_permission`'s own admin override) can archive/restore one, matching
-    /// "第二、三行的 `full_access` 由 workspace admin 承担".
-    fn required_permission_level(self, object_type: &str) -> authz::PermissionLevel {
+    /// The generic permission level for commands whose scope is known from their variant alone.
+    /// Lifecycle permission is deliberately not decided here: its tier depends on the actual tree
+    /// impact and sharing facts in `LifecyclePlan`.
+    const fn required_permission_level(self) -> authz::PermissionLevel {
         match self {
-            Self::Lifecycle(_) if object_type == "navigator" => authz::PermissionLevel::FullAccess,
             // `ADR-0012` §4: "被移动对象需 `full_access`（移动会改变它的继承）". This is only the
             // source side of the double-sided rule; `move_object::execute` owns the target side
             // (`edit` on the new parent), which is a different authorization domain whenever the
@@ -971,7 +1053,9 @@ impl CommandKind {
             Self::Governance(GovernanceCommandType::Link | GovernanceCommandType::Unlink) => {
                 authz::PermissionLevel::Edit
             }
-            _ => authz::PermissionLevel::Edit,
+            // Lifecycle commands never reach this generic path; their actual tier comes from a
+            // `LifecyclePlan`. The value here preserves the v0.4 registry's ordinary-page baseline.
+            Self::Content(_) | Self::Lifecycle(_) => authz::PermissionLevel::Edit,
         }
     }
 }
@@ -1179,7 +1263,7 @@ async fn execute_command_authorized(
     kind: CommandKind,
     workspace_id: Uuid,
     document_id: Uuid,
-    object_type: &str,
+    _object_type: &str,
 ) -> Result<AcceptedChange, ApiError> {
     // Relation commands have a relation id (not the source object id) as their event aggregate,
     // and their replay identity also includes the target/relation id from the payload. Let their
@@ -1187,6 +1271,10 @@ async fn execute_command_authorized(
     if let CommandKind::Governance(kind @ (GovernanceCommandType::Link | GovernanceCommandType::Unlink)) = kind {
         let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
         return super::relations::execute_command(state, input, workspace_id, checked_epoch, kind).await;
+    }
+
+    if let CommandKind::Lifecycle(lifecycle_kind) = kind {
+        return execute_lifecycle_command(state, input, workspace_id, lifecycle_kind).await;
     }
 
     if let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await? {
@@ -1239,7 +1327,7 @@ async fn execute_command_authorized(
         &input.role,
     )
     .await?;
-    if level < kind.required_permission_level(object_type) {
+    if level < kind.required_permission_level() {
         return Err(ApiError::policy_rejected("insufficient permission for this command"));
     }
 
@@ -1247,8 +1335,9 @@ async fn execute_command_authorized(
         CommandKind::Content(content_kind) => {
             execute_content_command(state, input, workspace_id, document_id, checked_epoch, content_kind).await
         }
-        CommandKind::Lifecycle(lifecycle_kind) => {
-            execute_lifecycle_command(state, input, workspace_id, checked_epoch, lifecycle_kind).await
+        CommandKind::Lifecycle(_)
+        | CommandKind::Governance(GovernanceCommandType::Link | GovernanceCommandType::Unlink) => {
+            Err(ApiError::Internal)
         }
         // The `full_access` check above is an early rejection (and the one that produces the
         // `flow.command.rejected` audit row); `move_object` re-decides both sides of
@@ -1257,7 +1346,6 @@ async fn execute_command_authorized(
         CommandKind::Governance(GovernanceCommandType::MoveObject) => {
             super::move_object::execute(state, input, workspace_id, checked_epoch).await
         }
-        CommandKind::Governance(GovernanceCommandType::Link | GovernanceCommandType::Unlink) => Err(ApiError::Internal),
     }
 }
 
@@ -1795,26 +1883,75 @@ async fn execute_content_command(
     })
 }
 
-/// `archive`/`restore`: a plain `flow_objects.lifecycle_status` transition, no document
-/// coordinator and no document row lock (this command's `existing_document_cardinality = 0` —
-/// see this module's own doc comment) — but it *does* take the commit-time `authz_epoch` fence
-/// (`ADR-0012` §3.1) below, on the same `flow_workspace_settings` row `execute_content_command`
-/// fences against, held to this transaction's own commit. Without it, the TOCTOU window
-/// `collab-protocol-v1.md` names for content writes applies here too: `execute_command`'s caller
-/// computes `authz::effective_permission` once, outside any transaction; a concurrent
-/// authorization change (a v0.5 grant revoke) that commits between that check and this
-/// transaction's own commit must not let this now-stale permission still land an
-/// archive/restore. `restore` is idempotent at the row level (setting an already-active object
-/// active again is a harmless no-op write, not an error); `archive` on an already-archived object
-/// is a real conflict — a caller retrying with a *new* `idempotency_key` after losing the
-/// original response should not silently succeed a second time.
+fn parse_lifecycle_payload(payload: &Value) -> Result<LifecycleCommandPayload, ApiError> {
+    if payload.is_null() {
+        return Ok(LifecycleCommandPayload::default());
+    }
+    serde_json::from_value(payload.clone())
+        .map_err(|err| ApiError::invalid_update(format!("invalid lifecycle command payload: {err}")))
+}
+
+async fn lifecycle_plan<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    object_id: Uuid,
+    cascade: bool,
+) -> Result<LifecyclePlan, ApiError> {
+    let depth_max = i64::try_from(collab_limits::TREE_DEPTH_MAX).unwrap_or(i64::MAX);
+    let rows = repository::lifecycle_scope(conn, workspace_id, object_id, cascade, depth_max).await?;
+    LifecyclePlan::derive(object_id, cascade, rows)
+}
+
+async fn authorize_lifecycle_plan<C: ConnectionTrait>(
+    conn: &C,
+    input: &ExecuteCommandInput,
+    workspace_id: Uuid,
+    plan: &LifecyclePlan,
+) -> Result<(), ApiError> {
+    let required = plan.required_permission_level(input.object_id)?;
+    let principal_kind = if input.principal_kind == "bot" { "bot" } else { "user" };
+    for object_id in plan.affected_object_ids() {
+        let level = authz::effective_permission(
+            conn,
+            workspace_id,
+            object_id,
+            principal_kind,
+            input.actor_id,
+            &input.role,
+        )
+        .await?;
+        if level < required {
+            return Err(ApiError::policy_rejected(
+                "insufficient permission for this lifecycle impact set",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_replay_affected_ids(metadata: &Value, object_id: Uuid) -> Vec<Uuid> {
+    let Some(values) = metadata.get("affected_object_ids").and_then(Value::as_array) else {
+        return vec![object_id];
+    };
+    let mut ids: Vec<Uuid> = values
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|raw| Uuid::parse_str(raw).ok())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() { vec![object_id] } else { ids }
+}
+
+/// `archive`/`restore` mutates no document head, but it is not necessarily a one-row governance
+/// operation: `payload.cascade=true` applies the reversible transition to the complete subtree.
+/// The impact set and its permission tier are prepared outside the transaction, then every member
+/// is locked and the complete plan (type, root-ness, share facts, statuses, and ids) is re-derived
+/// under the commit-time epoch fence. Any drift rolls the transaction back.
 async fn execute_lifecycle_command(
     state: &AppState,
     input: &ExecuteCommandInput,
     workspace_id: Uuid,
-    // The epoch `execute_command_authorized` read *before* computing this caller's permission --
-    // see the comment there for why it must not be re-read here.
-    checked_epoch: i64,
     kind: LifecycleCommandType,
 ) -> Result<AcceptedChange, ApiError> {
     if input.expected_frontier.is_some() {
@@ -1824,10 +1961,39 @@ async fn execute_lifecycle_command(
         ));
     }
 
+    let payload = parse_lifecycle_payload(&input.payload)?;
+    let checked_epoch = authz::read_epoch(&state.db, workspace_id).await?;
+    let prepared = lifecycle_plan(&state.db, workspace_id, input.object_id, payload.cascade).await?;
+    authorize_lifecycle_plan(&state.db, input, workspace_id, &prepared).await?;
+
     let (event_type, target_status) = match kind {
         LifecycleCommandType::Archive => ("flow.object.archived", "archived"),
         LifecycleCommandType::Restore => ("flow.object.restored", "active"),
     };
+
+    if let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await? {
+        if existing.event_type != event_type || existing.aggregate_id != input.object_id.to_string() {
+            return Err(ApiError::Conflict(
+                "idempotency_key was already used for a different operation".to_string(),
+            ));
+        }
+        let existing_cascade = existing
+            .metadata
+            .get("cascade")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if existing_cascade != payload.cascade {
+            return Err(ApiError::Conflict(
+                "idempotency_key was already used with a different lifecycle scope".to_string(),
+            ));
+        }
+        let current = repository::fetch_object_view(&state.db, input.object_id)
+            .await?
+            .ok_or(ApiError::Internal)?;
+        let mut change = accepted_change_from_row(current, existing.id);
+        change.affected_object_ids = lifecycle_replay_affected_ids(&existing.metadata, input.object_id);
+        return Ok(change);
+    }
 
     let tx = state.db.begin().await?;
 
@@ -1858,11 +2024,30 @@ async fn execute_lifecycle_command(
         }
     }
 
-    let locked = repository::fetch_object_lifecycle_for_update(&tx, input.object_id)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let affected_object_ids = prepared.affected_object_ids();
+    let locked = repository::lock_objects_for_update(&tx, &affected_object_ids).await?;
+    if locked.len() != affected_object_ids.len() {
+        let _ = tx.rollback().await;
+        return Err(ApiError::Conflict(
+            "the lifecycle impact set changed while it was being locked; retry".to_string(),
+        ));
+    }
 
-    if kind == LifecycleCommandType::Archive && locked.lifecycle_status == "archived" {
+    let rechecked = lifecycle_plan(&tx, workspace_id, input.object_id, payload.cascade).await?;
+    if rechecked != prepared {
+        let _ = tx.rollback().await;
+        return Err(ApiError::Conflict(
+            "the lifecycle impact set changed after authorization; retry".to_string(),
+        ));
+    }
+    if let Err(err) = authorize_lifecycle_plan(&tx, input, workspace_id, &rechecked).await {
+        let _ = tx.rollback().await;
+        return Err(err);
+    }
+
+    let root = rechecked.root(input.object_id)?;
+
+    if kind == LifecycleCommandType::Archive && root.lifecycle_status == "archived" {
         let _ = tx.rollback().await;
         return Err(ApiError::Conflict("object is already archived".to_string()));
     }
@@ -1872,28 +2057,38 @@ async fn execute_lifecycle_command(
     } else {
         None
     };
-    repository::set_object_lifecycle(
+    let changed = repository::set_objects_lifecycle(
         &tx,
-        input.object_id,
+        &affected_object_ids,
         target_status,
         archived_at,
         actor_user_id(input.actor_id, input.actor_is_bot()),
     )
     .await?;
+    if changed != u64::try_from(affected_object_ids.len()).unwrap_or(u64::MAX) {
+        let _ = tx.rollback().await;
+        return Err(ApiError::Conflict(
+            "the lifecycle impact set changed while it was being updated; retry".to_string(),
+        ));
+    }
 
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
     let event_id = insert_flow_event(
         &tx,
         BusinessEventInput {
             workspace_id,
-            project_id: None,
+            project_id: root.project_id,
             event_type: event_type.to_string(),
             aggregate_type: "flow_object".to_string(),
             aggregate_id: input.object_id.to_string(),
             actor_id: actor_user_id(input.actor_id, input.actor_is_bot()),
             source: input.origin.source_json(),
             payload: json!({ "object_id": input.object_id, "status": target_status }),
-            metadata: json!({ "message": input.message }),
+            metadata: json!({
+                "message": input.message,
+                "cascade": payload.cascade,
+                "affected_object_ids": affected_object_ids,
+            }),
             correlation_id: Some(input.origin.correlation_id),
             causation_id: input.origin.causation_id,
             idempotency_key: Some(input.idempotency_key.clone()),
@@ -1912,7 +2107,9 @@ async fn execute_lifecycle_command(
     let view = repository::fetch_object_view(&state.db, input.object_id)
         .await?
         .ok_or(ApiError::Internal)?;
-    Ok(accepted_change_from_row(view, event_id))
+    let mut change = accepted_change_from_row(view, event_id);
+    change.affected_object_ids = affected_object_ids;
+    Ok(change)
 }
 
 #[cfg(test)]
@@ -2005,6 +2202,82 @@ mod cardinality_gate_tests {
         assert_eq!(ExistingDocumentCardinality::Zero.count(), 0);
         assert_eq!(ExistingDocumentCardinality::One.count(), 1);
         assert_eq!(ExistingDocumentCardinality::BoundedMany(3).count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tier_tests {
+    use super::{LifecycleDurability, LifecycleTierFacts, authz::PermissionLevel, lifecycle_required_permission_level};
+    use uuid::Uuid;
+
+    #[test]
+    fn lifecycle_tier_is_classified_from_scope_not_only_object_type() {
+        assert_eq!(
+            lifecycle_required_permission_level(LifecycleTierFacts {
+                object_type: "page",
+                parent_id: Some(Uuid::nil()),
+                affected_count: 1,
+                has_shared_descendants: false,
+                durability: LifecycleDurability::Reversible,
+            }),
+            PermissionLevel::Edit,
+            "the v0.4 non-root leaf-page baseline must stay edit"
+        );
+        for (label, object_type, parent_id, affected_count, shared, durability) in [
+            (
+                "navigator",
+                "navigator",
+                None,
+                1,
+                false,
+                LifecycleDurability::Reversible,
+            ),
+            ("root page", "page", None, 1, false, LifecycleDurability::Reversible),
+            (
+                "collection",
+                "collection",
+                Some(Uuid::nil()),
+                1,
+                false,
+                LifecycleDurability::Reversible,
+            ),
+            (
+                "page cascade",
+                "page",
+                Some(Uuid::nil()),
+                2,
+                false,
+                LifecycleDurability::Reversible,
+            ),
+            (
+                "shared descendants",
+                "page",
+                Some(Uuid::nil()),
+                1,
+                true,
+                LifecycleDurability::Reversible,
+            ),
+            (
+                "retention/permanent cleanup",
+                "page",
+                Some(Uuid::nil()),
+                1,
+                false,
+                LifecycleDurability::Irreversible,
+            ),
+        ] {
+            assert_eq!(
+                lifecycle_required_permission_level(LifecycleTierFacts {
+                    object_type,
+                    parent_id,
+                    affected_count,
+                    has_shared_descendants: shared,
+                    durability,
+                }),
+                PermissionLevel::FullAccess,
+                "{label} must never fall through to the ordinary page edit tier"
+            );
+        }
     }
 }
 
@@ -2304,7 +2577,9 @@ mod database_tests {
         app::AppState,
         config::{AppConfig, Secret},
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    };
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -2497,6 +2772,95 @@ mod database_tests {
         .map(|accepted| accepted.object.id)
     }
 
+    async fn create_typed_object(state: &AppState, fx: &Fixture, object_type: &str, parent: Option<Uuid>) -> Uuid {
+        create_object(
+            state,
+            CreateObjectInput {
+                origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                workspace_id: fx.workspace_id,
+                actor_id: fx.owner_id,
+                actor_is_bot: false,
+                object_type: object_type.to_string(),
+                project_id: None,
+                parent_object_id: parent,
+                title: format!("Lifecycle {object_type}"),
+                idempotency_key: Uuid::new_v4().to_string(),
+                message: None,
+            },
+        )
+        .await
+        .expect("lifecycle fixture object is created")
+        .object
+        .id
+    }
+
+    async fn lifecycle_command(
+        state: &AppState,
+        _fx: &Fixture,
+        object_id: Uuid,
+        actor_id: Uuid,
+        role: &str,
+        command_type: &str,
+        cascade: bool,
+        idempotency_key: String,
+    ) -> Result<AcceptedChange, ApiError> {
+        execute_command(
+            state,
+            ExecuteCommandInput {
+                origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                object_id,
+                actor_id,
+                principal_kind: "user".to_string(),
+                role: role.to_string(),
+                command_type: command_type.to_string(),
+                payload: serde_json::json!({ "cascade": cascade }),
+                expected_frontier: None,
+                idempotency_key,
+                message: None,
+                origin_client_id: format!("lifecycle-test:{actor_id}"),
+            },
+        )
+        .await
+    }
+
+    async fn lifecycle_statuses(db: &DatabaseConnection, object_ids: &[Uuid]) -> Vec<(Uuid, String)> {
+        #[derive(FromQueryResult)]
+        struct Row {
+            id: Uuid,
+            lifecycle_status: String,
+        }
+        let ids = object_ids.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id, lifecycle_status FROM flow_objects \
+             WHERE id = ANY(string_to_array($1, ',')::uuid[]) ORDER BY id",
+            vec![ids.into()],
+        ))
+        .all(db)
+        .await
+        .expect("lifecycle statuses query runs")
+        .into_iter()
+        .map(|row| (row.id, row.lifecycle_status))
+        .collect()
+    }
+
+    async fn event_metadata(db: &DatabaseConnection, event_id: Uuid) -> serde_json::Value {
+        #[derive(FromQueryResult)]
+        struct Row {
+            metadata: serde_json::Value,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT metadata FROM business_events WHERE id = $1",
+            vec![event_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("event metadata query runs")
+        .expect("event exists")
+        .metadata
+    }
+
     async fn insert_raw_object(db: &DatabaseConnection, workspace_id: Uuid, parent_id: Option<Uuid>) -> Uuid {
         let id = Uuid::new_v4();
         exec(
@@ -2569,6 +2933,412 @@ mod database_tests {
             Some(&serde_json::json!("tree_depth")),
             "{what}: limit_kind must be the frozen `tree_depth`"
         );
+    }
+
+    /// `archive_tier_by_object_scope` plus the v0.4 baseline fixture named by the gate. The member
+    /// has only `default_member_level=edit`; every broader case must therefore be constructively
+    /// rejected while the ordinary non-root leaf succeeds through both transitions.
+    #[tokio::test]
+    async fn lifecycle_tier_uses_the_real_impact_set_and_preserves_the_edit_baseline() {
+        let scratch = scratch_or_skip!("lifecycle_tiers");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let navigator = create_typed_object(&state, &fx, "navigator", None).await;
+
+        // The exact v0.4 fixture: default-member edit, ordinary non-root Page, no cascade.
+        let leaf = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        let archived = lifecycle_command(
+            &state,
+            &fx,
+            leaf,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("an edit member keeps the v0.4 non-root leaf archive capability");
+        assert_eq!(archived.affected_object_ids, vec![leaf]);
+        assert_eq!(
+            event_metadata(&scratch.db, archived.event_id).await["affected_object_ids"],
+            serde_json::json!([leaf])
+        );
+
+        lifecycle_command(
+            &state,
+            &fx,
+            leaf,
+            fx.member_id,
+            "member",
+            "restore",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("the same edit member keeps the v0.4 restore capability");
+        lifecycle_command(
+            &state,
+            &fx,
+            leaf,
+            fx.member_id,
+            "member",
+            "restore",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("restore is idempotent even with a fresh request key");
+        assert_eq!(lifecycle_statuses(&scratch.db, &[leaf]).await[0].1, "active");
+
+        // `object_type` alone cannot distinguish a root page from the ordinary page above.
+        let root_page = create_typed_object(&state, &fx, "page", None).await;
+        for (label, object_id) in [("root Page", root_page), ("navigator", navigator)] {
+            let err = lifecycle_command(
+                &state,
+                &fx,
+                object_id,
+                fx.member_id,
+                "member",
+                "archive",
+                false,
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect_err(label);
+            assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "{label}: {err:?}");
+        }
+
+        // A real subtree makes the same Page command full_access. The owner can perform it and the
+        // committed event/response must both enumerate every changed row.
+        let subtree_root = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        let child = create_typed_object(&state, &fx, "page", Some(subtree_root)).await;
+        let grandchild = create_typed_object(&state, &fx, "page", Some(child)).await;
+        let err = lifecycle_command(
+            &state,
+            &fx,
+            subtree_root,
+            fx.member_id,
+            "member",
+            "archive",
+            true,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect_err("an edit-only member must not cascade");
+        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected);
+
+        let archive_key = Uuid::new_v4().to_string();
+        let cascaded = lifecycle_command(
+            &state,
+            &fx,
+            subtree_root,
+            fx.owner_id,
+            "owner",
+            "archive",
+            true,
+            archive_key.clone(),
+        )
+        .await
+        .expect("the workspace owner has full_access for the cascade");
+        let mut expected = vec![subtree_root, child, grandchild];
+        expected.sort_unstable();
+        assert_eq!(cascaded.affected_object_ids, expected);
+        assert_eq!(
+            event_metadata(&scratch.db, cascaded.event_id).await["affected_object_ids"],
+            serde_json::json!(expected),
+            "the event envelope must name the complete impact set"
+        );
+        assert!(
+            lifecycle_statuses(&scratch.db, &expected)
+                .await
+                .iter()
+                .all(|(_, status)| status == "archived")
+        );
+
+        let replayed = lifecycle_command(
+            &state,
+            &fx,
+            subtree_root,
+            fx.owner_id,
+            "owner",
+            "archive",
+            true,
+            archive_key,
+        )
+        .await
+        .expect("same-key cascade replays");
+        assert_eq!(replayed.event_id, cascaded.event_id);
+        assert_eq!(replayed.affected_object_ids, expected);
+
+        lifecycle_command(
+            &state,
+            &fx,
+            subtree_root,
+            fx.owner_id,
+            "owner",
+            "restore",
+            true,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("cascade restore succeeds");
+        lifecycle_command(
+            &state,
+            &fx,
+            subtree_root,
+            fx.owner_id,
+            "owner",
+            "restore",
+            true,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("cascade restore is idempotent");
+        assert!(
+            lifecycle_statuses(&scratch.db, &expected)
+                .await
+                .iter()
+                .all(|(_, status)| status == "active")
+        );
+
+        // A non-cascading request still has a broader tier when a strict descendant is explicitly
+        // shared. The fixture has a real child and asserts directly on the rejection and rows.
+        let shared_root = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        let shared_child = create_typed_object(&state, &fx, "page", Some(shared_root)).await;
+        exec(
+            &scratch.db,
+            "INSERT INTO flow_object_grants \
+             (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, 'edit')",
+            vec![fx.workspace_id.into(), shared_child.into(), fx.member_id.into()],
+        )
+        .await;
+        let err = lifecycle_command(
+            &state,
+            &fx,
+            shared_root,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect_err("a Page affecting an explicitly shared descendant requires full_access");
+        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected);
+        assert!(
+            lifecycle_statuses(&scratch.db, &[shared_root, shared_child])
+                .await
+                .iter()
+                .all(|(_, status)| status == "active")
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The unlocked set is not authority. A concurrent insert is hidden from the prepare snapshot,
+    /// then becomes visible after the lifecycle transaction obtains the root lock; the recheck must
+    /// reject and leave every row/event untouched.
+    #[tokio::test]
+    async fn lifecycle_impact_drift_rolls_back_instead_of_committing_the_prepared_subset() {
+        let scratch = scratch_or_skip!("lifecycle_drift");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let navigator = create_typed_object(&state, &fx, "navigator", None).await;
+        let root = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+
+        let db_url = scratch
+            .admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("database url");
+        let db_b = Database::connect(&db_url).await.expect("B connects independently");
+        let tx_b = db_b.begin().await.expect("B begins");
+        tx_b.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id FROM flow_objects WHERE id = $1 FOR UPDATE",
+            vec![root.into()],
+        ))
+        .await
+        .expect("B locks the root");
+
+        let state_a = state_for(scratch.db.clone());
+        let actor = fx.owner_id;
+        let workspace = fx.workspace_id;
+        let a_task = tokio::spawn(async move {
+            execute_command(
+                &state_a,
+                ExecuteCommandInput {
+                    origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                    object_id: root,
+                    actor_id: actor,
+                    principal_kind: "user".to_string(),
+                    role: "owner".to_string(),
+                    command_type: "archive".to_string(),
+                    payload: serde_json::json!({ "cascade": true }),
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                    origin_client_id: "lifecycle-drift-a".to_string(),
+                },
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!a_task.is_finished(), "A must be waiting for B's root row lock");
+        let child = Uuid::new_v4();
+        tx_b.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id) \
+                 VALUES ($1, $2, 'page', $3)",
+            vec![child.into(), workspace.into(), root.into()],
+        ))
+        .await
+        .expect("B grows the subtree while A holds only its unlocked plan");
+        tx_b.commit()
+            .await
+            .expect("B commits the new child and releases the root");
+
+        let err = a_task
+            .await
+            .expect("A joins")
+            .expect_err("the locked impact set differs from the prepared set");
+        assert!(matches!(err, ApiError::Conflict(_)), "{err:?}");
+        assert!(
+            lifecycle_statuses(&scratch.db, &[root, child])
+                .await
+                .iter()
+                .all(|(_, status)| status == "active")
+        );
+        assert_eq!(
+            scalar_i64(
+                &scratch.db,
+                "SELECT count(*)::bigint AS value FROM business_events \
+                 WHERE aggregate_id = $1 AND event_type = 'flow.object.archived'",
+                vec![root.to_string().into()],
+            )
+            .await,
+            0,
+            "a drift rejection must not emit the lifecycle event"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// The lifecycle transaction's epoch `FOR SHARE` is held through commit. A revocation that
+    /// reaches its conflicting epoch update while archive is parked on the object row must wait;
+    /// archive linearizes first, then the revocation advances the epoch.
+    #[tokio::test]
+    async fn lifecycle_holds_the_current_authz_epoch_fence_until_its_commit() {
+        let scratch = scratch_or_skip!("lifecycle_epoch_fence");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let navigator = create_typed_object(&state, &fx, "navigator", None).await;
+        let object_id = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![object_id.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "INSERT INTO flow_object_grants \
+             (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, 'edit')",
+            vec![fx.workspace_id.into(), object_id.into(), fx.member_id.into()],
+        )
+        .await;
+        let original_epoch = authz::read_epoch(&scratch.db, fx.workspace_id)
+            .await
+            .expect("epoch reads");
+
+        let db_url = scratch
+            .admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("database url");
+        let blocker_db = Database::connect(&db_url).await.expect("blocker connects");
+        let blocker = blocker_db.begin().await.expect("blocker begins");
+        blocker
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM flow_objects WHERE id = $1 FOR UPDATE",
+                vec![object_id.into()],
+            ))
+            .await
+            .expect("blocker locks the object");
+
+        let state_a = state_for(scratch.db.clone());
+        let member_id = fx.member_id;
+        let workspace_id = fx.workspace_id;
+        let a_task = tokio::spawn(async move {
+            execute_command(
+                &state_a,
+                ExecuteCommandInput {
+                    origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                    object_id,
+                    actor_id: member_id,
+                    principal_kind: "user".to_string(),
+                    role: "member".to_string(),
+                    command_type: "archive".to_string(),
+                    payload: serde_json::json!({}),
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                    origin_client_id: "lifecycle-epoch-a".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!a_task.is_finished(), "archive must be parked on the object lock");
+
+        let revoker_db = Database::connect(&db_url).await.expect("revoker connects");
+        let (deleted_tx, deleted_rx) = tokio::sync::oneshot::channel();
+        let revoker = tokio::spawn(async move {
+            let tx = revoker_db.begin().await.expect("revoker begins");
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM flow_object_grants WHERE workspace_id = $1 AND principal_id = $2",
+                vec![workspace_id.into(), member_id.into()],
+            ))
+            .await
+            .expect("revoker deletes the grant in its uncommitted transaction");
+            deleted_tx.send(()).expect("test still waits for the delete");
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("epoch update resumes after archive commits");
+            tx.commit().await.expect("revocation commits");
+        });
+        deleted_rx.await.expect("revoker reached the epoch update");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !revoker.is_finished(),
+            "the revocation must be blocked by archive's held epoch FOR SHARE"
+        );
+
+        blocker.commit().await.expect("release the object lock");
+        a_task
+            .await
+            .expect("archive task joins")
+            .expect("archive commits before the later revocation");
+        revoker.await.expect("revoker task joins");
+        assert_eq!(lifecycle_statuses(&scratch.db, &[object_id]).await[0].1, "archived");
+        assert_eq!(
+            authz::read_epoch(&scratch.db, fx.workspace_id)
+                .await
+                .expect("epoch reads"),
+            original_epoch + 1
+        );
+
+        scratch.drop_self().await;
     }
 
     // ---- 1. the `authz_epoch` fence's own TOCTOU: the two reads must not be inverted ----

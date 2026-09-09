@@ -356,58 +356,95 @@ pub async fn fetch_parent_object<C: ConnectionTrait>(conn: &C, parent_id: Uuid) 
     }))
 }
 
-/// `flow_objects` columns `command::execute_command` needs under a row lock before flipping
-/// `lifecycle_status` (`archive`/`restore`): just enough to compute the archive-tier permission
-/// (`object_type`) and to reject a redundant transition without a second round trip.
-#[derive(Debug, FromQueryResult)]
-pub struct ObjectLifecycleRow {
+/// One row in the object scope a lifecycle command reasons about.
+///
+/// `has_shared_descendants` is repeated on every returned row deliberately: it is a fact about the
+/// requested root, not an individual row. Keeping it in the same statement as the subtree snapshot
+/// prevents the permission tier from being computed from a separately-timed grants query.
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct LifecycleScopeRow {
+    pub id: Uuid,
     pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub parent_id: Option<Uuid>,
     pub object_type: String,
     pub lifecycle_status: String,
+    pub has_shared_descendants: bool,
+    pub invalid_tree: bool,
 }
 
-/// Locks the `flow_objects` row for the duration of the caller's transaction
-/// (`ADR-0013`'s "object/ancestor 行" lock-rank layer), so two concurrent `archive`/`restore`
-/// requests for the same object serialize instead of racing on `lifecycle_status`.
-pub async fn fetch_object_lifecycle_for_update<C: ConnectionTrait>(
+/// Reads the root and, when `cascade` is true, its complete affected subtree in ascending id order.
+///
+/// The recursive walk always visits strict descendants even for a non-cascading command because
+/// `ADR-0012` assigns `full_access` to an archive that affects a shared descendant. Here "shared"
+/// means a descendant with an explicit `flow_object_grants` row; workspace baseline access alone
+/// is not an object share. The walk is bounded one level past `tree_depth_max`, records cycles, and
+/// lets the caller fail closed instead of silently classifying a corrupt/truncated tree as a leaf.
+pub async fn lifecycle_scope<C: ConnectionTrait>(
     conn: &C,
+    workspace_id: Uuid,
     object_id: Uuid,
-) -> Result<Option<ObjectLifecycleRow>, ApiError> {
-    Ok(ObjectLifecycleRow::find_by_statement(Statement::from_sql_and_values(
+    cascade: bool,
+    tree_depth_max: i64,
+) -> Result<Vec<LifecycleScopeRow>, ApiError> {
+    Ok(LifecycleScopeRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT workspace_id, object_type, lifecycle_status FROM flow_objects WHERE id = $1 FOR UPDATE",
-        vec![object_id.into()],
+        "WITH RECURSIVE subtree AS ( \
+             SELECT o.id, o.workspace_id, o.project_id, o.parent_id, o.object_type, \
+                    o.lifecycle_status, 0::bigint AS depth, ARRAY[o.id]::uuid[] AS path, false AS cycle \
+               FROM flow_objects o WHERE o.id = $1 AND o.workspace_id = $2 \
+             UNION ALL \
+             SELECT c.id, c.workspace_id, c.project_id, c.parent_id, c.object_type, \
+                    c.lifecycle_status, s.depth + 1, s.path || c.id, c.id = ANY(s.path) \
+               FROM subtree s JOIN flow_objects c ON c.parent_id = s.id AND c.workspace_id = $2 \
+              WHERE NOT s.cycle AND s.depth < $4::bigint + 1 \
+         ), facts AS ( \
+             SELECT COALESCE(bool_or(s.cycle OR s.depth > $4::bigint), false) AS invalid_tree, \
+                    EXISTS (SELECT 1 FROM subtree d JOIN flow_object_grants g ON g.object_id = d.id \
+                             WHERE d.depth > 0) AS has_shared_descendants \
+               FROM subtree s \
+         ) \
+         SELECT s.id, s.workspace_id, s.project_id, s.parent_id, s.object_type, s.lifecycle_status, \
+                f.has_shared_descendants, f.invalid_tree \
+           FROM subtree s CROSS JOIN facts f \
+          WHERE $3::boolean OR s.depth = 0 \
+          ORDER BY s.id",
+        vec![
+            object_id.into(),
+            workspace_id.into(),
+            cascade.into(),
+            tree_depth_max.into(),
+        ],
     ))
-    .one(conn)
+    .all(conn)
     .await?)
 }
 
-/// Sets `lifecycle_status`/`archived_at`/`updated_by` in one parameterized statement. `archived_at`
-/// is `Some(now)` for `archived`, `None` for `active` — callers never build a raw SQL fragment for
-/// either half of `flow_objects_archived_at_check`'s `(lifecycle_status = 'archived') = (archived_at
-/// IS NOT NULL)` invariant.
-pub async fn set_object_lifecycle<C: ConnectionTrait>(
+/// Applies one reversible lifecycle transition to the exact, already-locked impact set.
+pub async fn set_objects_lifecycle<C: ConnectionTrait>(
     conn: &C,
-    object_id: Uuid,
+    object_ids: &[Uuid],
     lifecycle_status: &str,
     archived_at: Option<DateTime<Utc>>,
-    // `None` when the actor is a bot: this column is `REFERENCES users(id)` and a bot id is
-    // not a user id.
     updated_by: Option<Uuid>,
-) -> Result<(), ApiError> {
-    conn.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "UPDATE flow_objects SET lifecycle_status = $2, archived_at = $3, updated_at = now(), updated_by = $4 \
-         WHERE id = $1",
-        vec![
-            object_id.into(),
-            lifecycle_status.into(),
-            archived_at.into(),
-            updated_by.into(),
-        ],
-    ))
-    .await?;
-    Ok(())
+) -> Result<u64, ApiError> {
+    if object_ids.is_empty() {
+        return Ok(0);
+    }
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE flow_objects SET lifecycle_status = $2, archived_at = $3, updated_at = now(), updated_by = $4 \
+             WHERE id = ANY(string_to_array($1, ',')::uuid[])",
+            vec![
+                uuid_list(object_ids).into(),
+                lifecycle_status.into(),
+                archived_at.into(),
+                updated_by.into(),
+            ],
+        ))
+        .await?;
+    Ok(result.rows_affected())
 }
 
 /// A prior `business_events` row for this `(workspace_id, idempotency_key)`, if any.
@@ -418,6 +455,7 @@ pub struct IdempotentEvent {
     pub id: Uuid,
     pub event_type: String,
     pub aggregate_id: String,
+    pub metadata: serde_json::Value,
 }
 
 pub async fn find_idempotent_event<C: ConnectionTrait>(
@@ -430,10 +468,12 @@ pub async fn find_idempotent_event<C: ConnectionTrait>(
         id: Uuid,
         event_type: String,
         aggregate_id: String,
+        metadata: serde_json::Value,
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT id, event_type, aggregate_id FROM business_events WHERE workspace_id = $1 AND idempotency_key = $2",
+        "SELECT id, event_type, aggregate_id, metadata FROM business_events \
+         WHERE workspace_id = $1 AND idempotency_key = $2",
         vec![workspace_id.into(), idempotency_key.into()],
     ))
     .one(conn)
@@ -442,6 +482,7 @@ pub async fn find_idempotent_event<C: ConnectionTrait>(
         id: r.id,
         event_type: r.event_type,
         aggregate_id: r.aggregate_id,
+        metadata: r.metadata,
     }))
 }
 
