@@ -559,8 +559,8 @@ fn permission_changes(
 /// `GET /flow/objects/{object_id}/grants`.
 ///
 /// # Errors
-/// `NotFound` when the object is not in this workspace; `Forbidden` when the caller holds nothing
-/// on it (a caller who cannot read the object must not learn that it has a share list at all).
+/// `NotFound` when the object is absent, foreign, malformed, or the caller holds nothing on it;
+/// these answers deliberately collapse so the endpoint cannot reveal that a share list exists.
 /// Propagates database read failures.
 pub async fn get_grants(
     state: &AppState,
@@ -576,14 +576,15 @@ pub async fn get_grants(
         caller.actor_id,
         &caller.role,
     )
-    .await?;
+    .await
+    .map_err(super::policy::collapse_object_denial)?;
     if effective < PermissionLevel::View {
-        return Err(ApiError::Forbidden(
-            "insufficient permission for this object".to_string(),
-        ));
+        return Err(super::policy::object_not_found());
     }
 
-    let chain = authz::inheritance_chain(&state.db, workspace_id, object_id).await?;
+    let chain = authz::inheritance_chain(&state.db, workspace_id, object_id)
+        .await
+        .map_err(super::policy::collapse_object_denial)?;
     let inherit_from_parent = chain.boundary_index != Some(0);
 
     if effective < PermissionLevel::FullAccess {

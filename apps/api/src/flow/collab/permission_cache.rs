@@ -11,10 +11,10 @@
 //! subtree, and workspace invalidators only reclaim memory after a successful commit; correctness
 //! never depends on an exhaustive physical sweep.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hashlink::LinkedHashMap;
 use parking_lot::Mutex;
 use platform::app::AppState;
 use uuid::Uuid;
@@ -37,10 +37,26 @@ const PERMISSION_CACHE_ENTRIES_MAX: usize = 20_000;
 /// authorization or caller-visible limit.
 const PERMISSION_CACHE_IDLE_TTL: Duration = Duration::from_secs(WARM_CACHE_IDLE_TTL_SECONDS);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PrincipalKind {
+    User,
+    Bot,
+}
+
+impl PrincipalKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Bot => "bot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CacheKey {
     workspace_id: Uuid,
-    principal_kind: String,
+    principal_kind: PrincipalKind,
     principal_id: Uuid,
     object_id: Uuid,
 }
@@ -54,7 +70,8 @@ struct CacheEntry {
 
 #[derive(Default)]
 struct Registry {
-    entries: HashMap<CacheKey, CacheEntry>,
+    /// Oldest at the front, most recently used at the back.
+    entries: LinkedHashMap<CacheKey, CacheEntry>,
 }
 
 /// A bounded effective-permission cache owned by one [`AppState`].
@@ -88,10 +105,10 @@ impl PermissionCache {
 
     /// Reads one entry only when it was computed at `current_epoch`.
     #[must_use]
-    pub fn get(
+    pub(crate) fn get(
         &self,
         workspace_id: Uuid,
-        principal_kind: &str,
+        principal_kind: PrincipalKind,
         principal_id: Uuid,
         object_id: Uuid,
         current_epoch: i64,
@@ -99,29 +116,32 @@ impl PermissionCache {
         let now = Instant::now();
         let key = CacheKey {
             workspace_id,
-            principal_kind: principal_kind.to_string(),
+            principal_kind,
             principal_id,
             object_id,
         };
         let mut registry = self.registry.lock();
-        Self::remove_idle(&mut registry, now, self.idle_ttl);
-        let entry = registry.entries.get_mut(&key)?;
-        if entry.authz_epoch != current_epoch {
+        let hit = {
+            let entry = registry.entries.to_back(&key)?;
+            if entry.authz_epoch == current_epoch && now.saturating_duration_since(entry.last_access) <= self.idle_ttl {
+                entry.last_access = now;
+                Some(entry.level)
+            } else {
+                None
+            }
+        };
+        if hit.is_none() {
             registry.entries.remove(&key);
-            drop(registry);
-            return None;
         }
-        entry.last_access = now;
-        let level = entry.level;
         drop(registry);
-        Some(level)
+        hit
     }
 
     /// Stores a DB-derived effective permission at the epoch used for that derivation.
-    pub fn put(
+    pub(super) fn put(
         &self,
         workspace_id: Uuid,
-        principal_kind: &str,
+        principal_kind: PrincipalKind,
         principal_id: Uuid,
         object_id: Uuid,
         level: PermissionLevel,
@@ -133,21 +153,13 @@ impl PermissionCache {
         let now = Instant::now();
         let key = CacheKey {
             workspace_id,
-            principal_kind: principal_kind.to_string(),
+            principal_kind,
             principal_id,
             object_id,
         };
         let mut registry = self.registry.lock();
-        Self::remove_idle(&mut registry, now, self.idle_ttl);
         if !registry.entries.contains_key(&key) && registry.entries.len() >= self.max_entries {
-            let oldest = registry
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                registry.entries.remove(&oldest);
-            }
+            registry.entries.pop_front();
         }
         registry.entries.insert(
             key,
@@ -196,12 +208,6 @@ impl PermissionCache {
             .retain(|key, _| key.workspace_id != workspace_id);
     }
 
-    fn remove_idle(registry: &mut Registry, now: Instant, idle_ttl: Duration) {
-        registry
-            .entries
-            .retain(|_, entry| now.saturating_duration_since(entry.last_access) <= idle_ttl);
-    }
-
     #[cfg(test)]
     fn with_limits(max_entries: usize, idle_ttl: Duration) -> Self {
         Self {
@@ -212,8 +218,30 @@ impl PermissionCache {
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len_for_test(&self) -> usize {
         self.registry.lock().entries.len()
+    }
+
+    /// Deliberate poison seam for cross-module cache invalidation tests. Production code cannot
+    /// inject an arbitrary epoch/level pair because [`Self::put`] is restricted to `collab`.
+    #[cfg(test)]
+    pub(crate) fn put_for_test(
+        &self,
+        workspace_id: Uuid,
+        principal_kind: PrincipalKind,
+        principal_id: Uuid,
+        object_id: Uuid,
+        level: PermissionLevel,
+        authz_epoch: i64,
+    ) {
+        self.put(
+            workspace_id,
+            principal_kind,
+            principal_id,
+            object_id,
+            level,
+            authz_epoch,
+        );
     }
 }
 
@@ -244,15 +272,18 @@ mod tests {
         let (workspace_id, principal_id, object_id) = ids();
         cache.put(
             workspace_id,
-            "user",
+            PrincipalKind::User,
             principal_id,
             object_id,
             PermissionLevel::FullAccess,
             7,
         );
 
-        assert_eq!(cache.get(workspace_id, "user", principal_id, object_id, 8), None);
-        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::User, principal_id, object_id, 8),
+            None
+        );
+        assert_eq!(cache.len_for_test(), 0);
     }
 
     #[test]
@@ -262,7 +293,7 @@ mod tests {
         let second_object = Uuid::new_v4();
         cache.put(
             workspace_id,
-            "user",
+            PrincipalKind::User,
             principal_id,
             first_object,
             PermissionLevel::View,
@@ -270,18 +301,63 @@ mod tests {
         );
         cache.put(
             workspace_id,
-            "user",
+            PrincipalKind::User,
             principal_id,
             second_object,
             PermissionLevel::Edit,
             1,
         );
 
-        assert_eq!(cache.len(), 1);
-        assert_eq!(cache.get(workspace_id, "user", principal_id, first_object, 1), None);
+        assert_eq!(cache.len_for_test(), 1);
         assert_eq!(
-            cache.get(workspace_id, "user", principal_id, second_object, 1),
+            cache.get(workspace_id, PrincipalKind::User, principal_id, first_object, 1),
+            None
+        );
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::User, principal_id, second_object, 1),
             Some(PermissionLevel::Edit)
+        );
+    }
+
+    #[test]
+    fn a_get_refreshes_lru_recency_before_capacity_eviction() {
+        let cache = PermissionCache::with_limits(2, Duration::from_mins(1));
+        let (workspace_id, principal_id, first_object) = ids();
+        let second_object = Uuid::new_v4();
+        let third_object = Uuid::new_v4();
+        for object_id in [first_object, second_object] {
+            cache.put(
+                workspace_id,
+                PrincipalKind::User,
+                principal_id,
+                object_id,
+                PermissionLevel::View,
+                1,
+            );
+        }
+
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::User, principal_id, first_object, 1),
+            Some(PermissionLevel::View)
+        );
+        cache.put(
+            workspace_id,
+            PrincipalKind::User,
+            principal_id,
+            third_object,
+            PermissionLevel::Edit,
+            1,
+        );
+
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::User, principal_id, second_object, 1),
+            None,
+            "the untouched least-recently-used entry must be evicted"
+        );
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::User, principal_id, first_object, 1),
+            Some(PermissionLevel::View),
+            "the get must have refreshed the first entry"
         );
     }
 
@@ -289,11 +365,21 @@ mod tests {
     fn idle_entries_expire() {
         let cache = PermissionCache::with_limits(2, Duration::from_millis(1));
         let (workspace_id, principal_id, object_id) = ids();
-        cache.put(workspace_id, "bot", principal_id, object_id, PermissionLevel::View, 1);
+        cache.put(
+            workspace_id,
+            PrincipalKind::Bot,
+            principal_id,
+            object_id,
+            PermissionLevel::View,
+            1,
+        );
         thread::sleep(Duration::from_millis(3));
 
-        assert_eq!(cache.get(workspace_id, "bot", principal_id, object_id, 1), None);
-        assert_eq!(cache.len(), 0);
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::Bot, principal_id, object_id, 1),
+            None
+        );
+        assert_eq!(cache.len_for_test(), 0);
     }
 
     #[test]
@@ -301,10 +387,17 @@ mod tests {
         let cache = PermissionCache::default();
         let (workspace_id, principal_id, object_id) = ids();
         let other_workspace = Uuid::new_v4();
-        cache.put(workspace_id, "user", principal_id, object_id, PermissionLevel::View, 1);
+        cache.put(
+            workspace_id,
+            PrincipalKind::User,
+            principal_id,
+            object_id,
+            PermissionLevel::View,
+            1,
+        );
         cache.put(
             other_workspace,
-            "user",
+            PrincipalKind::User,
             principal_id,
             object_id,
             PermissionLevel::Edit,
@@ -312,13 +405,16 @@ mod tests {
         );
 
         cache.invalidate_object(workspace_id, object_id);
-        assert_eq!(cache.get(workspace_id, "user", principal_id, object_id, 1), None);
         assert_eq!(
-            cache.get(other_workspace, "user", principal_id, object_id, 1),
+            cache.get(workspace_id, PrincipalKind::User, principal_id, object_id, 1),
+            None
+        );
+        assert_eq!(
+            cache.get(other_workspace, PrincipalKind::User, principal_id, object_id, 1),
             Some(PermissionLevel::Edit)
         );
 
         cache.invalidate_workspace(other_workspace);
-        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.len_for_test(), 0);
     }
 }

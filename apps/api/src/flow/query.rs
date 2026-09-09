@@ -74,7 +74,7 @@ async fn scan_objects_within_budget(
     access: &FlowReadContext,
     mut filter: ListFilter,
     needed: usize,
-) -> Result<Vec<ObjectViewRow>, ApiError> {
+) -> Result<Option<Vec<ObjectViewRow>>, ApiError> {
     let mut accepted: Vec<ObjectViewRow> = Vec::new();
     let mut examined: u64 = 0;
     loop {
@@ -82,12 +82,15 @@ async fn scan_objects_within_budget(
         let batch = repository::list_objects(&state.db, &filter).await?;
         let batch_len = batch.len();
         if batch_len == 0 {
-            return Ok(accepted);
+            return Ok(Some(accepted));
         }
         let object_ids: Vec<Uuid> = batch.iter().map(|row| row.id).collect();
-        let visible =
+        let Some(visible) =
             policy::authorize_flow_objects(state, access, &object_ids, super::collab::authz::PermissionLevel::View)
-                .await?;
+                .await?
+        else {
+            return Ok(None);
+        };
         for (row, is_visible) in batch.into_iter().zip(visible) {
             examined += 1;
             check_scan_budget(examined)?;
@@ -95,18 +98,21 @@ async fn scan_objects_within_budget(
             if is_visible {
                 accepted.push(row);
                 if accepted.len() >= needed {
-                    return Ok(accepted);
+                    return Ok(Some(accepted));
                 }
             }
         }
         if (batch_len as u64) < SCAN_BATCH_SIZE {
-            return Ok(accepted);
+            return Ok(Some(accepted));
         }
     }
 }
 
 /// The `get_history` analog of [`scan_objects_within_budget`] — same batch/cursor/budget shape,
 /// walking `HistoryFilter::before_seq` backwards instead of `ListFilter::after` forwards.
+/// History rows are events from one object that the caller has already authorized, so they do
+/// not receive per-row object authorization; the scan exists only to enforce pagination and the
+/// shared bounded-work ceiling.
 async fn scan_history_within_budget(
     state: &AppState,
     mut filter: HistoryFilter,
@@ -125,12 +131,9 @@ async fn scan_history_within_budget(
             examined += 1;
             check_scan_budget(examined)?;
             filter.before_seq = Some(row.seq);
-            let is_visible = true; // see scan_objects_within_budget's doc comment
-            if is_visible {
-                accepted.push(row);
-                if accepted.len() >= needed {
-                    return Ok(accepted);
-                }
+            accepted.push(row);
+            if accepted.len() >= needed {
+                return Ok(accepted);
             }
         }
         if (batch_len as u64) < SCAN_BATCH_SIZE {
@@ -206,7 +209,7 @@ pub async fn get_object(
     access: &AuthorizedFlowObject,
     at_seq: Option<i64>,
     render: Render,
-) -> Result<FlowObjectView, ApiError> {
+) -> Result<Option<FlowObjectView>, ApiError> {
     let object_id = access.object_id();
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
@@ -232,7 +235,10 @@ pub async fn get_object(
     if render == Render::Markdown {
         view.semantic_content = json!({ "rendered": projection::render_markdown(&view.title) });
     }
-    Ok(view)
+    if !policy::ensure_epoch_current(state, access.context()).await? {
+        return Ok(None);
+    }
+    Ok(Some(view))
 }
 
 /// `GET /api/v1/flow/objects/{object_id}/bootstrap` (`rest-api-v1.md`: "**user only**；object
@@ -257,7 +263,7 @@ pub async fn get_bootstrap(
     access: &AuthorizedFlowObject,
     known_seq: Option<i64>,
     known_frontier: Option<String>,
-) -> Result<Bootstrap, ApiError> {
+) -> Result<Option<Bootstrap>, ApiError> {
     let object_id = access.object_id();
     let _ = known_seq;
     if let Some(raw) = known_frontier.as_deref() {
@@ -295,7 +301,7 @@ pub async fn get_bootstrap(
         return Err(ApiError::Conflict("resync_required".to_string()));
     }
 
-    Ok(Bootstrap {
+    let response = Bootstrap {
         object_id,
         document_id,
         engine: boot.engine,
@@ -317,7 +323,11 @@ pub async fn get_bootstrap(
         head_frontier: base64::engine::general_purpose::STANDARD.encode(&boot.head_frontier),
         limits: limits::effective_limits(),
         websocket_path: "/api/v1/collab/ws".to_string(),
-    })
+    };
+    if !policy::ensure_epoch_current(state, access.context()).await? {
+        return Ok(None);
+    }
+    Ok(Some(response))
 }
 
 /// Parameters for [`list_objects`], bundled into one struct so the handler-facing signature does
@@ -338,7 +348,7 @@ pub async fn list_objects(
     state: &AppState,
     access: &FlowReadContext,
     params: ListObjectsParams,
-) -> Result<FlowObjectListResponse, ApiError> {
+) -> Result<Option<FlowObjectListResponse>, ApiError> {
     if params.workspace_id != access.workspace_id() {
         return Err(ApiError::Internal);
     }
@@ -366,8 +376,12 @@ pub async fn list_objects(
         // Overwritten per candidate batch by `scan_objects_within_budget`.
         limit: 0,
     };
-    let mut rows = scan_objects_within_budget(state, access, filter, needed).await?;
-    policy::ensure_epoch_current(state, access).await?;
+    let Some(mut rows) = scan_objects_within_budget(state, access, filter, needed).await? else {
+        return Ok(None);
+    };
+    if !policy::ensure_epoch_current(state, access).await? {
+        return Ok(None);
+    }
 
     let next_cursor = if rows.len() > limit_usize {
         rows.truncate(limit_usize);
@@ -376,10 +390,10 @@ pub async fn list_objects(
         None
     };
 
-    Ok(FlowObjectListResponse {
+    Ok(Some(FlowObjectListResponse {
         items: rows.into_iter().map(object_view_from_row).collect(),
         next_cursor,
-    })
+    }))
 }
 
 pub async fn get_history(
@@ -387,7 +401,7 @@ pub async fn get_history(
     access: &AuthorizedFlowObject,
     before_seq: Option<i64>,
     limit: Option<u64>,
-) -> Result<HistoryResponse, ApiError> {
+) -> Result<Option<HistoryResponse>, ApiError> {
     let object_id = access.object_id();
     let row = repository::fetch_object_view(&state.db, object_id)
         .await?
@@ -416,7 +430,7 @@ pub async fn get_history(
         None
     };
 
-    Ok(HistoryResponse {
+    let response = HistoryResponse {
         items: rows
             .into_iter()
             .map(|row| HistoryItem {
@@ -429,7 +443,11 @@ pub async fn get_history(
             })
             .collect(),
         next_before_seq,
-    })
+    };
+    if !policy::ensure_epoch_current(state, access.context()).await? {
+        return Ok(None);
+    }
+    Ok(Some(response))
 }
 
 /// Row-to-wire mapping shared by the `GET` handler and `command::set_flow_feature`'s response.

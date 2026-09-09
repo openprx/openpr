@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::middleware::bot_auth::BotAuthContext;
+use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use crate::{
     error::ApiError,
     flow::{
@@ -176,26 +176,30 @@ pub async fn list_flow_objects(
     Query(params): Query<ListFlowObjectsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let extensions = build_auth_extensions(claims, bot);
-    let access = policy::begin_flow_read(&state, &extensions, workspace_id).await?;
-
-    let response = query::list_objects(
-        &state,
-        &access,
-        query::ListObjectsParams {
-            workspace_id,
-            project_id: params.project_id,
-            unprojected: params.unprojected,
-            object_type: params.object_type,
-            parent_id: params.parent_id,
-            q: params.q,
-            cursor: params.cursor,
-            limit: params.limit,
-            include_archived: params.include_archived,
-        },
-    )
-    .await?;
-
-    Ok(ApiResponse::success(response))
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let access = policy::begin_flow_read(&state, &extensions, workspace_id).await?;
+        let Some(response) = query::list_objects(
+            &state,
+            &access,
+            query::ListObjectsParams {
+                workspace_id,
+                project_id: params.project_id,
+                unprojected: params.unprojected,
+                object_type: params.object_type.clone(),
+                parent_id: params.parent_id,
+                q: params.q.clone(),
+                cursor: params.cursor.clone(),
+                limit: params.limit,
+                include_archived: params.include_archived,
+            },
+        )
+        .await?
+        else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response));
+    }
+    Err(policy::authorization_read_unstable())
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,19 +220,25 @@ pub async fn get_flow_object(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    let access = policy::require_flow_object_access(
-        &state,
-        &extensions,
-        workspace_id,
-        object_id,
-        crate::flow::collab::authz::PermissionLevel::View,
-    )
-    .await?;
-
     let render = Render::parse(params.render.as_deref())?;
-    let view = query::get_object(&state, &access, params.at_seq, render).await?;
-
-    Ok(ApiResponse::success(view))
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = policy::require_flow_object_access(
+            &state,
+            &extensions,
+            workspace_id,
+            object_id,
+            crate::flow::collab::authz::PermissionLevel::View,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(view) = query::get_object(&state, &access, params.at_seq, render).await? else {
+            continue;
+        };
+        return Ok(ApiResponse::success(view));
+    }
+    Err(policy::authorization_read_unstable())
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,18 +271,26 @@ pub async fn get_flow_object_bootstrap(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    let access = policy::require_flow_object_access(
-        &state,
-        &extensions,
-        workspace_id,
-        object_id,
-        crate::flow::collab::authz::PermissionLevel::Edit,
-    )
-    .await?;
-
-    let bootstrap = query::get_bootstrap(&state, &access, params.known_seq, params.known_frontier).await?;
-
-    Ok(ApiResponse::success(bootstrap))
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = policy::require_flow_object_access(
+            &state,
+            &extensions,
+            workspace_id,
+            object_id,
+            crate::flow::collab::authz::PermissionLevel::Edit,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(bootstrap) =
+            query::get_bootstrap(&state, &access, params.known_seq, params.known_frontier.clone()).await?
+        else {
+            continue;
+        };
+        return Ok(ApiResponse::success(bootstrap));
+    }
+    Err(policy::authorization_read_unstable())
 }
 
 #[derive(Debug, Deserialize)]
@@ -356,18 +374,24 @@ pub async fn get_flow_object_history(
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    let access = policy::require_flow_object_access(
-        &state,
-        &extensions,
-        workspace_id,
-        object_id,
-        crate::flow::collab::authz::PermissionLevel::View,
-    )
-    .await?;
-
-    let response = query::get_history(&state, &access, params.before_seq, params.limit).await?;
-
-    Ok(ApiResponse::success(response))
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = policy::require_flow_object_access(
+            &state,
+            &extensions,
+            workspace_id,
+            object_id,
+            crate::flow::collab::authz::PermissionLevel::View,
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(response) = query::get_history(&state, &access, params.before_seq, params.limit).await? else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response));
+    }
+    Err(policy::authorization_read_unstable())
 }
 
 /// `GET /api/v1/workspaces/{workspace_id}/features/flow`.
@@ -461,12 +485,16 @@ mod flow_database_tests {
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectHistoryQuery,
         GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, SetFlowFeatureRequest,
-        create_flow_object, get_flow_feature, get_flow_object, get_flow_object_bootstrap, get_flow_object_history,
-        list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
-        set_flow_feature,
+        SetInheritanceRequest, create_flow_object, get_flow_feature, get_flow_object, get_flow_object_bootstrap,
+        get_flow_object_grants, get_flow_object_history, list_flow_objects, post_flow_object_command,
+        put_flow_object_grants, put_flow_object_inheritance, set_flow_feature,
     };
     use crate::error::ApiError;
-    use crate::flow::collab::{authz::PermissionLevel, permission_cache::PermissionCache, registry::OutboundEvent};
+    use crate::flow::collab::{
+        authz::PermissionLevel,
+        permission_cache::{PermissionCache, PrincipalKind},
+        registry::OutboundEvent,
+    };
     use crate::routes::bot::{CreateBotRequest, create_bot};
     use crate::routes::member::{
         AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
@@ -1250,9 +1278,21 @@ mod flow_database_tests {
             "the hidden candidate must not affect response cardinality"
         );
         assert_eq!(items[0]["id"], visible_id.to_string());
-        assert!(list["data"].get("total").is_none(), "{list}");
-        assert!(list["data"].get("filtered_count").is_none(), "{list}");
-        assert!(list["data"].get("examined").is_none(), "{list}");
+        let response_keys: std::collections::BTreeSet<&str> = list["data"]
+            .as_object()
+            .expect("list data is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let allowed_keys = ["items", "next_cursor"].into_iter().collect();
+        assert!(
+            response_keys.is_subset(&allowed_keys),
+            "the list response exposed a key outside the frozen whitelist: {response_keys:?}"
+        );
+        assert!(
+            response_keys.contains("items"),
+            "the required items key is missing: {list}"
+        );
 
         let get = body_json(to_response(
             get_flow_object(
@@ -1337,6 +1377,237 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
+    #[tokio::test]
+    async fn object_reads_reauthorize_after_their_final_epoch_check_changes() {
+        let scratch = scratch_or_skip!("object_read_epoch_retry");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let object_ids = [
+            create_page_as_owner(&state, workspace_id, owner_id, "Retry object").await,
+            create_page_as_owner(&state, workspace_id, owner_id, "Retry bootstrap").await,
+            create_page_as_owner(&state, workspace_id, owner_id, "Retry history").await,
+        ];
+
+        // On a cold cache, checks one and two surround DB authorization. Changing the epoch at
+        // check three therefore targets the final pre-return fence in each query function.
+        crate::flow::policy::plan_epoch_changes_for_test(workspace_id, 2, 1);
+        let object = body_json(to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_ids[0]),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(object["code"], 0, "the object read did not recover: {object}");
+
+        crate::flow::policy::plan_epoch_changes_for_test(workspace_id, 2, 1);
+        let bootstrap = body_json(to_response(
+            get_flow_object_bootstrap(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_ids[1]),
+                Query(GetFlowObjectBootstrapQuery {
+                    known_seq: None,
+                    known_frontier: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(bootstrap["code"], 0, "the bootstrap read did not recover: {bootstrap}");
+
+        crate::flow::policy::plan_epoch_changes_for_test(workspace_id, 2, 1);
+        let history = body_json(to_response(
+            get_flow_object_history(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_ids[2]),
+                Query(FlowObjectHistoryQuery {
+                    before_seq: None,
+                    limit: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(history["code"], 0, "the history read did not recover: {history}");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn list_epoch_retry_is_bounded_to_three_complete_attempts() {
+        let scratch = scratch_or_skip!("list_epoch_retry");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        create_page_as_owner(&state, workspace_id, owner_id, "Retry list").await;
+
+        crate::flow::policy::plan_epoch_changes_for_test(workspace_id, 0, 2);
+        let recovered = body_json(to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(ListFlowObjectsQuery {
+                    project_id: None,
+                    unprojected: false,
+                    object_type: None,
+                    parent_id: None,
+                    q: None,
+                    cursor: None,
+                    limit: Some(50),
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            recovered["code"], 0,
+            "the third stable attempt must succeed: {recovered}"
+        );
+
+        crate::flow::policy::plan_epoch_changes_for_test(workspace_id, 0, 3);
+        let exhausted = body_json(to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(ListFlowObjectsQuery {
+                    project_id: None,
+                    unprojected: false,
+                    object_type: None,
+                    parent_id: None,
+                    q: None,
+                    cursor: None,
+                    limit: Some(50),
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            exhausted["code"], 403,
+            "three unstable attempts must fail closed: {exhausted}"
+        );
+        assert_eq!(
+            exhausted["message"], "authorization changed repeatedly while the read was being evaluated",
+            "the exhaustion path must remain distinguishable from an object permission denial"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn grant_and_inheritance_endpoints_collapse_foreign_and_absent_objects() {
+        let scratch = scratch_or_skip!("grant_existence_collapse");
+        let state = state_for(scratch.db.clone());
+        let (_workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let (foreign_workspace_id, foreign_owner_id) = seed_workspace(&state, true).await;
+        let foreign_id = create_page_as_owner(
+            &state,
+            foreign_workspace_id,
+            foreign_owner_id,
+            "Foreign authorization object",
+        )
+        .await;
+        let absent_id = Uuid::new_v4();
+
+        let foreign_get = body_json(to_response(
+            get_flow_object_grants(State(state.clone()), claims_for(owner_id), None, Path(foreign_id)).await,
+        ))
+        .await;
+        let absent_get = body_json(to_response(
+            get_flow_object_grants(State(state.clone()), claims_for(owner_id), None, Path(absent_id)).await,
+        ))
+        .await;
+        assert_eq!(foreign_get["code"], 404, "{foreign_get}");
+        assert_eq!(foreign_get, absent_get, "GET /grants leaked cross-tenant existence");
+
+        let grants_request = || SetGrantsRequest {
+            grants: Vec::new(),
+            confirm_self_lockout: false,
+            dry_run: false,
+            idempotency_key: "grant-collapse-key".to_string(),
+        };
+        let foreign_put_grants = body_json(to_response(
+            put_flow_object_grants(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(foreign_id),
+                Json(grants_request()),
+            )
+            .await,
+        ))
+        .await;
+        let absent_put_grants = body_json(to_response(
+            put_flow_object_grants(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(absent_id),
+                Json(grants_request()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(foreign_put_grants["code"], 404, "{foreign_put_grants}");
+        assert_eq!(
+            foreign_put_grants, absent_put_grants,
+            "PUT /grants leaked cross-tenant existence"
+        );
+
+        let inheritance_request = || SetInheritanceRequest {
+            inherit_from_parent: false,
+            confirm_self_lockout: false,
+            dry_run: false,
+            initial_grants: None,
+            idempotency_key: "inheritance-collapse-key".to_string(),
+        };
+        let foreign_put_inheritance = body_json(to_response(
+            put_flow_object_inheritance(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(foreign_id),
+                Json(inheritance_request()),
+            )
+            .await,
+        ))
+        .await;
+        let absent_put_inheritance = body_json(to_response(
+            put_flow_object_inheritance(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(absent_id),
+                Json(inheritance_request()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(foreign_put_inheritance["code"], 404, "{foreign_put_inheritance}");
+        assert_eq!(
+            foreign_put_inheritance, absent_put_inheritance,
+            "PUT /inheritance leaked cross-tenant existence"
+        );
+
+        scratch.drop_self().await;
+    }
+
     /// 1,001 hidden rows force the overfetch loop one row past the public scan ceiling. The error
     /// must reject rather than return a misleading empty short page, and both numeric fields must
     /// expose only the fixed ceiling, never the actual pre-filter count.
@@ -1387,6 +1658,96 @@ mod flow_database_tests {
         assert_eq!(body["details"]["limit"], 1000, "{body}");
         assert_eq!(body["details"]["observed"], 1000, "{body}");
         assert!(body["data"].is_null(), "a partial empty page must not escape: {body}");
+
+        scratch.drop_self().await;
+    }
+
+    /// Exercises the audit's concrete interference shape: a maximum-size permission cache, a
+    /// list that must inspect past the 1,000-row scan budget, and an unrelated content write in
+    /// flight at the same time. The timings are diagnostic evidence rather than a brittle CI
+    /// threshold; the assertions pin that both real operations executed to their intended ends.
+    #[tokio::test]
+    async fn full_scan_budget_and_content_write_complete_concurrently_with_a_full_cache() {
+        let scratch = scratch_or_skip!("cache_list_write_concurrency");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let writable_id = create_page_as_owner(&state, workspace_id, owner_id, "Concurrent write target").await;
+        exec(
+            &state,
+            "WITH objects AS ( \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, inherit_from_parent, created_at) \
+                 SELECT gen_random_uuid(), $1, 'page', false, now() + n * interval '1 microsecond' \
+                   FROM generate_series(1, 1001) AS n RETURNING id \
+             ), documents AS ( \
+                 INSERT INTO collab_documents (object_id, format_version, snapshot, snapshot_frontier, head_frontier) \
+                 SELECT id, 'loro-1', '\\x'::bytea, '\\x'::bytea, '\\x'::bytea FROM objects \
+             ) \
+             INSERT INTO flow_object_projections (object_id, document_seq, document_frontier, title, state, plain_text) \
+             SELECT id, 0, '\\x'::bytea, 'hidden', '{}'::jsonb, '' FROM objects",
+            vec![workspace_id.into()],
+        )
+        .await;
+
+        let cache = PermissionCache::for_state(&state).expect("permission cache is available");
+        for ordinal in 0_u128..20_000 {
+            cache.put_for_test(
+                Uuid::from_u128(1),
+                PrincipalKind::User,
+                Uuid::from_u128(2),
+                Uuid::from_u128(ordinal + 100),
+                PermissionLevel::View,
+                1,
+            );
+        }
+        assert_eq!(cache.len_for_test(), 20_000, "the measurement requires a full cache");
+
+        let list_state = state.clone();
+        let list_task = tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let body = body_json(to_response(
+                list_flow_objects(
+                    State(list_state),
+                    claims_for(member_id),
+                    None,
+                    Path(workspace_id),
+                    Query(ListFlowObjectsQuery {
+                        project_id: None,
+                        unprojected: false,
+                        object_type: None,
+                        parent_id: None,
+                        q: None,
+                        cursor: None,
+                        limit: Some(50),
+                        include_archived: false,
+                    }),
+                )
+                .await,
+            ))
+            .await;
+            (body, started.elapsed())
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let write_started = std::time::Instant::now();
+        let write_body = run_command(
+            &state,
+            &claims_for(owner_id),
+            writable_id,
+            "set_title",
+            json!({"title": "Concurrent write completed"}),
+        )
+        .await;
+        let write_elapsed = write_started.elapsed();
+        let (list_body, list_elapsed) = list_task.await.expect("concurrent list task joins");
+
+        assert_eq!(list_body["error_code"], "limit_exceeded", "{list_body}");
+        assert_eq!(list_body["details"]["limit_kind"], "scan_budget", "{list_body}");
+        assert_eq!(write_body["code"], 0, "{write_body}");
+        assert!(
+            !list_elapsed.is_zero() && !write_elapsed.is_zero(),
+            "both concurrent wall-clock measurements must be recorded: list={list_elapsed:?}, write={write_elapsed:?}"
+        );
 
         scratch.drop_self().await;
     }
@@ -1645,9 +2006,9 @@ mod flow_database_tests {
         let claims = claims_for(owner_id);
         let poisoned_object_id = Uuid::new_v4();
         let cache = PermissionCache::for_state(&state).expect("permission cache is available");
-        cache.put(
+        cache.put_for_test(
             workspace_id,
-            "user",
+            PrincipalKind::User,
             owner_id,
             poisoned_object_id,
             PermissionLevel::FullAccess,
@@ -1675,7 +2036,7 @@ mod flow_database_tests {
         assert_eq!(body["data"]["default_member_level"], "full_access", "{body}");
         assert_eq!(body["data"]["authz_epoch"], 1, "{body}");
         assert_eq!(
-            cache.get(workspace_id, "user", owner_id, poisoned_object_id, 1),
+            cache.get(workspace_id, PrincipalKind::User, owner_id, poisoned_object_id, 1),
             None,
             "workspace cleanup must remove even a future-epoch poisoned entry"
         );
@@ -1716,15 +2077,30 @@ mod flow_database_tests {
 
     #[tokio::test]
     async fn member_add_role_change_and_remove_advance_epoch_in_their_transactions() {
+        #[derive(FromQueryResult, PartialEq, Eq, Debug)]
+        struct SettingsAuditStamp {
+            updated_at: chrono::DateTime<chrono::Utc>,
+            updated_by: Option<Uuid>,
+        }
+
         let scratch = scratch_or_skip!("member-epoch-lifecycle");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
         let target_id = seed_user(&state).await;
+        let settings_stamp_before = SettingsAuditStamp::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT updated_at, updated_by FROM flow_workspace_settings WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("settings audit stamp query runs")
+        .expect("seeded settings exist");
         let poisoned_object_id = Uuid::new_v4();
         let cache = PermissionCache::for_state(&state).expect("permission cache is available");
-        cache.put(
+        cache.put_for_test(
             workspace_id,
-            "user",
+            PrincipalKind::User,
             target_id,
             poisoned_object_id,
             PermissionLevel::FullAccess,
@@ -1747,6 +2123,8 @@ mod flow_database_tests {
             "a rejected member mutation must roll its epoch advance back"
         );
 
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
         let added = body_json(to_response(
             add_member(
                 State(state.clone()),
@@ -1763,8 +2141,21 @@ mod flow_database_tests {
         assert_eq!(added["code"], 0, "{added}");
         assert_eq!(added["data"]["role"], "member", "response shape changed: {added}");
         assert_eq!(read_epoch(&state, workspace_id).await, 1);
+        let settings_stamp_after = SettingsAuditStamp::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT updated_at, updated_by FROM flow_workspace_settings WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("settings audit stamp query runs")
+        .expect("settings still exist");
         assert_eq!(
-            cache.get(workspace_id, "user", target_id, poisoned_object_id, 1),
+            settings_stamp_after, settings_stamp_before,
+            "membership-only epoch advancement must not rewrite Flow settings audit metadata"
+        );
+        assert_eq!(
+            cache.get(workspace_id, PrincipalKind::User, target_id, poisoned_object_id, 1),
             None,
             "member mutation must physically invalidate the workspace cache"
         );
@@ -3812,8 +4203,11 @@ async fn authorization_caller(
 ) -> Result<(Uuid, Caller), ApiError> {
     let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, object_id)
         .await?
-        .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
-    let (actor_id, role, is_bot) = policy::require_flow_workspace_access(state, extensions, workspace_id).await?;
+        .ok_or_else(policy::object_not_found)?;
+    let (actor_id, role, is_bot) = require_workspace_access(state, extensions, workspace_id)
+        .await
+        .map_err(policy::collapse_object_denial)?;
+    policy::require_flow_enabled(state, workspace_id).await?;
     Ok((
         workspace_id,
         Caller {

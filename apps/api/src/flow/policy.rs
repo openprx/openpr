@@ -12,16 +12,24 @@ use crate::error::ApiError;
 use crate::middleware::bot_auth::require_workspace_access;
 
 use super::repository;
-use super::{collab::authz, collab::permission_cache::PermissionCache};
+use super::{
+    collab,
+    collab::authz,
+    collab::permission_cache::{PermissionCache, PrincipalKind},
+};
 
 use authz::PermissionLevel;
+
+/// A read is evaluated from scratch at most this many times when authorization changes under it.
+/// The bound prevents active membership churn from becoming an unbounded request.
+pub(crate) const AUTHORIZATION_READ_ATTEMPTS: usize = 3;
 
 /// One read request's authenticated principal and epoch snapshot.
 pub struct FlowReadContext {
     workspace_id: Uuid,
     actor_id: Uuid,
     role: String,
-    principal_kind: &'static str,
+    principal_kind: PrincipalKind,
     authz_epoch: i64,
 }
 
@@ -40,6 +48,11 @@ impl AuthorizedFlowObject {
     #[must_use]
     pub const fn workspace_id(&self) -> Uuid {
         self.context.workspace_id
+    }
+
+    #[must_use]
+    pub(super) const fn context(&self) -> &FlowReadContext {
+        &self.context
     }
 }
 
@@ -78,7 +91,11 @@ pub async fn begin_flow_read(
         workspace_id,
         actor_id,
         role,
-        principal_kind: if is_bot { "bot" } else { "user" },
+        principal_kind: if is_bot {
+            PrincipalKind::Bot
+        } else {
+            PrincipalKind::User
+        },
         authz_epoch,
     })
 }
@@ -94,7 +111,7 @@ pub async fn require_flow_object_access(
     workspace_id: Uuid,
     object_id: Uuid,
     minimum: PermissionLevel,
-) -> Result<AuthorizedFlowObject, ApiError> {
+) -> Result<Option<AuthorizedFlowObject>, ApiError> {
     let actor = require_workspace_access(state, extensions, workspace_id)
         .await
         .map_err(collapse_object_denial)?;
@@ -103,28 +120,37 @@ pub async fn require_flow_object_access(
         workspace_id,
         actor_id: actor.0,
         role: actor.1,
-        principal_kind: if actor.2 { "bot" } else { "user" },
+        principal_kind: if actor.2 {
+            PrincipalKind::Bot
+        } else {
+            PrincipalKind::User
+        },
         authz_epoch: authz::read_epoch(&state.db, workspace_id).await?,
     };
-    let visible = authorize_flow_objects(state, &context, &[object_id], minimum).await?;
+    let Some(visible) = authorize_flow_objects(state, &context, &[object_id], minimum).await? else {
+        return Ok(None);
+    };
     if visible.first().copied() != Some(true) {
         return Err(object_not_found());
     }
-    Ok(AuthorizedFlowObject { object_id, context })
+    Ok(Some(AuthorizedFlowObject { object_id, context }))
 }
 
 /// Batch-authorizes object ids against one request epoch, preserving input order.
 ///
 /// Cache hits are accepted only at `context.authz_epoch`. All misses are resolved together by
 /// [`authz::effective_permissions`], then the epoch is read again before anything is cached or
-/// returned. Any epoch movement rejects the request fail closed; callers must start a new read.
+/// returned. Epoch movement returns an internal retry signal so the handler can restart the whole
+/// read; no mixed-epoch result is returned.
 pub async fn authorize_flow_objects(
     state: &AppState,
     context: &FlowReadContext,
     object_ids: &[Uuid],
     minimum: PermissionLevel,
-) -> Result<Vec<bool>, ApiError> {
-    ensure_epoch_current(state, context).await?;
+) -> Result<Option<Vec<bool>>, ApiError> {
+    if !ensure_epoch_current(state, context).await? {
+        return Ok(None);
+    }
     let cache = PermissionCache::for_state(state)?;
     let mut levels = vec![None; object_ids.len()];
     let mut misses = Vec::new();
@@ -151,15 +177,18 @@ pub async fn authorize_flow_objects(
             &state.db,
             context.workspace_id,
             &misses,
-            context.principal_kind,
+            context.principal_kind.as_str(),
             context.actor_id,
             &context.role,
         )
         .await
         .map_err(collapse_object_denial)?;
-        ensure_epoch_current(state, context).await?;
+        if !ensure_epoch_current(state, context).await? {
+            return Ok(None);
+        }
         for ((object_id, level), index) in resolved.into_iter().zip(miss_positions) {
-            cache.put(
+            collab::cache_db_permission(
+                &cache,
                 context.workspace_id,
                 context.principal_kind,
                 context.actor_id,
@@ -176,30 +205,92 @@ pub async fn authorize_flow_objects(
     levels
         .into_iter()
         .map(|level| level.map(|level| level >= minimum).ok_or(ApiError::Internal))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
-/// Final epoch check for multi-batch list scans. A change between any earlier batch and response
-/// assembly invalidates the whole result instead of returning a mixed-epoch page.
-pub async fn ensure_epoch_current(state: &AppState, context: &FlowReadContext) -> Result<(), ApiError> {
+/// Reports whether a read still belongs to its original epoch.
+///
+/// `false` is an internal retry signal, not a caller-visible authorization denial; the handler
+/// re-runs membership, feature, authorization, and data reads from scratch before returning
+/// anything.
+pub async fn ensure_epoch_current(state: &AppState, context: &FlowReadContext) -> Result<bool, ApiError> {
+    #[cfg(test)]
+    inject_epoch_change_if_planned(state, context.workspace_id).await?;
     let current = authz::read_epoch(&state.db, context.workspace_id).await?;
-    if current == context.authz_epoch {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden(
-            "authorization changed while the read was being evaluated".to_string(),
-        ))
-    }
+    Ok(current == context.authz_epoch)
 }
 
-fn collapse_object_denial(err: ApiError) -> ApiError {
+/// No frozen error code describes authorization churn after the bounded retries are exhausted.
+/// Keep the pre-existing fail-closed `Forbidden` wire behavior until the contract adds one;
+/// callers must not branch on this message.
+pub(crate) fn authorization_read_unstable() -> ApiError {
+    ApiError::Forbidden("authorization changed repeatedly while the read was being evaluated".to_string())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct EpochChangePlan {
+    checks_before_change: usize,
+    remaining_changes: usize,
+}
+
+#[cfg(test)]
+fn epoch_change_plans() -> &'static parking_lot::Mutex<std::collections::HashMap<Uuid, EpochChangePlan>> {
+    static PLANS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<Uuid, EpochChangePlan>>> =
+        std::sync::OnceLock::new();
+    PLANS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Installs a workspace-scoped, deterministic race for real-database route tests. Production
+/// builds contain neither the registry nor this injection seam.
+#[cfg(test)]
+pub(crate) fn plan_epoch_changes_for_test(workspace_id: Uuid, checks_before_change: usize, changes: usize) {
+    epoch_change_plans().lock().insert(
+        workspace_id,
+        EpochChangePlan {
+            checks_before_change,
+            remaining_changes: changes,
+        },
+    );
+}
+
+#[cfg(test)]
+async fn inject_epoch_change_if_planned(state: &AppState, workspace_id: Uuid) -> Result<(), ApiError> {
+    let should_change = {
+        let mut plans = epoch_change_plans().lock();
+        let Some(plan) = plans.get_mut(&workspace_id) else {
+            return Ok(());
+        };
+        if plan.checks_before_change > 0 {
+            plan.checks_before_change -= 1;
+            false
+        } else if plan.remaining_changes > 0 {
+            plan.remaining_changes -= 1;
+            let finished = plan.remaining_changes == 0;
+            if finished {
+                plans.remove(&workspace_id);
+            }
+            true
+        } else {
+            plans.remove(&workspace_id);
+            false
+        }
+    };
+    if should_change {
+        authz::advance_epoch(&state.db, workspace_id).await?;
+    }
+    Ok(())
+}
+
+pub(crate) fn collapse_object_denial(err: ApiError) -> ApiError {
     match err {
         ApiError::Forbidden(_) | ApiError::NotFound(_) => object_not_found(),
         other => other,
     }
 }
 
-fn object_not_found() -> ApiError {
+pub(crate) fn object_not_found() -> ApiError {
     ApiError::NotFound("flow object not found".to_string())
 }
 

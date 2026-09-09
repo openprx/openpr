@@ -503,10 +503,12 @@ pub async fn effective_permission<C: ConnectionTrait>(
 ///
 /// One recursive CTE resolves every requested object's complete leaf-to-root chain, and one grant
 /// query loads this principal's rows across their union. This avoids one recursive CTE plus one
-/// grant round trip per object. The implementation remains fail closed: a missing starting row,
-/// depth past `tree_depth_max`, a cycle, or an incomplete chain rejects the batch rather than
-/// returning a partial permission map. The API permission cache calls this only for misses; write
-/// paths continue to call [`effective_permission`] directly under their fencing transaction.
+/// grant round trip per object. The API permission cache calls this only for misses; write paths
+/// continue to call [`effective_permission`] directly under their fencing transaction. A
+/// candidate whose own chain is missing, too deep, cyclic, or incomplete resolves to
+/// [`PermissionLevel::Denied`] without poisoning the rest of the batch. That is fail closed for
+/// the candidate while allowing list scans to hide corrupt rows and continue; an explicitly
+/// requested object is still rejected by its caller because `Denied` cannot satisfy even `view`.
 ///
 /// Because this is a separately optimized implementation, the real-database test
 /// `batch_and_single_effective_permissions_are_strictly_equal` pins every result to the single
@@ -536,13 +538,17 @@ pub async fn effective_permissions<C: ConnectionTrait>(
         .all(conn)
         .await?;
         let existing: HashSet<Uuid> = existing.into_iter().map(|row| row.id).collect();
-        if object_ids.iter().any(|id| !existing.contains(id)) {
-            return Err(ApiError::NotFound("flow object not found".to_string()));
-        }
         return Ok(object_ids
             .iter()
             .copied()
-            .map(|id| (id, PermissionLevel::FullAccess))
+            .map(|id| {
+                let level = if existing.contains(&id) {
+                    PermissionLevel::FullAccess
+                } else {
+                    PermissionLevel::Denied
+                };
+                (id, level)
+            })
             .collect());
     }
 
@@ -596,26 +602,20 @@ pub async fn effective_permissions<C: ConnectionTrait>(
     }
 
     let mut chain_ids = HashSet::new();
+    let mut invalid_chains = HashSet::new();
     let tree_depth_max = i32::try_from(TREE_DEPTH_MAX).map_err(|_| ApiError::Internal)?;
     for object_id in object_ids {
         let Some(chain) = chains.get(object_id) else {
-            return Err(ApiError::NotFound("flow object not found".to_string()));
+            invalid_chains.insert(*object_id);
+            continue;
         };
         let Some(top) = chain.last() else {
-            return Err(ApiError::NotFound("flow object not found".to_string()));
+            invalid_chains.insert(*object_id);
+            continue;
         };
-        if chain.iter().any(|node| node.cycle) {
-            return Err(ApiError::Forbidden("object inheritance chain is cyclic".to_string()));
-        }
-        if chain.iter().any(|node| node.depth > tree_depth_max) {
-            return Err(ApiError::Forbidden(
-                "object inheritance chain is deeper than the frozen tree depth limit".to_string(),
-            ));
-        }
-        if top.parent_id.is_some() {
-            return Err(ApiError::Forbidden(
-                "object inheritance chain is incomplete".to_string(),
-            ));
+        if chain.iter().any(|node| node.cycle || node.depth > tree_depth_max) || top.parent_id.is_some() {
+            invalid_chains.insert(*object_id);
+            continue;
         }
         chain_ids.extend(chain.iter().map(|node| node.id));
     }
@@ -628,8 +628,13 @@ pub async fn effective_permissions<C: ConnectionTrait>(
     let baseline = workspace_baseline(conn, workspace_id, role).await?;
     let mut resolved = Vec::with_capacity(object_ids.len());
     for object_id in object_ids {
+        if invalid_chains.contains(object_id) {
+            resolved.push((*object_id, PermissionLevel::Denied));
+            continue;
+        }
         let Some(chain) = chains.get(object_id) else {
-            return Err(ApiError::NotFound("flow object not found".to_string()));
+            resolved.push((*object_id, PermissionLevel::Denied));
+            continue;
         };
         let boundary_index = chain.iter().position(|node| !node.inherit_from_parent);
         let applicable = boundary_index.map_or(chain.as_slice(), |index| chain.get(..=index).unwrap_or_default());
@@ -854,7 +859,7 @@ pub async fn advance_epoch_if_present<C: ConnectionTrait>(
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1, updated_at = now() \
+        "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 \
          WHERE workspace_id = $1 RETURNING authz_epoch",
         vec![workspace_id.into()],
     ))
@@ -1324,17 +1329,26 @@ mod database_tests {
     }
 
     /// The optimized page evaluator is independent code, so its oracle is the DB-direct single
-    /// evaluator, never a cache read. The fixture covers baseline, a boundary with no grant, a
-    /// grant below that boundary, and an inherited grant above the baseline.
+    /// evaluator, never a cache read. The fixture covers baseline, the boundary node and a
+    /// descendant below a boundary with no grants, a grant below another boundary, an inherited
+    /// grant above the baseline, the admin override, and a mixed absent id.
     #[tokio::test]
     async fn batch_and_single_effective_permissions_are_strictly_equal() {
         let scratch = scratch_or_skip!("batch_equals_single");
         let fx = seed_workspace(&scratch.db).await;
         let plain = build_chain(&scratch.db, fx.workspace_id, 3, None).await;
         let restricted = build_chain(&scratch.db, fx.workspace_id, 3, Some(1)).await;
+        let ungranted = build_chain(&scratch.db, fx.workspace_id, 4, Some(1)).await;
         grant(&scratch.db, fx.workspace_id, restricted[0], fx.member_id, "comment").await;
         grant(&scratch.db, fx.workspace_id, plain[2], fx.member_id, "full_access").await;
-        let object_ids = vec![plain[0], plain[1], restricted[0], restricted[2]];
+        let object_ids = vec![
+            plain[0],
+            plain[1],
+            restricted[0],
+            restricted[2],
+            ungranted[2],
+            ungranted[0],
+        ];
 
         let batch = effective_permissions(
             &scratch.db,
@@ -1358,6 +1372,50 @@ mod database_tests {
             batch, singles,
             "batch results must match DB-direct singles in input order"
         );
+        assert_eq!(
+            batch.get(4).map(|(_, level)| *level),
+            Some(PermissionLevel::Denied),
+            "the boundary node itself has no grant and must not inherit the workspace baseline"
+        );
+        assert_eq!(
+            batch.get(5).map(|(_, level)| *level),
+            Some(PermissionLevel::Denied),
+            "a descendant below an ungranted boundary must not inherit the workspace baseline"
+        );
+
+        let absent = Uuid::new_v4();
+        let mixed = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &[plain[0], absent],
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await
+        .expect("one absent candidate cannot poison its healthy batch peer");
+        assert_eq!(mixed[0], (plain[0], PermissionLevel::FullAccess));
+        assert_eq!(mixed[1], (absent, PermissionLevel::Denied));
+        assert!(
+            matches!(
+                effective_permission(&scratch.db, fx.workspace_id, absent, "user", fx.member_id, "member").await,
+                Err(ApiError::NotFound(_))
+            ),
+            "an explicitly requested absent object remains a rejection"
+        );
+
+        let admin_batch = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &[plain[0], absent],
+            "user",
+            fx.member_id,
+            "admin",
+        )
+        .await
+        .expect("admin batch evaluates every candidate independently");
+        assert_eq!(admin_batch[0], (plain[0], PermissionLevel::FullAccess));
+        assert_eq!(admin_batch[1], (absent, PermissionLevel::Denied));
 
         exec(
             &scratch.db,
@@ -1395,23 +1453,25 @@ mod database_tests {
     }
 
     #[tokio::test]
-    async fn batch_effective_permissions_fail_closed_for_depth_cycle_and_broken_chain() {
+    async fn batch_effective_permissions_deny_only_the_corrupt_candidate() {
         let scratch = scratch_or_skip!("batch_corrupt_chains");
         let fx = seed_workspace(&scratch.db).await;
+        let healthy = build_chain(&scratch.db, fx.workspace_id, 2, None).await[0];
 
         let too_deep = build_chain(&scratch.db, fx.workspace_id, FIRST_ILLEGAL_CHAIN_NODES, None).await;
         let result = effective_permissions(
             &scratch.db,
             fx.workspace_id,
-            &[too_deep[0]],
+            &[too_deep[0], healthy],
             "user",
             fx.member_id,
             "member",
         )
-        .await;
-        assert!(
-            matches!(result, Err(ApiError::Forbidden(_))),
-            "depth=33 resolved: {result:?}"
+        .await
+        .expect("an over-deep candidate must not poison its healthy peer");
+        assert_eq!(
+            result,
+            vec![(too_deep[0], PermissionLevel::Denied), (healthy, PermissionLevel::Edit)]
         );
 
         let cycle_a = insert_object(&scratch.db, fx.workspace_id, None, true).await;
@@ -1422,12 +1482,18 @@ mod database_tests {
             vec![cycle_b.into(), cycle_a.into()],
         )
         .await;
-        let result =
-            effective_permissions(&scratch.db, fx.workspace_id, &[cycle_b], "user", fx.member_id, "member").await;
-        assert!(
-            matches!(result, Err(ApiError::Forbidden(_))),
-            "cycle resolved: {result:?}"
-        );
+        let result = effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &[cycle_b, healthy],
+            "user",
+            fx.member_id,
+            "member",
+        )
+        .await
+        .expect("a cyclic candidate must not poison its healthy peer");
+        assert_eq!(result[0], (cycle_b, PermissionLevel::Denied));
+        assert_eq!(result[1], (healthy, PermissionLevel::Edit));
 
         scratch
             .db
@@ -1440,16 +1506,15 @@ mod database_tests {
         let result = effective_permissions(
             &scratch.db,
             fx.workspace_id,
-            &[broken_child],
+            &[broken_child, healthy],
             "user",
             fx.member_id,
             "member",
         )
-        .await;
-        assert!(
-            matches!(result, Err(ApiError::Forbidden(_))),
-            "broken chain resolved: {result:?}"
-        );
+        .await
+        .expect("a broken candidate must not poison its healthy peer");
+        assert_eq!(result[0], (broken_child, PermissionLevel::Denied));
+        assert_eq!(result[1], (healthy, PermissionLevel::Edit));
 
         scratch.drop_self().await;
     }

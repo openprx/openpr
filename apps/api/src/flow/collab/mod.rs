@@ -41,3 +41,22 @@ pub mod session;
 pub mod snapshot;
 pub mod ticket;
 pub mod write;
+
+pub(super) fn cache_db_permission(
+    cache: &permission_cache::PermissionCache,
+    workspace_id: uuid::Uuid,
+    principal_kind: permission_cache::PrincipalKind,
+    principal_id: uuid::Uuid,
+    object_id: uuid::Uuid,
+    level: authz::PermissionLevel,
+    authz_epoch: i64,
+) {
+    cache.put(
+        workspace_id,
+        principal_kind,
+        principal_id,
+        object_id,
+        level,
+        authz_epoch,
+    );
+}

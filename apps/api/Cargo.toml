@@ -17,6 +17,7 @@ clap.workspace = true
 collab-core = { path = "../../crates/collab-core" }
 hmac = "0.12"
 hex = "0.4"
+hashlink = "0.10"
 image.workspace = true
 jsonwebtoken.workspace = true
 parking_lot = "0.12"

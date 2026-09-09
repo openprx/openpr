@@ -1731,7 +1731,7 @@ mod collab_database_tests {
         scratch.drop_self().await;
     }
 
-    /// The ticket TTL is measured entirely by PostgreSQL's transaction clock. In particular, a
+    /// The ticket TTL is measured entirely by `PostgreSQL`'s transaction clock. In particular, a
     /// transaction that waits behind the epoch fence must not combine that old `created_at` with
     /// a later Rust wall-clock expiry and overshoot the frozen 60-second constraint.
     #[tokio::test]
