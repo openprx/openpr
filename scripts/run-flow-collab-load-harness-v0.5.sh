@@ -121,6 +121,8 @@ FIXTURE_SHA256="$({
 BASELINE_OUT="$EVIDENCE_ROOT/logs/v0.5-lock-load-raw.json"
 SESSION_OUT="$EVIDENCE_ROOT/logs/v0.5-session-load-raw.json"
 CACHE_OUT="$EVIDENCE_ROOT/logs/v0.5-cache-raw.json"
+REEXEC_OUT_DIR="$EVIDENCE_ROOT/logs/v0.5-api-reexec"
+REEXEC_OUT="$REEXEC_OUT_DIR/document-integrity-result.json"
 started_ms="$(date +%s%3N)"
 
 set +e
@@ -170,6 +172,34 @@ if [[ $SESSION_EXIT -eq 0 ]]; then
 else
   CACHE_EXIT=125
 fi
+
+# ADR-0010 says API restart, not merely reconstructing process-local state in the same test
+# process. Reuse the repository's canonical live restart driver as code, but execute a fresh copy
+# rewritten only to build/run current release binaries. Its v0.4 CLI version is an input-format
+# constraint, not reused evidence: this run gets a new scratch DB, PIDs, semantic hashes, source
+# HEAD, and output under this v0.5 evidence root.
+REEXEC_EXIT=125
+REEXEC_API_SHA256=""
+if [[ $CACHE_EXIT -eq 0 ]]; then
+  mkdir -p "$REEXEC_OUT_DIR"
+  REEXEC_DRIVER="$EVIDENCE_ROOT/logs/v0.5-document-integrity-release-driver.sh"
+  sed \
+    -e "s|^ROOT_DIR=.*|ROOT_DIR=\"$REPO_ROOT\"|" \
+    -e 's/cargo build -q -p api --bin api/cargo build -q --release -p api --bin api/' \
+    -e 's|API_BIN="$TARGET_DIR/debug/api"|API_BIN="$TARGET_DIR/release/api"|' \
+    -e 's/cargo build -q --manifest-path/cargo build -q --release --manifest-path/' \
+    -e 's|REPLAY_BIN="$TARGET_DIR/debug/flow-document-replay-probe"|REPLAY_BIN="$TARGET_DIR/release/flow-document-replay-probe"|' \
+    "$REPO_ROOT/scripts/verify-flow-document-integrity-v0.4.sh" >"$REEXEC_DRIVER"
+  chmod 700 "$REEXEC_DRIVER"
+  OPENPR_TEST_DATABASE_URL="$DATABASE_URL" \
+    "$REEXEC_DRIVER" --release 0.4 --database-url "$DATABASE_URL" \
+      --repo-root "$REPO_ROOT" --evidence-root "$REEXEC_OUT_DIR" --json \
+      >"$EVIDENCE_ROOT/logs/v0.5-api-reexec.log" 2>&1
+  REEXEC_EXIT=$?
+  if [[ -x "$REPO_ROOT/target/release/api" ]]; then
+    REEXEC_API_SHA256="$(sha256sum "$REPO_ROOT/target/release/api" | awk '{print $1}')"
+  fi
+fi
 set -e
 
 duration_ms="$(( $(date +%s%3N) - started_ms ))"
@@ -180,10 +210,11 @@ ACTIVE_OTHER_CLIENTS_AFTER="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc \
 ACTIVE_OTHER_CLIENTS_AFTER_JSON=null
 [[ "$ACTIVE_OTHER_CLIENTS_AFTER" =~ ^[0-9]+$ ]] && ACTIVE_OTHER_CLIENTS_AFTER_JSON="$ACTIVE_OTHER_CLIENTS_AFTER"
 
-baseline='{}'; session='{}'; cache='{}'
+baseline='{}'; session='{}'; cache='{}'; reexec='{}'
 [[ -f "$BASELINE_OUT" ]] && baseline="$(jq -c . "$BASELINE_OUT")"
 [[ -f "$SESSION_OUT" ]] && session="$(jq -c . "$SESSION_OUT")"
 [[ -f "$CACHE_OUT" ]] && cache="$(jq -c . "$CACHE_OUT")"
+[[ -f "$REEXEC_OUT" ]] && reexec="$(jq -c . "$REEXEC_OUT")"
 
 VIOLATIONS='[]'
 add_violation() { VIOLATIONS="$(jq -c --arg value "$1" '. + [$value]' <<<"$VIOLATIONS")"; }
@@ -191,7 +222,8 @@ add_violation() { VIOLATIONS="$(jq -c --arg value "$1" '. + [$value]' <<<"$VIOLA
 [[ $BASELINE_EXIT -eq 0 ]] || add_violation "release lock/load harness failed or was not run (exit=$BASELINE_EXIT)"
 [[ $SESSION_EXIT -eq 0 ]] || add_violation "release v0.5 multi-user/offline harness failed or was not run (exit=$SESSION_EXIT)"
 [[ $CACHE_EXIT -eq 0 ]] || add_violation "release cache/eviction/restart harness failed or was not run (exit=$CACHE_EXIT)"
-if [[ $BASELINE_EXIT -eq 0 && $SESSION_EXIT -eq 0 && $CACHE_EXIT -eq 0 ]]; then
+[[ $REEXEC_EXIT -eq 0 ]] || add_violation "fresh real API process re-exec proof failed or was not run (exit=$REEXEC_EXIT)"
+if [[ $BASELINE_EXIT -eq 0 && $SESSION_EXIT -eq 0 && $CACHE_EXIT -eq 0 && $REEXEC_EXIT -eq 0 ]]; then
   [[ "$(jq -r '.passed' <<<"$baseline")" == true ]] || add_violation "lock/load component self-verdict is not passed"
   [[ "$(jq -r '.passed' <<<"$session")" == true ]] || add_violation "multi-user/offline component self-verdict is not passed"
   [[ "$(jq -r '.passed' <<<"$cache")" == true ]] || add_violation "cache component self-verdict is not passed"
@@ -207,6 +239,12 @@ if [[ $BASELINE_EXIT -eq 0 && $SESSION_EXIT -eq 0 && $CACHE_EXIT -eq 0 ]]; then
   [[ "$(jq -r '.measured.fanout_rounds_complete' <<<"$session")" -eq 150 ]] || add_violation "not all controlled fan-out rounds completed"
   [[ "$(jq -r '.measured.peer_accepted_observed' <<<"$session")" -eq 1350 ]] || add_violation "10-client fan-out did not deliver all 1350 peer accepted frames"
   [[ "$(jq -r '.measured.peer_updates_observed' <<<"$session")" -eq 1350 ]] || add_violation "10-client fan-out did not deliver all 1350 peer update frames"
+  [[ "$(jq -r '.passed' <<<"$reexec")" == true ]] || add_violation "API process re-exec component self-verdict is not passed"
+  [[ "$(jq -r '.source_head' <<<"$reexec")" == "$SOURCE_HEAD" ]] || add_violation "API process re-exec source HEAD differs from this run"
+  [[ "$(jq -r '.process_restart.first_process_observed_dead' <<<"$reexec")" == true ]] || add_violation "first API process was not observed dead"
+  [[ "$(jq -r '.process_restart.distinct_processes' <<<"$reexec")" == true ]] || add_violation "API re-exec did not use distinct processes"
+  [[ "$(jq -r '.process_restart.semantic_hash_equal' <<<"$reexec")" == true ]] || add_violation "semantic hash changed across API re-exec"
+  [[ -n "$REEXEC_API_SHA256" ]] || add_violation "release API binary hash is missing"
 fi
 
 PASSED=false
@@ -219,7 +257,8 @@ jq -n \
   --argjson dirty "$SOURCE_DIRTY" --argjson clients "$CLIENTS" --argjson duration "$duration_ms" \
   --argjson worker_exit "$WORKER_BUILD_EXIT" --argjson baseline_exit "$BASELINE_EXIT" \
   --argjson session_exit "$SESSION_EXIT" --argjson cache_exit "$CACHE_EXIT" \
-  --argjson baseline "$baseline" --argjson session "$session" --argjson cache "$cache" \
+  --argjson reexec_exit "$REEXEC_EXIT" --arg release_api_sha "$REEXEC_API_SHA256" \
+  --argjson baseline "$baseline" --argjson session "$session" --argjson cache "$cache" --argjson reexec "$reexec" \
   --argjson violations "$VIOLATIONS" --argjson passed "$PASSED" \
   '{schema_version:"sylvode.flow.collab-load-v0.5-result.v1",release:"0.5",
     source_head:$head,source_dirty:$dirty,generated_at:$generated_at,
@@ -233,9 +272,20 @@ jq -n \
       fixture_sha256:$fixture_sha,offline_resume_clients:3,
       injections:["presence_fanout","content_fanout_barrier","offline_resume"]},
     execution:{duration_ms:$duration,release_worker_build_exit:$worker_exit,
-      lock_load_exit:$baseline_exit,session_load_exit:$session_exit,cache_exit:$cache_exit},
+      lock_load_exit:$baseline_exit,session_load_exit:$session_exit,cache_exit:$cache_exit,
+      api_reexec_exit:$reexec_exit},
     concurrency:$session.measured,lock:$baseline.lock,cache:$cache,
-    components:{lock_load:$baseline,multi_user_offline:$session,cache_eviction_restart:$cache},
+    process_restart:{build_profile:"release",api_binary_sha256:$release_api_sha,
+      driver_contract_release:"0.4",fresh_v0_5_run:true,
+      first_pid:($reexec.process_restart.first_pid // null),
+      first_process_observed_dead:($reexec.process_restart.first_process_observed_dead // false),
+      second_pid:($reexec.process_restart.second_pid // null),
+      distinct_processes:($reexec.process_restart.distinct_processes // false),
+      before_semantic_hash:($reexec.process_restart.before_semantic_hash // null),
+      after_semantic_hash:($reexec.process_restart.after_semantic_hash // null),
+      semantic_hash_equal:($reexec.process_restart.semantic_hash_equal // false)},
+    components:{lock_load:$baseline,multi_user_offline:$session,cache_eviction_restart:$cache,
+      fresh_api_reexec:$reexec},
     violations:$violations,passed:$passed}' >"$OUT.tmp"
 mv -f "$OUT.tmp" "$OUT"
 jq . "$OUT"

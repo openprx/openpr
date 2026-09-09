@@ -3799,6 +3799,49 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(bytes)
         }
 
+        /// Builds two valid CRDT deltas from the exact same canonical base. The returned order is
+        /// their generation order; tests deliberately send them in the opposite order so inbound
+        /// reordering is exercised independently of the outbound accepted sequencer.
+        async fn concurrent_update_frames(state: &AppState, document_id: Uuid) -> [Frame; 2] {
+            use collab_core::{CollabEngine, LoroCollabEngine};
+
+            #[derive(sea_orm::FromQueryResult)]
+            struct SnapshotRow {
+                snapshot: Vec<u8>,
+            }
+
+            let row = SnapshotRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT snapshot FROM collab_documents WHERE id = $1",
+                vec![document_id.into()],
+            ))
+            .one(&state.db)
+            .await
+            .expect("snapshot query runs")
+            .expect("document row exists");
+
+            let make = |label: &str| {
+                let mut engine = LoroCollabEngine::load(&row.snapshot).expect("snapshot loads");
+                let base = engine.frontier();
+                engine
+                    .set_title(&format!("inbound-reorder-{label}-{}", Uuid::new_v4()))
+                    .expect("set_title succeeds");
+                let bytes = engine.export_from(&base).expect("delta exports");
+                Frame::Update {
+                    protocol_version: PROTOCOL_VERSION,
+                    document_id,
+                    update_id: Uuid::new_v4(),
+                    base_frontier: crate::flow::projection::encode_frontier(&base),
+                    bytes: encode_b64(&bytes),
+                    idempotency_key: None,
+                    origin: format!("inbound-reorder-{label}"),
+                    message: None,
+                }
+            };
+
+            [make("generated-first"), make("generated-second")]
+        }
+
         fn accepted_frame_for(document_id: Uuid, accepted: &crate::flow::collab::write::Accepted) -> Frame {
             Frame::Accepted {
                 protocol_version: PROTOCOL_VERSION,
@@ -4165,6 +4208,68 @@ mod tests {
             scratch.drop_self().await;
         }
 
+        /// The collaboration suite requires inbound update reordering to be injected separately
+        /// from outbound accepted duplicate/reorder/gap. Two concurrent deltas are generated from
+        /// one base, then a controlled send order reverses them. The authoritative rows and the
+        /// sender's receipts must both reflect arrival order with one unique contiguous seq each.
+        #[tokio::test]
+        async fn inbound_updates_generated_from_one_base_are_accepted_in_injected_reverse_order() {
+            let scratch = scratch_or_skip!("inbound-reorder");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, "inbound-reorder").await;
+            let (mut ws, head_seq, _, _) = open_session_full(addr, &ticket, "inbound-reorder", document_id).await;
+            let generated = concurrent_update_frames(&state, document_id).await;
+            let generated_ids = generated.each_ref().map(|frame| {
+                let Frame::Update { update_id, .. } = frame else {
+                    panic!("helper only constructs updates");
+                };
+                *update_id
+            });
+
+            // Controlled barrier: generation is complete before either send, and a ping after each
+            // accepted bounds server processing. There is no scheduler-dependent race here.
+            for index in [1usize, 0usize] {
+                send_frame(&mut ws, &generated[index]).await;
+                let receipt = recv_frame(&mut ws).await;
+                let Frame::Accepted {
+                    update_id,
+                    head_seq: accepted_seq,
+                    ..
+                } = receipt
+                else {
+                    panic!("a valid reordered inbound delta must be accepted, got {receipt:?}");
+                };
+                assert_eq!(update_id, generated_ids[index]);
+                assert_eq!(accepted_seq, head_seq + if index == 1 { 1 } else { 2 });
+                sync(&mut ws).await;
+            }
+
+            #[derive(sea_orm::FromQueryResult)]
+            struct StoredUpdate {
+                seq: i64,
+                update_id: Uuid,
+            }
+            let stored = StoredUpdate::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT seq, update_id FROM collab_updates WHERE document_id = $1 ORDER BY seq",
+                vec![document_id.into()],
+            ))
+            .all(&state.db)
+            .await
+            .expect("stored update order query runs");
+            assert_eq!(stored.len(), 2, "both and only both injected deltas must persist");
+            assert_eq!((stored[0].seq, stored[0].update_id), (head_seq + 1, generated_ids[1]));
+            assert_eq!((stored[1].seq, stored[1].update_id), (head_seq + 2, generated_ids[0]));
+            assert_eq!(read_head_seq(&state, document_id).await, head_seq + 2);
+
+            scratch.drop_self().await;
+        }
+
         /// `versions/v0.5-collaboration.md`: "reconnect resume". A client that reconnects still
         /// holding the document at a seq/frontier the server can continue from receives the
         /// accepted stream it missed -- confirmed by an `ack` at its own resume point -- instead of
@@ -4224,6 +4329,51 @@ mod tests {
             // The replay is complete and the subscription is live: nothing else is pending.
             sync(&mut ws).await;
 
+            scratch.drop_self().await;
+        }
+
+        /// A successful resume already at the canonical head is not allowed to be silent. The
+        /// first observable response must be the exact confirmation ack; a trailing ping proves
+        /// that the empty replay produced no snapshot, update, accepted, or other extra frame.
+        #[tokio::test]
+        async fn resume_at_head_returns_exact_ack_before_an_empty_replay() {
+            let scratch = scratch_or_skip!("resume-at-head-ack");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+
+            let first_ticket = issue_ticket(addr, &token, workspace_id, document_id, "resume-head-a").await;
+            let (first, head_seq, head_frontier, _) =
+                open_session_full(addr, &first_ticket, "resume-head-a", document_id).await;
+            drop(first);
+
+            let resume_ticket = issue_ticket(addr, &token, workspace_id, document_id, "resume-head-b").await;
+            let (mut resumed, _) = handshake(
+                addr,
+                &resume_ticket,
+                "resume-head-b",
+                document_id,
+                Some(head_seq),
+                Some(head_frontier.clone()),
+            )
+            .await;
+            let first_response = recv_frame(&mut resumed).await;
+            let Frame::Ack {
+                document_id: confirmed_document,
+                seq: confirmed_seq,
+                frontier: confirmed_frontier,
+                ..
+            } = first_response
+            else {
+                panic!("resume-at-head must answer first with an ack, got {first_response:?}");
+            };
+            assert_eq!(confirmed_document, document_id);
+            assert_eq!(confirmed_seq, head_seq);
+            assert_eq!(confirmed_frontier, head_frontier);
+
+            sync(&mut resumed).await;
             scratch.drop_self().await;
         }
 

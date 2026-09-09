@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sylvode Flow v0.4 collab-architecture verifier.
+# Sylvode Flow v0.4/v0.5 collab-architecture verifier.
 #
 # Contract: /opt/working/sylvode-flow/gates/gate-commands.md, the v0.4
 # section's "Architecture verifier" paragraph, and
@@ -83,9 +83,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/flow_contract_path.sh
 source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.4"
+EVIDENCE_ROOT=""
 REPO_ROOT="$ROOT_DIR"
 RELEASE="0.4"
+CLIENTS=""
 ADR_PATH=""
 LIMITS_PATH=""
 JSON_MODE=0
@@ -96,7 +97,7 @@ DEDICATED_PG_CONTAINER="${OPENPR_FLOW_DEDICATED_PG_CONTAINER:-}"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/verify-flow-collab-architecture.sh --release 0.4 --adr PATH --limits PATH --json [OPTIONS]
+Usage: scripts/verify-flow-collab-architecture.sh --release VER --json [OPTIONS]
 
 Reads ADR-0010's DOCUMENT_CONTROL status and frozen numeric budgets
 (read-only), cross-checks the lock-wait/lock-hold/rebase-attempt
@@ -114,6 +115,8 @@ measurements are not accepted as official evidence.
 Options:
   --release VER            Gate release identifier (recorded in output).
                           Default: 0.4
+  --clients N              Collaboration client count. Required for v0.5;
+                          the v0.5 hard gate passes only at exactly 10.
   --adr PATH               Path to ADR-0010. Required. A relative path is
                           resolved against the current directory first,
                           then against --contracts-root (same for
@@ -125,8 +128,8 @@ Options:
   --contracts-root DIR     Root containing decisions/. Default:
                           /opt/working/sylvode-flow
   --evidence-root DIR     Where collab-architecture-result.json is
-                          written. Default:
-                          /opt/working/sylvode-flow/evidence/v0.4
+                          written. Default: evidence/v<release> under
+                          --contracts-root.
   --repo-root DIR         Repository containing apps/api and the cargo
                           workspace. Default: this checkout.
   --load-harness-evidence PATH
@@ -154,6 +157,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release) RELEASE="${2:?--release requires a value}"; shift 2 ;;
+    --clients) CLIENTS="${2:?--clients requires N}"; shift 2 ;;
     --adr) ADR_PATH="${2:?--adr requires a PATH argument}"; shift 2 ;;
     --limits) LIMITS_PATH="${2:?--limits requires a PATH argument}"; shift 2 ;;
     --contracts-root) CONTRACTS_ROOT="${2:?--contracts-root requires a DIR argument}"; shift 2 ;;
@@ -169,6 +173,15 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unexpected argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ -z "$EVIDENCE_ROOT" ]]; then
+  EVIDENCE_ROOT="$CONTRACTS_ROOT/evidence/v$RELEASE"
+fi
+if [[ "$RELEASE" == "0.5" ]]; then
+  [[ "$CLIENTS" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: v0.5 requires --clients N" >&2; exit 2; }
+  [[ -n "$ADR_PATH" ]] || ADR_PATH="$CONTRACTS_ROOT/decisions/ADR-0010-collab-server-architecture.md"
+  [[ -n "$LIMITS_PATH" ]] || LIMITS_PATH="$CONTRACTS_ROOT/contracts/limits-v1.md"
+fi
 
 if [[ $JSON_MODE -ne 1 ]]; then
   echo "FAIL: --json is required" >&2
@@ -220,6 +233,402 @@ done
 mkdir -p "$EVIDENCE_ROOT" "$EVIDENCE_ROOT/logs"
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+if [[ "$RELEASE" == "0.5" ]]; then
+  FIXED_DATABASE_URL="postgresql://flowtest:flowtest@127.0.0.1:25433/postgres"
+  SOURCE_DIRTY=false
+  [[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || SOURCE_DIRTY=true
+  V05_LOAD_DIR="$EVIDENCE_ROOT/logs/collab-load-v0.5"
+  V05_LOAD_LOG="$EVIDENCE_ROOT/logs/collab-load-v0.5.log"
+  V05_DYNAMIC_LOG="$EVIDENCE_ROOT/logs/collab-architecture-v0.5-tests.log"
+  V05_SURFACE_JSON="$EVIDENCE_ROOT/logs/surface-coverage-v0.5.json"
+  V05_LOAD_EXIT=0
+
+  if [[ -z "$LOAD_HARNESS_EVIDENCE" ]]; then
+    set +e
+    "$REPO_ROOT/scripts/run-flow-collab-load-harness-v0.5.sh" \
+      --clients "$CLIENTS" --repo-root "$REPO_ROOT" --database-url "$FIXED_DATABASE_URL" \
+      --evidence-root "$V05_LOAD_DIR" --json >"$V05_LOAD_LOG" 2>&1
+    V05_LOAD_EXIT=$?
+    set -e
+    LOAD_HARNESS_EVIDENCE="$V05_LOAD_DIR/collab-load-result.json"
+  fi
+
+  python3 "$REPO_ROOT/scripts/lib/flow_surface_coverage.py" \
+    --contracts-root "$CONTRACTS_ROOT" --release 0.5 >"$V05_SURFACE_JSON"
+
+  : >"$V05_DYNAMIC_LOG"
+  V05_DYNAMIC_EXIT=0
+  V05_TESTS=(
+    flow::collab::session::tests::live_ws::inbound_updates_generated_from_one_base_are_accepted_in_injected_reverse_order
+    flow::collab::session::tests::live_ws::outbound_duplicates_are_dropped_and_a_gap_is_backfilled_in_strict_seq_order
+    flow::collab::session::tests::live_ws::an_unfillable_outbound_gap_resyncs_and_never_forwards_the_revealing_notice
+    flow::collab::session::tests::live_ws::resume_at_head_returns_exact_ack_before_an_empty_replay
+  )
+  for test_name in "${V05_TESTS[@]}"; do
+    set +e
+    (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
+      cargo test --release -p api --lib "$test_name" -- --exact --test-threads=1) \
+      >>"$V05_DYNAMIC_LOG" 2>&1
+    test_exit=$?
+    set -e
+    if [[ $test_exit -ne 0 ]]; then V05_DYNAMIC_EXIT=1; fi
+  done
+  set +e
+  (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
+    cargo test --release -p api --lib 'flow::collab::snapshot::' -- --test-threads=1) \
+    >>"$V05_DYNAMIC_LOG" 2>&1
+  snapshot_exit=$?
+  set -e
+  if [[ $snapshot_exit -ne 0 ]]; then V05_DYNAMIC_EXIT=1; fi
+
+  V05_SOURCE_DIRTY_AFTER=false
+  [[ -z "$(git -C "$REPO_ROOT" status --porcelain)" ]] || V05_SOURCE_DIRTY_AFTER=true
+  ADR_SHA256="$(sha256sum "$ADR_PATH" | awk '{print $1}')"
+  LIMITS_SHA256="$(sha256sum "$LIMITS_PATH" | awk '{print $1}')"
+  EXECUTOR="${USER:-$(id -un)}@$(hostname)"
+
+  set +e
+  python3 - "$LOAD_HARNESS_EVIDENCE" "$V05_DYNAMIC_LOG" "$V05_SURFACE_JSON" \
+    "$SOURCE_HEAD" "$SOURCE_DIRTY" "$V05_SOURCE_DIRTY_AFTER" "$CLIENTS" \
+    "$ADR_SHA256" "$LIMITS_SHA256" "$GENERATED_AT" "$EXECUTOR" \
+    "$V05_LOAD_EXIT" "$V05_DYNAMIC_EXIT" "$EVIDENCE_ROOT/collab-architecture-result.json" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+
+(
+    load_path, test_log_path, surface_path, source_head, source_dirty,
+    source_dirty_after, clients_raw, adr_sha, limits_sha, generated_at,
+    executor, load_exit_raw, dynamic_exit_raw, output_path,
+) = sys.argv[1:]
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+load = read_json(load_path)
+surface = read_json(surface_path)
+try:
+    test_log = open(test_log_path, encoding="utf-8").read()
+except OSError:
+    test_log = ""
+
+clients = int(clients_raw)
+load_exit = int(load_exit_raw)
+dynamic_exit = int(dynamic_exit_raw)
+dirty = source_dirty == "true" or source_dirty_after == "true"
+problems = []
+
+def require(name, condition):
+    if not condition:
+        problems.append(name)
+    return bool(condition)
+
+def test_ok(name):
+    return re.search(r"^test " + re.escape(name) + r" \.\.\. ok$", test_log, re.M) is not None
+
+expected_tests = {
+    "inbound_reorder": "flow::collab::session::tests::live_ws::inbound_updates_generated_from_one_base_are_accepted_in_injected_reverse_order",
+    "egress_duplicate_reorder": "flow::collab::session::tests::live_ws::outbound_duplicates_are_dropped_and_a_gap_is_backfilled_in_strict_seq_order",
+    "egress_gap_resync": "flow::collab::session::tests::live_ws::an_unfillable_outbound_gap_resyncs_and_never_forwards_the_revealing_notice",
+    "resume_at_head_ack": "flow::collab::session::tests::live_ws::resume_at_head_returns_exact_ack_before_an_empty_replay",
+    "soft_count": "flow::collab::snapshot::tests::exactly_at_the_soft_update_count_is_soft_not_hard",
+    "soft_bytes": "flow::collab::snapshot::tests::exactly_at_the_soft_byte_count_is_soft",
+    "hard_count": "flow::collab::snapshot::tests::exactly_at_the_hard_update_count_is_hard_not_soft",
+    "hard_bytes": "flow::collab::snapshot::tests::exactly_at_the_hard_byte_count_is_hard",
+    "soft_rebuild": "flow::collab::snapshot::database_tests::soft_trigger_advances_snapshot_shortens_the_tail_and_keeps_every_old_update",
+    "hard_checkpoint": "flow::collab::snapshot::database_tests::hard_boundary_forces_a_checkpoint_before_the_next_update_is_accepted",
+    "checkpoint_race": "flow::collab::snapshot::database_tests::advancement_stays_correct_when_racing_a_concurrent_write",
+    "snapshot_restart": "flow::collab::snapshot::database_tests::restart_recovery_reproduces_the_exact_same_semantic_hash_from_snapshot_plus_tail",
+}
+tests = {key: test_ok(name) for key, name in expected_tests.items()}
+for key, value in tests.items():
+    require(f"dynamic test did not pass: {key}", value)
+
+environment = load.get("environment") or {}
+fixture = load.get("fixture") or {}
+concurrency_raw = load.get("concurrency") or {}
+lock_raw = load.get("lock") or {}
+cache_raw = load.get("cache") or {}
+restart_raw = load.get("process_restart") or {}
+boundaries = cache_raw.get("cache_boundaries") or {}
+rebuild = cache_raw.get("rebuild_after_eviction") or {}
+observers = cache_raw.get("observers_and_timers") or {}
+no_lost = cache_raw.get("no_accepted_update_lost") or {}
+retry = cache_raw.get("retry_exhaustion") or {}
+bypass = cache_raw.get("bypass_and_removal") or {}
+hold = lock_raw.get("lock_hold_p95") or {}
+wait = lock_raw.get("lock_wait") or {}
+round_trip = concurrency_raw.get("round_trip") or {}
+
+environment_ok = all((
+    load.get("schema_version") == "sylvode.flow.collab-load-v0.5-result.v1",
+    load.get("release") == "0.5",
+    load.get("source_head") == source_head,
+    load.get("source_dirty") is False,
+    environment.get("build_profile") == "release",
+    environment.get("database_kind") == "real_postgresql",
+    bool(environment.get("postgres_version")),
+    environment.get("active_other_clients_before") == 0,
+    environment.get("concurrent_cargo_before") == 0,
+    environment.get("qualification_status") == "satisfied",
+    load_exit == 0,
+    load.get("passed") is True,
+))
+require("official release PostgreSQL load evidence is not admissible", environment_ok)
+require("source tree was dirty", not dirty)
+
+fixture_ok = all((
+    clients == 10,
+    fixture.get("clients") == 10,
+    fixture.get("distinct_users") is True,
+    fixture.get("warmup_rounds") == 5,
+    fixture.get("min_measurements") == 30,
+    fixture.get("locked") is True,
+    bool(fixture.get("fixture_sha256")),
+))
+require("locked 10-client fixture, five warmups, or minimum sample declaration is wrong", fixture_ok)
+
+lock_flags = {
+    "samples_at_least_30": hold.get("samples", 0) >= 30 and wait.get("samples", 0) >= 30,
+    "wait_ms_max": wait.get("max_ms", float("inf")) <= 100,
+    "hold_ms_p95": hold.get("p95_ms", float("inf")) <= 25,
+    "hold_ms_max": hold.get("max_ms", float("inf")) <= 100,
+    "timeouts_rolled_back": ((retry.get("lock_wait_exhaustion") or {}).get("canonical_state_unchanged") is True),
+    "canonical_state_unchanged": ((retry.get("lock_wait_exhaustion") or {}).get("canonical_state_unchanged") is True),
+}
+for key, value in lock_flags.items():
+    require(f"lock check failed: {key}", value)
+
+expected_total = 10 * (5 + 10)
+expected_peer = expected_total * 9
+rebase_exhausted = retry.get("head_mismatch_exhaustion") or {}
+exhausted_call = rebase_exhausted.get("exhausts_at_the_ceiling") or {}
+concurrency_flags = {
+    "ten_clients": clients == 10 and fixture.get("clients") == 10,
+    "round_trip_samples_at_least_30": round_trip.get("samples", 0) >= 30,
+    "round_trip_p95_at_most_250_ms": round_trip.get("p95_ms", float("inf")) <= 250,
+    "seq_contiguous": concurrency_raw.get("accepted_total") == expected_total
+        and concurrency_raw.get("head_seq_final") == expected_total,
+    "fanout_exact": concurrency_raw.get("fanout_rounds_complete") == expected_total
+        and concurrency_raw.get("peer_updates_observed") == expected_peer
+        and concurrency_raw.get("peer_accepted_observed") == expected_peer,
+    "offline_resume_exercised": concurrency_raw.get("resumes_completed", 0) > 0,
+    "rebase_exhaustion_rolled_back": exhausted_call.get("forced_head_mismatches") == 3
+        and ((exhausted_call.get("victim_outcome") or {}).get("write_state") == "NotApplied"),
+}
+for key, value in concurrency_flags.items():
+    require(f"concurrency check failed: {key}", value)
+
+entry_ceiling = boundaries.get("entry_count_ceiling")
+bytes_ceiling = boundaries.get("decoded_bytes_ceiling")
+cache_flags = {
+    "entry_exact": isinstance(entry_ceiling, int) and boundaries.get("entry_exact_all_resident") is True
+        and boundaries.get("entry_exact_resident_count") == entry_ceiling,
+    "entry_plus_one_evicted": isinstance(entry_ceiling, int) and boundaries.get("entry_plus_one_lru_reclaimed") is True
+        and boundaries.get("entry_plus_one_resident_count") == entry_ceiling,
+    "bytes_exact": isinstance(bytes_ceiling, int) and boundaries.get("bytes_exact_equals_ceiling") is True
+        and boundaries.get("bytes_exact_total_bytes") == bytes_ceiling,
+    "bytes_plus_one_evicted": isinstance(bytes_ceiling, int) and boundaries.get("bytes_plus_one_lru_reclaimed") is True
+        and boundaries.get("bytes_plus_one_within_ceiling") is True,
+    "idle_ttl_reclaimed": boundaries.get("idle_ttl_alive_before_expiry") is True
+        and boundaries.get("idle_ttl_reclaimed") is True
+        and boundaries.get("idle_ttl_alive_probe_seconds", float("inf")) < boundaries.get("idle_ttl_seconds", -1)
+        < boundaries.get("idle_ttl_reclaim_probe_seconds", -1),
+    "restart_hash_equal": rebuild.get("semantic_hash_equal") is True
+        and rebuild.get("head_equal") is True and restart_raw.get("semantic_hash_equal") is True
+        and restart_raw.get("distinct_processes") is True
+        and restart_raw.get("first_process_observed_dead") is True
+        and restart_raw.get("build_profile") == "release",
+    "observers_after_destroy": observers.get("cycle_original_entries_remaining") == 0
+        and observers.get("open_fds_delta") == 0
+        and observers.get("engine_observer_api_exists_in_collab_core") is False,
+    "timers_after_destroy": observers.get("os_threads_delta") == 0
+        and observers.get("static_background_constructs_in_cache_and_coordinator") == [],
+}
+for key, value in cache_flags.items():
+    require(f"cache check failed: {key}", value)
+
+cache_no_loss = set(no_lost.get("conditions_exercised") or []) >= {"miss", "warmup", "hit", "eviction", "restart"} \
+    and no_lost.get("seq_contiguous_from_one") is True \
+    and no_lost.get("collab_updates_rows") == no_lost.get("accepted_total")
+row_lock_authority = ((bypass.get("row_lock_negative_control") or {}).get("row_lock_is_the_authority") is True)
+require("cache conditions did not preserve all accepted updates", cache_no_loss)
+require("row-lock negative control did not prove authority", row_lock_authority)
+
+snapshot = {
+    "soft_count_triggered": tests["soft_count"] and tests["soft_rebuild"],
+    "soft_bytes_triggered": tests["soft_bytes"],
+    "rebuild_triggered": tests["soft_rebuild"],
+    "hard_count_blocked": tests["hard_count"] and tests["hard_checkpoint"],
+    "hard_bytes_blocked": tests["hard_bytes"],
+    "checkpoint_head_race_safe": tests["checkpoint_race"],
+    "restart_hash_equal": tests["snapshot_restart"] and cache_flags["restart_hash_equal"],
+}
+for key, value in snapshot.items():
+    require(f"snapshot check failed: {key}", value)
+
+egress = {
+    "duplicates_ignored": tests["egress_duplicate_reorder"],
+    "reorder_monotonic": tests["egress_duplicate_reorder"],
+    "gap_resync": tests["egress_gap_resync"],
+    "saved_never_crossed_gap": tests["egress_gap_resync"],
+    "resume_at_head_ack": tests["resume_at_head_ack"],
+    "resume_request_position": "known_seq == head_seq with exact known_frontier",
+    "resume_first_observable_frame": "ack",
+}
+
+surface_violations = surface.get("violations") or {}
+surface_ok = surface.get("passed") is True and all(not values for values in surface_violations.values())
+require("surface contract fixed-schema checks failed", surface_ok)
+for required_hash in ("rest_sha256", "mcp_sha256", "cli_sha256", "ui_sha256", "matrix_sha256"):
+    require(f"contract hash missing: {required_hash}", bool((surface.get("contracts") or {}).get(required_hash)))
+
+budget_gate = environment_ok and fixture_ok and all(lock_flags.values()) and all(concurrency_flags.values())
+egress_gate = tests["inbound_reorder"] and all(isinstance(v, str) or v for v in egress.values())
+cache_gate = all(cache_flags.values()) and cache_no_loss and row_lock_authority
+snapshot_gate = all(snapshot.values())
+
+hard_gates = {
+    "ten_client_round_trip_and_lock_budget_no_regression": {
+        "status": "passed" if budget_gate else "failed",
+        "reason": "independently recomputed from release PostgreSQL distributions and exact 10-client fan-out counts",
+    },
+    "accepted_egress_duplicate_reorder_gap_resync": {
+        "status": "passed" if egress_gate else "failed",
+        "reason": "separate controlled inbound reorder and outbound duplicate/reorder/gap/resume-at-head injections",
+    },
+    "warm_cache_eviction_restart_semantic_equivalence": {
+        "status": "passed" if cache_gate else "failed",
+        "reason": "exact cache boundaries plus fresh release API process re-exec semantic equality",
+    },
+}
+
+adr_quantitative_gates = {
+    "lock_budget": all(lock_flags.values()),
+    "ten_client_round_trip_and_no_lost_update": all(concurrency_flags.values()) and cache_no_loss,
+    "bounded_cache_and_restart": cache_gate,
+    "snapshot_bounds_and_recovery": snapshot_gate,
+    "cache_coordinator_are_performance_only_db_lock_is_authority": row_lock_authority,
+}
+for key, value in adr_quantitative_gates.items():
+    require(f"ADR-0010 quantitative gate failed: {key}", value)
+require("dynamic collaboration test command failed", dynamic_exit == 0)
+
+result = {
+    "schema_version": "sylvode.flow.collab-architecture-result.v1",
+    "release": "0.5",
+    "source_head": source_head,
+    "source_tree_dirty": dirty,
+    "adr_sha256": adr_sha,
+    "limits_sha256": limits_sha,
+    "generated_at": generated_at,
+    "executor": executor,
+    "environment": {
+        "postgres_version": environment.get("postgres_version"),
+        "cpu": environment.get("cpu"),
+        "cores": environment.get("cores"),
+        "ram": environment.get("ram_bytes"),
+        "engine": "loro",
+        "build_profile": environment.get("build_profile"),
+        "fixture_sha256": fixture.get("fixture_sha256"),
+        "load_average_before": environment.get("load_average_before"),
+        "load_average_after": environment.get("load_average_after"),
+        "active_other_clients_before": environment.get("active_other_clients_before"),
+        "concurrent_cargo_before": environment.get("concurrent_cargo_before"),
+        "database_kind": environment.get("database_kind"),
+    },
+    "cache": cache_flags,
+    "cache_evidence": {
+        "available": bool(cache_raw),
+        "cache": cache_flags,
+        "supplemental_checks": {
+            "cache_conditions_no_lost_update": cache_no_loss,
+            "row_lock_is_authority": row_lock_authority,
+            "fresh_release_api_reexec": restart_raw.get("fresh_v0_5_run") is True
+                and restart_raw.get("build_profile") == "release",
+        },
+        "violations": [item for item in problems if item.startswith("cache check failed:")],
+        "passed": cache_gate,
+    },
+    "lock": {
+        "samples": hold.get("samples"),
+        "wait_ms_max": wait.get("max_ms"),
+        "hold_ms_p95": hold.get("p95_ms"),
+        "hold_ms_max": hold.get("max_ms"),
+        "timeouts_rolled_back": lock_flags["timeouts_rolled_back"],
+        "canonical_state_unchanged": lock_flags["canonical_state_unchanged"],
+    },
+    "concurrency": {
+        "clients": clients,
+        "warmup_rounds": fixture.get("warmup_rounds"),
+        "round_trip_samples": round_trip.get("samples"),
+        "accepted_round_trip_ms_p95": round_trip.get("p95_ms"),
+        "seq_contiguous": concurrency_flags["seq_contiguous"],
+        "rebase_exhaustion_rolled_back": concurrency_flags["rebase_exhaustion_rolled_back"],
+        "fanout_rounds": concurrency_raw.get("fanout_rounds_complete"),
+        "peer_update_frames": concurrency_raw.get("peer_updates_observed"),
+        "peer_accepted_frames": concurrency_raw.get("peer_accepted_observed"),
+        "offline_resumes": concurrency_raw.get("resumes_completed"),
+    },
+    "snapshot": snapshot,
+    "inbound": {
+        "update_reorder_injected": tests["inbound_reorder"],
+        "barrier": "both concurrent updates generated before reverse-order sends; ping after each accepted",
+    },
+    "egress": egress,
+    "process_restart": restart_raw,
+    "contracts": surface.get("contracts") or {},
+    "counts": surface.get("counts") or {},
+    "violations": surface_violations,
+    "verification_violations": problems,
+    "adr_quantitative_gates": adr_quantitative_gates,
+    "numeric_budgets_check": {
+        "load_harness": {
+            "available": bool(load),
+            "official_environment": {
+                "required": "release build on the dispatch-fixed, uncontended real PostgreSQL endpoint",
+                "qualification_status": environment.get("qualification_status"),
+                "active_other_clients_at_preflight": environment.get("active_other_clients_before"),
+                "shared_database_measurements_accepted": False,
+            },
+            "official_environment_ok": environment_ok,
+            "budget_gate_passed": budget_gate,
+            "parity_gate_passed": ((load.get("components") or {}).get("lock_load") or {}).get("passed") is True,
+            "violations": [item for item in problems if item.startswith("lock check failed:")
+                or item.startswith("concurrency check failed:")
+                or item.startswith("official release PostgreSQL")],
+        },
+    },
+    "hard_gates": hard_gates,
+    "gates": hard_gates,
+    "inputs": {
+        "load_harness_evidence": os.path.abspath(load_path),
+        "load_harness_sha256": hashlib.sha256(open(load_path, "rb").read()).hexdigest() if os.path.isfile(load_path) else None,
+        "dynamic_test_log": os.path.abspath(test_log_path),
+    },
+}
+result["passed"] = not problems and surface_ok and snapshot_gate and all(
+    gate["status"] == "passed" for gate in hard_gates.values()
+)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+with open(output_path + ".tmp", "w", encoding="utf-8") as handle:
+    json.dump(result, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.replace(output_path + ".tmp", output_path)
+print(json.dumps(result, indent=2, sort_keys=True))
+raise SystemExit(0 if result["passed"] else 1)
+PY
+  V05_RESULT_EXIT=$?
+  set -e
+  exit "$V05_RESULT_EXIT"
+fi
 
 # The load run is intentionally separate from the cheap architecture checks: it needs a release
 # build, PostgreSQL statement logging, and an uncontended dedicated database instance. This block
