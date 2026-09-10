@@ -954,11 +954,31 @@ else:
         "retention_permanent_cleanup_not_implemented_v0_5")
 member_baseline = baseline_result.get("member_baseline_no_behaviour_regression", {})
 baseline_passed = int(baseline_exit_s) == 0 and member_baseline.get("status") == "passed"
+baseline_violations = member_baseline.get("violations") or []
+if not isinstance(baseline_violations, list):
+    baseline_violations = []
+key_baseline_violations = [
+    violation for violation in baseline_violations
+    if isinstance(violation, str) and (
+        "default edit member archive was refused" in violation
+        or "default edit member restore was refused" in violation
+    )
+]
+if baseline_passed:
+    baseline_reason = None
+elif int(baseline_exit_s) == 1 and member_baseline.get("status") == "failed":
+    baseline_reason = "v0_4_member_baseline_fixture_failed_observed_regressions"
+else:
+    baseline_reason = "v0_4_member_baseline_fixture_not_covered"
 add(gate, "v0_4_member_baseline_fixture_reused", baseline_passed,
     {"verifier_exit": int(baseline_exit_s), "duration_ms": int(baseline_ms_s),
-     "status": member_baseline.get("status", "not_observed")},
+     "status": member_baseline.get("status", "not_observed"),
+     "violation_count": len(baseline_violations),
+     "key_violations": key_baseline_violations,
+     "archive_result": (member_baseline.get("writes") or {}).get("archive"),
+     "restore_result": (member_baseline.get("writes") or {}).get("restore")},
     [baseline_result_s, baseline_log_s, commands_s],
-    None if baseline_passed else "v0_4_member_baseline_fixture_failed_or_not_covered")
+    baseline_reason)
 gap_path = pathlib.Path("/opt/worker/task/openpr/contract-gaps-v05-2026-09-09.md")
 gap_text = read(gap_path) if gap_path.is_file() else ""
 g5 = "G5" in gap_text and "root Page" in gap_text and "v0.4" in gap_text and "v0.5" in gap_text
