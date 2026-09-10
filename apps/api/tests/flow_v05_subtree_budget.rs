@@ -43,7 +43,8 @@
 //! OPENPR_TEST_DATABASE_URL=postgres://flowtest:flowtest@127.0.0.1:25434/openpr \
 //! OPENPR_FLOW_DEDICATED_PG_CONTAINER=flow-load-pg \
 //! OPENPR_FLOW_SUBTREE_BUDGET_OUT=/tmp/subtree-budget.json \
-//!   cargo test -p api --all-features --test flow_v05_subtree_budget -- --nocapture
+//!   cargo test -p api --all-features --test flow_v05_subtree_budget \
+//!     move_subtree_nodes_max_cost_curve -- --exact --ignored --nocapture
 //! ```
 
 #![allow(
@@ -1330,10 +1331,11 @@ fn rung_json(rung: &RungResult) -> Value {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "environment-gated heavy measurement; run explicitly against dedicated PostgreSQL"]
 async fn move_subtree_nodes_max_cost_curve() {
     if let Some((code, detail)) = environment_problem() {
         emit_not_satisfied(code, &detail);
-        return;
+        panic!("ENVIRONMENT NOT SATISFIED [{code}]: {detail}");
     }
     // Every rung gets its **own** scratch database. Sharing one across the ladder makes the last
     // rungs measure the dead tuples and table growth the earlier ones left behind: in the first
@@ -1345,7 +1347,7 @@ async fn move_subtree_nodes_max_cost_curve() {
     for (index, &n) in ladder.iter().enumerate() {
         let Some(scratch) = scratch(&format!("rung{index}")).await else {
             emit_not_satisfied("scratch_unavailable", "the scratch database could not be created");
-            return;
+            panic!("the scratch database could not be created");
         };
         let started = Instant::now();
         let rung = measure_rung(&scratch.db, n).await;
@@ -1364,7 +1366,7 @@ async fn move_subtree_nodes_max_cost_curve() {
             "scratch_unavailable",
             "the anti-proof scratch database could not be created",
         );
-        return;
+        panic!("the anti-proof scratch database could not be created");
     };
     let anti_fixture = seed_fixture(&scratch.db, 10).await;
     checkpoint_and_settle(&scratch.db).await;

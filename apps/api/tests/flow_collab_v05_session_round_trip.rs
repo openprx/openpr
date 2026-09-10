@@ -1063,17 +1063,15 @@ async fn server_version(db: &DatabaseConnection) -> String {
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "environment-gated heavy measurement; run explicitly through the dedicated PostgreSQL harness"]
 async fn v05_multi_user_session_workload_round_trip_p95() {
     if let Some((reason_code, detail)) = load_environment_problem() {
         emit_environment_not_satisfied(reason_code, &detail);
-        eprintln!("ENVIRONMENT NOT SATISFIED [{reason_code}]: {detail}");
-        return;
+        panic!("ENVIRONMENT NOT SATISFIED [{reason_code}]: {detail}");
     }
 
-    // Without a real database there is nothing to measure. The test does not panic (that would
-    // break `cargo test -p api` on every machine without the dedicated instance), but it also
-    // refuses to look like a pass: it emits an evidence document whose `passed` is false and whose
-    // violation says the run never happened, so nothing downstream can read a green out of a skip.
+    // Without a real database there is nothing to measure. This test is ignored by ordinary
+    // workspace runs; when explicitly selected, an unsatisfied environment is a failure.
     let Some(scratch) = scratch("round_trip").await else {
         let mut skipped = Report {
             build_profile: build_profile(),
@@ -1084,8 +1082,7 @@ async fn v05_multi_user_session_workload_round_trip_p95() {
              measurement and must not be read as one"
         ));
         skipped.emit();
-        eprintln!("SKIPPED: {TEST_DATABASE_URL_ENV} is not set; the v0.5 session harness measured nothing");
-        return;
+        panic!("{TEST_DATABASE_URL_ENV} is not set; the v0.5 session harness measured nothing");
     };
 
     let mut report = Report {

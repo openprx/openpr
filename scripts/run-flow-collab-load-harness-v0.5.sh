@@ -139,7 +139,7 @@ if [[ $WORKER_BUILD_EXIT -eq 0 ]]; then
     OPENPR_FLOW_QUIET_PG_QUALIFIED=1 \
     OPENPR_FLOW_LOAD_HARNESS_OUT="$BASELINE_OUT" \
     cargo test --release -p api --test flow_collab_load_harness \
-      ten_client_load_harness_round_trip_p95_and_lock_hold_p95 -- --exact --nocapture) \
+      ten_client_load_harness_round_trip_p95_and_lock_hold_p95 -- --exact --ignored --nocapture) \
     >"$EVIDENCE_ROOT/logs/v0.5-lock-load.log" 2>&1
   BASELINE_EXIT=$?
 else
@@ -153,7 +153,7 @@ if [[ $BASELINE_EXIT -eq 0 ]]; then
     OPENPR_FLOW_QUIET_PG_QUALIFIED=1 \
     OPENPR_FLOW_V05_SESSION_ROUND_TRIP_OUT="$SESSION_OUT" \
     cargo test --release -p api --test flow_collab_v05_session_round_trip \
-      v05_multi_user_session_workload_round_trip_p95 -- --exact --nocapture) \
+      v05_multi_user_session_workload_round_trip_p95 -- --exact --ignored --nocapture) \
     >"$EVIDENCE_ROOT/logs/v0.5-session-load.log" 2>&1
   SESSION_EXIT=$?
 else

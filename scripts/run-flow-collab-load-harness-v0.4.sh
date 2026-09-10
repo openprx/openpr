@@ -134,7 +134,7 @@ set +e
   OPENPR_FLOW_PG_LOG_CONTAINER="$PG_LOG_CONTAINER" \
   OPENPR_FLOW_LOAD_HARNESS_OUT="$EVIDENCE_OUT" \
   cargo test --release -p api --test flow_collab_load_harness \
-    ten_client_load_harness_round_trip_p95_and_lock_hold_p95 -- --exact --nocapture) \
+    ten_client_load_harness_round_trip_p95_and_lock_hold_p95 -- --exact --ignored --nocapture) \
   >"$TMP_DIR/harness.log" 2>&1
 HARNESS_EXIT=$?
 set -e

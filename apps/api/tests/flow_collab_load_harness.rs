@@ -1651,18 +1651,16 @@ struct CountRow {
 /// round-trip p95) and `bootstrap_repeatable_read_and_ws_parity` (same `REPEATABLE READ` view,
 /// cross-surface `seq`/hash/frontier parity, no gaps).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "environment-gated heavy measurement; run explicitly through the dedicated PostgreSQL harness"]
 async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     if let Some((reason_code, detail)) = load_environment_problem() {
         emit_environment_not_satisfied(reason_code, &detail);
-        eprintln!("ENVIRONMENT NOT SATISFIED [{reason_code}]: {detail}");
-        return;
+        panic!("ENVIRONMENT NOT SATISFIED [{reason_code}]: {detail}");
     }
 
     // Without a real database there is nothing to measure -- `gate-commands.md` fails any run that
-    // substitutes a mock or in-memory database outright. The test does not panic (that would break
-    // `cargo test -p api` on every machine without the scratch instance), but it also refuses to
-    // look like a pass: it writes an evidence file whose `passed` is false and whose violation says
-    // the run never happened, so nothing downstream can read a green out of a skip.
+    // substitutes a mock or in-memory database outright. This test is ignored by ordinary workspace
+    // runs; when explicitly selected, an unsatisfied environment is a failure, never an `ok`.
     let Some(scratch) = scratch("ten_client").await else {
         let mut skipped = Report {
             build_profile: build_profile(),
@@ -1673,8 +1671,7 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
              must not be read as one"
         ));
         skipped.emit();
-        eprintln!("SKIPPED: {TEST_DATABASE_URL_ENV} is not set; the v0.4 load harness measured nothing");
-        return;
+        panic!("{TEST_DATABASE_URL_ENV} is not set; the v0.4 load harness measured nothing");
     };
 
     let mut report = Report {
