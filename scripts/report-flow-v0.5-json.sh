@@ -145,27 +145,30 @@ fi
 CHECKS_JSON='[]'
 
 record_check() {
-  local id="$1" status="$2" exit_json="$3" command="$4" output="$5"
+  local id="$1" status="$2" exit_json="$3" command="$4" output="$5" duration_json="${6:-null}"
   local log_file="$EVIDENCE_ROOT/logs/${id}.log" log_sha
   printf '%s\n' "$output" > "$log_file"
   log_sha="$(sha256_of "$log_file")"
   CHECKS_JSON="$(jq -c \
     --arg id "$id" --arg status "$status" --arg command "$command" \
-    --argjson exit_code "$exit_json" \
+    --argjson exit_code "$exit_json" --argjson duration_ms "$duration_json" \
     --arg evidence "evidence/v0.5/logs/${id}.log" --arg sha256 "$log_sha" \
-    '. + [{id:$id,status:$status,command:$command,exit_code:$exit_code,evidence:$evidence,sha256:$sha256}]' \
+    '. + [{id:$id,status:$status,command:$command,exit_code:$exit_code,duration_ms:$duration_ms,evidence:$evidence,sha256:$sha256}]' \
     <<<"$CHECKS_JSON")"
 }
 
 run_command() {
   local id="$1" command_display="$2"; shift 2
-  local output exit_code status
+  local output exit_code status started ended duration_ms
+  started="$(date +%s%N)"
   set +e
   output="$("$@" 2>&1)"
   exit_code=$?
+  ended="$(date +%s%N)"
   set -e
   status=$([[ $exit_code -eq 0 ]] && echo passed || echo failed)
-  record_check "$id" "$status" "$exit_code" "$command_display" "$output"
+  duration_ms="$(((ended - started) / 1000000))"
+  record_check "$id" "$status" "$exit_code" "$command_display" "$output" "$duration_ms"
 }
 
 record_or_run_required_producer() {
@@ -220,6 +223,12 @@ record_or_run_required_producer() {
         --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" \
         --repo-root "$REPO_ROOT" --json
       ;;
+    audit_causation_verify)
+      run_command "required.$key" "$command" \
+        "$REPO_ROOT/$script_rel" --contract "$CONTRACTS_ROOT/contracts/events-v1.md" \
+        --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" \
+        --repo-root "$REPO_ROOT" --json
+      ;;
     *)
       record_check "required.$key" producer_unspecified null "$command" \
         "no WP-29 invocation mapping exists for required producer: $key"
@@ -228,7 +237,7 @@ record_or_run_required_producer() {
 }
 
 for producer_key in surface_parity collab_architecture_verify authz_verify \
-  multi_document_verify cardinality_verify invalid_update_reason_verify; do
+  multi_document_verify cardinality_verify invalid_update_reason_verify audit_causation_verify; do
   record_or_run_required_producer "$producer_key"
 done
 
@@ -259,6 +268,7 @@ producer_metadata() {
     multi_document_result) command_key=multi_document_verify ;;
     cardinality_result) command_key=cardinality_verify ;;
     invalid_update_reason_result) command_key=invalid_update_reason_verify ;;
+    audit_causation_result) command_key=audit_causation_verify ;;
     convergence_result)
       command="$CONVERGENCE_COMMAND"; script_rel=scripts/verify-flow-convergence-v0.5.sh
       ;;
@@ -376,19 +386,19 @@ required_command_entry() {
   local key="$1" command check
   command="$(jq -r --arg k "$key" '.[$k]' <<<"$REQUIRED_COMMAND_STRINGS")"
   case "$key" in
-    surface_parity|collab_architecture_verify|authz_verify|multi_document_verify|cardinality_verify|invalid_update_reason_verify)
+    surface_parity|collab_architecture_verify|authz_verify|multi_document_verify|cardinality_verify|invalid_update_reason_verify|audit_causation_verify)
       check="$(check_for_required_key "$key")"
       jq -cn --arg command "$command" --argjson check "$check" \
-        '{command:$command,status:$check.status,exit_code:$check.exit_code,evidence:$check.evidence,sha256:$check.sha256}'
+        '{command:$command,status:$check.status,exit_code:$check.exit_code,duration_ms:$check.duration_ms,evidence:$check.evidence,sha256:$check.sha256}'
       ;;
     report)
-      jq -cn --arg command "$command" '{command:$command,status:"passed",exit_code:0,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
+      jq -cn --arg command "$command" '{command:$command,status:"passed",exit_code:0,duration_ms:null,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
       ;;
     verify|gate|manual_signoff)
-      jq -cn --arg command "$command" '{command:$command,status:"not_run",exit_code:null,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
+      jq -cn --arg command "$command" '{command:$command,status:"not_run",exit_code:null,duration_ms:null,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
       ;;
     *)
-      jq -cn --arg command "$command" '{command:$command,status:"producer_unspecified",exit_code:null,evidence:null,sha256:null}'
+      jq -cn --arg command "$command" '{command:$command,status:"producer_unspecified",exit_code:null,duration_ms:null,evidence:null,sha256:null}'
       ;;
   esac
 }

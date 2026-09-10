@@ -66,7 +66,7 @@ if [[ $JSON_MODE -ne 1 ]]; then
   echo "FAIL: --json is required" >&2
   exit 2
 fi
-for tool in jq sha256sum git awk sed xargs; do
+for tool in jq sha256sum git awk sed xargs python3; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     exit 2
@@ -203,6 +203,7 @@ producer_metadata() {
     multi_document_result) command_key=multi_document_verify ;;
     cardinality_result) command_key=cardinality_verify ;;
     invalid_update_reason_result) command_key=invalid_update_reason_verify ;;
+    audit_causation_result) command_key=audit_causation_verify ;;
     convergence_result)
       command='scripts/verify-flow-convergence-v0.5.sh --clients 10 --json'
       script_rel=scripts/verify-flow-convergence-v0.5.sh
@@ -241,12 +242,30 @@ while IFS= read -r artifact; do
   ARTIFACT_INPUTS="$(jq -c --arg k "$artifact" --argjson v "$input" '.[$k]=$v' <<<"$ARTIFACT_INPUTS")"
 done < <(jq -r 'keys[]' <<<"$ARTIFACT_PATHS")
 
-RECOMPUTED_STATES="$(jq -cn -L "$ROOT_DIR/scripts/lib" --argjson inputs "$ARTIFACT_INPUTS" --arg head "$SOURCE_HEAD" \
+JQ_RECOMPUTED_STATES="$(jq -cn -L "$ROOT_DIR/scripts/lib" --argjson inputs "$ARTIFACT_INPUTS" --arg head "$SOURCE_HEAD" \
   'include "flow_gate_v0_5_receipt_state"; flow_compute_artifact_states($inputs;$head)')"
-RECOMPUTED_GATES="$(jq -cn -L "$ROOT_DIR/scripts/lib" --argjson states "$RECOMPUTED_STATES" \
+JQ_RECOMPUTED_GATES="$(jq -cn -L "$ROOT_DIR/scripts/lib" --argjson states "$JQ_RECOMPUTED_STATES" \
   'include "flow_gate_v0_5_receipt_state"; flow_compute_hard_gates($states)')"
-[[ "$(jq -c '.artifact_states' "$GATE_RESULT_PATH")" == "$(jq -c . <<<"$RECOMPUTED_STATES")" ]] || add_drift "artifact_states drift from on-disk evidence"
-[[ "$(jq -c '.hard_gates' "$GATE_RESULT_PATH")" == "$(jq -c . <<<"$RECOMPUTED_GATES")" ]] || add_drift "hard_gates drift from on-disk evidence"
+set +e
+INDEPENDENT_JSON="$(python3 "$ROOT_DIR/scripts/lib/flow_gate_v0_5_recompute.py" \
+  --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --gate-yaml "$GATE_YAML")"
+INDEPENDENT_EXIT=$?
+set -e
+if [[ $INDEPENDENT_EXIT -ne 0 ]] || ! jq -e '
+  (.artifact_states|type)=="object" and (.hard_gates|type)=="object" and
+  (.reasons|type)=="object" and (.hard_gates|length)==31
+' >/dev/null 2>&1 <<<"$INDEPENDENT_JSON"; then
+  echo "FAIL: independent v0.5 recomputation failed or returned malformed JSON" >&2
+  printf '%s\n' "$INDEPENDENT_JSON" >&2
+  exit 2
+fi
+RECOMPUTED_STATES="$(jq -c .artifact_states <<<"$INDEPENDENT_JSON")"
+RECOMPUTED_GATES="$(jq -c .hard_gates <<<"$INDEPENDENT_JSON")"
+RECOMPUTED_REASONS="$(jq -c .reasons <<<"$INDEPENDENT_JSON")"
+[[ "$(jq -Sc . <<<"$JQ_RECOMPUTED_STATES")" == "$(jq -Sc . <<<"$RECOMPUTED_STATES")" ]] || add_drift "report jq artifact-state algorithm disagrees with independent Python recomputation"
+[[ "$(jq -Sc . <<<"$JQ_RECOMPUTED_GATES")" == "$(jq -Sc . <<<"$RECOMPUTED_GATES")" ]] || add_drift "report jq hard-gate algorithm disagrees with independent Python recomputation"
+[[ "$(jq -Sc '.artifact_states' "$GATE_RESULT_PATH")" == "$(jq -Sc . <<<"$RECOMPUTED_STATES")" ]] || add_drift "artifact_states drift from on-disk evidence"
+[[ "$(jq -Sc '.hard_gates' "$GATE_RESULT_PATH")" == "$(jq -Sc . <<<"$RECOMPUTED_GATES")" ]] || add_drift "hard_gates drift from on-disk evidence"
 
 while IFS= read -r artifact; do
   path="$(jq -r --arg k "$artifact" '.[$k]' <<<"$ARTIFACT_PATHS")"
@@ -278,14 +297,14 @@ for ((i=0; i<CHECK_COUNT; i++)); do
   fi
 done
 
-for key in surface_parity collab_architecture_verify authz_verify multi_document_verify cardinality_verify invalid_update_reason_verify; do
+for key in surface_parity collab_architecture_verify authz_verify multi_document_verify cardinality_verify invalid_update_reason_verify audit_causation_verify; do
   command="$(jq -r --arg k "$key" '.[$k]' <<<"$REQUIRED_COMMAND_STRINGS")"
   [[ "$(jq -r --arg k "$key" '.required_commands[$k].command // empty' "$GATE_RESULT_PATH")" == "$command" ]] || add_drift "required_commands.$key command drift"
   check="$(jq -c --arg id "required.$key" '[.checks[]|select(.id==$id)][0]//null' "$GATE_RESULT_PATH")"
   if [[ "$check" == null ]]; then add_drift "required producer check missing: $key"
   else
-    [[ "$(jq -c --arg k "$key" '.required_commands[$k] | {status,exit_code,evidence,sha256}' "$GATE_RESULT_PATH")" == \
-       "$(jq -c '{status,exit_code,evidence,sha256}' <<<"$check")" ]] || add_drift "required_commands.$key does not match its check"
+    [[ "$(jq -c --arg k "$key" '.required_commands[$k] | {status,exit_code,duration_ms,evidence,sha256}' "$GATE_RESULT_PATH")" == \
+       "$(jq -c '{status,exit_code,duration_ms,evidence,sha256}' <<<"$check")" ]] || add_drift "required_commands.$key does not match its check"
   fi
 done
 for key in report verify gate manual_signoff; do
@@ -345,8 +364,9 @@ PASSED=false
 if [[ "$(jq length <<<"$DRIFT")" -eq 0 && "$AUTOMATION_PASSED" == true ]]; then PASSED=true; fi
 RESULT="$(jq -cn --arg gate_result "$GATE_RESULT_PATH" --argjson receipt_consistent "$([[ "$(jq length <<<"$DRIFT")" -eq 0 ]] && echo true || echo false)" \
   --argjson automation_passed "$AUTOMATION_PASSED" --argjson drift "$DRIFT" \
-  --argjson hard_gates "$RECOMPUTED_GATES" --argjson artifact_states "$RECOMPUTED_STATES" --argjson passed "$PASSED" \
-  '{gate_result:$gate_result,receipt_consistent:$receipt_consistent,automation_passed:$automation_passed,hard_gate_counts:($hard_gates|to_entries|group_by(.value)|map({(.[0].value):length})|add),artifact_states:($artifact_states|with_entries(.value=.value.status)),drift:$drift,passed:$passed}')"
+  --argjson hard_gates "$RECOMPUTED_GATES" --argjson hard_gate_reasons "$RECOMPUTED_REASONS" \
+  --argjson artifact_states "$RECOMPUTED_STATES" --argjson passed "$PASSED" \
+  '{gate_result:$gate_result,receipt_consistent:$receipt_consistent,automation_passed:$automation_passed,hard_gate_counts:($hard_gates|to_entries|group_by(.value)|map({(.[0].value):length})|add),hard_gate_reasons:$hard_gate_reasons,artifact_states:($artifact_states|with_entries(.value=.value.status)),drift:$drift,passed:$passed}')"
 printf '%s\n' "$RESULT"
 if [[ $MALFORMED_ARTIFACTS -gt 0 ]]; then exit 2; fi
 if [[ "$PASSED" == true ]]; then exit 0; fi

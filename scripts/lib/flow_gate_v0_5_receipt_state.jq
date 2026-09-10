@@ -85,12 +85,22 @@ def flow_normalize_verdict($value):
   elif ($value | type) == "object" then
     if $value.status == "passed" and $value.passed != false then "passed"
     elif (($value | has("status")) | not) and $value.passed == true then "passed"
-    elif ($value.status | type) == "string" then $value.status
+    elif ($value.status | type) == "string" then
+      if $value.status == "not_implemented" or $value.status == "not_verified" or $value.status == "not_run"
+      then "not_covered"
+      elif $value.status == "passed" or $value.status == "failed" or $value.status == "not_covered"
+      then $value.status
+      else "not_covered"
+      end
     elif $value.passed == false then "failed"
-    else "not_implemented"
+    else "not_covered"
     end
-  elif ($value | type) == "string" then $value
-  else "not_implemented"
+  elif ($value | type) == "string" then
+    if $value == "not_implemented" or $value == "not_verified" or $value == "not_run"
+    then "not_covered"
+    else $value
+    end
+  else "not_covered"
   end;
 
 def flow_object_value($object; $key):
@@ -131,8 +141,9 @@ def flow_artifact_state($artifact; $input; $actual_head):
      elif $source_head != $actual_head then "source_head_mismatch"
      elif $source_dirty == null then "source_clean_unproven"
      elif $source_dirty != false then "source_dirty"
-     elif $document.passed != true then
-       if ($document | has("passed")) then "artifact_failed" else "artifact_verdict_missing" end
+     # An artifact can be complete and honest while one of its observations is
+     # failed/not_covered. Evidence integrity and gate success are separate.
+     # The producer command's non-zero exit remains visible in checks[].
      else "passed_evidence"
      end) as $status
   | (flow_gate_wiring | to_entries | map(select(.value.artifact == $artifact))) as $owned
@@ -150,7 +161,7 @@ def flow_artifact_state($artifact; $input; $actual_head):
           .[$entry.key] = (
             if $status == "passed_evidence" then
               flow_document_gate_verdict($document; $entry.key; $entry.value.top_level_fallback)
-            else $status
+            else "not_covered"
             end
           )
         )
