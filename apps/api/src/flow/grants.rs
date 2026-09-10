@@ -1709,6 +1709,23 @@ mod database_tests {
         .n
     }
 
+    async fn event_dispatch_count(db: &DatabaseConnection, workspace_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM event_dispatch WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("query runs")
+        .expect("count returns a row")
+        .n
+    }
+
     async fn run_command(state: &AppState, object_id: Uuid, caller: &Caller, command: &str) -> Result<(), ApiError> {
         execute_command(
             state,
@@ -2437,6 +2454,8 @@ mod database_tests {
         let key = "shared-idempotency-key".to_string();
         let epoch_before = authz::read_epoch(&scratch.db, fx.workspace_id).await.expect("epoch");
         let events_before = event_count(&scratch.db, fx.workspace_id).await;
+        let dispatch_before = event_dispatch_count(&scratch.db, fx.workspace_id).await;
+        let inheritance_before = inherit_flag(&scratch.db, page).await;
 
         let preview = set_grants(
             &state,
@@ -2456,6 +2475,11 @@ mod database_tests {
         assert!(preview.event_id.is_none());
         assert_eq!(grant_count(&scratch.db, page).await, 0, "a dry run wrote a grant row");
         assert_eq!(
+            inherit_flag(&scratch.db, page).await,
+            inheritance_before,
+            "a dry run changed inherit_from_parent"
+        );
+        assert_eq!(
             authz::read_epoch(&scratch.db, fx.workspace_id).await.expect("epoch"),
             epoch_before,
             "a dry run advanced the epoch"
@@ -2464,6 +2488,11 @@ mod database_tests {
             event_count(&scratch.db, fx.workspace_id).await,
             events_before,
             "a dry run wrote an event"
+        );
+        assert_eq!(
+            event_dispatch_count(&scratch.db, fx.workspace_id).await,
+            dispatch_before,
+            "a dry run wrote event_dispatch work"
         );
 
         // The same key still works, proving it was never consumed.

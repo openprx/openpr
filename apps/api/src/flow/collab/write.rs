@@ -1360,6 +1360,7 @@ mod isolation_rejection_tests {
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
+    clippy::print_stderr,
     clippy::indexing_slicing,
     clippy::too_many_lines
 )]
@@ -1919,6 +1920,9 @@ mod database_tests {
             final_epoch,
             original_epoch + 1,
             "B's revocation must still have taken effect"
+        );
+        eprintln!(
+            "AUTHZ_CONTENT_EPOCH_EVIDENCE checked_epoch={original_epoch} committed_epoch={final_epoch} outcome=policy_rejected persisted_updates=0"
         );
 
         scratch.drop_self().await;

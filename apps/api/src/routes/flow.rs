@@ -673,7 +673,13 @@ pub async fn set_flow_feature(
 // `apps/api/src/routes/label.rs` variant that treats the env var as an application connection
 // directly, which is a separately tracked inconsistency this package does not touch.
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::print_stderr,
+    clippy::indexing_slicing
+)]
 mod flow_database_tests {
     use std::time::Duration;
 
@@ -1586,6 +1592,225 @@ mod flow_database_tests {
             assert_eq!(body["code"], 404, "{body}");
             assert!(body["data"].is_null(), "{body}");
         }
+
+        scratch.drop_self().await;
+    }
+
+    /// A stale high-privilege cache entry is adversarial input, not authority. The read must miss
+    /// through to the database, and the write path must ignore the cache altogether.
+    #[tokio::test]
+    async fn poisoned_high_privilege_cache_cannot_make_read_visible_or_write_persist() {
+        let scratch = scratch_or_skip!("poisoned_cache_read_write");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "Restricted").await;
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![object_id.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        )
+        .await;
+        let current_epoch = read_epoch(&state, workspace_id).await;
+        assert!(current_epoch > 0, "the poison must be stale by construction");
+        let cache = PermissionCache::for_state(&state).expect("permission cache is available");
+        cache.put_for_test(
+            workspace_id,
+            PrincipalKind::User,
+            member_id,
+            object_id,
+            PermissionLevel::FullAccess,
+            current_epoch - 1,
+        );
+
+        let hidden = body_json(to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(object_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            hidden["code"], 404,
+            "the stale full_access entry made a denied object visible: {hidden}"
+        );
+
+        cache.put_for_test(
+            workspace_id,
+            PrincipalKind::User,
+            member_id,
+            object_id,
+            PermissionLevel::FullAccess,
+            current_epoch - 1,
+        );
+        let head_before = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT cd.head_seq FROM collab_documents cd WHERE cd.object_id = $1",
+                vec![object_id.into()],
+            ))
+            .await
+            .expect("head query runs")
+            .expect("document exists")
+            .try_get::<i64>("", "head_seq")
+            .expect("head_seq reads");
+        let rejected = body_json(to_response(
+            post_flow_object_command(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(object_id),
+                Json(ExecuteFlowCommandRequest {
+                    command: FlowCommandEnvelope {
+                        command_type: "set_title".to_string(),
+                        payload: json!({"title": "Must not persist"}),
+                    },
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_ne!(rejected["code"], 0, "the poisoned cache authorized a write: {rejected}");
+        let head_after = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT cd.head_seq FROM collab_documents cd WHERE cd.object_id = $1",
+                vec![object_id.into()],
+            ))
+            .await
+            .expect("head query runs")
+            .expect("document exists")
+            .try_get::<i64>("", "head_seq")
+            .expect("head_seq reads");
+        assert_eq!(head_after, head_before, "a denied write advanced the canonical head");
+
+        let owner_write = body_json(to_response(
+            post_flow_object_command(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_id),
+                Json(ExecuteFlowCommandRequest {
+                    command: FlowCommandEnvelope {
+                        command_type: "set_title".to_string(),
+                        payload: json!({"title": "Owner persists"}),
+                    },
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(
+            owner_write["code"], 0,
+            "the positive write control failed: {owner_write}"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// Measures the real content-command path with its database inheritance walk fixed at depth
+    /// 32. Each sample includes permission evaluation, isolated CRDT apply, the commit-time epoch
+    /// fence, canonical write, event and dispatch transaction.
+    #[tokio::test]
+    async fn depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets() {
+        let scratch = scratch_or_skip!("depth_32_commit_budget");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let leaf = create_page_as_owner(&state, workspace_id, owner_id, "Depth 32 leaf").await;
+
+        let mut parent = None;
+        let mut root = None;
+        for index in 0..32 {
+            let id = Uuid::new_v4();
+            exec(
+                &state,
+                "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, inherit_from_parent) \
+                 VALUES ($1, $2, 'page', $3, true)",
+                vec![id.into(), workspace_id.into(), parent.into()],
+            )
+            .await;
+            if index == 0 {
+                root = Some(id);
+            }
+            parent = Some(id);
+        }
+        exec(
+            &state,
+            "UPDATE flow_objects SET parent_id = $1 WHERE id = $2",
+            vec![parent.into(), leaf.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "INSERT INTO flow_object_grants (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, 'full_access')",
+            vec![workspace_id.into(), root.expect("root exists").into(), member_id.into()],
+        )
+        .await;
+        let chain = crate::flow::collab::authz::inheritance_chain(&state.db, workspace_id, leaf)
+            .await
+            .expect("the exact depth-32 chain is complete");
+        assert_eq!(chain.ids.len(), 33, "root depth zero plus leaf depth 32");
+
+        let mut samples_ms = Vec::new();
+        for sample in 0..10 {
+            let started = std::time::Instant::now();
+            let body = body_json(to_response(
+                post_flow_object_command(
+                    State(state.clone()),
+                    claims_for(member_id),
+                    None,
+                    Path(leaf),
+                    Json(ExecuteFlowCommandRequest {
+                        command: FlowCommandEnvelope {
+                            command_type: "set_title".to_string(),
+                            payload: json!({"title": format!("Depth 32 sample {sample}")}),
+                        },
+                        expected_frontier: None,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        message: None,
+                    }),
+                )
+                .await,
+            ))
+            .await;
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(body["code"], 0, "the measured depth-32 command failed: {body}");
+            samples_ms.push(elapsed);
+        }
+        samples_ms.sort_by(f64::total_cmp);
+        assert!(!samples_ms.is_empty());
+        let p95_index = ((samples_ms.len() * 95).div_ceil(100)).saturating_sub(1);
+        let p95_ms = samples_ms[p95_index];
+        let max_ms = *samples_ms.last().expect("samples are non-empty");
+        eprintln!(
+            "AUTHZ_DEPTH32_COMMIT_BUDGET_EVIDENCE {}",
+            json!({"depth": 32, "samples": samples_ms.len(), "p95_ms": p95_ms, "max_ms": max_ms})
+        );
+        assert!(p95_ms <= 25.0, "depth-32 commit-path p95 {p95_ms:.3}ms exceeded 25ms");
+        assert!(max_ms <= 100.0, "depth-32 commit-path max {max_ms:.3}ms exceeded 100ms");
 
         scratch.drop_self().await;
     }

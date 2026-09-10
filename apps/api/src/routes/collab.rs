@@ -1826,6 +1826,43 @@ mod collab_database_tests {
         scratch.drop_self().await;
     }
 
+    /// A ticket that was valid when issued must still be rejected once `PostgreSQL`'s expiry has
+    /// passed. The positive issuance/upgrade fixture above prevents an unconditional rejection
+    /// from satisfying this negative branch.
+    #[tokio::test]
+    async fn an_expired_ticket_is_rejected_at_atomic_consumption() {
+        let scratch = scratch_or_skip!("ticket-expired-consume");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let addr = spawn_server(state.clone()).await;
+        let client_id = "expired-client";
+        let ticket = issue_ticket(addr, &jwt_for(owner_id), workspace_id, document_id, client_id).await;
+
+        exec(
+            &state,
+            "UPDATE collab_tickets \
+             SET created_at = now() - interval '61 seconds', \
+                 expires_at = now() - interval '1 second' \
+             WHERE workspace_id = $1",
+            vec![workspace_id.into()],
+        )
+        .await;
+        let (status, body) = raw_upgrade_request(addr, &ticket, client_id).await;
+        assert_ne!(status, reqwest::StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            status,
+            reqwest::StatusCode::OK,
+            "the error stays in the envelope: {body}"
+        );
+        assert_eq!(
+            body["code"], 401,
+            "an expired ticket must be indistinguishable from an invalid ticket: {body}"
+        );
+
+        scratch.drop_self().await;
+    }
+
     /// `collab-protocol-v1.md` §3: "Upgrade 前原子消费 ticket，并验证其
     /// `user`/`workspace`/`document`/`client_id`/`Origin` 绑定与 `flow_enabled`".
     ///

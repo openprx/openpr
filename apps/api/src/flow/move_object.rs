@@ -990,7 +990,11 @@ async fn run_locked_phase(
         &input.role,
     )
     .await?;
-    if caller_before < authz::PermissionLevel::FullAccess {
+    #[cfg(test)]
+    let skip_locked_reauthorization = std::env::var_os("OPENPR_FLOW_TEST_MUTATION_SKIP_MOVE_REAUTH").is_some();
+    #[cfg(not(test))]
+    let skip_locked_reauthorization = false;
+    if !skip_locked_reauthorization && caller_before < authz::PermissionLevel::FullAccess {
         return Ok(LockedOutcome::PermissionRevoked(
             "full_access on the moved object is required to move it",
         ));
@@ -1004,7 +1008,7 @@ async fn run_locked_phase(
         &input.role,
     )
     .await?;
-    if target_level < authz::PermissionLevel::Edit {
+    if !skip_locked_reauthorization && target_level < authz::PermissionLevel::Edit {
         return Ok(LockedOutcome::PermissionRevoked(
             "edit on the target parent is required to move an object under it",
         ));
@@ -1407,6 +1411,54 @@ pub async fn execute(
     execute_on(state, runtime::runtime(), input, workspace_id, checked_epoch).await
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct PreparedMoveBarrier {
+    prepared: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+fn prepared_move_barriers()
+-> &'static parking_lot::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<PreparedMoveBarrier>>> {
+    static BARRIERS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<Uuid, std::sync::Arc<PreparedMoveBarrier>>>,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn install_prepared_move_barrier(workspace_id: Uuid) -> std::sync::Arc<PreparedMoveBarrier> {
+    let barrier = std::sync::Arc::new(PreparedMoveBarrier::default());
+    prepared_move_barriers().lock().insert(workspace_id, barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn pause_after_unlocked_move_checks(workspace_id: Uuid) {
+    let barrier = prepared_move_barriers().lock().remove(&workspace_id);
+    if let Some(barrier) = barrier {
+        barrier.prepared.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn move_locked_phase_samples() -> &'static parking_lot::Mutex<Vec<f64>> {
+    static SAMPLES: std::sync::OnceLock<parking_lot::Mutex<Vec<f64>>> = std::sync::OnceLock::new();
+    SAMPLES.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn clear_move_locked_phase_samples() {
+    move_locked_phase_samples().lock().clear();
+}
+
+#[cfg(test)]
+fn take_move_locked_phase_samples() -> Vec<f64> {
+    std::mem::take(&mut *move_locked_phase_samples().lock())
+}
+
 /// [`execute`] against an explicit collab runtime.
 ///
 /// The runtime is a parameter rather than a `runtime::runtime()` call inside the body for one
@@ -1567,6 +1619,13 @@ pub async fn execute_on(
     }
     let plan = plan;
 
+    // A test-only, workspace-scoped one-shot pause after both unlocked permission checks and the
+    // complete move plan, but before any coordinator permit or database transaction. It lets the
+    // linearization fixtures commit a real revocation/downgrade in exactly that window. Production
+    // builds contain neither the registry nor this await point.
+    #[cfg(test)]
+    pause_after_unlocked_move_checks(workspace_id).await;
+
     // [layer 0] every contended document's admission slot, ascending, before anything else.
     let Ok(_permits) = collab.coordinator.acquire_many(&plan.document_lock_order).await else {
         return Err(ApiError::server_draining(
@@ -1635,6 +1694,8 @@ pub async fn execute_on(
         }
 
         let tx = state.db.begin().await?;
+        #[cfg(test)]
+        let locked_phase_started = std::time::Instant::now();
         let mut observed_lock_order = Vec::with_capacity(plan.document_lock_order.len());
         let outcome = run_locked_phase(&tx, &ctx, &plan, &payload, &plans, &mut observed_lock_order).await;
 
@@ -1656,6 +1717,10 @@ pub async fn execute_on(
                 committed_epoch,
             } => {
                 tx.commit().await?;
+                #[cfg(test)]
+                move_locked_phase_samples()
+                    .lock()
+                    .push(locked_phase_started.elapsed().as_secs_f64() * 1000.0);
                 match super::collab::permission_cache::PermissionCache::for_state(state) {
                     Ok(cache) => {
                         cache.invalidate_workspace(workspace_id);
@@ -2153,7 +2218,7 @@ mod database_tests {
     use crate::flow::collab::coordinator::ascending_document_lock_order;
     use crate::flow::collab::registry::OutboundEvent;
     use crate::flow::collab::runtime::CollabRuntime;
-    use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object};
+    use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
     use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
     use crate::flow::grants::{Caller, GrantRequest, SetGrantsInput, set_grants};
     use crate::flow::model::AcceptedChange;
@@ -3069,7 +3134,6 @@ mod database_tests {
         let move_task = {
             let state = state.clone();
             let fx = fx.clone();
-            let runtime = runtime.clone();
             let start = start.clone();
             tokio::spawn(async move {
                 let input = move_input(leaf, fx.owner_id, "owner", json!({ "target_object_id": target_parent }));
@@ -3120,6 +3184,328 @@ mod database_tests {
             level_for(&scratch.db, &fx, leaf, fx.member_id, "member").await,
             PermissionLevel::FullAccess,
             "the depth-20 result must combine the committed move with the concurrent boundary grant"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// Controlled reproductions of ADR-0012's move races. The move is paused only after its
+    /// unlocked source/target authorization and plan are complete; the competing authorization
+    /// transaction then commits before the move is released into its locked phase.
+    #[tokio::test]
+    async fn concurrent_source_revocation_and_target_downgrade_are_rechecked_before_move_commit() {
+        let scratch = scratch_or_skip!("move_reauthorization_races");
+        let state = Arc::new(state_for(scratch.db.clone()));
+        let fx = Arc::new(seed_workspace(&scratch.db).await);
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let source_parent = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let target_parent = create(&state, &fx, "page", Some(fx.project_b), Some(nav_b)).await;
+        let moving = create(&state, &fx, "page", Some(fx.project_a), Some(source_parent)).await;
+        for object_id in [source_parent, target_parent] {
+            exec(
+                &scratch.db,
+                "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+                vec![object_id.into()],
+            )
+            .await;
+        }
+
+        let replace = |object_id, level: &'static str| {
+            let state = state.clone();
+            let fx = fx.clone();
+            async move {
+                set_grants(
+                    &state,
+                    fx.workspace_id,
+                    SetGrantsInput {
+                        object_id,
+                        caller: Caller {
+                            actor_id: fx.owner_id,
+                            principal_kind: "user".to_string(),
+                            role: "owner".to_string(),
+                            origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                        },
+                        grants: if level.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![GrantRequest {
+                                principal_kind: "user".to_string(),
+                                principal_id: fx.member_id,
+                                level: level.to_string(),
+                            }]
+                        },
+                        confirm_self_lockout: false,
+                        dry_run: false,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                    },
+                )
+                .await
+            }
+        };
+        replace(source_parent, "full_access")
+            .await
+            .expect("member receives source full_access");
+        replace(target_parent, "edit")
+            .await
+            .expect("member receives target edit");
+
+        let heads_before = (
+            head_seq(&scratch.db, document_of(&scratch.db, nav_a).await).await,
+            head_seq(&scratch.db, document_of(&scratch.db, nav_b).await).await,
+        );
+        let moved_before = moved_event_count(&scratch.db, fx.workspace_id).await;
+
+        // Race (a): source full_access was used by execute_command's first check, then revoked.
+        let barrier = super::install_prepared_move_barrier(fx.workspace_id);
+        let move_state = state.clone();
+        let fx_for_move = fx.clone();
+        let move_a = tokio::spawn(async move {
+            execute_command(
+                &move_state,
+                move_input(
+                    moving,
+                    fx_for_move.member_id,
+                    "member",
+                    json!({"target_object_id": target_parent}),
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), barrier.prepared.notified())
+            .await
+            .expect("move A reached the controlled post-check barrier");
+        replace(source_parent, "")
+            .await
+            .expect("B commits the source grant revocation");
+        barrier.release.notify_one();
+        let err = move_a
+            .await
+            .expect("move task joins")
+            .expect_err("the stale source authorization must not commit a move");
+        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "got {err:?}");
+        assert_eq!(parent_of(&scratch.db, moving).await, Some(source_parent));
+        assert_eq!(moved_event_count(&scratch.db, fx.workspace_id).await, moved_before);
+        assert_eq!(
+            (
+                head_seq(&scratch.db, document_of(&scratch.db, nav_a).await).await,
+                head_seq(&scratch.db, document_of(&scratch.db, nav_b).await).await
+            ),
+            heads_before,
+            "race (a) advanced a navigator head"
+        );
+
+        // Race (b): restore the source grant and target edit, let the first checks pass, then
+        // downgrade only the target before the locked phase.
+        replace(source_parent, "full_access")
+            .await
+            .expect("source access is restored");
+        replace(target_parent, "edit").await.expect("target edit is restored");
+        let barrier = super::install_prepared_move_barrier(fx.workspace_id);
+        let move_state = state.clone();
+        let fx_for_move = fx.clone();
+        let move_b = tokio::spawn(async move {
+            execute_command(
+                &move_state,
+                move_input(
+                    moving,
+                    fx_for_move.member_id,
+                    "member",
+                    json!({"target_object_id": target_parent}),
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), barrier.prepared.notified())
+            .await
+            .expect("move A reached the target-downgrade barrier");
+        replace(target_parent, "view")
+            .await
+            .expect("B commits the target downgrade");
+        barrier.release.notify_one();
+        let err = move_b
+            .await
+            .expect("move task joins")
+            .expect_err("the stale target authorization must not commit a move");
+        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "got {err:?}");
+        assert_eq!(parent_of(&scratch.db, moving).await, Some(source_parent));
+        assert_eq!(moved_event_count(&scratch.db, fx.workspace_id).await, moved_before);
+        eprintln!("AUTHZ_MOVE_RACE_EVIDENCE race_a=policy_rejected_zero_move race_b=policy_rejected_parent_unchanged");
+
+        scratch.drop_self().await;
+    }
+
+    /// The four v0.5 resource classes are released from one controlled epoch-row barrier: a
+    /// two-navigator move, a real grant replacement, a live-session subscription replacement,
+    /// and a content write. Every task must terminate without an inverse-order hang; a content
+    /// writer that loses the epoch race may fail closed, but may never report success without a
+    /// canonical row.
+    #[tokio::test]
+    async fn controlled_move_grant_subscription_and_content_injection_has_no_inverse_lock_cycle() {
+        let scratch = scratch_or_skip!("mixed_lock_rank_injection");
+        let state = Arc::new(state_for(scratch.db.clone()));
+        let fx = Arc::new(seed_workspace(&scratch.db).await);
+        let runtime = Arc::new(CollabRuntime::default());
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let moving = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let content = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+        let content_document = document_of(&scratch.db, content).await;
+        let original_session = Uuid::new_v4();
+        let _registered = runtime
+            .registry
+            .try_register_authorized(
+                content_document,
+                content,
+                fx.member_id,
+                fx.workspace_id,
+                original_session,
+                0,
+            )
+            .expect("the original subscription registers");
+
+        let blocker = scratch.db.begin().await.expect("barrier transaction begins");
+        authz::lock_epoch_for_update(&blocker, fx.workspace_id)
+            .await
+            .expect("the controlled barrier holds the first lock rank");
+        let start = Arc::new(tokio::sync::Barrier::new(5));
+
+        let move_task = {
+            let state = state.clone();
+            let fx = fx.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                execute_command(
+                    &state,
+                    move_input(moving, fx.owner_id, "owner", json!({"target_object_id": nav_b})),
+                )
+                .await
+            })
+        };
+        let grant_task = {
+            let state = state.clone();
+            let fx = fx.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                set_grants(
+                    &state,
+                    fx.workspace_id,
+                    SetGrantsInput {
+                        object_id: content,
+                        caller: Caller {
+                            actor_id: fx.owner_id,
+                            principal_kind: "user".to_string(),
+                            role: "owner".to_string(),
+                            origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                        },
+                        grants: vec![GrantRequest {
+                            principal_kind: "user".to_string(),
+                            principal_id: fx.member_id,
+                            level: "view".to_string(),
+                        }],
+                        confirm_self_lockout: false,
+                        dry_run: false,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                    },
+                )
+                .await
+            })
+        };
+        let content_task = {
+            let state = state.clone();
+            let fx = fx.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                execute_command(
+                    &state,
+                    ExecuteCommandInput {
+                        origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                        object_id: content,
+                        actor_id: fx.owner_id,
+                        principal_kind: "user".to_string(),
+                        role: "owner".to_string(),
+                        command_type: "set_title".to_string(),
+                        payload: json!({"title": "mixed injection content"}),
+                        expected_frontier: None,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        message: None,
+                        origin_client_id: "mixed-content".to_string(),
+                    },
+                )
+                .await
+            })
+        };
+        let subscription_task = {
+            let runtime = runtime.clone();
+            let fx = fx.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                runtime.registry.unregister(content_document, original_session);
+                let replacement = Uuid::new_v4();
+                let registered = runtime.registry.try_register_authorized(
+                    content_document,
+                    content,
+                    fx.member_id,
+                    fx.workspace_id,
+                    replacement,
+                    0,
+                );
+                (replacement, registered)
+            })
+        };
+
+        start.wait().await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!move_task.is_finished(), "move did not reach the epoch barrier");
+        assert!(
+            !grant_task.is_finished(),
+            "grant change did not reach the epoch barrier"
+        );
+        assert!(
+            !content_task.is_finished(),
+            "content write did not reach the epoch barrier"
+        );
+        assert!(
+            subscription_task.is_finished(),
+            "the in-memory subscription change unexpectedly waited on a DB lock"
+        );
+        blocker.rollback().await.expect("the barrier releases all DB tasks");
+
+        let moved = tokio::time::timeout(Duration::from_secs(30), move_task)
+            .await
+            .expect("move must not hang")
+            .expect("move task joins")
+            .expect("owner move commits after serialization");
+        assert_eq!(parent_of(&scratch.db, moving).await, Some(nav_b));
+        assert_eq!(
+            command_result(&moved)["existing_document_cardinality"],
+            json!("bounded_many")
+        );
+        let grant = tokio::time::timeout(Duration::from_secs(30), grant_task)
+            .await
+            .expect("grant must not hang")
+            .expect("grant task joins")
+            .expect("grant change commits after serialization");
+        assert!(grant.applied);
+        let content_result = tokio::time::timeout(Duration::from_secs(30), content_task)
+            .await
+            .expect("content must not hang")
+            .expect("content task joins");
+        let content_outcome = match content_result {
+            Ok(_) => "accepted",
+            Err(ref error) if error.kind() == ApiErrorKind::PolicyRejected => "epoch_fenced",
+            Err(error) => panic!("content write ended in an unexpected state: {error:?}"),
+        };
+        let (replacement, replacement_result) = subscription_task.await.expect("subscription task joins");
+        let _replacement = replacement_result.expect("replacement subscription registers");
+        assert_eq!(runtime.registry.session_count(content_document), 1);
+        runtime.registry.unregister(content_document, replacement);
+        eprintln!(
+            "MULTI_MIXED_INJECTION_EVIDENCE move=committed grant=committed subscription=replaced content={content_outcome} no_hang=true"
         );
 
         scratch.drop_self().await;
@@ -4350,6 +4736,7 @@ mod database_tests {
         }
         assert_eq!(subtree.len(), super::MOVE_SUBTREE_NODES_MAX);
 
+        super::clear_move_locked_phase_samples();
         let started = std::time::Instant::now();
         let change = run_move(
             &state,
@@ -4376,6 +4763,38 @@ mod database_tests {
             started.elapsed().as_secs_f64() * 1000.0
         );
         assert_eq!(command_result(&change)["cascaded_node_count"], json!(100));
+        let mut lock_hold_samples = super::take_move_locked_phase_samples();
+        assert!(
+            !lock_hold_samples.is_empty(),
+            "the exact-boundary move produced no lock-hold measurement"
+        );
+        lock_hold_samples.sort_by(f64::total_cmp);
+        let p95_index = ((lock_hold_samples.len() * 95).div_ceil(100)).saturating_sub(1);
+        let lock_hold_ms_p95 = lock_hold_samples[p95_index];
+        let lock_hold_ms_max = *lock_hold_samples.last().expect("samples are non-empty");
+        let gate_host = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .expect("the gate host identity must be available");
+        eprintln!(
+            "MOVE_SUBTREE_LIMIT_EVIDENCE {}",
+            json!({
+                "host": gate_host,
+                "samples": lock_hold_samples.len(),
+                "lock_hold_ms_p95": lock_hold_ms_p95,
+                "lock_hold_ms_max": lock_hold_ms_max,
+                "statement_timeout_count": 0,
+                "lock_timeout_count": 0,
+                "aborted_count": 0,
+                "exact_boundary": super::MOVE_SUBTREE_NODES_MAX,
+            })
+        );
         for object_id in &subtree {
             assert_eq!(project_of(&scratch.db, *object_id).await, Some(fx.project_b));
         }
@@ -4550,6 +4969,12 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
+    #[derive(FromQueryResult)]
+    struct NavigatorDocumentRow {
+        document_id: Uuid,
+        object_id: Uuid,
+    }
+
     /// `limits-v1.md`'s `move_subtree_nodes_max` `tombstone_interaction`: "级联把
     /// `navigator_tombstones` 的增长从「每命令 1 个」变成「每命令 N 个」... v0.5 强制的
     /// `navigator_tombstone_growth_measured` 取样口径应覆盖级联命令".
@@ -4617,9 +5042,13 @@ mod database_tests {
             a_after.snapshot_bytes,
         );
 
+        let observed_growth = if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_HIDE_TOMBSTONE_GROWTH").is_some() {
+            0
+        } else {
+            b_after.tombstone_count - b_before.tombstone_count
+        };
         assert_eq!(
-            b_after.tombstone_count - b_before.tombstone_count,
-            cascaded,
+            observed_growth, cascaded,
             "one command removed N entries, so it left N tombstones — the per-command growth the \
              contract says the sampling must cover is N, not 1"
         );
@@ -4635,6 +5064,60 @@ mod database_tests {
                 "snapshot_bytes must be a real measurement on the {label} navigator, not a default \
                  zero the gate would read as a missing field"
             );
+        }
+
+        let navigator_documents = NavigatorDocumentRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT cd.id AS document_id, fo.id AS object_id \
+             FROM flow_objects fo JOIN collab_documents cd ON cd.object_id = fo.id \
+             WHERE fo.workspace_id = $1 AND fo.object_type = 'navigator' ORDER BY cd.id",
+            vec![fx.workspace_id.into()],
+        ))
+        .all(&scratch.db)
+        .await
+        .expect("database-authoritative navigator document enumeration runs");
+        assert!(
+            !navigator_documents.is_empty(),
+            "the authoritative navigator set must be non-empty"
+        );
+        let queried_document_count = navigator_documents.len();
+        let mut measured_documents = Vec::with_capacity(queried_document_count);
+        for row in navigator_documents {
+            let census = navigator_census(&scratch.db, row.object_id).await;
+            measured_documents.push(json!({
+                "document_id": row.document_id,
+                "live_entry_count": census.live_entry_count,
+                "tombstone_count": census.tombstone_count,
+                "snapshot_bytes": census.snapshot_bytes,
+                "reclamation_signal": census.tombstone_count > census.live_entry_count,
+            }));
+        }
+        assert_eq!(
+            measured_documents.len(),
+            queried_document_count,
+            "every database-authoritative navigator document must be decoded and measured"
+        );
+        if let Some(path) = std::env::var_os("OPENPR_FLOW_NAVIGATOR_TOMBSTONE_EVIDENCE_OUT") {
+            let evidence = json!({
+                "schema_version": "sylvode.flow.navigator-tombstone-evidence.v1",
+                "workspace_id": fx.workspace_id,
+                "queried_document_count": queried_document_count,
+                "measured_document_count": measured_documents.len(),
+                "documents": measured_documents,
+                "move_out_and_back": true,
+                "growth": {
+                    "source_document_id": document_of(&scratch.db, nav_b).await,
+                    "before_tombstone_count": b_before.tombstone_count,
+                    "after_tombstone_count": b_after.tombstone_count,
+                    "delta": b_after.tombstone_count - b_before.tombstone_count,
+                    "snapshot_bytes_after": b_after.snapshot_bytes,
+                },
+            });
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&evidence).expect("navigator evidence serializes"),
+            )
+            .expect("navigator evidence writes");
         }
         scratch.drop_self().await;
     }

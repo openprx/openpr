@@ -11,8 +11,8 @@ set -euo pipefail
 #   1. real Rust tests for the two-document move and the layer-0 coordinator;
 #   2. fail-closed source enumeration for R17's two database reachability
 #      premises (transaction scope, not request scope); and
-#   3. the mixed move/grant/subscription/content injection, which is not wired
-#      in this source package yet and therefore remains `not_implemented`.
+#   3. controlled mixed move/grant/subscription/content injection and frozen
+#      subtree-ceiling boundary/measurement evidence.
 # It also refuses to attribute observations from dirty validated source to the
 # clean `source_head`: any change under the Cargo workspace source/migrations
 # scope makes the artifact a hard non-pass and is listed in the JSON.
@@ -26,9 +26,10 @@ source "$ROOT_DIR/scripts/lib/flow_contract_path.sh"
 
 REPO_ROOT="$ROOT_DIR"
 CONTRACTS_ROOT="/opt/working/sylvode-flow"
-EVIDENCE_ROOT="/opt/working/sylvode-flow/evidence/v0.5"
+EVIDENCE_ROOT="${TMPDIR:-/tmp}/openpr-flow-evidence/v0.5"
 ADR_PATH=""
 JSON_MODE=0
+DATABASE_URL="postgresql://flowtest:flowtest@127.0.0.1:25433/postgres"
 
 usage() {
   cat <<'EOF'
@@ -44,7 +45,7 @@ Options:
   --contracts-root DIR    Root containing decisions/. Default:
                           /opt/working/sylvode-flow
   --evidence-root DIR     Where multi-document-result.json is written.
-                          Default: /opt/working/sylvode-flow/evidence/v0.5
+                          Default: /tmp/openpr-flow-evidence/v0.5
   --repo-root DIR         Repository containing apps/api and the Cargo
                           workspace. Default: this checkout.
   --json                  Required for CLI-contract compatibility.
@@ -78,7 +79,7 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
-for tool in jq git python3 cargo; do
+for tool in jq git python3 cargo grep mktemp realpath rmdir; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     exit 2
@@ -87,10 +88,24 @@ done
 if ! ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")"; then
   exit 2
 fi
+LIMITS_PATH="$CONTRACTS_ROOT/contracts/limits-v1.md"
+if [[ ! -f "$LIMITS_PATH" ]]; then
+  echo "FAIL: limits contract not found: $LIMITS_PATH" >&2
+  exit 2
+fi
 if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
+CONTRACTS_REAL="$(realpath -m "$CONTRACTS_ROOT")"
+EVIDENCE_REAL="$(realpath -m "$EVIDENCE_ROOT")"
+case "$EVIDENCE_REAL/" in
+  "$CONTRACTS_REAL/"*)
+    echo "FAIL: refusing to write multi-document evidence inside the read-only contract checkout: $EVIDENCE_REAL" >&2
+    exit 2
+    ;;
+esac
+EVIDENCE_ROOT="$EVIDENCE_REAL"
 
 FLOW_ROOT="$REPO_ROOT/apps/api/src/flow"
 for source_file in \
@@ -388,12 +403,15 @@ fi
 # ---- 2. Dynamic move/coordinator tests ----
 MOVE_LOG="$EVIDENCE_ROOT/logs/multi-document.move_object.cargo_test.log"
 COORDINATOR_LOG="$EVIDENCE_ROOT/logs/multi-document.coordinator.cargo_test.log"
+MUTATION_LIMIT_LOG="$EVIDENCE_ROOT/logs/multi-document.mutation-subtree-limit.log"
+MUTATION_COORDINATOR_LOG="$EVIDENCE_ROOT/logs/multi-document.mutation-coordinator-order.log"
 
 run_cargo_suite() {
   local filter="$1" log="$2" start_ns end_ns status
   start_ns="$(date +%s%N)"
   set +e
-  (cd "$REPO_ROOT" && cargo test -p api --all-features "$filter" -- --nocapture --test-threads=1) >"$log" 2>&1
+  (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" \
+    cargo test -p api --all-features "$filter" -- --nocapture --test-threads=1) >"$log" 2>&1
   status=$?
   set -e
   end_ns="$(date +%s%N)"
@@ -408,15 +426,87 @@ echo "=== cargo test -p api --all-features collab::coordinator ===" >&2
 read -r COORDINATOR_EXIT COORDINATOR_WALL_MS < <(run_cargo_suite collab::coordinator "$COORDINATOR_LOG")
 echo "  exit=$COORDINATOR_EXIT wall_ms=$COORDINATOR_WALL_MS log=$COORDINATOR_LOG" >&2
 
+# Falsification runs use the committed source in a detached worktree so the artifact proves that
+# the boundary/order detectors distinguish the protected implementation from a concrete fault.
+MUTATION_PARENT="$(mktemp -d "$(dirname "$REPO_ROOT")/openpr-multi-mutations.XXXXXX")"
+MUTATION_REPO="$MUTATION_PARENT/source"
+cleanup_mutation_worktree() {
+  if git -C "$REPO_ROOT" worktree list --porcelain | grep -Fxq "worktree $MUTATION_REPO"; then
+    git -C "$REPO_ROOT" worktree remove --force "$MUTATION_REPO" >/dev/null 2>&1 || true
+  fi
+  rmdir "$MUTATION_PARENT" >/dev/null 2>&1 || true
+}
+trap cleanup_mutation_worktree EXIT
+git -C "$REPO_ROOT" worktree add --detach "$MUTATION_REPO" "$SOURCE_HEAD" >/dev/null
+
+apply_exact_mutation() {
+  local relative_path="$1" before="$2" after="$3"
+  python3 - "$MUTATION_REPO/$relative_path" "$before" "$after" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+before, after = sys.argv[2:]
+source = path.read_text(encoding="utf-8")
+count = source.count(before)
+if count != 1:
+    raise SystemExit(f"mutation target must occur exactly once in {path}: observed {count}")
+path.write_text(source.replace(before, after, 1), encoding="utf-8")
+PY
+}
+
+run_mutation_test() {
+  local log="$1" marker="$2" test_name="$3" started ended status
+  started="$(date +%s%N)"
+  set +e
+  (cd "$MUTATION_REPO" && {
+    printf '%s\n' "$marker"
+    OPENPR_TEST_DATABASE_URL="$DATABASE_URL" cargo test --locked -p api --lib --all-features \
+      "$test_name" -- --exact --nocapture --test-threads=1
+  }) >"$log" 2>&1
+  status=$?
+  set -e
+  ended="$(date +%s%N)"
+  printf '%s %s\n' "$status" "$(((ended - started) / 1000000))"
+}
+
+LIMIT_TEST="flow::move_object::database_tests::the_subtree_ceiling_admits_one_hundred_nodes_and_refuses_one_hundred_and_one"
+apply_exact_mutation "apps/api/src/flow/move_object.rs" \
+  'if total > i64::try_from(MOVE_SUBTREE_NODES_MAX).unwrap_or(i64::MAX) {' \
+  'if total >= i64::try_from(MOVE_SUBTREE_NODES_MAX).unwrap_or(i64::MAX) {'
+read -r MUTATION_LIMIT_EXIT MUTATION_LIMIT_MS < <(run_mutation_test \
+  "$MUTATION_LIMIT_LOG" "GATECHAIN_MUTATION_MOVE_SUBTREE_EXACT_BOUNDARY_REJECTED_ACTIVE" "$LIMIT_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/move_object.rs
+
+COORDINATOR_TEST="flow::collab::coordinator::tests::reversed_multi_document_requests_both_succeed_because_acquire_many_sorts"
+apply_exact_mutation "apps/api/src/flow/collab/coordinator.rs" \
+  '    ordered.sort_unstable();' \
+  '    // mutation: preserve caller order'
+read -r MUTATION_COORDINATOR_EXIT MUTATION_COORDINATOR_MS < <(run_mutation_test \
+  "$MUTATION_COORDINATOR_LOG" "GATECHAIN_MUTATION_COORDINATOR_SORT_REMOVED_ACTIVE" "$COORDINATOR_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/coordinator.rs
+cleanup_mutation_worktree
+trap - EXIT
+echo "  subtree limit mutation exit=$MUTATION_LIMIT_EXIT wall_ms=$MUTATION_LIMIT_MS log=$MUTATION_LIMIT_LOG" >&2
+echo "  coordinator order mutation exit=$MUTATION_COORDINATOR_EXIT wall_ms=$MUTATION_COORDINATOR_MS log=$MUTATION_COORDINATOR_LOG" >&2
+
 DYNAMIC_JSON="$(python3 - \
   "$MOVE_LOG" "$MOVE_EXIT" "$MOVE_WALL_MS" \
-  "$COORDINATOR_LOG" "$COORDINATOR_EXIT" "$COORDINATOR_WALL_MS" <<'PY'
+  "$COORDINATOR_LOG" "$COORDINATOR_EXIT" "$COORDINATOR_WALL_MS" \
+  "$LIMITS_PATH" "$FLOW_ROOT/move_object.rs" \
+  "$MUTATION_LIMIT_LOG" "$MUTATION_LIMIT_EXIT" "$MUTATION_LIMIT_MS" \
+  "$MUTATION_COORDINATOR_LOG" "$MUTATION_COORDINATOR_EXIT" "$MUTATION_COORDINATOR_MS" <<'PY'
 import json
 import pathlib
 import re
 import sys
 
-move_log, move_exit, move_wall, coordinator_log, coordinator_exit, coordinator_wall = sys.argv[1:]
+(
+    move_log, move_exit, move_wall, coordinator_log, coordinator_exit, coordinator_wall,
+    limits_path, move_source_path,
+    mutation_limit_log, mutation_limit_exit, mutation_limit_ms,
+    mutation_coordinator_log, mutation_coordinator_exit, mutation_coordinator_ms,
+) = sys.argv[1:]
 
 
 def parse_suite(path, command, exit_code, wall_ms, tests):
@@ -490,6 +580,8 @@ move = parse_suite(
         ("document_lock_order_is_identical_whichever_direction_the_move_goes", True),
         ("cross_project_move_advances_both_navigator_heads_in_one_ascending_ordered_transaction", True),
         ("two_concurrent_moves_with_reversed_contended_sets_both_complete_cleanly", True),
+        ("controlled_move_grant_subscription_and_content_injection_has_no_inverse_lock_cycle", True),
+        ("the_subtree_ceiling_admits_one_hundred_nodes_and_refuses_one_hundred_and_one", True),
     ],
 )
 coordinator = parse_suite(
@@ -499,12 +591,125 @@ coordinator = parse_suite(
     coordinator_wall,
     [("reversed_multi_document_requests_both_succeed_because_acquire_many_sorts", False)],
 )
+
+limits_text = pathlib.Path(limits_path).read_text(encoding="utf-8")
+move_source = pathlib.Path(move_source_path).read_text(encoding="utf-8")
+
+def structured_limit(name):
+    start = re.search(rf"^{re.escape(name)}:\s*$", limits_text, re.M)
+    if not start:
+        return {"status": "missing", "value": None, "set_by": "", "rule": "", "frozen": False}
+    tail = limits_text[start.end():]
+    end = re.search(r"^[a-z][a-z0-9_]*\s*:\s*$", tail, re.M)
+    body = tail[:end.start()] if end else tail
+    def field(key):
+        match = re.search(rf"^\s+{key}:\s*(.+?)\s*$", body, re.M)
+        return match.group(1).strip() if match else ""
+    status, set_by, rule = field("status"), field("set_by"), field("rule")
+    value_match = re.match(r"([0-9][0-9,]*)", status)
+    value = int(value_match.group(1).replace(",", "")) if value_match else None
+    return {"status": status, "value": value, "set_by": set_by, "rule": rule,
+            "frozen": value is not None and value > 0 and bool(set_by) and bool(rule)}
+
+subtree_contract = structured_limit("move_subtree_nodes_max")
+constant_match = re.search(r"pub\s+const\s+MOVE_SUBTREE_NODES_MAX\s*:\s*usize\s*=\s*([0-9_]+)\s*;", move_source)
+source_limit = int(constant_match.group(1).replace("_", "")) if constant_match else None
+contract_source_match = subtree_contract["frozen"] and source_limit == subtree_contract["value"]
+
+move_text = pathlib.Path(move_log).read_text(encoding="utf-8", errors="replace")
+marker = re.search(r"MOVE_SUBTREE_LIMIT_EVIDENCE\s+(\{[^\n]+\})", move_text)
+try:
+    measurement = json.loads(marker.group(1)) if marker else {}
+except json.JSONDecodeError:
+    measurement = {}
+required_measurement = {
+    "host", "samples", "lock_hold_ms_p95", "lock_hold_ms_max",
+    "statement_timeout_count", "lock_timeout_count", "aborted_count", "exact_boundary",
+}
+measurement_complete = (
+    required_measurement <= measurement.keys()
+    and isinstance(measurement.get("host"), str)
+    and bool(measurement.get("host"))
+    and measurement.get("host") != "unknown-host"
+    and isinstance(measurement.get("samples"), int) and measurement["samples"] > 0
+    and isinstance(measurement.get("lock_hold_ms_p95"), (int, float)) and measurement["lock_hold_ms_p95"] >= 0
+    and isinstance(measurement.get("lock_hold_ms_max"), (int, float)) and measurement["lock_hold_ms_max"] >= 0
+    and all(isinstance(measurement.get(key), int) and measurement[key] == 0
+            for key in ("statement_timeout_count", "lock_timeout_count", "aborted_count"))
+    and measurement.get("exact_boundary") == subtree_contract.get("value")
+)
+
+mixed_match = re.search(
+    r"MULTI_MIXED_INJECTION_EVIDENCE move=committed grant=committed subscription=replaced "
+    r"content=(?:committed|epoch_fenced) no_hang=true",
+    move_text,
+)
+mixed_test = next(
+    (item for item in move["assertions"]
+     if item["name"] == "controlled_move_grant_subscription_and_content_injection_has_no_inverse_lock_cycle"),
+    None,
+)
+mixed = {
+    "status": "passed" if mixed_match and mixed_test and mixed_test["passed"] else "failed",
+    "components": ["move_object", "grant_change", "subscription_change", "content_write"],
+    "marker_observed": bool(mixed_match),
+    "passed": bool(mixed_match and mixed_test and mixed_test["passed"]),
+}
+
+limit_mutation_text = pathlib.Path(mutation_limit_log).read_text(encoding="utf-8", errors="replace")
+limit_mutation_red = (
+    int(mutation_limit_exit) != 0
+    and "GATECHAIN_MUTATION_MOVE_SUBTREE_EXACT_BOUNDARY_REJECTED_ACTIVE" in limit_mutation_text
+    and bool(re.search(r"^test result: FAILED\. 0 passed; 1 failed;", limit_mutation_text, re.M))
+)
+coordinator_mutation_text = pathlib.Path(mutation_coordinator_log).read_text(encoding="utf-8", errors="replace")
+coordinator_mutation_red = (
+    int(mutation_coordinator_exit) != 0
+    and "GATECHAIN_MUTATION_COORDINATOR_SORT_REMOVED_ACTIVE" in coordinator_mutation_text
+    and bool(re.search(r"^test result: FAILED\. 0 passed; 1 failed;", coordinator_mutation_text, re.M))
+)
+
+subtree_test = next(
+    (item for item in move["assertions"]
+     if item["name"] == "the_subtree_ceiling_admits_one_hundred_nodes_and_refuses_one_hundred_and_one"),
+    None,
+)
+subtree_gate = {
+    "status": "passed" if all((subtree_contract["frozen"], contract_source_match,
+                                subtree_test and subtree_test["passed"], measurement_complete,
+                                limit_mutation_red)) else "failed",
+    "contract": subtree_contract,
+    "source_constant": source_limit,
+    "contract_source_match": contract_source_match,
+    "measurement": measurement,
+    "measurement_complete": measurement_complete,
+    "mutation": {"kind": "exact_boundary_rejected", "exit": int(mutation_limit_exit),
+                 "duration_ms": int(mutation_limit_ms), "log": mutation_limit_log,
+                 "red": limit_mutation_red},
+}
+subtree_gate["passed"] = subtree_gate["status"] == "passed"
+
+core_move_assertions = [
+    item for item in move["assertions"]
+    if item["name"] != "the_subtree_ceiling_admits_one_hundred_nodes_and_refuses_one_hundred_and_one"
+]
+lock_order_passed = (
+    bool(core_move_assertions) and all(item["passed"] for item in core_move_assertions)
+    and coordinator["passed"] and mixed["passed"] and coordinator_mutation_red
+)
 print(
     json.dumps(
         {
             "move_object": move,
             "collab_coordinator": coordinator,
-            "passed": move["passed"] and coordinator["passed"],
+            "mixed_injection": mixed,
+            "move_subtree_nodes_max_locked": subtree_gate,
+            "coordinator_order_mutation": {
+                "exit": int(mutation_coordinator_exit), "duration_ms": int(mutation_coordinator_ms),
+                "log": mutation_coordinator_log, "red": coordinator_mutation_red,
+            },
+            "lock_order_passed": lock_order_passed,
+            "passed": lock_order_passed and subtree_gate["passed"],
         },
         separators=(",", ":"),
     )
@@ -518,21 +723,16 @@ if ! jq -e . >/dev/null 2>&1 <<<"$DYNAMIC_JSON"; then
   exit 2
 fi
 
-# The grant and cross-instance subscription-change producers belong to other
-# v0.5 work packages. A source/test-only approximation is not evidence for the
-# contract's controlled four-way injection, so this remains a hard non-pass.
-MIXED_INJECTION_JSON="$(jq -n '{
-  status: "not_implemented",
-  components: ["move_object", "grant_change", "subscription_change", "content_write"],
-  reason: "grant-change and subscription-change injection producers are not both available in this package; the required controlled mixed injection was not run",
-  passed: false
-}')"
-
 STATIC_PASSED="$(jq -r '[.canonical_head_transactions_epoch_before_document_lock.passed, .multi_document_transactions_epoch_conflict_lock.passed] | all' <<<"$STATIC_JSON")"
-DYNAMIC_PASSED="$(jq -r '.passed' <<<"$DYNAMIC_JSON")"
+DYNAMIC_PASSED="$(jq -r '.lock_order_passed' <<<"$DYNAMIC_JSON")"
+MIXED_INJECTION_JSON="$(jq -c '.mixed_injection' <<<"$DYNAMIC_JSON")"
 MIXED_PASSED="$(jq -r '.passed' <<<"$MIXED_INJECTION_JSON")"
+SUBTREE_GATE_JSON="$(jq -c '.move_subtree_nodes_max_locked' <<<"$DYNAMIC_JSON")"
+SUBTREE_PASSED="$(jq -r '.passed' <<<"$SUBTREE_GATE_JSON")"
 SOURCE_INTEGRITY_PASSED=$([[ "$SOURCE_DIRTY" == false ]] && echo true || echo false)
-OVERALL_PASSED=$([[ "$STATIC_PASSED" == true && "$DYNAMIC_PASSED" == true && "$MIXED_PASSED" == true && "$SOURCE_INTEGRITY_PASSED" == true ]] && echo true || echo false)
+MULTI_GATE_PASSED=$([[ "$STATIC_PASSED" == true && "$DYNAMIC_PASSED" == true && "$MIXED_PASSED" == true && "$SOURCE_INTEGRITY_PASSED" == true ]] && echo true || echo false)
+SUBTREE_GATE_PASSED=$([[ "$SUBTREE_PASSED" == true && "$SOURCE_INTEGRITY_PASSED" == true ]] && echo true || echo false)
+OVERALL_PASSED=$([[ "$MULTI_GATE_PASSED" == true && "$SUBTREE_GATE_PASSED" == true ]] && echo true || echo false)
 
 RESULT="$(jq -n \
   --arg head "$SOURCE_HEAD" \
@@ -545,6 +745,9 @@ RESULT="$(jq -n \
   --argjson dynamic "$DYNAMIC_JSON" \
   --argjson static "$STATIC_JSON" \
   --argjson mixed "$MIXED_INJECTION_JSON" \
+  --argjson subtree "$SUBTREE_GATE_JSON" \
+  --argjson multi_gate_passed "$MULTI_GATE_PASSED" \
+  --argjson subtree_gate_passed "$SUBTREE_GATE_PASSED" \
   --argjson passed "$OVERALL_PASSED" \
   '{
     schema_version: "sylvode.flow.multi-document-result.v1",
@@ -563,8 +766,16 @@ RESULT="$(jq -n \
     r17_static_assertions: $static,
     mixed_move_grant_subscription_content_injection: $mixed,
     multi_document_lock_order_and_atomicity: {
-      status: (if $passed then "passed" else "failed" end),
-      passed: $passed
+      status: (if $multi_gate_passed then "passed" else "failed" end),
+      passed: $multi_gate_passed
+    },
+    move_subtree_nodes_max_locked: ($subtree + {
+      status: (if $subtree_gate_passed then "passed" else "failed" end),
+      passed: $subtree_gate_passed
+    }),
+    hard_gates: {
+      multi_document_lock_order_and_atomicity: (if $multi_gate_passed then "passed" else "failed" end),
+      move_subtree_nodes_max_locked: (if $subtree_gate_passed then "passed" else "failed" end)
     },
     passed: $passed
   }')"

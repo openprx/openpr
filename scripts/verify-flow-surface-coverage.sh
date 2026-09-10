@@ -110,6 +110,11 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
 fi
 
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+SOURCE_DIRTY_SCOPE='["apps/","crates/","spikes/","migrations/",".cargo/","Cargo.toml","Cargo.lock"]'
+SOURCE_DIRTY_STATUS="$(git -C "$REPO_ROOT" status --porcelain=v1 --untracked-files=all -- \
+  apps crates spikes migrations .cargo Cargo.toml Cargo.lock)"
+SOURCE_DIRTY_ENTRIES="$(printf '%s\n' "$SOURCE_DIRTY_STATUS" | jq -R 'select(length > 0)' | jq -s '.')"
+SOURCE_DIRTY=$([[ -n "$SOURCE_DIRTY_STATUS" ]] && echo true || echo false)
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "$EVIDENCE_ROOT"
 CARGO_OUTPUT_DIR="${CARGO_TARGET_DIR:-target}"
@@ -152,10 +157,19 @@ fi
 
 RESULT="$(jq --slurpfile implementation "$IMPL_OUT" \
   --arg release "$RELEASE" --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" \
+  --argjson source_dirty "$SOURCE_DIRTY" --argjson dirty_entries "$SOURCE_DIRTY_ENTRIES" \
+  --argjson dirty_scope "$SOURCE_DIRTY_SCOPE" \
   '{
     schema_version: "sylvode.flow.surface-coverage-result.v1",
     release: $release,
     source_head: $head,
+    source_dirty: $source_dirty,
+    source_integrity: {
+      status: (if $source_dirty then "failed" else "passed" end),
+      checked_scope: $dirty_scope,
+      dirty_entries: $dirty_entries,
+      passed: ($source_dirty | not)
+    },
     generated_at: $generated_at,
     contracts: .contracts,
     counts: .counts,
@@ -166,7 +180,7 @@ RESULT="$(jq --slurpfile implementation "$IMPL_OUT" \
       contract_rest_missing_implementation: $implementation[0].rest.contract_missing_in_implementation,
       contract_cli_missing_implementation: $implementation[0].cli.contract_missing_in_implementation
     }),
-    passed: (.passed and $implementation[0].passed)
+    passed: (.passed and $implementation[0].passed and ($source_dirty | not))
   }' "$PARSE_OUT")"
 rm -f "$PARSE_OUT" "$IMPL_OUT"
 

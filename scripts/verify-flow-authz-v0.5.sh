@@ -24,7 +24,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/verify-flow-authz-v0.5.sh --adr PATH --limits PATH --json [OPTIONS]
 
-Verifies all seven v0.5 authorization hard gates and writes authz-result.json.
+Verifies all ten v0.5 authorization hard gates and writes authz-result.json.
 
 Options:
   --adr PATH              ADR-0012 path (required).
@@ -36,7 +36,7 @@ Options:
   --json                  Required; emit the artifact on stdout.
   -h, --help              Show this help.
 
-Exit codes: 0 all seven gates passed; 1 a gate/evidence requirement failed;
+Exit codes: 0 all ten gates passed; 1 a gate/evidence requirement failed;
 2 usage, contract parsing, tool, or artifact integrity failure.
 EOF
 }
@@ -107,6 +107,13 @@ MUTATION_BOUNDARY_LOG="$EVIDENCE_REAL/logs/authz.mutation-boundary.log"
 MUTATION_PRESENCE_LOG="$EVIDENCE_REAL/logs/authz.mutation-presence.log"
 MUTATION_FENCE_LOG="$EVIDENCE_REAL/logs/authz.mutation-fence.log"
 MUTATION_REAUTHORIZE_LOG="$EVIDENCE_REAL/logs/authz.mutation-reauthorize.log"
+MUTATION_MOVE_REAUTH_LOG="$EVIDENCE_REAL/logs/authz.mutation-move-reauthorize.log"
+MUTATION_TICKET_EXPIRY_LOG="$EVIDENCE_REAL/logs/authz.mutation-ticket-expiry.log"
+MUTATION_CACHE_POISON_LOG="$EVIDENCE_REAL/logs/authz.mutation-cache-poison.log"
+MUTATION_DRY_RUN_LOG="$EVIDENCE_REAL/logs/authz.mutation-dry-run.log"
+MUTATION_ADMIN_BOT_LOG="$EVIDENCE_REAL/logs/authz.mutation-admin-bot.log"
+MUTATION_DEPTH_BUDGET_LOG="$EVIDENCE_REAL/logs/authz.mutation-depth-budget.log"
+MUTATION_NUMERIC_BUDGET_LOG="$EVIDENCE_REAL/logs/authz.mutation-numeric-budget.log"
 
 run_timed() {
   local log="$1"
@@ -137,10 +144,19 @@ flow::collab::authz::database_tests::a_parent_id_cycle_is_rejected
 flow::collab::authz::database_tests::a_parent_in_another_workspace_is_rejected_not_treated_as_a_root
 flow::collab::authz::database_tests::boundary_and_baseline_semantics_are_unchanged
 flow::collab::authz::database_tests::a_workspace_admin_keeps_the_rescue_path_when_the_chain_is_broken
+flow::collab::authz::database_tests::depth_1_inherits_from_the_database_then_breaks_at_the_child_boundary
 flow::move_object::database_tests::depth_20_evaluation_crosses_concurrent_grant_and_move
+routes::flow::flow_database_tests::depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets
 flow::collab::write::database_tests::epoch_fencing_blocks_a_write_that_straddles_a_concurrent_revocation
 flow::command::database_tests::authz_epoch_is_read_before_permission_so_a_revocation_between_them_cannot_be_fenced_out
+flow::move_object::database_tests::concurrent_source_revocation_and_target_downgrade_are_rechecked_before_move_commit
 flow::collab::permission_cache::tests::stale_epoch_poison_is_a_miss_and_is_removed
+routes::flow::flow_database_tests::poisoned_high_privilege_cache_cannot_make_read_visible_or_write_persist
+routes::collab::collab_database_tests::an_expired_ticket_is_rejected_at_atomic_consumption
+routes::collab::collab_database_tests::ticket_issuance_holds_current_epoch_through_insert_and_rechecks_membership
+routes::collab::collab_database_tests::a_flow_enabled_workspace_still_issues_a_ticket_and_still_upgrades
+flow::grants::database_tests::grant_count_ceilings_are_enforced_and_never_silently_truncate
+events::dispatcher::dispatcher_database_tests::coalescing_cap_freezes_the_row_and_opens_a_new_one_with_exact_source_counts
 flow::grants::database_tests::initial_grants_replaces_the_roster_and_cuts_the_principals_it_omits
 flow::move_object::database_tests::moving_under_a_boundary_denies_a_baseline_member_immediately
 routes::flow::flow_database_tests::member_add_role_change_and_remove_advance_epoch_in_their_transactions
@@ -153,6 +169,7 @@ flow::relations::database_tests::duplicate_link_is_typed_invalid_update_and_targ
 flow::relations::database_tests::relation_read_paginates_and_unavailable_is_the_exact_one_field_union
 flow::grants::database_tests::self_lockout_needs_confirmation_and_leaves_an_admin_rescue_path
 flow::grants::database_tests::a_dry_run_returns_the_same_summary_and_writes_nothing
+flow::grants::database_tests::an_admin_bot_does_not_bypass_an_object_boundary_but_keeps_workspace_admin
 flow::grants::database_tests::archive_and_restore_stay_in_the_edit_tier_but_a_navigator_does_not
 flow::command::database_tests::lifecycle_tier_uses_the_real_impact_set_and_preserves_the_edit_baseline
 flow::command::database_tests::lifecycle_descendant_growth_does_not_turn_a_plain_archive_into_a_cascade
@@ -234,7 +251,7 @@ run_mutation_test() {
   {
     printf '%s\n' "$marker"
     set +e
-    (cd "$MUTATION_REPO" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" \
+    (cd "$MUTATION_REPO" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" env "$@" \
       cargo test --locked -p api --lib --no-fail-fast \
       "$test_name" -- --exact --nocapture --test-threads=1)
     status=$?
@@ -279,6 +296,103 @@ apply_exact_mutation "apps/api/src/flow/policy.rs" \
 read -r MUTATION_REAUTHORIZE_EXIT MUTATION_REAUTHORIZE_MS < <(run_mutation_test \
   "$MUTATION_REAUTHORIZE_LOG" "WP24_MUTATION_FINAL_EPOCH_CHECK_ALWAYS_TRUE_ACTIVE" "$REAUTHORIZE_TEST")
 git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/policy.rs
+
+MOVE_REAUTH_TEST="flow::move_object::database_tests::concurrent_source_revocation_and_target_downgrade_are_rechecked_before_move_commit"
+read -r MUTATION_MOVE_REAUTH_EXIT MUTATION_MOVE_REAUTH_MS < <(run_mutation_test \
+  "$MUTATION_MOVE_REAUTH_LOG" "GATECHAIN_MUTATION_MOVE_LOCKED_REAUTH_DISABLED_ACTIVE" "$MOVE_REAUTH_TEST" \
+  OPENPR_FLOW_TEST_MUTATION_SKIP_MOVE_REAUTH=1)
+
+TICKET_EXPIRY_TEST="routes::collab::collab_database_tests::an_expired_ticket_is_rejected_at_atomic_consumption"
+apply_exact_mutation "apps/api/src/flow/collab/ticket.rs" \
+  '              AND expires_at > now()' \
+  '              AND expires_at <= now()'
+read -r MUTATION_TICKET_EXPIRY_EXIT MUTATION_TICKET_EXPIRY_MS < <(run_mutation_test \
+  "$MUTATION_TICKET_EXPIRY_LOG" "GATECHAIN_MUTATION_EXPIRED_TICKET_ACCEPTED_ACTIVE" "$TICKET_EXPIRY_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/ticket.rs
+
+CACHE_POISON_TEST="routes::flow::flow_database_tests::poisoned_high_privilege_cache_cannot_make_read_visible_or_write_persist"
+apply_exact_mutation "apps/api/src/flow/collab/permission_cache.rs" \
+  'if entry.authz_epoch == current_epoch && now.saturating_duration_since(entry.last_access) <= self.idle_ttl {' \
+  'if now.saturating_duration_since(entry.last_access) <= self.idle_ttl {'
+read -r MUTATION_CACHE_POISON_EXIT MUTATION_CACHE_POISON_MS < <(run_mutation_test \
+  "$MUTATION_CACHE_POISON_LOG" "GATECHAIN_MUTATION_CACHE_EPOCH_IGNORED_ACTIVE" "$CACHE_POISON_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/permission_cache.rs
+
+DRY_RUN_TEST="flow::grants::database_tests::a_dry_run_returns_the_same_summary_and_writes_nothing"
+apply_exact_mutation "apps/api/src/flow/grants.rs" \
+  $'Ok((outcome, Disposition::Rollback)) => {\n            tx.rollback().await?;' \
+  $'Ok((outcome, Disposition::Rollback)) => {\n            tx.commit().await?;'
+read -r MUTATION_DRY_RUN_EXIT MUTATION_DRY_RUN_MS < <(run_mutation_test \
+  "$MUTATION_DRY_RUN_LOG" "GATECHAIN_MUTATION_DRY_RUN_COMMITTED_ACTIVE" "$DRY_RUN_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/grants.rs
+
+ADMIN_BOT_TEST="flow::grants::database_tests::an_admin_bot_does_not_bypass_an_object_boundary_but_keeps_workspace_admin"
+apply_exact_mutation "apps/api/src/flow/collab/authz.rs" \
+  $'if principal_kind == "user" && (role == "owner" || role == "admin") {\n        if object_exists_in_workspace(conn, workspace_id, object_id).await? {' \
+  $'if role == "owner" || role == "admin" {\n        if object_exists_in_workspace(conn, workspace_id, object_id).await? {'
+read -r MUTATION_ADMIN_BOT_EXIT MUTATION_ADMIN_BOT_MS < <(run_mutation_test \
+  "$MUTATION_ADMIN_BOT_LOG" "GATECHAIN_MUTATION_ADMIN_BOT_FALLBACK_ACTIVE" "$ADMIN_BOT_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/authz.rs
+
+DEPTH_BUDGET_TEST="routes::flow::flow_database_tests::depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets"
+apply_exact_mutation "apps/api/src/flow/collab/authz.rs" \
+  'pub(crate) const TREE_DEPTH_MAX: usize = 32;' \
+  'pub(crate) const TREE_DEPTH_MAX: usize = 20;'
+read -r MUTATION_DEPTH_BUDGET_EXIT MUTATION_DEPTH_BUDGET_MS < <(run_mutation_test \
+  "$MUTATION_DEPTH_BUDGET_LOG" "GATECHAIN_MUTATION_AUTHZ_DEPTH_REDUCED_ACTIVE" "$DEPTH_BUDGET_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/authz.rs
+
+apply_exact_mutation "apps/api/src/events/dispatcher.rs" \
+  'const COALESCED_SOURCE_EVENTS_MAX: i64 = 20;' \
+  'const COALESCED_SOURCE_EVENTS_MAX: i64 = 21;'
+NUMERIC_BUDGET_STARTED="$(date +%s%N)"
+set +e
+{
+  printf '%s\n' "GATECHAIN_MUTATION_AUTHZ_NUMERIC_BUDGET_DRIFT_ACTIVE"
+  python3 - "$MUTATION_REPO/apps/api/src/flow/collab/authz.rs" \
+    "$MUTATION_REPO/apps/api/src/events/dispatcher.rs" "$LIMITS_PATH" <<'PY'
+import pathlib
+import re
+import sys
+
+authz = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+dispatcher = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+limits = pathlib.Path(sys.argv[3]).read_text(encoding="utf-8")
+
+def source_value(text, name):
+    match = re.search(rf"(?:pub\s+)?const\s+{name}\s*:\s*[^=]+\s*=\s*([0-9_]+)\s*;", text)
+    if not match:
+        raise SystemExit(f"missing source constant {name}")
+    return int(match.group(1).replace("_", ""))
+
+def contract_value(name):
+    start = re.search(rf"^{name}:\s*$", limits, re.M)
+    if not start:
+        raise SystemExit(f"missing contract block {name}")
+    tail = limits[start.end():]
+    end = re.search(r"^[a-z][a-z0-9_]*\s*:\s*$", tail, re.M)
+    body = tail[:end.start()] if end else tail
+    match = re.search(r"^\s+status:\s*([0-9][0-9,]*)", body, re.M)
+    if not match:
+        raise SystemExit(f"missing frozen contract value {name}")
+    return int(match.group(1).replace(",", ""))
+
+pairs = [
+    ("OBJECT_GRANTS_MAX", source_value(authz, "OBJECT_GRANTS_MAX"), contract_value("object_grants_max")),
+    ("COALESCED_SOURCE_EVENTS_MAX", source_value(dispatcher, "COALESCED_SOURCE_EVENTS_MAX"), contract_value("coalesced_source_events_max")),
+]
+for name, actual, expected in pairs:
+    if actual != expected:
+        raise SystemExit(f"{name} drift: source={actual} contract={expected}")
+print("numeric budgets match contract")
+PY
+  MUTATION_NUMERIC_BUDGET_EXIT=$?
+  printf 'mutation_exit=%s check=authorization_numeric_budgets\n' "$MUTATION_NUMERIC_BUDGET_EXIT"
+} >"$MUTATION_NUMERIC_BUDGET_LOG" 2>&1
+set -e
+NUMERIC_BUDGET_ENDED="$(date +%s%N)"
+MUTATION_NUMERIC_BUDGET_MS="$(((NUMERIC_BUDGET_ENDED - NUMERIC_BUDGET_STARTED) / 1000000))"
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/events/dispatcher.rs
 cleanup_mutation_worktree
 trap - EXIT
 
@@ -287,6 +401,14 @@ echo "  boundary exit=$MUTATION_BOUNDARY_EXIT duration_ms=$MUTATION_BOUNDARY_MS 
 echo "  presence exit=$MUTATION_PRESENCE_EXIT duration_ms=$MUTATION_PRESENCE_MS log=$MUTATION_PRESENCE_LOG" >&2
 echo "  fence exit=$MUTATION_FENCE_EXIT duration_ms=$MUTATION_FENCE_MS log=$MUTATION_FENCE_LOG" >&2
 echo "  reauthorize exit=$MUTATION_REAUTHORIZE_EXIT duration_ms=$MUTATION_REAUTHORIZE_MS log=$MUTATION_REAUTHORIZE_LOG" >&2
+echo "  move reauthorize exit=$MUTATION_MOVE_REAUTH_EXIT duration_ms=$MUTATION_MOVE_REAUTH_MS log=$MUTATION_MOVE_REAUTH_LOG" >&2
+echo "  ticket expiry exit=$MUTATION_TICKET_EXPIRY_EXIT duration_ms=$MUTATION_TICKET_EXPIRY_MS log=$MUTATION_TICKET_EXPIRY_LOG" >&2
+echo "  cache poison exit=$MUTATION_CACHE_POISON_EXIT duration_ms=$MUTATION_CACHE_POISON_MS log=$MUTATION_CACHE_POISON_LOG" >&2
+echo "  dry run exit=$MUTATION_DRY_RUN_EXIT duration_ms=$MUTATION_DRY_RUN_MS log=$MUTATION_DRY_RUN_LOG" >&2
+echo "  admin bot exit=$MUTATION_ADMIN_BOT_EXIT duration_ms=$MUTATION_ADMIN_BOT_MS log=$MUTATION_ADMIN_BOT_LOG" >&2
+echo "  depth budget exit=$MUTATION_DEPTH_BUDGET_EXIT duration_ms=$MUTATION_DEPTH_BUDGET_MS log=$MUTATION_DEPTH_BUDGET_LOG" >&2
+echo "  numeric budget exit=$MUTATION_NUMERIC_BUDGET_EXIT duration_ms=$MUTATION_NUMERIC_BUDGET_MS log=$MUTATION_NUMERIC_BUDGET_LOG" >&2
+echo "  depth budget exit=$MUTATION_DEPTH_BUDGET_EXIT duration_ms=$MUTATION_DEPTH_BUDGET_MS log=$MUTATION_DEPTH_BUDGET_LOG" >&2
 
 STATIC_DYNAMIC_JSON="$(python3 - \
   "$REPO_ROOT" "$CONTRACTS_ROOT" "$ADR_PATH" "$LIMITS_PATH" "$GATE_COMMANDS_PATH" \
@@ -297,7 +419,14 @@ STATIC_DYNAMIC_JSON="$(python3 - \
   "$MUTATION_BOUNDARY_LOG" "$MUTATION_BOUNDARY_EXIT" "$MUTATION_BOUNDARY_MS" "$BOUNDARY_TEST" \
   "$MUTATION_PRESENCE_LOG" "$MUTATION_PRESENCE_EXIT" "$MUTATION_PRESENCE_MS" "$PRESENCE_TEST" \
   "$MUTATION_FENCE_LOG" "$MUTATION_FENCE_EXIT" "$MUTATION_FENCE_MS" "$FENCE_TEST" \
-  "$MUTATION_REAUTHORIZE_LOG" "$MUTATION_REAUTHORIZE_EXIT" "$MUTATION_REAUTHORIZE_MS" "$REAUTHORIZE_TEST" <<'PY'
+  "$MUTATION_REAUTHORIZE_LOG" "$MUTATION_REAUTHORIZE_EXIT" "$MUTATION_REAUTHORIZE_MS" "$REAUTHORIZE_TEST" \
+  "$MUTATION_MOVE_REAUTH_LOG" "$MUTATION_MOVE_REAUTH_EXIT" "$MUTATION_MOVE_REAUTH_MS" "$MOVE_REAUTH_TEST" \
+  "$MUTATION_TICKET_EXPIRY_LOG" "$MUTATION_TICKET_EXPIRY_EXIT" "$MUTATION_TICKET_EXPIRY_MS" "$TICKET_EXPIRY_TEST" \
+  "$MUTATION_CACHE_POISON_LOG" "$MUTATION_CACHE_POISON_EXIT" "$MUTATION_CACHE_POISON_MS" "$CACHE_POISON_TEST" \
+  "$MUTATION_DRY_RUN_LOG" "$MUTATION_DRY_RUN_EXIT" "$MUTATION_DRY_RUN_MS" "$DRY_RUN_TEST" \
+  "$MUTATION_ADMIN_BOT_LOG" "$MUTATION_ADMIN_BOT_EXIT" "$MUTATION_ADMIN_BOT_MS" "$ADMIN_BOT_TEST" \
+  "$MUTATION_DEPTH_BUDGET_LOG" "$MUTATION_DEPTH_BUDGET_EXIT" "$MUTATION_DEPTH_BUDGET_MS" "$DEPTH_BUDGET_TEST" \
+  "$MUTATION_NUMERIC_BUDGET_LOG" "$MUTATION_NUMERIC_BUDGET_EXIT" "$MUTATION_NUMERIC_BUDGET_MS" <<'PY'
 import json
 import pathlib
 import re
@@ -313,6 +442,13 @@ import sys
     mutation_presence_log_s, mutation_presence_exit_s, mutation_presence_ms_s, presence_test,
     mutation_fence_log_s, mutation_fence_exit_s, mutation_fence_ms_s, fence_test,
     mutation_reauthorize_log_s, mutation_reauthorize_exit_s, mutation_reauthorize_ms_s, reauthorize_test,
+    mutation_move_reauth_log_s, mutation_move_reauth_exit_s, mutation_move_reauth_ms_s, move_reauth_test,
+    mutation_ticket_expiry_log_s, mutation_ticket_expiry_exit_s, mutation_ticket_expiry_ms_s, ticket_expiry_test,
+    mutation_cache_poison_log_s, mutation_cache_poison_exit_s, mutation_cache_poison_ms_s, cache_poison_test,
+    mutation_dry_run_log_s, mutation_dry_run_exit_s, mutation_dry_run_ms_s, dry_run_test,
+    mutation_admin_bot_log_s, mutation_admin_bot_exit_s, mutation_admin_bot_ms_s, admin_bot_test,
+    mutation_depth_budget_log_s, mutation_depth_budget_exit_s, mutation_depth_budget_ms_s, depth_budget_test,
+    mutation_numeric_budget_log_s, mutation_numeric_budget_exit_s, mutation_numeric_budget_ms_s,
 ) = sys.argv[1:]
 repo = pathlib.Path(repo_s)
 contracts = pathlib.Path(contracts_s)
@@ -345,6 +481,13 @@ mutation_boundary_log = read(mutation_boundary_log_s)
 mutation_presence_log = read(mutation_presence_log_s)
 mutation_fence_log = read(mutation_fence_log_s)
 mutation_reauthorize_log = read(mutation_reauthorize_log_s)
+mutation_move_reauth_log = read(mutation_move_reauth_log_s)
+mutation_ticket_expiry_log = read(mutation_ticket_expiry_log_s)
+mutation_cache_poison_log = read(mutation_cache_poison_log_s)
+mutation_dry_run_log = read(mutation_dry_run_log_s)
+mutation_admin_bot_log = read(mutation_admin_bot_log_s)
+mutation_depth_budget_log = read(mutation_depth_budget_log_s)
+mutation_numeric_budget_log = read(mutation_numeric_budget_log_s)
 
 GATES = [
     "permission_inheritance_and_break",
@@ -354,6 +497,9 @@ GATES = [
     "search_and_relation_use_effective_permission",
     "authz_boundary_self_lockout_guarded",
     "archive_tier_by_object_scope",
+    "token_expiry_and_permission_revocation",
+    "authz_numeric_budgets_locked",
+    "admin_bot_does_not_bypass_object_boundary",
 ]
 
 def parse_limit(name):
@@ -373,13 +519,35 @@ if not object_grants_match:
 object_grants_status = object_grants_match.group(1)
 object_grants_max = int(object_grants_status.replace(",", "")) if object_grants_status.isdigit() else None
 
+def structured_limit(name):
+    start = re.search(rf"^{re.escape(name)}:\s*$", limits, re.M)
+    if not start:
+        raise SystemExit(f"contract parse failed: structured block absent for {name}")
+    tail = limits[start.end():]
+    end = re.search(r"^(?:[a-z][a-z0-9_]*)\s*:\s*$", tail, re.M)
+    body = tail[:end.start()] if end else tail
+    def field(key):
+        match = re.search(rf"^\s+{key}:\s*(.+?)\s*$", body, re.M)
+        if not match or not match.group(1).strip():
+            raise SystemExit(f"contract parse failed: {name}.{key} is empty")
+        return match.group(1).strip()
+    status, set_by, rule = field("status"), field("set_by"), field("rule")
+    value_match = re.match(r"([0-9][0-9,]*)", status)
+    value = int(value_match.group(1).replace(",", "")) if value_match else None
+    return {"status": status, "value": value, "set_by": set_by, "rule": rule,
+            "frozen": value is not None and value > 0 and status != "unset"}
+
+object_grants_contract = structured_limit("object_grants_max")
+coalesced_sources_contract = structured_limit("coalesced_source_events_max")
+
 authz_start = commands.find("Authz verifier 覆盖 v0.5")
 authz_end = commands.find("Multi-document verifier 产出", authz_start)
 if authz_start < 0 or authz_end <= authz_start:
     raise SystemExit("contract parse failed: authz_verify paragraph is empty")
 authz_clause = commands[authz_start:authz_end]
-parsed_gates = [name for name in GATES if re.search(rf"`{re.escape(name)}`", authz_clause)]
-if not parsed_gates or parsed_gates != GATES:
+authz_paragraph_gates = GATES[:7]
+parsed_gates = [name for name in authz_paragraph_gates if re.search(rf"`{re.escape(name)}`", authz_clause)]
+if not parsed_gates or parsed_gates != authz_paragraph_gates:
     raise SystemExit(f"contract parse failed: seven authz gates not found in order: {parsed_gates!r}")
 
 for marker in ["(a)", "(b)", "(c)", "checked_epoch", "committed_epoch", "barrier 真实可控"]:
@@ -402,6 +570,9 @@ files = {
     "model": repo / "apps/api/src/flow/model.rs",
     "search": repo / "apps/api/src/flow/search.rs",
     "routes_flow": repo / "apps/api/src/routes/flow.rs",
+    "routes_collab": repo / "apps/api/src/routes/collab.rs",
+    "ticket": repo / "apps/api/src/flow/collab/ticket.rs",
+    "dispatcher": repo / "apps/api/src/events/dispatcher.rs",
     "migration": repo / "migrations/0054_flow_data_layer.sql",
     "core_limits": repo / "crates/collab-core/src/limits.rs",
 }
@@ -416,7 +587,7 @@ def const_int(text, name):
     return int(match.group(1).replace("_", "")) if match else None
 
 def fn_body(text, name):
-    match = re.search(rf"(?:async\s+)?fn\s+{re.escape(name)}\s*\([^{{]*\)\s*(?:->[^{{]+)?\{{", text)
+    match = re.search(rf"(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+{re.escape(name)}\s*\([^{{]*\)\s*(?:->[^{{]+)?\{{", text)
     if not match:
         return ""
     start = text.find("{", match.start())
@@ -443,6 +614,23 @@ for line in test_text.splitlines():
     match = re.match(r"^test (.+) \.\.\. (ok|FAILED|ignored)$", line)
     if match:
         statuses[match.group(1)] = match.group(2)
+# Evidence markers emitted during a test appear between libtest's `...` prefix and its final
+# `ok`/`FAILED` line. Parse those segments too instead of silently losing every instrumented test.
+for name in required_tests:
+    if name in statuses:
+        continue
+    match = re.search(
+        r"^test " + re.escape(name) + r" \.\.\.(.*?)(?=^test result:)",
+        test_text,
+        re.M | re.S,
+    )
+    if not match:
+        continue
+    segment = match.group(1)
+    if re.search(r"(?:^|\n)ok\b|\sok$", segment, re.M):
+        statuses[name] = "ok"
+    elif re.search(r"(?:^|\n)FAILED\b|\sFAILED$", segment, re.M):
+        statuses[name] = "FAILED"
 summary_matches = re.findall(
     r"^test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored; ([0-9]+) measured; ([0-9]+) filtered out; finished in ([0-9.]+)s$",
     test_text,
@@ -512,6 +700,7 @@ add(gate, "object_grants_limit_is_parsed_not_invented", object_grants_ok,
     {"contract_status": object_grants_status, "contract_value": object_grants_max, "source_value": source_object_grants_max},
     [limits_s, str(files["authz"])], None if object_grants_ok else "object_grants_limit_drift")
 for criterion, name in [
+    ("explicit_depth_1_database_fixture", "flow::collab::authz::database_tests::depth_1_inherits_from_the_database_then_breaks_at_the_child_boundary"),
     ("depth_32_and_boundary_at_depth_32", "flow::collab::authz::database_tests::a_boundary_on_the_deepest_legal_node_is_still_seen"),
     ("depth_33_fail_closed", "flow::collab::authz::database_tests::a_chain_one_node_past_the_limit_is_rejected"),
     ("cycle_fail_closed", "flow::collab::authz::database_tests::a_parent_id_cycle_is_rejected"),
@@ -519,28 +708,27 @@ for criterion, name in [
     ("boundary_no_grant_is_denied_not_view", "flow::collab::authz::database_tests::boundary_and_baseline_semantics_are_unchanged"),
     ("workspace_admin_rescue", "flow::collab::authz::database_tests::a_workspace_admin_keeps_the_rescue_path_when_the_chain_is_broken"),
 ]: add_test(gate, criterion, name)
-fixture_text = source["authz"] + source["grants"] + source["move"]
-for depth in (1, 20):
-    marker = bool(re.search(rf"scratch_or_skip!\(\"[^\"]*depth[_-]?{depth}[^\"]*\"\)", fixture_text, re.I))
-    add(gate, f"explicit_depth_{depth}_fixture", marker, "found" if marker else "absent",
-        [str(files["authz"]), str(files["grants"]), str(files["move"])],
-        None if marker else f"depth_{depth}_fixture_not_implemented")
 add_test(gate, "depth_evaluation_crosses_concurrent_grant_and_move",
     "flow::move_object::database_tests::depth_20_evaluation_crosses_concurrent_grant_and_move",
     "concurrent_depth_grant_move_fixture_missing_or_failed")
-cache_miss_e2e = bool(re.search(r"cache miss.*(?:database|source)|force.*cache.*miss", fixture_text, re.I))
-add(gate, "permission_cache_miss_forces_authoritative_source", cache_miss_e2e,
-    "constructive fixture found" if cache_miss_e2e else "no constructive fixture found",
-    [str(files["authz"]), str(files["grants"])], None if cache_miss_e2e else "cache_miss_authority_fixture_not_implemented")
-perf_body = fn_body(source["grants"], "object_grants_max_read_cost_is_measured_at_the_frozen_chain_depth")
-correct_perf_budget = bool(
-    re.search(rf"worst_[a-z_]+\s*<\s*{hold_p95}(?:\.0)?\b", perf_body)
-    and re.search(rf"(?:max|worst)_[a-z_]+\s*<\s*{hold_max}(?:\.0)?\b", perf_body)
-    and "p95" in perf_body.lower()
-)
-add(gate, "depth_32_commit_path_lock_hold_budget", correct_perf_budget,
-    {"required_p95_ms": hold_p95, "required_max_ms": hold_max, "fixture_uses_both": correct_perf_budget},
-    [str(files["grants"])], None if correct_perf_budget else "commit_path_depth_budget_not_measured")
+poison_test = "routes::flow::flow_database_tests::poisoned_high_privilege_cache_cannot_make_read_visible_or_write_persist"
+add_test(gate, "permission_cache_miss_forces_authoritative_source", poison_test,
+    "cache_miss_authority_fixture_missing_or_failed")
+depth_budget_test = "routes::flow::flow_database_tests::depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets"
+add_test(gate, "depth_32_commit_path_executes", depth_budget_test)
+budget_match = re.search(r"AUTHZ_DEPTH32_COMMIT_BUDGET_EVIDENCE\s+(\{[^\n]+\})", test_text)
+budget_evidence = json.loads(budget_match.group(1)) if budget_match else {}
+budget_values_ok = all((
+    budget_evidence.get("depth") == tree_depth,
+    isinstance(budget_evidence.get("samples"), int) and budget_evidence.get("samples", 0) > 0,
+    isinstance(budget_evidence.get("p95_ms"), (int, float)),
+    isinstance(budget_evidence.get("max_ms"), (int, float)),
+    budget_evidence.get("p95_ms", float("inf")) <= hold_p95,
+    budget_evidence.get("max_ms", float("inf")) <= hold_max,
+))
+add(gate, "depth_32_commit_path_lock_hold_budget", budget_values_ok,
+    {"required_p95_ms": hold_p95, "required_max_ms": hold_max, "measurement": budget_evidence},
+    [test_log_s, f"cargo_test:{depth_budget_test}"], None if budget_values_ok else "commit_path_depth_budget_not_measured")
 
 # authz_linearization_no_escalation
 gate = GATES[1]
@@ -548,37 +736,48 @@ write_prod = source["write"].split("#[cfg(test)]", 1)[0]
 fence_lock = "fence_epoch_for_share(tx" in write_prod and "SELECT authz_epoch" in source["authz"] and "FOR SHARE" in source["authz"]
 add(gate, "commit_time_epoch_fence_held_in_write_transaction", fence_lock, "present" if fence_lock else "absent",
     [str(files["write"]), str(files["authz"])], None if fence_lock else "commit_time_fence_missing")
-add_test(gate, "race_c_inflight_content_after_revocation", "flow::collab::write::database_tests::epoch_fencing_blocks_a_write_that_straddles_a_concurrent_revocation")
+race_c_test = "flow::collab::write::database_tests::epoch_fencing_blocks_a_write_that_straddles_a_concurrent_revocation"
+add_test(gate, "race_c_inflight_content_after_revocation", race_c_test)
 add_test(gate, "epoch_read_precedes_permission", "flow::command::database_tests::authz_epoch_is_read_before_permission_so_a_revocation_between_them_cannot_be_fenced_out")
-for criterion, pattern, reason in [
-    ("race_a_move_after_source_grant_revocation", r"fn\s+[a-z0-9_]*(?:racing|concurrent)[a-z0-9_]*(?:revok|source_grant)[a-z0-9_]*", "linearization_race_a_not_implemented"),
-    ("race_b_move_after_target_downgrade", r"fn\s+[a-z0-9_]*(?:racing|concurrent)[a-z0-9_]*(?:target_downgrade|downgraded_target)[a-z0-9_]*", "linearization_race_b_not_implemented"),
-]:
-    present = bool(re.search(pattern, source["move"], re.I))
-    add(gate, criterion, present, "constructive fixture found" if present else "not found", [str(files["move"])], None if present else reason)
-content_epoch_artifact = "checked_epoch" in write_prod and "committed_epoch" in write_prod
+move_race_test = "flow::move_object::database_tests::concurrent_source_revocation_and_target_downgrade_are_rechecked_before_move_commit"
+add_test(gate, "race_a_move_after_source_grant_revocation", move_race_test, "linearization_race_a_missing_or_failed")
+add_test(gate, "race_b_move_after_target_downgrade", move_race_test, "linearization_race_b_missing_or_failed")
+epoch_match = re.search(
+    r"AUTHZ_CONTENT_EPOCH_EVIDENCE checked_epoch=(\d+) committed_epoch=(\d+) outcome=policy_rejected persisted_updates=0",
+    test_text,
+)
+content_epoch_artifact = bool(epoch_match and int(epoch_match.group(2)) > int(epoch_match.group(1)))
 add(gate, "every_content_write_artifact_records_checked_and_committed_epoch", content_epoch_artifact,
-    "both fields present" if content_epoch_artifact else "content artifact lacks one or both fields",
-    [str(files["write"])], None if content_epoch_artifact else "content_epoch_artifact_fields_missing")
-controllable = bool(re.search(r"disable.*fenc|fenc.*disable|without.*fenc", source["write"] + source["move"], re.I))
+    {"checked_epoch": int(epoch_match.group(1)), "committed_epoch": int(epoch_match.group(2)), "persisted_updates": 0} if epoch_match else {},
+    [test_log_s], None if content_epoch_artifact else "content_epoch_artifact_fields_missing")
+move_mutation_red = int(mutation_move_reauth_exit_s) != 0 and "GATECHAIN_MUTATION_MOVE_LOCKED_REAUTH_DISABLED_ACTIVE" in mutation_move_reauth_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_move_reauth_log
+controllable = move_mutation_red and int(mutation_fence_exit_s) != 0
 add(gate, "barrier_control_replays_races_a_and_c_without_fencing", controllable,
-    "control found" if controllable else "no controllable barrier fixture", [str(files["write"]), str(files["move"])],
+    {"race_a_b_mutation_exit": int(mutation_move_reauth_exit_s), "race_a_b_duration_ms": int(mutation_move_reauth_ms_s),
+     "race_c_mutation_exit": int(mutation_fence_exit_s), "race_c_duration_ms": int(mutation_fence_ms_s)},
+    [mutation_move_reauth_log_s, mutation_fence_log_s],
     None if controllable else "barrier_control_mutation_not_implemented")
 
 # permission_cache_is_not_authority
 gate = GATES[2]
 add_test(gate, "stale_epoch_entry_is_a_miss", "flow::collab::permission_cache::tests::stale_epoch_poison_is_a_miss_and_is_removed")
 policy_prod = source["policy"].split("#[cfg(test)]", 1)[0]
-authority_order = "read_epoch" in policy_prod and "effective_permission" in policy_prod
-add(gate, "cache_miss_and_epoch_mismatch_return_to_database", authority_order, "present" if authority_order else "absent",
+authorize_body = fn_body(policy_prod, "authorize_flow_objects")
+first_epoch_check = authorize_body.find("ensure_epoch_current(")
+cache_read = authorize_body.find("cache.get(")
+database_read = authorize_body.find("authz::effective_permissions(")
+second_epoch_check = authorize_body.find("ensure_epoch_current(", first_epoch_check + 1)
+authority_order = min(first_epoch_check, cache_read, database_read, second_epoch_check) >= 0 and first_epoch_check < cache_read < database_read < second_epoch_check
+add(gate, "cache_miss_and_epoch_mismatch_return_to_database", authority_order,
+    {"first_epoch_check": first_epoch_check, "cache_read": cache_read, "database_read": database_read,
+     "second_epoch_check": second_epoch_check},
     [str(files["policy"])], None if authority_order else "database_authority_path_missing")
-poison_e2e = bool(re.search(
-    r"fn\s+[a-z0-9_]*poison[a-z0-9_]*(?:read|visible)[a-z0-9_]*(?:write|persist)[a-z0-9_]*",
-    source["routes_flow"] + source["grants"], re.I,
-))
-add(gate, "poisoned_high_privilege_cache_cannot_read_or_write", poison_e2e,
-    "constructive end-to-end fixture found" if poison_e2e else "only cache-unit miss is covered",
-    [str(files["routes_flow"]), str(files["grants"])], None if poison_e2e else "poisoned_cache_e2e_fixture_not_implemented")
+add_test(gate, "poisoned_high_privilege_cache_cannot_read_or_write", poison_test,
+    "poisoned_cache_e2e_fixture_missing_or_failed")
+cache_poison_mutation_red = int(mutation_cache_poison_exit_s) != 0 and "GATECHAIN_MUTATION_CACHE_EPOCH_IGNORED_ACTIVE" in mutation_cache_poison_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_cache_poison_log
+add(gate, "poisoned_cache_detector_mutation_red", cache_poison_mutation_red,
+    {"exit": int(mutation_cache_poison_exit_s), "duration_ms": int(mutation_cache_poison_ms_s)},
+    [mutation_cache_poison_log_s], None if cache_poison_mutation_red else "poisoned_cache_mutation_did_not_produce_red")
 for criterion, name in [
     ("grant_change_invalidation", "flow::grants::database_tests::initial_grants_replaces_the_roster_and_cuts_the_principals_it_omits"),
     ("parent_id_subtree_invalidation", "flow::move_object::database_tests::moving_under_a_boundary_denies_a_baseline_member_immediately"),
@@ -683,6 +882,10 @@ add(gate, "dry_run_adds_no_surface", surface_parity,
     {"contract_counts": expected_surface_counts, "observed_counts": observed_surface_counts,
      "surface_verifier_exit": int(surface_exit_s), "duration_ms": int(surface_ms_s)},
     [surface_result_s, surface_log_s, commands_s], None if surface_parity else "surface_parity_failed_or_count_drift")
+dry_run_mutation_red = int(mutation_dry_run_exit_s) != 0 and "GATECHAIN_MUTATION_DRY_RUN_COMMITTED_ACTIVE" in mutation_dry_run_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_dry_run_log
+add(gate, "dry_run_zero_change_detector_mutation_red", dry_run_mutation_red,
+    {"exit": int(mutation_dry_run_exit_s), "duration_ms": int(mutation_dry_run_ms_s)},
+    [mutation_dry_run_log_s], None if dry_run_mutation_red else "dry_run_mutation_did_not_produce_red")
 
 # archive_tier_by_object_scope
 gate = GATES[6]
@@ -743,6 +946,56 @@ if g5:
 else:
     add(gate, "root_page_policy_is_contract_consistent", True,
         {"g5_record_observed": False, "resolution": "no registered v0.4/v0.5 conflict"}, [commands_s])
+
+# token_expiry_and_permission_revocation
+gate = GATES[7]
+for criterion, name in [
+    ("valid_ticket_positive_control", "routes::collab::collab_database_tests::a_flow_enabled_workspace_still_issues_a_ticket_and_still_upgrades"),
+    ("expired_ticket_rejected_at_atomic_consume", "routes::collab::collab_database_tests::an_expired_ticket_is_rejected_at_atomic_consumption"),
+    ("permission_revocation_wins_before_ticket_insert", "routes::collab::collab_database_tests::ticket_issuance_holds_current_epoch_through_insert_and_rechecks_membership"),
+]: add_test(gate, criterion, name)
+ticket_mutation_red = int(mutation_ticket_expiry_exit_s) != 0 and "GATECHAIN_MUTATION_EXPIRED_TICKET_ACCEPTED_ACTIVE" in mutation_ticket_expiry_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_ticket_expiry_log
+add(gate, "ticket_expiry_detector_mutation_red", ticket_mutation_red,
+    {"exit": int(mutation_ticket_expiry_exit_s), "duration_ms": int(mutation_ticket_expiry_ms_s)},
+    [mutation_ticket_expiry_log_s], None if ticket_mutation_red else "ticket_expiry_mutation_did_not_produce_red")
+
+# authz_numeric_budgets_locked
+gate = GATES[8]
+source_object_grants = const_int(source["authz"], "OBJECT_GRANTS_MAX")
+source_coalesced = const_int(source["dispatcher"], "COALESCED_SOURCE_EVENTS_MAX")
+numeric_contract_ok = object_grants_contract["frozen"] and coalesced_sources_contract["frozen"]
+add(gate, "authorization_structured_budgets_have_value_set_by_and_rule", numeric_contract_ok,
+    {"object_grants_max": object_grants_contract, "coalesced_source_events_max": coalesced_sources_contract},
+    [limits_s], None if numeric_contract_ok else "authorization_budget_structured_fields_missing")
+numeric_constants_ok = source_object_grants == object_grants_contract["value"] and source_coalesced == coalesced_sources_contract["value"]
+add(gate, "contract_values_match_executed_source_constants", numeric_constants_ok,
+    {"object_grants_max": {"contract": object_grants_contract["value"], "source": source_object_grants},
+     "coalesced_source_events_max": {"contract": coalesced_sources_contract["value"], "source": source_coalesced}},
+    [str(files["authz"]), str(files["dispatcher"])], None if numeric_constants_ok else "authorization_budget_constant_drift")
+add_test(gate, "whole_table_grant_replacement_boundary_and_plus_one", "flow::grants::database_tests::grant_count_ceilings_are_enforced_and_never_silently_truncate")
+add_test(gate, "coalesced_source_rows_exact_and_plus_one", "events::dispatcher::dispatcher_database_tests::coalescing_cap_freezes_the_row_and_opens_a_new_one_with_exact_source_counts")
+incremental_surface_absent = "Change::AddGrant" not in source["grants"] and "append_grant" not in source["grants"]
+add(gate, "no_incremental_grant_surface_requires_object_grants_boundary", incremental_surface_absent,
+    {"incremental_surface_found": not incremental_surface_absent, "boundary_exemption": "whole_table_replacement"},
+    [str(files["grants"])], None if incremental_surface_absent else "incremental_grant_path_requires_boundary_fixture")
+numeric_mutation_red = int(mutation_numeric_budget_exit_s) != 0 and "GATECHAIN_MUTATION_AUTHZ_NUMERIC_BUDGET_DRIFT_ACTIVE" in mutation_numeric_budget_log and "COALESCED_SOURCE_EVENTS_MAX drift" in mutation_numeric_budget_log
+add(gate, "numeric_budget_drift_detector_mutation_red", numeric_mutation_red,
+    {"exit": int(mutation_numeric_budget_exit_s), "duration_ms": int(mutation_numeric_budget_ms_s)},
+    [mutation_numeric_budget_log_s], None if numeric_mutation_red else "authorization_numeric_budget_mutation_did_not_produce_red")
+
+# admin_bot_does_not_bypass_object_boundary
+gate = GATES[9]
+admin_test = "flow::grants::database_tests::an_admin_bot_does_not_bypass_an_object_boundary_but_keeps_workspace_admin"
+add_test(gate, "admin_bot_denied_at_object_boundary_and_workspace_admin_preserved", admin_test)
+admin_mutation_red = int(mutation_admin_bot_exit_s) != 0 and "GATECHAIN_MUTATION_ADMIN_BOT_FALLBACK_ACTIVE" in mutation_admin_bot_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_admin_bot_log
+add(gate, "admin_bot_boundary_detector_mutation_red", admin_mutation_red,
+    {"exit": int(mutation_admin_bot_exit_s), "duration_ms": int(mutation_admin_bot_ms_s)},
+    [mutation_admin_bot_log_s], None if admin_mutation_red else "admin_bot_mutation_did_not_produce_red")
+
+depth_mutation_red = int(mutation_depth_budget_exit_s) != 0 and "GATECHAIN_MUTATION_AUTHZ_DEPTH_REDUCED_ACTIVE" in mutation_depth_budget_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_depth_budget_log
+add(GATES[0], "depth_32_detector_mutation_red", depth_mutation_red,
+    {"exit": int(mutation_depth_budget_exit_s), "duration_ms": int(mutation_depth_budget_ms_s)},
+    [mutation_depth_budget_log_s], None if depth_mutation_red else "depth_budget_mutation_did_not_produce_red")
 
 boundary_mutation_red = (
     int(mutation_boundary_exit_s) != 0
@@ -837,6 +1090,21 @@ mutations = {
         "duration_ms": int(mutation_fence_ms_s), "log": mutation_fence_log_s},
     "final_epoch_check_always_true": {"test": reauthorize_test, "exit": int(mutation_reauthorize_exit_s),
         "duration_ms": int(mutation_reauthorize_ms_s), "log": mutation_reauthorize_log_s},
+    "move_locked_reauthorization_disabled": {"test": move_reauth_test, "exit": int(mutation_move_reauth_exit_s),
+        "duration_ms": int(mutation_move_reauth_ms_s), "log": mutation_move_reauth_log_s},
+    "expired_ticket_accepted": {"test": ticket_expiry_test, "exit": int(mutation_ticket_expiry_exit_s),
+        "duration_ms": int(mutation_ticket_expiry_ms_s), "log": mutation_ticket_expiry_log_s},
+    "cache_epoch_ignored": {"test": cache_poison_test, "exit": int(mutation_cache_poison_exit_s),
+        "duration_ms": int(mutation_cache_poison_ms_s), "log": mutation_cache_poison_log_s},
+    "dry_run_committed": {"test": dry_run_test, "exit": int(mutation_dry_run_exit_s),
+        "duration_ms": int(mutation_dry_run_ms_s), "log": mutation_dry_run_log_s},
+    "admin_bot_fallback_enabled": {"test": admin_bot_test, "exit": int(mutation_admin_bot_exit_s),
+        "duration_ms": int(mutation_admin_bot_ms_s), "log": mutation_admin_bot_log_s},
+    "authz_depth_reduced": {"test": depth_budget_test, "exit": int(mutation_depth_budget_exit_s),
+        "duration_ms": int(mutation_depth_budget_ms_s), "log": mutation_depth_budget_log_s},
+    "authorization_numeric_budget_drift": {"check": "source constants equal frozen contract values",
+        "exit": int(mutation_numeric_budget_exit_s), "duration_ms": int(mutation_numeric_budget_ms_s),
+        "log": mutation_numeric_budget_log_s},
 }
 
 print(json.dumps({
@@ -849,6 +1117,8 @@ print(json.dumps({
             "document_lock_hold_ms_max": hold_max,
             "object_grants_max_status": object_grants_status,
             "object_grants_max": object_grants_max,
+            "object_grants_max_structured": object_grants_contract,
+            "coalesced_source_events_max_structured": coalesced_sources_contract,
         },
     },
     "commands": {"worker_build": build, "test_inventory": inventory, "cargo_test": tests,

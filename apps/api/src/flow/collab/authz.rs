@@ -1214,6 +1214,44 @@ mod database_tests {
 
     // ---- the off-by-one, nailed from both sides ----
 
+    /// The smallest non-root inheritance chain is a separate boundary from the deep-chain cases:
+    /// a child at depth one must inherit its root grant, then stop inheriting immediately when the
+    /// child becomes an authorization boundary. This fixture is deliberately two nodes rather
+    /// than a root-only shortcut.
+    #[tokio::test]
+    async fn depth_1_inherits_from_the_database_then_breaks_at_the_child_boundary() {
+        let scratch = scratch_or_skip!("depth_1_database_authority");
+        let fx = seed_workspace(&scratch.db).await;
+        let chain = build_chain(&scratch.db, fx.workspace_id, 2, None).await;
+        let child = chain[0];
+        let root = chain[1];
+
+        grant(&scratch.db, fx.workspace_id, root, fx.member_id, "full_access").await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, child)
+                .await
+                .expect("a complete depth-one chain evaluates"),
+            PermissionLevel::FullAccess,
+            "the child must inherit the root's database grant"
+        );
+
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![child.into()],
+        )
+        .await;
+        assert_eq!(
+            member_level(&scratch.db, &fx, child)
+                .await
+                .expect("the depth-one boundary still evaluates"),
+            PermissionLevel::Denied,
+            "the boundary must cut both the root grant and workspace baseline"
+        );
+
+        scratch.drop_self().await;
+    }
+
     /// `tree_depth_max = 32` with the root at depth 0 means a legal chain spans depths `0..=32`:
     /// 33 nodes joined by 32 hops. The boundary is placed on the *root* — the 33rd and last node
     /// — so this fails if the walk stops even one node early, which would both deny a legitimate

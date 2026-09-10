@@ -175,7 +175,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$EVIDENCE_ROOT" ]]; then
-  EVIDENCE_ROOT="$CONTRACTS_ROOT/evidence/v$RELEASE"
+  EVIDENCE_ROOT="${TMPDIR:-/tmp}/openpr-flow-evidence/v$RELEASE"
 fi
 if [[ "$RELEASE" == "0.5" ]]; then
   [[ "$CLIENTS" =~ ^[1-9][0-9]*$ ]] || { echo "FAIL: v0.5 requires --clients N" >&2; exit 2; }
@@ -188,7 +188,7 @@ if [[ $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
-for tool in jq git python3 cargo; do
+for tool in jq git python3 cargo realpath; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: missing required command: $tool" >&2
     exit 2
@@ -220,6 +220,15 @@ if [[ ! -d "$REPO_ROOT" ]] || ! git -C "$REPO_ROOT" rev-parse --is-inside-work-t
   echo "FAIL: --repo-root is not a git work tree: $REPO_ROOT" >&2
   exit 2
 fi
+CONTRACTS_REAL="$(realpath -m "$CONTRACTS_ROOT")"
+EVIDENCE_REAL="$(realpath -m "$EVIDENCE_ROOT")"
+case "$EVIDENCE_REAL/" in
+  "$CONTRACTS_REAL/"*)
+    echo "FAIL: refusing to write collaboration architecture evidence inside the read-only contract checkout: $EVIDENCE_REAL" >&2
+    exit 2
+    ;;
+esac
+EVIDENCE_ROOT="$EVIDENCE_REAL"
 
 SNAPSHOT_RS="$REPO_ROOT/apps/api/src/flow/collab/snapshot.rs"
 LIMITS_RS="$REPO_ROOT/apps/api/src/flow/collab/limits.rs"
@@ -243,7 +252,9 @@ if [[ "$RELEASE" == "0.5" ]]; then
   V05_DYNAMIC_LOG="$EVIDENCE_ROOT/logs/collab-architecture-v0.5-tests.log"
   V05_RESUME_MUTATION_LOG="$EVIDENCE_ROOT/logs/resume-at-head-zero-frame-mutation.log"
   V05_EGRESS_MUTATION_LOG="$EVIDENCE_ROOT/logs/egress-duplicate-forward-mutation.log"
+  V05_TOMBSTONE_MUTATION_LOG="$EVIDENCE_ROOT/logs/navigator-tombstone-hidden-growth-mutation.log"
   V05_RESUME_JSON="$EVIDENCE_ROOT/logs/resume-at-head-v0.5.json"
+  V05_NAVIGATOR_JSON="$EVIDENCE_ROOT/logs/navigator-tombstone-v0.5.json"
   V05_SURFACE_JSON="$EVIDENCE_ROOT/logs/surface-coverage-v0.5.json"
   V05_LOAD_EXIT=0
 
@@ -268,11 +279,13 @@ if [[ "$RELEASE" == "0.5" ]]; then
     flow::collab::session::tests::live_ws::outbound_duplicates_are_dropped_and_a_gap_is_backfilled_in_strict_seq_order
     flow::collab::session::tests::live_ws::an_unfillable_outbound_gap_resyncs_and_never_forwards_the_revealing_notice
     flow::collab::session::tests::live_ws::resume_at_head_returns_exact_ack_before_an_empty_replay
+    flow::move_object::database_tests::navigator_tombstone_growth_is_measured_on_a_cascading_command
   )
   for test_name in "${V05_TESTS[@]}"; do
     set +e
     (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
       OPENPR_FLOW_RESUME_AT_HEAD_EVIDENCE_OUT="$V05_RESUME_JSON" \
+      OPENPR_FLOW_NAVIGATOR_TOMBSTONE_EVIDENCE_OUT="$V05_NAVIGATOR_JSON" \
       cargo test --release -p api --lib "$test_name" -- --exact --test-threads=1 --nocapture) \
       >>"$V05_DYNAMIC_LOG" 2>&1
     test_exit=$?
@@ -289,6 +302,7 @@ if [[ "$RELEASE" == "0.5" ]]; then
 
   : >"$V05_RESUME_MUTATION_LOG"
   : >"$V05_EGRESS_MUTATION_LOG"
+  : >"$V05_TOMBSTONE_MUTATION_LOG"
   mutation_started_ms="$(date +%s%3N)"
   set +e
   (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
@@ -306,6 +320,14 @@ if [[ "$RELEASE" == "0.5" ]]; then
       -- --exact --test-threads=1 --nocapture) >>"$V05_EGRESS_MUTATION_LOG" 2>&1
   V05_EGRESS_MUTATION_EXIT=$?
   V05_EGRESS_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
+  mutation_started_ms="$(date +%s%3N)"
+  (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
+    OPENPR_FLOW_TEST_MUTATION_HIDE_TOMBSTONE_GROWTH=1 \
+    cargo test --release -p api --lib \
+      flow::move_object::database_tests::navigator_tombstone_growth_is_measured_on_a_cascading_command \
+      -- --exact --test-threads=1 --nocapture) >>"$V05_TOMBSTONE_MUTATION_LOG" 2>&1
+  V05_TOMBSTONE_MUTATION_EXIT=$?
+  V05_TOMBSTONE_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
   set -e
 
   V05_SOURCE_DIRTY_AFTER=false
@@ -316,12 +338,14 @@ if [[ "$RELEASE" == "0.5" ]]; then
 
   set +e
   python3 - "$LOAD_HARNESS_EVIDENCE" "$V05_DYNAMIC_LOG" \
-    "$V05_RESUME_MUTATION_LOG" "$V05_EGRESS_MUTATION_LOG" "$V05_RESUME_JSON" "$V05_SURFACE_JSON" \
+    "$V05_RESUME_MUTATION_LOG" "$V05_EGRESS_MUTATION_LOG" "$V05_TOMBSTONE_MUTATION_LOG" \
+    "$V05_RESUME_JSON" "$V05_NAVIGATOR_JSON" "$V05_SURFACE_JSON" \
     "$SOURCE_HEAD" "$SOURCE_DIRTY" "$V05_SOURCE_DIRTY_AFTER" "$CLIENTS" \
     "$ADR_SHA256" "$LIMITS_SHA256" "$GENERATED_AT" "$EXECUTOR" \
     "$V05_LOAD_EXIT" "$V05_DYNAMIC_EXIT" \
     "$V05_RESUME_MUTATION_EXIT" "$V05_RESUME_MUTATION_DURATION_MS" \
     "$V05_EGRESS_MUTATION_EXIT" "$V05_EGRESS_MUTATION_DURATION_MS" \
+    "$V05_TOMBSTONE_MUTATION_EXIT" "$V05_TOMBSTONE_MUTATION_DURATION_MS" \
     "$EVIDENCE_ROOT/collab-architecture-result.json" <<'PY'
 import hashlib
 import json
@@ -331,11 +355,12 @@ import sys
 
 (
     load_path, test_log_path, resume_mutation_log_path, egress_mutation_log_path,
-    resume_evidence_path, surface_path, source_head, source_dirty,
+    tombstone_mutation_log_path, resume_evidence_path, navigator_evidence_path, surface_path, source_head, source_dirty,
     source_dirty_after, clients_raw, adr_sha, limits_sha, generated_at,
     executor, load_exit_raw, dynamic_exit_raw, resume_mutation_exit_raw,
     resume_mutation_duration_raw, egress_mutation_exit_raw,
-    egress_mutation_duration_raw, output_path,
+    egress_mutation_duration_raw, tombstone_mutation_exit_raw,
+    tombstone_mutation_duration_raw, output_path,
 ) = sys.argv[1:]
 
 def read_json(path):
@@ -359,6 +384,11 @@ try:
     egress_mutation_log = open(egress_mutation_log_path, encoding="utf-8").read()
 except OSError:
     egress_mutation_log = ""
+try:
+    tombstone_mutation_log = open(tombstone_mutation_log_path, encoding="utf-8").read()
+except OSError:
+    tombstone_mutation_log = ""
+navigator_evidence = read_json(navigator_evidence_path)
 
 clients = int(clients_raw)
 load_exit = int(load_exit_raw)
@@ -367,6 +397,8 @@ resume_mutation_exit = int(resume_mutation_exit_raw)
 resume_mutation_duration_ms = int(resume_mutation_duration_raw)
 egress_mutation_exit = int(egress_mutation_exit_raw)
 egress_mutation_duration_ms = int(egress_mutation_duration_raw)
+tombstone_mutation_exit = int(tombstone_mutation_exit_raw)
+tombstone_mutation_duration_ms = int(tombstone_mutation_duration_raw)
 dirty = source_dirty == "true" or source_dirty_after == "true"
 problems = []
 
@@ -376,7 +408,12 @@ def require(name, condition):
     return bool(condition)
 
 def test_ok(name):
-    return re.search(r"^test " + re.escape(name) + r" \.\.\. ok$", test_log, re.M) is not None
+    match = re.search(
+        r"^test " + re.escape(name) + r" \.\.\.(.*?)(?=^test |^test result:)",
+        test_log,
+        re.M | re.S,
+    )
+    return bool(match and re.search(r"(?:^|\n)ok\b|\sok$", match.group(1), re.M))
 
 expected_tests = {
     "inbound_reorder": "flow::collab::session::tests::live_ws::inbound_updates_generated_from_one_base_are_accepted_in_injected_reverse_order",
@@ -391,6 +428,7 @@ expected_tests = {
     "hard_checkpoint": "flow::collab::snapshot::database_tests::hard_boundary_forces_a_checkpoint_before_the_next_update_is_accepted",
     "checkpoint_race": "flow::collab::snapshot::database_tests::advancement_stays_correct_when_racing_a_concurrent_write",
     "snapshot_restart": "flow::collab::snapshot::database_tests::restart_recovery_reproduces_the_exact_same_semantic_hash_from_snapshot_plus_tail",
+    "navigator_tombstones": "flow::move_object::database_tests::navigator_tombstone_growth_is_measured_on_a_cascading_command",
 }
 tests = {key: test_ok(name) for key, name in expected_tests.items()}
 for key, value in tests.items():
@@ -425,6 +463,62 @@ egress_mutation_detected = all((
 ))
 require("empty-resume zero-frame mutation did not make the exact gate test red", resume_mutation_detected)
 require("egress duplicate-forward mutation did not make the exact gate test red", egress_mutation_detected)
+
+navigator_documents = navigator_evidence.get("documents") or []
+queried_navigators = navigator_evidence.get("queried_document_count")
+measured_navigators = navigator_evidence.get("measured_document_count")
+document_ids = [item.get("document_id") for item in navigator_documents if isinstance(item, dict)]
+
+def nonnegative_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+navigator_documents_complete = all((
+    navigator_evidence.get("schema_version") == "sylvode.flow.navigator-tombstone-evidence.v1",
+    nonnegative_int(queried_navigators) and queried_navigators > 0,
+    measured_navigators == queried_navigators == len(navigator_documents),
+    len(document_ids) == len(navigator_documents),
+    len(set(document_ids)) == len(document_ids),
+    all(bool(document_id) for document_id in document_ids),
+    all(
+        nonnegative_int(item.get("live_entry_count"))
+        and nonnegative_int(item.get("tombstone_count"))
+        and nonnegative_int(item.get("snapshot_bytes"))
+        and item.get("snapshot_bytes") > 0
+        and item.get("reclamation_signal")
+            == (item.get("tombstone_count") > item.get("live_entry_count"))
+        for item in navigator_documents
+        if isinstance(item, dict)
+    ),
+))
+growth = navigator_evidence.get("growth") or {}
+navigator_growth_observed = all((
+    navigator_evidence.get("move_out_and_back") is True,
+    growth.get("source_document_id") in set(document_ids),
+    nonnegative_int(growth.get("before_tombstone_count")),
+    nonnegative_int(growth.get("after_tombstone_count")),
+    nonnegative_int(growth.get("delta")),
+    growth.get("delta", 0) > 0,
+    growth.get("after_tombstone_count") > growth.get("before_tombstone_count"),
+    growth.get("delta")
+        == growth.get("after_tombstone_count") - growth.get("before_tombstone_count"),
+    nonnegative_int(growth.get("snapshot_bytes_after")),
+    growth.get("snapshot_bytes_after", 0) > 0,
+))
+tombstone_mutation_detected = all((
+    tombstone_mutation_exit != 0,
+    expected_tests["navigator_tombstones"] in tombstone_mutation_log,
+    "test result: FAILED. 0 passed; 1 failed;" in tombstone_mutation_log,
+    "one command removed N entries" in tombstone_mutation_log,
+))
+navigator_gate = all((
+    tests["navigator_tombstones"],
+    navigator_documents_complete,
+    navigator_growth_observed,
+    tombstone_mutation_detected,
+))
+require("database-authoritative navigator census was incomplete or defaulted", navigator_documents_complete)
+require("navigator move-out-and-back did not expose positive tombstone growth", navigator_growth_observed)
+require("hidden tombstone-growth mutation did not make the exact gate test red", tombstone_mutation_detected)
 
 environment = load.get("environment") or {}
 fixture = load.get("fixture") or {}
@@ -585,6 +679,10 @@ hard_gates = {
         "status": "passed" if cache_gate else "failed",
         "reason": "exact cache boundaries plus fresh release API process re-exec semantic equality",
     },
+    "navigator_tombstone_growth_measured": {
+        "status": "passed" if navigator_gate else "failed",
+        "reason": "database-authoritative complete navigator census plus move-out-and-back growth and mutation-red proof",
+    },
 }
 
 adr_quantitative_gates = {
@@ -660,6 +758,20 @@ result = {
         "barrier": "both concurrent updates generated before reverse-order sends; ping after each accepted",
     },
     "egress": egress,
+    "navigator_tombstone_growth_measured": {
+        "status": "passed" if navigator_gate else "failed",
+        "authoritative_enumeration": {
+            "queried_document_count": queried_navigators,
+            "measured_document_count": measured_navigators,
+            "documents": navigator_documents,
+            "complete": navigator_documents_complete,
+        },
+        "move_out_and_back": navigator_evidence.get("move_out_and_back"),
+        "growth": growth,
+        "growth_observed": navigator_growth_observed,
+        "reclamation_signal_is_non_rejecting": True,
+        "passed": navigator_gate,
+    },
     "falsification": {
         "empty_resume_zero_frames": {
             "mutation_log": os.path.abspath(resume_mutation_log_path),
@@ -678,6 +790,15 @@ result = {
             "duration_ms": egress_mutation_duration_ms,
             "observed": "duplicate Accepted crossed the sequencer before the marker",
             "gate_went_red": egress_mutation_detected,
+        },
+        "navigator_tombstone_growth_hidden": {
+            "mutation_log": os.path.abspath(tombstone_mutation_log_path),
+            "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_HIDE_TOMBSTONE_GROWTH=1",
+            "same_test_replayed": expected_tests["navigator_tombstones"],
+            "exit_code": tombstone_mutation_exit,
+            "duration_ms": tombstone_mutation_duration_ms,
+            "observed": "known positive N-node growth was reported as zero",
+            "gate_went_red": tombstone_mutation_detected,
         },
     },
     "process_restart": restart_raw,
@@ -709,6 +830,7 @@ result = {
         "load_harness_evidence": os.path.abspath(load_path),
         "load_harness_sha256": hashlib.sha256(open(load_path, "rb").read()).hexdigest() if os.path.isfile(load_path) else None,
         "dynamic_test_log": os.path.abspath(test_log_path),
+        "navigator_tombstone_evidence": os.path.abspath(navigator_evidence_path),
     },
 }
 result["passed"] = not problems and surface_ok and snapshot_gate and all(
