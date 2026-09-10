@@ -112,6 +112,8 @@ MUTATION_TICKET_EXPIRY_LOG="$EVIDENCE_REAL/logs/authz.mutation-ticket-expiry.log
 MUTATION_CACHE_POISON_LOG="$EVIDENCE_REAL/logs/authz.mutation-cache-poison.log"
 MUTATION_DRY_RUN_LOG="$EVIDENCE_REAL/logs/authz.mutation-dry-run.log"
 MUTATION_ADMIN_BOT_LOG="$EVIDENCE_REAL/logs/authz.mutation-admin-bot.log"
+MUTATION_ADMIN_BOT_BATCH_LOG="$EVIDENCE_REAL/logs/authz.mutation-admin-bot-batch.log"
+MUTATION_ADMIN_BOT_WORKSPACE_LOG="$EVIDENCE_REAL/logs/authz.mutation-admin-bot-workspace.log"
 MUTATION_DEPTH_BUDGET_LOG="$EVIDENCE_REAL/logs/authz.mutation-depth-budget.log"
 MUTATION_NUMERIC_BUDGET_LOG="$EVIDENCE_REAL/logs/authz.mutation-numeric-budget.log"
 
@@ -334,6 +336,20 @@ read -r MUTATION_ADMIN_BOT_EXIT MUTATION_ADMIN_BOT_MS < <(run_mutation_test \
   "$MUTATION_ADMIN_BOT_LOG" "GATECHAIN_MUTATION_ADMIN_BOT_FALLBACK_ACTIVE" "$ADMIN_BOT_TEST")
 git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/authz.rs
 
+apply_exact_mutation "apps/api/src/flow/collab/authz.rs" \
+  $'if principal_kind == "user" && (role == "owner" || role == "admin") {\n        #[derive(FromQueryResult)]' \
+  $'if role == "owner" || role == "admin" {\n        #[derive(FromQueryResult)]'
+read -r MUTATION_ADMIN_BOT_BATCH_EXIT MUTATION_ADMIN_BOT_BATCH_MS < <(run_mutation_test \
+  "$MUTATION_ADMIN_BOT_BATCH_LOG" "FINAL_FIX_MUTATION_ADMIN_BOT_BATCH_FALLBACK_ACTIVE" "$ADMIN_BOT_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/authz.rs
+
+apply_exact_mutation "apps/api/src/flow/policy.rs" \
+  $'    let actor = require_workspace_access(state, extensions, workspace_id).await?;\n    if actor.1 != "owner" && actor.1 != "admin" {' \
+  $'    let actor = require_workspace_access(state, extensions, workspace_id).await?;\n    if actor.2 {\n        return Err(ApiError::Forbidden("workspace admin access required".to_string()));\n    }\n    if actor.1 != "owner" && actor.1 != "admin" {'
+read -r MUTATION_ADMIN_BOT_WORKSPACE_EXIT MUTATION_ADMIN_BOT_WORKSPACE_MS < <(run_mutation_test \
+  "$MUTATION_ADMIN_BOT_WORKSPACE_LOG" "FINAL_FIX_MUTATION_ADMIN_BOT_WORKSPACE_ADMIN_REVOKED_ACTIVE" "$ADMIN_BOT_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/policy.rs
+
 DEPTH_BUDGET_TEST="routes::flow::flow_database_tests::depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets"
 apply_exact_mutation "apps/api/src/flow/collab/authz.rs" \
   'pub(crate) const TREE_DEPTH_MAX: usize = 32;' \
@@ -406,6 +422,8 @@ echo "  ticket expiry exit=$MUTATION_TICKET_EXPIRY_EXIT duration_ms=$MUTATION_TI
 echo "  cache poison exit=$MUTATION_CACHE_POISON_EXIT duration_ms=$MUTATION_CACHE_POISON_MS log=$MUTATION_CACHE_POISON_LOG" >&2
 echo "  dry run exit=$MUTATION_DRY_RUN_EXIT duration_ms=$MUTATION_DRY_RUN_MS log=$MUTATION_DRY_RUN_LOG" >&2
 echo "  admin bot exit=$MUTATION_ADMIN_BOT_EXIT duration_ms=$MUTATION_ADMIN_BOT_MS log=$MUTATION_ADMIN_BOT_LOG" >&2
+echo "  admin bot batch exit=$MUTATION_ADMIN_BOT_BATCH_EXIT duration_ms=$MUTATION_ADMIN_BOT_BATCH_MS log=$MUTATION_ADMIN_BOT_BATCH_LOG" >&2
+echo "  admin bot workspace exit=$MUTATION_ADMIN_BOT_WORKSPACE_EXIT duration_ms=$MUTATION_ADMIN_BOT_WORKSPACE_MS log=$MUTATION_ADMIN_BOT_WORKSPACE_LOG" >&2
 echo "  depth budget exit=$MUTATION_DEPTH_BUDGET_EXIT duration_ms=$MUTATION_DEPTH_BUDGET_MS log=$MUTATION_DEPTH_BUDGET_LOG" >&2
 echo "  numeric budget exit=$MUTATION_NUMERIC_BUDGET_EXIT duration_ms=$MUTATION_NUMERIC_BUDGET_MS log=$MUTATION_NUMERIC_BUDGET_LOG" >&2
 echo "  depth budget exit=$MUTATION_DEPTH_BUDGET_EXIT duration_ms=$MUTATION_DEPTH_BUDGET_MS log=$MUTATION_DEPTH_BUDGET_LOG" >&2
@@ -425,6 +443,8 @@ STATIC_DYNAMIC_JSON="$(python3 - \
   "$MUTATION_CACHE_POISON_LOG" "$MUTATION_CACHE_POISON_EXIT" "$MUTATION_CACHE_POISON_MS" "$CACHE_POISON_TEST" \
   "$MUTATION_DRY_RUN_LOG" "$MUTATION_DRY_RUN_EXIT" "$MUTATION_DRY_RUN_MS" "$DRY_RUN_TEST" \
   "$MUTATION_ADMIN_BOT_LOG" "$MUTATION_ADMIN_BOT_EXIT" "$MUTATION_ADMIN_BOT_MS" "$ADMIN_BOT_TEST" \
+  "$MUTATION_ADMIN_BOT_BATCH_LOG" "$MUTATION_ADMIN_BOT_BATCH_EXIT" "$MUTATION_ADMIN_BOT_BATCH_MS" \
+  "$MUTATION_ADMIN_BOT_WORKSPACE_LOG" "$MUTATION_ADMIN_BOT_WORKSPACE_EXIT" "$MUTATION_ADMIN_BOT_WORKSPACE_MS" \
   "$MUTATION_DEPTH_BUDGET_LOG" "$MUTATION_DEPTH_BUDGET_EXIT" "$MUTATION_DEPTH_BUDGET_MS" "$DEPTH_BUDGET_TEST" \
   "$MUTATION_NUMERIC_BUDGET_LOG" "$MUTATION_NUMERIC_BUDGET_EXIT" "$MUTATION_NUMERIC_BUDGET_MS" <<'PY'
 import json
@@ -447,6 +467,8 @@ import sys
     mutation_cache_poison_log_s, mutation_cache_poison_exit_s, mutation_cache_poison_ms_s, cache_poison_test,
     mutation_dry_run_log_s, mutation_dry_run_exit_s, mutation_dry_run_ms_s, dry_run_test,
     mutation_admin_bot_log_s, mutation_admin_bot_exit_s, mutation_admin_bot_ms_s, admin_bot_test,
+    mutation_admin_bot_batch_log_s, mutation_admin_bot_batch_exit_s, mutation_admin_bot_batch_ms_s,
+    mutation_admin_bot_workspace_log_s, mutation_admin_bot_workspace_exit_s, mutation_admin_bot_workspace_ms_s,
     mutation_depth_budget_log_s, mutation_depth_budget_exit_s, mutation_depth_budget_ms_s, depth_budget_test,
     mutation_numeric_budget_log_s, mutation_numeric_budget_exit_s, mutation_numeric_budget_ms_s,
 ) = sys.argv[1:]
@@ -486,6 +508,8 @@ mutation_ticket_expiry_log = read(mutation_ticket_expiry_log_s)
 mutation_cache_poison_log = read(mutation_cache_poison_log_s)
 mutation_dry_run_log = read(mutation_dry_run_log_s)
 mutation_admin_bot_log = read(mutation_admin_bot_log_s)
+mutation_admin_bot_batch_log = read(mutation_admin_bot_batch_log_s)
+mutation_admin_bot_workspace_log = read(mutation_admin_bot_workspace_log_s)
 mutation_depth_budget_log = read(mutation_depth_budget_log_s)
 mutation_numeric_budget_log = read(mutation_numeric_budget_log_s)
 
@@ -985,11 +1009,34 @@ add(gate, "numeric_budget_drift_detector_mutation_red", numeric_mutation_red,
 # admin_bot_does_not_bypass_object_boundary
 gate = GATES[9]
 admin_test = "flow::grants::database_tests::an_admin_bot_does_not_bypass_an_object_boundary_but_keeps_workspace_admin"
-add_test(gate, "admin_bot_denied_at_object_boundary_and_workspace_admin_preserved", admin_test)
+for criterion in [
+    "admin_bot_denied_at_single_object_boundary",
+    "admin_bot_denied_at_batch_object_boundary",
+    "admin_bot_workspace_admin_production_path_preserved",
+]:
+    add_test(gate, criterion, admin_test)
 admin_mutation_red = int(mutation_admin_bot_exit_s) != 0 and "GATECHAIN_MUTATION_ADMIN_BOT_FALLBACK_ACTIVE" in mutation_admin_bot_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_admin_bot_log
-add(gate, "admin_bot_boundary_detector_mutation_red", admin_mutation_red,
+add(gate, "admin_bot_single_boundary_detector_mutation_red", admin_mutation_red,
     {"exit": int(mutation_admin_bot_exit_s), "duration_ms": int(mutation_admin_bot_ms_s)},
     [mutation_admin_bot_log_s], None if admin_mutation_red else "admin_bot_mutation_did_not_produce_red")
+admin_batch_mutation_red = all((
+    int(mutation_admin_bot_batch_exit_s) != 0,
+    "FINAL_FIX_MUTATION_ADMIN_BOT_BATCH_FALLBACK_ACTIVE" in mutation_admin_bot_batch_log,
+    "test result: FAILED. 0 passed; 1 failed;" in mutation_admin_bot_batch_log,
+    "optimized batch evaluator must not restore" in mutation_admin_bot_batch_log,
+))
+add(gate, "admin_bot_batch_boundary_detector_mutation_red", admin_batch_mutation_red,
+    {"exit": int(mutation_admin_bot_batch_exit_s), "duration_ms": int(mutation_admin_bot_batch_ms_s)},
+    [mutation_admin_bot_batch_log_s], None if admin_batch_mutation_red else "admin_bot_batch_mutation_did_not_produce_red")
+admin_workspace_mutation_red = all((
+    int(mutation_admin_bot_workspace_exit_s) != 0,
+    "FINAL_FIX_MUTATION_ADMIN_BOT_WORKSPACE_ADMIN_REVOKED_ACTIVE" in mutation_admin_bot_workspace_log,
+    "test result: FAILED. 0 passed; 1 failed;" in mutation_admin_bot_workspace_log,
+    "keeps its production workspace-admin authorization path" in mutation_admin_bot_workspace_log,
+))
+add(gate, "admin_bot_workspace_admin_detector_mutation_red", admin_workspace_mutation_red,
+    {"exit": int(mutation_admin_bot_workspace_exit_s), "duration_ms": int(mutation_admin_bot_workspace_ms_s)},
+    [mutation_admin_bot_workspace_log_s], None if admin_workspace_mutation_red else "admin_bot_workspace_mutation_did_not_produce_red")
 
 depth_mutation_red = int(mutation_depth_budget_exit_s) != 0 and "GATECHAIN_MUTATION_AUTHZ_DEPTH_REDUCED_ACTIVE" in mutation_depth_budget_log and "test result: FAILED. 0 passed; 1 failed;" in mutation_depth_budget_log
 add(GATES[0], "depth_32_detector_mutation_red", depth_mutation_red,
@@ -1099,6 +1146,10 @@ mutations = {
         "duration_ms": int(mutation_dry_run_ms_s), "log": mutation_dry_run_log_s},
     "admin_bot_fallback_enabled": {"test": admin_bot_test, "exit": int(mutation_admin_bot_exit_s),
         "duration_ms": int(mutation_admin_bot_ms_s), "log": mutation_admin_bot_log_s},
+    "admin_bot_batch_fallback_enabled": {"test": admin_bot_test, "exit": int(mutation_admin_bot_batch_exit_s),
+        "duration_ms": int(mutation_admin_bot_batch_ms_s), "log": mutation_admin_bot_batch_log_s},
+    "admin_bot_workspace_admin_revoked": {"test": admin_bot_test, "exit": int(mutation_admin_bot_workspace_exit_s),
+        "duration_ms": int(mutation_admin_bot_workspace_ms_s), "log": mutation_admin_bot_workspace_log_s},
     "authz_depth_reduced": {"test": depth_budget_test, "exit": int(mutation_depth_budget_exit_s),
         "duration_ms": int(mutation_depth_budget_ms_s), "log": mutation_depth_budget_log_s},
     "authorization_numeric_budget_drift": {"check": "source constants equal frozen contract values",

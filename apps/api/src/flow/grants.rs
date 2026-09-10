@@ -1302,6 +1302,7 @@ mod database_tests {
     use std::time::Duration;
 
     use platform::app::AppState;
+    use platform::auth::{JwtClaims, TokenType};
     use platform::config::{AppConfig, Secret};
     use sea_orm::{
         ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
@@ -1315,7 +1316,7 @@ mod database_tests {
         CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput, create_object, execute_command, set_flow_feature,
     };
     use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
-    use crate::middleware::bot_auth::bot_role_from_permissions;
+    use crate::middleware::bot_auth::{BotAuthContext, bot_role_from_permissions};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
@@ -2177,6 +2178,21 @@ mod database_tests {
             PermissionLevel::Denied,
             "an admin bot must not inherit the human admin fallback through an object boundary"
         );
+        let batch = authz::effective_permissions(
+            &scratch.db,
+            fx.workspace_id,
+            &[restricted],
+            "bot",
+            fx.bot_id,
+            &synthesized,
+        )
+        .await
+        .expect("the batch evaluator resolves the restricted bot candidate");
+        assert_eq!(
+            batch,
+            vec![(restricted, PermissionLevel::Denied)],
+            "the optimized batch evaluator must not restore the human admin fallback for a bot"
+        );
         assert_policy_rejected(
             &run_command(&state, restricted, &admin_bot, "archive").await,
             "an admin bot behind an authorization boundary",
@@ -2209,9 +2225,33 @@ mod database_tests {
             "the human admin rescue path must survive the boundary"
         );
 
-        // (b) The same bot's workspace-level admin operation still works: the Flow feature flag,
-        // one of the v0.4-shipped `WorkspaceWide(admin)` capabilities `ADR-0012` §4.1 point 5
-        // explicitly keeps ("workspace 级 admin 操作: bot 保留，行为不变").
+        // (b) The same bot's workspace-level admin operation still works: authenticate with the
+        // real `BotAuthContext`, pass through the production workspace-admin policy, then use the
+        // returned bot actor to execute the v0.4-shipped Flow feature operation. This deliberately
+        // does not substitute the owner's id or a human `actor_is_bot=false` input.
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(JwtClaims {
+            sub: fx.bot_id.to_string(),
+            email: format!("{}@bot.invalid", fx.bot_id),
+            token_type: TokenType::Access,
+            iat: 0,
+            exp: 0,
+        });
+        extensions.insert(BotAuthContext {
+            bot_id: fx.bot_id,
+            workspace_id: fx.workspace_id,
+            permissions: vec!["read".to_string(), "write".to_string(), "admin".to_string()],
+            surface: EventSurface::McpStdio,
+            tool_name: Some("flow.feature_set".to_string()),
+            request_id: Uuid::new_v4(),
+        });
+        let (workspace_actor_id, workspace_role, workspace_actor_is_bot) =
+            crate::flow::policy::require_flow_workspace_admin_access(&state, &extensions, fx.workspace_id)
+                .await
+                .expect("the admin bot keeps its production workspace-admin authorization path");
+        assert_eq!(workspace_actor_id, fx.bot_id);
+        assert_eq!(workspace_role, "admin");
+        assert!(workspace_actor_is_bot);
         set_flow_feature(
             &state,
             SetFlowFeatureInput {
@@ -2219,20 +2259,15 @@ mod database_tests {
                     crate::flow::event_origin::EventSurface::Rest,
                 ),
                 workspace_id: fx.workspace_id,
-                actor_id: fx.owner_id,
-                actor_is_bot: false,
-                enabled: Some(true),
+                actor_id: workspace_actor_id,
+                actor_is_bot: workspace_actor_is_bot,
+                enabled: Some(false),
                 default_member_level: Some("edit".to_string()),
                 idempotency_key: Uuid::new_v4().to_string(),
             },
         )
         .await
         .expect("the workspace-level admin operation must remain available");
-        assert_eq!(
-            bot_role_from_permissions(&["admin".to_string()]),
-            "admin",
-            "the bot's workspace admin role must not have been narrowed away"
-        );
 
         // (c) The documented route back in for a bot: an explicit grant, like any other grantee.
         set_grants(
