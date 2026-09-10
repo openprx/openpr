@@ -264,6 +264,10 @@ def main() -> int:
 
     output = {
         "source_head": head,
+        "artifact_wiring": {
+            gate: {"artifact": artifact, "top_level_fallback": fallback}
+            for gate, (artifact, fallback) in WIRING.items()
+        },
         "artifact_states": states,
         "hard_gates": {gate: gates[gate] for gate in WIRING},
         "reasons": {gate: reasons[gate] for gate in WIRING},

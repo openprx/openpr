@@ -121,7 +121,7 @@ if [[ "$(jq 'length' <<<"$YAML_HARD_GATES")" -ne 31 ]] || \
   exit 2
 fi
 
-REQUIRED_TOP_KEYS='["schema_version","schema_path","release","source_baseline","source","generated_at","gate_contract","mode","automation_passed","candidate_ready","gate_passed","counts","checks","required_commands","artifacts","artifact_states","artifact_wiring","hard_gates","predecessor","budgets","manual_signoffs","blocking_reasons","pending_signoffs","blockers"]'
+REQUIRED_TOP_KEYS='["schema_version","schema_path","release","source_baseline","source","generated_at","gate_contract","mode","automation_passed","candidate_ready","gate_passed","counts","checks","required_commands","artifacts","artifact_states","artifact_wiring","hard_gates","predecessor","budgets","verification_assurance","manual_signoffs","blocking_reasons","pending_signoffs","blockers"]'
 STRUCT_ERRORS='[]'
 while IFS= read -r key; do
   if [[ "$(jq --arg k "$key" 'has($k)' "$GATE_RESULT_PATH")" != true ]]; then
@@ -131,7 +131,7 @@ done < <(jq -r '.[]' <<<"$REQUIRED_TOP_KEYS")
 for typed in source:object source_baseline:object gate_contract:object counts:object \
   checks:array required_commands:object artifacts:object \
   artifact_states:object artifact_wiring:object hard_gates:object predecessor:object \
-  budgets:object manual_signoffs:object blocking_reasons:array pending_signoffs:array blockers:array; do
+  budgets:object verification_assurance:object manual_signoffs:object blocking_reasons:array pending_signoffs:array blockers:array; do
   key="${typed%%:*}"; expected="${typed##*:}"
   actual="$(jq -r --arg k "$key" 'if has($k) then (.[$k]|type) else "missing" end' "$GATE_RESULT_PATH")"
   if [[ "$actual" != missing && "$actual" != "$expected" ]]; then
@@ -252,8 +252,8 @@ INDEPENDENT_JSON="$(python3 "$ROOT_DIR/scripts/lib/flow_gate_v0_5_recompute.py" 
 INDEPENDENT_EXIT=$?
 set -e
 if [[ $INDEPENDENT_EXIT -ne 0 ]] || ! jq -e '
-  (.artifact_states|type)=="object" and (.hard_gates|type)=="object" and
-  (.reasons|type)=="object" and (.hard_gates|length)==31
+  (.artifact_states|type)=="object" and (.artifact_wiring|type)=="object" and
+  (.hard_gates|type)=="object" and (.reasons|type)=="object" and (.hard_gates|length)==31
 ' >/dev/null 2>&1 <<<"$INDEPENDENT_JSON"; then
   echo "FAIL: independent v0.5 recomputation failed or returned malformed JSON" >&2
   printf '%s\n' "$INDEPENDENT_JSON" >&2
@@ -262,6 +262,9 @@ fi
 RECOMPUTED_STATES="$(jq -c .artifact_states <<<"$INDEPENDENT_JSON")"
 RECOMPUTED_GATES="$(jq -c .hard_gates <<<"$INDEPENDENT_JSON")"
 RECOMPUTED_REASONS="$(jq -c .reasons <<<"$INDEPENDENT_JSON")"
+RECOMPUTED_WIRING="$(jq -c .artifact_wiring <<<"$INDEPENDENT_JSON")"
+[[ "$(jq -Sc . <<<"$WIRING")" == "$(jq -Sc . <<<"$RECOMPUTED_WIRING")" ]] || add_drift "jq and Python artifact wiring disagree"
+[[ "$(jq -Sc '.artifact_wiring' "$GATE_RESULT_PATH")" == "$(jq -Sc . <<<"$RECOMPUTED_WIRING")" ]] || add_drift "artifact_wiring drift from independent Python wiring"
 [[ "$(jq -Sc . <<<"$JQ_RECOMPUTED_STATES")" == "$(jq -Sc . <<<"$RECOMPUTED_STATES")" ]] || add_drift "report jq artifact-state algorithm disagrees with independent Python recomputation"
 [[ "$(jq -Sc . <<<"$JQ_RECOMPUTED_GATES")" == "$(jq -Sc . <<<"$RECOMPUTED_GATES")" ]] || add_drift "report jq hard-gate algorithm disagrees with independent Python recomputation"
 [[ "$(jq -Sc '.artifact_states' "$GATE_RESULT_PATH")" == "$(jq -Sc . <<<"$RECOMPUTED_STATES")" ]] || add_drift "artifact_states drift from on-disk evidence"
@@ -332,7 +335,11 @@ PSTATUS=not_accepted; PREASON="v0.4 contract status is ${V04_STATUS:-missing}, e
 if [[ "$V04_STATUS" == accepted ]]; then
   if [[ ! -f "$V04_RECEIPT" ]]; then PSTATUS=artifact_missing; PREASON="v0.4 gate-result.json is missing"
   elif ! jq empty "$V04_RECEIPT" >/dev/null 2>&1; then PSTATUS=artifact_malformed; PREASON="v0.4 gate-result.json is malformed"
-  elif [[ "$(jq -r '.release//empty' "$V04_RECEIPT")" == 0.4.0 && "$(jq -r '.gate_passed//false' "$V04_RECEIPT")" == true && "$(jq -r '.source.dirty//true' "$V04_RECEIPT")" == false ]]; then
+  elif [[ "$(jq -r '.release//empty' "$V04_RECEIPT")" == 0.4.0 && \
+          "$(jq -r '.gate_passed//false' "$V04_RECEIPT")" == true ]] && \
+       jq -e '(.source | type) == "object" and (.source | has("dirty")) and
+              (.source.dirty | type) == "boolean" and .source.dirty == false' \
+         "$V04_RECEIPT" >/dev/null; then
     PSTATUS=accepted; PREASON="v0.4 contract and receipt both record acceptance"
   else PSTATUS=receipt_not_accepted; PREASON="v0.4 receipt does not prove a clean accepted gate"; fi
 fi
@@ -357,6 +364,25 @@ EXPECTED="$(jq -c --arg status "$EXPECTED_REPORT_STATUS" --argjson exit_code "$E
 for path in mode automation_passed candidate_ready gate_passed counts blocking_reasons pending_signoffs blockers; do
   [[ "$(jq -c ".$path" "$GATE_RESULT_PATH")" == "$(jq -c ".$path" <<<"$EXPECTED")" ]] || add_drift "derived $path drift"
 done
+VERIFICATION_ASSURANCE='{
+  "artifact_states_and_hard_gate_verdicts": {
+    "classification": "independent_dual_implementation",
+    "implementations": ["jq", "python"],
+    "wiring_fields_cross_checked": ["artifact", "top_level_fallback"]
+  },
+  "receipt_derivation": {
+    "classification": "shared_single_implementation",
+    "implementation": "flow_derive_receipt",
+    "fields": ["blocking_reasons", "counts", "mode", "automation_passed", "candidate_ready", "gate_passed", "pending_signoffs", "blockers"]
+  },
+  "producer_execution_metadata": {
+    "classification": "self_reported_with_integrity_checks",
+    "fields": ["checks", "required_commands.status", "required_commands.exit_code"],
+    "log_checksums_verified": true,
+    "log_contents_independently_recomputed": false
+  }
+}'
+[[ "$(jq -Sc '.verification_assurance' "$GATE_RESULT_PATH")" == "$(jq -Sc . <<<"$VERIFICATION_ASSURANCE")" ]] || add_drift "verification_assurance drift"
 [[ "$(jq -c '.required_commands.report|{status,exit_code}' "$GATE_RESULT_PATH")" == "$(jq -c '.required_commands.report|{status,exit_code}' <<<"$EXPECTED")" ]] || add_drift "report command status drift"
 
 AUTOMATION_PASSED="$(jq -r '.candidate_ready' <<<"$EXPECTED")"
@@ -366,7 +392,8 @@ RESULT="$(jq -cn --arg gate_result "$GATE_RESULT_PATH" --argjson receipt_consist
   --argjson automation_passed "$AUTOMATION_PASSED" --argjson drift "$DRIFT" \
   --argjson hard_gates "$RECOMPUTED_GATES" --argjson hard_gate_reasons "$RECOMPUTED_REASONS" \
   --argjson artifact_states "$RECOMPUTED_STATES" --argjson passed "$PASSED" \
-  '{gate_result:$gate_result,receipt_consistent:$receipt_consistent,automation_passed:$automation_passed,hard_gate_counts:($hard_gates|to_entries|group_by(.value)|map({(.[0].value):length})|add),hard_gate_reasons:$hard_gate_reasons,artifact_states:($artifact_states|with_entries(.value=.value.status)),drift:$drift,passed:$passed}')"
+  --argjson verification_assurance "$VERIFICATION_ASSURANCE" \
+  '{gate_result:$gate_result,receipt_consistent:$receipt_consistent,automation_passed:$automation_passed,verification_assurance:$verification_assurance,hard_gate_counts:($hard_gates|to_entries|group_by(.value)|map({(.[0].value):length})|add),hard_gate_reasons:$hard_gate_reasons,artifact_states:($artifact_states|with_entries(.value=.value.status)),drift:$drift,passed:$passed}')"
 printf '%s\n' "$RESULT"
 if [[ $MALFORMED_ARTIFACTS -gt 0 ]]; then exit 2; fi
 if [[ "$PASSED" == true ]]; then exit 0; fi

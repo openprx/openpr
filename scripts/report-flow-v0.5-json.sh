@@ -368,8 +368,10 @@ if [[ "$V04_CONTRACT_STATUS" == accepted ]]; then
     PREDECESSOR_STATUS=artifact_malformed
     PREDECESSOR_REASON="v0.4 gate-result.json is malformed"
   elif [[ "$(jq -r '.release // empty' "$V04_GATE_RESULT")" == 0.4.0 && \
-          "$(jq -r '.gate_passed // false' "$V04_GATE_RESULT")" == true && \
-          "$(jq -r '.source.dirty // true' "$V04_GATE_RESULT")" == false ]]; then
+          "$(jq -r '.gate_passed // false' "$V04_GATE_RESULT")" == true ]] && \
+       jq -e '(.source | type) == "object" and (.source | has("dirty")) and
+              (.source.dirty | type) == "boolean" and .source.dirty == false' \
+         "$V04_GATE_RESULT" >/dev/null; then
     PREDECESSOR_STATUS=accepted
     PREDECESSOR_REASON="v0.4 contract and receipt both record acceptance"
   else
@@ -410,6 +412,24 @@ done < <(jq -r 'keys[]' <<<"$REQUIRED_COMMAND_STRINGS")
 
 GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 GATE_YAML_SHA="$(sha256_of "$GATE_YAML")"
+VERIFICATION_ASSURANCE='{
+  "artifact_states_and_hard_gate_verdicts": {
+    "classification": "independent_dual_implementation",
+    "implementations": ["jq", "python"],
+    "wiring_fields_cross_checked": ["artifact", "top_level_fallback"]
+  },
+  "receipt_derivation": {
+    "classification": "shared_single_implementation",
+    "implementation": "flow_derive_receipt",
+    "fields": ["blocking_reasons", "counts", "mode", "automation_passed", "candidate_ready", "gate_passed", "pending_signoffs", "blockers"]
+  },
+  "producer_execution_metadata": {
+    "classification": "self_reported_with_integrity_checks",
+    "fields": ["checks", "required_commands.status", "required_commands.exit_code"],
+    "log_checksums_verified": true,
+    "log_contents_independently_recomputed": false
+  }
+}'
 BASE_RECEIPT="$(jq -cn \
   --arg generated_at "$GENERATED_AT" --arg repository "$REPO_ROOT" --arg head "$SOURCE_HEAD" \
   --arg rust_version "$RUST_WORKSPACE_VERSION" --arg frontend_version "$FRONTEND_PACKAGE_VERSION" \
@@ -420,6 +440,7 @@ BASE_RECEIPT="$(jq -cn \
   --argjson artifacts "$ARTIFACTS_JSON" --argjson artifact_states "$ARTIFACT_STATES" \
   --argjson hard_gates "$HARD_GATES" --argjson predecessor "$PREDECESSOR" \
   --argjson budgets "$BUDGETS" \
+  --argjson verification_assurance "$VERIFICATION_ASSURANCE" \
   --argjson wiring "$(jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; flow_gate_wiring')" \
   '{
     schema_version:"sylvode.flow.gate-result.v1",
@@ -433,6 +454,7 @@ BASE_RECEIPT="$(jq -cn \
     counts:{},checks:$checks,required_commands:$required_commands,
     artifacts:$artifacts,artifact_states:$artifact_states,artifact_wiring:$wiring,
     hard_gates:$hard_gates,predecessor:$predecessor,budgets:$budgets,
+    verification_assurance:$verification_assurance,
     manual_signoffs:{
       permission_revocation:{status:"pending",reviewer:"",evidence:""},
       audit_causation:{status:"pending",reviewer:"",evidence:""}

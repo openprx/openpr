@@ -185,6 +185,15 @@ def flow_compute_hard_gates($artifact_states):
 def flow_counts_by_status($values):
   reduce ($values | sort | group_by(.)[]) as $group ({}; .[$group[0]] = ($group | length));
 
+def flow_required_boolean($object; $key; $path):
+  if ($object | type) != "object" or (($object | has($key)) | not) then
+    error($path + " is required")
+  elif ($object[$key] | type) != "boolean" then
+    error($path + " must be boolean")
+  else
+    $object[$key]
+  end;
+
 def flow_derive_receipt:
   ([.checks[]? | select(.status != "passed") |
       "check-not-passed:" + .id + ":" + .status]) as $check_blocking
@@ -203,7 +212,8 @@ def flow_derive_receipt:
      end) as $predecessor_blocking
   | ([.budgets | to_entries[] | select(.value.frozen != true) |
       "budget-not-frozen:" + .key + ":" + .value.status]) as $budget_blocking
-  | (if (.source.dirty // true) then ["source-dirty"] else [] end) as $source_blocking
+  | (flow_required_boolean(.source; "dirty"; "source.dirty")) as $source_dirty
+  | (if $source_dirty then ["source-dirty"] else [] end) as $source_blocking
   | ([.manual_signoffs | to_entries[] | select(.value.status == "failed" or .value.status == "needs_rework") |
       "manual-signoff-blocking:" + .key + ":" + .value.status]) as $manual_blocking
   | ([.manual_signoffs | to_entries[] | select(.value.status == "pending") |
