@@ -6,6 +6,8 @@
 
 use axum::http::Extensions;
 use platform::app::AppState;
+#[cfg(test)]
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -253,6 +255,7 @@ pub(crate) fn authorization_read_unstable() -> ApiError {
 struct EpochChangePlan {
     checks_before_change: usize,
     remaining_changes: usize,
+    object_to_revoke: Option<Uuid>,
 }
 
 #[cfg(test)]
@@ -271,33 +274,60 @@ pub(crate) fn plan_epoch_changes_for_test(workspace_id: Uuid, checks_before_chan
         EpochChangePlan {
             checks_before_change,
             remaining_changes: changes,
+            object_to_revoke: None,
+        },
+    );
+}
+
+/// Schedules a real object-level revocation at the selected epoch check. The boundary change and
+/// epoch advance happen before the check returns, so the route must discard the already-built
+/// response and authorize the next attempt from scratch.
+#[cfg(test)]
+pub(crate) fn plan_object_revocation_for_test(workspace_id: Uuid, object_id: Uuid, checks_before_change: usize) {
+    epoch_change_plans().lock().insert(
+        workspace_id,
+        EpochChangePlan {
+            checks_before_change,
+            remaining_changes: 1,
+            object_to_revoke: Some(object_id),
         },
     );
 }
 
 #[cfg(test)]
 async fn inject_epoch_change_if_planned(state: &AppState, workspace_id: Uuid) -> Result<(), ApiError> {
-    let should_change = {
+    let change = {
         let mut plans = epoch_change_plans().lock();
         let Some(plan) = plans.get_mut(&workspace_id) else {
             return Ok(());
         };
         if plan.checks_before_change > 0 {
             plan.checks_before_change -= 1;
-            false
+            None
         } else if plan.remaining_changes > 0 {
             plan.remaining_changes -= 1;
+            let object_to_revoke = plan.object_to_revoke;
             let finished = plan.remaining_changes == 0;
             if finished {
                 plans.remove(&workspace_id);
             }
-            true
+            Some(object_to_revoke)
         } else {
             plans.remove(&workspace_id);
-            false
+            None
         }
     };
-    if should_change {
+    if let Some(object_to_revoke) = change {
+        if let Some(object_id) = object_to_revoke {
+            state
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE flow_objects SET inherit_from_parent = false WHERE workspace_id = $1 AND id = $2",
+                    vec![workspace_id.into(), object_id.into()],
+                ))
+                .await?;
+        }
         authz::advance_epoch(&state.db, workspace_id).await?;
     }
     Ok(())

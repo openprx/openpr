@@ -2141,7 +2141,9 @@ mod database_tests {
 
     use platform::app::AppState;
     use platform::config::{AppConfig, Secret};
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use sea_orm::{
+        ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+    };
     use serde_json::{Value, json};
     use uuid::Uuid;
 
@@ -2153,6 +2155,7 @@ mod database_tests {
     use crate::flow::collab::runtime::CollabRuntime;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object};
     use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
+    use crate::flow::grants::{Caller, GrantRequest, SetGrantsInput, set_grants};
     use crate::flow::model::AcceptedChange;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -2987,6 +2990,138 @@ mod database_tests {
             2,
             "two logical moves, two events, no duplicate and no lost write"
         );
+        scratch.drop_self().await;
+    }
+
+    /// The depth-20 authorization fixture and the grant/move race share the same real database
+    /// state. Both mutations are released from one epoch-row blocker, both are observed waiting on
+    /// the production lock, and the final effective permission is evaluated through the moved
+    /// leaf's complete 20-node chain. A source-text keyword cannot satisfy any assertion here.
+    #[tokio::test]
+    async fn depth_20_evaluation_crosses_concurrent_grant_and_move() {
+        let scratch = scratch_or_skip!("depth_20_concurrent_grant_move");
+        let state = Arc::new(state_for(scratch.db.clone()));
+        let fx = Arc::new(seed_workspace(&scratch.db).await);
+        let runtime = Arc::new(CollabRuntime::default());
+
+        let root = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let mut common_parent = root;
+        // root is depth 1; seventeen pages make `common_parent` depth 18.
+        for _ in 0..17 {
+            common_parent = create(&state, &fx, "page", Some(fx.project_a), Some(common_parent)).await;
+        }
+        let source_parent = create(&state, &fx, "page", Some(fx.project_a), Some(common_parent)).await;
+        let target_parent = create(&state, &fx, "page", Some(fx.project_a), Some(common_parent)).await;
+        let leaf = create(&state, &fx, "page", Some(fx.project_a), Some(source_parent)).await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![target_parent.into()],
+        )
+        .await;
+
+        let initial_chain = authz::inheritance_chain(&scratch.db, fx.workspace_id, leaf)
+            .await
+            .expect("the depth-20 source chain is valid");
+        assert_eq!(initial_chain.ids.len(), 20, "the fixture must reach exactly depth 20");
+        assert_eq!(
+            level_for(&scratch.db, &fx, target_parent, fx.member_id, "member").await,
+            PermissionLevel::Denied,
+            "the target boundary starts with no applicable grant"
+        );
+
+        let blocker = scratch.db.begin().await.expect("the race blocker opens a transaction");
+        authz::lock_epoch_for_update(&blocker, fx.workspace_id)
+            .await
+            .expect("the blocker owns the same epoch row both mutations require");
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let grant_task = {
+            let state = state.clone();
+            let fx = fx.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                start.wait().await;
+                set_grants(
+                    &state,
+                    fx.workspace_id,
+                    SetGrantsInput {
+                        object_id: target_parent,
+                        caller: Caller {
+                            actor_id: fx.owner_id,
+                            principal_kind: "user".to_string(),
+                            role: "owner".to_string(),
+                            origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                        },
+                        grants: vec![GrantRequest {
+                            principal_kind: "user".to_string(),
+                            principal_id: fx.member_id,
+                            level: "full_access".to_string(),
+                        }],
+                        confirm_self_lockout: false,
+                        dry_run: false,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                    },
+                )
+                .await
+            })
+        };
+        let move_task = {
+            let state = state.clone();
+            let fx = fx.clone();
+            let runtime = runtime.clone();
+            let start = start.clone();
+            tokio::spawn(async move {
+                let input = move_input(leaf, fx.owner_id, "owner", json!({ "target_object_id": target_parent }));
+                start.wait().await;
+                run_move_with_contention_retries(&state, &runtime, &fx, &input).await
+            })
+        };
+
+        start.wait().await;
+        // Stay below the command's 100 ms lock timeout while still giving both tasks time to
+        // issue their first locked statement.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !grant_task.is_finished(),
+            "the concurrent grant did not reach the epoch-row barrier"
+        );
+        assert!(
+            !move_task.is_finished(),
+            "the concurrent move did not reach the epoch-row barrier"
+        );
+        blocker
+            .rollback()
+            .await
+            .expect("the race blocker releases both mutations");
+
+        let grant = tokio::time::timeout(Duration::from_secs(30), grant_task)
+            .await
+            .expect("the concurrent grant must not hang")
+            .expect("the grant task joins")
+            .expect("the concurrent grant commits");
+        assert!(grant.applied, "the grant mutation must really commit");
+        tokio::time::timeout(Duration::from_secs(30), move_task)
+            .await
+            .expect("the concurrent move must not hang")
+            .expect("the move task joins")
+            .expect("the concurrent move commits after bounded contention retries");
+
+        assert_eq!(parent_of(&scratch.db, leaf).await, Some(target_parent));
+        let moved_chain = authz::inheritance_chain(&scratch.db, fx.workspace_id, leaf)
+            .await
+            .expect("the moved depth-20 chain is valid");
+        assert_eq!(
+            moved_chain.ids.len(),
+            20,
+            "the post-race evaluation must still traverse depth 20"
+        );
+        assert_eq!(
+            level_for(&scratch.db, &fx, leaf, fx.member_id, "member").await,
+            PermissionLevel::FullAccess,
+            "the depth-20 result must combine the committed move with the concurrent boundary grant"
+        );
+
         scratch.drop_self().await;
     }
 

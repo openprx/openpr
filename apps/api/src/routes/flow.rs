@@ -1628,6 +1628,7 @@ mod flow_database_tests {
         let scratch = scratch_or_skip!("object_read_epoch_retry");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
         let object_ids = [
             create_page_as_owner(&state, workspace_id, owner_id, "Retry object").await,
             create_page_as_owner(&state, workspace_id, owner_id, "Retry bootstrap").await,
@@ -1686,6 +1687,125 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(history["code"], 0, "the history read did not recover: {history}");
+
+        // Each member read succeeds on the workspace baseline, then its final epoch check applies
+        // a real boundary revocation. A correct route discards the prepared response, retries, and
+        // returns the same fieldless not-found envelope that a normally hidden object returns.
+        for (index, object_id) in object_ids.into_iter().enumerate() {
+            let visible = match index {
+                0 => {
+                    body_json(to_response(
+                        get_flow_object(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(object_id),
+                            Query(GetFlowObjectQuery {
+                                at_seq: None,
+                                render: None,
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await
+                }
+                1 => {
+                    body_json(to_response(
+                        get_flow_object_bootstrap(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(object_id),
+                            Query(GetFlowObjectBootstrapQuery {
+                                known_seq: None,
+                                known_frontier: None,
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await
+                }
+                _ => {
+                    body_json(to_response(
+                        get_flow_object_history(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(object_id),
+                            Query(FlowObjectHistoryQuery {
+                                before_seq: None,
+                                limit: None,
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await
+                }
+            };
+            assert_eq!(
+                visible["code"], 0,
+                "the member must be authorized before revocation: {visible}"
+            );
+
+            // The successful member read above warmed this principal's permission cache, so this
+            // request has one initial epoch check and then the final pre-return check.
+            crate::flow::policy::plan_object_revocation_for_test(workspace_id, object_id, 1);
+            let revoked = match index {
+                0 => {
+                    body_json(to_response(
+                        get_flow_object(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(object_id),
+                            Query(GetFlowObjectQuery {
+                                at_seq: None,
+                                render: None,
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await
+                }
+                1 => {
+                    body_json(to_response(
+                        get_flow_object_bootstrap(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(object_id),
+                            Query(GetFlowObjectBootstrapQuery {
+                                known_seq: None,
+                                known_frontier: None,
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await
+                }
+                _ => {
+                    body_json(to_response(
+                        get_flow_object_history(
+                            State(state.clone()),
+                            claims_for(member_id),
+                            None,
+                            Path(object_id),
+                            Query(FlowObjectHistoryQuery {
+                                before_seq: None,
+                                limit: None,
+                            }),
+                        )
+                        .await,
+                    ))
+                    .await
+                }
+            };
+            assert_eq!(
+                revoked["code"], 404,
+                "a read prepared before revocation escaped: {revoked}"
+            );
+            assert!(revoked["data"].is_null(), "a denied read exposed data: {revoked}");
+        }
 
         scratch.drop_self().await;
     }

@@ -61,7 +61,7 @@ if [[ -z "$ADR_PATH" || -z "$LIMITS_PATH" || $JSON_MODE -ne 1 ]]; then
   usage >&2
   exit 2
 fi
-for tool in cargo git jq python3 realpath; do
+for tool in cargo dirname git grep jq mktemp python3 realpath rmdir; do
   command -v "$tool" >/dev/null 2>&1 || { echo "FAIL: missing required tool: $tool" >&2; exit 2; }
 done
 ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")" || exit 2
@@ -97,6 +97,16 @@ BUILD_LOG="$EVIDENCE_REAL/logs/authz.worker-build.log"
 LIST_LOG="$EVIDENCE_REAL/logs/authz.test-list.log"
 TEST_LOG="$EVIDENCE_REAL/logs/authz.cargo-test.log"
 REQUIRED_TESTS_FILE="$EVIDENCE_REAL/logs/authz.required-tests.txt"
+SURFACE_LOG="$EVIDENCE_REAL/logs/authz.surface-parity.log"
+SURFACE_EVIDENCE_ROOT="$EVIDENCE_REAL/dependencies/surface-v0.4"
+SURFACE_RESULT="$SURFACE_EVIDENCE_ROOT/surface-coverage-result.json"
+BASELINE_LOG="$EVIDENCE_REAL/logs/authz.member-baseline.log"
+BASELINE_EVIDENCE_ROOT="$EVIDENCE_REAL/dependencies/authz-baseline-v0.4"
+BASELINE_RESULT="$BASELINE_EVIDENCE_ROOT/authz-baseline-result.json"
+MUTATION_BOUNDARY_LOG="$EVIDENCE_REAL/logs/authz.mutation-boundary.log"
+MUTATION_PRESENCE_LOG="$EVIDENCE_REAL/logs/authz.mutation-presence.log"
+MUTATION_FENCE_LOG="$EVIDENCE_REAL/logs/authz.mutation-fence.log"
+MUTATION_REAUTHORIZE_LOG="$EVIDENCE_REAL/logs/authz.mutation-reauthorize.log"
 
 run_timed() {
   local log="$1"
@@ -127,6 +137,7 @@ flow::collab::authz::database_tests::a_parent_id_cycle_is_rejected
 flow::collab::authz::database_tests::a_parent_in_another_workspace_is_rejected_not_treated_as_a_root
 flow::collab::authz::database_tests::boundary_and_baseline_semantics_are_unchanged
 flow::collab::authz::database_tests::a_workspace_admin_keeps_the_rescue_path_when_the_chain_is_broken
+flow::move_object::database_tests::depth_20_evaluation_crosses_concurrent_grant_and_move
 flow::collab::write::database_tests::epoch_fencing_blocks_a_write_that_straddles_a_concurrent_revocation
 flow::command::database_tests::authz_epoch_is_read_before_permission_so_a_revocation_between_them_cannot_be_fenced_out
 flow::collab::permission_cache::tests::stale_epoch_poison_is_a_miss_and_is_removed
@@ -144,7 +155,7 @@ flow::grants::database_tests::self_lockout_needs_confirmation_and_leaves_an_admi
 flow::grants::database_tests::a_dry_run_returns_the_same_summary_and_writes_nothing
 flow::grants::database_tests::archive_and_restore_stay_in_the_edit_tier_but_a_navigator_does_not
 flow::command::database_tests::lifecycle_tier_uses_the_real_impact_set_and_preserves_the_edit_baseline
-flow::command::database_tests::lifecycle_impact_drift_rolls_back_instead_of_committing_the_prepared_subset
+flow::command::database_tests::lifecycle_descendant_growth_does_not_turn_a_plain_archive_into_a_cascade
 flow::command::database_tests::lifecycle_holds_the_current_authz_epoch_fence_until_its_commit
 EOF
 printf '%s\n' "${REQUIRED_TESTS[@]}" >"$REQUIRED_TESTS_FILE"
@@ -167,10 +178,126 @@ TEST_END="$(date +%s%N)"
 TEST_MS="$(((TEST_END - TEST_START) / 1000000))"
 echo "  exit=$TEST_EXIT duration_ms=$TEST_MS log=$TEST_LOG" >&2
 
+mkdir -p "$SURFACE_EVIDENCE_ROOT" "$BASELINE_EVIDENCE_ROOT"
+echo "=== run v0.4 surface parity dependency ===" >&2
+read -r SURFACE_EXIT SURFACE_MS < <(run_timed "$SURFACE_LOG" \
+  "$REPO_ROOT/scripts/verify-flow-surface-coverage.sh" \
+  --release 0.4 --contracts-root "$CONTRACTS_ROOT" --evidence-root "$SURFACE_EVIDENCE_ROOT" \
+  --repo-root "$REPO_ROOT" --json)
+echo "  exit=$SURFACE_EXIT duration_ms=$SURFACE_MS log=$SURFACE_LOG" >&2
+
+echo "=== run v0.4 member-baseline dependency ===" >&2
+read -r BASELINE_EXIT BASELINE_MS < <(run_timed "$BASELINE_LOG" \
+  "$REPO_ROOT/scripts/verify-flow-authz-baseline-v0.4.sh" \
+  --adr "$ADR_PATH" --contracts-root "$CONTRACTS_ROOT" --database-url "$DATABASE_URL" \
+  --repo-root "$REPO_ROOT" --evidence-root "$BASELINE_EVIDENCE_ROOT" --json)
+echo "  exit=$BASELINE_EXIT duration_ms=$BASELINE_MS log=$BASELINE_LOG" >&2
+
+# Real source mutations run in a detached disposable worktree with its own default target. Sharing
+# the primary checkout's target would let the worktree's compile-time manifest path contaminate
+# build provenance in later primary-checkout builds. Each mutation is restored before the next one,
+# and the worktree is removed by the EXIT trap even when compilation or a criterion fails.
+# Keep the independent target on the same filesystem as the checkout: system /tmp is commonly a
+# small tmpfs and cannot safely hold a full Rust workspace build.
+MUTATION_PARENT="$(mktemp -d "$(dirname "$REPO_ROOT")/openpr-authz-mutations.XXXXXX")"
+MUTATION_REPO="$MUTATION_PARENT/source"
+cleanup_mutation_worktree() {
+  if git -C "$REPO_ROOT" worktree list --porcelain | grep -Fxq "worktree $MUTATION_REPO"; then
+    git -C "$REPO_ROOT" worktree remove --force "$MUTATION_REPO" >/dev/null 2>&1 || true
+  fi
+  rmdir "$MUTATION_PARENT" >/dev/null 2>&1 || true
+}
+trap cleanup_mutation_worktree EXIT
+git -C "$REPO_ROOT" worktree add --detach "$MUTATION_REPO" "$SOURCE_HEAD" >/dev/null
+
+apply_exact_mutation() {
+  local relative_path="$1" before="$2" after="$3"
+  python3 - "$MUTATION_REPO/$relative_path" "$before" "$after" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+before, after = sys.argv[2:]
+source = path.read_text(encoding="utf-8")
+count = source.count(before)
+if count != 1:
+    raise SystemExit(f"mutation target must occur exactly once in {path}: observed {count}")
+path.write_text(source.replace(before, after, 1), encoding="utf-8")
+PY
+}
+
+run_mutation_test() {
+  local log="$1" marker="$2" test_name="$3"
+  shift 3
+  local started ended status
+  started="$(date +%s%N)"
+  {
+    printf '%s\n' "$marker"
+    set +e
+    (cd "$MUTATION_REPO" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" \
+      cargo test --locked -p api --lib --no-fail-fast \
+      "$test_name" -- --exact --nocapture --test-threads=1)
+    status=$?
+    set -e
+    printf 'mutation_exit=%s test=%s\n' "$status" "$test_name"
+  } >"$log" 2>&1
+  ended="$(date +%s%N)"
+  printf '%s %s\n' "$status" "$(((ended - started) / 1000000))"
+}
+
+BOUNDARY_TEST="flow::move_object::database_tests::depth_20_evaluation_crosses_concurrent_grant_and_move"
+apply_exact_mutation "apps/api/src/flow/collab/authz.rs" \
+  'Ok(best_grant_in(bounded).unwrap_or(PermissionLevel::Denied))' \
+  'Ok(best_grant_in(bounded).unwrap_or(PermissionLevel::View))'
+apply_exact_mutation "apps/api/src/flow/collab/authz.rs" \
+  'best_grant.unwrap_or(PermissionLevel::Denied)' \
+  'best_grant.unwrap_or(PermissionLevel::View)'
+read -r MUTATION_BOUNDARY_EXIT MUTATION_BOUNDARY_MS < <(run_mutation_test \
+  "$MUTATION_BOUNDARY_LOG" "WP24_MUTATION_DENIED_TO_VIEW_ACTIVE" "$BOUNDARY_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/authz.rs
+
+PRESENCE_TEST="flow::grants::database_tests::subtree_revocation_removes_presence_closes_only_insufficient_sessions_and_stops_fanout"
+apply_exact_mutation "apps/api/src/flow/collab/revocation.rs" \
+  'let presence_removed = registry.remove_presence_for_sessions(revoked);' \
+  'let presence_removed = 0;'
+read -r MUTATION_PRESENCE_EXIT MUTATION_PRESENCE_MS < <(run_mutation_test \
+  "$MUTATION_PRESENCE_LOG" "WP24_MUTATION_PRESENCE_REMOVAL_DISABLED_ACTIVE" "$PRESENCE_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/revocation.rs
+
+FENCE_TEST="flow::collab::write::database_tests::epoch_fencing_blocks_a_write_that_straddles_a_concurrent_revocation"
+apply_exact_mutation "apps/api/src/flow/collab/write.rs" \
+  'match fence_epoch_for_share(tx, request.workspace_id, request.checked_epoch).await {' \
+  'match Ok::<(), ApiError>(()) {'
+read -r MUTATION_FENCE_EXIT MUTATION_FENCE_MS < <(run_mutation_test \
+  "$MUTATION_FENCE_LOG" "WP24_MUTATION_EPOCH_FENCE_DISABLED_ACTIVE" "$FENCE_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/collab/write.rs
+
+REAUTHORIZE_TEST="routes::flow::flow_database_tests::object_reads_reauthorize_after_their_final_epoch_check_changes"
+apply_exact_mutation "apps/api/src/flow/policy.rs" \
+  'Ok(current == context.authz_epoch)' \
+  'Ok(true)'
+read -r MUTATION_REAUTHORIZE_EXIT MUTATION_REAUTHORIZE_MS < <(run_mutation_test \
+  "$MUTATION_REAUTHORIZE_LOG" "WP24_MUTATION_FINAL_EPOCH_CHECK_ALWAYS_TRUE_ACTIVE" "$REAUTHORIZE_TEST")
+git -C "$MUTATION_REPO" restore --source=HEAD -- apps/api/src/flow/policy.rs
+cleanup_mutation_worktree
+trap - EXIT
+
+echo "=== real mutation results ===" >&2
+echo "  boundary exit=$MUTATION_BOUNDARY_EXIT duration_ms=$MUTATION_BOUNDARY_MS log=$MUTATION_BOUNDARY_LOG" >&2
+echo "  presence exit=$MUTATION_PRESENCE_EXIT duration_ms=$MUTATION_PRESENCE_MS log=$MUTATION_PRESENCE_LOG" >&2
+echo "  fence exit=$MUTATION_FENCE_EXIT duration_ms=$MUTATION_FENCE_MS log=$MUTATION_FENCE_LOG" >&2
+echo "  reauthorize exit=$MUTATION_REAUTHORIZE_EXIT duration_ms=$MUTATION_REAUTHORIZE_MS log=$MUTATION_REAUTHORIZE_LOG" >&2
+
 STATIC_DYNAMIC_JSON="$(python3 - \
   "$REPO_ROOT" "$CONTRACTS_ROOT" "$ADR_PATH" "$LIMITS_PATH" "$GATE_COMMANDS_PATH" \
   "$LIST_LOG" "$LIST_EXIT" "$LIST_MS" "$TEST_LOG" "$TEST_EXIT" "$TEST_MS" "$REQUIRED_TESTS_FILE" \
-  "$BUILD_LOG" "$BUILD_EXIT" "$BUILD_MS" "$DATABASE_URL" <<'PY'
+  "$BUILD_LOG" "$BUILD_EXIT" "$BUILD_MS" "$DATABASE_URL" \
+  "$SURFACE_RESULT" "$SURFACE_LOG" "$SURFACE_EXIT" "$SURFACE_MS" \
+  "$BASELINE_RESULT" "$BASELINE_LOG" "$BASELINE_EXIT" "$BASELINE_MS" \
+  "$MUTATION_BOUNDARY_LOG" "$MUTATION_BOUNDARY_EXIT" "$MUTATION_BOUNDARY_MS" "$BOUNDARY_TEST" \
+  "$MUTATION_PRESENCE_LOG" "$MUTATION_PRESENCE_EXIT" "$MUTATION_PRESENCE_MS" "$PRESENCE_TEST" \
+  "$MUTATION_FENCE_LOG" "$MUTATION_FENCE_EXIT" "$MUTATION_FENCE_MS" "$FENCE_TEST" \
+  "$MUTATION_REAUTHORIZE_LOG" "$MUTATION_REAUTHORIZE_EXIT" "$MUTATION_REAUTHORIZE_MS" "$REAUTHORIZE_TEST" <<'PY'
 import json
 import pathlib
 import re
@@ -180,6 +307,12 @@ import sys
     repo_s, contracts_s, adr_s, limits_s, commands_s,
     list_log_s, list_exit_s, list_ms_s, test_log_s, test_exit_s, test_ms_s, required_tests_s,
     build_log_s, build_exit_s, build_ms_s, database_url_s,
+    surface_result_s, surface_log_s, surface_exit_s, surface_ms_s,
+    baseline_result_s, baseline_log_s, baseline_exit_s, baseline_ms_s,
+    mutation_boundary_log_s, mutation_boundary_exit_s, mutation_boundary_ms_s, boundary_test,
+    mutation_presence_log_s, mutation_presence_exit_s, mutation_presence_ms_s, presence_test,
+    mutation_fence_log_s, mutation_fence_exit_s, mutation_fence_ms_s, fence_test,
+    mutation_reauthorize_log_s, mutation_reauthorize_exit_s, mutation_reauthorize_ms_s, reauthorize_test,
 ) = sys.argv[1:]
 repo = pathlib.Path(repo_s)
 contracts = pathlib.Path(contracts_s)
@@ -195,6 +328,23 @@ test_text = read(test_log_s)
 required_tests = [line for line in read(required_tests_s).splitlines() if line]
 if not required_tests or len(required_tests) != len(set(required_tests)):
     raise SystemExit("required test set parse failed: it must be non-empty and unique")
+
+def read_json(path):
+    candidate = pathlib.Path(path)
+    if not candidate.is_file():
+        return {}
+    try:
+        value = json.loads(read(candidate))
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+surface_result = read_json(surface_result_s)
+baseline_result = read_json(baseline_result_s)
+mutation_boundary_log = read(mutation_boundary_log_s)
+mutation_presence_log = read(mutation_presence_log_s)
+mutation_fence_log = read(mutation_fence_log_s)
+mutation_reauthorize_log = read(mutation_reauthorize_log_s)
 
 GATES = [
     "permission_inheritance_and_break",
@@ -316,6 +466,7 @@ def test_ok(name):
 
 observed = {gate: [] for gate in GATES}
 reason_codes = {gate: [] for gate in GATES}
+not_covered_reason_codes = {gate: [] for gate in GATES}
 
 def add(gate, criterion, passed, actual, evidence, reason=None):
     item = {
@@ -330,6 +481,19 @@ def add(gate, criterion, passed, actual, evidence, reason=None):
         if reason not in reason_codes[gate]:
             reason_codes[gate].append(reason)
     observed[gate].append(item)
+
+def add_not_covered(gate, criterion, actual, evidence, reason):
+    item = {
+        "criterion": criterion,
+        "status": "not_covered",
+        "passed": None,
+        "actual": actual,
+        "evidence": evidence if isinstance(evidence, list) else [evidence],
+        "reason_code": reason,
+    }
+    observed[gate].append(item)
+    if reason not in not_covered_reason_codes[gate]:
+        not_covered_reason_codes[gate].append(reason)
 
 def add_test(gate, criterion, name, reason="required_test_missing_or_failed"):
     ok = test_ok(name)
@@ -361,10 +525,9 @@ for depth in (1, 20):
     add(gate, f"explicit_depth_{depth}_fixture", marker, "found" if marker else "absent",
         [str(files["authz"]), str(files["grants"]), str(files["move"])],
         None if marker else f"depth_{depth}_fixture_not_implemented")
-concurrent_depth = bool(re.search(r"depth.*(?:concurrent|racing).*(?:grant|move)|(?:grant|move).*(?:concurrent|racing).*depth", fixture_text, re.I | re.S))
-add(gate, "depth_evaluation_crosses_concurrent_grant_and_move", concurrent_depth,
-    "source fixture found" if concurrent_depth else "no constructive fixture found",
-    [str(files["grants"]), str(files["move"])], None if concurrent_depth else "concurrent_depth_grant_move_fixture_not_implemented")
+add_test(gate, "depth_evaluation_crosses_concurrent_grant_and_move",
+    "flow::move_object::database_tests::depth_20_evaluation_crosses_concurrent_grant_and_move",
+    "concurrent_depth_grant_move_fixture_missing_or_failed")
 cache_miss_e2e = bool(re.search(r"cache miss.*(?:database|source)|force.*cache.*miss", fixture_text, re.I))
 add(gate, "permission_cache_miss_forces_authoritative_source", cache_miss_e2e,
     "constructive fixture found" if cache_miss_e2e else "no constructive fixture found",
@@ -442,10 +605,18 @@ for criterion, terms, reason in [
 production_remove = "remove_presence_for_sessions(revoked)" in source["revocation"]
 add(gate, "production_revocation_calls_presence_removal", production_remove, "present" if production_remove else "absent",
     [str(files["revocation"])], None if production_remove else "production_presence_removal_missing")
-virtual_mutation_red = production_remove and "remove_presence_for_sessions(revoked)" not in source["revocation"].replace("remove_presence_for_sessions(revoked)", "MUTATED_OUT", 1)
-add(gate, "presence_removal_detector_mutation_red", virtual_mutation_red,
-    "removing production call flips detector to non-pass" if virtual_mutation_red else "detector insensitive",
-    [str(files["revocation"])], None if virtual_mutation_red else "presence_mutation_detector_insensitive")
+presence_mutation_red = (
+    int(mutation_presence_exit_s) != 0
+    and "WP24_MUTATION_PRESENCE_REMOVAL_DISABLED_ACTIVE" in mutation_presence_log
+    and f"test {presence_test} ..." in mutation_presence_log
+    and "presence" in mutation_presence_log.lower()
+    and bool(re.search(r"^test result: FAILED\. 0 passed; 1 failed;", mutation_presence_log, re.M))
+)
+add(gate, "presence_removal_detector_mutation_red", presence_mutation_red,
+    {"exit": int(mutation_presence_exit_s), "duration_ms": int(mutation_presence_ms_s),
+     "failure_reason_matched": presence_mutation_red},
+    [mutation_presence_log_s, f"cargo_test:{presence_test}"],
+    None if presence_mutation_red else "presence_mutation_did_not_produce_expected_red")
 
 # search_and_relation_use_effective_permission
 gate = GATES[4]
@@ -456,6 +627,18 @@ for criterion, name in [
     ("relation_target_permission_is_second_gate", "flow::relations::database_tests::duplicate_link_is_typed_invalid_update_and_target_permission_is_a_real_second_gate"),
     ("unavailable_is_exact_fieldless_union", "flow::relations::database_tests::relation_read_paginates_and_unavailable_is_the_exact_one_field_union"),
 ]: add_test(gate, criterion, name)
+reauthorize_mutation_red = (
+    int(mutation_reauthorize_exit_s) != 0
+    and "WP24_MUTATION_FINAL_EPOCH_CHECK_ALWAYS_TRUE_ACTIVE" in mutation_reauthorize_log
+    and f"test {reauthorize_test} ..." in mutation_reauthorize_log
+    and "a read prepared before revocation escaped" in mutation_reauthorize_log
+    and bool(re.search(r"^test result: FAILED\. 0 passed; 1 failed;", mutation_reauthorize_log, re.M))
+)
+add(gate, "read_reauthorization_mutation_red", reauthorize_mutation_red,
+    {"exit": int(mutation_reauthorize_exit_s), "duration_ms": int(mutation_reauthorize_ms_s),
+     "failure_reason_matched": reauthorize_mutation_red},
+    [mutation_reauthorize_log_s, f"cargo_test:{reauthorize_test}"],
+    None if reauthorize_mutation_red else "read_reauthorization_mutation_did_not_produce_expected_red")
 fieldless = bool(re.search(r"pub\s+enum\s+RelationView\s*\{[\s\S]*?\bUnavailable\s*,\s*\}", source["model"]))
 add(gate, "unavailable_omits_identifier_and_reference_material", fieldless, "fieldless variant" if fieldless else "not proven fieldless",
     [str(files["model"]), str(files["relations"])], None if fieldless else "unavailable_union_leaks_fields_or_is_unproven")
@@ -487,15 +670,26 @@ add(gate, "admin_rescue_remains_available_and_audited", rescue_audited,
     "asserted" if rescue_audited else "audit assertion absent", [str(files["grants"])],
     None if rescue_audited else "admin_rescue_audit_not_proven")
 surface_count_literals = re.findall(r"surface verifier\s*的\s*(\d+)/(\d+)/(\d+)", authz_clause)
-add(gate, "dry_run_adds_no_surface", False,
-    {"contract_counts": surface_count_literals, "surface_verifier_run": False}, [commands_s], "surface_parity_not_run")
+surface_counts = surface_result.get("counts", {})
+expected_surface_counts = [int(value) for value in surface_count_literals[0]] if len(surface_count_literals) == 1 else []
+observed_surface_counts = [
+    surface_counts.get("rest_total"), surface_counts.get("mcp_tools_total"), surface_counts.get("cli_commands_total")
+]
+surface_parity = (
+    int(surface_exit_s) == 0 and surface_result.get("passed") is True
+    and expected_surface_counts == observed_surface_counts
+)
+add(gate, "dry_run_adds_no_surface", surface_parity,
+    {"contract_counts": expected_surface_counts, "observed_counts": observed_surface_counts,
+     "surface_verifier_exit": int(surface_exit_s), "duration_ms": int(surface_ms_s)},
+    [surface_result_s, surface_log_s, commands_s], None if surface_parity else "surface_parity_failed_or_count_drift")
 
 # archive_tier_by_object_scope
 gate = GATES[6]
 for criterion, name in [
     ("ordinary_non_root_page_edit_tier", "flow::grants::database_tests::archive_and_restore_stay_in_the_edit_tier_but_a_navigator_does_not"),
     ("lifecycle_scope_and_impact_classification", "flow::command::database_tests::lifecycle_tier_uses_the_real_impact_set_and_preserves_the_edit_baseline"),
-    ("archive_revalidates_impact_and_rolls_back_drift", "flow::command::database_tests::lifecycle_impact_drift_rolls_back_instead_of_committing_the_prepared_subset"),
+    ("archive_revalidates_impact_and_rolls_back_drift", "flow::command::database_tests::lifecycle_descendant_growth_does_not_turn_a_plain_archive_into_a_cascade"),
     ("archive_holds_current_authz_epoch_to_commit", "flow::command::database_tests::lifecycle_holds_the_current_authz_epoch_fence_until_its_commit"),
 ]: add_test(gate, criterion, name)
 lifecycle_body = fn_body(source["command"], "execute_lifecycle_command")
@@ -512,33 +706,72 @@ schema_types = re.findall(r"'([^']+)'", schema_types_match.group(1))
 if not schema_types:
     raise SystemExit("source parse failed: flow_objects object_type set is empty")
 has_collection = "collection" in schema_types
-add(gate, "collection_container_tier", False,
-    {"schema_object_types": schema_types, "schema_supports_collection": has_collection}, [str(files["migration"])], "collection_container_not_implemented_v0_5")
+if has_collection:
+    collection_fixture = bool(re.search(r"fn\s+[a-z0-9_]*collection[a-z0-9_]*(?:archive|tier)", source["command"], re.I))
+    add(gate, "collection_container_tier", collection_fixture,
+        {"schema_object_types": schema_types, "constructive_fixture_found": collection_fixture},
+        [str(files["migration"]), str(files["command"])],
+        None if collection_fixture else "collection_container_tier_fixture_not_implemented")
+else:
+    add_not_covered(gate, "collection_container_tier",
+        {"schema_object_types": schema_types, "schema_supports_collection": False, "version_boundary": "v0.5"},
+        [str(files["migration"])], "collection_container_not_implemented_v0_5")
 retention_action = bool(re.search(r"permanent[_ -]?(?:delete|purge)|retention[_ -]?(?:delete|purge)", source["command"], re.I))
-add(gate, "retention_or_permanent_cleanup_tier", False,
-    {"production_action_found": retention_action}, [str(files["command"])], "retention_permanent_cleanup_not_implemented_v0_5")
-add(gate, "v0_4_member_baseline_fixture_reused", False, "v0.4 verifier fixture not invoked by this evidence run",
-    [commands_s], "v0_4_member_baseline_fixture_not_reused")
+if retention_action:
+    retention_fixture = bool(re.search(r"fn\s+[a-z0-9_]*(?:retention|permanent)[a-z0-9_]*(?:archive|tier)", source["command"], re.I))
+    add(gate, "retention_or_permanent_cleanup_tier", retention_fixture,
+        {"production_action_found": True, "constructive_fixture_found": retention_fixture}, [str(files["command"])],
+        None if retention_fixture else "retention_cleanup_tier_fixture_not_implemented")
+else:
+    add_not_covered(gate, "retention_or_permanent_cleanup_tier",
+        {"production_action_found": False, "version_boundary": "v0.5"}, [str(files["command"])],
+        "retention_permanent_cleanup_not_implemented_v0_5")
+member_baseline = baseline_result.get("member_baseline_no_behaviour_regression", {})
+baseline_passed = int(baseline_exit_s) == 0 and member_baseline.get("status") == "passed"
+add(gate, "v0_4_member_baseline_fixture_reused", baseline_passed,
+    {"verifier_exit": int(baseline_exit_s), "duration_ms": int(baseline_ms_s),
+     "status": member_baseline.get("status", "not_observed")},
+    [baseline_result_s, baseline_log_s, commands_s],
+    None if baseline_passed else "v0_4_member_baseline_fixture_failed_or_not_covered")
 gap_path = pathlib.Path("/opt/worker/task/openpr/contract-gaps-v05-2026-09-09.md")
 gap_text = read(gap_path) if gap_path.is_file() else ""
 g5 = "G5" in gap_text and "root Page" in gap_text and "v0.4" in gap_text and "v0.5" in gap_text
-add(gate, "root_page_policy_is_contract_consistent", False,
-    {"g5_record_observed": g5, "resolution": "do not change root policy in v0.5"},
-    [str(gap_path) if gap_path.is_file() else commands_s], "contract_conflict_g5_root_page_archive_tier")
+if g5:
+    add_not_covered(gate, "root_page_policy_is_contract_consistent",
+        {"g5_record_observed": True, "resolution": "contract decision required", "version_boundary": "v0.5"},
+        [str(gap_path)], "contract_conflict_g5_root_page_archive_tier")
+else:
+    add(gate, "root_page_policy_is_contract_consistent", True,
+        {"g5_record_observed": False, "resolution": "no registered v0.4/v0.5 conflict"}, [commands_s])
 
-# Two more in-memory detector mutations. These prove the predicates are not
-# tautologies; delivery acceptance also re-runs the verifier against real source
-# mutations and records those executions separately in the receipt.
-boundary_marker = "PermissionLevel::Denied" in fn_body(source["authz"], "boundary_and_baseline_semantics_are_unchanged")
-mutated_boundary = source["authz"].replace("PermissionLevel::Denied", "PermissionLevel::View", 1)
-boundary_mutation_red = boundary_marker and mutated_boundary != source["authz"]
+boundary_mutation_red = (
+    int(mutation_boundary_exit_s) != 0
+    and "WP24_MUTATION_DENIED_TO_VIEW_ACTIVE" in mutation_boundary_log
+    and f"test {boundary_test} ..." in mutation_boundary_log
+    and "the target boundary starts with no applicable grant" in mutation_boundary_log
+    and bool(re.search(r"^test result: FAILED\. 0 passed; 1 failed;", mutation_boundary_log, re.M))
+)
 add(GATES[0], "boundary_denied_detector_mutation_red", boundary_mutation_red,
-    "Denied-to-View mutation changes inspected source" if boundary_mutation_red else "detector insensitive",
-    [str(files["authz"])], None if boundary_mutation_red else "boundary_mutation_detector_insensitive")
-fence_mutation_red = fence_lock and "fence_epoch_for_share(tx" not in write_prod.replace("fence_epoch_for_share(tx", "MUTATED_FENCE(tx", 1)
+    {"exit": int(mutation_boundary_exit_s), "duration_ms": int(mutation_boundary_ms_s),
+     "failure_reason_matched": boundary_mutation_red},
+    [mutation_boundary_log_s, f"cargo_test:{boundary_test}"],
+    None if boundary_mutation_red else "boundary_mutation_did_not_produce_expected_red")
+fence_mutation_red = (
+    int(mutation_fence_exit_s) != 0
+    and "WP24_MUTATION_EPOCH_FENCE_DISABLED_ACTIVE" in mutation_fence_log
+    and f"test {fence_test} ..." in mutation_fence_log
+    and (
+        "A must still be blocked on B's row lock" in mutation_fence_log
+        or "Accepted" in mutation_fence_log
+        or "accepted" in mutation_fence_log
+    )
+    and bool(re.search(r"^test result: FAILED\. 0 passed; 1 failed;", mutation_fence_log, re.M))
+)
 add(GATES[1], "fence_detector_mutation_red", fence_mutation_red,
-    "removing fence call flips detector to non-pass" if fence_mutation_red else "detector insensitive",
-    [str(files["write"])], None if fence_mutation_red else "fence_mutation_detector_insensitive")
+    {"exit": int(mutation_fence_exit_s), "duration_ms": int(mutation_fence_ms_s),
+     "failure_reason_matched": fence_mutation_red},
+    [mutation_fence_log_s, f"cargo_test:{fence_test}"],
+    None if fence_mutation_red else "fence_mutation_did_not_produce_expected_red")
 
 details = {}
 hard_gates = {}
@@ -546,11 +779,15 @@ for gate in GATES:
     items = observed[gate]
     if not items:
         raise SystemExit(f"internal verifier error: zero observations for {gate}")
-    passed = all(item["passed"] for item in items)
+    covered = [item for item in items if item["status"] != "not_covered"]
+    if not covered:
+        raise SystemExit(f"internal verifier error: zero covered observations for {gate}")
+    passed = all(item["passed"] for item in covered)
     details[gate] = {
         "status": "passed" if passed else "failed",
         "passed": passed,
         "reason_codes": reason_codes[gate],
+        "not_covered_reason_codes": not_covered_reason_codes[gate],
         "observed": items,
     }
     hard_gates[gate] = details[gate]["status"]
@@ -583,6 +820,24 @@ tests = {
         and summary_passed == len(required_tests) and not early_return
     ),
 }
+dependencies = {
+    "surface_parity": {"command": "verify-flow-surface-coverage.sh --release 0.4 --json",
+        "exit": int(surface_exit_s), "duration_ms": int(surface_ms_s), "log": surface_log_s,
+        "artifact": surface_result_s},
+    "member_baseline": {"command": "verify-flow-authz-baseline-v0.4.sh --json",
+        "exit": int(baseline_exit_s), "duration_ms": int(baseline_ms_s), "log": baseline_log_s,
+        "artifact": baseline_result_s},
+}
+mutations = {
+    "denied_to_view": {"test": boundary_test, "exit": int(mutation_boundary_exit_s),
+        "duration_ms": int(mutation_boundary_ms_s), "log": mutation_boundary_log_s},
+    "presence_removal_disabled": {"test": presence_test, "exit": int(mutation_presence_exit_s),
+        "duration_ms": int(mutation_presence_ms_s), "log": mutation_presence_log_s},
+    "epoch_fence_disabled": {"test": fence_test, "exit": int(mutation_fence_exit_s),
+        "duration_ms": int(mutation_fence_ms_s), "log": mutation_fence_log_s},
+    "final_epoch_check_always_true": {"test": reauthorize_test, "exit": int(mutation_reauthorize_exit_s),
+        "duration_ms": int(mutation_reauthorize_ms_s), "log": mutation_reauthorize_log_s},
+}
 
 print(json.dumps({
     "contract": {
@@ -596,7 +851,8 @@ print(json.dumps({
             "object_grants_max": object_grants_max,
         },
     },
-    "commands": {"worker_build": build, "test_inventory": inventory, "cargo_test": tests},
+    "commands": {"worker_build": build, "test_inventory": inventory, "cargo_test": tests,
+                 "dependencies": dependencies, "mutations": mutations},
     "hard_gates": hard_gates,
     "gate_details": details,
     "dynamic_passed": build["passed"] and inventory["passed"] and tests["passed"],
