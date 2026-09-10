@@ -774,7 +774,15 @@ pub(crate) async fn stage_one_document(
                 "projection_seq": new_head_seq,
                 "changed_block_ids": Vec::<Uuid>::new(),
             }),
-            metadata: serde_json::json!({ "message": request.message }),
+            metadata: serde_json::json!({
+                "message": request.message,
+                "before_frontier": encode_bytes(&before_frontier),
+                "after_frontier": encode_bytes(&after_frontier),
+                // Audit metadata is deliberately a structural summary, never document content.
+                // `events-v1.md` permits an action here and forbids CRDT bytes, snapshots,
+                // title/body/text and restricted field values from entering the envelope.
+                "semantic_summary": { "action": "content_update" },
+            }),
             correlation_id: Some(request.origin.correlation_id),
             causation_id: request.origin.causation_id,
             // `UpdateRequest::event_idempotency_key`'s doc comment: the REST command surface sets
@@ -3338,6 +3346,41 @@ mod database_tests {
         .n
     }
 
+    async fn event_metadata(state: &AppState, event_id: Uuid) -> Value {
+        #[derive(FromQueryResult)]
+        struct Row {
+            metadata: Value,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT metadata FROM business_events WHERE id = $1",
+            vec![event_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("event metadata query runs")
+        .expect("event row exists")
+        .metadata
+    }
+
+    async fn event_frontiers(state: &AppState, event_id: Uuid) -> (Vec<u8>, Vec<u8>) {
+        #[derive(FromQueryResult)]
+        struct Row {
+            before_frontier: Vec<u8>,
+            after_frontier: Vec<u8>,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT before_frontier, after_frontier FROM collab_updates WHERE event_id = $1",
+            vec![event_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("event frontier query runs")
+        .expect("the event's update row exists");
+        (row.before_frontier, row.after_frontier)
+    }
+
     fn command_input(
         object_id: Uuid,
         actor_id: Uuid,
@@ -3548,6 +3591,24 @@ mod database_tests {
         )
         .await
         .expect("the first submission is accepted");
+
+        let metadata = event_metadata(&state, first.event_id).await;
+        let (before_frontier, after_frontier) = event_frontiers(&state, first.event_id).await;
+        assert_eq!(
+            metadata["before_frontier"],
+            super::encode_bytes(&before_frontier),
+            "the audit envelope must carry the exact pre-update frontier"
+        );
+        assert_eq!(
+            metadata["after_frontier"],
+            super::encode_bytes(&after_frontier),
+            "the audit envelope must carry the exact committed frontier"
+        );
+        assert_eq!(
+            metadata["semantic_summary"],
+            serde_json::json!({"action": "content_update"}),
+            "the audit summary must stay on the safe action-only whitelist"
+        );
 
         let persisted = update_id_at_seq(&state, document_id, first.accepted_seq).await;
         assert_eq!(
