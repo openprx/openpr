@@ -157,7 +157,11 @@ def read(relative):
 
 
 def production(text):
-    return text.split("#[cfg(test)]", 1)[0]
+    for marker in re.finditer(r"(?m)^#\[cfg\(test\)\]", text):
+        tail = text[marker.end():]
+        if re.match(r"\s*(?:#\[[^\]]+\]\s*)*mod\s+\w+\s*\{", tail, re.S):
+            return text[:marker.start()]
+    return text
 
 
 def line_at(text, offset):
