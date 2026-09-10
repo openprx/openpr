@@ -116,7 +116,7 @@ def flow_document_gate_verdict($document; $gate; $allow_top_level):
     elif $gate_entry != null then flow_normalize_verdict($gate_entry)
     elif $top_gate != null then flow_normalize_verdict($top_gate)
     elif $allow_top_level then flow_normalize_verdict($document.passed)
-    else "not_implemented"
+    else "not_covered"
     end;
 
 # $input is produced independently by report/verify and contains file facts:
