@@ -495,7 +495,13 @@ fn build_navigator_update(
     let cascade_order = observed_cascade_order(&snapshot, &index, batch.cascaded);
 
     let mut operations: Vec<Operation> = Vec::with_capacity(batch.cascaded.len().saturating_add(1));
-    if batch.remove {
+    // Test builds can disable the production delete-generation branch so the tombstone gate proves
+    // it observes broken product behaviour rather than perturbing the test's own arithmetic.
+    #[cfg(test)]
+    let suppress_navigator_deletes = std::env::var_os("OPENPR_FLOW_TEST_MUTATION_SUPPRESS_NAVIGATOR_DELETES").is_some();
+    #[cfg(not(test))]
+    let suppress_navigator_deletes = false;
+    if batch.remove && !suppress_navigator_deletes {
         for object_id in std::iter::once(batch.primary).chain(batch.cascaded.iter().copied()) {
             if let Some(entry) = index.live_entry.get(&object_id) {
                 operations.push(Operation::DeleteNode { id: entry.clone() });
@@ -5042,11 +5048,7 @@ mod database_tests {
             a_after.snapshot_bytes,
         );
 
-        let observed_growth = if std::env::var_os("OPENPR_FLOW_TEST_MUTATION_HIDE_TOMBSTONE_GROWTH").is_some() {
-            0
-        } else {
-            b_after.tombstone_count - b_before.tombstone_count
-        };
+        let observed_growth = b_after.tombstone_count - b_before.tombstone_count;
         assert_eq!(
             observed_growth, cascaded,
             "one command removed N entries, so it left N tombstones — the per-command growth the \
@@ -5081,6 +5083,43 @@ mod database_tests {
             "the authoritative navigator set must be non-empty"
         );
         let queried_document_count = navigator_documents.len();
+        let reconciled_object_count = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value FROM flow_objects \
+             WHERE workspace_id = $1 AND object_type = 'navigator'",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        let reconciled_document_count = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value \
+             FROM flow_objects fo JOIN collab_documents cd ON cd.object_id = fo.id \
+             WHERE fo.workspace_id = $1 AND fo.object_type = 'navigator'",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        let missing_document_count = scalar_i64(
+            &scratch.db,
+            "SELECT count(*)::bigint AS value \
+             FROM flow_objects fo LEFT JOIN collab_documents cd ON cd.object_id = fo.id \
+             WHERE fo.workspace_id = $1 AND fo.object_type = 'navigator' AND cd.id IS NULL",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        assert_eq!(reconciled_object_count, 2, "the fixture creates exactly two navigators");
+        assert_eq!(
+            reconciled_document_count, 2,
+            "both navigators must have a collab document"
+        );
+        assert_eq!(
+            missing_document_count, 0,
+            "no navigator may disappear through the inner join"
+        );
+        assert_eq!(
+            i64::try_from(queried_document_count).expect("navigator count fits i64"),
+            reconciled_object_count,
+            "the independently recounted flow_objects side must match the document enumeration"
+        );
         let mut measured_documents = Vec::with_capacity(queried_document_count);
         for row in navigator_documents {
             let census = navigator_census(&scratch.db, row.object_id).await;
@@ -5098,11 +5137,23 @@ mod database_tests {
             "every database-authoritative navigator document must be decoded and measured"
         );
         if let Some(path) = std::env::var_os("OPENPR_FLOW_NAVIGATOR_TOMBSTONE_EVIDENCE_OUT") {
+            let source_head =
+                std::env::var("OPENPR_FLOW_SOURCE_HEAD").expect("evidence output requires OPENPR_FLOW_SOURCE_HEAD");
+            let generated_at = std::env::var("OPENPR_FLOW_EVIDENCE_GENERATED_AT")
+                .expect("evidence output requires OPENPR_FLOW_EVIDENCE_GENERATED_AT");
             let evidence = json!({
                 "schema_version": "sylvode.flow.navigator-tombstone-evidence.v1",
+                "source_head": source_head,
+                "generated_at": generated_at,
                 "workspace_id": fx.workspace_id,
                 "queried_document_count": queried_document_count,
                 "measured_document_count": measured_documents.len(),
+                "independent_database_reconciliation": {
+                    "expected_fixture_navigator_count": 2,
+                    "navigator_object_count": reconciled_object_count,
+                    "navigator_document_count": reconciled_document_count,
+                    "missing_document_count": missing_document_count,
+                },
                 "documents": measured_documents,
                 "move_out_and_back": true,
                 "growth": {

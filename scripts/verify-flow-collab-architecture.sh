@@ -273,6 +273,7 @@ if [[ "$RELEASE" == "0.5" ]]; then
 
   : >"$V05_DYNAMIC_LOG"
   : >"$V05_RESUME_JSON"
+  : >"$V05_NAVIGATOR_JSON"
   V05_DYNAMIC_EXIT=0
   V05_TESTS=(
     flow::collab::session::tests::live_ws::inbound_updates_generated_from_one_base_are_accepted_in_injected_reverse_order
@@ -286,6 +287,8 @@ if [[ "$RELEASE" == "0.5" ]]; then
     (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
       OPENPR_FLOW_RESUME_AT_HEAD_EVIDENCE_OUT="$V05_RESUME_JSON" \
       OPENPR_FLOW_NAVIGATOR_TOMBSTONE_EVIDENCE_OUT="$V05_NAVIGATOR_JSON" \
+      OPENPR_FLOW_SOURCE_HEAD="$SOURCE_HEAD" \
+      OPENPR_FLOW_EVIDENCE_GENERATED_AT="$GENERATED_AT" \
       cargo test --release -p api --lib "$test_name" -- --exact --test-threads=1 --nocapture) \
       >>"$V05_DYNAMIC_LOG" 2>&1
     test_exit=$?
@@ -322,7 +325,7 @@ if [[ "$RELEASE" == "0.5" ]]; then
   V05_EGRESS_MUTATION_DURATION_MS=$(( $(date +%s%3N) - mutation_started_ms ))
   mutation_started_ms="$(date +%s%3N)"
   (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$FIXED_DATABASE_URL" \
-    OPENPR_FLOW_TEST_MUTATION_HIDE_TOMBSTONE_GROWTH=1 \
+    OPENPR_FLOW_TEST_MUTATION_SUPPRESS_NAVIGATOR_DELETES=1 \
     cargo test --release -p api --lib \
       flow::move_object::database_tests::navigator_tombstone_growth_is_measured_on_a_cascading_command \
       -- --exact --test-threads=1 --nocapture) >>"$V05_TOMBSTONE_MUTATION_LOG" 2>&1
@@ -467,6 +470,7 @@ require("egress duplicate-forward mutation did not make the exact gate test red"
 navigator_documents = navigator_evidence.get("documents") or []
 queried_navigators = navigator_evidence.get("queried_document_count")
 measured_navigators = navigator_evidence.get("measured_document_count")
+reconciliation = navigator_evidence.get("independent_database_reconciliation") or {}
 document_ids = [item.get("document_id") for item in navigator_documents if isinstance(item, dict)]
 
 def nonnegative_int(value):
@@ -474,8 +478,15 @@ def nonnegative_int(value):
 
 navigator_documents_complete = all((
     navigator_evidence.get("schema_version") == "sylvode.flow.navigator-tombstone-evidence.v1",
+    navigator_evidence.get("source_head") == source_head,
+    navigator_evidence.get("generated_at") == generated_at,
     nonnegative_int(queried_navigators) and queried_navigators > 0,
     measured_navigators == queried_navigators == len(navigator_documents),
+    reconciliation.get("expected_fixture_navigator_count") == 2,
+    reconciliation.get("navigator_object_count") == 2,
+    reconciliation.get("navigator_document_count") == 2,
+    reconciliation.get("missing_document_count") == 0,
+    queried_navigators == reconciliation.get("navigator_object_count"),
     len(document_ids) == len(navigator_documents),
     len(set(document_ids)) == len(document_ids),
     all(bool(document_id) for document_id in document_ids),
@@ -764,6 +775,7 @@ result = {
             "queried_document_count": queried_navigators,
             "measured_document_count": measured_navigators,
             "documents": navigator_documents,
+            "independent_database_reconciliation": reconciliation,
             "complete": navigator_documents_complete,
         },
         "move_out_and_back": navigator_evidence.get("move_out_and_back"),
@@ -791,13 +803,13 @@ result = {
             "observed": "duplicate Accepted crossed the sequencer before the marker",
             "gate_went_red": egress_mutation_detected,
         },
-        "navigator_tombstone_growth_hidden": {
+        "navigator_deletion_generation_suppressed": {
             "mutation_log": os.path.abspath(tombstone_mutation_log_path),
-            "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_HIDE_TOMBSTONE_GROWTH=1",
+            "protection_disabled_by": "OPENPR_FLOW_TEST_MUTATION_SUPPRESS_NAVIGATOR_DELETES=1",
             "same_test_replayed": expected_tests["navigator_tombstones"],
             "exit_code": tombstone_mutation_exit,
             "duration_ms": tombstone_mutation_duration_ms,
-            "observed": "known positive N-node growth was reported as zero",
+            "observed": "production navigator deletion generation was suppressed and no tombstones were produced",
             "gate_went_red": tombstone_mutation_detected,
         },
     },
