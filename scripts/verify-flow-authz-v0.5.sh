@@ -761,8 +761,7 @@ add(gate, "barrier_control_replays_races_a_and_c_without_fencing", controllable,
 # permission_cache_is_not_authority
 gate = GATES[2]
 add_test(gate, "stale_epoch_entry_is_a_miss", "flow::collab::permission_cache::tests::stale_epoch_poison_is_a_miss_and_is_removed")
-policy_prod = source["policy"].split("#[cfg(test)]", 1)[0]
-authorize_body = fn_body(policy_prod, "authorize_flow_objects")
+authorize_body = fn_body(source["policy"], "authorize_flow_objects")
 first_epoch_check = authorize_body.find("ensure_epoch_current(")
 cache_read = authorize_body.find("cache.get(")
 database_read = authorize_body.find("authz::effective_permissions(")
