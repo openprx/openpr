@@ -2418,6 +2418,12 @@ mod database_tests {
         project_id: Option<Uuid>,
         parent: Option<Uuid>,
     ) -> Uuid {
+        if object_type == "navigator" && project_id.is_none() && parent.is_none() {
+            return crate::flow::repository::fetch_workspace_navigator_root(&state.db, fx.workspace_id)
+                .await
+                .expect("canonical root lookup runs")
+                .expect("workspace insert materialized its canonical root");
+        }
         create_object(
             state,
             CreateObjectInput {

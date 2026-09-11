@@ -130,7 +130,72 @@ ALTER TABLE flow_objects
   ADD CONSTRAINT flow_objects_non_navigator_parent_check
   CHECK (object_type = 'navigator' OR parent_id IS NOT NULL);
 
+-- Migration-time backfill is not enough: a workspace inserted after this file ran must have the
+-- same complete root aggregate before the workspace INSERT commits. Keeping this in an AFTER
+-- trigger makes direct SQL writers and future workspace creation surfaces obey NR-1 too; a
+-- failure to create any of the three rows aborts the workspace INSERT rather than leaving a
+-- partially initialized workspace.
+CREATE OR REPLACE FUNCTION flow_create_workspace_navigator_root()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  root_id UUID := gen_random_uuid();
+  document_id UUID := gen_random_uuid();
+  empty_snapshot BYTEA := decode(
+    '6c6f726f0000000000000000000000003ba2f83500032f0000004c4f524f0000000200767600000001000200e762c96c0100000005000000020066720002007676dbd8c9c816000000550000004c4f524f00000100000000000600830474726565030100000402000005000000000100050102000100000000060002007154a5550100000005000000060080046d6574610006008304747265659faa35f13400000000000000',
+    'hex'
+  );
+  empty_frontier BYTEA := decode('00', 'hex');
+BEGIN
+  INSERT INTO flow_objects (
+    id, workspace_id, project_id, object_type, parent_id,
+    inherit_from_parent, governance_metadata, lifecycle_status
+  ) VALUES (
+    root_id, NEW.id, NULL, 'navigator', NULL,
+    true, '{"system_role":"workspace_navigator_root"}'::jsonb, 'active'
+  );
+
+  INSERT INTO collab_documents (
+    id, object_id, engine, format_version, snapshot, snapshot_frontier, snapshot_seq,
+    head_frontier, head_seq, byte_count, update_count
+  ) VALUES (
+    document_id, root_id, 'loro', 'loro-1', empty_snapshot, empty_frontier, 0,
+    empty_frontier, 0, octet_length(empty_snapshot), 0
+  );
+
+  INSERT INTO flow_object_projections (
+    object_id, document_seq, document_frontier, title, state, plain_text, projection_version
+  ) VALUES (
+    root_id, 0, empty_frontier, '', '{"nodes":{}}'::jsonb, '', 1
+  );
+
+  RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS workspaces_create_flow_navigator_root ON workspaces;
+CREATE TRIGGER workspaces_create_flow_navigator_root
+AFTER INSERT ON workspaces
+FOR EACH ROW EXECUTE FUNCTION flow_create_workspace_navigator_root();
+
 CREATE OR REPLACE VIEW flow_object_navigator_root_violations AS
+  SELECT NULL::uuid AS object_id,
+         workspace_row.id AS workspace_id,
+         'navigator'::text AS object_type,
+         NULL::uuid AS project_id,
+         NULL::uuid AS parent_id,
+         'missing_workspace_navigator_root'::text AS violation
+    FROM workspaces workspace_row
+   WHERE NOT EXISTS (
+     SELECT 1
+       FROM flow_objects root
+      WHERE root.workspace_id = workspace_row.id
+        AND root.object_type = 'navigator'
+        AND root.project_id IS NULL
+        AND root.parent_id IS NULL
+   )
+  UNION ALL
   SELECT object_row.id AS object_id,
          object_row.workspace_id,
          object_row.object_type,

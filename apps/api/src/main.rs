@@ -2283,6 +2283,9 @@ enum SchemaProbe {
     EnumLabel(&'static str, &'static str),
     /// Named constraint whose definition contains a marker the migration introduced.
     ConstraintContains(&'static str, &'static str, &'static str),
+    /// A constraint marker and a trigger must both exist. Used when one migration creates the
+    /// static invariant and the mechanism that preserves it for future parent rows.
+    ConstraintAndTrigger(&'static str, &'static str, &'static str, &'static str),
     /// No object is created that could be probed, but re-executing the file is a no-op, so it is
     /// executed rather than adopted.
     Rerunnable,
@@ -2342,6 +2345,23 @@ impl SchemaProbe {
                     ) AS present
                 ",
                 vec![table.into(), constraint.into(), marker.into()],
+            )),
+            Self::ConstraintAndTrigger(table, constraint, marker, trigger) => Some(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                        SELECT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conrelid = to_regclass($1)
+                              AND conname = $2
+                              AND position($3 IN pg_get_constraintdef(oid)) > 0
+                        ) AND EXISTS (
+                            SELECT 1 FROM pg_trigger
+                            WHERE tgrelid = to_regclass('workspaces')
+                              AND tgname = $4
+                              AND NOT tgisinternal
+                        ) AS present
+                    ",
+                vec![table.into(), constraint.into(), marker.into(), trigger.into()],
             )),
             Self::Rerunnable | Self::Superseded => None,
         }
@@ -2522,7 +2542,12 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     ("0058_flow_search_index.sql", SchemaProbe::Relation("flow_search_index")),
     (
         "0059_flow_navigator_root.sql",
-        SchemaProbe::ConstraintContains("flow_objects", "flow_objects_non_navigator_parent_check", "parent_id"),
+        SchemaProbe::ConstraintAndTrigger(
+            "flow_objects",
+            "flow_objects_non_navigator_parent_check",
+            "parent_id",
+            "workspaces_create_flow_navigator_root",
+        ),
     ),
 ];
 
@@ -3571,6 +3596,47 @@ mod migration_runner_database_tests {
             replayed.try_get::<String>("", "root_id").expect("root id"),
             root_id.to_string()
         );
+
+        scratch
+            .db
+            .execute_unprepared(
+                "INSERT INTO workspaces (id, slug, name, created_by) VALUES \
+                 ('20000000-0000-0000-0000-000000000005', 'nr-future', 'NR Future', \
+                  '10000000-0000-0000-0000-000000000001')",
+            )
+            .await
+            .expect("a workspace created after 0059 commits with its root aggregate");
+        let future = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS roots, count(doc.id)::bigint AS documents, \
+                        count(projection.object_id)::bigint AS projections \
+                   FROM flow_objects root \
+                   LEFT JOIN collab_documents doc ON doc.object_id = root.id \
+                   LEFT JOIN flow_object_projections projection ON projection.object_id = root.id \
+                  WHERE root.workspace_id = '20000000-0000-0000-0000-000000000005'::uuid \
+                    AND root.object_type = 'navigator' AND root.project_id IS NULL \
+                    AND root.parent_id IS NULL"
+                    .to_string(),
+            ))
+            .await
+            .expect("future root query runs")
+            .expect("future root census row");
+        assert_eq!(future.try_get::<i64>("", "roots").expect("future roots"), 1);
+        assert_eq!(future.try_get::<i64>("", "documents").expect("future documents"), 1);
+        assert_eq!(future.try_get::<i64>("", "projections").expect("future projections"), 1);
+
+        let violations = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS n FROM flow_object_navigator_root_violations".to_string(),
+            ))
+            .await
+            .expect("root invariant monitor query runs")
+            .expect("root invariant monitor row");
+        assert_eq!(violations.try_get::<i64>("", "n").expect("violation count"), 0);
 
         let mutation = scratch
             .db

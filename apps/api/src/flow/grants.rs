@@ -1474,6 +1474,12 @@ mod database_tests {
     }
 
     async fn create(state: &AppState, fx: &Fixture, object_type: &str, parent: Option<Uuid>) -> Uuid {
+        if object_type == "navigator" && parent.is_none() {
+            return crate::flow::repository::fetch_workspace_navigator_root(&state.db, fx.workspace_id)
+                .await
+                .expect("canonical root lookup runs")
+                .expect("workspace insert materialized its canonical root");
+        }
         create_object(
             state,
             CreateObjectInput {
@@ -3168,9 +3174,14 @@ mod database_tests {
 
         let scratch = scratch_or_skip!("grants_cost");
         let fx = seed_workspace(&scratch.db).await;
+        let root = crate::flow::repository::fetch_workspace_navigator_root(&scratch.db, fx.workspace_id)
+            .await
+            .expect("canonical root lookup runs")
+            .expect("workspace insert materialized its canonical root");
         let mut ids = Vec::with_capacity(CHAIN_NODES);
-        let mut parent: Option<Uuid> = None;
-        for _ in 0..CHAIN_NODES {
+        ids.push(root);
+        let mut parent = Some(root);
+        for _ in 1..CHAIN_NODES {
             let id = Uuid::new_v4();
             exec(
                 &scratch.db,

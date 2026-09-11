@@ -2811,6 +2811,12 @@ mod database_tests {
     }
 
     async fn create_typed_object(state: &AppState, fx: &Fixture, object_type: &str, parent: Option<Uuid>) -> Uuid {
+        if object_type == "navigator" && parent.is_none() {
+            return crate::flow::repository::fetch_workspace_navigator_root(&state.db, fx.workspace_id)
+                .await
+                .expect("canonical root lookup runs")
+                .expect("workspace insert materialized its canonical root");
+        }
         create_object(
             state,
             CreateObjectInput {
@@ -3745,17 +3751,17 @@ mod database_tests {
         // A project exists but is not the parent's: nothing may drift into it by accident.
         let unrelated = seed_project(&scratch.db, fx.workspace_id, "SCOPEU").await;
 
-        let parent = try_create(&state, &fx, "navigator", None, None)
+        let parent_id = crate::flow::repository::fetch_workspace_navigator_root(&scratch.db, fx.workspace_id)
             .await
-            .expect("an unprojected root is created")
-            .object;
+            .expect("canonical root lookup runs")
+            .expect("workspace insert materialized its canonical root");
         assert_eq!(
-            stored_project_id(&scratch.db, parent.id).await,
+            stored_project_id(&scratch.db, parent_id).await,
             None,
             "fixture precondition: the parent really is unprojected"
         );
 
-        let accepted = try_create(&state, &fx, "page", None, Some(parent.id))
+        let accepted = try_create(&state, &fx, "page", None, Some(parent_id))
             .await
             .expect("omitting project_id under an unprojected parent is a legal request");
 
@@ -3822,11 +3828,10 @@ mod database_tests {
             .expect("a projected root is created")
             .object
             .id;
-        let root_unprojected = try_create(&state, &fx, "navigator", None, None)
+        let root_unprojected = crate::flow::repository::fetch_workspace_navigator_root(&scratch.db, fx.workspace_id)
             .await
-            .expect("an unprojected root is created")
-            .object
-            .id;
+            .expect("canonical root lookup runs")
+            .expect("workspace insert materialized its canonical root");
         let before_objects = scalar_i64(
             &scratch.db,
             "SELECT count(*)::bigint AS value FROM flow_objects WHERE workspace_id = $1",
