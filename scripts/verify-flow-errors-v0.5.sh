@@ -118,6 +118,16 @@ def check(name, passed, actual, reason):
     checks[name] = {"passed": bool(passed), "actual": actual,
                     "reason_code": None if passed else reason}
 
+def defer_to_frontend(name, actual, paired_gate):
+    checks[name] = {
+        "status": "deferred_to_frontend_track",
+        "passed": None,
+        "actual": actual,
+        "reason_code": "deferred_to_frontend_track",
+        "paired_gate": paired_gate,
+        "paired_gate_status": "contract_change_required",
+    }
+
 check("approved_reason_table_exact", approved == ["child_project_must_match_parent", "subtree_spans_multiple_projects"],
       approved, "approved_reason_table_drift")
 check("create_reason_constant", bool(re.search(
@@ -164,25 +174,20 @@ unified = {
 check("mcp_cli_unified_error_surface", bool(contract_codes_match) and all(unified.values()), unified,
       "mcp_cli_unified_error_surface_incomplete")
 
-# The named reason is meaningful only when consumers branch on details.reason.
-# Generic invalid_update handling is deliberately not credited as coverage.
-ui_named = (
-    "child_project_must_match_parent" in ui
-    and "subtree_spans_multiple_projects" in ui
-    and re.search(r"details[^\n]{0,120}reason|reason[^\n]{0,120}details", ui)
-)
-check("ui_named_reason_consumer", bool(ui_named), "production TypeScript scan",
-      "ui_named_reason_consumer_missing")
-check("unknown_reason_falls_back_without_message_branching",
-      bool(ui_named and re.search(r"unknown|default|otherwise", ui, re.I)
-           and not re.search(r"message\.(?:includes|match)|message\.includes", ui)),
-      "production TypeScript scan", "unknown_reason_fallback_not_proven")
-check("defensive_reason_enters_integrity_repair",
-      bool(ui_named and re.search(r"integrity|repair", ui, re.I)),
-      "production TypeScript scan", "integrity_repair_consumer_missing")
+# ADR-0017 moved browser/UI consumers to vF. The backend track proves the
+# typed REST/MCP/CLI producer and transport contract above; it must neither
+# scan TypeScript nor turn missing frontend work into a backend failure.
+frontend_pair = "gates/vF-frontend-gate.yaml#invalid_update_named_reason_consumers_v0_5"
+defer_to_frontend("ui_named_reason_consumer", "frontend TypeScript consumer", frontend_pair)
+defer_to_frontend("unknown_reason_falls_back_without_message_branching", "frontend fallback behavior", frontend_pair)
+defer_to_frontend("defensive_reason_enters_integrity_repair", "frontend integrity-repair behavior", frontend_pair)
 
 print(json.dumps({"approved_reasons": approved, "unified_error_surface": unified,
-                  "checks": checks, "passed": all(item["passed"] for item in checks.values())},
+                  "checks": checks,
+                  "deferred_to_frontend_track": [name for name, item in checks.items()
+                                                  if item.get("status") == "deferred_to_frontend_track"],
+                  "passed": all(item["passed"] for item in checks.values()
+                                if item.get("status") != "deferred_to_frontend_track")},
                  separators=(",", ":")))
 PY
 
@@ -239,16 +244,18 @@ fi
 REASONS="$(jq -c --argjson api "$API_DYNAMIC" --argjson cli "$CLI_DYNAMIC" \
   --argjson cm "$CREATE_MUTATION_RED" --argjson dm "$DEFENSIVE_MUTATION_RED" \
   --argjson clean "$([[ "$SOURCE_DIRTY" == false ]] && echo true || echo false)" '
-  [.checks|to_entries[]|select(.value.passed != true)|.value.reason_code]
+  [.checks|to_entries[]|select(.value.passed == false)|.value.reason_code]
   + (if $api then [] else ["reachable_create_dynamic_fixture_failed_or_skipped"] end)
   + (if $cli then [] else ["cli_error_mapping_dynamic_fixture_failed"] end)
   + (if $cm then [] else ["reachable_reason_mutation_did_not_turn_red"] end)
   + (if $dm then [] else ["defensive_reason_mutation_did_not_turn_red"] end)
   + (if $clean then [] else ["source_dirty"] end) | unique' "$STATIC_PATH")"
+DEFERRED_TO_FRONTEND="$(jq -c '.deferred_to_frontend_track' "$STATIC_PATH")"
 GATE="$(jq -cn --argjson passed "$OVERALL_PASSED" --argjson reasons "$REASONS" \
+  --argjson deferred "$DEFERRED_TO_FRONTEND" \
   '{status:(if $passed then "passed" else "failed" end),passed:$passed,
     reason_code:(if $passed then null else ($reasons[0] // "invalid_update_reason_evidence_failed") end),
-    reason_codes:$reasons}')"
+    reason_codes:$reasons,deferred_to_frontend_track:$deferred}')"
 
 RESULT="$(jq -n --arg head "$SOURCE_HEAD" --arg generated "$GENERATED_AT" \
   --arg contract "$CONTRACT_PATH" --arg contract_sha "$CONTRACT_SHA256" \
