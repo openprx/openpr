@@ -618,6 +618,23 @@ const fn rejected_frame(document_id: Uuid, code: RejectedCode, recoverable: bool
     }
 }
 
+fn authorization_churn_frame(document_id: Uuid) -> Frame {
+    Frame::Rejected {
+        protocol_version: PROTOCOL_VERSION,
+        document_id,
+        update_id: None,
+        code: RejectedCode::AuthorizationChurn,
+        recoverable: true,
+        write_state: WriteState::NotApplied,
+        details: Some(serde_json::json!({
+            "retry_after_ms": crate::flow::policy::AUTHORIZATION_CHURN_RETRY_AFTER_MS,
+        })),
+        current_seq: None,
+        current_frontier: None,
+        audit_event_id: None,
+    }
+}
+
 /// Runs one WebSocket session end to end. Consumes `socket` and never returns an error: every
 /// failure this function can observe is either a clean protocol-level `rejected`/close (sent on
 /// the wire) or a best-effort log, because by the time this runs the HTTP upgrade has already
@@ -679,93 +696,93 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     .await;
 
     // ---- open ----
-    let Some(open) = read_frame(&mut socket, HANDSHAKE_TIMEOUT).await else {
-        return;
-    };
-    let Frame::Open {
-        document_id: opened_document_id,
-        known_seq,
-        known_frontier,
-        ..
-    } = open
-    else {
-        reject_and_close(&mut socket, document_id, RejectedCode::InvalidUpdate, "expected open").await;
-        return;
-    };
-    if opened_document_id != document_id {
-        reject_and_close(
-            &mut socket,
-            document_id,
-            RejectedCode::Forbidden,
-            "open.document_id does not match the ticket",
-        )
-        .await;
-        return;
-    }
-
-    let ctx = match reverify_open(&state, &consumed).await {
-        Ok(ctx) => ctx,
-        Err(failure) => {
-            reject_open_failure(&mut socket, document_id, failure).await;
+    // Repeated epoch churn rejects this one `open`, not the connection. The client can wait for
+    // the supplied backoff and send `open` again without spending a new one-shot ticket.
+    let (mut registered, ctx, boot) = loop {
+        let Some(open) = read_frame(&mut socket, HANDSHAKE_TIMEOUT).await else {
+            return;
+        };
+        let Frame::Open {
+            document_id: opened_document_id,
+            known_seq,
+            known_frontier,
+            ..
+        } = open
+        else {
+            reject_and_close(&mut socket, document_id, RejectedCode::InvalidUpdate, "expected open").await;
+            return;
+        };
+        if opened_document_id != document_id {
+            reject_and_close(
+                &mut socket,
+                document_id,
+                RejectedCode::Forbidden,
+                "open.document_id does not match the ticket",
+            )
+            .await;
             return;
         }
-    };
 
-    // ---- snapshot ----
-    let Ok(boot) = bootstrap::load(&state.db, document_id).await else {
-        reject_and_close(
-            &mut socket,
-            document_id,
-            RejectedCode::ResyncRequired,
-            "bootstrap failed",
-        )
-        .await;
-        return;
-    };
-
-    // `collab-protocol-v1.md`'s `open known_seq/known_frontier`: a reconnecting client that still
-    // holds the document up to a seq this server can continue from gets the accepted stream it
-    // missed instead of the whole snapshot. Any refusal falls back to the full bootstrap below,
-    // which is always a correct answer to `open`. Build the answer before registration so a
-    // commit cannot both appear in this direct replay and be queued through the registry.
-    let opening_frames = match plan_resume(&state.db, document_id, &boot, known_seq, known_frontier.as_deref()).await {
-        Ok(frames) => frames,
-        Err(refusal) => {
-            if refusal != ResumeRefusal::NotRequested {
-                tracing::debug!(
-                    %document_id, ?refusal, ?known_seq,
-                    "collab session: resume refused, falling back to a full snapshot"
-                );
+        let ctx = match reverify_open(&state, &consumed).await {
+            Ok(ctx) => ctx,
+            Err(failure) => {
+                reject_open_failure(&mut socket, document_id, failure).await;
+                return;
             }
-            vec![Frame::Snapshot {
-                protocol_version: PROTOCOL_VERSION,
-                document_id,
-                snapshot_seq: boot.snapshot_seq,
-                head_seq: boot.head_seq,
-                snapshot: BASE64.encode(&boot.snapshot),
-                tail_updates: boot
-                    .tail_updates
-                    .iter()
-                    .map(|u| TailUpdate {
-                        seq: u.seq,
-                        update_id: u.update_id,
-                        bytes: BASE64.encode(&u.bytes),
-                        before_frontier: BASE64.encode(&u.before_frontier),
-                        after_frontier: BASE64.encode(&u.after_frontier),
-                    })
-                    .collect(),
-                head_frontier: BASE64.encode(&boot.head_frontier),
-            }]
-        }
-    };
+        };
 
-    // Register before any document content is sent. If authorization changed while the bounded
-    // bootstrap and resume planning were running, re-check it against the new epoch and retry the
-    // atomic registry admission; a still-authorized open proceeds, a confirmed revocation gets
-    // 4403, and repeated churn or a database failure gets the existing recoverable 4410 drain.
-    let (mut registered, ctx) =
+        let Ok(boot) = bootstrap::load(&state.db, document_id).await else {
+            reject_and_close(
+                &mut socket,
+                document_id,
+                RejectedCode::ResyncRequired,
+                "bootstrap failed",
+            )
+            .await;
+            return;
+        };
+
+        // Build the answer before registration so a commit cannot both appear in this direct
+        // replay and be queued through the registry.
+        let opening_frames =
+            match plan_resume(&state.db, document_id, &boot, known_seq, known_frontier.as_deref()).await {
+                Ok(frames) => frames,
+                Err(refusal) => {
+                    if refusal != ResumeRefusal::NotRequested {
+                        tracing::debug!(
+                            %document_id, ?refusal, ?known_seq,
+                            "collab session: resume refused, falling back to a full snapshot"
+                        );
+                    }
+                    vec![Frame::Snapshot {
+                        protocol_version: PROTOCOL_VERSION,
+                        document_id,
+                        snapshot_seq: boot.snapshot_seq,
+                        head_seq: boot.head_seq,
+                        snapshot: BASE64.encode(&boot.snapshot),
+                        tail_updates: boot
+                            .tail_updates
+                            .iter()
+                            .map(|u| TailUpdate {
+                                seq: u.seq,
+                                update_id: u.update_id,
+                                bytes: BASE64.encode(&u.bytes),
+                                before_frontier: BASE64.encode(&u.before_frontier),
+                                after_frontier: BASE64.encode(&u.after_frontier),
+                            })
+                            .collect(),
+                        head_frontier: BASE64.encode(&boot.head_frontier),
+                    }]
+                }
+            };
+
         match register_after_bootstrap(&state, &collab.registry, &consumed, session_id, ctx).await {
-            Ok(registered) => registered,
+            Ok((registered, ctx)) => {
+                for frame in &opening_frames {
+                    send(&mut socket, frame).await;
+                }
+                break (registered, ctx, boot);
+            }
             Err(RegisterAfterBootstrapFailure::Limit(limit)) => {
                 send(&mut socket, &connection_limit_frame(document_id, limit)).await;
                 close(&mut socket, LIMIT_EXCEEDED_CLOSE_CODE, "connection limit exceeded").await;
@@ -776,18 +793,10 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                 return;
             }
             Err(RegisterAfterBootstrapFailure::RepeatedStale) => {
-                reject_drain_and_close(
-                    &mut socket,
-                    document_id,
-                    DrainSignal::new(CONNECTION_LIMIT_RETRY_AFTER_MS),
-                )
-                .await;
-                return;
+                send(&mut socket, &authorization_churn_frame(document_id)).await;
             }
-        };
-    for frame in &opening_frames {
-        send(&mut socket, frame).await;
-    }
+        }
+    };
 
     // ---- steady state ----
     // `limits-v1.md`'s three connection ceilings (`connections_per_user_max`/`_per_document_max`/
@@ -2980,6 +2989,91 @@ mod tests {
             assert_eq!(close_reason["retry_after_ms"], 1_750);
 
             drop(guard);
+            scratch.drop_self().await;
+        }
+
+        #[tokio::test]
+        async fn repeated_open_epoch_churn_is_retryable_on_the_same_websocket() {
+            let scratch = scratch_or_skip!("authorization-churn-reopen");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state.clone()).await;
+            let client_id = "authorization-churn-reopen-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+
+            let current_epoch = crate::flow::collab::authz::read_epoch(&state.db, workspace_id)
+                .await
+                .expect("current authorization epoch reads");
+            let settled_epoch = current_epoch + 4;
+            assert!(
+                crate::flow::collab::runtime::runtime()
+                    .registry
+                    .observe_epoch_and_workspace_sessions(workspace_id, settled_epoch)
+                    .is_empty(),
+                "no session is registered before open"
+            );
+
+            let mut ws = connect(addr, &ticket, client_id).await;
+            send_frame(
+                &mut ws,
+                &Frame::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: vec![],
+                    client_id: client_id.to_string(),
+                    session_id: Uuid::new_v4(),
+                },
+            )
+            .await;
+            assert!(matches!(recv_frame(&mut ws).await, Frame::Hello { .. }));
+            let open = Frame::Open {
+                protocol_version: PROTOCOL_VERSION,
+                document_id,
+                known_seq: None,
+                known_frontier: None,
+            };
+            send_frame(&mut ws, &open).await;
+
+            let Frame::Rejected {
+                code,
+                recoverable,
+                write_state,
+                details,
+                ..
+            } = recv_frame(&mut ws).await
+            else {
+                panic!("expected authorization_churn rejection");
+            };
+            assert_eq!(code, RejectedCode::AuthorizationChurn);
+            assert!(recoverable);
+            assert_eq!(write_state, WriteState::NotApplied);
+            assert_eq!(
+                details.expect("churn retry details")["retry_after_ms"],
+                crate::flow::policy::AUTHORIZATION_CHURN_RETRY_AFTER_MS
+            );
+
+            exec(
+                &state,
+                "UPDATE flow_workspace_settings SET authz_epoch = $2 WHERE workspace_id = $1",
+                vec![workspace_id.into(), settled_epoch.into()],
+            )
+            .await;
+            send_frame(&mut ws, &open).await;
+            assert!(
+                matches!(recv_frame(&mut ws).await, Frame::Snapshot { .. }),
+                "the same connection must accept a later open once authorization settles"
+            );
+            send_frame(
+                &mut ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "still-open".to_string(),
+                },
+            )
+            .await;
+            assert!(matches!(recv_frame(&mut ws).await, Frame::Pong { .. }));
+
             scratch.drop_self().await;
         }
 
