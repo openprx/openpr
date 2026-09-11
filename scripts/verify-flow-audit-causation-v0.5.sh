@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# v0.5 Flow event registry, audit-origin and causation verifier. The accepted
-# contract's explicit origin-header residual trust gap is reported as a failure,
-# never hidden by otherwise-passing transport tests.
+# v0.5 Flow event registry, audit-origin and causation verifier. The origin
+# header trust detector stays live, while ADR-0018 assigns credential binding to
+# the paired v0.7 gate and therefore excludes that unresolved gap from v0.5.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/flow_contract_path.sh
@@ -58,6 +58,10 @@ done
 CONTRACT_PATH="$(flow_resolve_contract_path --contract "$CONTRACT_PATH" "$CONTRACTS_ROOT")" || exit 2
 GATE_COMMANDS="$CONTRACTS_ROOT/gates/gate-commands.md"
 [[ -f "$GATE_COMMANDS" ]] || { echo "FAIL: missing gate-commands.md" >&2; exit 2; }
+ADR_0018="$CONTRACTS_ROOT/decisions/ADR-0018-v05-contract-gap-resolutions.md"
+V07_GATE="$CONTRACTS_ROOT/gates/v0.7-gate.yaml"
+[[ -f "$ADR_0018" ]] || { echo "FAIL: missing ADR-0018" >&2; exit 2; }
+[[ -f "$V07_GATE" ]] || { echo "FAIL: missing v0.7 gate" >&2; exit 2; }
 git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 2
 
 CONTRACTS_REAL="$(realpath -m "$CONTRACTS_ROOT")"
@@ -106,6 +110,7 @@ routes::flow::flow_database_tests::a_rejected_command_is_audited_for_a_bot_exact
 routes::flow::flow_database_tests::the_bot_behind_an_event_is_recoverable_through_the_request_id_the_middleware_minted
 routes::flow::flow_database_tests::the_same_route_records_the_transport_it_was_reached_over_and_one_request_id_per_request
 routes::flow::flow_database_tests::every_event_a_rest_request_writes_carries_the_rest_surface_and_a_server_request_id
+routes::flow::flow_database_tests::every_bot_transport_is_self_reported_while_direct_jwt_rest_is_attested
 EOF
 printf '%s\n' "${TESTS[@]}" >"$TEST_NAMES_FILE"
 : >"$TEST_LOG"
@@ -134,7 +139,8 @@ read -r MUTATION_EXIT MUTATION_MS < <(run_timed "$MUTATION_LOG" env \
 echo "  exit=$MUTATION_EXIT duration_ms=$MUTATION_MS log=$MUTATION_LOG" >&2
 
 ANALYSIS_JSON="$(python3 - \
-  "$REPO_ROOT" "$CONTRACT_PATH" "$GATE_COMMANDS" "$BUILD_LOG" "$BUILD_EXIT" "$BUILD_MS" \
+  "$REPO_ROOT" "$CONTRACT_PATH" "$GATE_COMMANDS" "$ADR_0018" "$V07_GATE" \
+  "$BUILD_LOG" "$BUILD_EXIT" "$BUILD_MS" \
   "$TEST_LOG" "$TEST_EXIT" "$TEST_MS" "$DATABASE_URL" "$TEST_NAMES_FILE" \
   "$MUTATION_LOG" "$MUTATION_EXIT" "$MUTATION_MS" "$MUTATION_TEST" <<'PY'
 import collections
@@ -143,12 +149,14 @@ import pathlib
 import re
 import sys
 
-(repo_s, contract_s, commands_s, build_log_s, build_exit_s, build_ms_s,
+(repo_s, contract_s, commands_s, adr0018_s, v07_gate_s, build_log_s, build_exit_s, build_ms_s,
  test_log_s, test_exit_s, test_ms_s, database_url, names_s,
  mutation_log_s, mutation_exit_s, mutation_ms_s, mutation_test) = sys.argv[1:]
 repo = pathlib.Path(repo_s)
 contract = pathlib.Path(contract_s).read_text(encoding="utf-8")
 commands = pathlib.Path(commands_s).read_text(encoding="utf-8")
+adr0018 = pathlib.Path(adr0018_s).read_text(encoding="utf-8")
+v07_gate = pathlib.Path(v07_gate_s).read_text(encoding="utf-8")
 test_log = pathlib.Path(test_log_s).read_text(encoding="utf-8", errors="replace")
 mutation_log = pathlib.Path(mutation_log_s).read_text(encoding="utf-8", errors="replace")
 tests = [line for line in pathlib.Path(names_s).read_text().splitlines() if line]
@@ -221,6 +229,35 @@ registry_pass = not missing_contract and not missing_policy and not forbidden_po
 origin_gap = all(fragment in contract for fragment in [
     "surface 实际来自 **HTTP 头**", "没有关闭", "不得声称已解决",
 ])
+g8_schedule = all(fragment in adr0018 for fragment in [
+    "**v0.7**：给 `workspace_bots` 设计凭据绑定的 transport surface",
+    "`audit_actor_origin_causation` 方可转绿",
+])
+v07_pairing = bool(re.search(
+    r"(?m)^\s{2}audit_actor_origin_credential_bound:\s*pending\s*$", v07_gate
+))
+g8_exclusion_valid = origin_gap and g8_schedule and v07_pairing
+
+ao1_contract = all(fragment in contract for fragment in [
+    "source:{surface,attestation,session?,tool?,request?,client_id?,service?}",
+    'attestation:"attested"|"self_reported"',
+])
+event_origin_source = (flow_root / "event_origin.rs").read_text(encoding="utf-8").split(
+    "\n#[cfg(test)]\n#[allow(clippy::unwrap_used", 1
+)[0]
+route_source = (repo / "apps/api/src/routes/flow.rs").read_text(encoding="utf-8")
+request_origin_start = route_source.find("fn request_origin(")
+request_origin_end = route_source.find("fn build_auth_extensions", request_origin_start)
+request_origin_source = (
+    route_source[request_origin_start:request_origin_end]
+    if request_origin_start >= 0 and request_origin_end > request_origin_start else ""
+)
+ao1_source = all(fragment in event_origin_source for fragment in [
+    "pub enum OriginAttestation", "Attested", "SelfReported",
+    '"attestation".to_string()', "self.attestation.as_wire()",
+]) and all(fragment in request_origin_source for fragment in [
+    "extract_bot_context", ".self_reported()",
+])
 metadata_contract = all(fragment in contract for fragment in [
     "before_frontier?", "after_frontier?", "semantic_summary",
 ])
@@ -250,7 +287,6 @@ move_event_start = move_source.find("event_type: GovernanceCommandType::MoveObje
 move_event_end = move_source.find("correlation_id:", move_event_start)
 move_event_block = move_source[move_event_start:move_event_end] if move_event_start >= 0 and move_event_end > move_event_start else ""
 payload_duplicate_count = '"cascaded_node_count"' in move_event_block
-route_source = (repo / "apps/api/src/routes/flow.rs").read_text(encoding="utf-8")
 route_start = route_source.find("the_same_route_records_the_transport_it_was_reached_over_and_one_request_id_per_request")
 route_end = route_source.find("async fn every_event_a_rest_request", route_start)
 route_test_source = route_source[route_start:route_end] if route_start >= 0 and route_end > route_start else ""
@@ -265,6 +301,13 @@ dynamic_pass = (
     int(build_exit_s) == 0 and int(test_exit_s) == 0 and not skipped
     and len(passed_tests) == len(tests) and summary_count == len(tests)
 )
+ao1_test = "routes::flow::flow_database_tests::every_bot_transport_is_self_reported_while_direct_jwt_rest_is_attested"
+ao1_test_passed = ao1_test in passed_tests
+# AO-1 requires a mutation that promotes bot provenance to attested and makes
+# its own criterion red. The existing surface-forced-to-REST mutation is a
+# different assertion and must not be counted as AO-1 evidence.
+ao1_mutation_red = False
+ao1_pass = ao1_contract and ao1_source and ao1_test_passed and ao1_mutation_red
 
 mutation_red = (
     int(mutation_exit_s) != 0
@@ -303,6 +346,24 @@ observed = [
     {"kind": "known_contract_gap", "id": "origin_header_trust", "present": origin_gap,
      "reason_code": "origin_transport_header_not_credential_bound",
      "detail": "allow-listed transport label remains caller-controlled and workspace_bots has no bound surface"},
+    {"kind": "release_exclusion", "id": "G8", "valid": g8_exclusion_valid,
+     "excluded_from_release": "v0.5", "owning_release": "v0.7",
+     "reason_code": "origin_credential_binding_owned_by_v0_7",
+     "paired_gate": "gates/v0.7-gate.yaml#audit_actor_origin_credential_bound",
+     "current_state": "contract_change_required", "detected_gap_present": origin_gap,
+     "adr_schedule_present": g8_schedule, "paired_gate_present": v07_pairing},
+    {"kind": "scheduled_followup", "id": "AO-1", "owning_release": "v0.6",
+     "status": "passed" if ao1_pass else "not_covered",
+     "contract_envelope_declared": ao1_contract, "implementation_present": ao1_source,
+     "criterion_passed": ao1_test_passed, "mutation_red": ao1_mutation_red,
+     "reason_codes": [] if ao1_pass else [
+         reason for condition, reason in [
+             (ao1_contract, "ao_1_contract_envelope_missing"),
+             (ao1_source, "ao_1_implementation_missing"),
+             (ao1_test_passed, "ao_1_criterion_not_passed"),
+             (ao1_mutation_red, "ao_1_mutation_not_red"),
+         ] if not condition
+     ]},
     {"kind": "dispatch_source_cross_check", "centralized_exactly_one_path": dispatch_static},
     {"kind": "affected_set_cross_check", "dynamic_requirement_parsed": affected_dynamic_requirement,
      "sorted_subtree_envelope_source": affected_static,
@@ -324,6 +385,7 @@ observed = [
 print(json.dumps({
     "audit_gate": audit_gate, "relation_move_gate": relation_move_gate,
     "origin_gap": origin_gap, "metadata_complete": metadata_complete,
+    "g8_exclusion_valid": g8_exclusion_valid, "ao1_pass": ao1_pass,
     "mutation_red": mutation_red, "observed": observed,
 }, separators=(",", ":")))
 PY
@@ -333,10 +395,13 @@ AUDIT_PASS="$(jq -r '.audit_gate' <<<"$ANALYSIS_JSON")"
 RELATION_MOVE_PASS="$(jq -r '.relation_move_gate' <<<"$ANALYSIS_JSON")"
 ORIGIN_GAP="$(jq -r '.origin_gap' <<<"$ANALYSIS_JSON")"
 METADATA_COMPLETE="$(jq -r '.metadata_complete' <<<"$ANALYSIS_JSON")"
+G8_EXCLUSION_VALID="$(jq -r '.g8_exclusion_valid' <<<"$ANALYSIS_JSON")"
 MUTATION_RED="$(jq -r '.mutation_red' <<<"$ANALYSIS_JSON")"
 
 if [[ "$AUDIT_PASS" == true ]]; then
   AUDIT_GATE='{"status":"passed","passed":true,"reason_code":null,"blocking_reasons":[]}'
+elif [[ "$G8_EXCLUSION_VALID" == true ]]; then
+  AUDIT_GATE='{"status":"excluded","passed":false,"reason_code":"origin_credential_binding_owned_by_v0_7","excluded_reason_codes":["origin_credential_binding_owned_by_v0_7"],"retained_gap_reason_codes":["origin_transport_header_not_credential_bound"],"excluded_from_release":"v0.5","owning_release":"v0.7","paired_gate":"gates/v0.7-gate.yaml#audit_actor_origin_credential_bound","current_state":"contract_change_required","blocking_reasons":[]}'
 else
   BLOCKING_REASONS='[]'
   [[ "$ORIGIN_GAP" == false ]] || BLOCKING_REASONS="$(jq -c '. + ["origin_transport_header_not_credential_bound"]' <<<"$BLOCKING_REASONS")"
@@ -350,7 +415,8 @@ else
   RELATION_MOVE_GATE='{"status":"failed","passed":false,"reason_code":"relation_move_registry_transport_causation_evidence_failed"}'
 fi
 PASSED=false
-[[ "$AUDIT_PASS" == true && "$RELATION_MOVE_PASS" == true && "$SOURCE_DIRTY" == false ]] && PASSED=true
+[[ "$AUDIT_PASS" == true || "$G8_EXCLUSION_VALID" == true ]] \
+  && [[ "$RELATION_MOVE_PASS" == true && "$SOURCE_DIRTY" == false ]] && PASSED=true
 
 ARTIFACT="$EVIDENCE_REAL/audit-causation-result.json"
 TMP_ARTIFACT="$ARTIFACT.tmp.$$"

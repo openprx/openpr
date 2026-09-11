@@ -88,7 +88,7 @@ def flow_normalize_verdict($value):
     elif ($value.status | type) == "string" then
       if $value.status == "not_implemented" or $value.status == "not_verified" or $value.status == "not_run"
       then "not_covered"
-      elif $value.status == "passed" or $value.status == "failed" or $value.status == "not_covered"
+      elif $value.status == "passed" or $value.status == "failed" or $value.status == "not_covered" or $value.status == "excluded"
       then $value.status
       else "not_covered"
       end
@@ -210,7 +210,7 @@ def flow_derive_receipt:
       "required-command-not-passed:" + .key + ":" + .value.status]) as $command_blocking
   | ([.artifact_states | to_entries[] | select(.value.status != "passed_evidence") |
       "artifact-not-passed:" + .key + ":" + .value.status]) as $artifact_blocking
-  | ([.hard_gates | to_entries[] | select(.value != "passed") |
+  | ([.hard_gates | to_entries[] | select(.value != "passed" and .value != "excluded") |
       "hard-gate-not-passed:" + .key + ":" + .value]) as $hard_gate_blocking
   | (if .predecessor.status == "accepted" then []
      else ["predecessor-not-accepted:" + .predecessor.status]

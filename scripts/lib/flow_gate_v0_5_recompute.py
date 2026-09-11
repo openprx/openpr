@@ -107,6 +107,8 @@ def normalize(value: Any) -> str:
         return "passed"
     if value is False or value == "failed":
         return "failed"
+    if value == "excluded":
+        return "excluded"
     if value in ("not_covered", "not_implemented", "not_verified", "not_run"):
         return "not_covered"
     if isinstance(value, dict):
@@ -114,7 +116,7 @@ def normalize(value: Any) -> str:
             return "passed"
         if "status" not in value and value.get("passed") is True:
             return "passed"
-        if value.get("status") in ("failed", "not_covered"):
+        if value.get("status") in ("failed", "not_covered", "excluded"):
             return value["status"]
         if value.get("passed") is False:
             return "failed"
@@ -144,7 +146,10 @@ def reason_codes(document: dict[str, Any], gate: str, verdict: str) -> list[str]
             value = candidate.get(key)
             if isinstance(value, str) and value and value not in values:
                 values.append(value)
-        list_key = "not_covered_reason_codes" if verdict == "not_covered" else "reason_codes"
+        list_key = {
+            "not_covered": "not_covered_reason_codes",
+            "excluded": "excluded_reason_codes",
+        }.get(verdict, "reason_codes")
         value = candidate.get(list_key)
         if isinstance(value, list):
             for item in value:
@@ -249,7 +254,7 @@ def main() -> int:
             status = "source_clean_unproven"
         elif source_dirty is not False:
             status = "source_dirty"
-        elif any(verdict not in ("passed", "failed", "not_covered") for verdict in explicit.values()):
+        elif any(verdict not in ("passed", "failed", "not_covered", "excluded") for verdict in explicit.values()):
             status = "artifact_verdict_missing"
         else:
             # Evidence completeness is independent from whether the observations passed.
@@ -261,7 +266,11 @@ def main() -> int:
                 verdict = explicit[gate]
                 why = reason_codes(document, gate, verdict)
                 if not why and verdict != "passed":
-                    why = ["artifact_reported_failure" if verdict == "failed" else "artifact_did_not_cover_gate"]
+                    why = [{
+                        "failed": "artifact_reported_failure",
+                        "not_covered": "artifact_did_not_cover_gate",
+                        "excluded": "artifact_reported_exclusion",
+                    }[verdict]]
             elif status == "artifact_missing_after_execution":
                 verdict = "failed"
                 why = [status]
