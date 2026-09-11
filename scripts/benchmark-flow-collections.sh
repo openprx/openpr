@@ -58,12 +58,17 @@ set -e
 END_NS="$(date +%s%N)"
 DURATION_MS="$(((END_NS - START_NS) / 1000000))"
 METRICS_LINE="$(sed -n 's/^FLOW_COLLECTION_10K_METRICS //p' "$LOG_FILE" | tail -1)"
+EXECUTED_TESTS="$(sed -nE 's/^test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed;.*/\2 \3/p' "$LOG_FILE" \
+  | awk '{total += $1 + $2} END {print total + 0}')"
 if [[ $TEST_EXIT -ne 0 ]]; then
   cat "$LOG_FILE" >&2
 fi
 if [[ -z "$METRICS_LINE" ]] || ! jq -e 'type=="object" and .records==10000' >/dev/null 2>&1 <<<"$METRICS_LINE"; then
   STATUS=false
   REASON="test did not emit valid 10k metrics (an environment skip is not a pass)"
+elif [[ "$EXECUTED_TESTS" -eq 0 ]]; then
+  STATUS=false
+  REASON="cargo reported zero executed tests"
 else
   STATUS=true
   REASON="typed index was required and invalid document bytes were never decoded"
@@ -75,8 +80,9 @@ RESULT="$(jq -cn \
   --arg release 0.6.0 --arg source_head "$SOURCE_HEAD" \
   --arg command 'cargo test -p api ten_thousand_record_query_uses_index_without_decoding_documents -- --nocapture' \
   --argjson records 10000 --argjson test_exit "$TEST_EXIT" --argjson duration_ms "$DURATION_MS" \
+  --argjson executed_tests "$EXECUTED_TESTS" \
   --argjson metrics "${METRICS_LINE:-null}" --argjson passed "$STATUS" --arg reason "$REASON" \
-  '{schema_version:$schema_version,release:$release,source_head:$source_head,command:$command,records:$records,test_exit_code:$test_exit,duration_ms:$duration_ms,metrics:$metrics,passed:$passed,reason:$reason}')"
+  '{schema_version:$schema_version,release:$release,source_head:$source_head,command:$command,records:$records,test_exit_code:$test_exit,duration_ms:$duration_ms,executed_tests:$executed_tests,metrics:$metrics,passed:$passed,reason:$reason}')"
 TMP_RESULT="$(mktemp "$EVIDENCE_ROOT/.collection-10k-result.XXXXXX")"
 printf '%s\n' "$RESULT" >"$TMP_RESULT"
 mv -f "$TMP_RESULT" "$EVIDENCE_ROOT/collection-10k-result.json"

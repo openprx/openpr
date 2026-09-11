@@ -103,6 +103,37 @@ commands = {
     "surface": [str(repo / "scripts/verify-flow-surface-coverage.sh"), "--release", "0.6", "--contracts-root", str(contracts), "--evidence-root", str(evidence), "--repo-root", str(repo), "--json"],
 }
 
+cargo_test_checks = {
+    "collection_contract", "atomic_embed", "projection_rebuild", "forms_boundary",
+    "schema_convergence", "field_secrecy", "collection_events", "metadata_redaction",
+    "ticket_guard", "mcp_cli", "tool_registry",
+}
+
+def cargo_executed_tests(output):
+    return sum(
+        int(match.group(1)) + int(match.group(2))
+        for match in re.finditer(
+            r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;",
+            output,
+            re.M,
+        )
+    )
+
+def artifact_execution_count(check_id):
+    artifact_fields = {
+        "capacity": ("collection-10k-result.json", ("executed_tests",)),
+        "cardinality": ("cardinality-result.json", ("new_commands_found",)),
+        "surface": ("surface-coverage-result.json", ("counts", "matrix_rows")),
+    }
+    filename, fields = artifact_fields[check_id]
+    try:
+        value = json.loads((evidence / filename).read_text(encoding="utf-8"))
+        for field in fields:
+            value = value[field]
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return 0
+
 checks = []
 for check_id, command in commands.items():
     started = time.monotonic()
@@ -111,13 +142,23 @@ for check_id, command in commands.items():
     log_path = evidence / "logs" / f"{check_id}.log"
     log_path.write_text(completed.stdout, encoding="utf-8")
     skipped = "skipped: OPENPR_TEST_DATABASE_URL is not set" in completed.stdout
-    status = "environment_unavailable" if skipped else ("passed" if completed.returncode == 0 else "failed")
+    executed_count = (
+        cargo_executed_tests(completed.stdout)
+        if check_id in cargo_test_checks
+        else artifact_execution_count(check_id)
+    )
+    status = (
+        "environment_unavailable"
+        if skipped
+        else ("passed" if completed.returncode == 0 and executed_count > 0 else "failed")
+    )
     checks.append({
         "id": check_id,
         "status": status,
         "command": " ".join(command),
         "exit_code": completed.returncode,
         "duration_ms": duration_ms,
+        "executed_count": executed_count,
         "log": f"logs/{check_id}.log",
         "sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
     })
@@ -127,6 +168,9 @@ def passed(*ids):
     return all(by_id[item]["status"] == "passed" for item in ids)
 def verdict(*ids):
     return "passed" if passed(*ids) else "failed"
+
+def gate_execution_count(*ids):
+    return min(by_id[item]["executed_count"] for item in ids)
 
 artifact_checks = {
     "collection-contract-result.json": "collection_contract",
@@ -140,7 +184,7 @@ for filename, check_id in artifact_checks.items():
         "schema_version": "sylvode.flow.check-result.v1", "release": "0.6.0", "source_head": head,
         "check": check_id, "status": item["status"], "passed": item["status"] == "passed",
         "command": item["command"], "duration_ms": item["duration_ms"], "log": item["log"],
-        "log_sha256": item["sha256"],
+        "executed_count": item["executed_count"], "log_sha256": item["sha256"],
     }
     (evidence / filename).write_text(json.dumps(artifact, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
@@ -160,6 +204,23 @@ hard_gates = {
     "mcp_cli_create_equivalence": verdict("mcp_cli"),
     "tool_registry_expected_122_or_rebased": verdict("tool_registry"),
     "collection_record_event_registry_and_redaction": verdict("collection_events", "metadata_redaction"),
+}
+hard_gate_execution_counts = {
+    "rest_mcp_cli_surface_parity": gate_execution_count("surface", "mcp_cli"),
+    "mcp_default_rest_coverage_three_adr_threat_exceptions_only": gate_execution_count("surface"),
+    "standalone_collection_create_idempotent": gate_execution_count("collection_contract"),
+    "embedded_collection_single_transaction": gate_execution_count("atomic_embed"),
+    "embedded_collection_fault_injection_no_orphan": gate_execution_count("atomic_embed"),
+    "command_contended_document_cardinality": gate_execution_count("cardinality"),
+    "generic_record_create_rejected": gate_execution_count("collection_contract"),
+    "schema_field_and_view_convergence": gate_execution_count("schema_convergence"),
+    "typed_projection_rebuild_matches_canonical": gate_execution_count("projection_rebuild"),
+    "ten_thousand_record_query_uses_index": gate_execution_count("capacity"),
+    "field_secrecy_client_crdt_denied": gate_execution_count("field_secrecy"),
+    "forms_tables_untouched": gate_execution_count("forms_boundary"),
+    "mcp_cli_create_equivalence": gate_execution_count("mcp_cli"),
+    "tool_registry_expected_122_or_rebased": gate_execution_count("tool_registry"),
+    "collection_record_event_registry_and_redaction": gate_execution_count("collection_events", "metadata_redaction"),
 }
 
 predecessor_path = contracts / "evidence/v0.5/gate-result.json"
@@ -224,6 +285,7 @@ result = {
     "checks": checks,
     "artifacts": artifacts,
     "hard_gates": hard_gates,
+    "hard_gate_execution_counts": hard_gate_execution_counts,
     "predecessor": {"release": "0.5.0", "status": predecessor_status, "path": str(predecessor_path)},
     "manual_signoffs": manual,
     "deferred_to_frontend_track": ["table_board", "schema_mode", "large_collection"],

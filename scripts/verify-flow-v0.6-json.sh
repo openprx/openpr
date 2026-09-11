@@ -122,14 +122,53 @@ if not isinstance(checks, list) or any(not isinstance(item, dict) for item in ch
     raise SystemExit(2)
 by_id = {item.get("id"): item for item in checks}
 same("checks.keys", set(by_id), expected_check_ids)
+cargo_test_checks = {
+    "collection_contract", "atomic_embed", "projection_rebuild", "forms_boundary",
+    "schema_convergence", "field_secrecy", "collection_events", "metadata_redaction",
+    "ticket_guard", "mcp_cli", "tool_registry",
+}
+
+def cargo_executed_tests(output):
+    return sum(
+        int(match.group(1)) + int(match.group(2))
+        for match in re.finditer(
+            r"^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;",
+            output,
+            re.M,
+        )
+    )
+
+def artifact_execution_count(check_id):
+    artifact_fields = {
+        "capacity": ("collection-10k-result.json", ("executed_tests",)),
+        "cardinality": ("cardinality-result.json", ("new_commands_found",)),
+        "surface": ("surface-coverage-result.json", ("counts", "matrix_rows")),
+    }
+    filename, fields = artifact_fields[check_id]
+    try:
+        value = json.loads((evidence / filename).read_text(encoding="utf-8"))
+        for field in fields:
+            value = value[field]
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return 0
+
 for check_id, item in by_id.items():
     log = evidence / str(item.get("log", ""))
     if not log.is_file():
         drift.append({"field": f"checks.{check_id}.log", "observed": "missing", "expected": "present"})
         continue
-    same(f"checks.{check_id}.sha256", item.get("sha256"), hashlib.sha256(log.read_bytes()).hexdigest())
-    expected_status = "passed" if item.get("exit_code") == 0 else "failed"
-    if b"skipped: OPENPR_TEST_DATABASE_URL is not set" in log.read_bytes():
+    log_bytes = log.read_bytes()
+    same(f"checks.{check_id}.sha256", item.get("sha256"), hashlib.sha256(log_bytes).hexdigest())
+    log_text = log_bytes.decode("utf-8", errors="replace")
+    executed_count = (
+        cargo_executed_tests(log_text)
+        if check_id in cargo_test_checks
+        else artifact_execution_count(check_id)
+    )
+    same(f"checks.{check_id}.executed_count", item.get("executed_count"), executed_count)
+    expected_status = "passed" if item.get("exit_code") == 0 and executed_count > 0 else "failed"
+    if b"skipped: OPENPR_TEST_DATABASE_URL is not set" in log_bytes:
         expected_status = "environment_unavailable"
     same(f"checks.{check_id}.status", item.get("status"), expected_status)
 
@@ -137,6 +176,8 @@ def passed(*ids):
     return all(by_id.get(item, {}).get("status") == "passed" for item in ids)
 def verdict(*ids):
     return "passed" if passed(*ids) else "failed"
+def gate_execution_count(*ids):
+    return min(by_id.get(item, {}).get("executed_count", 0) for item in ids)
 hard_gates = {
     "rest_mcp_cli_surface_parity": verdict("surface", "mcp_cli"),
     "mcp_default_rest_coverage_three_adr_threat_exceptions_only": verdict("surface"),
@@ -155,6 +196,24 @@ hard_gates = {
     "collection_record_event_registry_and_redaction": verdict("collection_events", "metadata_redaction"),
 }
 same("hard_gates", receipt.get("hard_gates"), hard_gates)
+hard_gate_execution_counts = {
+    "rest_mcp_cli_surface_parity": gate_execution_count("surface", "mcp_cli"),
+    "mcp_default_rest_coverage_three_adr_threat_exceptions_only": gate_execution_count("surface"),
+    "standalone_collection_create_idempotent": gate_execution_count("collection_contract"),
+    "embedded_collection_single_transaction": gate_execution_count("atomic_embed"),
+    "embedded_collection_fault_injection_no_orphan": gate_execution_count("atomic_embed"),
+    "command_contended_document_cardinality": gate_execution_count("cardinality"),
+    "generic_record_create_rejected": gate_execution_count("collection_contract"),
+    "schema_field_and_view_convergence": gate_execution_count("schema_convergence"),
+    "typed_projection_rebuild_matches_canonical": gate_execution_count("projection_rebuild"),
+    "ten_thousand_record_query_uses_index": gate_execution_count("capacity"),
+    "field_secrecy_client_crdt_denied": gate_execution_count("field_secrecy"),
+    "forms_tables_untouched": gate_execution_count("forms_boundary"),
+    "mcp_cli_create_equivalence": gate_execution_count("mcp_cli"),
+    "tool_registry_expected_122_or_rebased": gate_execution_count("tool_registry"),
+    "collection_record_event_registry_and_redaction": gate_execution_count("collection_events", "metadata_redaction"),
+}
+same("hard_gate_execution_counts", receipt.get("hard_gate_execution_counts"), hard_gate_execution_counts)
 
 artifact_relatives = {
     "collection_contract_result": "collection-contract-result.json",
