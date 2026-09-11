@@ -72,6 +72,8 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.relation.unlinked",
         public_payload(&["relation_id", "source_object_id", "target_object_id", "relation_type"]),
     ),
+    ("flow.record.created", public_payload(&["collection_id", "record_id"])),
+    ("flow.record.archived", public_payload(&["collection_id", "record_id"])),
     ("flow.feature.enabled", public_payload(&["workspace_id"])),
     ("flow.feature.disabled", public_payload(&["workspace_id"])),
     (
@@ -253,8 +255,16 @@ mod tests {
         let grants_rs = include_str!("grants.rs");
         let move_object_rs = include_str!("move_object.rs");
         let relations_rs = include_str!("relations.rs");
+        let collections_rs = include_str!("collections.rs");
         let mut literals = BTreeSet::new();
-        for source in [command_rs, write_rs, grants_rs, move_object_rs, relations_rs] {
+        for source in [
+            command_rs,
+            write_rs,
+            grants_rs,
+            move_object_rs,
+            relations_rs,
+            collections_rs,
+        ] {
             let cut = source.find("\n#[cfg(test)]").unwrap_or(source.len());
             literals.extend(event_type_literals(&source[..cut]));
         }
@@ -269,8 +279,21 @@ mod tests {
             .collect();
         assert!(
             undeclared.is_empty(),
-            "these event types are emitted by flow::command/flow::collab::write/flow::grants but declare no payload policy: {undeclared:?}"
+            "these event types are emitted by Flow production modules but declare no payload policy: {undeclared:?}"
         );
+    }
+
+    #[test]
+    fn record_policies_expose_only_collection_and_record_ids() {
+        let payload = json!({
+            "collection_id": "c",
+            "record_id": "r",
+            "properties": {"secret": "must not be delivered"},
+        });
+        for event_type in ["flow.record.created", "flow.record.archived"] {
+            let filtered = redact_flow_event_payload_for_delivery(event_type, &payload);
+            assert_eq!(filtered, json!({"collection_id": "c", "record_id": "r"}));
+        }
     }
 
     #[test]
