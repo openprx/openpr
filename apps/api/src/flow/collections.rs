@@ -2802,12 +2802,46 @@ mod tests {
         files
     }
 
+    fn sql_identifier_matches_table(identifier: &str, table: &str) -> bool {
+        identifier == table
+            || identifier
+                .strip_suffix(table)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    }
+
+    fn source_mutates_table(source: &str, table: &str) -> bool {
+        let tokens = source
+            .split(|character: char| !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.')))
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        tokens.windows(2).any(|pair| {
+            matches!(pair, [verb, identifier]
+                if matches!(*verb, "copy" | "update" | "truncate")
+                    && sql_identifier_matches_table(identifier, table))
+        }) || tokens.windows(3).any(|triple| {
+            matches!(triple, [verb, modifier, identifier]
+                if matches!(
+                    (*verb, *modifier),
+                    ("insert", "into")
+                        | ("merge", "into")
+                        | ("delete", "from")
+                        | ("update", "only")
+                        | ("truncate", "table" | "only")
+                ) && sql_identifier_matches_table(identifier, table))
+        }) || tokens.windows(4).any(|quad| {
+            matches!(quad, [verb, preposition, modifier, identifier]
+                if matches!(
+                    (*verb, *preposition, *modifier),
+                    ("delete", "from", "only") | ("truncate", "table", "only")
+                ) && sql_identifier_matches_table(identifier, table))
+        })
+    }
+
     #[test]
     fn flow_collection_forms_tables_untouched_scans_executable_sql_paths() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace = manifest.join("../..");
         let forbidden_forms = ["project_forms", "form_records", "form_views", "form_record_field_index"];
-        let mutation_verbs = ["insert into", "update", "delete from", "merge into", "truncate"];
         let allowed_forms_writers = [
             "apps/api/src/forms/projections.rs",
             "apps/api/src/routes/form.rs",
@@ -2830,11 +2864,9 @@ mod tests {
                 .replace('\\', "/");
             let source = normalized_non_comment_source(&path);
             let normalized_sql = source.replace('"', "");
-            let mutates_forms = forbidden_forms.iter().any(|table| {
-                mutation_verbs
-                    .iter()
-                    .any(|verb| normalized_sql.contains(&format!("{verb} {table}")))
-            });
+            let mutates_forms = forbidden_forms
+                .iter()
+                .any(|table| source_mutates_table(&normalized_sql, table));
             if mutates_forms {
                 assert!(
                     allowed_forms_writers.contains(&relative.as_str()),

@@ -10,7 +10,9 @@ The `flow_collection_forms_tables_untouched_scans_executable_sql_paths` regressi
 
 The same check scans those Forms owners for literal reads of the Flow canonical/projection tables. A new SQL execution location therefore enters the scan automatically; a new Forms writer requires an explicit allowlist review.
 
-This is not a SQL parser and must not be represented as complete protection. It can be bypassed by a table name assembled dynamically (for example, `format!("INSERT INTO {table}")`), SQL loaded from a non-Rust resource, a stored procedure, a macro whose expanded SQL is absent from the scanned source text, or a new non-Rust execution runtime. Runtime database roles and grants remain the authoritative enforcement layer. Any introduction of dynamic identifiers must use the repository's identifier validator and needs a dedicated database-level boundary test.
+The tokenizer recognizes bare and schema-qualified table identifiers, including `public.form_records`, and the literal DML shapes `INSERT INTO`, `UPDATE`, `UPDATE ONLY`, `DELETE FROM`, `DELETE FROM ONLY`, `MERGE INTO`, `TRUNCATE [TABLE] [ONLY]`, and `COPY`. Those forms are regression fixtures, not entries in the bypass list.
+
+This is not a SQL parser and must not be represented as complete protection. It can still be bypassed by a table name assembled dynamically (for example, `format!("INSERT INTO {table}")`), SQL loaded from a non-Rust resource, a stored procedure, a macro whose expanded SQL is absent from the scanned source text, ORM-generated writes with no literal DML in Rust source, database indirection through writable views or triggers, or a new non-Rust execution runtime. Runtime database roles and grants remain the authoritative enforcement layer. Any introduction of dynamic identifiers must use the repository's identifier validator and needs a dedicated database-level boundary test.
 
 ## Client CRDT and field secrecy
 
