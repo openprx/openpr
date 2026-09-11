@@ -482,9 +482,12 @@ navigator_documents_complete = all((
     navigator_evidence.get("generated_at") == generated_at,
     nonnegative_int(queried_navigators) and queried_navigators > 0,
     measured_navigators == queried_navigators == len(navigator_documents),
-    reconciliation.get("expected_fixture_navigator_count") == 2,
-    reconciliation.get("navigator_object_count") == 2,
-    reconciliation.get("navigator_document_count") == 2,
+    # Current source materializes the workspace root in addition to the two
+    # project ordering navigators. Freeze all three so a new navigator still
+    # forces re-evidence instead of being silently accepted.
+    reconciliation.get("expected_fixture_navigator_count") == 3,
+    reconciliation.get("navigator_object_count") == 3,
+    reconciliation.get("navigator_document_count") == 3,
     reconciliation.get("missing_document_count") == 0,
     queried_navigators == reconciliation.get("navigator_object_count"),
     len(document_ids) == len(navigator_documents),
