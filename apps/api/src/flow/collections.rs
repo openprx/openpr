@@ -2376,10 +2376,7 @@ async fn create_collection_embed(
     {
         return Ok(replay);
     }
-    let root_id = repository::fetch_navigator_root(&state.db, workspace_id, page.project_id)
-        .await?
-        .ok_or_else(|| ApiError::invalid_update("project-scoped navigator root is missing"))?;
-    authz::ensure_parent_can_adopt_child(&state.db, workspace_id, root_id).await?;
+    authz::ensure_parent_can_adopt_child(&state.db, workspace_id, input.object_id).await?;
     let collection_id = Uuid::new_v4();
     let collection_document_id = Uuid::new_v4();
     let block_id = Uuid::new_v4();
@@ -2488,7 +2485,7 @@ async fn create_collection_embed(
                 workspace_id,
                 project_id: page.project_id,
                 object_type: "collection".to_string(),
-                parent_id: Some(root_id),
+                parent_id: Some(input.object_id),
                 created_by: actor_user_id(input.actor_id, input.actor_is_bot()),
                 governance_metadata: json!({}),
             },
@@ -2899,7 +2896,10 @@ mod database_tests {
     };
     use crate::flow::event_origin::{CommandOrigin, EventSurface};
     use crate::flow::repository;
-    use crate::flow::{collab::authz::PermissionLevel, policy};
+    use crate::flow::{
+        collab::authz::{self, PermissionLevel},
+        policy,
+    };
     use crate::routes::flow::post_flow_object_command;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -3912,12 +3912,39 @@ mod database_tests {
             .await
             .expect("collection query runs")
             .expect("collection exists");
-        let root = repository::fetch_navigator_root(&state.db, workspace_id, Some(project_id))
-            .await
-            .expect("root query runs")
-            .expect("root exists");
-        assert_eq!(collection.parent_id, Some(root));
+        assert_eq!(collection.parent_id, Some(page_id));
         assert_eq!(collection.project_id, Some(project_id));
+
+        let member_id = Uuid::new_v4();
+        exec(
+            &state.db,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'member', 'user', true)",
+            vec![member_id.into(), format!("{member_id}@collection.test").into()],
+        )
+        .await;
+        exec(
+            &state.db,
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+            vec![workspace_id.into(), member_id.into()],
+        )
+        .await;
+        exec(
+            &state.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![page_id.into()],
+        )
+        .await;
+        let page_permission =
+            authz::effective_permission(&state.db, workspace_id, page_id, "user", member_id, "member")
+                .await
+                .expect("page permission evaluates");
+        let collection_permission =
+            authz::effective_permission(&state.db, workspace_id, collection_id, "user", member_id, "member")
+                .await
+                .expect("embedded Collection permission evaluates");
+        assert_eq!(page_permission, PermissionLevel::Denied);
+        assert_eq!(collection_permission, PermissionLevel::Denied);
         scratch.drop_self().await;
     }
 
