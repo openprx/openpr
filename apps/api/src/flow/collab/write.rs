@@ -904,6 +904,12 @@ async fn run_locked_phase(
     dispatch_max_attempts: i32,
     staging_budget: Duration,
 ) -> LockedOutcome {
+    // The architecture harness reconstructs this same `BEGIN` -> `COMMIT` span from PostgreSQL's
+    // statement log. The test hook deliberately brackets the production function at those same
+    // endpoints (starting just before the `BEGIN` round trip and ending after commit/rollback), so
+    // it is a conservative in-process superset rather than a newly chosen, narrower timer.
+    #[cfg(test)]
+    let _locked_phase_measurement = begin_locked_phase_measurement(request.document_id);
     let tx = match db.begin().await {
         Ok(tx) => tx,
         Err(err) => {
@@ -979,6 +985,61 @@ async fn run_locked_phase(
             LockedOutcome::CommitUnknown
         }
     }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LockedPhaseProbe {
+    document_id: Option<Uuid>,
+    samples_ms: Vec<f64>,
+}
+
+#[cfg(test)]
+fn locked_phase_probe() -> &'static parking_lot::Mutex<LockedPhaseProbe> {
+    static PROBE: std::sync::OnceLock<parking_lot::Mutex<LockedPhaseProbe>> = std::sync::OnceLock::new();
+    PROBE.get_or_init(|| parking_lot::Mutex::new(LockedPhaseProbe::default()))
+}
+
+#[cfg(test)]
+struct LockedPhaseMeasurement {
+    document_id: Uuid,
+    started: std::time::Instant,
+}
+
+#[cfg(test)]
+impl Drop for LockedPhaseMeasurement {
+    fn drop(&mut self) {
+        let mut probe = locked_phase_probe().lock();
+        if probe.document_id == Some(self.document_id) {
+            probe.samples_ms.push(self.started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn begin_locked_phase_measurement(document_id: Uuid) -> Option<LockedPhaseMeasurement> {
+    (locked_phase_probe().lock().document_id == Some(document_id)).then(|| LockedPhaseMeasurement {
+        document_id,
+        started: std::time::Instant::now(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn install_locked_phase_probe(document_id: Uuid) {
+    *locked_phase_probe().lock() = LockedPhaseProbe {
+        document_id: Some(document_id),
+        samples_ms: Vec::new(),
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_locked_phase_samples() -> Vec<f64> {
+    std::mem::take(&mut locked_phase_probe().lock().samples_ms)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_locked_phase_probe() {
+    *locked_phase_probe().lock() = LockedPhaseProbe::default();
 }
 
 /// Runs [`hydrate_and_apply`] + [`run_locked_phase`] with bounded rebase, inside one coordinator

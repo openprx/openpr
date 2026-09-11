@@ -16,6 +16,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(test)]
+use std::time::{Duration, Instant};
+
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use uuid::Uuid;
 
@@ -106,6 +109,76 @@ pub(crate) const TREE_DEPTH_MAX: usize = 32;
 /// landing exactly on the deepest node — to be evaluated *in full*, so this many nodes is legal
 /// and must never be truncated ("不得以性能为由把鉴权深度降回 20").
 pub(crate) const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 1;
+
+/// Test-only observation of the real evaluator call made by a content command.
+///
+/// The probe is scoped to one object id, so unrelated real-database tests running in parallel do
+/// not enter its distribution. Production builds contain neither the registry nor the optional
+/// delay: the latter exists solely to make the depth-32 budget predicate falsifiable in a mutation
+/// run instead of accepting a timing assertion that cannot be driven red.
+#[cfg(test)]
+#[derive(Default)]
+struct EvaluationProbe {
+    object_id: Option<Uuid>,
+    delay: Duration,
+    samples_ms: Vec<f64>,
+}
+
+#[cfg(test)]
+fn evaluation_probe() -> &'static parking_lot::Mutex<EvaluationProbe> {
+    static PROBE: std::sync::OnceLock<parking_lot::Mutex<EvaluationProbe>> = std::sync::OnceLock::new();
+    PROBE.get_or_init(|| parking_lot::Mutex::new(EvaluationProbe::default()))
+}
+
+#[cfg(test)]
+struct EvaluationMeasurement {
+    object_id: Uuid,
+    started: Instant,
+}
+
+#[cfg(test)]
+impl Drop for EvaluationMeasurement {
+    fn drop(&mut self) {
+        let mut probe = evaluation_probe().lock();
+        if probe.object_id == Some(self.object_id) {
+            probe.samples_ms.push(self.started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+}
+
+#[cfg(test)]
+fn begin_evaluation_measurement(object_id: Uuid) -> (Option<EvaluationMeasurement>, Duration) {
+    let probe = evaluation_probe().lock();
+    if probe.object_id != Some(object_id) {
+        return (None, Duration::ZERO);
+    }
+    (
+        Some(EvaluationMeasurement {
+            object_id,
+            started: Instant::now(),
+        }),
+        probe.delay,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn install_evaluation_probe(object_id: Uuid, delay: Duration) {
+    *evaluation_probe().lock() = EvaluationProbe {
+        object_id: Some(object_id),
+        delay,
+        samples_ms: Vec::new(),
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn take_evaluation_samples() -> Vec<f64> {
+    std::mem::take(&mut evaluation_probe().lock().samples_ms)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_evaluation_probe() {
+    *evaluation_probe().lock() = EvaluationProbe::default();
+}
 
 struct ChainNode {
     id: Uuid,
@@ -418,6 +491,13 @@ pub async fn effective_permission<C: ConnectionTrait>(
     principal_id: Uuid,
     role: &str,
 ) -> Result<PermissionLevel, ApiError> {
+    #[cfg(test)]
+    let (_measurement, injected_delay) = begin_evaluation_measurement(object_id);
+    #[cfg(test)]
+    if !injected_delay.is_zero() {
+        tokio::time::sleep(injected_delay).await;
+    }
+
     // Workspace admin always keeps `full_access` regardless of any authorization boundary
     // (`ADR-0012` §3: "workspace admin 永远保留 full_access（可审计的管理员兜底）"; §4.1 point 3:
     // "workspace admin 兜底永不可被边界切断"; gate `authz_boundary_self_lockout_guarded`:

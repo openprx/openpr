@@ -1729,11 +1729,60 @@ mod flow_database_tests {
         scratch.drop_self().await;
     }
 
-    /// Measures the real content-command path with its database inheritance walk fixed at depth
-    /// 32. Each sample includes permission evaluation, isolated CRDT apply, the commit-time epoch
-    /// fence, canonical write, event and dispatch transaction.
+    async fn run_depth_32_content_command(
+        state: &AppState,
+        member_id: Uuid,
+        leaf: Uuid,
+        sample: usize,
+    ) -> (Value, f64) {
+        let started = std::time::Instant::now();
+        let body = body_json(to_response(
+            post_flow_object_command(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Path(leaf),
+                Json(ExecuteFlowCommandRequest {
+                    command: FlowCommandEnvelope {
+                        command_type: "set_title".to_string(),
+                        payload: json!({"title": format!("Depth 32 sample {sample}")}),
+                    },
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        (body, started.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn measured_p95_and_max(samples: &mut [f64]) -> (f64, f64) {
+        samples.sort_by(f64::total_cmp);
+        let p95_index = ((samples.len() * 95).div_ceil(100)).saturating_sub(1);
+        (samples[p95_index], *samples.last().expect("samples are non-empty"))
+    }
+
+    /// Measures the real content-command path with its database inheritance walk and boundary
+    /// fixed at depth 32. The frozen 25/100 ms lock budgets are checked against two deliberately
+    /// separate windows from that same request:
+    ///
+    /// * `write::run_locked_phase`'s `BEGIN` -> `COMMIT` span, using the same endpoints as the
+    ///   PostgreSQL-log-derived collab architecture harness; and
+    /// * the actual `effective_permission` invocation that evaluates the depth-32 recursive CTE.
+    ///
+    /// The whole handler is retained only as a diagnostic distribution. It includes HTTP-layer
+    /// work, unlocked CRDT apply and extra reads, and no frozen contract budget has that sequential
+    /// in-process shape (the frozen 250 ms number is a 10-client accepted round trip).
     #[tokio::test]
     async fn depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets() {
+        const WARMUP_ROUNDS: usize = 5;
+        const MEASURED_ROUNDS: usize = 30;
+        const MIN_SAMPLES: usize = 30;
+        const LOCK_HOLD_P95_MS_MAX: f64 = 25.0;
+        const LOCK_HOLD_SINGLE_MS_MAX: f64 = 100.0;
+
         let scratch = scratch_or_skip!("depth_32_commit_budget");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
@@ -1762,11 +1811,18 @@ mod flow_database_tests {
             vec![parent.into(), leaf.into()],
         )
         .await;
+        let root = root.expect("root exists");
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![root.into()],
+        )
+        .await;
         exec(
             &state,
             "INSERT INTO flow_object_grants (workspace_id, object_id, principal_kind, principal_id, level) \
              VALUES ($1, $2, 'user', $3, 'full_access')",
-            vec![workspace_id.into(), root.expect("root exists").into(), member_id.into()],
+            vec![workspace_id.into(), root.into(), member_id.into()],
         )
         .await;
         let chain = crate::flow::collab::authz::inheritance_chain(&state.db, workspace_id, leaf)
@@ -1774,43 +1830,97 @@ mod flow_database_tests {
             .expect("the exact depth-32 chain is complete");
         assert_eq!(chain.ids.len(), 33, "root depth zero plus leaf depth 32");
 
-        let mut samples_ms = Vec::new();
-        for sample in 0..10 {
-            let started = std::time::Instant::now();
-            let body = body_json(to_response(
-                post_flow_object_command(
-                    State(state.clone()),
-                    claims_for(member_id),
-                    None,
-                    Path(leaf),
-                    Json(ExecuteFlowCommandRequest {
-                        command: FlowCommandEnvelope {
-                            command_type: "set_title".to_string(),
-                            payload: json!({"title": format!("Depth 32 sample {sample}")}),
-                        },
-                        expected_frontier: None,
-                        idempotency_key: Uuid::new_v4().to_string(),
-                        message: None,
-                    }),
-                )
-                .await,
-            ))
-            .await;
-            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-            assert_eq!(body["code"], 0, "the measured depth-32 command failed: {body}");
-            samples_ms.push(elapsed);
+        let document_id = document_id_for(&state, leaf).await;
+        let injected_delay_ms = std::env::var("OPENPR_TEST_AUTHZ_DEPTH32_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        crate::flow::collab::authz::install_evaluation_probe(leaf, Duration::from_millis(injected_delay_ms));
+        crate::flow::collab::write::install_locked_phase_probe(document_id);
+
+        for sample in 0..WARMUP_ROUNDS {
+            let (body, _) = run_depth_32_content_command(&state, member_id, leaf, sample).await;
+            assert_eq!(body["code"], 0, "the warmup depth-32 command failed: {body}");
         }
-        samples_ms.sort_by(f64::total_cmp);
-        assert!(!samples_ms.is_empty());
-        let p95_index = ((samples_ms.len() * 95).div_ceil(100)).saturating_sub(1);
-        let p95_ms = samples_ms[p95_index];
-        let max_ms = *samples_ms.last().expect("samples are non-empty");
+        let warmup_evaluation_samples = crate::flow::collab::authz::take_evaluation_samples();
+        let warmup_lock_hold_samples = crate::flow::collab::write::take_locked_phase_samples();
+        assert_eq!(warmup_evaluation_samples.len(), WARMUP_ROUNDS);
+        assert_eq!(warmup_lock_hold_samples.len(), WARMUP_ROUNDS);
+
+        let mut end_to_end_samples_ms = Vec::with_capacity(MEASURED_ROUNDS);
+        for sample in WARMUP_ROUNDS..WARMUP_ROUNDS + MEASURED_ROUNDS {
+            let (body, elapsed_ms) = run_depth_32_content_command(&state, member_id, leaf, sample).await;
+            assert_eq!(body["code"], 0, "the measured depth-32 command failed: {body}");
+            end_to_end_samples_ms.push(elapsed_ms);
+        }
+
+        let mut evaluation_samples_ms = crate::flow::collab::authz::take_evaluation_samples();
+        let mut lock_hold_samples_ms = crate::flow::collab::write::take_locked_phase_samples();
+        crate::flow::collab::authz::remove_evaluation_probe();
+        crate::flow::collab::write::remove_locked_phase_probe();
+
+        // Sample sufficiency is decided before a percentile is calculated. In particular, a
+        // short vector can never turn its maximum into a plausible-looking p95 and pass.
+        assert!(
+            evaluation_samples_ms.len() >= MIN_SAMPLES,
+            "depth-32 inheritance evaluation produced only {} samples; at least {MIN_SAMPLES} are required",
+            evaluation_samples_ms.len()
+        );
+        assert!(
+            lock_hold_samples_ms.len() >= MIN_SAMPLES,
+            "depth-32 lock hold produced only {} samples; at least {MIN_SAMPLES} are required",
+            lock_hold_samples_ms.len()
+        );
+        assert_eq!(evaluation_samples_ms.len(), MEASURED_ROUNDS);
+        assert_eq!(lock_hold_samples_ms.len(), MEASURED_ROUNDS);
+        assert_eq!(end_to_end_samples_ms.len(), MEASURED_ROUNDS);
+
+        let (evaluation_p95_ms, evaluation_max_ms) = measured_p95_and_max(&mut evaluation_samples_ms);
+        let (lock_hold_p95_ms, lock_hold_max_ms) = measured_p95_and_max(&mut lock_hold_samples_ms);
+        let (end_to_end_p95_ms, end_to_end_max_ms) = measured_p95_and_max(&mut end_to_end_samples_ms);
         eprintln!(
             "AUTHZ_DEPTH32_COMMIT_BUDGET_EVIDENCE {}",
-            json!({"depth": 32, "samples": samples_ms.len(), "p95_ms": p95_ms, "max_ms": max_ms})
+            json!({
+                "depth": 32,
+                "boundary_depth": 32,
+                "warmup_rounds": WARMUP_ROUNDS,
+                "minimum_samples": MIN_SAMPLES,
+                "samples": lock_hold_samples_ms.len(),
+                "p95_ms": lock_hold_p95_ms,
+                "max_ms": lock_hold_max_ms,
+                "lock_hold_ms_p95": lock_hold_p95_ms,
+                "lock_hold_ms_max": lock_hold_max_ms,
+                "lock_hold_samples_ms": lock_hold_samples_ms,
+                "inheritance_evaluation_samples": evaluation_samples_ms.len(),
+                "inheritance_evaluation_ms_p95": evaluation_p95_ms,
+                "inheritance_evaluation_ms_max": evaluation_max_ms,
+                "inheritance_evaluation_samples_ms": evaluation_samples_ms,
+                "end_to_end_samples": end_to_end_samples_ms.len(),
+                "end_to_end_ms_p95_diagnostic_only": end_to_end_p95_ms,
+                "end_to_end_ms_max_diagnostic_only": end_to_end_max_ms,
+                "end_to_end_samples_ms_diagnostic_only": end_to_end_samples_ms,
+                "end_to_end_budget_ms": Value::Null,
+                "end_to_end_budget_status": "not_frozen_for_sequential_in_process_rest_handler",
+                "injected_authz_delay_ms": injected_delay_ms,
+                "measurement_scope": "depth-32 effective_permission plus write::run_locked_phase BEGIN-to-COMMIT",
+            })
         );
-        assert!(p95_ms <= 25.0, "depth-32 commit-path p95 {p95_ms:.3}ms exceeded 25ms");
-        assert!(max_ms <= 100.0, "depth-32 commit-path max {max_ms:.3}ms exceeded 100ms");
+        assert!(
+            evaluation_p95_ms <= LOCK_HOLD_P95_MS_MAX,
+            "depth-32 inheritance-evaluation p95 {evaluation_p95_ms:.3}ms exceeded {LOCK_HOLD_P95_MS_MAX}ms"
+        );
+        assert!(
+            evaluation_max_ms <= LOCK_HOLD_SINGLE_MS_MAX,
+            "depth-32 inheritance-evaluation max {evaluation_max_ms:.3}ms exceeded {LOCK_HOLD_SINGLE_MS_MAX}ms"
+        );
+        assert!(
+            lock_hold_p95_ms <= LOCK_HOLD_P95_MS_MAX,
+            "depth-32 lock-hold p95 {lock_hold_p95_ms:.3}ms exceeded {LOCK_HOLD_P95_MS_MAX}ms"
+        );
+        assert!(
+            lock_hold_max_ms <= LOCK_HOLD_SINGLE_MS_MAX,
+            "depth-32 lock-hold max {lock_hold_max_ms:.3}ms exceeded {LOCK_HOLD_SINGLE_MS_MAX}ms"
+        );
 
         scratch.drop_self().await;
     }
