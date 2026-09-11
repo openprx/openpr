@@ -364,7 +364,7 @@ baseline_totals = {
     for match in re.finditer(r"^\| 0\.[5-9] \|.*?\| ([0-9]+) \|$", baseline, re.M)
 }
 adr_delegates_to_table = "逐工具表为准" in adr and "不得硬编码" in adr
-adr_match = re.search(r"v0\.5 累计总数.*?\*{0,2}([0-9]+)\*{0,2}", adr)
+adr_match = re.search(r"当前 v0\.5 累计总数[^\n]*?（\*\*([0-9]+)\*\*", adr)
 if not total_match or not baseline_match or not baseline_totals or not adr_delegates_to_table:
     raise SystemExit("G6 count parse failed: every source must be non-empty")
 mcp_declared = int(total_match.group(1))
