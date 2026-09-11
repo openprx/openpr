@@ -375,14 +375,17 @@ fn command_body(command_type: &str, payload: &Value, idempotency_key: &str, mess
 pub fn create_flow_object_tool() -> ToolDefinition {
     ToolDefinition {
         name: "objects.create".to_string(),
-        description: "Create a page or navigator Flow object; same key and body replay the original receipt, while body drift conflicts.".to_string(),
+        description: "Create a page, navigator, or Collection Flow object. A Collection with embed_page_id uses the server's atomic Page embed command; Record creation is collection-scoped.".to_string(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "workspace_id": { "type": "string" },
                 "project_id": { "type": "string" },
-                "type": { "type": "string", "enum": ["page", "navigator"] },
+                "type": { "type": "string", "enum": ["page", "navigator", "collection"] },
                 "parent_id": { "type": "string" },
+                "embed_page_id": { "type": "string", "description": "For type=collection, atomically create and embed in this Page" },
+                "initial_fields": {"type": "array", "items": {"type": "object"}},
+                "initial_view": {"type": "object"},
                 "title": { "type": "string" },
                 "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128 },
                 "message": { "type": "string" }
@@ -401,6 +404,10 @@ struct CreateFlowObjectInput {
     #[serde(rename = "type")]
     object_type: String,
     parent_id: Option<String>,
+    embed_page_id: Option<String>,
+    #[serde(default)]
+    initial_fields: Vec<Value>,
+    initial_view: Option<Value>,
     title: String,
     idempotency_key: String,
     message: Option<String>,
@@ -414,13 +421,37 @@ pub async fn create_flow_object(client: &OpenPrClient, args: Value) -> CallToolR
     if let Err(result) = required_write_key(&input.idempotency_key) {
         return result;
     }
-    if !matches!(input.object_type.as_str(), "page" | "navigator") {
-        return CallToolResult::error("type must be page or navigator".to_string());
+    if !matches!(input.object_type.as_str(), "page" | "navigator" | "collection") {
+        return CallToolResult::error(
+            "type must be page, navigator, or collection; records use records.create".to_string(),
+        );
+    }
+    if input.embed_page_id.is_some() && input.object_type != "collection" {
+        return CallToolResult::error("embed_page_id is only valid for type=collection".to_string());
+    }
+    if input.embed_page_id.is_some() && input.parent_id.is_some() {
+        return CallToolResult::error("embed_page_id and parent_id are mutually exclusive".to_string());
+    }
+    if let Some(page_id) = input.embed_page_id.as_deref() {
+        let body = command_body(
+            "create_collection_embed",
+            &json!({
+                "title": input.title,
+                "initial_fields": input.initial_fields,
+                "initial_view": input.initial_view,
+            }),
+            &input.idempotency_key,
+            input.message.as_deref(),
+        );
+        let path = format!("/api/v1/flow/objects/{}/commands", encode_query_component(page_id));
+        return respond_data(post_structured(client, &path, &body).await);
     }
     let mut body = json!({
         "object_type": input.object_type,
         "title": input.title,
         "idempotency_key": input.idempotency_key,
+        "initial_fields": input.initial_fields,
+        "initial_view": input.initial_view,
     });
     if let Some(object) = body.as_object_mut() {
         if let Some(project_id) = input.project_id {
@@ -1123,6 +1154,164 @@ fn query_suffix(params: &[String]) -> String {
     } else {
         format!("?{}", params.join("&"))
     }
+}
+
+// ---- Flow v0.6 Collection tools ----
+
+pub fn describe_collection_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "collections.describe".to_string(),
+        description: "Describe a Collection with field IDs and labels, views, record count, schema seq, and projection seq. Reads typed projections only.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "at_seq": {"type": "integer"}
+            },
+            "required": ["collection_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescribeCollectionInput {
+    collection_id: String,
+    at_seq: Option<i64>,
+}
+
+pub async fn describe_collection(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: DescribeCollectionInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let suffix = input.at_seq.map_or_else(String::new, |seq| format!("?at_seq={seq}"));
+    let path = format!(
+        "/api/v1/flow/collections/{}{suffix}",
+        encode_query_component(&input.collection_id)
+    );
+    respond_data(get_structured(client, &path).await)
+}
+
+pub fn query_collection_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "collections.query".to_string(),
+        description: "Query typed Collection record projections with opaque cursor pagination, field-ID filter/sort/group, and field ID plus label metadata.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "filter": {
+                    "type": "object",
+                    "properties": {
+                        "field_id": {"type": "string"},
+                        "op": {"type": "string", "enum": ["eq", "ne", "lt", "lte", "gt", "gte", "contains"]},
+                        "value": {}
+                    },
+                    "required": ["field_id", "op", "value"]
+                },
+                "sort": {
+                    "type": "object",
+                    "properties": {
+                        "field_id": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["asc", "desc"]}
+                    },
+                    "required": ["field_id"]
+                },
+                "group": {"type": "string", "description": "Field UUID"},
+                "field_ids": {"type": "array", "items": {"type": "string"}},
+                "cursor": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50}
+            },
+            "required": ["collection_id"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QueryCollectionInput {
+    collection_id: String,
+    filter: Option<Value>,
+    sort: Option<Value>,
+    group: Option<String>,
+    field_ids: Option<Vec<String>>,
+    cursor: Option<String>,
+    limit: Option<u64>,
+}
+
+pub async fn query_collection(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: QueryCollectionInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if input.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+        return CallToolResult::error("limit must be between 1 and 100".to_string());
+    }
+    let path = format!(
+        "/api/v1/flow/collections/{}/query",
+        encode_query_component(&input.collection_id)
+    );
+    let mut body = serde_json::to_value(&input).unwrap_or_else(|_| json!({}));
+    if let Some(object) = body.as_object_mut() {
+        object.remove("collection_id");
+    }
+    respond_data(post_structured(client, &path, &body).await)
+}
+
+pub fn create_collection_record_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "records.create".to_string(),
+        description: "Create one Record inside a Collection using values keyed only by stable field UUID. The response and follow-up query include field IDs and labels.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "collection_id": {"type": "string"},
+                "values_by_field_id": {"type": "object"},
+                "body": {"type": "string"},
+                "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 128},
+                "message": {"type": "string"}
+            },
+            "required": ["collection_id", "values_by_field_id", "idempotency_key"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCollectionRecordInput {
+    collection_id: String,
+    values_by_field_id: Value,
+    body: Option<String>,
+    idempotency_key: String,
+    message: Option<String>,
+}
+
+pub async fn create_collection_record(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: CreateCollectionRecordInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if !input.values_by_field_id.is_object() {
+        return CallToolResult::error("values_by_field_id must be an object keyed by field UUID".to_string());
+    }
+    if let Err(result) = required_write_key(&input.idempotency_key) {
+        return result;
+    }
+    let path = format!(
+        "/api/v1/flow/collections/{}/records",
+        encode_query_component(&input.collection_id)
+    );
+    let body = json!({
+        "values_by_field_id": input.values_by_field_id,
+        "body": input.body,
+        "idempotency_key": input.idempotency_key,
+        "message": input.message,
+    });
+    respond_data(post_structured(client, &path, &body).await)
 }
 
 #[cfg(test)]

@@ -329,6 +329,7 @@ const fn default_query_limit() -> u32 {
 struct EmbedIdempotencyBody {
     title: String,
     display_settings: Map<String, Value>,
+    initial_schema: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -336,6 +337,85 @@ struct CreateCollectionEmbedPayload {
     title: String,
     #[serde(default)]
     display_settings: Map<String, Value>,
+    #[serde(default)]
+    initial_fields: Vec<Value>,
+    #[serde(default)]
+    initial_view: Option<Value>,
+}
+
+pub fn apply_initial_collection_schema(engine: &mut LoroCollabEngine, schema: &Value) -> Result<(), ApiError> {
+    let fields = schema
+        .get("initial_fields")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for raw in fields {
+        let field: FieldCreatePayload = parse_payload("initial collection field", &raw)?;
+        validate_field_type(&field.field_type)?;
+        let label = validate_label(&field.label, "field label")?;
+        let id = node_id(field.field_id);
+        for operation in [
+            Operation::CreateNode {
+                id: id.clone(),
+                parent: None,
+                index: field.index,
+                kind: NodeKind::CollectionField,
+            },
+            Operation::SetProperty {
+                id: id.clone(),
+                key: "field_type".to_string(),
+                value: field.field_type,
+            },
+            Operation::SetProperty {
+                id: id.clone(),
+                key: "label".to_string(),
+                value: label,
+            },
+            Operation::SetProperty {
+                id,
+                key: "config".to_string(),
+                value: serde_json::to_string(&field.config).map_err(|_| ApiError::Internal)?,
+            },
+        ] {
+            engine
+                .apply_operation(&operation)
+                .map_err(|error| ApiError::invalid_update(format!("initial Collection schema rejected: {error}")))?;
+        }
+    }
+    if let Some(raw) = schema.get("initial_view").filter(|value| !value.is_null()) {
+        let view: ViewCreatePayload = parse_payload("initial collection view", raw)?;
+        validate_view_type(&view.view_type)?;
+        let name = validate_label(&view.name, "view name")?;
+        let id = node_id(view.view_id);
+        for operation in [
+            Operation::CreateNode {
+                id: id.clone(),
+                parent: None,
+                index: view.index,
+                kind: NodeKind::CollectionView,
+            },
+            Operation::SetProperty {
+                id: id.clone(),
+                key: "view_type".to_string(),
+                value: view.view_type,
+            },
+            Operation::SetProperty {
+                id: id.clone(),
+                key: "name".to_string(),
+                value: name,
+            },
+            Operation::SetProperty {
+                id,
+                key: "config".to_string(),
+                value: serde_json::to_string(&view.config).map_err(|_| ApiError::Internal)?,
+            },
+        ] {
+            engine
+                .apply_operation(&operation)
+                .map_err(|error| ApiError::invalid_update(format!("initial Collection schema rejected: {error}")))?;
+        }
+    }
+    Ok(())
 }
 
 fn node_id(id: Uuid) -> NodeId {
@@ -494,6 +574,14 @@ async fn sync_collection_projection(
     Ok(())
 }
 
+pub async fn sync_new_collection_projection(
+    tx: &sea_orm::DatabaseTransaction,
+    collection_id: Uuid,
+    engine: &LoroCollabEngine,
+) -> Result<(), ApiError> {
+    sync_collection_projection(tx, collection_id, 0, engine).await
+}
+
 async fn sync_record_projection(
     tx: &sea_orm::DatabaseTransaction,
     collection_id: Uuid,
@@ -610,6 +698,7 @@ struct RebuildDocumentRow {
 }
 
 /// Rebuilds only the typed, disposable Collection projections from canonical collab documents.
+///
 /// All canonical snapshots/tails are loaded before the replacement transaction starts, then the
 /// derived rows are replaced atomically so readers never observe a half-rebuilt schema/value set.
 pub async fn rebuild_typed_projections(
@@ -1887,31 +1976,16 @@ fn typed_column(field_type: &str) -> Result<&'static str, ApiError> {
 
 fn scalar_sql_parameter(column: &str, parameter: usize) -> Result<String, ApiError> {
     match column {
-        "text_value" | "select_value" => Ok(format!(
-            "({parameter_sql}::jsonb #>> '{{}}')",
-            parameter_sql = format!("${parameter}")
-        )),
-        "number_value" => Ok(format!(
-            "({parameter_sql}::jsonb #>> '{{}}')::numeric",
-            parameter_sql = format!("${parameter}")
-        )),
-        "boolean_value" => Ok(format!(
-            "({parameter_sql}::jsonb #>> '{{}}')::boolean",
-            parameter_sql = format!("${parameter}")
-        )),
-        "date_value" => Ok(format!(
-            "({parameter_sql}::jsonb #>> '{{}}')::timestamptz",
-            parameter_sql = format!("${parameter}")
-        )),
+        "text_value" | "select_value" => Ok(format!("(${parameter}::jsonb #>> '{{}}')")),
+        "number_value" => Ok(format!("(${parameter}::jsonb #>> '{{}}')::numeric")),
+        "boolean_value" => Ok(format!("(${parameter}::jsonb #>> '{{}}')::boolean")),
+        "date_value" => Ok(format!("(${parameter}::jsonb #>> '{{}}')::timestamptz")),
         "multi_select_value" | "relation_value" => Ok(format!("${parameter}::jsonb")),
         _ => Err(ApiError::Internal),
     }
 }
 
-async fn query_field<'a>(
-    fields: &'a [CollectionFieldView],
-    field_id: Uuid,
-) -> Result<&'a CollectionFieldView, ApiError> {
+fn query_field(fields: &[CollectionFieldView], field_id: Uuid) -> Result<&CollectionFieldView, ApiError> {
     fields
         .iter()
         .find(|field| field.field_id == field_id && !field.archived && !field_is_restricted(field))
@@ -1967,7 +2041,7 @@ async fn query_collection_records_inner(
     );
     let mut values: Vec<sea_orm::Value> = vec![access.object_id().into()];
     if let Some(group_id) = request.group {
-        let field = query_field(&all_fields, group_id).await?;
+        let field = query_field(&all_fields, group_id)?;
         let column = typed_column(&field.field_type)?;
         values.push(group_id.into());
         let _ = write!(
@@ -1979,7 +2053,7 @@ async fn query_collection_records_inner(
         let _ = column;
     }
     if let Some(sort) = &request.sort {
-        let field = query_field(&all_fields, sort.field_id).await?;
+        let field = query_field(&all_fields, sort.field_id)?;
         values.push(sort.field_id.into());
         let _ = write!(
             sql,
@@ -1991,7 +2065,7 @@ async fn query_collection_records_inner(
     }
     sql.push_str(" WHERE rp.collection_id = $1 AND fo.lifecycle_status = 'active'");
     if let Some(filter) = &request.filter {
-        let field = query_field(&all_fields, filter.field_id).await?;
+        let field = query_field(&all_fields, filter.field_id)?;
         validate_typed_value(&field.field_type, &filter.value)?;
         let column = typed_column(&field.field_type)?;
         let operator = match filter.op.as_str() {
@@ -2022,11 +2096,11 @@ async fn query_collection_records_inner(
     }
     let mut order = Vec::new();
     if let Some(group_id) = request.group {
-        let field = query_field(&all_fields, group_id).await?;
+        let field = query_field(&all_fields, group_id)?;
         order.push(format!("groupv.{} ASC NULLS LAST", typed_column(&field.field_type)?));
     }
     if let Some(sort) = &request.sort {
-        let field = query_field(&all_fields, sort.field_id).await?;
+        let field = query_field(&all_fields, sort.field_id)?;
         order.push(format!(
             "sortv.{} {} NULLS LAST",
             typed_column(&field.field_type)?,
@@ -2088,7 +2162,7 @@ async fn query_collection_records_inner(
         request.field_ids.iter().copied().collect::<BTreeSet<_>>()
     };
     for field_id in &requested_fields {
-        let _ = query_field(&all_fields, *field_id).await?;
+        let _ = query_field(&all_fields, *field_id)?;
     }
 
     let mut items = Vec::new();
@@ -2261,6 +2335,10 @@ async fn create_collection_embed(
     let idempotency_body = EmbedIdempotencyBody {
         title: title.clone(),
         display_settings: payload.display_settings.clone(),
+        initial_schema: json!({
+            "initial_fields": payload.initial_fields,
+            "initial_view": payload.initial_view,
+        }),
     };
     if let Some(replay) = replay_embed(
         state,
@@ -2337,6 +2415,7 @@ async fn create_collection_embed(
         };
         let mut collection_engine = LoroCollabEngine::new_empty(rand::random());
         collection_engine.set_title(&title).map_err(|_| ApiError::Internal)?;
+        apply_initial_collection_schema(&mut collection_engine, &idempotency_body.initial_schema)?;
         let collection_snapshot = collection_engine.export_snapshot().map_err(|_| ApiError::Internal)?;
         let collection_frontier = collection_engine.frontier().as_bytes().to_vec();
         let collection_semantic = collection_engine.semantic_snapshot().map_err(|_| ApiError::Internal)?;
@@ -2425,6 +2504,7 @@ async fn create_collection_embed(
             Value::Object(payload.display_settings.clone()),
         )
         .await?;
+        sync_collection_projection(&tx, collection_id, 0, &collection_engine).await?;
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO flow_relations \
@@ -2769,6 +2849,7 @@ mod tests {
 )]
 mod database_tests {
     use std::collections::BTreeSet;
+    use std::time::Instant;
 
     use axum::body::to_bytes;
     use axum::{Extension, Router, routing::post};
@@ -2784,12 +2865,14 @@ mod database_tests {
 
     use super::{
         CollectionCommandType, CountRow, EmbedFaultPoint, RecordFilter, RecordQueryPayload, RecordSort,
-        collection_operations, engine_at_head, execute_embed_with_fault, node_id, query_collection_records,
-        query_collection_records_requiring_typed_index, rebuild_typed_projections,
+        collection_operations, describe_collection, engine_at_head, execute_embed_with_fault, node_id,
+        query_collection_records, query_collection_records_requiring_typed_index, rebuild_typed_projections,
     };
     use crate::error::ApiError;
     use crate::flow::collab::bootstrap;
-    use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
+    use crate::flow::command::{
+        CreateObjectInput, ExecuteCommandInput, create_object, create_object_with_collection_schema, execute_command,
+    };
     use crate::flow::event_origin::{CommandOrigin, EventSurface};
     use crate::flow::repository;
     use crate::flow::{collab::authz::PermissionLevel, policy};
@@ -3595,6 +3678,64 @@ mod database_tests {
     }
 
     #[tokio::test]
+    async fn flow_collection_standalone_create_with_schema_is_idempotent() {
+        let scratch = scratch_or_skip!("standalone_replay");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let key = Uuid::new_v4().to_string();
+        let field_id = Uuid::new_v4();
+        let view_id = Uuid::new_v4();
+        let schema = json!({
+            "initial_fields": [{
+                "field_id": field_id,
+                "label": "Priority",
+                "field_type": "select",
+                "config": {"options": ["high", "low"]},
+                "index": 0
+            }],
+            "initial_view": {
+                "view_id": view_id,
+                "name": "All records",
+                "view_type": "table",
+                "index": 0
+            }
+        });
+        let make_input = || CreateObjectInput {
+            workspace_id,
+            actor_id: owner_id,
+            actor_is_bot: false,
+            object_type: "collection".to_string(),
+            project_id: None,
+            parent_object_id: None,
+            title: "Standalone schema".to_string(),
+            idempotency_key: key.clone(),
+            message: None,
+            origin: CommandOrigin::first_request_from(EventSurface::Rest),
+        };
+
+        let first = create_object_with_collection_schema(&state, make_input(), schema.clone())
+            .await
+            .expect("first standalone Collection create succeeds");
+        let replay = create_object_with_collection_schema(&state, make_input(), schema)
+            .await
+            .expect("identical standalone Collection create replays");
+        assert_eq!(first.object.id, replay.object.id);
+        assert_eq!(first.object.document_id, replay.object.document_id);
+        assert_eq!(first.event_id, replay.event_id);
+        assert_eq!(first.projection_seq, replay.projection_seq);
+        let access = read_access(&state, workspace_id, owner_id, first.object.id).await;
+        let described = describe_collection(&state, &access, None)
+            .await
+            .expect("Collection projection describes")
+            .expect("authorization epoch remains stable");
+        assert_eq!(described.fields.len(), 1);
+        assert_eq!(described.fields[0].field_id, field_id);
+        assert_eq!(described.views.len(), 1);
+        assert_eq!(described.views[0].view_id, view_id);
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn flow_collection_atomic_create_two_real_requests_same_key_return_same_ids() {
         use tower::ServiceExt as _;
 
@@ -3884,6 +4025,7 @@ mod database_tests {
 
     #[tokio::test]
     async fn ten_thousand_record_query_uses_index_without_decoding_documents() {
+        let total_started = Instant::now();
         let scratch = scratch_or_skip!("query_10k");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed(&state).await;
@@ -3927,12 +4069,15 @@ mod database_tests {
             ANALYZE flow_record_value_projections;
             "
         );
+        let fixture_started = Instant::now();
         state
             .db
             .execute_unprepared(&fixture_sql)
             .await
             .expect("ten thousand typed records insert");
+        let fixture_ms = fixture_started.elapsed().as_millis();
         let access = read_access(&state, workspace_id, owner_id, collection_id).await;
+        let query_started = Instant::now();
         let response = query_collection_records_requiring_typed_index(
             &state,
             &access,
@@ -3952,6 +4097,7 @@ mod database_tests {
         .await
         .expect("typed query runs despite invalid document bytes")
         .expect("authorization epoch is stable");
+        let query_ms = query_started.elapsed().as_millis();
         assert_eq!(response.items.len(), 1);
         assert_eq!(response.fields.len(), 1);
         assert_eq!(response.fields[0].field_id, field_id);
@@ -3959,6 +4105,18 @@ mod database_tests {
         assert_eq!(
             response.items[0].values_by_field_id.get(&field_id.to_string()),
             Some(&json!(7777))
+        );
+        eprintln!(
+            "FLOW_COLLECTION_10K_METRICS {}",
+            json!({
+                "records": 10_000,
+                "fixture_ms": fixture_ms,
+                "query_ms": query_ms,
+                "total_ms": total_started.elapsed().as_millis(),
+                "matched_records": response.items.len(),
+                "typed_index_required": true,
+                "document_decode_attempts": 0,
+            })
         );
         scratch.drop_self().await;
     }

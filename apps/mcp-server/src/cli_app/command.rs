@@ -40,6 +40,10 @@ pub enum Commands {
     Features(FeaturesCmd),
     /// Flow objects
     Objects(ObjectsCmd),
+    /// Flow Collections
+    Collections(CollectionsCmd),
+    /// Collection Records
+    Records(RecordsCmd),
     /// Flow collaboration diagnostics
     Collab(CollabCmd),
 }
@@ -94,18 +98,22 @@ pub struct ObjectsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ObjectsAction {
-    /// Create a page or navigator Flow object
+    /// Create a page, navigator, or Collection Flow object
     Create {
         #[arg(long)]
         workspace: String,
         #[arg(long)]
         project: Option<String>,
-        #[arg(long = "type", value_parser = ["page", "navigator"])]
+        #[arg(long = "type", value_parser = ["page", "navigator", "collection"])]
         object_type: String,
         #[arg(long)]
         title: String,
         #[arg(long)]
         parent: Option<String>,
+        #[arg(long = "embed-page")]
+        embed_page: Option<String>,
+        #[arg(long = "schema-file")]
+        schema_file: Option<PathBuf>,
         #[arg(long = "idempotency-key")]
         idempotency_key: String,
     },
@@ -227,6 +235,55 @@ pub enum ObjectsAction {
         before_seq: Option<i64>,
         #[arg(long)]
         limit: Option<u64>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct CollectionsCmd {
+    #[command(subcommand)]
+    pub action: CollectionsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CollectionsAction {
+    Describe {
+        id: String,
+    },
+    Query {
+        id: String,
+        #[arg(long = "query-file")]
+        query_file: PathBuf,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct RecordsCmd {
+    #[command(subcommand)]
+    pub action: RecordsAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordsAction {
+    Create {
+        #[arg(long)]
+        collection: String,
+        #[arg(long = "values-file")]
+        values_file: PathBuf,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        #[arg(long)]
+        body: Option<String>,
+    },
+    Patch {
+        id: String,
+        #[arg(long = "values-file")]
+        values_file: PathBuf,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        #[arg(long)]
+        body: Option<String>,
     },
 }
 

@@ -129,6 +129,7 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         objects::get_flow_object_history_tool(),
     ];
     tools.extend(flow_v05_tool_definitions());
+    tools.extend(flow_v06_tool_definitions());
     tools.extend([
         legacy_pages::legacy_pages_inventory_tool(),
         legacy_pages::legacy_pages_import_preview_tool(),
@@ -136,6 +137,14 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         legacy_pages::legacy_pages_import_status_tool(),
     ]);
     tools
+}
+
+fn flow_v06_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        objects::describe_collection_tool(),
+        objects::query_collection_tool(),
+        objects::create_collection_record_tool(),
+    ]
 }
 
 /// The live v0.5 registration set. Keeping the version boundary explicit lets the contract test
@@ -160,10 +169,37 @@ fn flow_v05_tool_definitions() -> Vec<ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_v05_tool_definitions, get_all_tool_definitions};
+    use super::{flow_v05_tool_definitions, flow_v06_tool_definitions, get_all_tool_definitions};
     use std::collections::HashSet;
 
     const FLOW_V05_SURFACE_SNAPSHOT: &str = include_str!("mcp-surface-v05.snapshot.md");
+
+    #[test]
+    fn flow_v06_tools_are_registered_once_in_the_exact_122_tool_surface() {
+        let tools = get_all_tool_definitions();
+        let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
+        let unique = names.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(
+            tools.len(),
+            122,
+            "v0.6 adds exactly three tools to the 119-tool v0.5 registry"
+        );
+        assert_eq!(names.len(), unique.len(), "MCP tool names must remain unique");
+
+        let live_v06 = flow_v06_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            live_v06,
+            HashSet::from([
+                "collections.describe".to_string(),
+                "collections.query".to_string(),
+                "records.create".to_string(),
+            ]),
+            "the live v0.6 delta must be the frozen three-tool surface"
+        );
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct FlowV05Surface {
@@ -317,11 +353,8 @@ mod tests {
             expected_v05_count,
             "the snapshot must contain exactly total(v0.5)-total(v0.4) tool rows"
         );
-        assert_eq!(
-            tools.len(),
-            snapshot.expected_total,
-            "the live registry count must equal the embedded v0.5 total"
-        );
+        // The snapshot freezes the v0.5 delta, not the all-releases live total. Later releases
+        // deliberately append tools; their exact current total has its own release test.
 
         // The live side is independently enumerable from the registration function used by the
         // server. Comparing only `snapshot.iter().all(live.contains)` would make an empty or

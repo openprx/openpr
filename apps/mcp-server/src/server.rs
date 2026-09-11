@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (119)
+## Tools (122)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -27,7 +27,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
 ### Other: members.list, search.all, bot_operation_logs.list
-### Flow (v0.5): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, collab.projection_lag, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
+### Flow (v0.6): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, collab.projection_lag, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -411,6 +411,9 @@ const TOOL_POLICY_SCOPES: &[(&str, PolicyScope)] = &[
     ("objects.inheritance_set", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
     ("objects.relations", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
     ("objects.search", PolicyScope::DeclaredProject { required: false }),
+    ("collections.describe", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("collections.query", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("records.create", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
     (
         "collab.projection_lag",
         PolicyScope::DeclaredProject { required: false },
@@ -853,6 +856,9 @@ impl McpServer {
             "objects.relations" => tools::objects::list_flow_object_relations(&self.client, args).await,
             "objects.search" => tools::objects::search_flow_objects(&self.client, args).await,
             "collab.projection_lag" => tools::objects::get_flow_projection_lag(&self.client, args).await,
+            "collections.describe" => tools::objects::describe_collection(&self.client, args).await,
+            "collections.query" => tools::objects::query_collection(&self.client, args).await,
+            "records.create" => tools::objects::create_collection_record(&self.client, args).await,
             "legacy_pages.inventory" => tools::legacy_pages::legacy_pages_inventory(&self.client, args).await,
             "legacy_pages.import_preview" => tools::legacy_pages::legacy_pages_import_preview(&self.client, args).await,
             "legacy_pages.import_commit" => tools::legacy_pages::legacy_pages_import_commit(&self.client, args).await,

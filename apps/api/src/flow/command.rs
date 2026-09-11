@@ -218,16 +218,23 @@ struct CreateObjectIdempotencyBody {
     parent_object_id: Option<Uuid>,
     title: String,
     message: Option<String>,
+    #[serde(default)]
+    initial_collection_schema: Option<Value>,
 }
 
 impl CreateObjectIdempotencyBody {
-    fn from_input(input: &CreateObjectInput, normalized_title: &str) -> Self {
+    fn from_input(
+        input: &CreateObjectInput,
+        normalized_title: &str,
+        initial_collection_schema: Option<&Value>,
+    ) -> Self {
         Self {
             object_type: input.object_type.clone(),
             project_id: input.project_id,
             parent_object_id: input.parent_object_id,
             title: normalized_title.to_string(),
             message: input.message.clone(),
+            initial_collection_schema: initial_collection_schema.cloned(),
         }
     }
 }
@@ -371,10 +378,31 @@ async fn replay_created_object(
 pub const CHILD_PROJECT_MUST_MATCH_PARENT: &str = "child_project_must_match_parent";
 
 pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result<AcceptedChange, ApiError> {
+    create_object_inner(state, input, None).await
+}
+
+pub async fn create_object_with_collection_schema(
+    state: &AppState,
+    input: CreateObjectInput,
+    initial_collection_schema: Value,
+) -> Result<AcceptedChange, ApiError> {
+    create_object_inner(state, input, Some(initial_collection_schema)).await
+}
+
+async fn create_object_inner(
+    state: &AppState,
+    input: CreateObjectInput,
+    initial_collection_schema: Option<Value>,
+) -> Result<AcceptedChange, ApiError> {
     runtime::runtime().ensure_workspace_accepting(input.workspace_id)?;
     validate(&input)?;
     let title = input.title.trim().to_string();
-    let idempotency_body = CreateObjectIdempotencyBody::from_input(&input, &title);
+    if initial_collection_schema.is_some() && input.object_type != "collection" {
+        return Err(ApiError::invalid_update(
+            "initial_fields and initial_view require object_type=collection",
+        ));
+    }
+    let idempotency_body = CreateObjectIdempotencyBody::from_input(&input, &title, initial_collection_schema.as_ref());
 
     // Idempotent replay: a caller retrying the exact same `idempotency_key` gets back the
     // original result instead of a unique-violation `Conflict`
@@ -510,6 +538,9 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         tracing::error!(error = %err, "collab-core: set_title failed on a brand-new document");
         ApiError::Internal
     })?;
+    if let Some(schema) = initial_collection_schema.as_ref() {
+        super::collections::apply_initial_collection_schema(&mut engine, schema)?;
+    }
     let snapshot = engine.export_snapshot().map_err(|err| {
         tracing::error!(error = %err, "collab-core: export_snapshot failed on a brand-new document");
         ApiError::Internal
@@ -583,6 +614,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             json!({}),
         )
         .await?;
+        super::collections::sync_new_collection_projection(&tx, object_id, &engine).await?;
     }
 
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;

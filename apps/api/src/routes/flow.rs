@@ -130,6 +130,9 @@ pub struct CreateFlowObjectRequest {
     pub title: String,
     pub idempotency_key: String,
     pub message: Option<String>,
+    #[serde(default)]
+    pub initial_fields: Vec<Value>,
+    pub initial_view: Option<Value>,
 }
 
 /// `POST /api/v1/workspaces/{workspace_id}/flow/objects`
@@ -144,22 +147,28 @@ pub async fn create_flow_object(
     let (actor_id, _role, actor_is_bot) =
         policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
 
-    let accepted = crate::flow::command::create_object(
-        &state,
-        CreateObjectInput {
-            workspace_id,
-            actor_id,
-            actor_is_bot,
-            object_type: req.object_type,
-            project_id: req.project_id,
-            parent_object_id: req.parent_object_id,
-            title: req.title,
-            idempotency_key: req.idempotency_key,
-            message: req.message,
-            origin: request_origin(&extensions),
-        },
-    )
-    .await?;
+    let input = CreateObjectInput {
+        workspace_id,
+        actor_id,
+        actor_is_bot,
+        object_type: req.object_type,
+        project_id: req.project_id,
+        parent_object_id: req.parent_object_id,
+        title: req.title,
+        idempotency_key: req.idempotency_key,
+        message: req.message,
+        origin: request_origin(&extensions),
+    };
+    let accepted = if req.initial_fields.is_empty() && req.initial_view.is_none() {
+        crate::flow::command::create_object(&state, input).await?
+    } else {
+        crate::flow::command::create_object_with_collection_schema(
+            &state,
+            input,
+            serde_json::json!({"initial_fields": req.initial_fields, "initial_view": req.initial_view}),
+        )
+        .await?
+    };
 
     Ok(ApiResponse::success(accepted))
 }
@@ -1191,6 +1200,8 @@ mod flow_database_tests {
                     title: title.to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -1333,6 +1344,8 @@ mod flow_database_tests {
                     title: "Boundary Fixture".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -1478,6 +1491,8 @@ mod flow_database_tests {
                     title: "My First Page".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: Some("initial create".to_string()),
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -1627,6 +1642,8 @@ mod flow_database_tests {
                     title: "Doesn't matter".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -1668,6 +1685,8 @@ mod flow_database_tests {
                     title: "Should never be created".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -2893,6 +2912,8 @@ mod flow_database_tests {
             title: "Replayed Page".to_string(),
             idempotency_key: idempotency_key.clone(),
             message: None,
+            initial_fields: Vec::new(),
+            initial_view: None,
         };
 
         let first = body_json(to_response(
@@ -3020,6 +3041,8 @@ mod flow_database_tests {
                     title: "Top-level Page".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -3101,6 +3124,8 @@ mod flow_database_tests {
                     title: "Project top-level page".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -3705,6 +3730,8 @@ mod flow_database_tests {
                     title: "Commands Test Page".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -4937,6 +4964,8 @@ mod flow_database_tests {
                     title: "Bootstrap Test Page".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5042,6 +5071,8 @@ mod flow_database_tests {
                     title: "Page In Workspace A".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5068,6 +5099,8 @@ mod flow_database_tests {
                     title: "Cross-Workspace Attempt".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5282,6 +5315,8 @@ mod flow_database_tests {
                     title: "Semantic Patch Bytes Test".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5350,6 +5385,8 @@ mod flow_database_tests {
                     title: "Drain Surface Test".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5408,6 +5445,8 @@ mod flow_database_tests {
                     title: "Tree Depth Limit Test".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5546,6 +5585,8 @@ mod flow_database_tests {
                     title: "Batch Count Limit Test".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -5758,6 +5799,8 @@ mod flow_database_tests {
                             title,
                             idempotency_key: Uuid::new_v4().to_string(),
                             message: None,
+                            initial_fields: Vec::new(),
+                            initial_view: None,
                         }),
                     )
                     .await,
@@ -6075,6 +6118,8 @@ mod flow_database_tests {
                     title: "Bot Created".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -6249,6 +6294,8 @@ mod flow_database_tests {
                     title: "Transport Origin".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,
@@ -6479,6 +6526,8 @@ mod flow_database_tests {
                     title: "REST Origin Test".to_string(),
                     idempotency_key: Uuid::new_v4().to_string(),
                     message: None,
+                    initial_fields: Vec::new(),
+                    initial_view: None,
                 }),
             )
             .await,

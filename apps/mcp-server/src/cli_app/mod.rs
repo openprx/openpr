@@ -12,7 +12,8 @@ pub mod render;
 
 use crate::client::{OpenPrClient, encode_query_component};
 use command::{
-    Cli, CollabAction, Commands, FeaturesAction, FlowFeatureAction, GrantsAction, InheritanceAction, ObjectsAction,
+    Cli, CollabAction, CollectionsAction, Commands, FeaturesAction, FlowFeatureAction, GrantsAction, InheritanceAction,
+    ObjectsAction, RecordsAction,
 };
 use error::CliError;
 use serde_json::{Value, json};
@@ -65,6 +66,14 @@ fn command_name(command: &Commands) -> String {
             ObjectsAction::Get { .. } => "objects.get".to_string(),
             ObjectsAction::Query { .. } => "objects.query".to_string(),
             ObjectsAction::History { .. } => "objects.history".to_string(),
+        },
+        Commands::Collections(cmd) => match &cmd.action {
+            CollectionsAction::Describe { .. } => "collections.describe".to_string(),
+            CollectionsAction::Query { .. } => "collections.query".to_string(),
+        },
+        Commands::Records(cmd) => match &cmd.action {
+            RecordsAction::Create { .. } => "records.create".to_string(),
+            RecordsAction::Patch { .. } => "records.patch".to_string(),
         },
         Commands::Collab(cmd) => match &cmd.action {
             CollabAction::Inspect { .. } => "collab.inspect".to_string(),
@@ -121,6 +130,8 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 object_type,
                 title,
                 parent,
+                embed_page,
+                schema_file,
                 idempotency_key,
             } => {
                 let workspace = checked_uuid("--workspace", workspace)?;
@@ -128,12 +139,44 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 if title.trim().is_empty() {
                     return Err(CliError::usage("--title must not be empty"));
                 }
-                let mut body = json!({
-                    "object_type": object_type,
-                    "title": title,
-                    "idempotency_key": idempotency_key,
-                });
-                if let Some(object) = body.as_object_mut() {
+                if parent.is_some() && embed_page.is_some() {
+                    return Err(CliError::usage("--parent and --embed-page are mutually exclusive"));
+                }
+                let mut initial_schema = schema_file
+                    .as_ref()
+                    .map(|path| read_json_file(path))
+                    .transpose()?
+                    .unwrap_or_else(|| json!({}));
+                {
+                    let schema_object = initial_schema
+                        .as_object_mut()
+                        .ok_or_else(|| CliError::usage("--schema-file must contain a JSON object"))?;
+                    schema_object.entry("initial_fields").or_insert_with(|| json!([]));
+                    schema_object.entry("initial_view").or_insert(Value::Null);
+                }
+                let (path, mut body) = if let Some(page) = embed_page {
+                    if object_type != "collection" {
+                        return Err(CliError::usage("--embed-page requires --type collection"));
+                    }
+                    let page = checked_uuid("--embed-page", page)?;
+                    if let Some(schema_object) = initial_schema.as_object_mut() {
+                        schema_object.insert("title".to_string(), json!(title));
+                    }
+                    (
+                        format!("/api/v1/flow/objects/{page}/commands"),
+                        flow_command("create_collection_embed", &initial_schema, idempotency_key),
+                    )
+                } else {
+                    if let Some(schema_object) = initial_schema.as_object_mut() {
+                        schema_object.insert("object_type".to_string(), json!(object_type));
+                        schema_object.insert("title".to_string(), json!(title));
+                        schema_object.insert("idempotency_key".to_string(), json!(idempotency_key));
+                    }
+                    (format!("/api/v1/workspaces/{workspace}/flow/objects"), initial_schema)
+                };
+                if embed_page.is_none()
+                    && let Some(object) = body.as_object_mut()
+                {
                     if let Some(project) = project {
                         object.insert("project_id".to_string(), json!(checked_uuid("--project", project)?));
                     }
@@ -141,7 +184,6 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                         object.insert("parent_object_id".to_string(), json!(checked_uuid("--parent", parent)?));
                     }
                 }
-                let path = format!("/api/v1/workspaces/{workspace}/flow/objects");
                 api_data(client.post_structured::<Value, _>(&path, &body).await)
             }
             ObjectsAction::Patch {
@@ -437,6 +479,84 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 api_data(client.get_structured::<Value>(&path).await)
             }
         },
+        Commands::Collections(cmd) => match &cmd.action {
+            CollectionsAction::Describe { id } => {
+                let id = checked_uuid("collection id", id)?;
+                api_data(
+                    client
+                        .get_structured::<Value>(&format!("/api/v1/flow/collections/{id}"))
+                        .await,
+                )
+            }
+            CollectionsAction::Query { id, query_file, cursor } => {
+                let id = checked_uuid("collection id", id)?;
+                let mut body = read_json_file(query_file)?;
+                if !body.is_object() {
+                    return Err(CliError::usage("--query-file must contain a JSON object"));
+                }
+                if let (Some(cursor), Some(object)) = (cursor, body.as_object_mut()) {
+                    object.insert("cursor".to_string(), json!(cursor));
+                }
+                api_data(
+                    client
+                        .post_structured::<Value, _>(&format!("/api/v1/flow/collections/{id}/query"), &body)
+                        .await,
+                )
+            }
+        },
+        Commands::Records(cmd) => {
+            match &cmd.action {
+                RecordsAction::Create {
+                    collection,
+                    values_file,
+                    idempotency_key,
+                    body,
+                } => {
+                    let collection = checked_uuid("--collection", collection)?;
+                    checked_idempotency_key(idempotency_key)?;
+                    let values = read_json_file(values_file)?;
+                    if !values.is_object() {
+                        return Err(CliError::usage(
+                            "--values-file must contain a JSON object keyed by field UUID",
+                        ));
+                    }
+                    api_data(client.post_structured::<Value, _>(&format!("/api/v1/flow/collections/{collection}/records"), &json!({"values_by_field_id": values, "body": body, "idempotency_key": idempotency_key})).await)
+                }
+                RecordsAction::Patch {
+                    id,
+                    values_file,
+                    idempotency_key,
+                    body,
+                } => {
+                    let id = checked_uuid("record id", id)?;
+                    checked_idempotency_key(idempotency_key)?;
+                    let values = read_json_file(values_file)?;
+                    if !values.is_object() {
+                        return Err(CliError::usage(
+                            "--values-file must contain a JSON object keyed by field UUID",
+                        ));
+                    }
+                    let record = api_data(
+                        client
+                            .get_structured::<Value>(&format!("/api/v1/flow/objects/{id}"))
+                            .await,
+                    )?;
+                    let collection = record
+                        .get("parent_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| CliError::usage("record response has no owning Collection"))?;
+                    let payload = json!({"record_id": id, "properties": values, "body": body});
+                    api_data(
+                        client
+                            .post_structured::<Value, _>(
+                                &format!("/api/v1/flow/objects/{collection}/commands"),
+                                &flow_command("record_patch", &payload, idempotency_key),
+                            )
+                            .await,
+                    )
+                }
+            }
+        }
         Commands::Collab(cmd) => match &cmd.action {
             CollabAction::Inspect { id } => {
                 let id = checked_uuid("object id", id)?;
