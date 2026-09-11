@@ -2276,6 +2276,7 @@ fn record_query_requires_read_endpoint(payload: &Value) -> Result<AcceptedChange
     ))
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmbedFaultPoint {
     Object,
@@ -2285,6 +2286,7 @@ pub(crate) enum EmbedFaultPoint {
     Dispatch,
 }
 
+#[cfg(test)]
 fn inject_embed_fault(selected: Option<EmbedFaultPoint>, point: EmbedFaultPoint) -> Result<(), ApiError> {
     if selected == Some(point) {
         Err(ApiError::Internal)
@@ -2347,7 +2349,7 @@ async fn create_collection_embed(
     workspace_id: Uuid,
     page: &repository::ObjectViewRow,
     checked_epoch: i64,
-    fault: Option<EmbedFaultPoint>,
+    #[cfg(test)] fault: Option<EmbedFaultPoint>,
 ) -> Result<AcceptedChange, ApiError> {
     if page.object_type != "page" || page.lifecycle_status == "archived" {
         return Err(ApiError::invalid_update(
@@ -2477,6 +2479,7 @@ async fn create_collection_embed(
             }
             continue;
         };
+        #[cfg(test)]
         inject_embed_fault(fault, EmbedFaultPoint::Block)?;
         repository::insert_flow_object(
             &tx,
@@ -2491,6 +2494,7 @@ async fn create_collection_embed(
             },
         )
         .await?;
+        #[cfg(test)]
         inject_embed_fault(fault, EmbedFaultPoint::Object)?;
         repository::insert_collab_document(
             &tx,
@@ -2503,6 +2507,7 @@ async fn create_collection_embed(
             },
         )
         .await?;
+        #[cfg(test)]
         inject_embed_fault(fault, EmbedFaultPoint::Document)?;
         repository::insert_projection(
             &tx,
@@ -2542,6 +2547,7 @@ async fn create_collection_embed(
             ],
         ))
         .await?;
+        #[cfg(test)]
         inject_embed_fault(fault, EmbedFaultPoint::Relation)?;
         let command_result = json!({
             "collection_id": collection_id,
@@ -2569,6 +2575,7 @@ async fn create_collection_embed(
             ],
         ))
         .await?;
+        #[cfg(test)]
         inject_embed_fault(fault, EmbedFaultPoint::Dispatch)?;
         tx.commit().await?;
         let before_frontier = prepared.observed.head_frontier.clone();
@@ -2680,7 +2687,10 @@ pub async fn execute(
 ) -> Result<AcceptedChange, ApiError> {
     runtime::runtime().ensure_workspace_accepting(workspace_id)?;
     if kind == CollectionCommandType::CreateCollectionEmbed {
+        #[cfg(test)]
         return create_collection_embed(state, input, workspace_id, target, checked_epoch, None).await;
+        #[cfg(not(test))]
+        return create_collection_embed(state, input, workspace_id, target, checked_epoch).await;
     }
     let collection = ensure_collection_target(state, input.object_id).await?;
     if let Some(replay) = replay_existing_command(state, input, workspace_id, kind).await? {
