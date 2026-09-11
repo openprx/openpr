@@ -396,16 +396,16 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     let mut effective_parent_id = input.parent_object_id;
 
     if effective_parent_id.is_none() && input.object_type != "navigator" {
-        effective_parent_id = Some(repository::ensure_workspace_navigator_root(&state.db, input.workspace_id).await?);
+        effective_parent_id =
+            Some(repository::ensure_navigator_root(&state.db, input.workspace_id, input.project_id).await?);
     } else if effective_parent_id.is_none()
         && input.object_type == "navigator"
-        && input.project_id.is_none()
-        && repository::fetch_workspace_navigator_root(&state.db, input.workspace_id)
+        && repository::fetch_navigator_root(&state.db, input.workspace_id, input.project_id)
             .await?
             .is_some()
     {
         return Err(ApiError::Conflict(
-            "workspace already has a canonical navigator root".to_string(),
+            "workspace project scope already has a canonical navigator root".to_string(),
         ));
     }
 
@@ -513,6 +513,12 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
 
     let tx = state.db.begin().await?;
 
+    let governance_metadata = if input.object_type == "navigator" && effective_parent_id.is_none() {
+        json!({ "system_role": repository::NAVIGATOR_ROOT_SYSTEM_ROLE })
+    } else {
+        json!({})
+    };
+
     repository::insert_flow_object(
         &tx,
         &NewFlowObject {
@@ -522,6 +528,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             object_type: input.object_type.clone(),
             parent_id: effective_parent_id,
             created_by: actor_user_id(input.actor_id, input.actor_is_bot),
+            governance_metadata: governance_metadata.clone(),
         },
     )
     .await?;
@@ -625,7 +632,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         parent_id: effective_parent_id,
         object_type: input.object_type,
         lifecycle_status: "active".to_string(),
-        governance_metadata: json!({}),
+        governance_metadata,
         title,
         semantic_content: state_json.clone(),
         document_id,
@@ -2631,10 +2638,10 @@ mod database_tests {
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
-    /// `limits-v1.md`'s `tree_depth_max = 32` with the root at depth 0, written as a literal so
+    /// `limits-v1.md`'s `tree_depth_max = 32`, written as a literal so
     /// these fixtures pin the *contract* rather than sliding along with any implementation
-    /// constant: a legal chain spans depths `0..=32`, i.e. 33 nodes joined by 32 hops.
-    const DEEPEST_LEGAL_CHAIN_NODES: usize = 33;
+    /// constant: a legal chain has 33 user nodes plus the hidden navigator root.
+    const DEEPEST_LEGAL_CHAIN_NODES: usize = 34;
 
     struct Scratch {
         db: DatabaseConnection,
@@ -3505,7 +3512,8 @@ mod database_tests {
         let state = state_for(scratch.db.clone());
         let fx = seed_workspace(&scratch.db).await;
 
-        // Root-first, so `chain[i]` sits at depth `i`.
+        // Root-first: `chain[0]` is the hidden navigator root and `chain[i]` has user depth
+        // `i - 1` thereafter.
         let chain = build_chain(&scratch.db, fx.workspace_id, DEEPEST_LEGAL_CHAIN_NODES).await;
         let at_limit = chain[DEEPEST_LEGAL_CHAIN_NODES - 1]; // depth 32
         let one_below_limit = chain[DEEPEST_LEGAL_CHAIN_NODES - 2]; // depth 31

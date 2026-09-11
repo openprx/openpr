@@ -3529,9 +3529,36 @@ mod migration_runner_database_tests {
                  INSERT INTO workspaces (id, slug, name, created_by) VALUES \
                  ('20000000-0000-0000-0000-000000000001', 'nr-replay', 'NR Replay', \
                   '10000000-0000-0000-0000-000000000001'); \
+                 INSERT INTO projects (id, workspace_id, key, name, created_by) VALUES \
+                 ('25000000-0000-0000-0000-000000000001', \
+                  '20000000-0000-0000-0000-000000000001', 'NRP', 'NR Project', \
+                  '10000000-0000-0000-0000-000000000001'); \
                  INSERT INTO flow_objects (id, workspace_id, object_type, project_id, parent_id) VALUES \
                  ('30000000-0000-0000-0000-000000000001', \
-                  '20000000-0000-0000-0000-000000000001', 'page', NULL, NULL);",
+                  '20000000-0000-0000-0000-000000000001', 'page', NULL, NULL), \
+                 ('30000000-0000-0000-0000-000000000011', \
+                  '20000000-0000-0000-0000-000000000001', 'page', \
+                  '25000000-0000-0000-0000-000000000001', NULL), \
+                 ('30000000-0000-0000-0000-000000000012', \
+                  '20000000-0000-0000-0000-000000000001', 'navigator', \
+                  '25000000-0000-0000-0000-000000000001', NULL); \
+                 UPDATE flow_objects \
+                    SET governance_metadata = '{\"legacy_key\":\"preserved\"}'::jsonb \
+                  WHERE id = '30000000-0000-0000-0000-000000000012'; \
+                 INSERT INTO collab_documents ( \
+                   id, object_id, engine, format_version, snapshot, snapshot_frontier, snapshot_seq, \
+                   head_frontier, head_seq, byte_count, update_count \
+                 ) VALUES ( \
+                   '35000000-0000-0000-0000-000000000012', \
+                   '30000000-0000-0000-0000-000000000012', 'loro', 'loro-1', \
+                   decode('00','hex'), decode('00','hex'), 0, decode('00','hex'), 0, 1, 0 \
+                 ); \
+                 INSERT INTO flow_object_projections ( \
+                   object_id, document_seq, document_frontier, title, state, plain_text, projection_version \
+                 ) VALUES ( \
+                   '30000000-0000-0000-0000-000000000012', 0, decode('00','hex'), \
+                   'Legacy navigator', '{\"nodes\":{}}'::jsonb, '', 1 \
+                 );",
             )
             .await
             .expect("legacy compatible root page fixture is valid before 0059");
@@ -3573,6 +3600,52 @@ mod migration_runner_database_tests {
             1
         );
 
+        let adopted = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT page.parent_id, page.project_id, root.governance_metadata, \
+                        count(doc.id)::bigint AS document_count, \
+                        count(projection.object_id)::bigint AS projection_count \
+                   FROM flow_objects root \
+                   JOIN flow_objects page ON page.id = \
+                        '30000000-0000-0000-0000-000000000011'::uuid \
+                   LEFT JOIN collab_documents doc ON doc.object_id = root.id \
+                   LEFT JOIN flow_object_projections projection ON projection.object_id = root.id \
+                  WHERE root.id = '30000000-0000-0000-0000-000000000012'::uuid \
+                  GROUP BY page.parent_id, page.project_id, root.governance_metadata"
+                    .to_string(),
+            ))
+            .await
+            .expect("adopted project root query runs")
+            .expect("adopted project root remains");
+        assert_eq!(
+            adopted
+                .try_get::<uuid::Uuid>("", "parent_id")
+                .expect("project page parent"),
+            uuid::Uuid::parse_str("30000000-0000-0000-0000-000000000012").expect("literal uuid"),
+            "projected legacy page must attach to its own scope root"
+        );
+        assert_eq!(
+            adopted.try_get::<uuid::Uuid>("", "project_id").expect("project scope"),
+            uuid::Uuid::parse_str("25000000-0000-0000-0000-000000000001").expect("literal uuid"),
+            "reparenting must not rewrite project scope"
+        );
+        let metadata: serde_json::Value = adopted.try_get("", "governance_metadata").expect("metadata");
+        assert_eq!(metadata["system_role"], "workspace_navigator_root");
+        assert_eq!(
+            metadata["legacy_key"], "preserved",
+            "adoption must preserve unrelated metadata"
+        );
+        assert_eq!(adopted.try_get::<i64>("", "document_count").expect("document count"), 1);
+        assert_eq!(
+            adopted
+                .try_get::<i64>("", "projection_count")
+                .expect("projection count"),
+            1,
+            "adoption must preserve, not duplicate, the projection"
+        );
+
         scratch
             .db
             .execute_unprepared(migration)
@@ -3582,16 +3655,17 @@ mod migration_runner_database_tests {
             .db
             .query_one(Statement::from_string(
                 DbBackend::Postgres,
-                "SELECT count(*)::bigint AS roots, min(id::text) AS root_id \
+                "SELECT count(*)::bigint AS roots, \
+                        min(id::text) FILTER (WHERE project_id IS NULL) AS root_id \
                    FROM flow_objects \
                   WHERE workspace_id = '20000000-0000-0000-0000-000000000001'::uuid \
-                    AND object_type = 'navigator' AND project_id IS NULL AND parent_id IS NULL"
+                    AND object_type = 'navigator' AND parent_id IS NULL"
                     .to_string(),
             ))
             .await
             .expect("replay census runs")
             .expect("replay census row");
-        assert_eq!(replayed.try_get::<i64>("", "roots").expect("root count"), 1);
+        assert_eq!(replayed.try_get::<i64>("", "roots").expect("root count"), 2);
         assert_eq!(
             replayed.try_get::<String>("", "root_id").expect("root id"),
             root_id.to_string()
@@ -3665,11 +3739,17 @@ mod migration_runner_database_tests {
                  INSERT INTO workspaces (id, slug, name, created_by) VALUES \
                  ('20000000-0000-0000-0000-000000000002', 'nr-duplicate', 'NR Duplicate', \
                   '10000000-0000-0000-0000-000000000002'); \
+                 INSERT INTO projects (id, workspace_id, key, name, created_by) VALUES \
+                 ('25000000-0000-0000-0000-000000000002', \
+                  '20000000-0000-0000-0000-000000000002', 'NRD', 'NR Duplicate', \
+                  '10000000-0000-0000-0000-000000000002'); \
                  INSERT INTO flow_objects (id, workspace_id, object_type, project_id, parent_id) VALUES \
                  ('30000000-0000-0000-0000-000000000002', \
-                  '20000000-0000-0000-0000-000000000002', 'navigator', NULL, NULL), \
+                  '20000000-0000-0000-0000-000000000002', 'navigator', \
+                  '25000000-0000-0000-0000-000000000002', NULL), \
                  ('30000000-0000-0000-0000-000000000003', \
-                  '20000000-0000-0000-0000-000000000002', 'navigator', NULL, NULL);",
+                  '20000000-0000-0000-0000-000000000002', 'navigator', \
+                  '25000000-0000-0000-0000-000000000002', NULL);",
             )
             .await
             .expect("pre-0059 duplicate-root fixture is constructible");
@@ -3679,12 +3759,16 @@ mod migration_runner_database_tests {
             .execute_unprepared(include_str!("../../../migrations/0059_flow_navigator_root.sql"))
             .await
             .expect_err("0059 must fail closed on duplicate canonical roots");
-        assert!(err.to_string().contains("has 2 unprojected navigator roots"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("project scope 25000000-0000-0000-0000-000000000002 has 2 navigator roots"),
+            "{err}"
+        );
         scratch.drop_self().await;
     }
 
     #[tokio::test]
-    async fn navigator_root_migration_fails_closed_on_project_scope_mismatch() {
+    async fn navigator_root_migration_materializes_project_scope_without_rewriting_it() {
         let scratch = scratch_or_skip!("navigator_root_scope");
         seed_pre_ledger_schema(&scratch.db, Some("0059_flow_navigator_root.sql")).await;
         scratch
@@ -3707,28 +3791,37 @@ mod migration_runner_database_tests {
             .await
             .expect("pre-0059 incompatible projected root fixture is constructible");
 
-        let err = scratch
+        scratch
             .db
             .execute_unprepared(include_str!("../../../migrations/0059_flow_navigator_root.sql"))
             .await
-            .expect_err("0059 must not silently change a projected root's scope");
-        assert!(err.to_string().contains("projected non-navigator root object"), "{err}");
+            .expect("0059 materializes the matching project root");
         let root = scratch
             .db
             .query_one(Statement::from_string(
                 DbBackend::Postgres,
-                "SELECT count(*)::bigint AS n FROM flow_objects \
-                  WHERE workspace_id = '20000000-0000-0000-0000-000000000004'::uuid \
-                    AND object_type = 'navigator' AND project_id IS NULL AND parent_id IS NULL"
-                    .to_string(),
+                "SELECT page.project_id, page.parent_id, root.id AS root_id \
+                   FROM flow_objects page \
+                   JOIN flow_objects root ON root.id = page.parent_id \
+                  WHERE page.id = '30000000-0000-0000-0000-000000000004'::uuid \
+                    AND root.workspace_id = page.workspace_id \
+                    AND root.project_id IS NOT DISTINCT FROM page.project_id \
+                    AND flow_is_system_navigator_root( \
+                          root.object_type, root.parent_id, root.governance_metadata \
+                        )"
+                .to_string(),
             ))
             .await
-            .expect("post-failure root count runs")
-            .expect("post-failure root count row");
+            .expect("project root query runs")
+            .expect("project page is attached to its root");
         assert_eq!(
-            root.try_get::<i64>("", "n").expect("root count"),
-            0,
-            "failure must be atomic"
+            root.try_get::<uuid::Uuid>("", "project_id").expect("page scope"),
+            uuid::Uuid::parse_str("25000000-0000-0000-0000-000000000004").expect("literal uuid"),
+            "the migration must preserve the projected page's scope"
+        );
+        assert_eq!(
+            root.try_get::<uuid::Uuid>("", "parent_id").expect("page parent"),
+            root.try_get::<uuid::Uuid>("", "root_id").expect("root id")
         );
         scratch.drop_self().await;
     }

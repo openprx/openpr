@@ -104,11 +104,10 @@ pub const OBJECT_GRANTS_MAX: usize = 100;
 /// not on nodes.
 pub(crate) const TREE_DEPTH_MAX: usize = 32;
 
-/// Nodes in a chain that sits exactly at [`TREE_DEPTH_MAX`]: depths `0..=32`, i.e. 33 rows joined
-/// by 32 hops. `gates/gate-commands.md` requires `depth=32` — and an authorization boundary
-/// landing exactly on the deepest node — to be evaluated *in full*, so this many nodes is legal
-/// and must never be truncated ("不得以性能为由把鉴权深度降回 20").
-pub(crate) const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 1;
+/// Storage nodes needed to evaluate a user-visible chain at [`TREE_DEPTH_MAX`]. The internal
+/// navigator root is structural and does not consume user depth, so a visible depth-32 object
+/// has 33 visible nodes plus that hidden root.
+pub(crate) const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 2;
 
 /// Test-only observation of the real evaluator call made by a content command.
 ///
@@ -183,6 +182,7 @@ pub(crate) fn remove_evaluation_probe() {
 struct ChainNode {
     id: Uuid,
     inherit_from_parent: bool,
+    is_system_navigator_root: bool,
 }
 
 /// How a `parent_id` walk that started at some object ended.
@@ -224,6 +224,7 @@ async fn walk_chain<C: ConnectionTrait>(conn: &C, workspace_id: Uuid, object_id:
         id: Uuid,
         parent_id: Option<Uuid>,
         inherit_from_parent: bool,
+        is_system_navigator_root: bool,
     }
 
     // One `WITH RECURSIVE` round trip for the whole chain, replacing one `SELECT` per hop. This
@@ -239,16 +240,22 @@ async fn walk_chain<C: ConnectionTrait>(conn: &C, workspace_id: Uuid, object_id:
     let rows = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "WITH RECURSIVE chain AS ( \
-             SELECT o.id, o.parent_id, o.inherit_from_parent, 0 AS depth \
+             SELECT o.id, o.parent_id, o.inherit_from_parent, \
+                    flow_is_system_navigator_root(o.object_type, o.parent_id, o.governance_metadata) \
+                        AS is_system_navigator_root, \
+                    0 AS depth \
                FROM flow_objects o \
               WHERE o.id = $1 AND o.workspace_id = $2 \
              UNION ALL \
-             SELECT p.id, p.parent_id, p.inherit_from_parent, c.depth + 1 \
+             SELECT p.id, p.parent_id, p.inherit_from_parent, \
+                    flow_is_system_navigator_root(p.object_type, p.parent_id, p.governance_metadata), \
+                    c.depth + 1 \
                FROM chain c \
                JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $2 \
               WHERE c.parent_id IS NOT NULL AND c.depth < $3::int \
          ) \
-         SELECT id, parent_id, inherit_from_parent FROM chain ORDER BY depth",
+         SELECT id, parent_id, inherit_from_parent, is_system_navigator_root \
+           FROM chain ORDER BY depth",
         vec![object_id.into(), workspace_id.into(), probe_depth.into()],
     ))
     .all(conn)
@@ -271,7 +278,10 @@ async fn walk_chain<C: ConnectionTrait>(conn: &C, workspace_id: Uuid, object_id:
         }
         seen.push(row.id);
     }
-    if rows.len() > MAX_CHAIN_NODES {
+    let allowed_nodes = TREE_DEPTH_MAX
+        .saturating_add(1)
+        .saturating_add(usize::from(top.is_system_navigator_root));
+    if rows.len() > allowed_nodes {
         return Ok(ChainWalk::TooDeep);
     }
     if top.parent_id.is_some() {
@@ -287,6 +297,7 @@ async fn walk_chain<C: ConnectionTrait>(conn: &C, workspace_id: Uuid, object_id:
             .map(|row| ChainNode {
                 id: row.id,
                 inherit_from_parent: row.inherit_from_parent,
+                is_system_navigator_root: row.is_system_navigator_root,
             })
             .collect(),
     ))
@@ -360,18 +371,17 @@ pub async fn ensure_parent_can_adopt_child<C: ConnectionTrait>(
 ) -> Result<(), ApiError> {
     match walk_chain(conn, workspace_id, parent_id).await? {
         ChainWalk::Complete(chain) => {
-            // `chain.len()` is the parent's own depth + 1, so the child's chain would have
-            // `chain.len() + 1` nodes. The child is legal exactly while that stays within
-            // `MAX_CHAIN_NODES` (33 nodes = depths 0..=32) — the same boundary `fetch_chain`
-            // enforces on the way back out, so a row this accepts is always one the read path can
-            // still evaluate.
+            // The internal navigator root is not user content and therefore does not consume one
+            // of the 32 user-visible parent hops.
             let child_nodes = chain.len().saturating_add(1);
-            if child_nodes > MAX_CHAIN_NODES {
+            let hidden_root_nodes = usize::from(chain.last().is_some_and(|node| node.is_system_navigator_root));
+            let child_user_depth = child_nodes.saturating_sub(hidden_root_nodes).saturating_sub(1);
+            if child_user_depth > TREE_DEPTH_MAX {
                 return Err(ApiError::limit_exceeded(
                     "parent_object_id is already at the frozen tree depth limit",
                     "tree_depth",
                     Some(serde_json::json!(TREE_DEPTH_MAX)),
-                    Some(serde_json::json!(child_nodes.saturating_sub(1))),
+                    Some(serde_json::json!(child_user_depth)),
                     None,
                 ));
             }
@@ -640,23 +650,27 @@ pub async fn effective_permissions<C: ConnectionTrait>(
         inherit_from_parent: bool,
         depth: i32,
         cycle: bool,
+        is_system_navigator_root: bool,
     }
     let probe_depth = i64::try_from(MAX_CHAIN_NODES).unwrap_or(i64::MAX);
     let rows = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "WITH RECURSIVE chain AS ( \
              SELECT o.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent, 0 AS depth, \
+                    flow_is_system_navigator_root(o.object_type, o.parent_id, o.governance_metadata) \
+                        AS is_system_navigator_root, \
                     ARRAY[o.id]::uuid[] AS path, false AS cycle \
                FROM flow_objects o \
               WHERE o.workspace_id = $1 AND o.id = ANY($2) \
              UNION ALL \
              SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent, c.depth + 1, \
+                    flow_is_system_navigator_root(p.object_type, p.parent_id, p.governance_metadata), \
                     c.path || p.id, p.id = ANY(c.path) \
                FROM chain c \
                JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $1 \
               WHERE c.parent_id IS NOT NULL AND c.depth < $3::int AND NOT c.cycle \
          ) \
-         SELECT seed_id, id, parent_id, inherit_from_parent, depth, cycle \
+         SELECT seed_id, id, parent_id, inherit_from_parent, depth, cycle, is_system_navigator_root \
            FROM chain ORDER BY seed_id, depth",
         vec![workspace_id.into(), object_ids.to_vec().into(), probe_depth.into()],
     ))
@@ -669,6 +683,7 @@ pub async fn effective_permissions<C: ConnectionTrait>(
         inherit_from_parent: bool,
         depth: i32,
         cycle: bool,
+        is_system_navigator_root: bool,
     }
     let mut chains: HashMap<Uuid, Vec<BatchNode>> = HashMap::new();
     for row in rows {
@@ -678,12 +693,12 @@ pub async fn effective_permissions<C: ConnectionTrait>(
             inherit_from_parent: row.inherit_from_parent,
             depth: row.depth,
             cycle: row.cycle,
+            is_system_navigator_root: row.is_system_navigator_root,
         });
     }
 
     let mut chain_ids = HashSet::new();
     let mut invalid_chains = HashSet::new();
-    let tree_depth_max = i32::try_from(TREE_DEPTH_MAX).map_err(|_| ApiError::Internal)?;
     for object_id in object_ids {
         let Some(chain) = chains.get(object_id) else {
             invalid_chains.insert(*object_id);
@@ -693,7 +708,18 @@ pub async fn effective_permissions<C: ConnectionTrait>(
             invalid_chains.insert(*object_id);
             continue;
         };
-        if chain.iter().any(|node| node.cycle || node.depth > tree_depth_max) || top.parent_id.is_some() {
+        let allowed_nodes = TREE_DEPTH_MAX
+            .saturating_add(1)
+            .saturating_add(usize::from(top.is_system_navigator_root));
+        let max_storage_depth = chain
+            .iter()
+            .map(|node| usize::try_from(node.depth).unwrap_or(usize::MAX))
+            .max()
+            .unwrap_or(usize::MAX);
+        if chain.iter().any(|node| node.cycle)
+            || max_storage_depth.saturating_add(1) > allowed_nodes
+            || top.parent_id.is_some()
+        {
             invalid_chains.insert(*object_id);
             continue;
         }
@@ -975,11 +1001,12 @@ mod tests {
     #[test]
     fn chain_bounds_match_adr_0012_tree_depth_max() {
         // Depth is counted with the root at 0 (`collab_core::limits::depth_of`), so a chain at
-        // exactly `tree_depth_max = 32` has 33 nodes. Getting this wrong in either direction is a
+        // exactly `tree_depth_max = 32` has 33 visible nodes plus one internal navigator root.
+        // Getting this wrong in either direction is a
         // security bug: one node short truncates legal depth-32 chains (and can hide an
         // authorization boundary), one node long accepts a chain the limit forbids.
         assert_eq!(super::TREE_DEPTH_MAX, 32);
-        assert_eq!(super::MAX_CHAIN_NODES, 33);
+        assert_eq!(super::MAX_CHAIN_NODES, 34);
     }
 }
 
@@ -1001,21 +1028,22 @@ mod tests {
     clippy::too_many_lines
 )]
 mod database_tests {
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
     use uuid::Uuid;
 
     use super::{PermissionLevel, effective_permission, effective_permissions};
     use crate::error::ApiError;
 
     /// Nodes in the deepest chain `ADR-0012` §3 permits, written as a literal on purpose: these
-    /// tests must pin the *contract* (`limits-v1.md`'s `tree_depth_max = 32`, root at depth 0, so
-    /// depths `0..=32`), not whatever `super::MAX_CHAIN_NODES` currently happens to say. Deriving
+    /// tests must pin the *contract* (`limits-v1.md`'s `tree_depth_max = 32`, 33 visible nodes
+    /// plus one internal navigator root), not whatever `super::MAX_CHAIN_NODES` currently happens
+    /// to say. Deriving
     /// the fixture sizes from the implementation constant would make the fixtures slide along with
     /// an off-by-one and quietly keep passing.
-    const DEEPEST_LEGAL_CHAIN_NODES: usize = 33;
+    const DEEPEST_LEGAL_CHAIN_NODES: usize = 34;
 
     /// One node past the limit: depth 33, which `gate-commands.md` requires to fail closed.
-    const FIRST_ILLEGAL_CHAIN_NODES: usize = 34;
+    const FIRST_ILLEGAL_CHAIN_NODES: usize = 35;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
@@ -1357,10 +1385,96 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
-    /// `tree_depth_max = 32` with the root at depth 0 means a legal chain spans depths `0..=32`:
-    /// 33 nodes joined by 32 hops. The boundary is placed on the *root* — the 33rd and last node
-    /// — so this fails if the walk stops even one node early, which would both deny a legitimate
-    /// object and, in the old code, hide the boundary.
+    /// A grant or inheritance boundary on a navigator root governs only that `(workspace,
+    /// project scope)`. Per-project roots must never recreate the old whole-workspace switch.
+    #[tokio::test]
+    async fn project_root_grant_and_boundary_do_not_cross_into_another_scope() {
+        let scratch = scratch_or_skip!("project_root_grant_scope");
+        let fx = seed_workspace(&scratch.db).await;
+        let owner_id = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+             VALUES ($1, $2, '!', 'project owner', 'user', true)",
+            vec![owner_id.into(), format!("{owner_id}@authz.test").into()],
+        )
+        .await;
+        let project_a = Uuid::new_v4();
+        let project_b = Uuid::new_v4();
+        for (project_id, key) in [(project_a, "PRA"), (project_b, "PRB")] {
+            exec(
+                &scratch.db,
+                "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+                 VALUES ($1, $2, $3, $3, $4)",
+                vec![project_id.into(), fx.workspace_id.into(), key.into(), owner_id.into()],
+            )
+            .await;
+        }
+        let mut roots = Vec::new();
+        for project_id in [project_a, project_b] {
+            #[derive(FromQueryResult)]
+            struct RootRow {
+                id: Uuid,
+            }
+            let root = RootRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT flow_ensure_navigator_root($1, $2) AS id",
+                vec![fx.workspace_id.into(), project_id.into()],
+            ))
+            .one(&scratch.db)
+            .await
+            .expect("project root materialization runs")
+            .expect("project root is returned")
+            .id;
+            roots.push(root);
+        }
+        let mut pages = Vec::new();
+        for (project_id, root_id) in [(project_a, roots[0]), (project_b, roots[1])] {
+            let page_id = Uuid::new_v4();
+            exec(
+                &scratch.db,
+                "INSERT INTO flow_objects \
+                    (id, workspace_id, project_id, object_type, parent_id, inherit_from_parent) \
+                 VALUES ($1, $2, $3, 'page', $4, true)",
+                vec![
+                    page_id.into(),
+                    fx.workspace_id.into(),
+                    project_id.into(),
+                    root_id.into(),
+                ],
+            )
+            .await;
+            pages.push(page_id);
+        }
+
+        grant(&scratch.db, fx.workspace_id, roots[0], fx.member_id, "full_access").await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_objects SET inherit_from_parent = false WHERE id = $1",
+            vec![roots[0].into()],
+        )
+        .await;
+
+        assert_eq!(
+            member_level(&scratch.db, &fx, pages[0])
+                .await
+                .expect("project A evaluates"),
+            PermissionLevel::FullAccess
+        );
+        assert_eq!(
+            member_level(&scratch.db, &fx, pages[1])
+                .await
+                .expect("project B evaluates"),
+            PermissionLevel::Edit,
+            "project A's root grant and boundary leaked across scopes"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    /// `tree_depth_max = 32` permits 33 visible nodes plus the internal navigator root. The
+    /// authorization boundary is placed on that scope root, so this fails if the walk stops even
+    /// one node early.
     #[tokio::test]
     async fn a_boundary_on_the_deepest_legal_node_is_still_seen() {
         let scratch = scratch_or_skip!("depth_32_boundary");
@@ -1377,7 +1491,7 @@ mod database_tests {
         assert_eq!(
             level,
             PermissionLevel::Denied,
-            "a boundary at depth 32 must still cut the workspace baseline"
+            "the scope-root boundary above a visible depth-32 object must cut the baseline"
         );
 
         // ...and a grant on that same boundary node must be reachable at that depth.
@@ -1386,7 +1500,7 @@ mod database_tests {
         assert_eq!(
             level,
             PermissionLevel::FullAccess,
-            "the boundary node at depth 32 belongs to chain[..=index]"
+            "the scope-root boundary belongs to chain[..=index]"
         );
 
         scratch.drop_self().await;
@@ -1401,7 +1515,7 @@ mod database_tests {
 
         let chain = build_chain(&scratch.db, fx.workspace_id, FIRST_ILLEGAL_CHAIN_NODES, None).await;
         let result = member_level(&scratch.db, &fx, chain[0]).await;
-        assert_forbidden(&result, "a chain of 34 nodes (depth 33)");
+        assert_forbidden(&result, "a chain of 35 stored nodes (visible depth 33)");
 
         // ...while its parent, sitting at exactly the limit, still resolves normally.
         let at_limit = member_level(&scratch.db, &fx, chain[1])

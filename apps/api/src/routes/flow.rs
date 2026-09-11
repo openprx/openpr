@@ -1874,7 +1874,7 @@ mod flow_database_tests {
             .expect("creating the leaf materializes the workspace root");
         let mut parent = Some(navigator_root);
         let mut root = None;
-        for index in 0..31 {
+        for index in 0..32 {
             let id = Uuid::new_v4();
             exec(
                 &state,
@@ -1911,7 +1911,11 @@ mod flow_database_tests {
         let chain = crate::flow::collab::authz::inheritance_chain(&state.db, workspace_id, leaf)
             .await
             .expect("the exact depth-32 chain is complete");
-        assert_eq!(chain.ids.len(), 33, "root depth zero plus leaf depth 32");
+        assert_eq!(
+            chain.ids.len(),
+            34,
+            "the hidden navigator root plus visible depths zero through 32"
+        );
 
         let document_id = document_id_for(&state, leaf).await;
         let injected_delay_ms = std::env::var("OPENPR_TEST_AUTHZ_DEPTH32_DELAY_MS")
@@ -2742,6 +2746,142 @@ mod flow_database_tests {
         assert_eq!(navigator["data"]["nodes"][0]["type"], "page", "{navigator}");
         assert_eq!(navigator["data"]["document_seq"], 0, "{navigator}");
         assert!(navigator["data"]["frontier"].is_string(), "{navigator}");
+
+        scratch.drop_self().await;
+    }
+
+    /// ADR-0018 NR-1: omitting `parent_object_id` in a project scope attaches the object to that
+    /// project's own navigator root. It must not fall back to the unprojected workspace root.
+    #[tokio::test]
+    async fn project_scoped_create_without_parent_uses_only_the_project_navigator_root() {
+        #[derive(FromQueryResult)]
+        struct ScopeRow {
+            project_id: Option<Uuid>,
+            parent_id: Option<Uuid>,
+            is_system_root: bool,
+        }
+
+        let scratch = scratch_or_skip!("project-default-parent");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let project_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'PRJ', 'Project root test', $3)",
+            vec![project_id.into(), workspace_id.into(), owner_id.into()],
+        )
+        .await;
+
+        let response = to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: Some(project_id),
+                    parent_object_id: None,
+                    title: "Project top-level page".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], 0, "{body}");
+        let page_id =
+            Uuid::parse_str(body["data"]["object"]["id"].as_str().expect("page id")).expect("page id is a uuid");
+        let parent_id = Uuid::parse_str(body["data"]["object"]["parent_id"].as_str().expect("default parent id"))
+            .expect("parent id is a uuid");
+
+        let page = ScopeRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT project_id, parent_id, false AS is_system_root \
+               FROM flow_objects WHERE id = $1",
+            vec![page_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("page lookup runs")
+        .expect("page exists");
+        let root = ScopeRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT project_id, parent_id, \
+                    flow_is_system_navigator_root(object_type, parent_id, governance_metadata) \
+                        AS is_system_root \
+               FROM flow_objects WHERE id = $1",
+            vec![parent_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("root lookup runs")
+        .expect("root exists");
+        let workspace_root = crate::flow::repository::fetch_workspace_navigator_root(&state.db, workspace_id)
+            .await
+            .expect("workspace root lookup runs")
+            .expect("workspace root exists");
+
+        assert_eq!(page.project_id, Some(project_id));
+        assert_eq!(page.parent_id, Some(parent_id));
+        assert_eq!(root.project_id, Some(project_id));
+        assert_eq!(root.parent_id, None);
+        assert!(root.is_system_root, "the lazy-created project root must be marked");
+        assert_ne!(
+            parent_id, workspace_root,
+            "project create fell back to the NULL scope root"
+        );
+
+        // Reproduce a pre-0059 adopted root, then replay the migration. The public
+        // `require_current` search must stay usable after adoption; a shape-only root predicate
+        // would leave this workspace permanently stale because the root itself is never indexed.
+        state
+            .db
+            .execute_unprepared(
+                "ALTER TABLE flow_objects DROP CONSTRAINT flow_objects_navigator_root_role_check; \
+                 DROP TRIGGER flow_objects_mark_system_navigator_root ON flow_objects",
+            )
+            .await
+            .expect("legacy fixture may temporarily remove marker enforcement");
+        exec(
+            &state,
+            "UPDATE flow_objects SET governance_metadata = governance_metadata - 'system_role' WHERE id = $1",
+            vec![parent_id.into()],
+        )
+        .await;
+        let migration = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../migrations/0059_flow_navigator_root.sql"
+        ))
+        .expect("0059 migration is readable");
+        state
+            .db
+            .execute_unprepared(&migration)
+            .await
+            .expect("0059 replay adopts and marks the legacy project root");
+
+        index_accepted_projection(&state, page_id).await;
+        let mut current = search_query("Project top-level page");
+        current.project_id = Some(project_id);
+        current.all_visible = false;
+        current.freshness = Some("require_current".to_string());
+        let current = body_json(to_response(
+            get_flow_search(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(current),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(current["code"], 0, "adopted root poisoned require_current: {current}");
+        assert_eq!(current["data"]["index_frontier"]["stale"], false, "{current}");
+        assert_eq!(current["data"]["items"][0]["object"]["id"], page_id.to_string());
 
         scratch.drop_self().await;
     }

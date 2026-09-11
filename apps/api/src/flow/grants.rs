@@ -3156,7 +3156,8 @@ mod database_tests {
     // -----------------------------------------------------------------------------------------
 
     /// Measures what `object_grants_max` actually costs, so the proposed value rests on numbers
-    /// rather than on a guess: a chain at the frozen `tree_depth_max` (33 nodes, depths 0..=32)
+    /// rather than on a guess: a chain at the frozen `tree_depth_max` (33 user nodes plus the
+    /// hidden navigator root)
     /// with `n` grants on **every** node, timing the two reads the ceiling bounds --
     /// `effective_permission` (one principal across the whole chain) and the `GET .../grants`
     /// roster (every principal on every contributing ancestor).
@@ -3167,8 +3168,7 @@ mod database_tests {
     /// inside.
     #[tokio::test]
     async fn object_grants_max_read_cost_is_measured_at_the_frozen_chain_depth() {
-        // 33 nodes = depths 0..=32, the deepest chain `tree_depth_max` allows.
-        const CHAIN_NODES: usize = 33;
+        const CHAIN_NODES: usize = 34;
         /// Repetitions each timing averages over.
         const ROUNDS: u32 = 20;
 

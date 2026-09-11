@@ -1296,9 +1296,9 @@ async fn check_cycle_and_depth<C: sea_orm::ConnectionTrait>(
             "target_object_id is the object itself or one of its descendants; the move would create a parent_id cycle",
         ));
     }
-    // `target_chain` is leaf-first and root-terminated, so its length is `depth(target) + 1`,
-    // which is also the moved object's own depth after the move.
-    let object_depth_after = target_chain.len();
+    // `target_chain` includes the internal navigator root. That structural row does not consume
+    // user depth, so moving below a top-level target produces depth 1, not depth 2.
+    let object_depth_after = target_chain.len().saturating_sub(1);
     let probe = i64::try_from(TREE_DEPTH_MAX.saturating_add(1)).unwrap_or(i64::MAX);
     let height = repository::subtree_height(conn, plan.workspace_id, plan.object_id, probe).await?;
     let deepest = object_depth_after.saturating_add(usize::try_from(height).unwrap_or(usize::MAX));
@@ -1546,6 +1546,12 @@ pub async fn execute_on(
     if target.lifecycle_status != "active" {
         return Err(ApiError::invalid_update("target_object_id is archived"));
     }
+
+    // ADR-0018 NR-1: both scope roots exist before the multi-document set is derived. The
+    // database function is the same producer migration 0059 uses, so a project first touched by a
+    // move cannot silently contribute zero navigator documents.
+    repository::ensure_navigator_root(&state.db, workspace_id, source.project_id).await?;
+    repository::ensure_navigator_root(&state.db, workspace_id, target.project_id).await?;
 
     // `ADR-0012` §4: "被移动对象需 `full_access`（移动会改变它的继承），目标父级需 `edit`". The
     // first half was checked by the caller; this is the second, and it is a *separate*

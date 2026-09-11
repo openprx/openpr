@@ -182,7 +182,7 @@ async fn policy_filtered_frontier(
     let mut values: Vec<sea_orm::Value> = vec![search.workspace_id.into()];
     let mut scope_predicate = String::from(
         "fo.workspace_id = $1 AND fo.lifecycle_status = 'active' \
-         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+         AND NOT flow_is_system_navigator_root(fo.object_type, fo.parent_id, fo.governance_metadata)",
     );
     add_scope_predicate(&mut scope_predicate, &mut values, search.scope, "fo");
     add_object_type_predicate(&mut scope_predicate, &mut values, search.object_type.as_deref(), "fo");
@@ -216,12 +216,17 @@ async fn policy_filtered_frontier(
               FROM flow_objects fo
              WHERE {scope_predicate}
         ), chain AS (
-            SELECT s.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent, 0 AS depth,
+            SELECT s.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent,
+                   flow_is_system_navigator_root(o.object_type, o.parent_id, o.governance_metadata)
+                       AS is_system_navigator_root,
+                   0 AS depth,
                    ARRAY[o.id]::uuid[] AS path, false AS cycle
               FROM scoped s
               JOIN flow_objects o ON o.id = s.id
             UNION ALL
-            SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent, c.depth + 1,
+            SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent,
+                   flow_is_system_navigator_root(p.object_type, p.parent_id, p.governance_metadata),
+                   c.depth + 1,
                    c.path || p.id, p.id = ANY(c.path)
               FROM chain c
               JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $1
@@ -230,7 +235,9 @@ async fn policy_filtered_frontier(
                AND NOT c.cycle
         ), chain_state AS (
             SELECT seed_id,
-                   bool_or(cycle OR depth > ${tree_depth_index}::int) AS invalid,
+                   bool_or(cycle)
+                       OR max(depth) > ${tree_depth_index}::int
+                           + CASE WHEN bool_or(is_system_navigator_root) THEN 1 ELSE 0 END AS invalid,
                    (array_agg(parent_id ORDER BY depth DESC))[1] IS NOT NULL AS incomplete,
                    min(depth) FILTER (WHERE NOT inherit_from_parent) AS boundary_depth
               FROM chain
@@ -417,7 +424,7 @@ async fn fetch_search_batch(
     let mut values: Vec<sea_orm::Value> = vec![search.q.clone().into(), search.workspace_id.into()];
     let mut where_sql = String::from(
         "fo.workspace_id = $2 AND fo.lifecycle_status = 'active' \
-         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+         AND NOT flow_is_system_navigator_root(fo.object_type, fo.parent_id, fo.governance_metadata)",
     );
     add_scope_predicate(&mut where_sql, &mut values, search.scope, "fo");
     add_object_type_predicate(&mut where_sql, &mut values, search.object_type.as_deref(), "fo");

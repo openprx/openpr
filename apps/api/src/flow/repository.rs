@@ -198,7 +198,7 @@ pub struct ListFilter {
 pub async fn list_objects<C: ConnectionTrait>(conn: &C, filter: &ListFilter) -> Result<Vec<ObjectViewRow>, ApiError> {
     let mut sql = format!(
         "{OBJECT_VIEW_SELECT} WHERE fo.workspace_id = $1 \
-         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'"
+         AND NOT flow_is_system_navigator_root(fo.object_type, fo.parent_id, fo.governance_metadata)"
     );
     let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
 
@@ -287,7 +287,7 @@ pub async fn aggregate_projection_lag<C: ConnectionTrait>(
 ) -> Result<ProjectionLagAggregate, ApiError> {
     let mut scope_predicate = String::from(
         "fo.workspace_id = $1 \
-         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+         AND NOT flow_is_system_navigator_root(fo.object_type, fo.parent_id, fo.governance_metadata)",
     );
     let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
     if let Some(project_id) = filter.project_id {
@@ -314,12 +314,17 @@ pub async fn aggregate_projection_lag<C: ConnectionTrait>(
               FROM flow_objects fo
              WHERE {scope_predicate}
         ), chain AS (
-            SELECT s.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent, 0 AS depth,
+            SELECT s.id AS seed_id, o.id, o.parent_id, o.inherit_from_parent,
+                   flow_is_system_navigator_root(o.object_type, o.parent_id, o.governance_metadata)
+                       AS is_system_navigator_root,
+                   0 AS depth,
                    ARRAY[o.id]::uuid[] AS path, false AS cycle
               FROM scoped s
               JOIN flow_objects o ON o.id = s.id
             UNION ALL
-            SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent, c.depth + 1,
+            SELECT c.seed_id, p.id, p.parent_id, p.inherit_from_parent,
+                   flow_is_system_navigator_root(p.object_type, p.parent_id, p.governance_metadata),
+                   c.depth + 1,
                    c.path || p.id, p.id = ANY(c.path)
               FROM chain c
               JOIN flow_objects p ON p.id = c.parent_id AND p.workspace_id = $1
@@ -328,7 +333,9 @@ pub async fn aggregate_projection_lag<C: ConnectionTrait>(
                AND NOT c.cycle
         ), chain_state AS (
             SELECT seed_id,
-                   bool_or(cycle OR depth > ${tree_depth_index}::int) AS invalid,
+                   bool_or(cycle)
+                       OR max(depth) > ${tree_depth_index}::int
+                           + CASE WHEN bool_or(is_system_navigator_root) THEN 1 ELSE 0 END AS invalid,
                    (array_agg(parent_id ORDER BY depth DESC))[1] IS NOT NULL AS incomplete,
                    min(depth) FILTER (WHERE NOT inherit_from_parent) AS boundary_depth
               FROM chain
@@ -385,7 +392,7 @@ pub async fn list_projection_lag_candidates<C: ConnectionTrait>(
            JOIN collab_documents cd ON cd.object_id = fo.id \
            JOIN flow_object_projections p ON p.object_id = fo.id \
           WHERE fo.workspace_id = $1 \
-            AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+            AND NOT flow_is_system_navigator_root(fo.object_type, fo.parent_id, fo.governance_metadata)",
     );
     let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
     if let Some(project_id) = filter.project_id {
@@ -593,14 +600,18 @@ pub struct NewFlowObject {
     pub parent_id: Option<Uuid>,
     /// `None` when the actor is a bot (`REFERENCES users(id)`).
     pub created_by: Option<Uuid>,
+    pub governance_metadata: serde_json::Value,
 }
 
 pub async fn insert_flow_object<C: ConnectionTrait>(conn: &C, object: &NewFlowObject) -> Result<(), ApiError> {
     conn.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            INSERT INTO flow_objects (id, workspace_id, project_id, object_type, parent_id, created_by, updated_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $6)
+            INSERT INTO flow_objects (
+                id, workspace_id, project_id, object_type, parent_id, created_by, updated_by,
+                governance_metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
         ",
         vec![
             object.id.into(),
@@ -609,19 +620,20 @@ pub async fn insert_flow_object<C: ConnectionTrait>(conn: &C, object: &NewFlowOb
             object.object_type.clone().into(),
             object.parent_id.into(),
             object.created_by.into(),
+            object.governance_metadata.clone().into(),
         ],
     ))
     .await?;
     Ok(())
 }
 
-/// Returns the one canonical, unprojected navigator root for a workspace.
-///
-/// Migration `0059_flow_navigator_root.sql` makes this lookup unique. Project-scoped navigator
-/// rows are ordering documents and deliberately do not satisfy this predicate.
-pub async fn fetch_workspace_navigator_root<C: ConnectionTrait>(
+pub const NAVIGATOR_ROOT_SYSTEM_ROLE: &str = "workspace_navigator_root";
+
+/// Returns the one canonical navigator root for a `(workspace, project scope)` pair.
+pub async fn fetch_navigator_root<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
+    project_id: Option<Uuid>,
 ) -> Result<Option<Uuid>, ApiError> {
     #[derive(FromQueryResult)]
     struct Row {
@@ -631,86 +643,51 @@ pub async fn fetch_workspace_navigator_root<C: ConnectionTrait>(
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT id FROM flow_objects \
-          WHERE workspace_id = $1 AND object_type = 'navigator' \
-            AND project_id IS NULL AND parent_id IS NULL",
-        vec![workspace_id.into()],
+          WHERE workspace_id = $1 AND project_id IS NOT DISTINCT FROM $2 \
+            AND flow_is_system_navigator_root(object_type, parent_id, governance_metadata)",
+        vec![workspace_id.into(), project_id.into()],
     ))
     .one(conn)
     .await?;
     Ok(row.map(|row| row.id))
 }
 
-/// Materializes the canonical workspace navigator root for a workspace created after migration
-/// `0059` ran, returning the existing root when another request won the race.
-///
-/// Root materialization is a system data-model operation, not a user command: it creates the
-/// addressable object, its valid empty Loro document, and its projection together, without
-/// inventing a user-authored business event. Existing workspaces receive the identical shape in
-/// the migration itself.
-pub async fn ensure_workspace_navigator_root(db: &DatabaseConnection, workspace_id: Uuid) -> Result<Uuid, ApiError> {
-    if let Some(root_id) = fetch_workspace_navigator_root(db, workspace_id).await? {
-        return Ok(root_id);
-    }
-
+/// Materializes the root through migration `0059`'s database function, keeping runtime and
+/// migration adoption/creation on one implementation.
+pub async fn ensure_navigator_root<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    project_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
     #[derive(FromQueryResult)]
     struct Row {
         id: Uuid,
     }
-
-    let inserted = Row::find_by_statement(Statement::from_sql_and_values(
+    Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"
-            WITH inserted_root AS (
-                INSERT INTO flow_objects (
-                    id, workspace_id, project_id, object_type, parent_id,
-                    inherit_from_parent, governance_metadata, lifecycle_status
-                )
-                VALUES (
-                    gen_random_uuid(), $1, NULL, 'navigator', NULL,
-                    true, '{"system_role":"workspace_navigator_root"}'::jsonb, 'active'
-                )
-                ON CONFLICT DO NOTHING
-                RETURNING id
-            ), inserted_document AS (
-                INSERT INTO collab_documents (
-                    id, object_id, engine, format_version, snapshot, snapshot_frontier,
-                    snapshot_seq, head_frontier, head_seq, byte_count, update_count
-                )
-                SELECT gen_random_uuid(), id, 'loro', 'loro-1',
-                       decode(
-                         '6c6f726f0000000000000000000000003ba2f83500032f0000004c4f524f0000000200767600000001000200e762c96c0100000005000000020066720002007676dbd8c9c816000000550000004c4f524f00000100000000000600830474726565030100000402000005000000000100050102000100000000060002007154a5550100000005000000060080046d6574610006008304747265659faa35f13400000000000000',
-                         'hex'
-                       ),
-                       decode('00', 'hex'), 0, decode('00', 'hex'), 0,
-                       octet_length(decode(
-                         '6c6f726f0000000000000000000000003ba2f83500032f0000004c4f524f0000000200767600000001000200e762c96c0100000005000000020066720002007676dbd8c9c816000000550000004c4f524f00000100000000000600830474726565030100000402000005000000000100050102000100000000060002007154a5550100000005000000060080046d6574610006008304747265659faa35f13400000000000000',
-                         'hex'
-                       )), 0
-                  FROM inserted_root
-            ), inserted_projection AS (
-                INSERT INTO flow_object_projections (
-                    object_id, document_seq, document_frontier, title, state, plain_text,
-                    projection_version
-                )
-                SELECT id, 0, decode('00', 'hex'), '', '{"nodes":{}}'::jsonb, '', 1
-                  FROM inserted_root
-            )
-            SELECT id FROM inserted_root
-        "#,
-        vec![workspace_id.into()],
+        "SELECT flow_ensure_navigator_root($1, $2) AS id",
+        vec![workspace_id.into(), project_id.into()],
     ))
-    .one(db)
-    .await?;
+    .one(conn)
+    .await?
+    .map(|row| row.id)
+    .ok_or(ApiError::Internal)
+}
 
-    if let Some(row) = inserted {
-        return Ok(row.id);
-    }
+/// Compatibility helper for call sites that explicitly mean the unprojected scope.
+pub async fn fetch_workspace_navigator_root<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    fetch_navigator_root(conn, workspace_id, None).await
+}
 
-    // `ON CONFLICT` can observe a concurrent insertion that was not visible to this statement's
-    // initial snapshot. A fresh statement sees the committed winner.
-    fetch_workspace_navigator_root(db, workspace_id)
-        .await?
-        .ok_or(ApiError::Internal)
+/// Compatibility helper for call sites that explicitly mean the unprojected scope.
+pub async fn ensure_workspace_navigator_root<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<Uuid, ApiError> {
+    ensure_navigator_root(conn, workspace_id, None).await
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -1403,9 +1380,9 @@ pub async fn fetch_navigator_document<C: ConnectionTrait>(
         DbBackend::Postgres,
         "SELECT fo.id AS object_id, cd.id AS document_id \
            FROM flow_objects fo JOIN collab_documents cd ON cd.object_id = fo.id \
-          WHERE fo.workspace_id = $1 AND fo.object_type = 'navigator' \
-            AND fo.project_id IS NOT DISTINCT FROM $2 AND fo.lifecycle_status = 'active' \
-          ORDER BY fo.created_at, fo.id LIMIT 1",
+          WHERE fo.workspace_id = $1 AND fo.project_id IS NOT DISTINCT FROM $2 \
+            AND flow_is_system_navigator_root(fo.object_type, fo.parent_id, fo.governance_metadata) \
+            AND fo.lifecycle_status = 'active'",
         vec![workspace_id.into(), project_id.into()],
     ))
     .one(conn)

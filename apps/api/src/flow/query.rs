@@ -505,12 +505,14 @@ pub async fn get_navigator(
         )));
     }
 
-    let root_object_id = repository::fetch_workspace_navigator_root(&state.db, access.workspace_id())
-        .await?
-        .ok_or_else(|| ApiError::NotFound("workspace navigator root not found".to_string()))?;
+    let root_object_id = repository::ensure_navigator_root(&state.db, access.workspace_id(), project_id).await?;
     let ordering = repository::fetch_navigator_document(&state.db, access.workspace_id(), project_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("navigator for the requested scope not found".to_string()))?;
+    if ordering.object_id != root_object_id {
+        tracing::error!(%root_object_id, ordering_object_id = %ordering.object_id, "navigator root predicates disagreed");
+        return Err(ApiError::Internal);
+    }
     let ordering_view = repository::fetch_object_view(&state.db, ordering.object_id)
         .await?
         .ok_or(ApiError::Internal)?;

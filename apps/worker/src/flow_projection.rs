@@ -44,10 +44,8 @@ pub async fn run_tick(db: &DatabaseConnection, requested_batch_size: usize) -> a
               JOIN flow_objects fo ON fo.id = p.object_id
          LEFT JOIN flow_search_index si ON si.object_id = p.object_id
              WHERE fo.lifecycle_status = 'active'
-               AND NOT (
-                    fo.object_type = 'navigator'
-                    AND fo.project_id IS NULL
-                    AND fo.parent_id IS NULL
+               AND NOT flow_is_system_navigator_root(
+                    fo.object_type, fo.parent_id, fo.governance_metadata
                )
                AND (
                     si.object_id IS NULL
@@ -98,10 +96,8 @@ pub async fn run_tick(db: &DatabaseConnection, requested_batch_size: usize) -> a
                  WHERE fo.id = si.object_id
                    AND (
                         fo.lifecycle_status = 'archived'
-                        OR (
-                            fo.object_type = 'navigator'
-                            AND fo.project_id IS NULL
-                            AND fo.parent_id IS NULL
+                        OR flow_is_system_navigator_root(
+                            fo.object_type, fo.parent_id, fo.governance_metadata
                         )
                    )
             "
@@ -356,6 +352,69 @@ mod tests {
         assert!(
             indexed(&scratch.db, object_id).await.is_none(),
             "ON DELETE CASCADE removes the index row"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_projection_excludes_and_purges_system_roots_in_both_project_scopes() {
+        let scratch = scratch_or_skip!("flow_projection_system_roots");
+        let (workspace_id, object_id, user_id) = seed_projection(&scratch.db).await;
+        assert_eq!(run_tick(&scratch.db, 10).await.expect("page indexes"), 1);
+
+        let project_id = Uuid::new_v4();
+        execute(
+            &scratch.db,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'IDX', 'index scope', $3)",
+            vec![project_id.into(), workspace_id.into(), user_id.into()],
+        )
+        .await;
+        let project_root: Uuid = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT flow_ensure_navigator_root($1, $2) AS id",
+                vec![workspace_id.into(), project_id.into()],
+            ))
+            .await
+            .expect("project root materialization runs")
+            .expect("project root query returns a row")
+            .try_get("", "id")
+            .expect("project root id reads");
+        let workspace_root: Uuid = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM flow_objects WHERE workspace_id = $1 AND project_id IS NULL \
+                 AND flow_is_system_navigator_root(object_type, parent_id, governance_metadata)",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("workspace root query runs")
+            .expect("workspace root exists")
+            .try_get("", "id")
+            .expect("workspace root id reads");
+
+        for root_id in [workspace_root, project_root] {
+            execute(
+                &scratch.db,
+                "INSERT INTO flow_search_index \
+                    (object_id, indexed_seq, indexed_frontier, title, plain_text) \
+                 SELECT object_id, document_seq, document_frontier, title, plain_text \
+                   FROM flow_object_projections WHERE object_id = $1",
+                vec![root_id.into()],
+            )
+            .await;
+        }
+
+        assert_eq!(run_tick(&scratch.db, 10).await.expect("root purge tick succeeds"), 2);
+        assert!(indexed(&scratch.db, workspace_root).await.is_none());
+        assert!(indexed(&scratch.db, project_root).await.is_none());
+        assert!(
+            indexed(&scratch.db, object_id).await.is_some(),
+            "ordinary page stays indexed"
         );
 
         scratch.drop_self().await;
