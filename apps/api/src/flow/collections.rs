@@ -4207,6 +4207,52 @@ mod database_tests {
             .expect("projection rows query runs")
         }
 
+        #[derive(FromQueryResult)]
+        struct CanonicalDocumentRow {
+            record_id: Uuid,
+            document_id: Uuid,
+        }
+
+        async fn canonical_rows(state: &AppState, collection_id: Uuid) -> Vec<ProjectionRow> {
+            let documents = CanonicalDocumentRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT record_id, document_id FROM flow_record_projections \
+                 WHERE collection_id = $1 ORDER BY record_id",
+                vec![collection_id.into()],
+            ))
+            .all(&state.db)
+            .await
+            .expect("canonical document registry query runs");
+            let mut rows = Vec::with_capacity(documents.len());
+            for document in documents {
+                let boot = bootstrap::load(&state.db, document.document_id)
+                    .await
+                    .expect("canonical Record document loads");
+                let semantic = engine_at_head(&boot)
+                    .expect("canonical Record engine loads")
+                    .semantic_snapshot()
+                    .expect("canonical Record semantic snapshot reads");
+                let properties = semantic
+                    .nodes
+                    .iter()
+                    .filter(|(_, node)| node.kind == NodeKind::RecordProperty && !node.deleted)
+                    .map(|(field_id, node)| {
+                        let value = node.properties.get("value").expect("canonical property has a value");
+                        (
+                            field_id.to_string(),
+                            serde_json::from_str(value).expect("canonical property value is JSON"),
+                        )
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                rows.push(ProjectionRow {
+                    record_id: document.record_id,
+                    properties: Value::Object(properties.clone()),
+                    values: Value::Object(properties),
+                });
+            }
+            rows
+        }
+
         let scratch = scratch_or_skip!("projection_rebuild");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed(&state).await;
@@ -4237,7 +4283,7 @@ mod database_tests {
             .await
             .expect("record creates");
         }
-        let expected = projection_rows(&state.db, collection_id).await;
+        let expected = canonical_rows(&state, collection_id).await;
         exec(
             &state.db,
             "UPDATE flow_record_projections SET properties = '{}'::jsonb WHERE collection_id = $1",
@@ -4256,7 +4302,11 @@ mod database_tests {
         assert_eq!(rebuilt.record_count, 3);
         assert_eq!(rebuilt.field_count, 2);
         assert_eq!(rebuilt.value_count, 6);
-        assert_eq!(projection_rows(&state.db, collection_id).await, expected);
+        assert_eq!(
+            projection_rows(&state.db, collection_id).await,
+            expected,
+            "rebuilt typed rows must match values decoded independently from canonical Record documents"
+        );
         scratch.drop_self().await;
     }
 
