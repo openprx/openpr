@@ -207,6 +207,14 @@ fn validate_view_type(view_type: &str) -> Result<(), ApiError> {
     }
 }
 
+fn validate_field_config(config: &Map<String, Value>) -> Result<bool, ApiError> {
+    match config.get("restricted") {
+        None => Ok(false),
+        Some(Value::Bool(restricted)) => Ok(*restricted),
+        Some(_) => Err(ApiError::invalid_update("field config restricted must be a boolean")),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct FieldCreatePayload {
     field_id: Uuid,
@@ -352,6 +360,7 @@ pub fn apply_initial_collection_schema(engine: &mut LoroCollabEngine, schema: &V
     for raw in fields {
         let field: FieldCreatePayload = parse_payload("initial collection field", &raw)?;
         validate_field_type(&field.field_type)?;
+        let _ = validate_field_config(&field.config)?;
         let label = validate_label(&field.label, "field label")?;
         let id = node_id(field.field_id);
         for operation in [
@@ -448,6 +457,7 @@ async fn sync_collection_projection(
     candidate: &LoroCollabEngine,
 ) -> Result<(), ApiError> {
     let semantic = candidate.semantic_snapshot().map_err(|_| ApiError::Internal)?;
+    let mut field_secrecy_enabled = false;
     let mut fields: Vec<_> = semantic
         .nodes
         .iter()
@@ -482,6 +492,13 @@ async fn sync_collection_projection(
             .get("config")
             .map_or_else(|| Ok(json!({})), |raw| serde_json::from_str(raw))
             .map_err(|_| ApiError::invalid_update("field config is invalid"))?;
+        let config_object = config
+            .as_object()
+            .ok_or_else(|| ApiError::invalid_update("field config must be an object"))?;
+        let restricted = validate_field_config(config_object)?;
+        if !node.deleted {
+            field_secrecy_enabled |= restricted;
+        }
         let position = i64::try_from(position).map_err(|_| ApiError::Internal)?;
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -567,8 +584,10 @@ async fn sync_collection_projection(
     }
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "UPDATE flow_collection_projections SET schema_seq = $2, updated_at = now() WHERE collection_id = $1",
-        vec![collection_id.into(), document_seq.into()],
+        "UPDATE flow_collection_projections SET schema_seq = $2, field_secrecy_enabled = $3, \
+         client_crdt_enabled = CASE WHEN $3 THEN false ELSE client_crdt_enabled END, updated_at = now() \
+         WHERE collection_id = $1",
+        vec![collection_id.into(), document_seq.into(), field_secrecy_enabled.into()],
     ))
     .await?;
     Ok(())
@@ -1115,6 +1134,7 @@ async fn collection_operations(
         CollectionCommandType::FieldCreate => {
             let payload: FieldCreatePayload = parse_payload("field_create", payload)?;
             validate_field_type(&payload.field_type)?;
+            let _ = validate_field_config(&payload.config)?;
             let label = validate_label(&payload.label, "field label")?;
             let id = node_id(payload.field_id);
             vec![
@@ -1164,6 +1184,7 @@ async fn collection_operations(
                 });
             }
             if let Some(config) = payload.config {
+                let _ = validate_field_config(&config)?;
                 operations.push(Operation::SetProperty {
                     id,
                     key: "config".to_string(),
@@ -1909,7 +1930,10 @@ async fn collection_views<C: ConnectionTrait>(
 }
 
 fn field_is_restricted(field: &CollectionFieldView) -> bool {
-    field.config.get("restricted").and_then(Value::as_bool).unwrap_or(false)
+    match field.config.get("restricted") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) | Some(_) => true,
+    }
 }
 
 pub async fn describe_collection(
@@ -4232,13 +4256,24 @@ mod database_tests {
         .await
         .expect("restricted record creates through the semantic API")
         .object;
-        exec(
-            &state.db,
-            "UPDATE flow_collection_projections SET client_crdt_enabled = false, field_secrecy_enabled = true \
-             WHERE collection_id = $1",
-            vec![collection_id.into()],
+        let forbidden_fixture_update = ["SET client_crdt_enabled = false", "field_secrecy_enabled = true"].join(", ");
+        assert!(
+            !include_str!("collections.rs").contains(&forbidden_fixture_update),
+            "field secrecy gate must not manufacture production state with raw SQL"
+        );
+        let description = describe_collection(
+            &state,
+            &read_access(&state, workspace_id, owner_id, collection_id).await,
+            None,
         )
-        .await;
+        .await
+        .expect("collection description runs")
+        .expect("authorization epoch is stable");
+        assert!(
+            description.field_secrecy_enabled,
+            "the production field command must enable collection field secrecy"
+        );
+        assert!(description.fields.is_empty());
         let invalid_client_enable = state
             .db
             .execute(Statement::from_sql_and_values(
@@ -4271,11 +4306,14 @@ mod database_tests {
         assert!(response.fields.is_empty());
         assert_eq!(response.items.len(), 1);
         assert!(response.items[0].values_by_field_id.is_empty());
-        assert!(
-            !serde_json::to_string(&response)
-                .expect("response serializes")
-                .contains("9001")
-        );
+        assert_eq!(response.items[0].record.semantic_content, json!({}));
+        let response_json = serde_json::to_string(&response).expect("response serializes");
+        for secret in ["9001", "PRIVATE-BODY-9001"] {
+            assert!(
+                !response_json.contains(secret),
+                "server query leaked restricted record content through one response channel: {secret}"
+            );
+        }
 
         let record_access = read_access(&state, workspace_id, owner_id, record.id).await;
         let bootstrap = crate::flow::query::get_bootstrap(&state, &record_access, None, None).await;
