@@ -1400,6 +1400,13 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route(
+            "/api/v1/workspaces/{workspace_id}/flow/navigator",
+            get(routes::flow::get_flow_navigator).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
             "/api/v1/workspaces/{workspace_id}/flow/search",
             get(routes::flow::get_flow_search).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
@@ -2216,6 +2223,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0058_flow_search_index.sql",
         include_str!("../../../migrations/0058_flow_search_index.sql"),
     ),
+    (
+        "0059_flow_navigator_root.sql",
+        include_str!("../../../migrations/0059_flow_navigator_root.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2509,6 +2520,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
         SchemaProbe::Relation("idx_flow_objects_parent_project_scope"),
     ),
     ("0058_flow_search_index.sql", SchemaProbe::Relation("flow_search_index")),
+    (
+        "0059_flow_navigator_root.sql",
+        SchemaProbe::ConstraintContains("flow_objects", "flow_objects_non_navigator_parent_check", "parent_id"),
+    ),
 ];
 
 /// One recorded migration outcome.
@@ -3020,7 +3035,8 @@ mod tests {
                 "0055_flow_import_jobs.sql",
                 "0056_flow_objects_parent_project_invariant.sql",
                 "0057_flow_objects_parent_project_scope_index.sql",
-                "0058_flow_search_index.sql"
+                "0058_flow_search_index.sql",
+                "0059_flow_navigator_root.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
@@ -3469,6 +3485,185 @@ mod migration_runner_database_tests {
         }
         assert_schema_complete(&scratch.db).await;
 
+        scratch.drop_self().await;
+    }
+
+    /// ADR-0018 NR-1..NR-4 is a data migration, not just a final CHECK constraint: it must create
+    /// one addressable root aggregate, reparent compatible legacy rows, survive replay, and make
+    /// the old NULL-parent page shape impossible afterward.
+    #[tokio::test]
+    async fn navigator_root_migration_materializes_reparents_and_replays() {
+        let scratch = scratch_or_skip!("navigator_root_replay");
+        seed_pre_ledger_schema(&scratch.db, Some("0059_flow_navigator_root.sql")).await;
+
+        scratch
+            .db
+            .execute_unprepared(
+                "INSERT INTO users (id, email, name, password_hash) VALUES \
+                 ('10000000-0000-0000-0000-000000000001', 'nr-replay@example.test', 'NR Replay', 'x'); \
+                 INSERT INTO workspaces (id, slug, name, created_by) VALUES \
+                 ('20000000-0000-0000-0000-000000000001', 'nr-replay', 'NR Replay', \
+                  '10000000-0000-0000-0000-000000000001'); \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, project_id, parent_id) VALUES \
+                 ('30000000-0000-0000-0000-000000000001', \
+                  '20000000-0000-0000-0000-000000000001', 'page', NULL, NULL);",
+            )
+            .await
+            .expect("legacy compatible root page fixture is valid before 0059");
+
+        let migration = include_str!("../../../migrations/0059_flow_navigator_root.sql");
+        scratch
+            .db
+            .execute_unprepared(migration)
+            .await
+            .expect("0059 materializes the root and reparents the compatible page");
+
+        let first = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT root.id AS root_id, page.parent_id, \
+                        count(doc.id)::bigint AS document_count, \
+                        count(projection.object_id)::bigint AS projection_count \
+                   FROM flow_objects root \
+                   JOIN flow_objects page ON page.id = \
+                        '30000000-0000-0000-0000-000000000001'::uuid \
+                   LEFT JOIN collab_documents doc ON doc.object_id = root.id \
+                   LEFT JOIN flow_object_projections projection ON projection.object_id = root.id \
+                  WHERE root.workspace_id = '20000000-0000-0000-0000-000000000001'::uuid \
+                    AND root.object_type = 'navigator' AND root.project_id IS NULL \
+                    AND root.parent_id IS NULL \
+                  GROUP BY root.id, page.parent_id"
+                    .to_string(),
+            ))
+            .await
+            .expect("root aggregate query runs")
+            .expect("root aggregate exists");
+        let root_id: uuid::Uuid = first.try_get("", "root_id").expect("root id");
+        let parent_id: uuid::Uuid = first.try_get("", "parent_id").expect("page parent id");
+        assert_eq!(parent_id, root_id, "legacy top-level page must be attached to the root");
+        assert_eq!(first.try_get::<i64>("", "document_count").expect("document count"), 1);
+        assert_eq!(
+            first.try_get::<i64>("", "projection_count").expect("projection count"),
+            1
+        );
+
+        scratch
+            .db
+            .execute_unprepared(migration)
+            .await
+            .expect("0059 is replay-safe");
+        let replayed = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS roots, min(id::text) AS root_id \
+                   FROM flow_objects \
+                  WHERE workspace_id = '20000000-0000-0000-0000-000000000001'::uuid \
+                    AND object_type = 'navigator' AND project_id IS NULL AND parent_id IS NULL"
+                    .to_string(),
+            ))
+            .await
+            .expect("replay census runs")
+            .expect("replay census row");
+        assert_eq!(replayed.try_get::<i64>("", "roots").expect("root count"), 1);
+        assert_eq!(
+            replayed.try_get::<String>("", "root_id").expect("root id"),
+            root_id.to_string()
+        );
+
+        let mutation = scratch
+            .db
+            .execute_unprepared(
+                "INSERT INTO flow_objects (workspace_id, object_type, project_id, parent_id) VALUES \
+                 ('20000000-0000-0000-0000-000000000001', 'page', NULL, NULL)",
+            )
+            .await;
+        assert!(
+            mutation.is_err(),
+            "NR-4 mutation survived: removing flow_objects_non_navigator_parent_check must make this assertion red"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn navigator_root_migration_fails_closed_on_duplicate_roots() {
+        let scratch = scratch_or_skip!("navigator_root_duplicate");
+        seed_pre_ledger_schema(&scratch.db, Some("0059_flow_navigator_root.sql")).await;
+        scratch
+            .db
+            .execute_unprepared(
+                "INSERT INTO users (id, email, name, password_hash) VALUES \
+                 ('10000000-0000-0000-0000-000000000002', 'nr-duplicate@example.test', 'NR Duplicate', 'x'); \
+                 INSERT INTO workspaces (id, slug, name, created_by) VALUES \
+                 ('20000000-0000-0000-0000-000000000002', 'nr-duplicate', 'NR Duplicate', \
+                  '10000000-0000-0000-0000-000000000002'); \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, project_id, parent_id) VALUES \
+                 ('30000000-0000-0000-0000-000000000002', \
+                  '20000000-0000-0000-0000-000000000002', 'navigator', NULL, NULL), \
+                 ('30000000-0000-0000-0000-000000000003', \
+                  '20000000-0000-0000-0000-000000000002', 'navigator', NULL, NULL);",
+            )
+            .await
+            .expect("pre-0059 duplicate-root fixture is constructible");
+
+        let err = scratch
+            .db
+            .execute_unprepared(include_str!("../../../migrations/0059_flow_navigator_root.sql"))
+            .await
+            .expect_err("0059 must fail closed on duplicate canonical roots");
+        assert!(err.to_string().contains("has 2 unprojected navigator roots"), "{err}");
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn navigator_root_migration_fails_closed_on_project_scope_mismatch() {
+        let scratch = scratch_or_skip!("navigator_root_scope");
+        seed_pre_ledger_schema(&scratch.db, Some("0059_flow_navigator_root.sql")).await;
+        scratch
+            .db
+            .execute_unprepared(
+                "INSERT INTO users (id, email, name, password_hash) VALUES \
+                 ('10000000-0000-0000-0000-000000000004', 'nr-scope@example.test', 'NR Scope', 'x'); \
+                 INSERT INTO workspaces (id, slug, name, created_by) VALUES \
+                 ('20000000-0000-0000-0000-000000000004', 'nr-scope', 'NR Scope', \
+                  '10000000-0000-0000-0000-000000000004'); \
+                 INSERT INTO projects (id, workspace_id, key, name, created_by) VALUES \
+                 ('25000000-0000-0000-0000-000000000004', \
+                  '20000000-0000-0000-0000-000000000004', 'NR', 'NR Project', \
+                  '10000000-0000-0000-0000-000000000004'); \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, project_id, parent_id) VALUES \
+                 ('30000000-0000-0000-0000-000000000004', \
+                  '20000000-0000-0000-0000-000000000004', 'page', \
+                  '25000000-0000-0000-0000-000000000004', NULL);",
+            )
+            .await
+            .expect("pre-0059 incompatible projected root fixture is constructible");
+
+        let err = scratch
+            .db
+            .execute_unprepared(include_str!("../../../migrations/0059_flow_navigator_root.sql"))
+            .await
+            .expect_err("0059 must not silently change a projected root's scope");
+        assert!(err.to_string().contains("projected non-navigator root object"), "{err}");
+        let root = scratch
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS n FROM flow_objects \
+                  WHERE workspace_id = '20000000-0000-0000-0000-000000000004'::uuid \
+                    AND object_type = 'navigator' AND project_id IS NULL AND parent_id IS NULL"
+                    .to_string(),
+            ))
+            .await
+            .expect("post-failure root count runs")
+            .expect("post-failure root count row");
+        assert_eq!(
+            root.try_get::<i64>("", "n").expect("root count"),
+            0,
+            "failure must be atomic"
+        );
         scratch.drop_self().await;
     }
 

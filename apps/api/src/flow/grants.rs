@@ -3174,7 +3174,8 @@ mod database_tests {
             let id = Uuid::new_v4();
             exec(
                 &scratch.db,
-                "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id) VALUES ($1, $2, 'page', $3)",
+                "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id) \
+                 VALUES ($1, $2, CASE WHEN $3::uuid IS NULL THEN 'navigator' ELSE 'page' END, $3)",
                 vec![id.into(), fx.workspace_id.into(), parent.into()],
             )
             .await;

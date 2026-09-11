@@ -1159,15 +1159,23 @@ mod database_tests {
         parent_id: Option<Uuid>,
         inherit_from_parent: bool,
     ) -> Uuid {
+        let canonical_root = if parent_id.is_none() {
+            crate::flow::repository::fetch_workspace_navigator_root(db, workspace_id)
+                .await
+                .expect("canonical root lookup runs")
+        } else {
+            None
+        };
+        let effective_parent = parent_id.or(canonical_root);
         let id = Uuid::new_v4();
         exec(
             db,
             "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, inherit_from_parent) \
-             VALUES ($1, $2, 'page', $3, $4)",
+             VALUES ($1, $2, CASE WHEN $3::uuid IS NULL THEN 'navigator' ELSE 'page' END, $3, $4)",
             vec![
                 id.into(),
                 workspace_id.into(),
-                parent_id.into(),
+                effective_parent.into(),
                 inherit_from_parent.into(),
             ],
         )
@@ -1186,9 +1194,26 @@ mod database_tests {
         nodes: usize,
         boundary_from_root: Option<usize>,
     ) -> Vec<Uuid> {
+        if nodes == 0 {
+            return Vec::new();
+        }
+        let root = match crate::flow::repository::fetch_workspace_navigator_root(db, workspace_id)
+            .await
+            .expect("canonical root lookup runs")
+        {
+            Some(root) => root,
+            None => insert_object(db, workspace_id, None, boundary_from_root != Some(0)).await,
+        };
+        exec(
+            db,
+            "UPDATE flow_objects SET inherit_from_parent = $2 WHERE id = $1",
+            vec![root.into(), (boundary_from_root != Some(0)).into()],
+        )
+        .await;
         let mut ids = Vec::with_capacity(nodes);
-        let mut parent = None;
-        for index in 0..nodes {
+        ids.push(root);
+        let mut parent = Some(root);
+        for index in 1..nodes {
             let inherit = boundary_from_root != Some(index);
             let id = insert_object(db, workspace_id, parent, inherit).await;
             ids.push(id);

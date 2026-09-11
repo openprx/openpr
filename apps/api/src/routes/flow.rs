@@ -213,6 +213,41 @@ pub struct GetFlowObjectQuery {
     pub render: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GetFlowNavigatorQuery {
+    pub project_id: Option<Uuid>,
+    pub depth: Option<u64>,
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+/// `GET /api/v1/workspaces/{workspace_id}/flow/navigator`.
+pub async fn get_flow_navigator(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Query(params): Query<GetFlowNavigatorQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let access = policy::begin_flow_read(&state, &extensions, workspace_id).await?;
+        let Some(response) = query::get_navigator(
+            &state,
+            &access,
+            params.project_id,
+            params.depth,
+            params.include_archived,
+        )
+        .await?
+        else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response));
+    }
+    Err(policy::authorization_read_unstable())
+}
+
 /// `GET /api/v1/flow/objects/{object_id}`
 pub async fn get_flow_object(
     State(state): State<AppState>,
@@ -698,9 +733,10 @@ mod flow_database_tests {
 
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectDiffQuery,
-        FlowObjectHistoryQuery, FlowRelationsQuery, FlowSearchQuery, GetFlowObjectBootstrapQuery, GetFlowObjectQuery,
-        ListFlowObjectsQuery, ProjectionLagQuery, SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object,
-        get_flow_feature, get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
+        FlowObjectHistoryQuery, FlowRelationsQuery, FlowSearchQuery, GetFlowNavigatorQuery,
+        GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, ProjectionLagQuery,
+        SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, get_flow_feature, get_flow_navigator,
+        get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
         get_flow_object_history, get_flow_object_relations, get_flow_projection_lag, get_flow_search,
         list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
         set_flow_feature,
@@ -1437,7 +1473,7 @@ mod flow_database_tests {
             .db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1",
+                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1 AND object_type = 'page'",
                 vec![workspace_id.into()],
             ))
             .await
@@ -1789,9 +1825,13 @@ mod flow_database_tests {
         let member_id = seed_member(&state, workspace_id).await;
         let leaf = create_page_as_owner(&state, workspace_id, owner_id, "Depth 32 leaf").await;
 
-        let mut parent = None;
+        let navigator_root = crate::flow::repository::fetch_workspace_navigator_root(&state.db, workspace_id)
+            .await
+            .expect("root lookup runs")
+            .expect("creating the leaf materializes the workspace root");
+        let mut parent = Some(navigator_root);
         let mut root = None;
-        for index in 0..32 {
+        for index in 0..31 {
             let id = Uuid::new_v4();
             exec(
                 &state,
@@ -2318,11 +2358,14 @@ mod flow_database_tests {
         let state = state_for(scratch.db.clone());
         let (workspace_id, _owner_id) = seed_workspace(&state, true).await;
         let member_id = seed_member(&state, workspace_id).await;
+        let root_id = crate::flow::repository::ensure_workspace_navigator_root(&state.db, workspace_id)
+            .await
+            .expect("scan fixture root materializes");
         exec(
             &state,
             "WITH objects AS ( \
-                 INSERT INTO flow_objects (id, workspace_id, object_type, inherit_from_parent, created_at) \
-                 SELECT gen_random_uuid(), $1, 'page', false, now() + n * interval '1 microsecond' \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, inherit_from_parent, created_at) \
+                 SELECT gen_random_uuid(), $1, 'page', $2, false, now() + n * interval '1 microsecond' \
                    FROM generate_series(1, 1001) AS n RETURNING id \
              ), documents AS ( \
                  INSERT INTO collab_documents (object_id, format_version, snapshot, snapshot_frontier, head_frontier) \
@@ -2330,7 +2373,7 @@ mod flow_database_tests {
              ) \
              INSERT INTO flow_object_projections (object_id, document_seq, document_frontier, title, state, plain_text) \
              SELECT id, 0, '\\x'::bytea, 'hidden', '{}'::jsonb, '' FROM objects",
-            vec![workspace_id.into()],
+            vec![workspace_id.into(), root_id.into()],
         )
         .await;
 
@@ -2374,11 +2417,15 @@ mod flow_database_tests {
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
         let member_id = seed_member(&state, workspace_id).await;
         let writable_id = create_page_as_owner(&state, workspace_id, owner_id, "Concurrent write target").await;
+        let root_id = crate::flow::repository::fetch_workspace_navigator_root(&state.db, workspace_id)
+            .await
+            .expect("root lookup runs")
+            .expect("creating the writable page materializes the root");
         exec(
             &state,
             "WITH objects AS ( \
-                 INSERT INTO flow_objects (id, workspace_id, object_type, inherit_from_parent, created_at) \
-                 SELECT gen_random_uuid(), $1, 'page', false, now() + n * interval '1 microsecond' \
+                 INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, inherit_from_parent, created_at) \
+                 SELECT gen_random_uuid(), $1, 'page', $2, false, now() + n * interval '1 microsecond' \
                    FROM generate_series(1, 1001) AS n RETURNING id \
              ), documents AS ( \
                  INSERT INTO collab_documents (object_id, format_version, snapshot, snapshot_frontier, head_frontier) \
@@ -2386,7 +2433,7 @@ mod flow_database_tests {
              ) \
              INSERT INTO flow_object_projections (object_id, document_seq, document_frontier, title, state, plain_text) \
              SELECT id, 0, '\\x'::bytea, 'hidden', '{}'::jsonb, '' FROM objects",
-            vec![workspace_id.into()],
+            vec![workspace_id.into(), root_id.into()],
         )
         .await;
 
@@ -2556,12 +2603,14 @@ mod flow_database_tests {
             );
         }
 
-        // Only one row was ever written, not two.
+        // Only one caller-created Page was ever written, not two. The materialized navigator root
+        // is a separate system aggregate and is intentionally excluded from this idempotency
+        // assertion.
         let count = state
             .db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1",
+                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1 AND object_type = 'page'",
                 vec![workspace_id.into()],
             ))
             .await
@@ -2569,6 +2618,71 @@ mod flow_database_tests {
             .expect("count query returns a row");
         let n: i64 = count.try_get("", "n").expect("count column reads");
         assert_eq!(n, 1);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn navigator_response_exposes_the_materialized_root_and_default_parent() {
+        let scratch = scratch_or_skip!("navigator-root-response");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let claims = claims_for(owner_id);
+
+        let created = body_json(to_response(
+            create_flow_object(
+                State(state.clone()),
+                claims.clone(),
+                None,
+                Path(workspace_id),
+                Json(CreateFlowObjectRequest {
+                    object_type: "page".to_string(),
+                    project_id: None,
+                    parent_object_id: None,
+                    title: "Top-level Page".to_string(),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(created["code"], 0, "{created}");
+        let page_id = created["data"]["object"]["id"].as_str().expect("page id").to_string();
+        let root_id = created["data"]["object"]["parent_id"]
+            .as_str()
+            .expect("NR-3 default parent")
+            .to_string();
+        assert_ne!(page_id, root_id, "top-level Page must not itself be the root");
+
+        let navigator = body_json(to_response(
+            get_flow_navigator(
+                State(state.clone()),
+                claims,
+                None,
+                Path(workspace_id),
+                Query(GetFlowNavigatorQuery {
+                    project_id: None,
+                    depth: Some(20),
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(navigator["code"], 0, "{navigator}");
+        assert_eq!(navigator["data"]["root_object_id"], root_id, "{navigator}");
+        assert_eq!(
+            navigator["data"]["nodes"].as_array().map(Vec::len),
+            Some(1),
+            "{navigator}"
+        );
+        assert_eq!(navigator["data"]["nodes"][0]["object_id"], page_id, "{navigator}");
+        assert_eq!(navigator["data"]["nodes"][0]["parent_id"], root_id, "{navigator}");
+        assert!(navigator["data"]["nodes"][0]["position"].is_string(), "{navigator}");
+        assert_eq!(navigator["data"]["nodes"][0]["type"], "page", "{navigator}");
+        assert_eq!(navigator["data"]["document_seq"], 0, "{navigator}");
+        assert!(navigator["data"]["frontier"].is_string(), "{navigator}");
 
         scratch.drop_self().await;
     }
@@ -3724,6 +3838,10 @@ mod flow_database_tests {
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
         let member_id = seed_member(&state, workspace_id).await;
         let source = create_page_as_owner(&state, workspace_id, owner_id, "aggregate seed").await;
+        let root_id = crate::flow::repository::fetch_workspace_navigator_root(&state.db, workspace_id)
+            .await
+            .expect("root lookup runs")
+            .expect("creating the aggregate seed materializes the root");
 
         exec(
             &state,
@@ -3736,12 +3854,12 @@ mod flow_database_tests {
         exec(
             &state,
             "INSERT INTO flow_objects \
-                (id, workspace_id, object_type, created_by, updated_by, created_at, updated_at) \
-             SELECT id, $1, 'page', $2, $2, \
+                (id, workspace_id, object_type, parent_id, created_by, updated_by, created_at, updated_at) \
+             SELECT id, $1, 'page', $3, $2, $2, \
                     TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => n), \
                     TIMESTAMPTZ '2026-01-01 00:00:00+00' + make_interval(secs => n) \
                FROM flow_projection_lag_bulk_ids",
-            vec![workspace_id.into(), owner_id.into()],
+            vec![workspace_id.into(), owner_id.into(), root_id.into()],
         )
         .await;
         exec(
@@ -3951,6 +4069,10 @@ mod flow_database_tests {
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
         let matching = create_page_as_owner(&state, workspace_id, owner_id, "unique-frontier-needle").await;
         index_accepted_projection(&state, matching).await;
+        let root_id = crate::flow::repository::fetch_workspace_navigator_root(&state.db, workspace_id)
+            .await
+            .expect("root lookup runs")
+            .expect("creating the matching page materializes the root");
 
         exec(
             &state,
@@ -3961,9 +4083,9 @@ mod flow_database_tests {
         .await;
         exec(
             &state,
-            "INSERT INTO flow_objects (id, workspace_id, object_type, created_by, updated_by) \
-             SELECT id, $1, 'page', $2, $2 FROM flow_search_bulk_ids",
-            vec![workspace_id.into(), owner_id.into()],
+            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, created_by, updated_by) \
+             SELECT id, $1, 'page', $3, $2, $2 FROM flow_search_bulk_ids",
+            vec![workspace_id.into(), owner_id.into(), root_id.into()],
         )
         .await;
         exec(

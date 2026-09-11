@@ -34,6 +34,7 @@ import {
 	type ExecuteFlowCommandInput,
 	type FlowDiffResponse,
 	type FlowHistoryResponse,
+	type FlowNavigatorResponse,
 	type FlowObjectListResponse,
 	type ListFlowObjectsQuery
 } from '$lib/api/flow';
@@ -109,6 +110,10 @@ export class FlowCommandService {
 
 	async listObjects(workspaceId: string, query: ListFlowObjectsQuery = {}): Promise<ApiResult<FlowObjectListResponse>> {
 		return flowApi.listObjects(workspaceId, query);
+	}
+
+	async getNavigator(workspaceId: string): Promise<ApiResult<FlowNavigatorResponse>> {
+		return flowApi.getNavigator(workspaceId);
 	}
 
 	async getHistory(

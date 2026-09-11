@@ -180,7 +180,10 @@ async fn policy_filtered_frontier(
     search: &ValidatedSearch,
 ) -> Result<SearchIndexFrontier, ApiError> {
     let mut values: Vec<sea_orm::Value> = vec![search.workspace_id.into()];
-    let mut scope_predicate = String::from("fo.workspace_id = $1 AND fo.lifecycle_status = 'active'");
+    let mut scope_predicate = String::from(
+        "fo.workspace_id = $1 AND fo.lifecycle_status = 'active' \
+         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+    );
     add_scope_predicate(&mut scope_predicate, &mut values, search.scope, "fo");
     add_object_type_predicate(&mut scope_predicate, &mut values, search.object_type.as_deref(), "fo");
 
@@ -412,7 +415,10 @@ async fn fetch_search_batch(
     after: Option<(f32, Uuid)>,
 ) -> Result<Vec<SearchCandidate>, ApiError> {
     let mut values: Vec<sea_orm::Value> = vec![search.q.clone().into(), search.workspace_id.into()];
-    let mut where_sql = String::from("fo.workspace_id = $2 AND fo.lifecycle_status = 'active'");
+    let mut where_sql = String::from(
+        "fo.workspace_id = $2 AND fo.lifecycle_status = 'active' \
+         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+    );
     add_scope_predicate(&mut where_sql, &mut values, search.scope, "fo");
     add_object_type_predicate(&mut where_sql, &mut values, search.object_type.as_deref(), "fo");
     let mut outer_predicate = String::new();

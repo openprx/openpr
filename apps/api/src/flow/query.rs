@@ -8,7 +8,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use chrono::{DateTime, Utc};
-use collab_core::{Frontier, SemanticSnapshot};
+use collab_core::{Frontier, NodeKind, SemanticSnapshot};
 use platform::app::AppState;
 use serde_json::json;
 use uuid::Uuid;
@@ -20,7 +20,7 @@ use super::collab::frame::TailUpdate;
 use super::collab::{limits, runtime};
 use super::model::{
     Bootstrap, FlowFeatureView, FlowObjectListResponse, FlowObjectView, HistoryItem, HistoryResponse,
-    ObjectDiffResponse, ProjectionLagItem, ProjectionLagResponse,
+    NavigatorNodeView, NavigatorResponse, ObjectDiffResponse, ProjectionLagItem, ProjectionLagResponse,
 };
 use super::policy::{self, AuthorizedFlowObject, FlowReadContext};
 use super::projection;
@@ -31,6 +31,7 @@ use super::repository::{
 
 pub const DEFAULT_LIST_LIMIT: u64 = 50;
 pub const MAX_LIST_LIMIT: u64 = 100;
+pub const MAX_NAVIGATOR_DEPTH: u64 = 20;
 
 /// Computes lag for both the projection-lag and search surfaces. Keeping the subtraction here
 /// prevents the two public APIs from silently acquiring different negative/corrupt-row behavior.
@@ -467,6 +468,92 @@ pub async fn list_objects(
     Ok(Some(FlowObjectListResponse {
         items: rows.into_iter().map(object_view_from_row).collect(),
         next_cursor,
+    }))
+}
+
+fn navigator_positions(state: serde_json::Value) -> Result<std::collections::HashMap<Uuid, String>, ApiError> {
+    let snapshot: SemanticSnapshot = serde_json::from_value(state).map_err(|_| ApiError::Internal)?;
+    let mut positions = std::collections::HashMap::new();
+    for (entry_id, node) in snapshot.nodes {
+        if node.deleted || node.parent.is_some() || node.kind != NodeKind::NavigatorNode {
+            continue;
+        }
+        let object_id = entry_id
+            .split_once('#')
+            .map_or_else(|| entry_id.as_ref(), |(object_id, _)| object_id);
+        let Ok(object_id) = Uuid::parse_str(object_id) else {
+            continue;
+        };
+        positions.entry(object_id).or_insert(node.order_key);
+    }
+    Ok(positions)
+}
+
+/// Loads the v0.6 navigator tree from the `PostgreSQL` parent authority while taking ordering keys
+/// and the response frontier from the navigator document for the selected project scope.
+pub async fn get_navigator(
+    state: &AppState,
+    access: &FlowReadContext,
+    project_id: Option<Uuid>,
+    depth: Option<u64>,
+    include_archived: bool,
+) -> Result<Option<NavigatorResponse>, ApiError> {
+    let depth = depth.unwrap_or(MAX_NAVIGATOR_DEPTH);
+    if !(1..=MAX_NAVIGATOR_DEPTH).contains(&depth) {
+        return Err(ApiError::BadRequest(format!(
+            "depth must be between 1 and {MAX_NAVIGATOR_DEPTH}"
+        )));
+    }
+
+    let root_object_id = repository::fetch_workspace_navigator_root(&state.db, access.workspace_id())
+        .await?
+        .ok_or_else(|| ApiError::NotFound("workspace navigator root not found".to_string()))?;
+    let ordering = repository::fetch_navigator_document(&state.db, access.workspace_id(), project_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("navigator for the requested scope not found".to_string()))?;
+    let ordering_view = repository::fetch_object_view(&state.db, ordering.object_id)
+        .await?
+        .ok_or(ApiError::Internal)?;
+    let positions = navigator_positions(ordering_view.projection_state)?;
+    let rows = repository::fetch_navigator_nodes(
+        &state.db,
+        access.workspace_id(),
+        ordering.object_id,
+        depth,
+        include_archived,
+    )
+    .await?;
+    let ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let Some(visible) =
+        policy::authorize_flow_objects(state, access, &ids, super::collab::authz::PermissionLevel::View).await?
+    else {
+        return Ok(None);
+    };
+    if !policy::ensure_epoch_current(state, access).await? {
+        return Ok(None);
+    }
+
+    let nodes = rows
+        .into_iter()
+        .zip(visible)
+        .filter(|(_, is_visible)| *is_visible)
+        .map(|(row, _)| NavigatorNodeView {
+            object_id: row.id,
+            parent_id: row.parent_id,
+            position: positions
+                .get(&row.id)
+                .cloned()
+                .unwrap_or_else(|| format!("{}:{}", row.created_at.timestamp_micros(), row.id)),
+            title: row.title,
+            object_type: row.object_type,
+        })
+        .collect();
+
+    Ok(Some(NavigatorResponse {
+        root_object_id,
+        nodes,
+        document_seq: ordering_view.document_seq,
+        frontier: projection::encode_frontier(&Frontier::from_bytes(ordering_view.document_frontier)),
     }))
 }
 

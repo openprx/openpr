@@ -196,7 +196,10 @@ pub struct ListFilter {
 }
 
 pub async fn list_objects<C: ConnectionTrait>(conn: &C, filter: &ListFilter) -> Result<Vec<ObjectViewRow>, ApiError> {
-    let mut sql = format!("{OBJECT_VIEW_SELECT} WHERE fo.workspace_id = $1");
+    let mut sql = format!(
+        "{OBJECT_VIEW_SELECT} WHERE fo.workspace_id = $1 \
+         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'"
+    );
     let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
 
     fn push_eq(sql: &mut String, values: &mut Vec<sea_orm::Value>, column: &str, value: sea_orm::Value) {
@@ -282,7 +285,10 @@ pub async fn aggregate_projection_lag<C: ConnectionTrait>(
     conn: &C,
     filter: &ProjectionLagAggregateFilter<'_>,
 ) -> Result<ProjectionLagAggregate, ApiError> {
-    let mut scope_predicate = String::from("fo.workspace_id = $1");
+    let mut scope_predicate = String::from(
+        "fo.workspace_id = $1 \
+         AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
+    );
     let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
     if let Some(project_id) = filter.project_id {
         values.push(project_id.into());
@@ -378,7 +384,8 @@ pub async fn list_projection_lag_candidates<C: ConnectionTrait>(
            FROM flow_objects fo \
            JOIN collab_documents cd ON cd.object_id = fo.id \
            JOIN flow_object_projections p ON p.object_id = fo.id \
-          WHERE fo.workspace_id = $1",
+          WHERE fo.workspace_id = $1 \
+            AND fo.governance_metadata->>'system_role' IS DISTINCT FROM 'workspace_navigator_root'",
     );
     let mut values: Vec<sea_orm::Value> = vec![filter.workspace_id.into()];
     if let Some(project_id) = filter.project_id {
@@ -606,6 +613,160 @@ pub async fn insert_flow_object<C: ConnectionTrait>(conn: &C, object: &NewFlowOb
     ))
     .await?;
     Ok(())
+}
+
+/// Returns the one canonical, unprojected navigator root for a workspace.
+///
+/// Migration `0059_flow_navigator_root.sql` makes this lookup unique. Project-scoped navigator
+/// rows are ordering documents and deliberately do not satisfy this predicate.
+pub async fn fetch_workspace_navigator_root<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+) -> Result<Option<Uuid>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        id: Uuid,
+    }
+
+    let row = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id FROM flow_objects \
+          WHERE workspace_id = $1 AND object_type = 'navigator' \
+            AND project_id IS NULL AND parent_id IS NULL",
+        vec![workspace_id.into()],
+    ))
+    .one(conn)
+    .await?;
+    Ok(row.map(|row| row.id))
+}
+
+/// Materializes the canonical workspace navigator root for a workspace created after migration
+/// `0059` ran, returning the existing root when another request won the race.
+///
+/// Root materialization is a system data-model operation, not a user command: it creates the
+/// addressable object, its valid empty Loro document, and its projection together, without
+/// inventing a user-authored business event. Existing workspaces receive the identical shape in
+/// the migration itself.
+pub async fn ensure_workspace_navigator_root(db: &DatabaseConnection, workspace_id: Uuid) -> Result<Uuid, ApiError> {
+    if let Some(root_id) = fetch_workspace_navigator_root(db, workspace_id).await? {
+        return Ok(root_id);
+    }
+
+    #[derive(FromQueryResult)]
+    struct Row {
+        id: Uuid,
+    }
+
+    let inserted = Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r#"
+            WITH inserted_root AS (
+                INSERT INTO flow_objects (
+                    id, workspace_id, project_id, object_type, parent_id,
+                    inherit_from_parent, governance_metadata, lifecycle_status
+                )
+                VALUES (
+                    gen_random_uuid(), $1, NULL, 'navigator', NULL,
+                    true, '{"system_role":"workspace_navigator_root"}'::jsonb, 'active'
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING id
+            ), inserted_document AS (
+                INSERT INTO collab_documents (
+                    id, object_id, engine, format_version, snapshot, snapshot_frontier,
+                    snapshot_seq, head_frontier, head_seq, byte_count, update_count
+                )
+                SELECT gen_random_uuid(), id, 'loro', 'loro-1',
+                       decode(
+                         '6c6f726f0000000000000000000000003ba2f83500032f0000004c4f524f0000000200767600000001000200e762c96c0100000005000000020066720002007676dbd8c9c816000000550000004c4f524f00000100000000000600830474726565030100000402000005000000000100050102000100000000060002007154a5550100000005000000060080046d6574610006008304747265659faa35f13400000000000000',
+                         'hex'
+                       ),
+                       decode('00', 'hex'), 0, decode('00', 'hex'), 0,
+                       octet_length(decode(
+                         '6c6f726f0000000000000000000000003ba2f83500032f0000004c4f524f0000000200767600000001000200e762c96c0100000005000000020066720002007676dbd8c9c816000000550000004c4f524f00000100000000000600830474726565030100000402000005000000000100050102000100000000060002007154a5550100000005000000060080046d6574610006008304747265659faa35f13400000000000000',
+                         'hex'
+                       )), 0
+                  FROM inserted_root
+            ), inserted_projection AS (
+                INSERT INTO flow_object_projections (
+                    object_id, document_seq, document_frontier, title, state, plain_text,
+                    projection_version
+                )
+                SELECT id, 0, decode('00', 'hex'), '', '{"nodes":{}}'::jsonb, '', 1
+                  FROM inserted_root
+            )
+            SELECT id FROM inserted_root
+        "#,
+        vec![workspace_id.into()],
+    ))
+    .one(db)
+    .await?;
+
+    if let Some(row) = inserted {
+        return Ok(row.id);
+    }
+
+    // `ON CONFLICT` can observe a concurrent insertion that was not visible to this statement's
+    // initial snapshot. A fresh statement sees the committed winner.
+    fetch_workspace_navigator_root(db, workspace_id)
+        .await?
+        .ok_or(ApiError::Internal)
+}
+
+#[derive(Debug, FromQueryResult)]
+pub struct NavigatorNodeRow {
+    pub id: Uuid,
+    pub parent_id: Uuid,
+    pub object_type: String,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Loads the bounded PostgreSQL-authoritative subtree rooted at one navigator object. The query
+/// traverses archived parents so an active descendant cannot be silently re-rooted; archive
+/// filtering is applied only to the returned rows.
+pub async fn fetch_navigator_nodes<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    navigator_object_id: Uuid,
+    depth: u64,
+    include_archived: bool,
+) -> Result<Vec<NavigatorNodeRow>, ApiError> {
+    let depth = i64::try_from(depth).map_err(|_| ApiError::BadRequest("depth is too large".to_string()))?;
+    Ok(NavigatorNodeRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        r"
+            WITH RECURSIVE tree AS (
+                SELECT object_row.id, object_row.parent_id, object_row.object_type,
+                       object_row.lifecycle_status, object_row.created_at,
+                       ARRAY[object_row.id]::uuid[] AS path, 1::bigint AS depth
+                  FROM flow_objects object_row
+                 WHERE object_row.workspace_id = $1 AND object_row.parent_id = $2
+                UNION ALL
+                SELECT child.id, child.parent_id, child.object_type,
+                       child.lifecycle_status, child.created_at,
+                       tree.path || child.id, tree.depth + 1
+                  FROM tree
+                  JOIN flow_objects child
+                    ON child.workspace_id = $1 AND child.parent_id = tree.id
+                 WHERE tree.depth < $3 AND NOT child.id = ANY(tree.path)
+            )
+            SELECT tree.id, tree.parent_id, tree.object_type, projection.title,
+                   tree.created_at
+              FROM tree
+              JOIN flow_object_projections projection ON projection.object_id = tree.id
+             WHERE $4 OR tree.lifecycle_status = 'active'
+             ORDER BY tree.created_at, tree.id
+        ",
+        vec![
+            workspace_id.into(),
+            navigator_object_id.into(),
+            depth.into(),
+            include_archived.into(),
+        ],
+    ))
+    .all(conn)
+    .await?)
 }
 
 pub struct NewCollabDocument {

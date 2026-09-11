@@ -62,6 +62,7 @@
 	const commandService = new FlowCommandService();
 
 	let objects = $state<FlowObjectView[]>([]);
+	let rootObjectId = $state<string | null>(null);
 	let navEntry: OpenFlowObjectResult | null = null;
 	let orderVersion = $state(0); // bumped whenever the order map changes, to re-derive the tree
 	let loading = $state(true);
@@ -107,7 +108,7 @@
 				children: expanded.has(object.id) ? build(object.id, depth + 1) : []
 			}));
 		}
-		return build(null, 0);
+		return rootObjectId ? build(rootObjectId, 0) : [];
 	});
 
 	function flattenVisible(nodes: TreeNode[] = tree): TreeNode[] {
@@ -198,27 +199,21 @@
 		}
 	}
 
-	async function ensureNavigatorObject(): Promise<string> {
-		const existing = await commandService.listObjects(workspaceId, {
-			object_type: 'navigator',
-			limit: 1
-		});
-		if (existing.code === 0 && existing.data && existing.data.items.length > 0) {
-			return existing.data.items[0].id;
+	async function loadNavigatorRoot(): Promise<string> {
+		const result = await commandService.getNavigator(workspaceId);
+		if (result.code !== 0 || !result.data) {
+			throw new Error('workspace navigator root is unavailable');
 		}
-		const created = await commandService.createObject(workspaceId, {
-			object_type: 'navigator',
-			title: 'Navigator'
-		});
-		return created.object.id;
+		rootObjectId = result.data.root_object_id;
+		return result.data.root_object_id;
 	}
 
 	onMount(() => {
 		const controller = new AbortController();
 		void (async () => {
 			try {
+				const navigatorObjectId = await loadNavigatorRoot();
 				await loadObjects();
-				const navigatorObjectId = await ensureNavigatorObject();
 				navEntry = await repository.open({
 					workspaceId,
 					objectId: navigatorObjectId,

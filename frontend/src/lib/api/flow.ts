@@ -57,6 +57,21 @@ export interface FlowObjectListResponse {
 	next_cursor?: string;
 }
 
+export interface FlowNavigatorNode {
+	object_id: string;
+	parent_id: string;
+	position: string;
+	title: string;
+	type: FlowObjectType;
+}
+
+export interface FlowNavigatorResponse {
+	root_object_id: string;
+	nodes: FlowNavigatorNode[];
+	document_seq: number;
+	frontier: string;
+}
+
 export interface FlowHistoryEntry {
 	seq: number;
 	actor: string;
@@ -219,6 +234,20 @@ export const flowApi = {
 			include_archived: query.include_archived
 		});
 		return apiClient.get<FlowObjectListResponse>(`/api/v1/workspaces/${workspaceId}/flow/objects${qs}`);
+	},
+
+	getNavigator(
+		workspaceId: string,
+		query: { project_id?: string; depth?: number; include_archived?: boolean } = {}
+	): Promise<ApiResult<FlowNavigatorResponse>> {
+		const qs = buildQuery({
+			project_id: query.project_id,
+			depth: query.depth,
+			include_archived: query.include_archived
+		});
+		return apiClient.get<FlowNavigatorResponse>(
+			`/api/v1/workspaces/${workspaceId}/flow/navigator${qs}`
+		);
 	},
 
 	getObject(

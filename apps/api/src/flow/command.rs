@@ -393,8 +393,23 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
     // the inheritance `rest-api-v1.md` and `ADR-0013` §2.2 R17 require. Nothing between here and
     // `insert_flow_object` may go back to reading `input.project_id` for the stored scope.
     let mut effective_project_id = input.project_id;
+    let mut effective_parent_id = input.parent_object_id;
 
-    if let Some(parent_id) = input.parent_object_id {
+    if effective_parent_id.is_none() && input.object_type != "navigator" {
+        effective_parent_id = Some(repository::ensure_workspace_navigator_root(&state.db, input.workspace_id).await?);
+    } else if effective_parent_id.is_none()
+        && input.object_type == "navigator"
+        && input.project_id.is_none()
+        && repository::fetch_workspace_navigator_root(&state.db, input.workspace_id)
+            .await?
+            .is_some()
+    {
+        return Err(ApiError::Conflict(
+            "workspace already has a canonical navigator root".to_string(),
+        ));
+    }
+
+    if let Some(parent_id) = effective_parent_id {
         let parent = repository::fetch_parent_object(&state.db, parent_id)
             .await?
             .ok_or_else(|| ApiError::BadRequest("parent_object_id not found".to_string()))?;
@@ -505,7 +520,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             workspace_id: input.workspace_id,
             project_id: effective_project_id,
             object_type: input.object_type.clone(),
-            parent_id: input.parent_object_id,
+            parent_id: effective_parent_id,
             created_by: actor_user_id(input.actor_id, input.actor_is_bot),
         },
     )
@@ -554,7 +569,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
             payload: json!({
                 "object_id": object_id,
                 "object_type": input.object_type,
-                "parent_object_id": input.parent_object_id,
+                "parent_object_id": effective_parent_id,
             }),
             metadata: json!({
                 "message": input.message,
@@ -607,7 +622,7 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         // Same reason as the event above: this view is the caller's copy of the row that was just
         // committed, so it reports the inherited scope, not the omitted request field.
         project_id: effective_project_id,
-        parent_id: input.parent_object_id,
+        parent_id: effective_parent_id,
         object_type: input.object_type,
         lifecycle_status: "active".to_string(),
         governance_metadata: json!({}),
@@ -2606,6 +2621,7 @@ mod database_tests {
     use crate::flow::collab::authz;
     use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
     use crate::flow::model::AcceptedChange;
+    use crate::flow::repository;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
@@ -2887,7 +2903,8 @@ mod database_tests {
         let id = Uuid::new_v4();
         exec(
             db,
-            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id) VALUES ($1, $2, 'page', $3)",
+            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id) \
+             VALUES ($1, $2, CASE WHEN $3::uuid IS NULL THEN 'navigator' ELSE 'page' END, $3)",
             vec![id.into(), workspace_id.into(), parent_id.into()],
         )
         .await;
@@ -3033,23 +3050,42 @@ mod database_tests {
         .expect("restore is idempotent even with a fresh request key");
         assert_eq!(lifecycle_statuses(&scratch.db, &[ordinary_page]).await[0].1, "active");
 
-        // `object_type` alone cannot distinguish a root page from the ordinary page above.
-        let root_page = create_typed_object(&state, &fx, "page", None).await;
-        for (label, object_id) in [("root Page", root_page), ("navigator", navigator)] {
-            let err = lifecycle_command(
-                &state,
-                &fx,
-                object_id,
-                fx.member_id,
-                "member",
-                "archive",
-                false,
-                Uuid::new_v4().to_string(),
-            )
+        // ADR-0018 NR-3 removes the old synthetic-root conflict: omission resolves to the
+        // materialized navigator root, so this second top-level Page is non-root and the edit
+        // baseline can archive it. The actual navigator root still requires full_access.
+        let default_parent_page = create_typed_object(&state, &fx, "page", None).await;
+        let parent = repository::fetch_movable_object(&scratch.db, default_parent_page)
             .await
-            .expect_err(label);
-            assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "{label}: {err:?}");
-        }
+            .expect("default-parent lookup runs")
+            .expect("default-parent page exists")
+            .parent_id;
+        assert_eq!(parent, Some(navigator), "omitted parent must resolve to root_object_id");
+        lifecycle_command(
+            &state,
+            &fx,
+            default_parent_page,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("an edit member can archive a default-parent top-level Page");
+
+        let err = lifecycle_command(
+            &state,
+            &fx,
+            navigator,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect_err("navigator root still requires full_access");
+        assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "navigator: {err:?}");
 
         scratch.drop_self().await;
     }
@@ -3854,9 +3890,14 @@ mod database_tests {
             .object
             .id;
         assert_eq!(stored_project_id(&scratch.db, same).await, Some(project_a));
-        let root = try_create(&state, &fx, "page", Some(project_b), None)
+        let root_b = try_create(&state, &fx, "navigator", Some(project_b), None)
             .await
-            .expect("a root has no parent to agree with")
+            .expect("a project-scoped navigator root is legal")
+            .object
+            .id;
+        let root = try_create(&state, &fx, "page", Some(project_b), Some(root_b))
+            .await
+            .expect("a projected Page starts below its compatible navigator")
             .object
             .id;
         assert_eq!(stored_project_id(&scratch.db, root).await, Some(project_b));
@@ -4349,7 +4390,7 @@ mod idempotency_race_database_tests {
         assert_eq!(
             count(
                 &state,
-                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1",
+                "SELECT count(*) AS n FROM flow_objects WHERE workspace_id = $1 AND object_type = 'page'",
                 vec![workspace_id.into()],
             )
             .await,
@@ -4360,7 +4401,8 @@ mod idempotency_race_database_tests {
             count(
                 &state,
                 "SELECT count(*) AS n FROM collab_documents cd \
-                 JOIN flow_objects fo ON fo.id = cd.object_id WHERE fo.workspace_id = $1",
+                 JOIN flow_objects fo ON fo.id = cd.object_id \
+                 WHERE fo.workspace_id = $1 AND fo.object_type = 'page'",
                 vec![workspace_id.into()],
             )
             .await,
@@ -4370,7 +4412,8 @@ mod idempotency_race_database_tests {
             count(
                 &state,
                 "SELECT count(*) AS n FROM flow_object_projections p \
-                 JOIN flow_objects fo ON fo.id = p.object_id WHERE fo.workspace_id = $1",
+                 JOIN flow_objects fo ON fo.id = p.object_id \
+                 WHERE fo.workspace_id = $1 AND fo.object_type = 'page'",
                 vec![workspace_id.into()],
             )
             .await,

@@ -95,6 +95,26 @@ pub struct FlowObjectListResponse {
     pub next_cursor: Option<String>,
 }
 
+/// One policy-visible tree node in the v0.6 navigator response.
+#[derive(Debug, Serialize)]
+pub struct NavigatorNodeView {
+    pub object_id: Uuid,
+    pub parent_id: Uuid,
+    pub position: String,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub object_type: String,
+}
+
+/// `GET /workspaces/{workspace_id}/flow/navigator`.
+#[derive(Debug, Serialize)]
+pub struct NavigatorResponse {
+    pub root_object_id: Uuid,
+    pub nodes: Vec<NavigatorNodeView>,
+    pub document_seq: i64,
+    pub frontier: String,
+}
+
 /// The object summary nested in a visible [`RelationView`].
 #[derive(Debug, Clone, Serialize)]
 pub struct RelatedObjectView {
