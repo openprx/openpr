@@ -1922,29 +1922,34 @@ mod flow_database_tests {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        crate::flow::collab::authz::install_evaluation_probe(leaf, Duration::from_millis(injected_delay_ms));
-        crate::flow::collab::write::install_locked_phase_probe(document_id);
+        let evaluation_probe =
+            crate::flow::collab::authz::EvaluationProbe::new(leaf, Duration::from_millis(injected_delay_ms));
+        let locked_phase_probe = crate::flow::collab::write::LockedPhaseProbe::new(document_id);
+        let (mut evaluation_samples_ms, mut lock_hold_samples_ms, mut end_to_end_samples_ms) =
+            Box::pin(evaluation_probe.scope(locked_phase_probe.scope(async {
+                for sample in 0..WARMUP_ROUNDS {
+                    let (body, _) = run_depth_32_content_command(&state, member_id, leaf, sample).await;
+                    assert_eq!(body["code"], 0, "the warmup depth-32 command failed: {body}");
+                }
+                let warmup_evaluation_samples = evaluation_probe.take_samples();
+                let warmup_lock_hold_samples = locked_phase_probe.take_samples();
+                assert_eq!(warmup_evaluation_samples.len(), WARMUP_ROUNDS);
+                assert_eq!(warmup_lock_hold_samples.len(), WARMUP_ROUNDS);
 
-        for sample in 0..WARMUP_ROUNDS {
-            let (body, _) = run_depth_32_content_command(&state, member_id, leaf, sample).await;
-            assert_eq!(body["code"], 0, "the warmup depth-32 command failed: {body}");
-        }
-        let warmup_evaluation_samples = crate::flow::collab::authz::take_evaluation_samples();
-        let warmup_lock_hold_samples = crate::flow::collab::write::take_locked_phase_samples();
-        assert_eq!(warmup_evaluation_samples.len(), WARMUP_ROUNDS);
-        assert_eq!(warmup_lock_hold_samples.len(), WARMUP_ROUNDS);
+                let mut end_to_end_samples_ms = Vec::with_capacity(MEASURED_ROUNDS);
+                for sample in WARMUP_ROUNDS..WARMUP_ROUNDS + MEASURED_ROUNDS {
+                    let (body, elapsed_ms) = run_depth_32_content_command(&state, member_id, leaf, sample).await;
+                    assert_eq!(body["code"], 0, "the measured depth-32 command failed: {body}");
+                    end_to_end_samples_ms.push(elapsed_ms);
+                }
 
-        let mut end_to_end_samples_ms = Vec::with_capacity(MEASURED_ROUNDS);
-        for sample in WARMUP_ROUNDS..WARMUP_ROUNDS + MEASURED_ROUNDS {
-            let (body, elapsed_ms) = run_depth_32_content_command(&state, member_id, leaf, sample).await;
-            assert_eq!(body["code"], 0, "the measured depth-32 command failed: {body}");
-            end_to_end_samples_ms.push(elapsed_ms);
-        }
-
-        let mut evaluation_samples_ms = crate::flow::collab::authz::take_evaluation_samples();
-        let mut lock_hold_samples_ms = crate::flow::collab::write::take_locked_phase_samples();
-        crate::flow::collab::authz::remove_evaluation_probe();
-        crate::flow::collab::write::remove_locked_phase_probe();
+                (
+                    evaluation_probe.take_samples(),
+                    locked_phase_probe.take_samples(),
+                    end_to_end_samples_ms,
+                )
+            })))
+            .await;
 
         // Sample sufficiency is decided before a percentile is calculated. In particular, a
         // short vector can never turn its maximum into a plausible-looking p95 and pass.

@@ -1449,20 +1449,36 @@ async fn pause_after_unlocked_move_checks(workspace_id: Uuid) {
     }
 }
 
+/// One test's multi-document lock-hold samples. Production calls observe no active task-local and
+/// become a no-op; parallel tests each install a distinct handle and can only drain that handle.
 #[cfg(test)]
-fn move_locked_phase_samples() -> &'static parking_lot::Mutex<Vec<f64>> {
-    static SAMPLES: std::sync::OnceLock<parking_lot::Mutex<Vec<f64>>> = std::sync::OnceLock::new();
-    SAMPLES.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+#[derive(Clone, Default)]
+struct MoveLockedPhaseProbe {
+    samples_ms: Arc<parking_lot::Mutex<Vec<f64>>>,
 }
 
 #[cfg(test)]
-fn clear_move_locked_phase_samples() {
-    move_locked_phase_samples().lock().clear();
+tokio::task_local! {
+    static MOVE_LOCKED_PHASE_PROBE: MoveLockedPhaseProbe;
 }
 
 #[cfg(test)]
-fn take_move_locked_phase_samples() -> Vec<f64> {
-    std::mem::take(&mut *move_locked_phase_samples().lock())
+impl MoveLockedPhaseProbe {
+    async fn scope<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        MOVE_LOCKED_PHASE_PROBE.scope(self.clone(), future).await
+    }
+
+    fn take_samples(&self) -> Vec<f64> {
+        std::mem::take(&mut *self.samples_ms.lock())
+    }
+}
+
+#[cfg(test)]
+fn record_move_locked_phase_sample(elapsed_ms: f64) {
+    let _ = MOVE_LOCKED_PHASE_PROBE.try_with(|probe| probe.samples_ms.lock().push(elapsed_ms));
 }
 
 /// [`execute`] against an explicit collab runtime.
@@ -1730,9 +1746,7 @@ pub async fn execute_on(
             } => {
                 tx.commit().await?;
                 #[cfg(test)]
-                move_locked_phase_samples()
-                    .lock()
-                    .push(locked_phase_started.elapsed().as_secs_f64() * 1000.0);
+                record_move_locked_phase_sample(locked_phase_started.elapsed().as_secs_f64() * 1000.0);
                 match super::collab::permission_cache::PermissionCache::for_state(state) {
                     Ok(cache) => {
                         cache.invalidate_workspace(workspace_id);
@@ -2904,6 +2918,53 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
+    /// Two overlapping task-local sessions record different crossing counts. Replacing the
+    /// task-local with one process-global vector makes one side take the other's samples and this
+    /// exact assertion fail, even though both tasks deliberately run in one test process.
+    #[tokio::test]
+    async fn concurrent_move_probe_sessions_take_only_their_own_crossings() {
+        let first_probe = super::MoveLockedPhaseProbe::default();
+        let second_probe = super::MoveLockedPhaseProbe::default();
+        let both_started = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let first_scope = first_probe.clone();
+        let first = tokio::spawn({
+            let both_started = std::sync::Arc::clone(&both_started);
+            let release = std::sync::Arc::clone(&release);
+            async move {
+                first_scope
+                    .scope(async move {
+                        both_started.wait().await;
+                        release.wait().await;
+                        super::record_move_locked_phase_sample(1.0);
+                    })
+                    .await;
+            }
+        });
+        let second_scope = second_probe.clone();
+        let second = tokio::spawn({
+            let both_started = std::sync::Arc::clone(&both_started);
+            let release = std::sync::Arc::clone(&release);
+            async move {
+                second_scope
+                    .scope(async move {
+                        both_started.wait().await;
+                        release.wait().await;
+                        super::record_move_locked_phase_sample(2.0);
+                        super::record_move_locked_phase_sample(3.0);
+                    })
+                    .await;
+            }
+        });
+
+        first.await.expect("the first concurrent task completes");
+        second.await.expect("the second concurrent task completes");
+
+        assert_eq!(first_probe.take_samples(), vec![1.0]);
+        assert_eq!(second_probe.take_samples(), vec![2.0, 3.0]);
+    }
+
     /// Five warmups followed by thirty measured cross-project moves. The probe brackets the
     /// production locked phase itself (including commit), not request setup, CRDT preparation, or
     /// response construction, so the observation is the quantity LB-1 actually budgets.
@@ -2928,27 +2989,29 @@ mod database_tests {
         )
         .await
         .expect("setup move materializes the target navigator entry");
-        super::clear_move_locked_phase_samples();
-
-        let mut currently_in_a = false;
-        for sample in 0..(WARMUPS + MEASUREMENTS) {
-            let target = if currently_in_a { nav_b } else { nav_a };
-            run_move(
-                &state,
-                &collab,
-                &fx,
-                &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": target })),
-            )
-            .await
-            .unwrap_or_else(|err| panic!("two-document sample {sample} failed: {err:?}"));
-            currently_in_a = !currently_in_a;
-            if sample + 1 == WARMUPS {
-                let discarded = super::take_move_locked_phase_samples();
-                assert_eq!(discarded.len(), WARMUPS, "every warmup must cross the measured phase");
-            }
-        }
-
-        let mut samples = super::take_move_locked_phase_samples();
+        let probe = super::MoveLockedPhaseProbe::default();
+        let mut samples = probe
+            .scope(async {
+                let mut currently_in_a = false;
+                for sample in 0..(WARMUPS + MEASUREMENTS) {
+                    let target = if currently_in_a { nav_b } else { nav_a };
+                    run_move(
+                        &state,
+                        &collab,
+                        &fx,
+                        &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": target })),
+                    )
+                    .await
+                    .unwrap_or_else(|err| panic!("two-document sample {sample} failed: {err:?}"));
+                    currently_in_a = !currently_in_a;
+                    if sample + 1 == WARMUPS {
+                        let discarded = probe.take_samples();
+                        assert_eq!(discarded.len(), WARMUPS, "every warmup must cross the measured phase");
+                    }
+                }
+                probe.take_samples()
+            })
+            .await;
         assert_eq!(
             samples.len(),
             MEASUREMENTS,
@@ -4863,20 +4926,21 @@ mod database_tests {
         }
         assert_eq!(subtree.len(), super::MOVE_SUBTREE_NODES_MAX);
 
-        super::clear_move_locked_phase_samples();
+        let probe = super::MoveLockedPhaseProbe::default();
         let started = std::time::Instant::now();
-        let change = run_move(
-            &state,
-            &collab,
-            &fx,
-            &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
-        )
-        .await
-        .expect(
-            "the frozen ceiling is an inclusive maximum: a subtree of exactly move_subtree_nodes_max \
+        let change = probe
+            .scope(run_move(
+                &state,
+                &collab,
+                &fx,
+                &move_input(root, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+            ))
+            .await
+            .expect(
+                "the frozen ceiling is an inclusive maximum: a subtree of exactly move_subtree_nodes_max \
              nodes must commit, and must not be aborted by the locked phase's statement or lock \
              timeout budgets",
-        );
+            );
         // `limits-v1.md`'s `per_host_authority` ruling: the frozen 12.21 ms in-lock hold is a
         // design figure, not a per-host pass criterion — this host's own run-to-run spread (2.8x)
         // is wider than the value's headroom (2.05x), so a hard `p95 < 25 ms` assertion here would
@@ -4890,7 +4954,7 @@ mod database_tests {
             started.elapsed().as_secs_f64() * 1000.0
         );
         assert_eq!(command_result(&change)["cascaded_node_count"], json!(100));
-        let mut lock_hold_samples = super::take_move_locked_phase_samples();
+        let mut lock_hold_samples = probe.take_samples();
         assert!(
             !lock_hold_samples.is_empty(),
             "the exact-boundary move produced no lock-hold measurement"

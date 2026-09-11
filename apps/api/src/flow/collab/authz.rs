@@ -111,22 +111,46 @@ pub(crate) const MAX_CHAIN_NODES: usize = TREE_DEPTH_MAX + 2;
 
 /// Test-only observation of the real evaluator call made by a content command.
 ///
-/// The probe is scoped to one object id, so unrelated real-database tests running in parallel do
-/// not enter its distribution. Production builds contain neither the registry nor the optional
-/// delay: the latter exists solely to make the depth-32 budget predicate falsifiable in a mutation
-/// run instead of accepting a timing assertion that cannot be driven red.
+/// Each test owns a probe instance and installs it only inside its Tokio task-local scope. The
+/// object id remains a second line of defence against measuring an unrelated evaluator call in
+/// the same test, but it is deliberately not the isolation boundary: two parallel tests may use
+/// the same fixture ids and must still receive disjoint samples. Production builds contain
+/// neither the task-local nor the optional delay; the latter exists solely to make the depth-32
+/// budget predicate falsifiable in a mutation run instead of accepting a timing assertion that
+/// cannot be driven red.
 #[cfg(test)]
-#[derive(Default)]
-struct EvaluationProbe {
-    object_id: Option<Uuid>,
+#[derive(Clone)]
+pub(crate) struct EvaluationProbe {
+    object_id: Uuid,
     delay: Duration,
-    samples_ms: Vec<f64>,
+    samples_ms: std::sync::Arc<parking_lot::Mutex<Vec<f64>>>,
 }
 
 #[cfg(test)]
-fn evaluation_probe() -> &'static parking_lot::Mutex<EvaluationProbe> {
-    static PROBE: std::sync::OnceLock<parking_lot::Mutex<EvaluationProbe>> = std::sync::OnceLock::new();
-    PROBE.get_or_init(|| parking_lot::Mutex::new(EvaluationProbe::default()))
+tokio::task_local! {
+    static EVALUATION_PROBE: EvaluationProbe;
+}
+
+#[cfg(test)]
+impl EvaluationProbe {
+    pub(crate) fn new(object_id: Uuid, delay: Duration) -> Self {
+        Self {
+            object_id,
+            delay,
+            samples_ms: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) async fn scope<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        EVALUATION_PROBE.scope(self.clone(), future).await
+    }
+
+    pub(crate) fn take_samples(&self) -> Vec<f64> {
+        std::mem::take(&mut *self.samples_ms.lock())
+    }
 }
 
 #[cfg(test)]
@@ -138,45 +162,101 @@ struct EvaluationMeasurement {
 #[cfg(test)]
 impl Drop for EvaluationMeasurement {
     fn drop(&mut self) {
-        let mut probe = evaluation_probe().lock();
-        if probe.object_id == Some(self.object_id) {
-            probe.samples_ms.push(self.started.elapsed().as_secs_f64() * 1000.0);
-        }
+        record_evaluation_sample(self.object_id, self.started.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
 #[cfg(test)]
 fn begin_evaluation_measurement(object_id: Uuid) -> (Option<EvaluationMeasurement>, Duration) {
-    let probe = evaluation_probe().lock();
-    if probe.object_id != Some(object_id) {
-        return (None, Duration::ZERO);
+    EVALUATION_PROBE
+        .try_with(|probe| {
+            if probe.object_id != object_id {
+                return (None, Duration::ZERO);
+            }
+            (
+                Some(EvaluationMeasurement {
+                    object_id,
+                    started: Instant::now(),
+                }),
+                probe.delay,
+            )
+        })
+        .unwrap_or((None, Duration::ZERO))
+}
+
+#[cfg(test)]
+fn record_evaluation_sample(object_id: Uuid, elapsed_ms: f64) {
+    let _ = EVALUATION_PROBE.try_with(|probe| {
+        if probe.object_id == object_id {
+            probe.samples_ms.lock().push(elapsed_ms);
+        }
+    });
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod probe_isolation_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::sync::Barrier;
+    use uuid::Uuid;
+
+    use super::{EvaluationProbe, begin_evaluation_measurement};
+
+    #[tokio::test]
+    async fn concurrent_evaluation_probe_sessions_take_only_their_own_crossings() {
+        let shared_object_id = Uuid::new_v4();
+        let first_probe = EvaluationProbe::new(shared_object_id, Duration::ZERO);
+        let second_probe = EvaluationProbe::new(shared_object_id, Duration::ZERO);
+        let both_started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let first_scope = first_probe.clone();
+        let first = tokio::spawn({
+            let both_started = Arc::clone(&both_started);
+            let release = Arc::clone(&release);
+            async move {
+                first_scope
+                    .scope(async move {
+                        let measurement = begin_evaluation_measurement(shared_object_id)
+                            .0
+                            .expect("the first session is installed in this task");
+                        both_started.wait().await;
+                        release.wait().await;
+                        drop(measurement);
+                    })
+                    .await;
+            }
+        });
+        let second_scope = second_probe.clone();
+        let second = tokio::spawn({
+            let both_started = Arc::clone(&both_started);
+            let release = Arc::clone(&release);
+            async move {
+                second_scope
+                    .scope(async move {
+                        let first_measurement = begin_evaluation_measurement(shared_object_id)
+                            .0
+                            .expect("the second session is installed in this task");
+                        let second_measurement = begin_evaluation_measurement(shared_object_id)
+                            .0
+                            .expect("one session may observe more than one crossing");
+                        both_started.wait().await;
+                        release.wait().await;
+                        drop(first_measurement);
+                        drop(second_measurement);
+                    })
+                    .await;
+            }
+        });
+
+        first.await.expect("the first concurrent task completes");
+        second.await.expect("the second concurrent task completes");
+
+        assert_eq!(first_probe.take_samples().len(), 1);
+        assert_eq!(second_probe.take_samples().len(), 2);
     }
-    (
-        Some(EvaluationMeasurement {
-            object_id,
-            started: Instant::now(),
-        }),
-        probe.delay,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn install_evaluation_probe(object_id: Uuid, delay: Duration) {
-    *evaluation_probe().lock() = EvaluationProbe {
-        object_id: Some(object_id),
-        delay,
-        samples_ms: Vec::new(),
-    };
-}
-
-#[cfg(test)]
-pub(crate) fn take_evaluation_samples() -> Vec<f64> {
-    std::mem::take(&mut evaluation_probe().lock().samples_ms)
-}
-
-#[cfg(test)]
-pub(crate) fn remove_evaluation_probe() {
-    *evaluation_probe().lock() = EvaluationProbe::default();
 }
 
 struct ChainNode {

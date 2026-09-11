@@ -990,17 +990,40 @@ async fn run_locked_phase(
     }
 }
 
+/// One test's lock-hold measurements, activated only within that test's Tokio task-local scope.
+/// The document filter prevents unrelated writes inside the same test from entering the sample;
+/// the task-local session keeps parallel tests from sharing or draining one process-wide vector.
 #[cfg(test)]
-#[derive(Default)]
-struct LockedPhaseProbe {
-    document_id: Option<Uuid>,
-    samples_ms: Vec<f64>,
+#[derive(Clone)]
+pub(crate) struct LockedPhaseProbe {
+    document_id: Uuid,
+    samples_ms: std::sync::Arc<parking_lot::Mutex<Vec<f64>>>,
 }
 
 #[cfg(test)]
-fn locked_phase_probe() -> &'static parking_lot::Mutex<LockedPhaseProbe> {
-    static PROBE: std::sync::OnceLock<parking_lot::Mutex<LockedPhaseProbe>> = std::sync::OnceLock::new();
-    PROBE.get_or_init(|| parking_lot::Mutex::new(LockedPhaseProbe::default()))
+tokio::task_local! {
+    static LOCKED_PHASE_PROBE: LockedPhaseProbe;
+}
+
+#[cfg(test)]
+impl LockedPhaseProbe {
+    pub(crate) fn new(document_id: Uuid) -> Self {
+        Self {
+            document_id,
+            samples_ms: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub(crate) async fn scope<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        LOCKED_PHASE_PROBE.scope(self.clone(), future).await
+    }
+
+    pub(crate) fn take_samples(&self) -> Vec<f64> {
+        std::mem::take(&mut *self.samples_ms.lock())
+    }
 }
 
 #[cfg(test)]
@@ -1012,37 +1035,92 @@ struct LockedPhaseMeasurement {
 #[cfg(test)]
 impl Drop for LockedPhaseMeasurement {
     fn drop(&mut self) {
-        let mut probe = locked_phase_probe().lock();
-        if probe.document_id == Some(self.document_id) {
-            probe.samples_ms.push(self.started.elapsed().as_secs_f64() * 1000.0);
-        }
+        record_locked_phase_sample(self.document_id, self.started.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
 #[cfg(test)]
 fn begin_locked_phase_measurement(document_id: Uuid) -> Option<LockedPhaseMeasurement> {
-    (locked_phase_probe().lock().document_id == Some(document_id)).then(|| LockedPhaseMeasurement {
-        document_id,
-        started: std::time::Instant::now(),
-    })
+    LOCKED_PHASE_PROBE
+        .try_with(|probe| {
+            (probe.document_id == document_id).then(|| LockedPhaseMeasurement {
+                document_id,
+                started: std::time::Instant::now(),
+            })
+        })
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
-pub(crate) fn install_locked_phase_probe(document_id: Uuid) {
-    *locked_phase_probe().lock() = LockedPhaseProbe {
-        document_id: Some(document_id),
-        samples_ms: Vec::new(),
-    };
+fn record_locked_phase_sample(document_id: Uuid, elapsed_ms: f64) {
+    let _ = LOCKED_PHASE_PROBE.try_with(|probe| {
+        if probe.document_id == document_id {
+            probe.samples_ms.lock().push(elapsed_ms);
+        }
+    });
 }
 
 #[cfg(test)]
-pub(crate) fn take_locked_phase_samples() -> Vec<f64> {
-    std::mem::take(&mut locked_phase_probe().lock().samples_ms)
-}
+#[allow(clippy::expect_used)]
+mod probe_isolation_tests {
+    use std::sync::Arc;
 
-#[cfg(test)]
-pub(crate) fn remove_locked_phase_probe() {
-    *locked_phase_probe().lock() = LockedPhaseProbe::default();
+    use tokio::sync::Barrier;
+    use uuid::Uuid;
+
+    use super::{LockedPhaseProbe, begin_locked_phase_measurement};
+
+    #[tokio::test]
+    async fn concurrent_locked_phase_probe_sessions_take_only_their_own_crossings() {
+        let shared_document_id = Uuid::new_v4();
+        let first_probe = LockedPhaseProbe::new(shared_document_id);
+        let second_probe = LockedPhaseProbe::new(shared_document_id);
+        let both_started = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+
+        let first_scope = first_probe.clone();
+        let first = tokio::spawn({
+            let both_started = Arc::clone(&both_started);
+            let release = Arc::clone(&release);
+            async move {
+                first_scope
+                    .scope(async move {
+                        let measurement = begin_locked_phase_measurement(shared_document_id)
+                            .expect("the first session is installed in this task");
+                        both_started.wait().await;
+                        release.wait().await;
+                        drop(measurement);
+                    })
+                    .await;
+            }
+        });
+        let second_scope = second_probe.clone();
+        let second = tokio::spawn({
+            let both_started = Arc::clone(&both_started);
+            let release = Arc::clone(&release);
+            async move {
+                second_scope
+                    .scope(async move {
+                        let first_measurement = begin_locked_phase_measurement(shared_document_id)
+                            .expect("the second session is installed in this task");
+                        let second_measurement = begin_locked_phase_measurement(shared_document_id)
+                            .expect("one session may observe more than one crossing");
+                        both_started.wait().await;
+                        release.wait().await;
+                        drop(first_measurement);
+                        drop(second_measurement);
+                    })
+                    .await;
+            }
+        });
+
+        first.await.expect("the first concurrent task completes");
+        second.await.expect("the second concurrent task completes");
+
+        assert_eq!(first_probe.take_samples().len(), 1);
+        assert_eq!(second_probe.take_samples().len(), 2);
+    }
 }
 
 /// Runs [`hydrate_and_apply`] + [`run_locked_phase`] with bounded rebase, inside one coordinator
