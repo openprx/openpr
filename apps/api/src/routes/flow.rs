@@ -97,7 +97,12 @@ fn request_origin(extensions: &axum::http::Extensions) -> CommandOrigin {
     let source = crate::middleware::bot_auth::extract_bot_context(extensions).map_or_else(
         || EventSource::new(EventSurface::Rest).with_request(Uuid::new_v4().to_string()),
         |bot| {
-            let source = EventSource::new(bot.surface).with_request(bot.request_id.to_string());
+            // ADR-0018 AO-1: the allow-listed transport header is still controlled by the bot
+            // credential holder. Until v0.7 binds a transport to that credential, every bot
+            // route is explicitly self-reported -- including a bot that presents as plain REST.
+            let source = EventSource::new(bot.surface)
+                .self_reported()
+                .with_request(bot.request_id.to_string());
             match bot.tool_name.as_deref() {
                 Some(tool) => source.with_tool(tool),
                 None => source,
@@ -739,7 +744,7 @@ mod flow_database_tests {
         get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
         get_flow_object_history, get_flow_object_relations, get_flow_projection_lag, get_flow_search,
         list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
-        set_flow_feature,
+        request_origin, set_flow_feature,
     };
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::{
@@ -755,6 +760,44 @@ mod flow_database_tests {
     use axum::{Extension, Json};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    /// AO-1's transport-wide criterion at the production resolver. The set includes a bot with
+    /// no transport header (`Rest`): its label is still not credential-bound, so it must not gain
+    /// stronger provenance than the five explicitly selectable bot transports.
+    #[test]
+    fn every_bot_transport_is_self_reported_while_direct_jwt_rest_is_attested() {
+        use crate::flow::event_origin::EventSurface;
+
+        let direct = request_origin(&axum::http::Extensions::new()).source_json();
+        assert_eq!(direct["attestation"], "attested");
+
+        for surface in [
+            EventSurface::Rest,
+            EventSurface::McpHttp,
+            EventSurface::McpSse,
+            EventSurface::McpStdio,
+            EventSurface::Cli,
+            EventSurface::CliToolsCall,
+        ] {
+            let mut extensions = axum::http::Extensions::new();
+            extensions.insert(crate::middleware::bot_auth::BotAuthContext {
+                bot_id: Uuid::new_v4(),
+                workspace_id: Uuid::new_v4(),
+                permissions: vec!["write".to_string()],
+                surface,
+                tool_name: Some("flow.object_create".to_string()),
+                request_id: Uuid::new_v4(),
+            });
+            let source = request_origin(&extensions).source_json();
+            assert_eq!(source["surface"], surface.as_wire());
+            assert_eq!(
+                source["attestation"],
+                "self_reported",
+                "bot surface {} must remain explicitly unverified",
+                surface.as_wire()
+            );
+        }
+    }
 
     struct Scratch {
         db: DatabaseConnection,
@@ -5472,6 +5515,10 @@ mod flow_database_tests {
             event.source
         );
         assert_eq!(
+            event.source["attestation"], "self_reported",
+            "a real bot request must never present its caller-controlled transport as attested"
+        );
+        assert_eq!(
             event.source["tool"], "flow.object_create",
             "the exact registered tool must reach the envelope: {:?}",
             event.source
@@ -5853,12 +5900,17 @@ mod flow_database_tests {
         for row in &rows {
             let surface = row.source["surface"].as_str().unwrap_or_default();
             if surface == "rest" {
+                assert_eq!(row.source["attestation"], "attested");
                 assert!(
                     row.source.get("tool").is_none(),
                     "a JWT-direct REST call has no tool concept, so the key must be omitted: {:?}",
                     row.source
                 );
             } else {
+                assert_eq!(
+                    row.source["attestation"], "self_reported",
+                    "every bot-selected transport must disclose that it is not credential-bound"
+                );
                 assert_eq!(
                     row.source["tool"], "objects.grants_set",
                     "an MCP call must carry the exact registered tool the middleware resolved: {:?}",

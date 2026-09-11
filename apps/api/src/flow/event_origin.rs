@@ -1,6 +1,7 @@
 //! The server-side origin every Flow command stamps onto the events it produces.
 //!
-//! `events-v1.md`'s envelope `source:{surface,session?,tool?,request?,client_id?,service?}` plus
+//! `events-v1.md`'s envelope
+//! `source:{surface,attestation,session?,tool?,request?,client_id?,service?}` plus
 //! the two causal-chain fields `correlation_id` / `causation_id`.
 //!
 //! # Why this is a type and not a `json!` literal at each producer
@@ -27,6 +28,36 @@
 
 use serde_json::{Map, Value};
 use uuid::Uuid;
+
+/// How strongly the server can prove the transport named by [`EventSource::surface`].
+///
+/// This is deliberately independent of [`EventSurface`]: a bot token may arrive without a
+/// transport header and therefore be labelled `rest`, but that label is still caller-controlled
+/// until v0.7 binds a transport to the credential. Consumers must treat only [`Self::Attested`]
+/// as verified provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginAttestation {
+    Attested,
+    SelfReported,
+}
+
+impl OriginAttestation {
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Attested => "attested",
+            Self::SelfReported => "self_reported",
+        }
+    }
+
+    /// The only predicate consumers should use when deciding whether transport provenance was
+    /// verified. In particular, `self_reported` must never be promoted merely because its surface
+    /// is in the allow-list.
+    #[must_use]
+    pub const fn is_verified(self) -> bool {
+        matches!(self, Self::Attested)
+    }
+}
 
 /// `events-v1.md`: "`source.surface` 全集为 `web|rest|mcp_http|mcp_sse|mcp_stdio|cli|
 /// cli_tools_call|worker|system`".
@@ -158,6 +189,8 @@ fn source_surface_for_serialization(surface: EventSurface) -> EventSurface {
 #[derive(Debug, Clone)]
 pub struct EventSource {
     pub surface: EventSurface,
+    /// Proof level for `surface`. Required in every Flow event source envelope.
+    pub attestation: OriginAttestation,
     /// `mcp-surface-v1.md`: "session id 由服务端生成" — an MCP transport's server-generated
     /// session id, or a WebSocket collab session id. `None` for a plain REST request, which has
     /// no session concept at all.
@@ -180,12 +213,21 @@ impl EventSource {
     pub const fn new(surface: EventSurface) -> Self {
         Self {
             surface,
+            attestation: OriginAttestation::Attested,
             session: None,
             tool: None,
             request: None,
             client_id: None,
             service: None,
         }
+    }
+
+    /// Downgrade provenance whose transport label came from the credential holder. Bot traffic
+    /// must use this until v0.7 binds the transport to the credential.
+    #[must_use]
+    pub const fn self_reported(mut self) -> Self {
+        self.attestation = OriginAttestation::SelfReported;
+        self
     }
 
     #[must_use]
@@ -226,6 +268,10 @@ impl EventSource {
         map.insert(
             "surface".to_string(),
             Value::String(source_surface_for_serialization(self.surface).as_wire().to_string()),
+        );
+        map.insert(
+            "attestation".to_string(),
+            Value::String(self.attestation.as_wire().to_string()),
         );
         for (key, value) in [
             ("session", self.session.as_ref()),
@@ -313,7 +359,7 @@ impl CommandOrigin {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use super::{CommandOrigin, EventSource, EventSurface};
+    use super::{CommandOrigin, EventSource, EventSurface, OriginAttestation};
     use uuid::Uuid;
 
     /// `events-v1.md`'s frozen `source.surface` value set, and
@@ -342,12 +388,24 @@ mod tests {
         let json = EventSource::new(EventSurface::Rest).to_json();
         let object = json.as_object().expect("source is a JSON object");
         assert_eq!(object.get("surface").and_then(serde_json::Value::as_str), Some("rest"));
+        assert_eq!(
+            object.get("attestation").and_then(serde_json::Value::as_str),
+            Some("attested")
+        );
         for key in ["session", "tool", "request", "client_id", "service"] {
             assert!(
                 !object.contains_key(key),
                 "an omitted optional key must contribute no key at all, but '{key}' was present"
             );
         }
+    }
+
+    #[test]
+    fn self_reported_provenance_is_serialized_and_never_counts_as_verified() {
+        let source = EventSource::new(EventSurface::McpHttp).self_reported();
+        assert_eq!(source.to_json()["attestation"], "self_reported");
+        assert!(!source.attestation.is_verified());
+        assert!(OriginAttestation::Attested.is_verified());
     }
 
     /// The "缺省与空值不可区分" guard. `None` and `Some("")` are two different facts and must
