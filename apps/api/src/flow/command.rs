@@ -2912,6 +2912,12 @@ mod database_tests {
     }
 
     async fn insert_raw_object(db: &DatabaseConnection, workspace_id: Uuid, parent_id: Option<Uuid>) -> Uuid {
+        if parent_id.is_none() {
+            return crate::flow::repository::fetch_workspace_navigator_root(db, workspace_id)
+                .await
+                .expect("canonical root lookup runs")
+                .expect("workspace insert materialized its canonical root");
+        }
         let id = Uuid::new_v4();
         exec(
             db,
@@ -4083,7 +4089,11 @@ mod database_tests {
             assert!(types.contains(&expected), "'{expected}' was not written; got {types:?}");
         }
 
-        let expected_source = serde_json::json!({ "surface": "cli", "tool": "sylvode objects create" });
+        let expected_source = serde_json::json!({
+            "surface": "cli",
+            "attestation": "attested",
+            "tool": "sylvode objects create"
+        });
         for row in &rows {
             assert_eq!(
                 row.source, expected_source,

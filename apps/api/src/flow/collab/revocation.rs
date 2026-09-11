@@ -317,7 +317,7 @@ mod tests {
             session(authorized_object),
         ];
         let levels = HashMap::from([
-            (revoked_object, PermissionLevel::View),
+            (revoked_object, PermissionLevel::Denied),
             (authorized_object, MINIMUM_COLLAB_SESSION_LEVEL),
         ]);
         let uncertain_objects = HashSet::from([uncertain_object]);

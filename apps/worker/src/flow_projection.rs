@@ -44,6 +44,11 @@ pub async fn run_tick(db: &DatabaseConnection, requested_batch_size: usize) -> a
               JOIN flow_objects fo ON fo.id = p.object_id
          LEFT JOIN flow_search_index si ON si.object_id = p.object_id
              WHERE fo.lifecycle_status = 'active'
+               AND NOT (
+                    fo.object_type = 'navigator'
+                    AND fo.project_id IS NULL
+                    AND fo.parent_id IS NULL
+               )
                AND (
                     si.object_id IS NULL
                     OR si.indexed_seq <> p.document_seq
@@ -91,7 +96,14 @@ pub async fn run_tick(db: &DatabaseConnection, requested_batch_size: usize) -> a
                 DELETE FROM flow_search_index si
                  USING flow_objects fo
                  WHERE fo.id = si.object_id
-                   AND fo.lifecycle_status = 'archived'
+                   AND (
+                        fo.lifecycle_status = 'archived'
+                        OR (
+                            fo.object_type = 'navigator'
+                            AND fo.project_id IS NULL
+                            AND fo.parent_id IS NULL
+                        )
+                   )
             "
             .to_string(),
         ))
@@ -206,10 +218,23 @@ mod tests {
             vec![workspace_id.into(), format!("ws-{workspace_id}").into(), user_id.into()],
         )
         .await;
+        let root_id: Uuid = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM flow_objects WHERE workspace_id = $1 AND object_type = 'navigator' \
+                 AND project_id IS NULL AND parent_id IS NULL",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("canonical root lookup runs")
+            .expect("workspace insert materialized its canonical root")
+            .try_get("", "id")
+            .expect("canonical root id reads");
         execute(
             db,
-            "INSERT INTO flow_objects (id, workspace_id, object_type, created_by) VALUES ($1, $2, 'page', $3)",
-            vec![object_id.into(), workspace_id.into(), user_id.into()],
+            "INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, created_by) \
+             VALUES ($1, $2, 'page', $3, $4)",
+            vec![object_id.into(), workspace_id.into(), root_id.into(), user_id.into()],
         )
         .await;
         execute(

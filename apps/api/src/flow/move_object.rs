@@ -5221,10 +5221,13 @@ mod database_tests {
             vec![fx.workspace_id.into()],
         )
         .await;
-        assert_eq!(reconciled_object_count, 2, "the fixture creates exactly two navigators");
         assert_eq!(
-            reconciled_document_count, 2,
-            "both navigators must have a collab document"
+            reconciled_object_count, 3,
+            "the fixture has two project ordering navigators plus the materialized workspace root"
+        );
+        assert_eq!(
+            reconciled_document_count, 3,
+            "all project navigators and the workspace root must have a collab document"
         );
         assert_eq!(
             missing_document_count, 0,
@@ -5264,7 +5267,7 @@ mod database_tests {
                 "queried_document_count": queried_document_count,
                 "measured_document_count": measured_documents.len(),
                 "independent_database_reconciliation": {
-                    "expected_fixture_navigator_count": 2,
+                    "expected_fixture_navigator_count": 3,
                     "navigator_object_count": reconciled_object_count,
                     "navigator_document_count": reconciled_document_count,
                     "missing_document_count": missing_document_count,
@@ -5566,6 +5569,7 @@ mod database_tests {
 
         let expected_source = json!({
             "surface": "mcp_stdio",
+            "attestation": "attested",
             "session": "stdio-session-1",
             "tool": "objects.move",
             "request": "json-rpc-42",

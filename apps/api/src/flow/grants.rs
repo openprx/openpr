@@ -3300,6 +3300,7 @@ mod database_tests {
         );
         let expected_source = serde_json::json!({
             "surface": "cli_tools_call",
+            "attestation": "attested",
             "tool": "objects.grants_set",
             "session": "cli-session-3",
         });
@@ -3350,6 +3351,7 @@ mod database_tests {
         );
         let expected_source = serde_json::json!({
             "surface": "mcp_http",
+            "attestation": "attested",
             "tool": "objects.inheritance_set",
             "request": "json-rpc-11",
         });
