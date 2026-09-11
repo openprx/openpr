@@ -72,8 +72,34 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.relation.unlinked",
         public_payload(&["relation_id", "source_object_id", "target_object_id", "relation_type"]),
     ),
-    ("flow.record.created", public_payload(&["collection_id", "record_id"])),
-    ("flow.record.archived", public_payload(&["collection_id", "record_id"])),
+    (
+        "flow.record.created",
+        public_payload(&["collection_id", "record_id", "seq"]),
+    ),
+    (
+        "flow.schema.changed",
+        public_payload(&["collection_id", "field_id", "change_kind", "schema_seq"]),
+    ),
+    (
+        "flow.view.created",
+        public_payload(&["collection_id", "view_id", "view_type", "schema_seq"]),
+    ),
+    (
+        "flow.view.updated",
+        public_payload(&["collection_id", "view_id", "change_kind", "schema_seq"]),
+    ),
+    (
+        "flow.view.reordered",
+        public_payload(&["collection_id", "view_id", "old_ordinal", "new_ordinal", "schema_seq"]),
+    ),
+    (
+        "flow.record.updated",
+        public_payload(&["collection_id", "record_id", "changed_field_ids", "body_changed", "seq"]),
+    ),
+    (
+        "flow.record.archived",
+        public_payload(&["collection_id", "record_id", "status"]),
+    ),
     ("flow.feature.enabled", public_payload(&["workspace_id"])),
     ("flow.feature.disabled", public_payload(&["workspace_id"])),
     (
@@ -222,9 +248,12 @@ fn looks_like_flow_event_type(literal: &str) -> bool {
     if !literal.starts_with(FLOW_EVENT_TYPE_PREFIX) {
         return false;
     }
-    literal.chars().all(|character| {
-        character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_' || character == '.'
-    })
+    let segments = literal.split('.').collect::<Vec<_>>();
+    segments.len() == 3
+        && segments.iter().all(|segment| !segment.is_empty())
+        && literal.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_' || character == '.'
+        })
 }
 
 #[cfg(test)]
@@ -235,6 +264,22 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::BTreeSet;
+
+    fn rust_files_below(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut files = Vec::new();
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                for entry in std::fs::read_dir(&path).expect("Flow source directory reads") {
+                    pending.push(entry.expect("Flow source entry reads").path());
+                }
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+        files.sort();
+        files
+    }
 
     #[test]
     fn declared_type_keeps_only_its_declared_keys() {
@@ -283,21 +328,34 @@ mod tests {
     /// independently recomputes from outside the crate.
     #[test]
     fn every_emitted_flow_event_type_declares_a_payload_policy() {
-        let command_rs = include_str!("command.rs");
-        let write_rs = include_str!("collab/write.rs");
-        let grants_rs = include_str!("grants.rs");
-        let move_object_rs = include_str!("move_object.rs");
-        let relations_rs = include_str!("relations.rs");
-        let collections_rs = include_str!("collections.rs");
-        let mut literals = BTreeSet::new();
-        for source in [
-            command_rs,
-            write_rs,
-            grants_rs,
-            move_object_rs,
-            relations_rs,
-            collections_rs,
+        let flow_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/flow");
+        let files = rust_files_below(&flow_root);
+        assert!(!files.is_empty(), "Flow producer discovery must be non-empty");
+        let discovered = files
+            .iter()
+            .filter_map(|path| path.strip_prefix(&flow_root).ok())
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<BTreeSet<_>>();
+        for known in [
+            "command.rs",
+            "collections.rs",
+            "grants.rs",
+            "move_object.rs",
+            "relations.rs",
+            "collab/snapshot.rs",
+            "collab/write.rs",
         ] {
+            assert!(
+                discovered.contains(known),
+                "known Flow producer was not discovered: {known}"
+            );
+        }
+        let mut literals = BTreeSet::new();
+        for path in files {
+            if path == flow_root.join("event_policy.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("Flow producer source reads");
             let cut = source.find("\n#[cfg(test)]").unwrap_or(source.len());
             literals.extend(event_type_literals(&source[..cut]));
         }

@@ -584,6 +584,139 @@ enum ProjectionSync {
     Record { collection_id: Uuid, record_id: Uuid },
 }
 
+struct SemanticEventRewrite {
+    event_type: &'static str,
+    aggregate_type: &'static str,
+    aggregate_id: String,
+    payload: Value,
+}
+
+async fn semantic_event_rewrite(
+    tx: &sea_orm::DatabaseTransaction,
+    input: &ExecuteCommandInput,
+    sync: ProjectionSync,
+    seq: i64,
+) -> Result<SemanticEventRewrite, ApiError> {
+    let collection_id = match sync {
+        ProjectionSync::Collection { collection_id } | ProjectionSync::Record { collection_id, .. } => collection_id,
+    };
+    let required_uuid = |key: &str| {
+        input
+            .payload
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .ok_or_else(|| ApiError::invalid_update(format!("{key} must be a UUID")))
+    };
+    match input.command_type.as_str() {
+        "field_create" | "field_update" | "field_archive" | "field_reorder" => {
+            let field_id = required_uuid("field_id")?;
+            let change_kind = input.command_type.trim_start_matches("field_");
+            Ok(SemanticEventRewrite {
+                event_type: "flow.schema.changed",
+                aggregate_type: "flow_collection",
+                aggregate_id: collection_id.to_string(),
+                payload: json!({
+                    "collection_id": collection_id,
+                    "field_id": field_id,
+                    "change_kind": change_kind,
+                    "schema_seq": seq,
+                }),
+            })
+        }
+        "view_create" => {
+            let view_id = required_uuid("view_id")?;
+            let view_type = input
+                .payload
+                .get("view_type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::invalid_update("view_type is required"))?;
+            Ok(SemanticEventRewrite {
+                event_type: "flow.view.created",
+                aggregate_type: "flow_view",
+                aggregate_id: view_id.to_string(),
+                payload: json!({
+                    "collection_id": collection_id,
+                    "view_id": view_id,
+                    "view_type": view_type,
+                    "schema_seq": seq,
+                }),
+            })
+        }
+        "view_update" => {
+            let view_id = required_uuid("view_id")?;
+            Ok(SemanticEventRewrite {
+                event_type: "flow.view.updated",
+                aggregate_type: "flow_view",
+                aggregate_id: view_id.to_string(),
+                payload: json!({
+                    "collection_id": collection_id,
+                    "view_id": view_id,
+                    "change_kind": "updated",
+                    "schema_seq": seq,
+                }),
+            })
+        }
+        "view_reorder" => {
+            #[derive(FromQueryResult)]
+            struct PositionRow {
+                position: i64,
+            }
+            let view_id = required_uuid("view_id")?;
+            let old = PositionRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT position FROM flow_view_projections WHERE collection_id = $1 AND view_id = $2",
+                vec![collection_id.into(), view_id.into()],
+            ))
+            .one(tx)
+            .await?
+            .ok_or_else(|| ApiError::invalid_update("view does not exist"))?;
+            let new_ordinal = input
+                .payload
+                .get("index")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| ApiError::invalid_update("index is required"))?;
+            Ok(SemanticEventRewrite {
+                event_type: "flow.view.reordered",
+                aggregate_type: "flow_view",
+                aggregate_id: view_id.to_string(),
+                payload: json!({
+                    "collection_id": collection_id,
+                    "view_id": view_id,
+                    "old_ordinal": old.position,
+                    "new_ordinal": new_ordinal,
+                    "schema_seq": seq,
+                }),
+            })
+        }
+        "record_patch" => {
+            let ProjectionSync::Record { record_id, .. } = sync else {
+                return Err(ApiError::Internal);
+            };
+            let mut changed_field_ids = input
+                .payload
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            changed_field_ids.sort();
+            Ok(SemanticEventRewrite {
+                event_type: "flow.record.updated",
+                aggregate_type: "flow_record",
+                aggregate_id: record_id.to_string(),
+                payload: json!({
+                    "collection_id": collection_id,
+                    "record_id": record_id,
+                    "changed_field_ids": changed_field_ids,
+                    "body_changed": input.payload.get("body").is_some_and(|body| !body.is_null()),
+                    "seq": seq,
+                }),
+            })
+        }
+        _ => Err(ApiError::Internal),
+    }
+}
+
 async fn execute_document_update(
     state: &AppState,
     input: &ExecuteCommandInput,
@@ -674,6 +807,7 @@ async fn execute_document_update(
             }
             continue;
         };
+        let semantic_event = semantic_event_rewrite(&tx, input, sync, staged.new_head_seq).await?;
         match sync {
             ProjectionSync::Collection { collection_id } => {
                 sync_collection_projection(&tx, collection_id, staged.new_head_seq, &prepared.candidate).await?;
@@ -687,11 +821,22 @@ async fn execute_document_update(
         }
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "UPDATE business_events SET metadata = metadata || $2::jsonb WHERE id = $1",
+            "UPDATE business_events SET event_type = $2, aggregate_type = $3, aggregate_id = $4, \
+             payload = $5, metadata = metadata || $6::jsonb WHERE id = $1",
             vec![
                 staged.event_id.into(),
+                semantic_event.event_type.into(),
+                semantic_event.aggregate_type.into(),
+                semantic_event.aggregate_id.into(),
+                semantic_event.payload.into(),
                 json!({"semantic_summary": {"action": input.command_type}}).into(),
             ],
+        ))
+        .await?;
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE event_dispatch SET event_type = $2, document_id = NULL, accepted_seq = NULL WHERE event_id = $1",
+            vec![staged.event_id.into(), semantic_event.event_type.into()],
         ))
         .await?;
         tx.commit().await?;
@@ -1134,11 +1279,11 @@ async fn create_record(
             workspace_id,
             project_id: collection.project_id,
             event_type: "flow.record.created".to_string(),
-            aggregate_type: "flow_object".to_string(),
+            aggregate_type: "flow_record".to_string(),
             aggregate_id: record_id.to_string(),
             actor_id: actor_user_id(input.actor_id, input.actor_is_bot()),
             source: input.origin.source_json(),
-            payload: json!({"collection_id": input.object_id, "record_id": record_id}),
+            payload: json!({"collection_id": input.object_id, "record_id": record_id, "seq": 0}),
             metadata: json!({"idempotency_fingerprint": idempotency_fingerprint}),
             correlation_id: Some(input.origin.correlation_id),
             causation_id: input.origin.causation_id,
@@ -1323,11 +1468,11 @@ async fn archive_record(
             workspace_id,
             project_id: target.project_id,
             event_type: "flow.record.archived".to_string(),
-            aggregate_type: "flow_object".to_string(),
+            aggregate_type: "flow_record".to_string(),
             aggregate_id: payload.record_id.to_string(),
             actor_id: actor_user_id(input.actor_id, input.actor_is_bot()),
             source: input.origin.source_json(),
-            payload: json!({"collection_id": input.object_id, "record_id": payload.record_id}),
+            payload: json!({"collection_id": input.object_id, "record_id": payload.record_id, "status": "archived"}),
             metadata: json!({"message": input.message}),
             correlation_id: Some(input.origin.correlation_id),
             causation_id: input.origin.causation_id,
@@ -1685,7 +1830,6 @@ async fn replay_existing_command(
     input: &ExecuteCommandInput,
     workspace_id: Uuid,
     kind: CollectionCommandType,
-    target_document_id: Uuid,
 ) -> Result<Option<AcceptedChange>, ApiError> {
     let Some(event) = repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await? else {
         return Ok(None);
@@ -1694,21 +1838,33 @@ async fn replay_existing_command(
         CollectionCommandType::FieldCreate
         | CollectionCommandType::FieldUpdate
         | CollectionCommandType::FieldArchive
-        | CollectionCommandType::FieldReorder
-        | CollectionCommandType::ViewCreate
-        | CollectionCommandType::ViewUpdate
-        | CollectionCommandType::ViewReorder => (
-            "flow.content.accepted",
-            target_document_id.to_string(),
+        | CollectionCommandType::FieldReorder => (
+            "flow.schema.changed",
+            input.object_id.to_string(),
             input.object_id,
             None,
         ),
+        CollectionCommandType::ViewCreate | CollectionCommandType::ViewUpdate | CollectionCommandType::ViewReorder => {
+            let view_id = input
+                .payload
+                .get("view_id")
+                .and_then(Value::as_str)
+                .and_then(|raw| Uuid::parse_str(raw).ok())
+                .ok_or_else(|| ApiError::invalid_update("view_id must be a UUID"))?;
+            let event_type = match kind {
+                CollectionCommandType::ViewCreate => "flow.view.created",
+                CollectionCommandType::ViewUpdate => "flow.view.updated",
+                CollectionCommandType::ViewReorder => "flow.view.reordered",
+                _ => return Err(ApiError::Internal),
+            };
+            (event_type, view_id.to_string(), input.object_id, None)
+        }
         CollectionCommandType::RecordPatch => {
             let payload: RecordPatchPayload = parse_payload("record_patch", &input.payload)?;
-            let target = fetch_record_target(&state.db, input.object_id, payload.record_id).await?;
+            fetch_record_target(&state.db, input.object_id, payload.record_id).await?;
             (
-                "flow.content.accepted",
-                target.document_id.to_string(),
+                "flow.record.updated",
+                payload.record_id.to_string(),
                 payload.record_id,
                 Some(json!({"record_id": payload.record_id})),
             )
@@ -1752,7 +1908,7 @@ pub async fn execute(
         return create_collection_embed(state, input, workspace_id, target, checked_epoch, None).await;
     }
     let collection = ensure_collection_target(state, input.object_id).await?;
-    if let Some(replay) = replay_existing_command(state, input, workspace_id, kind, collection.document_id).await? {
+    if let Some(replay) = replay_existing_command(state, input, workspace_id, kind).await? {
         return Ok(replay);
     }
     match kind {
@@ -1864,43 +2020,45 @@ mod tests {
     #[test]
     fn flow_collection_forms_tables_untouched_scans_executable_sql_paths() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let flow_root = manifest.join("src/flow");
-        let worker_root = manifest.join("../worker/src");
-        let forms_root = manifest.join("src/forms");
-        let routes_root = manifest.join("src/routes");
+        let workspace = manifest.join("../..");
         let forbidden_forms = ["project_forms", "form_records", "form_views", "form_record_field_index"];
         let mutation_verbs = ["insert into", "update", "delete from", "merge into", "truncate"];
-        let flow_sources = rust_files_below(&flow_root)
-            .into_iter()
-            .chain(rust_files_below(&worker_root))
-            .map(|path| normalized_non_comment_source(&path))
-            .collect::<Vec<_>>()
-            .join(" ");
-        for table in forbidden_forms {
-            for verb in mutation_verbs {
+        let allowed_forms_writers = [
+            "apps/api/src/forms/projections.rs",
+            "apps/api/src/routes/form.rs",
+            "apps/api/src/routes/project.rs",
+        ];
+        let mut production_files = Vec::new();
+        for root in ["apps/api/src", "apps/worker/src", "apps/mcp-server/src", "crates"] {
+            production_files.extend(rust_files_below(&workspace.join(root)));
+        }
+        assert!(!production_files.is_empty(), "production SQL source scan must be non-empty");
+        let mut forms_sources = Vec::new();
+        for path in production_files {
+            let relative = path
+                .strip_prefix(&workspace)
+                .expect("production source stays below workspace")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source = normalized_non_comment_source(&path);
+            let normalized_sql = source.replace('"', "");
+            let mutates_forms = forbidden_forms.iter().any(|table| {
+                mutation_verbs
+                    .iter()
+                    .any(|verb| normalized_sql.contains(&format!("{verb} {table}")))
+            });
+            if mutates_forms {
                 assert!(
-                    !flow_sources.contains(&format!("{verb} {table}")),
-                    "Flow executable SQL must not mutate Universal Forms table {table}"
+                    allowed_forms_writers.contains(&relative.as_str()),
+                    "production source outside the reviewed Forms owners mutates a Forms table: {relative}"
                 );
             }
+            if allowed_forms_writers.contains(&relative.as_str()) {
+                forms_sources.push(source);
+            }
         }
-
-        let mut forms_files = rust_files_below(&forms_root);
-        forms_files.extend(rust_files_below(&routes_root).into_iter().filter(|path| {
-            forbidden_forms
-                .iter()
-                .any(|table| normalized_non_comment_source(path).contains(table))
-        }));
-        forms_files.extend(rust_files_below(&worker_root).into_iter().filter(|path| {
-            forbidden_forms
-                .iter()
-                .any(|table| normalized_non_comment_source(path).contains(table))
-        }));
-        let forms_sources = forms_files
-            .into_iter()
-            .map(|path| normalized_non_comment_source(&path))
-            .collect::<Vec<_>>()
-            .join(" ");
+        assert!(!forms_sources.is_empty(), "reviewed Forms source scan must be non-empty");
+        let forms_sources = forms_sources.join(" ");
         for table in [
             "flow_objects",
             "collab_documents",
@@ -1916,8 +2074,6 @@ mod tests {
                 "Forms executable SQL must not read Flow canonical table {table}"
             );
         }
-        assert!(!flow_sources.is_empty(), "Flow source scan must be non-empty");
-        assert!(!forms_sources.is_empty(), "Forms source scan must be non-empty");
     }
 }
 
@@ -2494,6 +2650,213 @@ mod database_tests {
             matches!(record_generic, Err(ApiError::Typed { ref message, .. }) if message.contains("typed collection commands")),
             "generic content path must reject Record documents: {record_generic:?}"
         );
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn collection_commands_emit_the_frozen_v0_6_semantic_event_family() {
+        #[derive(FromQueryResult)]
+        struct EventRow {
+            event_type: String,
+            aggregate_type: String,
+            aggregate_id: String,
+            payload: Value,
+            dispatch_event_type: String,
+            document_id: Option<Uuid>,
+            accepted_seq: Option<i64>,
+        }
+        async fn event(db: &DatabaseConnection, id: Uuid) -> EventRow {
+            EventRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT b.event_type, b.aggregate_type, b.aggregate_id, b.payload, \
+                        d.event_type AS dispatch_event_type, d.document_id, d.accepted_seq \
+                 FROM business_events b JOIN event_dispatch d ON d.event_id = b.id WHERE b.id = $1",
+                vec![id.into()],
+            ))
+            .one(db)
+            .await
+            .expect("semantic event query runs")
+            .expect("semantic event exists")
+        }
+
+        let scratch = scratch_or_skip!("semantic_events");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Events").await;
+        let field_id = Uuid::new_v4();
+        let field_create_key = Uuid::new_v4().to_string();
+        let mut field_events = Vec::new();
+        let mut field_event_ids = Vec::new();
+        for (kind, payload, key) in [
+            (
+                "field_create",
+                json!({"field_id": field_id, "label": "Name", "field_type": "text"}),
+                field_create_key.clone(),
+            ),
+            (
+                "field_update",
+                json!({"field_id": field_id, "label": "Renamed"}),
+                Uuid::new_v4().to_string(),
+            ),
+            (
+                "field_reorder",
+                json!({"field_id": field_id, "index": 0}),
+                Uuid::new_v4().to_string(),
+            ),
+            (
+                "field_archive",
+                json!({"field_id": field_id}),
+                Uuid::new_v4().to_string(),
+            ),
+        ] {
+            let changed = command(&state, owner_id, collection_id, kind, payload, key)
+                .await
+                .expect("field command succeeds");
+            field_event_ids.push(changed.event_id);
+            field_events.push(event(&state.db, changed.event_id).await);
+        }
+        assert_eq!(field_events.len(), 4);
+        for (row, change_kind) in field_events.iter().zip(["create", "update", "reorder", "archive"]) {
+            assert_eq!(row.event_type, "flow.schema.changed");
+            assert_eq!(row.aggregate_type, "flow_collection");
+            assert_eq!(row.aggregate_id, collection_id.to_string());
+            assert_eq!(row.payload["field_id"], json!(field_id));
+            assert_eq!(row.payload["change_kind"], json!(change_kind));
+            assert!(row.payload["schema_seq"].as_i64().is_some());
+            assert_eq!(row.dispatch_event_type, row.event_type);
+            assert_eq!(row.document_id, None);
+            assert_eq!(row.accepted_seq, None);
+        }
+        let replay = command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({"field_id": field_id, "label": "Name", "field_type": "text"}),
+            field_create_key,
+        )
+        .await
+        .expect("semantic command replay succeeds");
+        assert_eq!(replay.event_id, field_event_ids[0]);
+
+        let view_id = Uuid::new_v4();
+        let view_create = command(
+            &state,
+            owner_id,
+            collection_id,
+            "view_create",
+            json!({"view_id": view_id, "name": "Main", "view_type": "table"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("view creates");
+        let second_view_id = Uuid::new_v4();
+        let second_view = command(
+            &state,
+            owner_id,
+            collection_id,
+            "view_create",
+            json!({"view_id": second_view_id, "name": "Second", "view_type": "board", "index": 1}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("second view creates");
+        let view_update = command(
+            &state,
+            owner_id,
+            collection_id,
+            "view_update",
+            json!({"view_id": view_id, "name": "Renamed"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("view updates");
+        let view_reorder = command(
+            &state,
+            owner_id,
+            collection_id,
+            "view_reorder",
+            json!({"view_id": second_view_id, "index": 0}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("view reorders");
+        for (id, expected_type) in [
+            (view_create.event_id, "flow.view.created"),
+            (second_view.event_id, "flow.view.created"),
+            (view_update.event_id, "flow.view.updated"),
+            (view_reorder.event_id, "flow.view.reordered"),
+        ] {
+            let row = event(&state.db, id).await;
+            assert_eq!(row.event_type, expected_type);
+            assert_eq!(row.aggregate_type, "flow_view");
+            assert!(
+                matches!(row.payload["view_id"].as_str(), Some(raw) if raw == view_id.to_string() || raw == second_view_id.to_string())
+            );
+            assert_eq!(row.payload["view_id"].as_str(), Some(row.aggregate_id.as_str()));
+            assert!(row.payload["schema_seq"].as_i64().is_some());
+            assert_eq!(row.dispatch_event_type, row.event_type);
+            assert_eq!((row.document_id, row.accepted_seq), (None, None));
+        }
+
+        let active_field_id = Uuid::new_v4();
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({"field_id": active_field_id, "label": "Active", "field_type": "text"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("active field creates");
+        let created = command(
+            &state,
+            owner_id,
+            collection_id,
+            "record_create",
+            json!({"properties": {active_field_id.to_string(): "secret"}}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("record creates");
+        let patched = command(
+            &state,
+            owner_id,
+            collection_id,
+            "record_patch",
+            json!({"record_id": created.object.id, "properties": {active_field_id.to_string(): "new secret"}}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("record patches");
+        let archived = command(
+            &state,
+            owner_id,
+            collection_id,
+            "record_archive",
+            json!({"record_id": created.object.id}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("record archives");
+        for (id, expected_type) in [
+            (created.event_id, "flow.record.created"),
+            (patched.event_id, "flow.record.updated"),
+            (archived.event_id, "flow.record.archived"),
+        ] {
+            let row = event(&state.db, id).await;
+            assert_eq!(row.event_type, expected_type);
+            assert_eq!(row.aggregate_type, "flow_record");
+            assert_eq!(row.aggregate_id, created.object.id.to_string());
+            assert_eq!(row.dispatch_event_type, row.event_type);
+            assert_eq!((row.document_id, row.accepted_seq), (None, None));
+            let encoded = serde_json::to_string(&row.payload).expect("event payload serializes");
+            assert!(
+                !encoded.contains("secret"),
+                "semantic event payload leaked record values"
+            );
+        }
         scratch.drop_self().await;
     }
 
