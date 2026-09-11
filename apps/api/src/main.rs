@@ -1421,6 +1421,36 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route(
+            "/api/v1/flow/objects/{object_id}/schema",
+            get(routes::flow::get_flow_collection).route_layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/collections/{collection_id}",
+            get(routes::flow::get_flow_collection).route_layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/collections/{collection_id}/records",
+            get(routes::flow::get_flow_collection_records)
+                .post(routes::flow::post_flow_collection_record)
+                .route_layer(axum_middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                )),
+        )
+        .route(
+            "/api/v1/flow/collections/{collection_id}/query",
+            post(routes::flow::post_flow_collection_query).route_layer(axum_middleware::from_fn_with_state(
+                state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
             "/api/v1/flow/objects/{object_id}/commands",
             post(routes::flow::post_flow_object_command).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
@@ -2231,6 +2261,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0060_flow_collections_core.sql",
         include_str!("../../../migrations/0060_flow_collections_core.sql"),
     ),
+    (
+        "0061_flow_collections_query_indexes.sql",
+        include_str!("../../../migrations/0061_flow_collections_query_indexes.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2556,6 +2590,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0060_flow_collections_core.sql",
         SchemaProbe::Relation("flow_collections_core_schema_guard"),
+    ),
+    (
+        "0061_flow_collections_query_indexes.sql",
+        SchemaProbe::Relation("flow_collections_query_schema_guard"),
     ),
 ];
 
@@ -3070,7 +3108,8 @@ mod tests {
                 "0057_flow_objects_parent_project_scope_index.sql",
                 "0058_flow_search_index.sql",
                 "0059_flow_navigator_root.sql",
-                "0060_flow_collections_core.sql"
+                "0060_flow_collections_core.sql",
+                "0061_flow_collections_query_indexes.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );

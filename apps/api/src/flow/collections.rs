@@ -4,12 +4,20 @@
 //! `flow_objects`/`collab_documents` aggregate; only rebuildable typed values live in projection
 //! tables. No path in this module reads or writes Universal Forms tables.
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 use collab_core::{CollabEngine, LoroCollabEngine, NodeId, NodeKind, Operation};
 use platform::app::AppState;
+use ring::{
+    aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
+    rand::{SecureRandom, SystemRandom},
+};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -20,12 +28,15 @@ use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 use super::collab::{authz, bootstrap, frame, runtime, write};
 use super::command::{ExecuteCommandInput, ExistingDocumentCardinality, actor_user_id, map_write_rejection};
 use super::model::AcceptedChange;
-use super::projection;
 use super::repository::{self, NewCollabDocument, NewFlowObject, NewProjection};
+use super::{policy, projection, query};
 
 const DOCUMENT_FORMAT_VERSION: &str = "loro-1";
 const LABEL_MAX_CHARS: usize = 500;
 const MAX_REBASE_ATTEMPTS: u32 = 3;
+const QUERY_CURSOR_VERSION: u8 = 1;
+const QUERY_CURSOR_AAD: &[u8] = b"openpr.flow.collections.query.cursor.v1";
+const QUERY_SCAN_ROWS_MAX: u32 = 1_000;
 
 #[derive(FromQueryResult)]
 struct FieldTypeRow {
@@ -276,10 +287,38 @@ struct RecordIdPayload {
     record_id: Uuid,
 }
 
-#[derive(Debug, Deserialize)]
-struct RecordQueryPayload {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecordFilter {
+    pub field_id: Uuid,
+    pub op: String,
+    pub value: Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecordSort {
+    pub field_id: Uuid,
+    #[serde(default = "default_sort_direction")]
+    pub direction: String,
+}
+
+fn default_sort_direction() -> String {
+    "asc".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RecordQueryPayload {
+    #[serde(default)]
+    pub filter: Option<RecordFilter>,
+    #[serde(default)]
+    pub sort: Option<RecordSort>,
+    #[serde(default)]
+    pub group: Option<Uuid>,
+    #[serde(default)]
+    pub cursor: Option<String>,
     #[serde(default = "default_query_limit")]
-    limit: u32,
+    pub limit: u32,
+    #[serde(default)]
+    pub field_ids: Vec<Uuid>,
 }
 
 const fn default_query_limit() -> u32 {
@@ -552,6 +591,109 @@ async fn sync_record_projection(
         .await?;
     }
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectionRebuildResult {
+    pub collection_id: Uuid,
+    pub collection_seq: i64,
+    pub record_count: usize,
+    pub field_count: i64,
+    pub value_count: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RebuildDocumentRow {
+    record_id: Uuid,
+    document_id: Uuid,
+    document_seq: i64,
+}
+
+/// Rebuilds only the typed, disposable Collection projections from canonical collab documents.
+/// All canonical snapshots/tails are loaded before the replacement transaction starts, then the
+/// derived rows are replaced atomically so readers never observe a half-rebuilt schema/value set.
+pub async fn rebuild_typed_projections(
+    state: &AppState,
+    collection_id: Uuid,
+) -> Result<ProjectionRebuildResult, ApiError> {
+    #[derive(FromQueryResult)]
+    struct CollectionDocumentRow {
+        document_id: Uuid,
+        schema_seq: i64,
+    }
+    let collection = CollectionDocumentRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT document_id, schema_seq FROM flow_collection_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("collection not found".to_string()))?;
+    let collection_boot = bootstrap::load(&state.db, collection.document_id).await?;
+    let collection_engine = engine_at_head(&collection_boot)?;
+    let records = RebuildDocumentRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT record_id, document_id, document_seq FROM flow_record_projections \
+         WHERE collection_id = $1 ORDER BY record_id",
+        vec![collection_id.into()],
+    ))
+    .all(&state.db)
+    .await?;
+    let mut record_engines = Vec::with_capacity(records.len());
+    for record in &records {
+        let boot = bootstrap::load(&state.db, record.document_id).await?;
+        record_engines.push(engine_at_head(&boot)?);
+    }
+
+    let tx = state.db.begin().await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM flow_record_value_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM flow_view_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "DELETE FROM flow_field_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .await?;
+    sync_collection_projection(&tx, collection_id, collection.schema_seq, &collection_engine).await?;
+    for (record, engine) in records.iter().zip(&record_engines) {
+        sync_record_projection(&tx, collection_id, record.record_id, record.document_seq, engine).await?;
+    }
+    let field_count = CountRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT count(*) AS count FROM flow_field_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .one(&tx)
+    .await?
+    .ok_or(ApiError::Internal)?
+    .count;
+    let value_count = CountRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT count(*) AS count FROM flow_record_value_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .one(&tx)
+    .await?
+    .ok_or(ApiError::Internal)?
+    .count;
+    tx.commit().await?;
+    Ok(ProjectionRebuildResult {
+        collection_id,
+        collection_seq: collection.schema_seq,
+        record_count: records.len(),
+        field_count,
+        value_count,
+    })
 }
 
 fn validate_typed_value(field_type: &str, value: &Value) -> Result<(), ApiError> {
@@ -1494,13 +1636,545 @@ async fn archive_record(
     Ok(change)
 }
 
-fn record_query_not_in_this_package(payload: &Value) -> Result<AcceptedChange, ApiError> {
+#[derive(Debug, FromQueryResult)]
+struct CollectionReadRow {
+    schema_seq: i64,
+    client_crdt_enabled: bool,
+    field_secrecy_enabled: bool,
+}
+
+#[derive(Debug, FromQueryResult, Serialize)]
+pub struct CollectionFieldView {
+    pub field_id: Uuid,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub field_type: String,
+    pub config: Value,
+    pub position: i64,
+    pub archived: bool,
+    pub document_seq: i64,
+}
+
+#[derive(Debug, FromQueryResult, Serialize)]
+pub struct CollectionViewView {
+    pub view_id: Uuid,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub view_type: String,
+    pub config: Value,
+    pub position: i64,
+    pub document_seq: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollectionDescription {
+    pub object: super::model::FlowObjectView,
+    pub fields: Vec<CollectionFieldView>,
+    pub views: Vec<CollectionViewView>,
+    pub record_count: i64,
+    pub schema_seq: i64,
+    pub projection_seq: i64,
+    pub client_crdt_enabled: bool,
+    pub field_secrecy_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordQueryItem {
+    pub record: super::model::FlowObjectView,
+    pub values_by_field_id: Map<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordQueryResponse {
+    pub fields: Vec<CollectionFieldView>,
+    pub items: Vec<RecordQueryItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub projection_seq: i64,
+    pub schema_seq: i64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RecordQueryCursor {
+    fingerprint: String,
+    offset: u32,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RecordCandidateRow {
+    record_id: Uuid,
+    properties: Value,
+    document_seq: i64,
+}
+
+fn query_cursor_key(secret: &str) -> Result<LessSafeKey, ApiError> {
+    let mut digest = Sha256::new();
+    digest.update(QUERY_CURSOR_AAD);
+    digest.update([0]);
+    digest.update(secret.as_bytes());
+    UnboundKey::new(&aead::CHACHA20_POLY1305, &digest.finalize())
+        .map(LessSafeKey::new)
+        .map_err(|_| ApiError::Internal)
+}
+
+fn query_fingerprint(query: &RecordQueryPayload) -> Result<String, ApiError> {
+    let mut canonical = query.clone();
+    canonical.cursor = None;
+    let bytes = serde_json::to_vec(&canonical).map_err(|_| ApiError::Internal)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn encode_query_cursor(secret: &str, cursor: &RecordQueryCursor) -> Result<String, ApiError> {
+    let mut nonce_bytes = [0_u8; aead::NONCE_LEN];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| ApiError::Internal)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    let mut encrypted = serde_json::to_vec(cursor).map_err(|_| ApiError::Internal)?;
+    query_cursor_key(secret)?
+        .seal_in_place_append_tag(nonce, Aad::from(QUERY_CURSOR_AAD), &mut encrypted)
+        .map_err(|_| ApiError::Internal)?;
+    let mut token = Vec::with_capacity(1 + aead::NONCE_LEN + encrypted.len());
+    token.push(QUERY_CURSOR_VERSION);
+    token.extend_from_slice(&nonce_bytes);
+    token.extend_from_slice(&encrypted);
+    Ok(BASE64_URL.encode(token))
+}
+
+fn decode_query_cursor(secret: &str, raw: &str, fingerprint: &str) -> Result<u32, ApiError> {
+    let token = BASE64_URL
+        .decode(raw)
+        .map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    let (version, payload) = token
+        .split_first()
+        .ok_or_else(|| ApiError::invalid_update("cursor is not valid"))?;
+    if *version != QUERY_CURSOR_VERSION {
+        return Err(ApiError::invalid_update("cursor is not valid"));
+    }
+    let (nonce_bytes, ciphertext) = payload
+        .split_at_checked(aead::NONCE_LEN)
+        .ok_or_else(|| ApiError::invalid_update("cursor is not valid"))?;
+    let nonce =
+        Nonce::try_assume_unique_for_key(nonce_bytes).map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    let mut in_out = ciphertext.to_vec();
+    let plaintext = query_cursor_key(secret)?
+        .open_in_place(nonce, Aad::from(QUERY_CURSOR_AAD), &mut in_out)
+        .map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    let cursor: RecordQueryCursor =
+        serde_json::from_slice(plaintext).map_err(|_| ApiError::invalid_update("cursor is not valid"))?;
+    if cursor.fingerprint != fingerprint {
+        return Err(ApiError::invalid_update(
+            "cursor belongs to a different collection query",
+        ));
+    }
+    Ok(cursor.offset)
+}
+
+async fn collection_read_row<C: ConnectionTrait>(conn: &C, collection_id: Uuid) -> Result<CollectionReadRow, ApiError> {
+    CollectionReadRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT schema_seq, client_crdt_enabled, field_secrecy_enabled \
+         FROM flow_collection_projections WHERE collection_id = $1",
+        vec![collection_id.into()],
+    ))
+    .one(conn)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("collection not found".to_string()))
+}
+
+async fn collection_fields<C: ConnectionTrait>(
+    conn: &C,
+    collection_id: Uuid,
+    include_archived: bool,
+) -> Result<Vec<CollectionFieldView>, ApiError> {
+    let archived_clause = if include_archived {
+        ""
+    } else {
+        " AND archived_at IS NULL"
+    };
+    let sql = format!(
+        "SELECT field_id, label, field_type, config, position, archived_at IS NOT NULL AS archived, document_seq \
+         FROM flow_field_projections WHERE collection_id = $1{archived_clause} ORDER BY position, field_id"
+    );
+    Ok(CollectionFieldView::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        sql,
+        vec![collection_id.into()],
+    ))
+    .all(conn)
+    .await?)
+}
+
+async fn collection_views<C: ConnectionTrait>(
+    conn: &C,
+    collection_id: Uuid,
+) -> Result<Vec<CollectionViewView>, ApiError> {
+    Ok(CollectionViewView::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT view_id, name, view_type, config, position, document_seq \
+         FROM flow_view_projections WHERE collection_id = $1 ORDER BY position, view_id",
+        vec![collection_id.into()],
+    ))
+    .all(conn)
+    .await?)
+}
+
+fn field_is_restricted(field: &CollectionFieldView) -> bool {
+    field.config.get("restricted").and_then(Value::as_bool).unwrap_or(false)
+}
+
+pub async fn describe_collection(
+    state: &AppState,
+    access: &policy::AuthorizedFlowObject,
+    at_seq: Option<i64>,
+) -> Result<Option<CollectionDescription>, ApiError> {
+    let object_row = repository::fetch_object_view(&state.db, access.object_id())
+        .await?
+        .ok_or_else(|| ApiError::NotFound("collection not found".to_string()))?;
+    if object_row.object_type != "collection" || object_row.workspace_id != access.workspace_id() {
+        return Err(ApiError::NotFound("collection not found".to_string()));
+    }
+    let collection = collection_read_row(&state.db, access.object_id()).await?;
+    if let Some(at_seq) = at_seq
+        && at_seq != collection.schema_seq
+    {
+        return Err(ApiError::invalid_update(
+            "at_seq is not the current collection schema sequence",
+        ));
+    }
+    let mut fields = collection_fields(&state.db, access.object_id(), true).await?;
+    if collection.field_secrecy_enabled {
+        fields.retain(|field| !field_is_restricted(field));
+    }
+    let views = collection_views(&state.db, access.object_id()).await?;
+    let count = CountRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT count(*) AS count FROM flow_record_projections rp \
+         JOIN flow_objects fo ON fo.id = rp.record_id \
+         WHERE rp.collection_id = $1 AND fo.lifecycle_status = 'active'",
+        vec![access.object_id().into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or(ApiError::Internal)?;
+    if !policy::ensure_epoch_current(state, access.context()).await? {
+        return Ok(None);
+    }
+    Ok(Some(CollectionDescription {
+        object: query::object_view_from_row(object_row),
+        fields,
+        views,
+        record_count: count.count,
+        schema_seq: collection.schema_seq,
+        projection_seq: collection.schema_seq,
+        client_crdt_enabled: collection.client_crdt_enabled,
+        field_secrecy_enabled: collection.field_secrecy_enabled,
+    }))
+}
+
+fn typed_column(field_type: &str) -> Result<&'static str, ApiError> {
+    match field_type {
+        "text" => Ok("text_value"),
+        "number" => Ok("number_value"),
+        "boolean" => Ok("boolean_value"),
+        "date" => Ok("date_value"),
+        "select" => Ok("select_value"),
+        "multi_select" => Ok("multi_select_value"),
+        "relation" => Ok("relation_value"),
+        _ => Err(ApiError::invalid_update("unsupported collection field type")),
+    }
+}
+
+fn scalar_sql_parameter(column: &str, parameter: usize) -> Result<String, ApiError> {
+    match column {
+        "text_value" | "select_value" => Ok(format!(
+            "({parameter_sql}::jsonb #>> '{{}}')",
+            parameter_sql = format!("${parameter}")
+        )),
+        "number_value" => Ok(format!(
+            "({parameter_sql}::jsonb #>> '{{}}')::numeric",
+            parameter_sql = format!("${parameter}")
+        )),
+        "boolean_value" => Ok(format!(
+            "({parameter_sql}::jsonb #>> '{{}}')::boolean",
+            parameter_sql = format!("${parameter}")
+        )),
+        "date_value" => Ok(format!(
+            "({parameter_sql}::jsonb #>> '{{}}')::timestamptz",
+            parameter_sql = format!("${parameter}")
+        )),
+        "multi_select_value" | "relation_value" => Ok(format!("${parameter}::jsonb")),
+        _ => Err(ApiError::Internal),
+    }
+}
+
+async fn query_field<'a>(
+    fields: &'a [CollectionFieldView],
+    field_id: Uuid,
+) -> Result<&'a CollectionFieldView, ApiError> {
+    fields
+        .iter()
+        .find(|field| field.field_id == field_id && !field.archived && !field_is_restricted(field))
+        .ok_or_else(|| ApiError::invalid_update("query references an unknown, archived, or restricted field"))
+}
+
+pub async fn query_collection_records(
+    state: &AppState,
+    access: &policy::AuthorizedFlowObject,
+    request: &RecordQueryPayload,
+) -> Result<Option<RecordQueryResponse>, ApiError> {
+    query_collection_records_inner(state, access, request, false).await
+}
+
+#[cfg(test)]
+async fn query_collection_records_requiring_typed_index(
+    state: &AppState,
+    access: &policy::AuthorizedFlowObject,
+    request: &RecordQueryPayload,
+) -> Result<Option<RecordQueryResponse>, ApiError> {
+    query_collection_records_inner(state, access, request, true).await
+}
+
+async fn query_collection_records_inner(
+    state: &AppState,
+    access: &policy::AuthorizedFlowObject,
+    request: &RecordQueryPayload,
+    require_typed_index: bool,
+) -> Result<Option<RecordQueryResponse>, ApiError> {
+    if request.limit == 0 || request.limit > 100 {
+        return Err(ApiError::invalid_update("record query limit must be 1-100"));
+    }
+    if let Some(sort) = &request.sort
+        && !matches!(sort.direction.as_str(), "asc" | "desc")
+    {
+        return Err(ApiError::invalid_update(
+            "record query sort direction must be asc or desc",
+        ));
+    }
+    let collection = collection_read_row(&state.db, access.object_id()).await?;
+    let all_fields = collection_fields(&state.db, access.object_id(), false).await?;
+    let fingerprint = query_fingerprint(request)?;
+    let offset = request
+        .cursor
+        .as_deref()
+        .map(|raw| decode_query_cursor(state.cfg.jwt_secret.expose(), raw, &fingerprint))
+        .transpose()?
+        .unwrap_or(0);
+
+    let mut sql = String::from(
+        "SELECT rp.record_id, rp.properties, rp.document_seq FROM flow_record_projections rp \
+         JOIN flow_objects fo ON fo.id = rp.record_id",
+    );
+    let mut values: Vec<sea_orm::Value> = vec![access.object_id().into()];
+    if let Some(group_id) = request.group {
+        let field = query_field(&all_fields, group_id).await?;
+        let column = typed_column(&field.field_type)?;
+        values.push(group_id.into());
+        let _ = write!(
+            sql,
+            " LEFT JOIN flow_record_value_projections groupv ON groupv.record_id = rp.record_id \
+             AND groupv.collection_id = $1 AND groupv.field_id = ${}",
+            values.len()
+        );
+        let _ = column;
+    }
+    if let Some(sort) = &request.sort {
+        let field = query_field(&all_fields, sort.field_id).await?;
+        values.push(sort.field_id.into());
+        let _ = write!(
+            sql,
+            " LEFT JOIN flow_record_value_projections sortv ON sortv.record_id = rp.record_id \
+             AND sortv.collection_id = $1 AND sortv.field_id = ${}",
+            values.len()
+        );
+        let _ = typed_column(&field.field_type)?;
+    }
+    sql.push_str(" WHERE rp.collection_id = $1 AND fo.lifecycle_status = 'active'");
+    if let Some(filter) = &request.filter {
+        let field = query_field(&all_fields, filter.field_id).await?;
+        validate_typed_value(&field.field_type, &filter.value)?;
+        let column = typed_column(&field.field_type)?;
+        let operator = match filter.op.as_str() {
+            "eq" => "=",
+            "ne" => "<>",
+            "lt" if !matches!(column, "multi_select_value" | "relation_value") => "<",
+            "lte" if !matches!(column, "multi_select_value" | "relation_value") => "<=",
+            "gt" if !matches!(column, "multi_select_value" | "relation_value") => ">",
+            "gte" if !matches!(column, "multi_select_value" | "relation_value") => ">=",
+            "contains" if matches!(column, "multi_select_value" | "relation_value") => "@>",
+            _ => {
+                return Err(ApiError::invalid_update(
+                    "record query filter operator is not valid for the field type",
+                ));
+            }
+        };
+        values.push(filter.field_id.into());
+        let field_parameter = values.len();
+        values.push(filter.value.clone().into());
+        let value_parameter = values.len();
+        let typed_parameter = scalar_sql_parameter(column, value_parameter)?;
+        let _ = write!(
+            sql,
+            " AND EXISTS (SELECT 1 FROM flow_record_value_projections filterv \
+             WHERE filterv.collection_id = $1 AND filterv.record_id = rp.record_id \
+             AND filterv.field_id = ${field_parameter} AND filterv.{column} {operator} {typed_parameter})"
+        );
+    }
+    let mut order = Vec::new();
+    if let Some(group_id) = request.group {
+        let field = query_field(&all_fields, group_id).await?;
+        order.push(format!("groupv.{} ASC NULLS LAST", typed_column(&field.field_type)?));
+    }
+    if let Some(sort) = &request.sort {
+        let field = query_field(&all_fields, sort.field_id).await?;
+        order.push(format!(
+            "sortv.{} {} NULLS LAST",
+            typed_column(&field.field_type)?,
+            sort.direction.to_ascii_uppercase()
+        ));
+    }
+    order.push("rp.record_id ASC".to_string());
+    let _ = write!(sql, " ORDER BY {}", order.join(", "));
+    values.push(i64::from(offset).into());
+    let offset_parameter = values.len();
+    values.push(i64::from(QUERY_SCAN_ROWS_MAX).into());
+    let limit_parameter = values.len();
+    let _ = write!(sql, " OFFSET ${offset_parameter} LIMIT ${limit_parameter}");
+
+    #[cfg(not(test))]
+    let _ = require_typed_index;
+    #[cfg(test)]
+    if require_typed_index {
+        let explain = state
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                format!("EXPLAIN (FORMAT TEXT) {sql}"),
+                values.clone(),
+            ))
+            .await?;
+        let plan = explain
+            .iter()
+            .map(|row| row.try_get::<String>("", "QUERY PLAN").map_err(|_| ApiError::Internal))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n");
+        if !plan.contains("idx_flow_record_values_") {
+            return Err(ApiError::invalid_update(format!(
+                "typed Collection query did not use a typed value index: {plan}"
+            )));
+        }
+    }
+    let candidates =
+        RecordCandidateRow::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres, sql, values))
+            .all(&state.db)
+            .await?;
+    let candidate_ids = candidates.iter().map(|row| row.record_id).collect::<Vec<_>>();
+    let Some(visible) =
+        policy::authorize_flow_objects(state, access.context(), &candidate_ids, authz::PermissionLevel::View).await?
+    else {
+        return Ok(None);
+    };
+    if visible.len() != candidates.len() {
+        return Err(ApiError::Internal);
+    }
+
+    let requested_fields = if request.field_ids.is_empty() {
+        all_fields
+            .iter()
+            .filter(|field| !field_is_restricted(field))
+            .map(|field| field.field_id)
+            .collect::<BTreeSet<_>>()
+    } else {
+        request.field_ids.iter().copied().collect::<BTreeSet<_>>()
+    };
+    for field_id in &requested_fields {
+        let _ = query_field(&all_fields, *field_id).await?;
+    }
+
+    let mut items = Vec::new();
+    let mut last_returned_offset = None;
+    let mut has_more = false;
+    let mut projection_seq = collection.schema_seq;
+    for (index, (candidate, is_visible)) in candidates.iter().zip(visible).enumerate() {
+        if !is_visible {
+            continue;
+        }
+        if items.len() == usize::try_from(request.limit).map_err(|_| ApiError::Internal)? {
+            has_more = true;
+            break;
+        }
+        let object_row = repository::fetch_object_view(&state.db, candidate.record_id)
+            .await?
+            .ok_or(ApiError::Internal)?;
+        let properties = candidate.properties.as_object().ok_or(ApiError::Internal)?;
+        let values_by_field_id = properties
+            .iter()
+            .filter_map(|(field_id, value)| {
+                Uuid::parse_str(field_id)
+                    .ok()
+                    .filter(|field_id| requested_fields.contains(field_id))
+                    .map(|_| (field_id.clone(), value.clone()))
+            })
+            .collect();
+        projection_seq = projection_seq.max(candidate.document_seq);
+        let mut record = query::object_view_from_row(object_row);
+        if collection.field_secrecy_enabled {
+            record.semantic_content = json!({});
+        }
+        items.push(RecordQueryItem {
+            record,
+            values_by_field_id,
+        });
+        let consumed = u32::try_from(index + 1).map_err(|_| ApiError::Internal)?;
+        last_returned_offset = Some(offset.saturating_add(consumed));
+    }
+    if !has_more && candidates.len() == usize::try_from(QUERY_SCAN_ROWS_MAX).map_err(|_| ApiError::Internal)? {
+        if items.len() < usize::try_from(request.limit).map_err(|_| ApiError::Internal)? {
+            return Err(ApiError::limit_exceeded(
+                "record query authorization scan budget exhausted",
+                "scan_budget",
+                Some(json!(QUERY_SCAN_ROWS_MAX)),
+                Some(json!(QUERY_SCAN_ROWS_MAX)),
+                None,
+            ));
+        }
+        has_more = true;
+    }
+    let next_cursor = if has_more {
+        last_returned_offset
+            .map(|offset| {
+                encode_query_cursor(
+                    state.cfg.jwt_secret.expose(),
+                    &RecordQueryCursor { fingerprint, offset },
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let response_fields = all_fields
+        .into_iter()
+        .filter(|field| requested_fields.contains(&field.field_id) && !field_is_restricted(field))
+        .collect();
+    if !policy::ensure_epoch_current(state, access.context()).await? {
+        return Ok(None);
+    }
+    Ok(Some(RecordQueryResponse {
+        fields: response_fields,
+        items,
+        next_cursor,
+        projection_seq,
+        schema_seq: collection.schema_seq,
+    }))
+}
+
+fn record_query_requires_read_endpoint(payload: &Value) -> Result<AcceptedChange, ApiError> {
     let payload: RecordQueryPayload = parse_payload("record_query", payload)?;
     if payload.limit == 0 || payload.limit > 100 {
-        return Err(ApiError::invalid_update("record_query limit must be 1-100"));
+        return Err(ApiError::invalid_update("record query limit must be 1-100"));
     }
     Err(ApiError::invalid_update(
-        "record_query execution is reserved for the v0.6 query/index package",
+        "record_query is read-only; use the collection records or query endpoint",
     ))
 }
 
@@ -1939,7 +2613,7 @@ pub async fn execute(
         }
         CollectionCommandType::RecordPatch => record_patch(state, input, workspace_id, checked_epoch).await,
         CollectionCommandType::RecordArchive => archive_record(state, input, workspace_id, checked_epoch).await,
-        CollectionCommandType::RecordQuery => record_query_not_in_this_package(&input.payload),
+        CollectionCommandType::RecordQuery => record_query_requires_read_endpoint(&input.payload),
         CollectionCommandType::CreateCollectionEmbed => Err(ApiError::Internal),
     }
 }
@@ -2032,7 +2706,10 @@ mod tests {
         for root in ["apps/api/src", "apps/worker/src", "apps/mcp-server/src", "crates"] {
             production_files.extend(rust_files_below(&workspace.join(root)));
         }
-        assert!(!production_files.is_empty(), "production SQL source scan must be non-empty");
+        assert!(
+            !production_files.is_empty(),
+            "production SQL source scan must be non-empty"
+        );
         let mut forms_sources = Vec::new();
         for path in production_files {
             let relative = path
@@ -2057,7 +2734,10 @@ mod tests {
                 forms_sources.push(source);
             }
         }
-        assert!(!forms_sources.is_empty(), "reviewed Forms source scan must be non-empty");
+        assert!(
+            !forms_sources.is_empty(),
+            "reviewed Forms source scan must be non-empty"
+        );
         let forms_sources = forms_sources.join(" ");
         for table in [
             "flow_objects",
@@ -2088,6 +2768,8 @@ mod tests {
     clippy::too_many_lines
 )]
 mod database_tests {
+    use std::collections::BTreeSet;
+
     use axum::body::to_bytes;
     use axum::{Extension, Router, routing::post};
     use collab_core::{CollabEngine, NodeKind, Operation};
@@ -2101,14 +2783,16 @@ mod database_tests {
     use uuid::Uuid;
 
     use super::{
-        CollectionCommandType, EmbedFaultPoint, collection_operations, engine_at_head, execute_embed_with_fault,
-        node_id,
+        CollectionCommandType, CountRow, EmbedFaultPoint, RecordFilter, RecordQueryPayload, RecordSort,
+        collection_operations, engine_at_head, execute_embed_with_fault, node_id, query_collection_records,
+        query_collection_records_requiring_typed_index, rebuild_typed_projections,
     };
     use crate::error::ApiError;
     use crate::flow::collab::bootstrap;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
     use crate::flow::event_origin::{CommandOrigin, EventSurface};
     use crate::flow::repository;
+    use crate::flow::{collab::authz::PermissionLevel, policy};
     use crate::routes::flow::post_flow_object_command;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -2291,6 +2975,27 @@ mod database_tests {
             },
         )
         .await
+    }
+
+    async fn read_access(
+        state: &AppState,
+        workspace_id: Uuid,
+        owner_id: Uuid,
+        object_id: Uuid,
+    ) -> policy::AuthorizedFlowObject {
+        let claims = JwtClaims {
+            sub: owner_id.to_string(),
+            email: format!("{owner_id}@collection.test"),
+            token_type: TokenType::Access,
+            iat: 0,
+            exp: usize::MAX,
+        };
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(claims);
+        policy::require_flow_object_access(state, &extensions, workspace_id, object_id, PermissionLevel::View)
+            .await
+            .expect("collection authorization runs")
+            .expect("authorization epoch is stable")
     }
 
     #[tokio::test]
@@ -3175,5 +3880,472 @@ mod database_tests {
             "record head and typed projection must roll back together"
         );
         scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_record_query_uses_index_without_decoding_documents() {
+        let scratch = scratch_or_skip!("query_10k");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Ten thousand").await;
+        let field_id = Uuid::new_v4();
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({"field_id": field_id, "label": "Rank", "field_type": "number"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("number field creates");
+        let fixture_sql = format!(
+            r"
+            CREATE TEMP TABLE query_10k_fixture AS
+              SELECT gen_random_uuid() AS record_id, gen_random_uuid() AS document_id, n
+                FROM generate_series(1, 10000) n;
+            INSERT INTO flow_objects (id, workspace_id, object_type, parent_id, created_by)
+              SELECT record_id, '{workspace_id}', 'record', '{collection_id}', '{owner_id}'
+                FROM query_10k_fixture;
+            INSERT INTO collab_documents
+              (id, object_id, format_version, snapshot, snapshot_frontier, head_frontier, byte_count)
+              SELECT document_id, record_id, 'loro-1', decode('00', 'hex'), ''::bytea, ''::bytea, 1
+                FROM query_10k_fixture;
+            INSERT INTO flow_object_projections
+              (object_id, document_seq, document_frontier, title, state, plain_text)
+              SELECT record_id, 0, ''::bytea, '', '{{}}'::jsonb, '' FROM query_10k_fixture;
+            INSERT INTO flow_record_projections
+              (record_id, collection_id, document_id, properties, document_seq)
+              SELECT record_id, '{collection_id}', document_id,
+                     jsonb_build_object('{field_id}', n), 0
+                FROM query_10k_fixture;
+            INSERT INTO flow_record_value_projections
+              (record_id, collection_id, field_id, field_type, number_value, document_seq)
+              SELECT record_id, '{collection_id}', '{field_id}', 'number', n, 0
+                FROM query_10k_fixture;
+            ANALYZE flow_record_projections;
+            ANALYZE flow_record_value_projections;
+            "
+        );
+        state
+            .db
+            .execute_unprepared(&fixture_sql)
+            .await
+            .expect("ten thousand typed records insert");
+        let access = read_access(&state, workspace_id, owner_id, collection_id).await;
+        let response = query_collection_records_requiring_typed_index(
+            &state,
+            &access,
+            &RecordQueryPayload {
+                filter: Some(RecordFilter {
+                    field_id,
+                    op: "eq".to_string(),
+                    value: json!(7777),
+                }),
+                sort: None,
+                group: None,
+                cursor: None,
+                limit: 10,
+                field_ids: vec![field_id],
+            },
+        )
+        .await
+        .expect("typed query runs despite invalid document bytes")
+        .expect("authorization epoch is stable");
+        assert_eq!(response.items.len(), 1);
+        assert_eq!(response.fields.len(), 1);
+        assert_eq!(response.fields[0].field_id, field_id);
+        assert_eq!(response.fields[0].label, "Rank");
+        assert_eq!(
+            response.items[0].values_by_field_id.get(&field_id.to_string()),
+            Some(&json!(7777))
+        );
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn typed_projection_rebuild_matches_canonical() {
+        #[derive(Debug, FromQueryResult, PartialEq)]
+        struct ProjectionRow {
+            record_id: Uuid,
+            properties: Value,
+            values: Value,
+        }
+
+        async fn projection_rows(db: &DatabaseConnection, collection_id: Uuid) -> Vec<ProjectionRow> {
+            ProjectionRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT rp.record_id, rp.properties, COALESCE(jsonb_object_agg(v.field_id::text, \
+                 COALESCE(to_jsonb(v.number_value), to_jsonb(v.text_value))) \
+                 FILTER (WHERE v.field_id IS NOT NULL), '{}'::jsonb) AS values \
+                 FROM flow_record_projections rp LEFT JOIN flow_record_value_projections v \
+                 ON v.record_id = rp.record_id WHERE rp.collection_id = $1 \
+                 GROUP BY rp.record_id, rp.properties ORDER BY rp.record_id",
+                vec![collection_id.into()],
+            ))
+            .all(db)
+            .await
+            .expect("projection rows query runs")
+        }
+
+        let scratch = scratch_or_skip!("projection_rebuild");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Rebuild").await;
+        let number_id = Uuid::new_v4();
+        let text_id = Uuid::new_v4();
+        for (field_id, label, field_type) in [(number_id, "Count", "number"), (text_id, "Title", "text")] {
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "field_create",
+                json!({"field_id": field_id, "label": label, "field_type": field_type}),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("field creates");
+        }
+        for (count, title) in [(7, "seven"), (11, "eleven"), (19, "nineteen")] {
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "record_create",
+                json!({"properties": {number_id.to_string(): count, text_id.to_string(): title}}),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("record creates");
+        }
+        let expected = projection_rows(&state.db, collection_id).await;
+        exec(
+            &state.db,
+            "UPDATE flow_record_projections SET properties = '{}'::jsonb WHERE collection_id = $1",
+            vec![collection_id.into()],
+        )
+        .await;
+        exec(
+            &state.db,
+            "DELETE FROM flow_record_value_projections WHERE collection_id = $1",
+            vec![collection_id.into()],
+        )
+        .await;
+        let rebuilt = rebuild_typed_projections(&state, collection_id)
+            .await
+            .expect("canonical rebuild succeeds");
+        assert_eq!(rebuilt.record_count, 3);
+        assert_eq!(rebuilt.field_count, 2);
+        assert_eq!(rebuilt.value_count, 6);
+        assert_eq!(projection_rows(&state.db, collection_id).await, expected);
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn field_secrecy_client_crdt_denied_and_server_query_redacts_restricted_fields() {
+        let scratch = scratch_or_skip!("field_secrecy");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Restricted").await;
+        let field_id = Uuid::new_v4();
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({
+                "field_id": field_id,
+                "label": "Private salary",
+                "field_type": "number",
+                "config": {"restricted": true}
+            }),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("restricted field creates through the server-only schema path");
+        let record = command(
+            &state,
+            owner_id,
+            collection_id,
+            "record_create",
+            json!({"properties": {field_id.to_string(): 9001}, "body": "PRIVATE-BODY-9001"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("restricted record creates through the semantic API")
+        .object;
+        exec(
+            &state.db,
+            "UPDATE flow_collection_projections SET client_crdt_enabled = false, field_secrecy_enabled = true \
+             WHERE collection_id = $1",
+            vec![collection_id.into()],
+        )
+        .await;
+        let invalid_client_enable = state
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE flow_collection_projections SET client_crdt_enabled = true WHERE collection_id = $1",
+                vec![collection_id.into()],
+            ))
+            .await;
+        assert!(
+            invalid_client_enable.is_err(),
+            "database constraint must deny client CRDT with field secrecy"
+        );
+
+        let collection_access = read_access(&state, workspace_id, owner_id, collection_id).await;
+        let response = query_collection_records(
+            &state,
+            &collection_access,
+            &RecordQueryPayload {
+                filter: None,
+                sort: None,
+                group: None,
+                cursor: None,
+                limit: 10,
+                field_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("server-only query runs")
+        .expect("authorization epoch is stable");
+        assert!(response.fields.is_empty());
+        assert_eq!(response.items.len(), 1);
+        assert!(response.items[0].values_by_field_id.is_empty());
+        assert!(
+            !serde_json::to_string(&response)
+                .expect("response serializes")
+                .contains("9001")
+        );
+
+        let record_access = read_access(&state, workspace_id, owner_id, record.id).await;
+        let bootstrap = crate::flow::query::get_bootstrap(&state, &record_access, None, None).await;
+        assert!(
+            matches!(bootstrap, Err(ApiError::Forbidden(_))),
+            "full Record CRDT snapshot must be denied"
+        );
+        let leaked_events = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS count FROM business_events \
+             WHERE workspace_id = $1 AND (payload::text LIKE '%PRIVATE-BODY-9001%' \
+                OR metadata::text LIKE '%PRIVATE-BODY-9001%' OR payload::text LIKE '%9001%')",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("event leakage query runs")
+        .expect("event leakage count exists");
+        assert_eq!(
+            leaked_events.count, 0,
+            "history/event delivery material must not contain restricted values"
+        );
+        let leaked_search = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS count FROM flow_search_index search \
+             JOIN flow_objects object ON object.id = search.object_id \
+             WHERE object.workspace_id = $1 AND (search.title LIKE '%9001%' OR search.plain_text LIKE '%9001%')",
+            vec![workspace_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("search leakage query runs")
+        .expect("search leakage count exists");
+        assert_eq!(
+            leaked_search.count, 0,
+            "restricted values must not enter search projection"
+        );
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn collection_query_cursor_field_ids_sort_and_group_are_projection_backed() {
+        let scratch = scratch_or_skip!("query_page");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Query page").await;
+        let group_id = Uuid::new_v4();
+        let rank_id = Uuid::new_v4();
+        for (field_id, label, field_type) in [(group_id, "Status", "select"), (rank_id, "Rank", "number")] {
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "field_create",
+                json!({"field_id": field_id, "label": label, "field_type": field_type}),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("query field creates");
+        }
+        for (group, rank) in [("alpha", 1), ("beta", 8), ("alpha", 9)] {
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "record_create",
+                json!({"properties": {group_id.to_string(): group, rank_id.to_string(): rank}}),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .expect("query record creates");
+        }
+        let access = read_access(&state, workspace_id, owner_id, collection_id).await;
+        let mut request = RecordQueryPayload {
+            filter: None,
+            sort: Some(RecordSort {
+                field_id: rank_id,
+                direction: "desc".to_string(),
+            }),
+            group: Some(group_id),
+            cursor: None,
+            limit: 2,
+            field_ids: vec![group_id, rank_id],
+        };
+        let first = query_collection_records(&state, &access, &request)
+            .await
+            .expect("first page query runs")
+            .expect("first page epoch stable");
+        assert_eq!(first.items.len(), 2);
+        assert_eq!(
+            first
+                .fields
+                .iter()
+                .map(|field| (field.field_id, field.label.as_str()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(group_id, "Status"), (rank_id, "Rank")])
+        );
+        assert_eq!(
+            first.items[0].values_by_field_id.get(&group_id.to_string()),
+            Some(&json!("alpha"))
+        );
+        assert_eq!(
+            first.items[0].values_by_field_id.get(&rank_id.to_string()),
+            Some(&json!(9))
+        );
+        request.cursor = first.next_cursor;
+        let second = query_collection_records(&state, &access, &request)
+            .await
+            .expect("second page query runs")
+            .expect("second page epoch stable");
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(
+            second.items[0].values_by_field_id.get(&group_id.to_string()),
+            Some(&json!("beta"))
+        );
+        assert!(second.next_cursor.is_none());
+        scratch.drop_self().await;
+    }
+
+    #[test]
+    fn schema_field_and_view_convergence_keeps_stable_ids() {
+        let field_a = Uuid::new_v4();
+        let field_b = Uuid::new_v4();
+        let view_a = Uuid::new_v4();
+        let view_b = Uuid::new_v4();
+        let mut base = collab_core::LoroCollabEngine::new_empty(1);
+        for (id, kind, label_key, label, type_key, kind_name, index) in [
+            (
+                field_a,
+                NodeKind::CollectionField,
+                "label",
+                "Alpha",
+                "field_type",
+                "text",
+                0,
+            ),
+            (
+                view_a,
+                NodeKind::CollectionView,
+                "name",
+                "Table",
+                "view_type",
+                "table",
+                1,
+            ),
+        ] {
+            let node = node_id(id);
+            base.apply_operation(&Operation::CreateNode {
+                id: node.clone(),
+                parent: None,
+                index,
+                kind,
+            })
+            .expect("base node creates");
+            base.apply_operation(&Operation::SetProperty {
+                id: node.clone(),
+                key: label_key.to_string(),
+                value: label.to_string(),
+            })
+            .expect("base label sets");
+            base.apply_operation(&Operation::SetProperty {
+                id: node,
+                key: type_key.to_string(),
+                value: kind_name.to_string(),
+            })
+            .expect("base type sets");
+        }
+        let snapshot = base.export_snapshot().expect("base snapshot exports");
+        let frontier = base.frontier();
+        let mut left = collab_core::LoroCollabEngine::load(&snapshot).expect("left loads");
+        let mut right = collab_core::LoroCollabEngine::load(&snapshot).expect("right loads");
+        left.apply_operation(&Operation::SetProperty {
+            id: node_id(field_a),
+            key: "label".to_string(),
+            value: "Alpha renamed".to_string(),
+        })
+        .expect("field rename applies");
+        left.apply_operation(&Operation::CreateNode {
+            id: node_id(field_b),
+            parent: None,
+            index: 0,
+            kind: NodeKind::CollectionField,
+        })
+        .expect("concurrent field creates");
+        left.apply_operation(&Operation::MoveNode {
+            id: node_id(view_a),
+            new_parent: None,
+            index: 0,
+        })
+        .expect("view reorder applies");
+        right
+            .apply_operation(&Operation::CreateNode {
+                id: node_id(view_b),
+                parent: None,
+                index: 0,
+                kind: NodeKind::CollectionView,
+            })
+            .expect("concurrent view creates");
+        right
+            .apply_operation(&Operation::SetProperty {
+                id: node_id(view_a),
+                key: "name".to_string(),
+                value: "Grid renamed".to_string(),
+            })
+            .expect("view rename applies");
+        right
+            .apply_operation(&Operation::MoveNode {
+                id: node_id(field_a),
+                new_parent: None,
+                index: 1,
+            })
+            .expect("field reorder applies");
+        let left_update = left.export_from(&frontier).expect("left delta exports");
+        let right_update = right.export_from(&frontier).expect("right delta exports");
+        let mut merged_lr = collab_core::LoroCollabEngine::load(&snapshot).expect("merge lr loads");
+        merged_lr.import_update(&left_update).expect("left imports");
+        merged_lr.import_update(&right_update).expect("right imports");
+        let mut merged_rl = collab_core::LoroCollabEngine::load(&snapshot).expect("merge rl loads");
+        merged_rl.import_update(&right_update).expect("right imports");
+        merged_rl.import_update(&left_update).expect("left imports");
+        let semantic_lr = merged_lr.semantic_snapshot().expect("lr semantic snapshot");
+        let semantic_rl = merged_rl.semantic_snapshot().expect("rl semantic snapshot");
+        assert_eq!(semantic_lr, semantic_rl);
+        for stable_id in [field_a, field_b, view_a, view_b] {
+            assert!(
+                semantic_lr.nodes.contains_key(&node_id(stable_id)),
+                "stable id {stable_id} survives convergence"
+            );
+        }
     }
 }

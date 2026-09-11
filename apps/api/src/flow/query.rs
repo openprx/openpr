@@ -354,6 +354,11 @@ pub async fn get_bootstrap(
     if row.workspace_id != access.workspace_id() {
         return Err(ApiError::NotFound("flow object not found".to_string()));
     }
+    if matches!(row.object_type.as_str(), "collection" | "record") {
+        return Err(ApiError::Forbidden(
+            "collection and record documents are server-only; use typed collection endpoints".to_string(),
+        ));
+    }
     let document_id = row.document_id;
 
     // The exact loader the WebSocket `snapshot` frame uses (`flow::collab::session::run`) —

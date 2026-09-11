@@ -40,6 +40,7 @@ use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
 use crate::{
     error::ApiError,
     flow::{
+        collections::{self, RecordQueryPayload},
         command::{CreateObjectInput, ExecuteCommandInput, SetFlowFeatureInput},
         event_origin::{CommandOrigin, EventSource, EventSurface},
         grants::{self, Caller, GrantRequest, SetGrantsInput, SetInheritanceInput},
@@ -216,6 +217,172 @@ pub async fn list_flow_objects(
 pub struct GetFlowObjectQuery {
     pub at_seq: Option<i64>,
     pub render: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DescribeCollectionQuery {
+    pub at_seq: Option<i64>,
+}
+
+async fn collection_read_access(
+    state: &AppState,
+    extensions: &axum::http::Extensions,
+    collection_id: Uuid,
+) -> Result<Option<policy::AuthorizedFlowObject>, ApiError> {
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, collection_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("collection not found".to_string()))?;
+    policy::require_flow_object_access(
+        state,
+        extensions,
+        workspace_id,
+        collection_id,
+        crate::flow::collab::authz::PermissionLevel::View,
+    )
+    .await
+}
+
+/// `GET /api/v1/flow/collections/{collection_id}` and the Collection branch of the schema
+/// resource. Both are served from synchronous projections; neither decodes collab bytes.
+pub async fn get_flow_collection(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(collection_id): Path<Uuid>,
+    Query(params): Query<DescribeCollectionQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = collection_read_access(&state, &extensions, collection_id).await? else {
+            continue;
+        };
+        let Some(description) = collections::describe_collection(&state, &access, params.at_seq).await? else {
+            continue;
+        };
+        return Ok(ApiResponse::success(description));
+    }
+    Err(policy::authorization_read_unstable())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GetCollectionRecordsQuery {
+    pub filter: Option<String>,
+    pub sort: Option<String>,
+    pub group: Option<Uuid>,
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+    pub field_ids: Option<String>,
+}
+
+fn parse_json_query<T: for<'de> Deserialize<'de>>(raw: Option<String>, name: &str) -> Result<Option<T>, ApiError> {
+    raw.map(|raw| serde_json::from_str(&raw).map_err(|_| ApiError::invalid_update(format!("{name} is not valid JSON"))))
+        .transpose()
+}
+
+fn parse_field_ids(raw: Option<String>) -> Result<Vec<Uuid>, ApiError> {
+    raw.map_or_else(
+        || Ok(Vec::new()),
+        |raw| {
+            raw.split(',')
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    Uuid::parse_str(part)
+                        .map_err(|_| ApiError::invalid_update("field_ids must be comma-separated UUIDs"))
+                })
+                .collect()
+        },
+    )
+}
+
+/// `GET /api/v1/flow/collections/{collection_id}/records`.
+pub async fn get_flow_collection_records(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(collection_id): Path<Uuid>,
+    Query(params): Query<GetCollectionRecordsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let request = RecordQueryPayload {
+        filter: parse_json_query(params.filter, "filter")?,
+        sort: parse_json_query(params.sort, "sort")?,
+        group: params.group,
+        cursor: params.cursor,
+        limit: params.limit.unwrap_or(50),
+        field_ids: parse_field_ids(params.field_ids)?,
+    };
+    query_flow_collection(&state, claims, bot, collection_id, &request).await
+}
+
+async fn query_flow_collection(
+    state: &AppState,
+    claims: JwtClaims,
+    bot: Option<Extension<BotAuthContext>>,
+    collection_id: Uuid,
+    request: &RecordQueryPayload,
+) -> Result<axum::response::Response, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    for _attempt in 0..policy::AUTHORIZATION_READ_ATTEMPTS {
+        let Some(access) = collection_read_access(state, &extensions, collection_id).await? else {
+            continue;
+        };
+        let Some(response) = collections::query_collection_records(state, &access, request).await? else {
+            continue;
+        };
+        return Ok(ApiResponse::success(response).into_response());
+    }
+    Err(policy::authorization_read_unstable())
+}
+
+/// `POST /api/v1/flow/collections/{collection_id}/query`.
+pub async fn post_flow_collection_query(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(collection_id): Path<Uuid>,
+    Json(request): Json<RecordQueryPayload>,
+) -> Result<impl IntoResponse, ApiError> {
+    query_flow_collection(&state, claims, bot, collection_id, &request).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCollectionRecordRequest {
+    pub values_by_field_id: serde_json::Map<String, Value>,
+    pub body: Option<String>,
+    pub idempotency_key: String,
+    pub message: Option<String>,
+}
+
+/// `POST /api/v1/flow/collections/{collection_id}/records`.
+pub async fn post_flow_collection_record(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(collection_id): Path<Uuid>,
+    Json(req): Json<CreateCollectionRecordRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let workspace_id = crate::flow::repository::fetch_object_workspace(&state.db, collection_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("collection not found".to_string()))?;
+    let (actor_id, role, is_bot) = policy::require_flow_workspace_access(&state, &extensions, workspace_id).await?;
+    let accepted = crate::flow::command::execute_command(
+        &state,
+        ExecuteCommandInput {
+            object_id: collection_id,
+            actor_id,
+            principal_kind: if is_bot { "bot".to_string() } else { "user".to_string() },
+            role,
+            command_type: "record_create".to_string(),
+            payload: serde_json::json!({"properties": req.values_by_field_id, "body": req.body}),
+            expected_frontier: None,
+            idempotency_key: req.idempotency_key,
+            message: req.message,
+            origin_client_id: format!("rest:{actor_id}"),
+            origin: request_origin(&extensions),
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(accepted))
 }
 
 #[derive(Debug, Deserialize)]
