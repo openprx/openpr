@@ -145,6 +145,39 @@ pub fn redact_flow_event_payload_for_delivery(event_type: &str, payload: &Value)
     Value::Object(kept)
 }
 
+/// Fail-closed delivery filter for the metadata channel. Replay receipts,
+/// request messages, and command results are internal database state and must
+/// never bypass the payload policy by riding beside it in the envelope.
+#[must_use]
+pub fn redact_flow_event_metadata_for_delivery(metadata: &Value) -> Value {
+    const PUBLIC_KEYS: &[&str] = &[
+        "delivery_class",
+        "outcome",
+        "action",
+        "object_id",
+        "object_type",
+        "document_id",
+        "accepted_seq",
+        "projection_seq",
+        "before_frontier",
+        "after_frontier",
+        "affected_object_ids",
+        "semantic_summary",
+        "error_code",
+        "idempotency_key",
+    ];
+    let Value::Object(entries) = metadata else {
+        return withheld_object();
+    };
+    let mut kept = Map::new();
+    for (key, value) in entries {
+        if PUBLIC_KEYS.contains(&key.as_str()) {
+            kept.insert(key.clone(), value.clone());
+        }
+    }
+    Value::Object(kept)
+}
+
 /// Collect every string literal of `source` that looks like a Flow event type, the same
 /// bracket-scanning approach `forms::event_redaction::event_type_literals` uses, line-scoped the
 /// same way `scripts/verify-flow-events-v0.4.sh`'s own static check is: a line containing
@@ -198,7 +231,7 @@ fn looks_like_flow_event_type(literal: &str) -> bool {
 mod tests {
     use super::{
         EVENT_REDACTED_MARKER, FLOW_EVENT_PAYLOAD_POLICIES, event_type_literals, flow_event_payload_policy,
-        redact_flow_event_payload_for_delivery,
+        redact_flow_event_metadata_for_delivery, redact_flow_event_payload_for_delivery,
     };
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -294,6 +327,32 @@ mod tests {
             let filtered = redact_flow_event_payload_for_delivery(event_type, &payload);
             assert_eq!(filtered, json!({"collection_id": "c", "record_id": "r"}));
         }
+    }
+
+    #[test]
+    fn delivery_metadata_withholds_record_content_and_internal_replay_receipts() {
+        let metadata = json!({
+            "idempotency_body": {
+                "properties": {"salary": "SECRET-SALARY-9001"},
+                "body": "SECRET-BODY-NOTE"
+            },
+            "idempotency_fingerprint": "safe-but-internal",
+            "message": "SECRET-MESSAGE",
+            "semantic_summary": {"action": "record_create"},
+            "affected_object_ids": ["record-id"]
+        });
+
+        let delivered = redact_flow_event_metadata_for_delivery(&metadata);
+
+        assert_eq!(
+            delivered,
+            json!({
+                "semantic_summary": {"action": "record_create"},
+                "affected_object_ids": ["record-id"]
+            })
+        );
+        let encoded = serde_json::to_string(&delivered).expect("delivery metadata serializes");
+        assert!(!encoded.contains("SECRET-"));
     }
 
     #[test]

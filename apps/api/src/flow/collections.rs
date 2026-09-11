@@ -11,6 +11,7 @@ use platform::app::AppState;
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::ApiError;
@@ -340,7 +341,18 @@ async fn sync_collection_projection(
             .properties
             .get("field_type")
             .ok_or_else(|| ApiError::invalid_update("field type is missing"))?;
-        validate_field_type(field_type)?;
+        if let Err(error) = validate_field_type(field_type) {
+            if node.deleted {
+                tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "DELETE FROM flow_field_projections WHERE collection_id = $1 AND field_id = $2",
+                    vec![collection_id.into(), field_id.into()],
+                ))
+                .await?;
+                continue;
+            }
+            return Err(error);
+        }
         let label = node
             .properties
             .get("label")
@@ -999,6 +1011,11 @@ struct RecordCreateIdempotencyBody {
     body: Option<String>,
 }
 
+fn record_create_idempotency_fingerprint(body: &RecordCreateIdempotencyBody) -> Result<String, ApiError> {
+    let canonical = serde_json::to_vec(body).map_err(|_| ApiError::Internal)?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
 async fn replay_record_create(
     state: &AppState,
     workspace_id: Uuid,
@@ -1013,15 +1030,17 @@ async fn replay_record_create(
             "idempotency_key was already used for a different operation".to_string(),
         ));
     }
-    let stored: RecordCreateIdempotencyBody = serde_json::from_value(
-        event
-            .metadata
-            .get("idempotency_body")
-            .cloned()
-            .ok_or_else(|| ApiError::Conflict("record create replay identity is missing".to_string()))?,
-    )
-    .map_err(|_| ApiError::Conflict("record create replay identity is invalid".to_string()))?;
-    if stored != *body {
+    let expected = record_create_idempotency_fingerprint(body)?;
+    let matches = if let Some(stored) = event.metadata.get("idempotency_fingerprint").and_then(Value::as_str) {
+        stored == expected
+    } else if let Some(legacy) = event.metadata.get("idempotency_body") {
+        serde_json::from_value::<RecordCreateIdempotencyBody>(legacy.clone()).is_ok_and(|stored| stored == *body)
+    } else {
+        return Err(ApiError::Conflict(
+            "record create replay identity is missing".to_string(),
+        ));
+    };
+    if !matches {
         return Err(ApiError::Conflict(
             "idempotency_key was already used with a different record create request".to_string(),
         ));
@@ -1050,6 +1069,7 @@ async fn create_record(
         properties: payload.properties.clone(),
         body: payload.body.clone(),
     };
+    let idempotency_fingerprint = record_create_idempotency_fingerprint(&idempotency_body)?;
     if let Some(replay) = replay_record_create(state, workspace_id, &input.idempotency_key, &idempotency_body).await? {
         return Ok(replay);
     }
@@ -1119,7 +1139,7 @@ async fn create_record(
             actor_id: actor_user_id(input.actor_id, input.actor_is_bot()),
             source: input.origin.source_json(),
             payload: json!({"collection_id": input.object_id, "record_id": record_id}),
-            metadata: json!({"idempotency_body": idempotency_body}),
+            metadata: json!({"idempotency_fingerprint": idempotency_fingerprint}),
             correlation_id: Some(input.origin.correlation_id),
             causation_id: input.origin.causation_id,
             idempotency_key: Some(input.idempotency_key.clone()),
@@ -1914,6 +1934,7 @@ mod tests {
 mod database_tests {
     use axum::body::to_bytes;
     use axum::{Extension, Router, routing::post};
+    use collab_core::{CollabEngine, NodeKind, Operation};
     use platform::{
         app::AppState,
         auth::{JwtClaims, TokenType},
@@ -1923,7 +1944,12 @@ mod database_tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
 
-    use super::{EmbedFaultPoint, execute_embed_with_fault};
+    use super::{
+        CollectionCommandType, EmbedFaultPoint, collection_operations, engine_at_head, execute_embed_with_fault,
+        node_id,
+    };
+    use crate::error::ApiError;
+    use crate::flow::collab::bootstrap;
     use crate::flow::command::{CreateObjectInput, ExecuteCommandInput, create_object, execute_command};
     use crate::flow::event_origin::{CommandOrigin, EventSurface};
     use crate::flow::repository;
@@ -2316,6 +2342,158 @@ mod database_tests {
         )
         .await;
         assert!(generic_record.is_err(), "generic object create must reject Record");
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn collection_and_record_writes_require_typed_server_paths_and_corrupt_field_can_be_archived() {
+        let scratch = scratch_or_skip!("typed_only");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Guarded").await;
+        let collection = repository::fetch_object_view(&state.db, collection_id)
+            .await
+            .expect("collection lookup runs")
+            .expect("collection exists");
+        let bad_field_id = Uuid::new_v4();
+        let semantic_patch = json!({"operations": [
+            {"op": "create_node", "id": bad_field_id, "parent": null, "index": 0, "kind": "collection_field"},
+            {"op": "set_property", "id": bad_field_id, "key": "field_type", "value": "formula"},
+            {"op": "set_property", "id": bad_field_id, "key": "label", "value": "Forbidden formula"}
+        ]});
+
+        let generic = command(
+            &state,
+            owner_id,
+            collection_id,
+            "semantic_patch",
+            semantic_patch,
+            Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert!(
+            matches!(generic, Err(ApiError::Typed { ref message, .. }) if message.contains("typed collection commands")),
+            "generic content path must reject Collection documents: {generic:?}"
+        );
+        let formula = command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({"field_id": bad_field_id, "label": "Formula", "field_type": "formula"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert!(
+            matches!(formula, Err(ApiError::Typed { ref message, .. }) if message.contains("unsupported collection field type")),
+            "typed write must reject deferred field types: {formula:?}"
+        );
+        let formula_operations = collection_operations(
+            &state,
+            collection.document_id,
+            CollectionCommandType::FieldCreate,
+            &json!({"field_id": Uuid::new_v4(), "label": "Formula", "field_type": "formula"}),
+        )
+        .await;
+        assert!(
+            matches!(formula_operations, Err(ApiError::Typed { ref message, .. }) if message.contains("unsupported collection field type")),
+            "write-time validator must reject before projection synchronization: {formula_operations:?}"
+        );
+        let ticket = crate::flow::collab::ticket::issue(
+            &state.db,
+            crate::flow::collab::ticket::IssueTicketInput {
+                user_id: owner_id,
+                workspace_id,
+                document_id: collection.document_id,
+                client_id: "collection-ticket-probe".to_string(),
+                origin: "https://flow.test".to_string(),
+            },
+            &["https://flow.test".to_string()],
+        )
+        .await;
+        assert!(matches!(ticket, Err(ApiError::Forbidden(message)) if message.contains("server-only typed commands")));
+
+        let boot = bootstrap::load(&state.db, collection.document_id)
+            .await
+            .expect("collection bootstrap loads");
+        let mut corrupt = engine_at_head(&boot).expect("collection engine loads");
+        let bad_node = node_id(bad_field_id);
+        for operation in [
+            Operation::CreateNode {
+                id: bad_node.clone(),
+                parent: None,
+                index: 0,
+                kind: NodeKind::CollectionField,
+            },
+            Operation::SetProperty {
+                id: bad_node.clone(),
+                key: "field_type".to_string(),
+                value: "formula".to_string(),
+            },
+            Operation::SetProperty {
+                id: bad_node,
+                key: "label".to_string(),
+                value: "Legacy corrupt field".to_string(),
+            },
+        ] {
+            corrupt
+                .apply_operation(&operation)
+                .expect("legacy corruption fixture applies");
+        }
+        let snapshot = corrupt.export_snapshot().expect("legacy corrupt snapshot exports");
+        let frontier = corrupt.frontier().as_bytes().to_vec();
+        exec(
+            &state.db,
+            "UPDATE collab_documents SET snapshot = $2, snapshot_frontier = $3, head_frontier = $3 WHERE id = $1",
+            vec![collection.document_id.into(), snapshot.into(), frontier.into()],
+        )
+        .await;
+
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_archive",
+            json!({"field_id": bad_field_id}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("an unsupported legacy field remains archivable");
+        let valid_field_id = Uuid::new_v4();
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({"field_id": valid_field_id, "label": "Recovered", "field_type": "text"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("collection accepts typed writes after rescue");
+
+        let record = command(
+            &state,
+            owner_id,
+            collection_id,
+            "record_create",
+            json!({"properties": {valid_field_id.to_string(): "value"}}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("record creates");
+        let record_generic = command(
+            &state,
+            owner_id,
+            record.object.id,
+            "semantic_patch",
+            json!({"operations": []}),
+            Uuid::new_v4().to_string(),
+        )
+        .await;
+        assert!(
+            matches!(record_generic, Err(ApiError::Typed { ref message, .. }) if message.contains("typed collection commands")),
+            "generic content path must reject Record documents: {record_generic:?}"
+        );
         scratch.drop_self().await;
     }
 

@@ -1193,6 +1193,7 @@ fn envelope_json(
 ) -> Value {
     let raw_payload = payload_override.unwrap_or_else(|| event.payload.clone());
     let payload = crate::flow::event_policy::redact_flow_event_payload_for_delivery(&event.event_type, &raw_payload);
+    let metadata = crate::flow::event_policy::redact_flow_event_metadata_for_delivery(&event.metadata);
     json!({
         "version": "openpr.event.v1",
         "event_id": event_id_override.unwrap_or(event.id),
@@ -1203,7 +1204,7 @@ fn envelope_json(
         "actor_id": event.actor_id,
         "source": event.source,
         "payload": payload,
-        "metadata": event.metadata,
+        "metadata": metadata,
         "correlation_id": event.correlation_id,
         "causation_id": event.causation_id,
         "created_at": created_at_override.unwrap_or(event.created_at).to_rfc3339(),
@@ -1441,16 +1442,50 @@ mod dispatcher_database_tests {
     use uuid::Uuid;
 
     use super::{
-        DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B, OLDEST_PENDING_AGE_ALERT_MS,
-        SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body, dispatcher_is_live,
-        dispatcher_is_live_since, ensure_workspace_subscriber_slot, expand_one, oldest_pending_delivery_age_ms,
-        oldest_pending_dispatch_age_ms, reap_delivery_source_tombstones, reclaim_expired_delivery_leases,
-        reclaim_expired_dispatch_leases, requeue_failed, run_tick, send_one, workspace_subscriber_count,
+        BusinessEventRow, DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B,
+        OLDEST_PENDING_AGE_ALERT_MS, SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body,
+        dispatcher_is_live, dispatcher_is_live_since, ensure_workspace_subscriber_slot, envelope_json, expand_one,
+        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_source_tombstones,
+        reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases, requeue_failed, run_tick, send_one,
+        workspace_subscriber_count,
     };
     use crate::error::ApiError;
     use crate::events::{BusinessEventInput, insert_business_event};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    #[test]
+    fn delivery_envelope_redacts_record_content_from_metadata() {
+        let event = BusinessEventRow {
+            id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            project_id: None,
+            event_type: "flow.record.created".to_string(),
+            aggregate_type: "flow_record".to_string(),
+            aggregate_id: Uuid::new_v4().to_string(),
+            actor_id: Some(Uuid::new_v4()),
+            source: json!({"surface": "rest"}),
+            payload: json!({"collection_id": "collection", "record_id": "record"}),
+            metadata: json!({
+                "idempotency_body": {
+                    "properties": {"salary": "SECRET-SALARY-9001"},
+                    "body": "SECRET-BODY-NOTE"
+                },
+                "idempotency_fingerprint": "internal",
+                "message": "SECRET-MESSAGE"
+            }),
+            correlation_id: None,
+            causation_id: None,
+            created_at: Utc::now(),
+        };
+
+        let envelope = envelope_json(&event, None, None, None);
+        let encoded = serde_json::to_string(&envelope).expect("envelope serializes");
+        assert_eq!(envelope["metadata"], json!({}));
+        for secret in ["SECRET-SALARY-9001", "SECRET-BODY-NOTE", "SECRET-MESSAGE"] {
+            assert!(!encoded.contains(secret), "delivery envelope leaked {secret}");
+        }
+    }
 
     struct Scratch {
         db: DatabaseConnection,

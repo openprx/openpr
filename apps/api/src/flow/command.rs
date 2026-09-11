@@ -1358,8 +1358,13 @@ async fn execute_command_authorized(
     kind: CommandKind,
     workspace_id: Uuid,
     document_id: Uuid,
-    _object_type: &str,
+    object_type: &str,
 ) -> Result<AcceptedChange, ApiError> {
+    if matches!(kind, CommandKind::Content(_)) && matches!(object_type, "collection" | "record") {
+        return Err(ApiError::invalid_update(
+            "collection and record content must use typed collection commands",
+        ));
+    }
     // Relation commands have a relation id (not the source object id) as their event aggregate,
     // and their replay identity also includes the target/relation id from the payload. Let their
     // module perform that richer replay check before the generic object/document aggregate check.

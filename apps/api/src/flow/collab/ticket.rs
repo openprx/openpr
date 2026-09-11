@@ -48,6 +48,10 @@ fn validate_client_id(client_id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn object_type_admits_collab_session(object_type: &str) -> bool {
+    !matches!(object_type, "collection" | "record")
+}
+
 /// Issues a one-time ticket. Callers must already have rejected `BotAuthContext` (`ADR-0007`:
 /// "handler 在 `BotAuthContext` 存在时返回 forbidden"); everything else `ADR-0007` requires
 /// "签发前" happens here: the strict Origin allowlist, workspace membership, the workspace's
@@ -155,10 +159,11 @@ pub async fn issue(
     #[derive(FromQueryResult)]
     struct DocRow {
         object_id: Uuid,
+        object_type: String,
     }
     let doc = DocRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT d.object_id FROM collab_documents d \
+        "SELECT d.object_id, o.object_type FROM collab_documents d \
          JOIN flow_objects o ON o.id = d.object_id \
          WHERE d.id = $1 AND o.workspace_id = $2",
         vec![input.document_id.into(), input.workspace_id.into()],
@@ -166,6 +171,11 @@ pub async fn issue(
     .one(&tx)
     .await?
     .ok_or_else(|| ApiError::NotFound("document not found".to_string()))?;
+    if !object_type_admits_collab_session(&doc.object_type) {
+        return Err(ApiError::Forbidden(
+            "collection and record documents require server-only typed commands".to_string(),
+        ));
+    }
 
     let level = super::authz::effective_permission(
         &tx,
@@ -293,12 +303,20 @@ pub async fn consume<C: ConnectionTrait>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    use super::validate_client_id;
+    use super::{object_type_admits_collab_session, validate_client_id};
 
     #[test]
     fn client_id_rejects_empty_and_overlong() {
         assert!(validate_client_id("").is_err());
         assert!(validate_client_id(&"x".repeat(257)).is_err());
         assert!(validate_client_id("client-1").is_ok());
+    }
+
+    #[test]
+    fn collection_and_record_documents_cannot_receive_collab_tickets() {
+        assert!(object_type_admits_collab_session("page"));
+        assert!(object_type_admits_collab_session("navigator"));
+        assert!(!object_type_admits_collab_session("collection"));
+        assert!(!object_type_admits_collab_session("record"));
     }
 }
