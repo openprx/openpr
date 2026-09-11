@@ -4520,115 +4520,124 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
-    #[test]
-    fn schema_field_and_view_convergence_keeps_stable_ids() {
+    #[tokio::test]
+    async fn schema_field_and_view_convergence_keeps_stable_ids() {
+        let scratch = scratch_or_skip!("schema_convergence");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed(&state).await;
+        let collection_id = create_object_for(&state, workspace_id, owner_id, "collection", "Convergence").await;
         let field_a = Uuid::new_v4();
         let field_b = Uuid::new_v4();
         let view_a = Uuid::new_v4();
         let view_b = Uuid::new_v4();
-        let mut base = collab_core::LoroCollabEngine::new_empty(1);
-        for (id, kind, label_key, label, type_key, kind_name, index) in [
-            (
-                field_a,
-                NodeKind::CollectionField,
-                "label",
-                "Alpha",
-                "field_type",
-                "text",
-                0,
-            ),
-            (
-                view_a,
-                NodeKind::CollectionView,
-                "name",
-                "Table",
-                "view_type",
-                "table",
-                1,
-            ),
-        ] {
-            let node = node_id(id);
-            base.apply_operation(&Operation::CreateNode {
-                id: node.clone(),
-                parent: None,
-                index,
-                kind,
-            })
-            .expect("base node creates");
-            base.apply_operation(&Operation::SetProperty {
-                id: node.clone(),
-                key: label_key.to_string(),
-                value: label.to_string(),
-            })
-            .expect("base label sets");
-            base.apply_operation(&Operation::SetProperty {
-                id: node,
-                key: type_key.to_string(),
-                value: kind_name.to_string(),
-            })
-            .expect("base type sets");
-        }
-        let snapshot = base.export_snapshot().expect("base snapshot exports");
-        let frontier = base.frontier();
-        let mut left = collab_core::LoroCollabEngine::load(&snapshot).expect("left loads");
-        let mut right = collab_core::LoroCollabEngine::load(&snapshot).expect("right loads");
-        left.apply_operation(&Operation::SetProperty {
-            id: node_id(field_a),
-            key: "label".to_string(),
-            value: "Alpha renamed".to_string(),
-        })
-        .expect("field rename applies");
-        left.apply_operation(&Operation::CreateNode {
-            id: node_id(field_b),
-            parent: None,
-            index: 0,
-            kind: NodeKind::CollectionField,
-        })
-        .expect("concurrent field creates");
-        left.apply_operation(&Operation::MoveNode {
-            id: node_id(view_a),
-            new_parent: None,
-            index: 0,
-        })
-        .expect("view reorder applies");
-        right
-            .apply_operation(&Operation::CreateNode {
-                id: node_id(view_b),
-                parent: None,
-                index: 0,
-                kind: NodeKind::CollectionView,
-            })
-            .expect("concurrent view creates");
-        right
-            .apply_operation(&Operation::SetProperty {
-                id: node_id(view_a),
-                key: "name".to_string(),
-                value: "Grid renamed".to_string(),
-            })
-            .expect("view rename applies");
-        right
-            .apply_operation(&Operation::MoveNode {
-                id: node_id(field_a),
-                new_parent: None,
-                index: 1,
-            })
-            .expect("field reorder applies");
-        let left_update = left.export_from(&frontier).expect("left delta exports");
-        let right_update = right.export_from(&frontier).expect("right delta exports");
-        let mut merged_lr = collab_core::LoroCollabEngine::load(&snapshot).expect("merge lr loads");
-        merged_lr.import_update(&left_update).expect("left imports");
-        merged_lr.import_update(&right_update).expect("right imports");
-        let mut merged_rl = collab_core::LoroCollabEngine::load(&snapshot).expect("merge rl loads");
-        merged_rl.import_update(&right_update).expect("right imports");
-        merged_rl.import_update(&left_update).expect("left imports");
-        let semantic_lr = merged_lr.semantic_snapshot().expect("lr semantic snapshot");
-        let semantic_rl = merged_rl.semantic_snapshot().expect("rl semantic snapshot");
-        assert_eq!(semantic_lr, semantic_rl);
-        for stable_id in [field_a, field_b, view_a, view_b] {
-            assert!(
-                semantic_lr.nodes.contains_key(&node_id(stable_id)),
-                "stable id {stable_id} survives convergence"
-            );
-        }
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "field_create",
+            json!({"field_id": field_a, "label": "Alpha", "field_type": "text"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("base field creates through the production command path");
+        command(
+            &state,
+            owner_id,
+            collection_id,
+            "view_create",
+            json!({"view_id": view_a, "name": "Table", "view_type": "table"}),
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("base view creates through the production command path");
+
+        let left = async {
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "field_create",
+                json!({"field_id": field_b, "label": "Beta", "field_type": "number", "index": 0}),
+                Uuid::new_v4().to_string(),
+            )
+            .await?;
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "field_update",
+                json!({"field_id": field_a, "label": "Alpha renamed"}),
+                Uuid::new_v4().to_string(),
+            )
+            .await?;
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "view_reorder",
+                json!({"view_id": view_a, "index": 1}),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+        };
+        let right = async {
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "view_create",
+                json!({"view_id": view_b, "name": "Board", "view_type": "board", "index": 0}),
+                Uuid::new_v4().to_string(),
+            )
+            .await?;
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "view_update",
+                json!({"view_id": view_a, "name": "Grid renamed"}),
+                Uuid::new_v4().to_string(),
+            )
+            .await?;
+            command(
+                &state,
+                owner_id,
+                collection_id,
+                "field_reorder",
+                json!({"field_id": field_a, "index": 1}),
+                Uuid::new_v4().to_string(),
+            )
+            .await
+        };
+        let (left_result, right_result) = tokio::join!(left, right);
+        left_result.expect("left concurrent production command sequence converges");
+        right_result.expect("right concurrent production command sequence converges");
+
+        let described = describe_collection(
+            &state,
+            &read_access(&state, workspace_id, owner_id, collection_id).await,
+            None,
+        )
+        .await
+        .expect("converged collection describes")
+        .expect("authorization epoch is stable");
+        assert_eq!(
+            described
+                .fields
+                .iter()
+                .map(|field| (field.field_id, field.label.as_str()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(field_a, "Alpha renamed"), (field_b, "Beta")])
+        );
+        assert_eq!(
+            described
+                .views
+                .iter()
+                .map(|view| (view.view_id, view.name.as_str()))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(view_a, "Grid renamed"), (view_b, "Board")])
+        );
+        assert_eq!(described.schema_seq, 8);
+        scratch.drop_self().await;
     }
 }
