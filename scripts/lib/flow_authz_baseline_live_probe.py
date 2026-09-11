@@ -148,7 +148,7 @@ def cli_get(args: argparse.Namespace, object_id: str) -> dict:
     return outputs
 
 
-def normalize_object(envelope: dict) -> dict:
+def normalize_rest_object(envelope: dict) -> dict:
     data = envelope.get("data") if isinstance(envelope, dict) else None
     if not isinstance(data, dict):
         return {"code": envelope.get("code") if isinstance(envelope, dict) else None, "invalid": True}
@@ -160,18 +160,68 @@ def normalize_object(envelope: dict) -> dict:
     }
 
 
+def normalize_mcp_object(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"code": None, "invalid": True}
+    return {
+        "code": 0,
+        "title": payload.get("title"),
+        "lifecycle_status": payload.get("lifecycle_status"),
+        "document_seq": payload.get("document_seq"),
+    }
+
+
+def rest_history_succeeded(envelope: dict) -> bool:
+    data = envelope.get("data") if isinstance(envelope, dict) else None
+    return envelope.get("code") == 0 and isinstance(data, dict) and isinstance(data.get("items"), list)
+
+
+def mcp_history_succeeded(payload: dict) -> bool:
+    return isinstance(payload, dict) and isinstance(payload.get("items"), list)
+
+
+def cli_history_succeeded(result: dict) -> bool:
+    body = result.get("body") if isinstance(result, dict) else None
+    data = body.get("data") if isinstance(body, dict) else None
+    return (
+        result.get("exit_code") == 0
+        and body.get("ok") is True
+        and isinstance(data, dict)
+        and isinstance(data.get("items"), list)
+    )
+
+
+def object_projection_matches(value: dict, title: str, lifecycle_status: str, document_seq: int) -> bool:
+    return value == {
+        "code": 0,
+        "title": title,
+        "lifecycle_status": lifecycle_status,
+        "document_seq": document_seq,
+    }
+
+
 def observe(args: argparse.Namespace, object_id: str, label: str) -> dict:
     rest_object = request(args.api, args.bot_token, "GET", f"/api/v1/flow/objects/{object_id}")
     rest_history = request(args.api, args.bot_token, "GET", f"/api/v1/flow/objects/{object_id}/history?limit=100")
     mcp = {transport: mcp_get(args, transport, object_id, label) for transport in ("http", "sse", "stdio")}
     cli = cli_get(args, object_id)
-    normalized = {"rest": normalize_object(rest_object)}
+    normalized = {"rest": normalize_rest_object(rest_object)}
+    normalized_histories = {"rest": rest_history_succeeded(rest_history)}
     for transport, result in mcp.items():
-        normalized[f"mcp_{transport}"] = normalize_object(result.get("object") or {})
+        transport_ok = not result.get("transport_errors") and not result.get("error")
+        normalized[f"mcp_{transport}"] = normalize_mcp_object(result.get("object") or {}) if transport_ok else {"code": None, "invalid": True}
+        normalized_histories[f"mcp_{transport}"] = transport_ok and mcp_history_succeeded(result.get("history") or {})
     cli_envelope = ((cli.get("object") or {}).get("body") or {})
     # CLI unwraps ApiResponse.data into its own data field; rebuild a comparable envelope.
-    normalized["cli"] = normalize_object({"code": 0 if (cli.get("object") or {}).get("exit_code") == 0 else None, "data": cli_envelope.get("data")})
-    return {"rest": {"object": rest_object, "history": rest_history}, "mcp": mcp, "cli": cli, "normalized_objects": normalized}
+    normalized["cli"] = normalize_rest_object({"code": 0 if (cli.get("object") or {}).get("exit_code") == 0 else None, "data": cli_envelope.get("data")})
+    normalized_histories["cli"] = cli_history_succeeded(cli.get("history") or {})
+    return {
+        "rest": {"object": rest_object, "history": rest_history},
+        "mcp": mcp,
+        "cli": cli,
+        "normalized_objects": normalized,
+        "normalized_histories": normalized_histories,
+    }
 
 
 def main() -> int:
@@ -243,16 +293,9 @@ def main() -> int:
     for phase, (title, lifecycle, seq) in expected.items():
         normalized = timeline[phase]["normalized_objects"]
         for surface, value in normalized.items():
-            if value != {"code": 0, "title": title, "lifecycle_status": lifecycle, "document_seq": seq}:
+            if not object_projection_matches(value, title, lifecycle, seq):
                 violations.append(f"{phase} {surface} object projection mismatch: {value}")
-        history_success = [timeline[phase]["rest"]["history"].get("code") == 0]
-        history_success.extend(
-            (timeline[phase]["mcp"][transport].get("history") or {}).get("code") == 0
-            for transport in ("http", "sse", "stdio")
-        )
-        cli_history = timeline[phase]["cli"].get("history") or {}
-        history_success.append(cli_history.get("exit_code") == 0 and (cli_history.get("body") or {}).get("ok") is True)
-        if not all(history_success):
+        if not all(timeline[phase]["normalized_histories"].values()):
             violations.append(f"{phase} one or more REST/MCP/CLI history reads were refused")
 
     if set_title.get("code") != 0:
