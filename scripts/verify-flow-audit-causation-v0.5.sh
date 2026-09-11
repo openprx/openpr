@@ -157,10 +157,14 @@ if not tests or len(tests) != len(set(tests)):
 
 registry_section = contract.split("## Event type registry", 1)[1].split("## 投递", 1)[0]
 registry_rows = []
+registry_first_release = {}
 for line in registry_section.splitlines():
-    match = re.match(r"^\| `(flow\.[a-z0-9_]+\.[a-z0-9_]+)` \| (0\.[45])(?: conditional.*)? \|", line)
+    match = re.match(r"^\| `(flow\.[a-z0-9_]+\.[a-z0-9_]+)` \| (0\.[0-9]+)(?: conditional.*)? \|", line)
     if match:
-        registry_rows.append(match.group(1))
+        event_type, release = match.groups()
+        registry_first_release[event_type] = release
+        if tuple(map(int, release.split("."))) <= (0, 5):
+            registry_rows.append(event_type)
 if not registry_rows:
     raise SystemExit("event contract parse failed: v0.4/v0.5 registry is empty")
 registry_counts = collections.Counter(registry_rows)
@@ -185,6 +189,16 @@ producer_types = sorted(producer_sites)
 if not producer_files or not producer_types:
     raise SystemExit("producer scan failed: files and literals must be non-empty")
 
+# A v0.5 predecessor gate may be rerun on a later source head. Producers whose
+# registry row explicitly says they first ship after v0.5 are outside this
+# gate; unknown producer types remain in scope and therefore fail closed.
+v05_producer_types = sorted(
+    name for name in producer_types
+    if name not in registry_first_release
+    or tuple(map(int, registry_first_release[name].split("."))) <= (0, 5)
+)
+later_release_producer_types = sorted(set(producer_types) - set(v05_producer_types))
+
 policy_source = (flow_root / "event_policy.rs").read_text(encoding="utf-8").split("\n#[cfg(test)]", 1)[0]
 policy_rows = []
 pattern = r'\(\s*"(flow\.[a-z0-9_]+\.[a-z0-9_]+)"\s*,\s*public_payload\(&\[(.*?)\]\)\s*,?\s*\)'
@@ -196,10 +210,10 @@ if not policy_rows:
 policy_counts = collections.Counter(name for name, _ in policy_rows)
 policy_keys = {name: keys for name, keys in policy_rows}
 
-missing_contract = sorted(name for name in producer_types if registry_counts[name] != 1)
-missing_policy = sorted(name for name in producer_types if policy_counts[name] != 1 or not policy_keys.get(name))
+missing_contract = sorted(name for name in v05_producer_types if registry_counts[name] != 1)
+missing_policy = sorted(name for name in v05_producer_types if policy_counts[name] != 1 or not policy_keys.get(name))
 forbidden_policy_keys = sorted({
-    key for name in producer_types for key in policy_keys.get(name, [])
+    key for name in v05_producer_types for key in policy_keys.get(name, [])
     if key in {"title", "body", "text", "snapshot", "update", "token", "peer_id", "properties"}
 })
 registry_pass = not missing_contract and not missing_policy and not forbidden_policy_keys
@@ -277,6 +291,8 @@ observed = [
      "producer_type_count": len(producer_types), "producer_types": producer_types,
      "sites": producer_sites},
     {"kind": "payload_policy_cross_check", "policy_row_count": len(policy_rows),
+     "v0_5_scoped_producer_types": v05_producer_types,
+     "later_release_producer_types_excluded": later_release_producer_types,
      "missing_or_duplicate_contract_rows": missing_contract,
      "missing_empty_or_duplicate_payload_policies": missing_policy,
      "forbidden_policy_keys": forbidden_policy_keys, "passed": registry_pass},
