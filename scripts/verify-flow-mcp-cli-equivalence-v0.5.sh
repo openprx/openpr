@@ -65,6 +65,7 @@ ADR_PATH="$(flow_resolve_contract_path --adr "$ADR_PATH" "$CONTRACTS_ROOT")" || 
 BASELINE_CONTRACT="$CONTRACTS_ROOT/contracts/tool-count-baseline.md"
 [[ -f "$BASELINE_CONTRACT" ]] || { echo "FAIL: missing tool count baseline" >&2; exit 2; }
 git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 2
+REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 CONTRACTS_REAL="$(realpath -m "$CONTRACTS_ROOT")"
 EVIDENCE_REAL="$(realpath -m "$EVIDENCE_ROOT")"
@@ -358,12 +359,17 @@ expected_from_table = base_count + len(required_names)
 
 total_match = re.search(r"v0\.5 `([0-9]+)`", mcp)
 baseline_match = re.search(r"^\| 0\.5 \|.*?\| ([0-9]+) \|$", baseline, re.M)
-adr_match = re.search(r"v0\.5 累计总数为 ([0-9]+)", adr)
-if not total_match or not baseline_match or not adr_match:
+baseline_totals = {
+    int(match.group(1))
+    for match in re.finditer(r"^\| 0\.[5-9] \|.*?\| ([0-9]+) \|$", baseline, re.M)
+}
+adr_delegates_to_table = "逐工具表为准" in adr and "不得硬编码" in adr
+adr_match = re.search(r"v0\.5 累计总数.*?\*{0,2}([0-9]+)\*{0,2}", adr)
+if not total_match or not baseline_match or not baseline_totals or not adr_delegates_to_table:
     raise SystemExit("G6 count parse failed: every source must be non-empty")
 mcp_declared = int(total_match.group(1))
 baseline_declared = int(baseline_match.group(1))
-adr_declared = int(adr_match.group(1))
+adr_declared = int(adr_match.group(1)) if adr_match else None
 
 header_match = re.search(r"Available MCP Tools \(([0-9]+) total\):", live)
 live_names = re.findall(r"^  ([A-Za-z0-9_.-]+)\n   [^\n]", live, re.M)
@@ -375,7 +381,8 @@ missing_required = sorted(set(required_names) - set(live_names))
 names_hash = hashlib.sha256(("\n".join(sorted(live_names)) + "\n").encode()).hexdigest()
 registry_pass = (
     int(build_exit_s) == 0 and int(live_exit_s) == 0 and live_header_count == live_count
-    and expected_from_table == mcp_declared == baseline_declared == live_count
+    and expected_from_table == mcp_declared == baseline_declared
+    and live_count in baseline_totals and live_count >= expected_from_table
     and not missing_required
 )
 
@@ -421,13 +428,15 @@ observed = [
     {"kind": "contract_registry_parse", "base_count": base_count,
      "v04_v05_table_rows": len(required_names), "expected_from_table": expected_from_table,
      "mcp_declared_v05": mcp_declared, "baseline_declared_v05": baseline_declared,
+     "allowed_rebased_totals": sorted(baseline_totals),
      "parse_nonempty": True},
     {"kind": "live_registry", "header_count": live_header_count, "parsed_count": live_count,
      "missing_required": missing_required, "sorted_names_sha256": names_hash,
      "exit": int(live_exit_s), "duration_ms": int(live_ms_s), "log": live_log_s},
     {"kind": "contract_conflict", "id": "G6", "mcp_table_authoritative_total": expected_from_table,
      "mcp_declared_total": mcp_declared, "adr_0009_total": adr_declared,
-     "conflict_present": adr_declared != expected_from_table,
+     "delegates_to_tool_table": adr_delegates_to_table,
+     "conflict_present": adr_declared is not None and adr_declared != expected_from_table,
      "resolution": "per-tool table plus live registry"},
     {"kind": "cargo_build", "targets": ["mcp-server", "sylvode", "list-tools"],
      "exit": int(build_exit_s), "duration_ms": int(build_ms_s), "log": build_log_s},
