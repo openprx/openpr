@@ -486,6 +486,9 @@ import sys
 ) = sys.argv[1:]
 repo = pathlib.Path(repo_s)
 contracts = pathlib.Path(contracts_s)
+sys.path.insert(0, str(repo / "scripts/lib"))
+
+from flow_authz_baseline_scope import evaluate_member_baseline
 
 def read(path):
     return pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
@@ -998,11 +1001,9 @@ else:
         [str(files["command"]), str(contracts / "versions/v0.8-hardening.md"),
          str(contracts / "gates/v0.8-gate.yaml")],
         "excluded_from_v0_5_paired_to_v0_8_object_retention_cleanup_archive_tier")
-member_baseline = baseline_result.get("member_baseline_no_behaviour_regression", {})
-baseline_passed = int(baseline_exit_s) == 0 and member_baseline.get("status") == "passed"
-baseline_violations = member_baseline.get("violations") or []
-if not isinstance(baseline_violations, list):
-    baseline_violations = []
+baseline_passed, baseline_reason, member_baseline, baseline_violations = evaluate_member_baseline(
+    baseline_result, int(baseline_exit_s)
+)
 key_baseline_violations = [
     violation for violation in baseline_violations
     if isinstance(violation, str) and (
@@ -1010,14 +1011,10 @@ key_baseline_violations = [
         or "default edit member restore was refused" in violation
     )
 ]
-if baseline_passed:
-    baseline_reason = None
-elif int(baseline_exit_s) == 1 and member_baseline.get("status") == "failed":
-    baseline_reason = "v0_4_member_baseline_fixture_failed_observed_regressions"
-else:
-    baseline_reason = "v0_4_member_baseline_fixture_not_covered"
 add(gate, "v0_4_member_baseline_fixture_reused", baseline_passed,
     {"verifier_exit": int(baseline_exit_s), "duration_ms": int(baseline_ms_s),
+     "dependency_scope": "member_baseline_no_behaviour_regression",
+     "unrelated_dependency_failure_ignored": int(baseline_exit_s) != 0 and baseline_passed,
      "status": member_baseline.get("status", "not_observed"),
      "violation_count": len(baseline_violations),
      "key_violations": key_baseline_violations,
