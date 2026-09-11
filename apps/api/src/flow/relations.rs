@@ -782,12 +782,12 @@ async fn record_relation_integrity(state: &AppState, workspace_id: Uuid, relatio
 
 /// Lists relations for an already-authorized root object.
 ///
-/// Candidate rows are fetched in fixed batches and counted before authorization. The current
-/// relation contract preserves denied targets as `Unavailable`, so today a row is never silently
-/// discarded. Since `limit <= 100`, at most two 100-row batches (200 rows total) can be examined;
-/// retaining the 1000-row guard makes that safety invariant explicit and prevents a future
-/// policy-filtering rule from turning into unbounded overfetch or a silently short page. As in
-/// WP-10, a violation reports the fixed limit as `observed`, never the actual scan count.
+/// Candidate rows are fetched without caller filters, authorized, and only then matched against
+/// `direction`/`relation_type` (`ADR-0018` RF-1). An unfiltered view deliberately preserves a
+/// denied target as `Unavailable`; a filtered view drops it before either predicate can reveal a
+/// property of the hidden relation. Fixed batches plus the 1000-row scan guard bound the
+/// post-authorization overfetch. As in WP-10, a violation reports the fixed limit as `observed`,
+/// never the actual scan count.
 pub async fn list_relations(
     state: &AppState,
     access: &policy::AuthorizedFlowObject,
@@ -796,6 +796,7 @@ pub async fn list_relations(
     let limit = super::query::validate_limit(params.limit)?;
     let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
     let needed = limit_usize.saturating_add(1);
+    let filtered_view = params.relation_type.is_some() || params.direction != RelationDirection::Both;
     let mut after = params
         .cursor
         .as_deref()
@@ -807,8 +808,8 @@ pub async fn list_relations(
         let batch = fetch_relation_batch(
             &state.db,
             access.object_id(),
-            params.direction,
-            params.relation_type.as_deref(),
+            RelationDirection::Both,
+            None,
             after,
             RELATION_SCAN_BATCH_SIZE,
         )
@@ -837,7 +838,24 @@ pub async fn list_relations(
         };
         for (row, is_visible) in batch.into_iter().zip(visible) {
             after = Some((row.created_at, row.id));
-            accepted.push((row, is_visible));
+            if !is_visible {
+                if !filtered_view {
+                    accepted.push((row, false));
+                }
+                continue;
+            }
+            let direction_matches = match params.direction {
+                RelationDirection::Outgoing => row.source_object_id == access.object_id(),
+                RelationDirection::Incoming => row.source_object_id != access.object_id(),
+                RelationDirection::Both => true,
+            };
+            let type_matches = params
+                .relation_type
+                .as_deref()
+                .is_none_or(|relation_type| row.relation_type == relation_type);
+            if direction_matches && type_matches {
+                accepted.push((row, true));
+            }
             if accepted.len() >= needed {
                 break;
             }
@@ -1699,6 +1717,96 @@ mod database_tests {
         );
         assert_eq!(visible["direction"], "outgoing");
         assert_eq!(visible["other_object"]["id"], visible_target.to_string());
+        scratch.drop_self().await;
+    }
+
+    /// `ADR-0018` RF-2's oracle fixture: the only `classified_as` relation points at an object
+    /// this member cannot view. The unfiltered disclosure remains one opaque placeholder, while
+    /// asking for that exact type must reveal nothing at all.
+    #[tokio::test]
+    async fn filtered_relation_view_drops_unauthorized_rows_before_type_or_direction_matching() {
+        let scratch = scratch_or_skip!("filtered_no_oracle");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id, member_id) = seed_workspace(&state).await;
+        let source = page(&state, workspace_id, owner_id, "Source").await;
+        let hidden_target = page(&state, workspace_id, owner_id, "Hidden classified target").await;
+        execute_command(
+            &state,
+            relation_command(
+                source,
+                owner_id,
+                "owner",
+                "link",
+                json!({"target_object_id":hidden_target,"relation_type":"classified_as"}),
+                Uuid::new_v4().to_string(),
+            ),
+        )
+        .await
+        .expect("hidden relation fixture links");
+        exec(
+            &state,
+            "UPDATE flow_objects SET inherit_from_parent=false WHERE id=$1",
+            vec![hidden_target.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "UPDATE flow_workspace_settings SET authz_epoch=authz_epoch+1 WHERE workspace_id=$1",
+            vec![workspace_id.into()],
+        )
+        .await;
+
+        let unfiltered = list_relations(
+            &state,
+            &read_access(&state, workspace_id, source, member_id).await,
+            ListRelationsParams {
+                direction: RelationDirection::Both,
+                relation_type: None,
+                cursor: None,
+                limit: None,
+            },
+        )
+        .await
+        .expect("unfiltered relation query succeeds")
+        .expect("epoch remains stable");
+        assert_eq!(
+            unfiltered.items.len(),
+            1,
+            "the fixture must cross the disclosure boundary"
+        );
+        assert_eq!(
+            serde_json::to_value(&unfiltered.items[0]).expect("placeholder serializes"),
+            json!({"visibility":"unavailable"})
+        );
+
+        for params in [
+            ListRelationsParams {
+                direction: RelationDirection::Both,
+                relation_type: Some("classified_as".to_string()),
+                cursor: None,
+                limit: None,
+            },
+            ListRelationsParams {
+                direction: RelationDirection::Outgoing,
+                relation_type: None,
+                cursor: None,
+                limit: None,
+            },
+        ] {
+            let filtered = list_relations(
+                &state,
+                &read_access(&state, workspace_id, source, member_id).await,
+                params,
+            )
+            .await
+            .expect("filtered relation query succeeds")
+            .expect("epoch remains stable");
+            assert!(
+                filtered.items.is_empty(),
+                "an unauthorized relation must not produce a placeholder in a filtered view"
+            );
+            assert!(filtered.next_cursor.is_none());
+        }
         scratch.drop_self().await;
     }
 
