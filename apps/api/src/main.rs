@@ -2227,6 +2227,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0059_flow_navigator_root.sql",
         include_str!("../../../migrations/0059_flow_navigator_root.sql"),
     ),
+    (
+        "0060_flow_collections_core.sql",
+        include_str!("../../../migrations/0060_flow_collections_core.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2548,6 +2552,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
             "parent_id",
             "workspaces_create_flow_navigator_root",
         ),
+    ),
+    (
+        "0060_flow_collections_core.sql",
+        SchemaProbe::Relation("flow_collections_core_schema_guard"),
     ),
 ];
 
@@ -3061,7 +3069,8 @@ mod tests {
                 "0056_flow_objects_parent_project_invariant.sql",
                 "0057_flow_objects_parent_project_scope_index.sql",
                 "0058_flow_search_index.sql",
-                "0059_flow_navigator_root.sql"
+                "0059_flow_navigator_root.sql",
+                "0060_flow_collections_core.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );

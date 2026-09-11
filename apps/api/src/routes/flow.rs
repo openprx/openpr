@@ -355,8 +355,8 @@ pub struct ExecuteFlowCommandRequest {
     pub message: Option<String>,
 }
 
-/// `POST /api/v1/flow/objects/{object_id}/commands` (`rest-api-v1.md`: `set_title|insert_block|
-/// update_block|delete_block|move_block|semantic_patch|archive|restore`).
+/// `POST /api/v1/flow/objects/{object_id}/commands`, shared by content, lifecycle, governance,
+/// and v0.6 Collection command families.
 ///
 /// `command::execute_command` re-runs the object-level `edit`/`full_access` permission check
 /// itself (`authz::effective_permission`) on top of the workspace-membership gate here — the same

@@ -1,6 +1,6 @@
 //! The write paths this package ships: `POST .../flow/objects` (object creation) and
 //! `POST .../flow/objects/{id}/commands` (`set_title|insert_block|update_block|delete_block|
-//! move_block|semantic_patch|archive|restore`, `rest-api-v1.md` "v0.4 Flow Alpha").
+//! move_block|semantic_patch|archive|restore` plus v0.6's Collection family).
 //!
 //! The six content types share the *exact* write path `flow::collab::write::accept_update` and
 //! the WebSocket `update` frame use (hydrate/isolated-apply outside any lock, the per-document
@@ -40,7 +40,7 @@ use super::repository::{self, NewCollabDocument, NewFlowObject, NewProjection};
 /// and `page`; `collection`/`record` are v0.6). Not a `flow_objects_object_type_check` mirror by
 /// accident — the two must never drift, and the CHECK constraint is the actual enforcement; this
 /// list only lets the handler reject early with a typed `invalid_update` instead of a DB error.
-const REGISTERED_OBJECT_TYPES: &[&str] = &["page", "navigator"];
+const REGISTERED_OBJECT_TYPES: &[&str] = &["page", "navigator", "collection"];
 
 /// Not frozen by `limits-v1.md` (only `message` at 500 chars and `idempotency_key` at 1-128 bytes
 /// are). Chosen to match the one limit the contract *does* freeze for a similar caller-supplied
@@ -151,6 +151,16 @@ pub fn v0_5_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
     registry
 }
 
+/// Every command registered through v0.6. The Collection package owns the new-variant list, while
+/// this cumulative registry keeps the release-by-release machine scan from silently extrapolating
+/// v0.5's set.
+#[must_use]
+pub fn v0_6_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
+    let mut registry = v0_5_command_cardinality_registry();
+    registry.extend(super::collections::v0_6_command_cardinality_registry());
+    registry
+}
+
 /// The value a `REFERENCES users(id)` column may take for this actor: the actor's own id when it
 /// is a user, `None` when it is a bot.
 ///
@@ -223,6 +233,11 @@ impl CreateObjectIdempotencyBody {
 }
 
 fn validate(input: &CreateObjectInput) -> Result<(), ApiError> {
+    if input.object_type == "record" {
+        return Err(ApiError::invalid_update(
+            "record is collection-scoped and cannot be created by the generic object endpoint",
+        ));
+    }
     if !REGISTERED_OBJECT_TYPES.contains(&input.object_type.as_str()) {
         return Err(ApiError::BadRequest(format!(
             "object_type must be one of {REGISTERED_OBJECT_TYPES:?}"
@@ -557,6 +572,18 @@ pub async fn create_object(state: &AppState, input: CreateObjectInput) -> Result
         },
     )
     .await?;
+
+    if input.object_type == "collection" {
+        super::collections::insert_collection_projection(
+            &tx,
+            object_id,
+            document_id,
+            input.workspace_id,
+            effective_project_id,
+            json!({}),
+        )
+        .await?;
+    }
 
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
     let outcome = insert_flow_event(
@@ -1074,6 +1101,7 @@ enum CommandKind {
     /// check reads, and so a `bounded_many` command's wire name lives next to the multi-document
     /// machinery that makes it legal.
     Governance(GovernanceCommandType),
+    Collection(super::collections::CollectionCommandType),
 }
 
 impl CommandKind {
@@ -1082,6 +1110,7 @@ impl CommandKind {
             .map(Self::Content)
             .or_else(|| LifecycleCommandType::parse(raw).map(Self::Lifecycle))
             .or_else(|| GovernanceCommandType::parse(raw).map(Self::Governance))
+            .or_else(|| super::collections::CollectionCommandType::parse(raw).map(Self::Collection))
     }
 
     /// The `events-v1.md` primary event type this command produces on success — also the
@@ -1090,7 +1119,7 @@ impl CommandKind {
     /// silent replay of the wrong operation).
     const fn event_type(self) -> &'static str {
         match self {
-            Self::Content(_) => "flow.content.accepted",
+            Self::Content(_) | Self::Collection(_) => "flow.content.accepted",
             Self::Lifecycle(LifecycleCommandType::Archive) => "flow.object.archived",
             Self::Lifecycle(LifecycleCommandType::Restore) => "flow.object.restored",
             Self::Governance(kind) => kind.event_type(),
@@ -1106,13 +1135,22 @@ impl CommandKind {
             // source side of the double-sided rule; `move_object::execute` owns the target side
             // (`edit` on the new parent), which is a different authorization domain whenever the
             // two sides sit under different boundaries.
-            Self::Governance(GovernanceCommandType::MoveObject) => authz::PermissionLevel::FullAccess,
+            Self::Governance(GovernanceCommandType::MoveObject)
+            | Self::Collection(
+                super::collections::CollectionCommandType::FieldCreate
+                | super::collections::CollectionCommandType::FieldUpdate
+                | super::collections::CollectionCommandType::FieldArchive
+                | super::collections::CollectionCommandType::FieldReorder
+                | super::collections::CollectionCommandType::ViewCreate
+                | super::collections::CollectionCommandType::ViewUpdate
+                | super::collections::CollectionCommandType::ViewReorder,
+            ) => authz::PermissionLevel::FullAccess,
             Self::Governance(GovernanceCommandType::Link | GovernanceCommandType::Unlink) => {
                 authz::PermissionLevel::Edit
             }
             // Lifecycle commands never reach this generic path; their actual tier comes from a
             // `LifecyclePlan`. The value here preserves the v0.4 registry's ordinary-page baseline.
-            Self::Content(_) | Self::Lifecycle(_) => authz::PermissionLevel::Edit,
+            Self::Content(_) | Self::Lifecycle(_) | Self::Collection(_) => authz::PermissionLevel::Edit,
         }
     }
 }
@@ -1274,7 +1312,7 @@ pub async fn execute_command(state: &AppState, input: ExecuteCommandInput) -> Re
 
     let kind = CommandKind::parse(&input.command_type).ok_or_else(|| {
         ApiError::invalid_update(format!(
-            "command.type '{}' is not a registered v0.4 command",
+            "command.type '{}' is not a registered Flow command",
             input.command_type
         ))
     })?;
@@ -1334,7 +1372,10 @@ async fn execute_command_authorized(
         return execute_lifecycle_command(state, input, workspace_id, lifecycle_kind).await;
     }
 
-    if let Some(existing) = repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await? {
+    if !matches!(kind, CommandKind::Collection(_))
+        && let Some(existing) =
+            repository::find_idempotent_event(&state.db, workspace_id, &input.idempotency_key).await?
+    {
         if existing.event_type != kind.event_type() {
             return Err(ApiError::Conflict(
                 "idempotency_key was already used for a different operation".to_string(),
@@ -1347,7 +1388,7 @@ async fn execute_command_authorized(
         // (`flow.content.accepted`) and the object for lifecycle ones.
         let expected_aggregate = match kind {
             CommandKind::Content(_) => document_id,
-            CommandKind::Lifecycle(_) | CommandKind::Governance(_) => input.object_id,
+            CommandKind::Lifecycle(_) | CommandKind::Governance(_) | CommandKind::Collection(_) => input.object_id,
         };
         if existing.aggregate_id != expected_aggregate.to_string() {
             return Err(ApiError::Conflict(
@@ -1402,6 +1443,12 @@ async fn execute_command_authorized(
         // commits, so it takes no permission level from here.
         CommandKind::Governance(GovernanceCommandType::MoveObject) => {
             super::move_object::execute(state, input, workspace_id, checked_epoch).await
+        }
+        CommandKind::Collection(collection_kind) => {
+            let target = repository::fetch_object_view(&state.db, input.object_id)
+                .await?
+                .ok_or(ApiError::Internal)?;
+            super::collections::execute(state, input, workspace_id, checked_epoch, collection_kind, &target).await
         }
     }
 }

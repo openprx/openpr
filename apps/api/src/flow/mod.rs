@@ -4,7 +4,9 @@
 //! - [`model`]: wire-shape response types (`FlowObjectView`, `AcceptedChange`, list/history
 //!   response envelopes) shared by every handler in `crate::routes::flow`.
 //! - [`policy`]: the workspace-membership + `flow_enabled` gate every handler runs first.
-//! - [`command`]: the one write path this package ships — object creation.
+//! - [`command`]: the shared object command dispatcher and object creation path.
+//! - [`collections`]: v0.6 Collection schema/view/Record commands and synchronous typed
+//!   projections; every Record remains an independent collaborative document.
 //! - [`grants`]: `ADR-0012`'s v0.5 authorization surface — `flow_object_grants` and the
 //!   `inherit_from_parent` boundary, with the §4.1 self-lockout guard and the §3.1 epoch lock.
 //! - [`move_object`]: `ADR-0012` §4's cross-parent move, and the only command in the frozen v0.5
@@ -22,6 +24,7 @@
 //! document lifecycle, and the SQL).
 
 pub mod collab;
+pub mod collections;
 pub mod command;
 pub mod event_origin;
 pub mod event_policy;
