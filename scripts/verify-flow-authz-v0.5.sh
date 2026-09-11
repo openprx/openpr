@@ -184,8 +184,14 @@ TEST_EXIT=0
 for test_name in "${REQUIRED_TESTS[@]}"; do
   printf '=== %s ===\n' "$test_name" >>"$TEST_LOG"
   set +e
-  (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" \
-    cargo test -p api --lib --no-fail-fast "$test_name" -- --exact --nocapture --test-threads=1) >>"$TEST_LOG" 2>&1
+  if [[ "$test_name" == routes::flow::flow_database_tests::depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets ]]; then
+    (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" CARGO_BUILD_JOBS=4 \
+      cargo test --release -p api --lib --no-fail-fast "$test_name" -- \
+      --exact --ignored --nocapture --test-threads=1) >>"$TEST_LOG" 2>&1
+  else
+    (cd "$REPO_ROOT" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" CARGO_BUILD_JOBS=4 \
+      cargo test -p api --lib --no-fail-fast "$test_name" -- --exact --nocapture --test-threads=1) >>"$TEST_LOG" 2>&1
+  fi
   test_status=$?
   set -e
   printf '=== exit=%s test=%s ===\n' "$test_status" "$test_name" >>"$TEST_LOG"
@@ -253,9 +259,15 @@ run_mutation_test() {
   {
     printf '%s\n' "$marker"
     set +e
-    (cd "$MUTATION_REPO" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" env "$@" \
-      cargo test --locked -p api --lib --no-fail-fast \
-      "$test_name" -- --exact --nocapture --test-threads=1)
+    if [[ "$test_name" == routes::flow::flow_database_tests::depth_32_content_commit_path_stays_inside_the_frozen_authz_budgets ]]; then
+      (cd "$MUTATION_REPO" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" CARGO_BUILD_JOBS=4 env "$@" \
+        cargo test --locked --release -p api --lib --no-fail-fast \
+        "$test_name" -- --exact --ignored --nocapture --test-threads=1)
+    else
+      (cd "$MUTATION_REPO" && OPENPR_TEST_DATABASE_URL="$DATABASE_URL" CARGO_BUILD_JOBS=4 env "$@" \
+        cargo test --locked -p api --lib --no-fail-fast \
+        "$test_name" -- --exact --nocapture --test-threads=1)
+    fi
     status=$?
     set -e
     printf 'mutation_exit=%s test=%s\n' "$status" "$test_name"
@@ -744,7 +756,17 @@ budget_match = re.search(r"AUTHZ_DEPTH32_COMMIT_BUDGET_EVIDENCE\s+(\{[^\n]+\})",
 budget_evidence = json.loads(budget_match.group(1)) if budget_match else {}
 budget_values_ok = all((
     budget_evidence.get("depth") == tree_depth,
-    isinstance(budget_evidence.get("samples"), int) and budget_evidence.get("samples", 0) > 0,
+    budget_evidence.get("boundary_depth") == tree_depth,
+    budget_evidence.get("build_profile") == "release",
+    budget_evidence.get("measurement_condition") == "official_release_dedicated_quiet",
+    budget_evidence.get("frozen_lock_budget_status") == "executed",
+    budget_evidence.get("warmup_rounds") == 5,
+    isinstance(budget_evidence.get("minimum_samples"), int) and budget_evidence.get("minimum_samples", 0) >= 30,
+    isinstance(budget_evidence.get("samples"), int) and budget_evidence.get("samples", 0) >= 30,
+    isinstance(budget_evidence.get("lock_hold_samples_ms"), list)
+        and len(budget_evidence.get("lock_hold_samples_ms")) == budget_evidence.get("samples"),
+    isinstance(budget_evidence.get("inheritance_evaluation_samples_ms"), list)
+        and len(budget_evidence.get("inheritance_evaluation_samples_ms")) == budget_evidence.get("samples"),
     isinstance(budget_evidence.get("p95_ms"), (int, float)),
     isinstance(budget_evidence.get("max_ms"), (int, float)),
     budget_evidence.get("p95_ms", float("inf")) <= hold_p95,
@@ -752,7 +774,7 @@ budget_values_ok = all((
 ))
 add(gate, "depth_32_commit_path_lock_hold_budget", budget_values_ok,
     {"required_p95_ms": hold_p95, "required_max_ms": hold_max, "measurement": budget_evidence},
-    [test_log_s, f"cargo_test:{depth_budget_test}"], None if budget_values_ok else "commit_path_depth_budget_not_measured")
+    [test_log_s, f"cargo_test_release_ignored:{depth_budget_test}"], None if budget_values_ok else "official_commit_path_depth_budget_not_measured")
 
 # authz_linearization_no_escalation
 gate = GATES[1]
