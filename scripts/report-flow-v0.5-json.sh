@@ -145,15 +145,16 @@ fi
 CHECKS_JSON='[]'
 
 record_check() {
-  local id="$1" status="$2" exit_json="$3" command="$4" output="$5" duration_json="${6:-null}"
+  local id="$1" status="$2" exit_json="$3" command="$4" output="$5" duration_json="${6:-null}" executed_count="${7:-0}"
   local log_file="$EVIDENCE_ROOT/logs/${id}.log" log_sha
   printf '%s\n' "$output" > "$log_file"
   log_sha="$(sha256_of "$log_file")"
   CHECKS_JSON="$(jq -c \
     --arg id "$id" --arg status "$status" --arg command "$command" \
     --argjson exit_code "$exit_json" --argjson duration_ms "$duration_json" \
+    --argjson executed_count "$executed_count" \
     --arg evidence "evidence/v0.5/logs/${id}.log" --arg sha256 "$log_sha" \
-    '. + [{id:$id,status:$status,command:$command,exit_code:$exit_code,duration_ms:$duration_ms,evidence:$evidence,sha256:$sha256}]' \
+    '. + [{id:$id,status:$status,command:$command,exit_code:$exit_code,duration_ms:$duration_ms,executed_count:$executed_count,evidence:$evidence,sha256:$sha256}]' \
     <<<"$CHECKS_JSON")"
 }
 
@@ -168,7 +169,7 @@ run_command() {
   set -e
   status=$([[ $exit_code -eq 0 ]] && echo passed || echo failed)
   duration_ms="$(((ended - started) / 1000000))"
-  record_check "$id" "$status" "$exit_code" "$command_display" "$output" "$duration_ms"
+  record_check "$id" "$status" "$exit_code" "$command_display" "$output" "$duration_ms" 1
 }
 
 record_or_run_required_producer() {
@@ -229,6 +230,27 @@ record_or_run_required_producer() {
         --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" \
         --repo-root "$REPO_ROOT" --json
       ;;
+    relation_policy_verify)
+      run_command "required.$key" "$command" \
+        "$REPO_ROOT/$script_rel" --contract "$CONTRACTS_ROOT/contracts/rest-api-v1.md" \
+        --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" \
+        --repo-root "$REPO_ROOT" --json
+      ;;
+    search_contract_verify)
+      run_command "required.$key" "$command" \
+        "$REPO_ROOT/$script_rel" --adr "$CONTRACTS_ROOT/decisions/ADR-0009-flow-search-surface.md" \
+        --contract "$CONTRACTS_ROOT/contracts/rest-api-v1.md" \
+        --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" \
+        --repo-root "$REPO_ROOT" --json
+      ;;
+    mcp_cli_equivalence_verify)
+      run_command "required.$key" "$command" \
+        "$REPO_ROOT/$script_rel" --mcp-contract "$CONTRACTS_ROOT/contracts/mcp-surface-v1.md" \
+        --surface-contract "$CONTRACTS_ROOT/contracts/surface-coverage-v1.md" \
+        --adr "$CONTRACTS_ROOT/decisions/ADR-0009-flow-search-surface.md" \
+        --contracts-root "$CONTRACTS_ROOT" --evidence-root "$EVIDENCE_ROOT" \
+        --repo-root "$REPO_ROOT" --json
+      ;;
     *)
       record_check "required.$key" producer_unspecified null "$command" \
         "no WP-29 invocation mapping exists for required producer: $key"
@@ -237,7 +259,8 @@ record_or_run_required_producer() {
 }
 
 for producer_key in surface_parity collab_architecture_verify authz_verify \
-  multi_document_verify cardinality_verify invalid_update_reason_verify audit_causation_verify; do
+  multi_document_verify cardinality_verify invalid_update_reason_verify relation_policy_verify \
+  search_contract_verify mcp_cli_equivalence_verify audit_causation_verify; do
   record_or_run_required_producer "$producer_key"
 done
 
@@ -268,6 +291,9 @@ producer_metadata() {
     multi_document_result) command_key=multi_document_verify ;;
     cardinality_result) command_key=cardinality_verify ;;
     invalid_update_reason_result) command_key=invalid_update_reason_verify ;;
+    relation_policy_result) command_key=relation_policy_verify ;;
+    search_contract_result) command_key=search_contract_verify ;;
+    mcp_cli_equivalence_result) command_key=mcp_cli_equivalence_verify ;;
     audit_causation_result) command_key=audit_causation_verify ;;
     convergence_result)
       command="$CONVERGENCE_COMMAND"; script_rel=scripts/verify-flow-convergence-v0.5.sh
@@ -282,8 +308,20 @@ producer_metadata() {
     else status=producer_missing
     fi
   fi
+  local check='null' executed_count=0 execution_status=null
+  if [[ -n "$command_key" ]]; then
+    check="$(check_for_required_key "$command_key")"
+  elif [[ "$artifact" == convergence_result ]]; then
+    check="$(jq -c '[.[] | select(.id=="extra.convergence_verify")][0] // null' <<<"$CHECKS_JSON")"
+  fi
+  if [[ "$check" != null ]]; then
+    executed_count="$(jq -r '.executed_count // 0' <<<"$check")"
+    execution_status="$(jq -r '.status // "not_run" | @json' <<<"$check")"
+  fi
   jq -cn --arg status "$status" --arg command "$command" \
-    '{producer_status:$status,producer_command:(if $command=="" then null else $command end)}'
+    --argjson executed_count "$executed_count" --argjson execution_status "$execution_status" \
+    '{producer_status:$status,producer_command:(if $command=="" then null else $command end),
+      producer_executed_count:$executed_count,producer_execution_status:$execution_status}'
 }
 
 ARTIFACT_INPUTS='{}'
@@ -388,19 +426,19 @@ required_command_entry() {
   local key="$1" command check
   command="$(jq -r --arg k "$key" '.[$k]' <<<"$REQUIRED_COMMAND_STRINGS")"
   case "$key" in
-    surface_parity|collab_architecture_verify|authz_verify|multi_document_verify|cardinality_verify|invalid_update_reason_verify|audit_causation_verify)
+    surface_parity|collab_architecture_verify|authz_verify|multi_document_verify|cardinality_verify|invalid_update_reason_verify|relation_policy_verify|search_contract_verify|mcp_cli_equivalence_verify|audit_causation_verify)
       check="$(check_for_required_key "$key")"
       jq -cn --arg command "$command" --argjson check "$check" \
-        '{command:$command,status:$check.status,exit_code:$check.exit_code,duration_ms:$check.duration_ms,evidence:$check.evidence,sha256:$check.sha256}'
+        '{command:$command,status:$check.status,exit_code:$check.exit_code,duration_ms:$check.duration_ms,executed_count:$check.executed_count,evidence:$check.evidence,sha256:$check.sha256}'
       ;;
     report)
-      jq -cn --arg command "$command" '{command:$command,status:"passed",exit_code:0,duration_ms:null,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
+      jq -cn --arg command "$command" '{command:$command,status:"passed",exit_code:0,duration_ms:null,executed_count:1,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
       ;;
     verify|gate|manual_signoff)
-      jq -cn --arg command "$command" '{command:$command,status:"not_run",exit_code:null,duration_ms:null,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
+      jq -cn --arg command "$command" '{command:$command,status:"not_run",exit_code:null,duration_ms:null,executed_count:0,evidence:"evidence/v0.5/gate-result.json",sha256:null}'
       ;;
     *)
-      jq -cn --arg command "$command" '{command:$command,status:"producer_unspecified",exit_code:null,duration_ms:null,evidence:null,sha256:null}'
+      jq -cn --arg command "$command" '{command:$command,status:"producer_unspecified",exit_code:null,duration_ms:null,executed_count:0,evidence:null,sha256:null}'
       ;;
   esac
 }
@@ -425,7 +463,7 @@ VERIFICATION_ASSURANCE='{
   },
   "producer_execution_metadata": {
     "classification": "self_reported_with_integrity_checks",
-    "fields": ["checks", "required_commands.status", "required_commands.exit_code"],
+    "fields": ["checks", "required_commands.status", "required_commands.exit_code", "required_commands.executed_count"],
     "log_checksums_verified": true,
     "log_contents_independently_recomputed": false
   }

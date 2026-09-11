@@ -59,6 +59,9 @@ COMMAND_FOR_ARTIFACT = {
     "multi_document_result": "multi_document_verify",
     "cardinality_result": "cardinality_verify",
     "invalid_update_reason_result": "invalid_update_reason_verify",
+    "relation_policy_result": "relation_policy_verify",
+    "search_contract_result": "search_contract_verify",
+    "mcp_cli_equivalence_result": "mcp_cli_equivalence_verify",
     "audit_causation_result": "audit_causation_verify",
 }
 
@@ -173,6 +176,13 @@ def main() -> int:
         raise RuntimeError("independent 31-gate wiring does not match v0.5-gate.yaml")
 
     head = git_output(args.repo_root, "rev-parse", "HEAD")
+    _receipt_valid, receipt = load_json(os.path.join(args.evidence_root, "gate-result.json"))
+    receipt = receipt if isinstance(receipt, dict) else {}
+    checks = {
+        item.get("id"): item
+        for item in receipt.get("checks", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
     states: dict[str, Any] = {}
     gates: dict[str, str] = {}
     reasons: dict[str, list[str]] = {}
@@ -194,6 +204,12 @@ def main() -> int:
             producer_status = "producer_missing"
         else:
             producer_status = "available"
+        check_id = f"required.{command_key}" if command_key else "extra.convergence_verify"
+        producer_check = checks.get(check_id, {})
+        producer_executed_count = producer_check.get("executed_count", 0)
+        if not isinstance(producer_executed_count, int) or isinstance(producer_executed_count, bool):
+            producer_executed_count = 0
+        producer_execution_status = producer_check.get("status")
 
         path = os.path.join(args.evidence_root, os.path.basename(canonical))
         exists = os.path.isfile(path)
@@ -217,7 +233,10 @@ def main() -> int:
             gate: normalize(raw_gate(document, gate, fallback)) for gate, fallback in owned
         }
         if not exists:
-            status = producer_status if producer_status != "available" else "artifact_missing"
+            if producer_status == "available" and producer_executed_count > 0:
+                status = "artifact_missing_after_execution"
+            else:
+                status = producer_status if producer_status != "available" else "artifact_missing"
         elif not valid:
             status = "artifact_malformed"
         elif producer_status != "available":
@@ -243,6 +262,9 @@ def main() -> int:
                 why = reason_codes(document, gate, verdict)
                 if not why and verdict != "passed":
                     why = ["artifact_reported_failure" if verdict == "failed" else "artifact_did_not_cover_gate"]
+            elif status == "artifact_missing_after_execution":
+                verdict = "failed"
+                why = [status]
             else:
                 verdict = "not_covered"
                 why = [status]
@@ -256,6 +278,8 @@ def main() -> int:
             "sha256": artifact_sha,
             "producer_status": producer_status,
             "producer_command": command or None,
+            "producer_executed_count": producer_executed_count,
+            "producer_execution_status": producer_execution_status,
             "source_head": source_head,
             "source_dirty": source_dirty,
             "passed": status == "passed_evidence",

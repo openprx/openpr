@@ -139,8 +139,8 @@ for typed in source:object source_baseline:object gate_contract:object counts:ob
   fi
 done
 if ! jq -e '
-  all(.checks[]; type == "object") and
-  all(.required_commands[]; type == "object") and
+  all(.checks[]; type == "object" and (.executed_count | type) == "number" and .executed_count >= 0) and
+  all(.required_commands[]; type == "object" and (.executed_count | type) == "number" and .executed_count >= 0) and
   all(.artifacts[]; type == "object") and
   all(.artifact_states[]; type == "object") and
   all(.manual_signoffs[]; type == "object")
@@ -203,6 +203,9 @@ producer_metadata() {
     multi_document_result) command_key=multi_document_verify ;;
     cardinality_result) command_key=cardinality_verify ;;
     invalid_update_reason_result) command_key=invalid_update_reason_verify ;;
+    relation_policy_result) command_key=relation_policy_verify ;;
+    search_contract_result) command_key=search_contract_verify ;;
+    mcp_cli_equivalence_result) command_key=mcp_cli_equivalence_verify ;;
     audit_causation_result) command_key=audit_causation_verify ;;
     convergence_result)
       command='scripts/verify-flow-convergence-v0.5.sh --clients 10 --json'
@@ -216,8 +219,17 @@ producer_metadata() {
   if [[ -n "$command" ]]; then
     if [[ -f "$REPO_ROOT/$script_rel" ]]; then status=available; else status=producer_missing; fi
   fi
+  local check_id="extra.convergence_verify" check='null' executed_count=0 execution_status=null
+  if [[ -n "$command_key" ]]; then check_id="required.$command_key"; fi
+  check="$(jq -c --arg id "$check_id" '[.checks[] | select(.id==$id)][0] // null' "$GATE_RESULT_PATH")"
+  if [[ "$check" != null ]]; then
+    executed_count="$(jq -r '.executed_count // 0' <<<"$check")"
+    execution_status="$(jq -r '.status // "not_run" | @json' <<<"$check")"
+  fi
   jq -cn --arg status "$status" --arg command "$command" \
-    '{producer_status:$status,producer_command:(if $command=="" then null else $command end)}'
+    --argjson executed_count "$executed_count" --argjson execution_status "$execution_status" \
+    '{producer_status:$status,producer_command:(if $command=="" then null else $command end),
+      producer_executed_count:$executed_count,producer_execution_status:$execution_status}'
 }
 
 ARTIFACT_INPUTS='{}'
@@ -290,8 +302,10 @@ for ((i=0; i<CHECK_COUNT; i++)); do
   rel="$(jq -r ".checks[$i].evidence // empty" "$GATE_RESULT_PATH")"
   sha="$(jq -r ".checks[$i].sha256 // empty" "$GATE_RESULT_PATH")"
   exit_type="$(jq -r ".checks[$i].exit_code|type" "$GATE_RESULT_PATH")"
+  executed_count="$(jq -r ".checks[$i].executed_count // -1" "$GATE_RESULT_PATH")"
   case "$status" in passed|failed|not_run|producer_missing|producer_unspecified) ;; *) add_drift "check $id has unknown status $status" ;; esac
   if [[ "$status" == passed && "$(jq -r ".checks[$i].exit_code" "$GATE_RESULT_PATH")" != 0 ]]; then add_drift "check $id passed without exit 0"; fi
+  if [[ "$status" == passed && "$executed_count" -le 0 ]]; then add_drift "check $id passed with zero executions"; fi
   if [[ "$status" == failed && "$exit_type" != number ]]; then add_drift "check $id failed without numeric exit"; fi
   if [[ "$status" != passed && "$status" != failed && "$exit_type" != null ]]; then add_drift "check $id $status must have exit null"; fi
   log="$EVIDENCE_ROOT/logs/$(basename "$rel")"
@@ -300,14 +314,14 @@ for ((i=0; i<CHECK_COUNT; i++)); do
   fi
 done
 
-for key in surface_parity collab_architecture_verify authz_verify multi_document_verify cardinality_verify invalid_update_reason_verify audit_causation_verify; do
+for key in surface_parity collab_architecture_verify authz_verify multi_document_verify cardinality_verify invalid_update_reason_verify relation_policy_verify search_contract_verify mcp_cli_equivalence_verify audit_causation_verify; do
   command="$(jq -r --arg k "$key" '.[$k]' <<<"$REQUIRED_COMMAND_STRINGS")"
   [[ "$(jq -r --arg k "$key" '.required_commands[$k].command // empty' "$GATE_RESULT_PATH")" == "$command" ]] || add_drift "required_commands.$key command drift"
   check="$(jq -c --arg id "required.$key" '[.checks[]|select(.id==$id)][0]//null' "$GATE_RESULT_PATH")"
   if [[ "$check" == null ]]; then add_drift "required producer check missing: $key"
   else
-    [[ "$(jq -c --arg k "$key" '.required_commands[$k] | {status,exit_code,duration_ms,evidence,sha256}' "$GATE_RESULT_PATH")" == \
-       "$(jq -c '{status,exit_code,duration_ms,evidence,sha256}' <<<"$check")" ]] || add_drift "required_commands.$key does not match its check"
+    [[ "$(jq -c --arg k "$key" '.required_commands[$k] | {status,exit_code,duration_ms,executed_count,evidence,sha256}' "$GATE_RESULT_PATH")" == \
+       "$(jq -c '{status,exit_code,duration_ms,executed_count,evidence,sha256}' <<<"$check")" ]] || add_drift "required_commands.$key does not match its check"
   fi
 done
 for key in report verify gate manual_signoff; do
@@ -377,7 +391,7 @@ VERIFICATION_ASSURANCE='{
   },
   "producer_execution_metadata": {
     "classification": "self_reported_with_integrity_checks",
-    "fields": ["checks", "required_commands.status", "required_commands.exit_code"],
+    "fields": ["checks", "required_commands.status", "required_commands.exit_code", "required_commands.executed_count"],
     "log_checksums_verified": true,
     "log_contents_independently_recomputed": false
   }

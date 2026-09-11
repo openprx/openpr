@@ -130,7 +130,9 @@ def flow_artifact_state($artifact; $input; $actual_head):
      else null
      end) as $source_dirty
   | (if ($input.exists | not) then
-       if $input.producer_status == "producer_missing" then "producer_missing"
+       if $input.producer_status == "available" and ($input.producer_executed_count // 0) > 0
+       then "artifact_missing_after_execution"
+       elif $input.producer_status == "producer_missing" then "producer_missing"
        elif $input.producer_status == "producer_unspecified" then "producer_unspecified"
        else "artifact_missing"
        end
@@ -153,6 +155,8 @@ def flow_artifact_state($artifact; $input; $actual_head):
       sha256: ($input.sha256 // null),
       producer_status: $input.producer_status,
       producer_command: ($input.producer_command // null),
+      producer_executed_count: ($input.producer_executed_count // 0),
+      producer_execution_status: ($input.producer_execution_status // null),
       source_head: (if $source_head == "" then null else $source_head end),
       source_dirty: $source_dirty,
       passed: ($status == "passed_evidence"),
@@ -161,6 +165,7 @@ def flow_artifact_state($artifact; $input; $actual_head):
           .[$entry.key] = (
             if $status == "passed_evidence" then
               flow_document_gate_verdict($document; $entry.key; $entry.value.top_level_fallback)
+            elif $status == "artifact_missing_after_execution" then "failed"
             else "not_covered"
             end
           )
