@@ -86,8 +86,8 @@ use api::flow::collab::bootstrap;
 use api::flow::collab::cache::{PutOutcome, WarmCache};
 use api::flow::collab::coordinator::DocumentCoordinator;
 use api::flow::collab::limits::{
-    DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS, WARM_CACHE_DECODED_BYTES_MAX, WARM_CACHE_DOCUMENTS_MAX,
-    WARM_CACHE_ENTRY_DECODED_BYTES_MAX, WARM_CACHE_IDLE_TTL_SECONDS,
+    MAX_REBASE_ATTEMPTS, WARM_CACHE_DECODED_BYTES_MAX, WARM_CACHE_DOCUMENTS_MAX, WARM_CACHE_ENTRY_DECODED_BYTES_MAX,
+    WARM_CACHE_IDLE_TTL_SECONDS, document_lock_timeout_ms,
 };
 use api::flow::collab::registry::SessionRegistry;
 use api::flow::collab::snapshot::SnapshotAdvancer;
@@ -1368,12 +1368,13 @@ async fn section_retry_exhaustion(
             before.head_seq, after.head_seq
         ));
     }
-    // Three attempts, each bounded by the 100 ms lock wait, is the floor for this construction.
-    let attempts_floor_ms = f64::from(MAX_REBASE_ATTEMPTS) * DOCUMENT_LOCK_WAIT_MS_MAX as f64;
+    // Three attempts, each bounded by the applied 80 ms lock timeout, is the floor for this construction.
+    let lock_timeout_ms = document_lock_timeout_ms(1);
+    let attempts_floor_ms = f64::from(MAX_REBASE_ATTEMPTS) * lock_timeout_ms as f64;
     if elapsed_ms < attempts_floor_ms * 0.8 {
         violations.push(format!(
             "exhaustion: the victim gave up after {elapsed_ms:.0} ms, well under the \
-             {MAX_REBASE_ATTEMPTS} x {DOCUMENT_LOCK_WAIT_MS_MAX} ms the bounded retry implies -- it \
+             {MAX_REBASE_ATTEMPTS} x {lock_timeout_ms} ms the bounded retry implies -- it \
              probably did not make all three attempts"
         ));
     }

@@ -883,7 +883,7 @@ async fn run_locked_phase(
     observed_lock_order: &mut Vec<Uuid>,
 ) -> Result<LockedOutcome, ApiError> {
     let input = ctx.input;
-    write::set_locked_phase_statement_budgets(tx).await?;
+    write::set_locked_phase_statement_budgets(tx, plan.document_lock_order.len()).await?;
 
     // [layer 1] the conflicting epoch lock, held to commit. Taken first, so any in-flight content
     // write holding `FOR SHARE` on this row has either committed or is blocked before this
@@ -2858,6 +2858,115 @@ mod database_tests {
     // -----------------------------------------------------------------------------------------
     // 1. The multi-document path itself: two heads, one transaction, ascending lock order.
     // -----------------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn two_document_move_installs_distinct_lock_and_statement_timeouts_in_postgres() {
+        #[derive(FromQueryResult)]
+        struct TimeoutRow {
+            lock_timeout: String,
+            statement_timeout: String,
+        }
+
+        let scratch = scratch_or_skip!("two_document_timeouts");
+        let tx = scratch.db.begin().await.expect("transaction starts");
+        crate::flow::collab::write::set_locked_phase_statement_budgets(&tx, 2)
+            .await
+            .expect("production timeout setup succeeds");
+        let settings = TimeoutRow::find_by_statement(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT current_setting('lock_timeout') AS lock_timeout, \
+                    current_setting('statement_timeout') AS statement_timeout"
+                .to_string(),
+        ))
+        .one(&tx)
+        .await
+        .expect("current settings query succeeds")
+        .expect("settings row exists");
+        assert_eq!(settings.lock_timeout, "180ms");
+        assert_eq!(settings.statement_timeout, "200ms");
+        assert_ne!(
+            settings.lock_timeout, settings.statement_timeout,
+            "equal deadlines make 55P03 versus 57014 nondeterministic"
+        );
+        tx.rollback().await.expect("read-only fixture rolls back");
+        scratch.drop_self().await;
+    }
+
+    /// Five warmups followed by thirty measured cross-project moves. The probe brackets the
+    /// production locked phase itself (including commit), not request setup, CRDT preparation, or
+    /// response construction, so the observation is the quantity LB-1 actually budgets.
+    #[tokio::test]
+    async fn two_document_move_lock_hold_has_five_warmups_and_thirty_measured_samples() {
+        const WARMUPS: usize = 5;
+        const MEASUREMENTS: usize = 30;
+
+        let scratch = scratch_or_skip!("two_document_lock_hold_samples");
+        let state = state_for(scratch.db.clone());
+        let collab = CollabRuntime::default();
+        let fx = seed_workspace(&scratch.db).await;
+        let nav_a = create(&state, &fx, "navigator", Some(fx.project_a), None).await;
+        let nav_b = create(&state, &fx, "navigator", Some(fx.project_b), None).await;
+        let page = create(&state, &fx, "page", Some(fx.project_a), Some(nav_a)).await;
+
+        run_move(
+            &state,
+            &collab,
+            &fx,
+            &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": nav_b })),
+        )
+        .await
+        .expect("setup move materializes the target navigator entry");
+        super::clear_move_locked_phase_samples();
+
+        let mut currently_in_a = false;
+        for sample in 0..(WARMUPS + MEASUREMENTS) {
+            let target = if currently_in_a { nav_b } else { nav_a };
+            run_move(
+                &state,
+                &collab,
+                &fx,
+                &move_input(page, fx.owner_id, "owner", json!({ "target_object_id": target })),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("two-document sample {sample} failed: {err:?}"));
+            currently_in_a = !currently_in_a;
+            if sample + 1 == WARMUPS {
+                let discarded = super::take_move_locked_phase_samples();
+                assert_eq!(discarded.len(), WARMUPS, "every warmup must cross the measured phase");
+            }
+        }
+
+        let mut samples = super::take_move_locked_phase_samples();
+        assert_eq!(
+            samples.len(),
+            MEASUREMENTS,
+            "ADR-0010 requires at least thirty post-warmup lock-hold samples"
+        );
+        samples.sort_by(f64::total_cmp);
+        let p95_index = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+        let p95_ms = samples[p95_index];
+        let max_ms = *samples.last().expect("thirty samples are non-empty");
+        let budget_ms = f64::from(
+            u32::try_from(crate::flow::collab::limits::document_lock_statement_timeout_ms(2))
+                .expect("two-document budget fits u32"),
+        );
+        assert!(
+            max_ms <= budget_ms,
+            "two-document locked phase max {max_ms:.3}ms exceeds {budget_ms:.0}ms"
+        );
+        eprintln!(
+            "LB1_LOCK_HOLD_EVIDENCE {}",
+            json!({
+                "warmups": WARMUPS,
+                "samples": samples.len(),
+                "contended_documents": 2,
+                "budget_ms": budget_ms,
+                "lock_hold_ms_p95": p95_ms,
+                "lock_hold_ms_max": max_ms,
+            })
+        );
+        scratch.drop_self().await;
+    }
 
     #[tokio::test]
     async fn cross_project_move_advances_both_navigator_heads_in_one_ascending_ordered_transaction() {

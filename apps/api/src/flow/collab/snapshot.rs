@@ -34,9 +34,9 @@ use crate::error::ApiError;
 
 use super::bootstrap;
 use super::limits::{
-    BOOTSTRAP_DECODED_BYTES_MAX, DOCUMENT_LOCK_HOLD_MS_MAX, DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS,
-    SNAPSHOT_REBUILD_WALL_MS_SOFT_MAX, SNAPSHOT_TAIL_BYTES_HARD_MAX, SNAPSHOT_TAIL_BYTES_SOFT_MAX,
-    SNAPSHOT_TAIL_UPDATES_HARD_MAX, SNAPSHOT_TAIL_UPDATES_SOFT_MAX,
+    BOOTSTRAP_DECODED_BYTES_MAX, DOCUMENT_LOCK_HOLD_MS_MAX, MAX_REBASE_ATTEMPTS, SNAPSHOT_REBUILD_WALL_MS_SOFT_MAX,
+    SNAPSHOT_TAIL_BYTES_HARD_MAX, SNAPSHOT_TAIL_BYTES_SOFT_MAX, SNAPSHOT_TAIL_UPDATES_HARD_MAX,
+    SNAPSHOT_TAIL_UPDATES_SOFT_MAX,
 };
 
 /// A point-in-time read of one document's snapshot/tail shape. Never held across the trigger
@@ -271,8 +271,11 @@ pub async fn commit_candidate(
     candidate: &Candidate,
 ) -> Result<CommitOutcome, ApiError> {
     let tx = db.begin().await?;
-    tx.execute_unprepared(&format!("SET LOCAL lock_timeout = '{DOCUMENT_LOCK_WAIT_MS_MAX}ms'"))
-        .await?;
+    tx.execute_unprepared(&format!(
+        "SET LOCAL lock_timeout = '{}ms'",
+        super::limits::document_lock_timeout_ms(1)
+    ))
+    .await?;
     tx.execute_unprepared(&format!(
         "SET LOCAL statement_timeout = '{DOCUMENT_LOCK_HOLD_MS_MAX}ms'"
     ))

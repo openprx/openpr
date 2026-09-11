@@ -2080,7 +2080,7 @@ mod harness_self_checks {
     fn locked_phase(extra: &[&str]) -> LoggedTransaction {
         let mut statements = vec![
             statement(0, 0, 0.02, "BEGIN"),
-            statement(0, 0, 0.02, "SET LOCAL lock_timeout = '100ms'"),
+            statement(0, 0, 0.02, "SET LOCAL lock_timeout = '80ms'"),
             statement(0, 0, 0.02, "SET LOCAL statement_timeout = '100ms'"),
             statement(
                 0,

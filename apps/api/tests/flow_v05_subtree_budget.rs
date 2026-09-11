@@ -84,6 +84,10 @@ use api::flow::projection;
 const LOCK_HOLD_P95_MS_MAX: f64 = 25.0;
 /// `document_lock_hold_ms_max`.
 const LOCK_HOLD_SINGLE_MS_MAX: f64 = 100.0;
+/// `document_lock_hold_ms_max_per_extra_document`.
+const LOCK_HOLD_PER_EXTRA_DOCUMENT_MS: f64 = 100.0;
+/// This harness always contends two navigator documents.
+const LOCK_HOLD_TWO_DOCUMENT_MS_MAX: f64 = LOCK_HOLD_SINGLE_MS_MAX + LOCK_HOLD_PER_EXTRA_DOCUMENT_MS;
 /// `update_bytes_max`.
 const UPDATE_BYTES_MAX: usize = 65_536;
 /// `websocket_frame_bytes_max` — the outbound broadcast of a navigator update has to fit a frame
@@ -713,10 +717,10 @@ async fn run_cascade(db: &DatabaseConnection, input: &CascadeInput<'_>) -> Resul
     let tx = db.begin().await.map_err(|err| format!("begin: {err}"))?;
 
     if input.production_budgets {
-        tx.execute_unprepared("SET LOCAL lock_timeout = '100ms'")
+        tx.execute_unprepared("SET LOCAL lock_timeout = '180ms'")
             .await
             .map_err(|err| format!("lock_timeout: {err}"))?;
-        tx.execute_unprepared("SET LOCAL statement_timeout = '100ms'")
+        tx.execute_unprepared("SET LOCAL statement_timeout = '200ms'")
             .await
             .map_err(|err| format!("statement_timeout: {err}"))?;
     }
@@ -1414,7 +1418,7 @@ async fn move_subtree_nodes_max_cost_curve() {
                     rung.n, hold.samples
                 ));
             }
-            if hold.p95_ms <= LOCK_HOLD_P95_MS_MAX && hold.max_ms <= LOCK_HOLD_SINGLE_MS_MAX {
+            if hold.p95_ms <= LOCK_HOLD_P95_MS_MAX && hold.max_ms <= LOCK_HOLD_TWO_DOCUMENT_MS_MAX {
                 largest_n_within_time = largest_n_within_time.max(rung.n);
             }
         }
@@ -1467,6 +1471,8 @@ async fn move_subtree_nodes_max_cost_curve() {
         "frozen_targets": {
             "document_lock_hold_ms_p95_max": LOCK_HOLD_P95_MS_MAX,
             "document_lock_hold_ms_max": LOCK_HOLD_SINGLE_MS_MAX,
+            "document_lock_hold_ms_max_per_extra_document": LOCK_HOLD_PER_EXTRA_DOCUMENT_MS,
+            "two_document_lock_hold_ms_max": LOCK_HOLD_TWO_DOCUMENT_MS_MAX,
             "update_bytes_max": UPDATE_BYTES_MAX,
             "websocket_frame_bytes_max": WEBSOCKET_FRAME_BYTES_MAX,
             "container_count_max": CONTAINER_COUNT_MAX,

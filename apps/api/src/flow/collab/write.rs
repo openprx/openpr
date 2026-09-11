@@ -67,7 +67,7 @@ use super::bootstrap::{self, content_hash};
 use super::cache::WarmCache;
 use super::coordinator::DocumentCoordinator;
 use super::frame::{Frame, PROTOCOL_VERSION, RejectedCode, SERVER_REJECTED_REASON_DATABASE, WriteState, encode_bytes};
-use super::limits::{DOCUMENT_LOCK_HOLD_MS_MAX, DOCUMENT_LOCK_WAIT_MS_MAX, MAX_REBASE_ATTEMPTS};
+use super::limits::{DOCUMENT_LOCK_HOLD_MS_MAX, MAX_REBASE_ATTEMPTS};
 use super::registry::SessionRegistry;
 use super::snapshot::{self, SnapshotAdvancer, Trigger};
 
@@ -670,7 +670,7 @@ async fn stage_locked_writes(
     prepared: &Prepared,
     dispatch_max_attempts: i32,
 ) -> Result<StagedOutcome, ApiError> {
-    set_locked_phase_statement_budgets(tx).await?;
+    set_locked_phase_statement_budgets(tx, 1).await?;
 
     // [layer 1] the commit-time epoch fence, held to commit. Only a genuine epoch mismatch
     // (`ApiError::Conflict` -- `authz_epoch` really did move past `checked_epoch`) means the
@@ -691,20 +691,23 @@ async fn stage_locked_writes(
 }
 
 /// `limits-v1.md`'s `document_lock_wait_ms_max` / `document_lock_hold_ms_max`, applied
-/// server-side to every statement of a locked phase. Shared with `flow::move_object`, whose
-/// multi-document locked phase is held to the *same* per-statement budgets — `ADR-0013` §2.4
-/// withdrew the 150 ms multi-document ceiling and left multi-document commands on the
-/// single-document numbers until `document_lock_hold_ms_max_per_extra_document` is frozen.
+/// server-side to every statement of a locked phase. `ADR-0018` LB-1 assigns 100 ms to each
+/// contended document, while LB-2 keeps the row-lock deadline 20 ms below that statement budget
+/// so a wait timeout cannot race a generic statement timeout.
 ///
 /// # Errors
 /// Propagates a database failure.
-pub(crate) async fn set_locked_phase_statement_budgets(tx: &DatabaseTransaction) -> Result<(), ApiError> {
-    tx.execute_unprepared(&format!("SET LOCAL lock_timeout = '{DOCUMENT_LOCK_WAIT_MS_MAX}ms'"))
+pub(crate) async fn set_locked_phase_statement_budgets(
+    tx: &DatabaseTransaction,
+    contended_document_count: usize,
+) -> Result<(), ApiError> {
+    let statement_timeout_ms = super::limits::document_lock_statement_timeout_ms(contended_document_count);
+    let lock_timeout_ms = super::limits::document_lock_timeout_ms(contended_document_count);
+    debug_assert!(lock_timeout_ms < statement_timeout_ms);
+    tx.execute_unprepared(&format!("SET LOCAL lock_timeout = '{lock_timeout_ms}ms'"))
         .await?;
-    tx.execute_unprepared(&format!(
-        "SET LOCAL statement_timeout = '{DOCUMENT_LOCK_HOLD_MS_MAX}ms'"
-    ))
-    .await?;
+    tx.execute_unprepared(&format!("SET LOCAL statement_timeout = '{statement_timeout_ms}ms'"))
+        .await?;
     Ok(())
 }
 
@@ -1947,7 +1950,7 @@ mod database_tests {
         // Give A a real chance to reach `fence_epoch_for_share` and block on B's `FOR UPDATE`
         // before B is allowed to proceed -- this is what makes the interleaving deterministic:
         // A's write is provably in flight, past its own permission check, when B commits. Kept
-        // well under `DOCUMENT_LOCK_WAIT_MS_MAX` (100ms, `run_locked_phase`'s own `lock_timeout`)
+        // well under the applied 80ms `lock_timeout`
         // so this proves A is *blocked* on B's lock, not that A's own lock_timeout fired first.
         tokio::time::sleep(Duration::from_millis(40)).await;
         assert!(
@@ -1991,11 +1994,11 @@ mod database_tests {
 
     /// Root-cause reproduction for the full-suite flake: `fence_epoch_for_share`'s `SELECT ...
     /// FOR SHARE` can fail for reasons that have nothing to do with `authz_epoch` ever moving --
-    /// most concretely, Postgres's own `lock_timeout` (`DOCUMENT_LOCK_WAIT_MS_MAX`, 100ms) firing
+    /// most concretely, `PostgreSQL`'s own 80ms `lock_timeout` firing
     /// while it waits on a row lock some *other* transaction happens to be holding a moment too
     /// long (exactly what many scratch databases hammering one shared Postgres instance under
     /// `cargo test --workspace` produce). `B` here holds a real `FOR UPDATE` on the same row for
-    /// 150ms -- past `A`'s 100ms `lock_timeout` -- then rolls back having never touched
+    /// 150ms -- past `A`'s 80ms `lock_timeout` -- then rolls back having never touched
     /// `authz_epoch` at all. No authorization ever changed; this is pure transient contention.
     ///
     /// Before the fix this reads as `LockedOutcome::EpochMismatch` (any `Err` from the fence
@@ -2050,7 +2053,7 @@ mod database_tests {
             .expect("B locks the epoch row");
             b_holding_tx.send(()).expect("A is still waiting to receive this");
 
-            // Held well past A's 100ms `lock_timeout` so A's own `FOR SHARE` is guaranteed to be
+            // Held well past A's 80ms `lock_timeout` so A's own `FOR SHARE` is guaranteed to be
             // cancelled by Postgres (`55P03 lock_not_available`), not merely to block and then
             // succeed once granted.
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2149,8 +2152,13 @@ mod database_tests {
     /// checks the exact frozen `limits-v1.md` numbers `run_locked_phase` sends over the wire.
     #[test]
     fn lock_timeout_budgets_match_the_frozen_limits_v1_numbers() {
-        assert_eq!(super::DOCUMENT_LOCK_WAIT_MS_MAX, 100);
+        assert_eq!(super::super::limits::DOCUMENT_LOCK_WAIT_MS_MAX, 100);
         assert_eq!(super::DOCUMENT_LOCK_HOLD_MS_MAX, 100);
+        assert_eq!(super::super::limits::document_lock_timeout_ms(1), 80);
+        assert!(
+            super::super::limits::document_lock_timeout_ms(1)
+                < super::super::limits::document_lock_statement_timeout_ms(1)
+        );
     }
 
     /// `flow::collab::egress::EgressSequencer`'s `SeqDecision::Gap` backfill query

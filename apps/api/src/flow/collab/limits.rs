@@ -31,6 +31,39 @@ pub const DOCUMENT_LOCK_WAIT_MS_MAX: u64 = 100;
 /// `document_lock_hold_ms_max` — hard per-transaction deadline (`SET LOCAL statement_timeout`
 /// budget for the locked portion of the write transaction).
 pub const DOCUMENT_LOCK_HOLD_MS_MAX: u64 = 100;
+/// `document_lock_hold_ms_max_per_extra_document` — each additional contended document adds the
+/// same 100 ms critical-section allowance (`ADR-0018` LB-1).
+pub const DOCUMENT_LOCK_HOLD_MS_MAX_PER_EXTRA_DOCUMENT: u64 = 100;
+/// Separation between the row-lock wait deadline and the statement deadline. A positive margin
+/// makes `PostgreSQL`'s `55P03` lock timeout win deterministically over `57014` statement timeout.
+pub const DOCUMENT_LOCK_TIMEOUT_MARGIN_MS: u64 = 20;
+
+/// Total locked-phase statement budget for `contended_document_count` documents.
+#[must_use]
+pub const fn document_lock_statement_timeout_ms(contended_document_count: usize) -> u64 {
+    let count = if contended_document_count == 0 {
+        1
+    } else {
+        contended_document_count as u64
+    };
+    DOCUMENT_LOCK_HOLD_MS_MAX.saturating_add(
+        count
+            .saturating_sub(1)
+            .saturating_mul(DOCUMENT_LOCK_HOLD_MS_MAX_PER_EXTRA_DOCUMENT),
+    )
+}
+
+/// Actual `PostgreSQL` row-lock timeout, strictly below the paired statement timeout.
+#[must_use]
+pub const fn document_lock_timeout_ms(contended_document_count: usize) -> u64 {
+    document_lock_statement_timeout_ms(contended_document_count).saturating_sub(DOCUMENT_LOCK_TIMEOUT_MARGIN_MS)
+}
+
+/// Inclusive exact-boundary predicate used by budget evidence.
+#[must_use]
+pub const fn document_lock_hold_within_budget(contended_document_count: usize, observed_ms: u64) -> bool {
+    observed_ms <= document_lock_statement_timeout_ms(contended_document_count)
+}
 
 /// Bounded rebase retry count (`collab-protocol-v1.md`: "最多 3 次锁外 rebase"). Also the
 /// `document_prepare_rebase_attempts_max` budget snapshot advancement's own boundary/head-mismatch
@@ -304,7 +337,33 @@ pub const fn effective_limits() -> FlowLimitsV1 {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use super::effective_limits;
+    use super::{
+        DOCUMENT_LOCK_HOLD_MS_MAX_PER_EXTRA_DOCUMENT, DOCUMENT_LOCK_TIMEOUT_MARGIN_MS,
+        document_lock_hold_within_budget, document_lock_statement_timeout_ms, document_lock_timeout_ms,
+        effective_limits,
+    };
+
+    #[test]
+    fn two_document_lock_budget_accepts_exactly_two_hundred_and_rejects_two_hundred_one() {
+        assert_eq!(DOCUMENT_LOCK_HOLD_MS_MAX_PER_EXTRA_DOCUMENT, 100);
+        assert_eq!(document_lock_statement_timeout_ms(1), 100);
+        assert_eq!(document_lock_statement_timeout_ms(2), 200);
+        assert!(document_lock_hold_within_budget(2, 200));
+        assert!(!document_lock_hold_within_budget(2, 201));
+    }
+
+    #[test]
+    fn lock_timeout_is_strictly_below_statement_timeout_for_each_contended_document_count() {
+        assert_eq!(DOCUMENT_LOCK_TIMEOUT_MARGIN_MS, 20);
+        for count in 1..=32 {
+            assert!(
+                document_lock_timeout_ms(count) < document_lock_statement_timeout_ms(count),
+                "document count {count} must retain a deterministic timeout margin"
+            );
+        }
+        assert_eq!(document_lock_timeout_ms(1), 80);
+        assert_eq!(document_lock_timeout_ms(2), 180);
+    }
 
     /// `limits-v1.md`: "Bootstrap 必须返回 effective、完整且不可空的结构" — pins the wire field
     /// count and a couple of values so a future edit here cannot silently drop a field without a
