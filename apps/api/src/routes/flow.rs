@@ -741,7 +741,7 @@ mod flow_database_tests {
         list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
         set_flow_feature,
     };
-    use crate::error::ApiError;
+    use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::{
         authz::PermissionLevel,
         permission_cache::{PermissionCache, PrincipalKind},
@@ -2240,12 +2240,28 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(
-            exhausted["code"], 403,
-            "three unstable attempts must fail closed: {exhausted}"
+            exhausted["code"], 409,
+            "three unstable attempts must report conflict: {exhausted}"
+        );
+        assert_eq!(exhausted["error_code"], "authorization_churn");
+        assert_eq!(
+            exhausted["details"]["retry_after_ms"],
+            crate::flow::policy::AUTHORIZATION_CHURN_RETRY_AFTER_MS
         );
         assert_eq!(
             exhausted["message"], "authorization changed repeatedly while the read was being evaluated",
-            "the exhaustion path must remain distinguishable from an object permission denial"
+            "the caller-safe explanation remains stable"
+        );
+        let forbidden = body_json(to_response::<Response>(Err(ApiError::typed(
+            ApiErrorKind::Forbidden,
+            "authorization changed repeatedly while the read was being evaluated",
+        ))))
+        .await;
+        assert_eq!(forbidden["code"], 403);
+        assert_eq!(forbidden["error_code"], "forbidden");
+        assert_ne!(
+            exhausted["error_code"], forbidden["error_code"],
+            "authorization churn must be distinguishable from a real denial without reading message prose"
         );
 
         scratch.drop_self().await;

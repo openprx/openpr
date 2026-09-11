@@ -306,6 +306,9 @@ pub enum ApiErrorKind {
     PolicyRejected,
     LimitExceeded,
     ResyncRequired,
+    /// A read could not obtain a stable authorization epoch within its bounded retries. This is
+    /// not a denial: retrying after the supplied delay may succeed (`ADR-0018` AC-1).
+    AuthorizationChurn,
     /// A deterministic, permanent **server-side** refusal: the operation will be refused
     /// identically on every attempt, so advertising it as retryable is a lie the caller acts on
     /// (`error-mapping-v1.md`, 2026-09-01: "永远不可能成功的失败,不得报成可重试").
@@ -346,6 +349,7 @@ impl ApiErrorKind {
             Self::PolicyRejected => "policy_rejected",
             Self::LimitExceeded => "limit_exceeded",
             Self::ResyncRequired => "resync_required",
+            Self::AuthorizationChurn => "authorization_churn",
             Self::ServerRejected => "server_rejected",
             Self::ServerDraining(_) => "server_draining",
             Self::ChecksumMismatch => "checksum_mismatch",
@@ -375,7 +379,7 @@ impl ApiErrorKind {
             | Self::LimitExceeded
             | Self::ChecksumMismatch
             | Self::UnsupportedFormat => 400,
-            Self::StaleFrontier | Self::ResyncRequired | Self::ServerDraining(_) => 409,
+            Self::StaleFrontier | Self::ResyncRequired | Self::AuthorizationChurn | Self::ServerDraining(_) => 409,
         }
     }
 
@@ -395,6 +399,7 @@ impl ApiErrorKind {
             Self::PolicyRejected => "policy rejected",
             Self::LimitExceeded => "limit exceeded",
             Self::ResyncRequired => "resync required",
+            Self::AuthorizationChurn => "authorization churn",
             Self::ServerRejected => "server rejected",
             Self::ServerDraining(ServerDrainingReason::Drain) => "server draining",
             Self::ServerDraining(ServerDrainingReason::Contention) => "server busy",
@@ -435,7 +440,7 @@ impl ApiErrorKind {
             // Both `server_draining` reasons *do* share 9 ("两种 reason 不拆退出码，JSON 保留
             // discriminator"), and that sharing is sound where the split above is not: both
             // reasons are retryable, so it never crosses the boundary `$?` is read for.
-            Self::ServerDraining(_) => 9,
+            Self::AuthorizationChurn | Self::ServerDraining(_) => 9,
         }
     }
 
@@ -463,6 +468,7 @@ impl ApiErrorKind {
             | Self::StaleFrontier
             | Self::InvalidUpdate
             | Self::ResyncRequired
+            | Self::AuthorizationChurn
             // `server_rejected` refuses the *update*, not the session: the contract's own reason
             // is that killing a healthy connection turns one local failure into a full reconnect.
             // Its close is the repeated-failure one below, never a single-rejection close.
@@ -500,6 +506,7 @@ impl ApiErrorKind {
             | Self::PolicyRejected
             | Self::LimitExceeded
             | Self::ResyncRequired
+            | Self::AuthorizationChurn
             | Self::ServerDraining(_)
             | Self::ChecksumMismatch
             | Self::UnsupportedFormat => None,
@@ -515,7 +522,11 @@ impl ApiErrorKind {
     #[must_use]
     pub const fn recoverable(self) -> bool {
         match self {
-            Self::Unauthenticated | Self::StaleFrontier | Self::ResyncRequired | Self::ServerDraining(_) => true,
+            Self::Unauthenticated
+            | Self::StaleFrontier
+            | Self::ResyncRequired
+            | Self::AuthorizationChurn
+            | Self::ServerDraining(_) => true,
             Self::Unclassified
             | Self::Forbidden
             | Self::FeatureDisabled
@@ -549,6 +560,7 @@ impl ApiErrorKind {
             Self::PolicyRejected => "flow.error.policy_rejected",
             Self::LimitExceeded => "flow.error.limit_exceeded",
             Self::ResyncRequired => "flow.error.resync_required",
+            Self::AuthorizationChurn => "flow.error.authorization_churn",
             Self::ServerRejected => "flow.error.server_rejected",
             Self::ServerDraining(ServerDrainingReason::Drain) => "flow.error.server_draining.drain",
             Self::ServerDraining(ServerDrainingReason::Contention) => "flow.error.server_draining.contention",
@@ -631,6 +643,16 @@ impl ApiError {
 
     pub fn invalid_update(message: impl Into<String>) -> Self {
         Self::typed(ApiErrorKind::InvalidUpdate, message)
+    }
+
+    /// A bounded authorization read exhausted its epoch-stability retries. The retry hint is
+    /// required on every transport so callers never have to guess a backoff.
+    pub fn authorization_churn(retry_after_ms: u64) -> Self {
+        Self::typed_with_details(
+            ApiErrorKind::AuthorizationChurn,
+            "authorization changed repeatedly while the read was being evaluated",
+            json!({ "retry_after_ms": retry_after_ms }),
+        )
     }
 
     /// A deterministic, permanent server-side refusal, carrying only the safe classification
@@ -835,6 +857,21 @@ impl IntoResponse for ApiError {
 mod server_rejected_row_tests {
     use super::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK, ServerDrainingReason};
 
+    #[test]
+    fn authorization_churn_row_is_retryable_and_distinct_from_forbidden() {
+        let churn = ApiErrorKind::AuthorizationChurn;
+        let forbidden = ApiErrorKind::Forbidden;
+        assert_eq!(churn.stable_code(), "authorization_churn");
+        assert_eq!(churn.http_status_code(), 409);
+        assert_eq!(churn.cli_exit_code(), 9);
+        assert_eq!(churn.ui_key(), "flow.error.authorization_churn");
+        assert!(churn.recoverable());
+        assert_eq!(churn.ws_close_code(), None, "one rejected frame keeps the socket open");
+        assert_ne!(churn.stable_code(), forbidden.stable_code());
+        assert_ne!(churn.http_status_code(), forbidden.http_status_code());
+        assert_ne!(churn.recoverable(), forbidden.recoverable());
+    }
+
     /// `error-mapping-v1.md`'s `server_rejected` row, transcribed cell by cell.
     ///
     /// Every number here is frozen contract, and none of them is derivable from the others — a
@@ -950,6 +987,7 @@ mod server_rejected_row_tests {
             ApiErrorKind::ServerDraining(ServerDrainingReason::Drain),
             ApiErrorKind::StaleFrontier,
             ApiErrorKind::ResyncRequired,
+            ApiErrorKind::AuthorizationChurn,
             ApiErrorKind::PolicyRejected,
             ApiErrorKind::ChecksumMismatch,
             ApiErrorKind::UnsupportedFormat,

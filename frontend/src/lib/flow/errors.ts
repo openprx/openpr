@@ -30,6 +30,7 @@ export const FLOW_ERROR_CODES = [
 	'policy_rejected',
 	'limit_exceeded',
 	'resync_required',
+	'authorization_churn',
 	'server_draining'
 ] as const satisfies readonly FlowErrorCode[];
 
@@ -259,6 +260,7 @@ function isRecoverable(code: FlowErrorCode): boolean {
 		case 'unauthenticated':
 		case 'stale_frontier':
 		case 'resync_required':
+		case 'authorization_churn':
 		case 'server_draining':
 			return true;
 		default:

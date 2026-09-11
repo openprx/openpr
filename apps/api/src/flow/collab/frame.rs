@@ -57,6 +57,7 @@ pub enum RejectedCode {
     PolicyRejected,
     LimitExceeded,
     ResyncRequired,
+    AuthorizationChurn,
     /// A deterministic, permanent server-side refusal of **this one update**
     /// (`collab-protocol-v1.md`, 2026-09-01). `recoverable` is always `false` and the connection
     /// is kept: what is permanently refused is the update, not the session.

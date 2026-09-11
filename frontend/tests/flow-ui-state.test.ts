@@ -54,6 +54,34 @@ const suite = new Suite('web_ime_undo_selection_and_sync_state');
 
 const { clientError: clientErrorRef } = await import('../src/lib/flow/errors');
 
+suite.check('authorization churn is retryable and machine-distinct from forbidden on REST and WS', () => {
+	const envelope = flowErrorFromEnvelope({
+		code: 409,
+		error_code: 'authorization_churn',
+		details: { retry_after_ms: 200 }
+	});
+	const frame = flowErrorFromRejectedFrame({
+		type: 'rejected',
+		code: 'authorization_churn',
+		recoverable: true,
+		details: { retry_after_ms: 200 }
+	});
+	const forbidden = flowErrorFromEnvelope({ code: 403, error_code: 'forbidden' });
+	for (const [surface, error] of [
+		['REST', envelope],
+		['WS', frame]
+	] as const) {
+		assert(error !== null, `${surface} must recognize authorization_churn`);
+		assertEqual(error.code, 'authorization_churn', `${surface} stable code`);
+		assertEqual(error.recoverable, true, `${surface} retry disposition`);
+		assertEqual(parseRetryAfterMs(error.details), 200, `${surface} retry hint`);
+		assertEqual(flowErrorI18nKey(error), 'flow.error.authorization_churn', `${surface} UI key`);
+	}
+	assert(forbidden !== null, 'forbidden fixture must parse');
+	assertEqual(forbidden.recoverable, false, 'forbidden is not retryable');
+	assertNotEqual(envelope?.code, forbidden.code, 'stable codes must not collapse');
+});
+
 // =============================================================================================
 // The one producer fixture, in the three shapes the server emits it in.
 // =============================================================================================

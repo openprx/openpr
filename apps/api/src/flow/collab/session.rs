@@ -253,6 +253,7 @@ const fn rejected_code_to_api_kind(code: RejectedCode) -> ApiErrorKind {
         RejectedCode::PolicyRejected => ApiErrorKind::PolicyRejected,
         RejectedCode::LimitExceeded => ApiErrorKind::LimitExceeded,
         RejectedCode::ResyncRequired => ApiErrorKind::ResyncRequired,
+        RejectedCode::AuthorizationChurn => ApiErrorKind::AuthorizationChurn,
         RejectedCode::ServerRejected => ApiErrorKind::ServerRejected,
         // A handshake-time close always reports `drain`, never `contention`: there is no document
         // lock/rebase/snapshot contention to report about a session that has not reached `open`
@@ -1905,6 +1906,7 @@ mod tests {
             RejectedCode::PolicyRejected,
             RejectedCode::LimitExceeded,
             RejectedCode::ResyncRequired,
+            RejectedCode::AuthorizationChurn,
             RejectedCode::ServerRejected,
             RejectedCode::ServerDraining,
         ] {

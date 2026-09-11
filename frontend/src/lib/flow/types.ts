@@ -42,6 +42,7 @@ export type FlowErrorCode =
 	| 'policy_rejected'
 	| 'limit_exceeded'
 	| 'resync_required'
+	| 'authorization_churn'
 	| 'server_draining';
 
 export interface FlowDrainDetails {

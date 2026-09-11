@@ -115,6 +115,7 @@ impl CliError {
             "policy_rejected" => Self::from_kind(ApiErrorKind::PolicyRejected, message, details),
             "limit_exceeded" => Self::from_kind(ApiErrorKind::LimitExceeded, message, details),
             "resync_required" => Self::from_kind(ApiErrorKind::ResyncRequired, message, details),
+            "authorization_churn" => Self::from_kind(ApiErrorKind::AuthorizationChurn, message, details),
             // Without this arm a `server_rejected` response falls through to the numeric
             // fallback below, which has no `500` case and therefore reports it as
             // `Self::network` -- stable code `server_draining`, `recoverable: true`. The exit
@@ -299,6 +300,18 @@ mod tests {
         assert_eq!(
             CliError::from_structured(typed(409, "resync_required", None)).exit,
             exit::CONFLICT
+        );
+        let authorization_churn =
+            CliError::from_structured(typed(409, "authorization_churn", Some(json!({"retry_after_ms": 200}))));
+        assert_eq!(authorization_churn.exit, exit::TEMPORARY);
+        assert_eq!(authorization_churn.code, "authorization_churn");
+        assert!(authorization_churn.recoverable);
+        assert_eq!(
+            authorization_churn
+                .details
+                .get("retry_after_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(200)
         );
         assert_eq!(
             CliError::from_structured(typed(400, "invalid_update", None)).exit,

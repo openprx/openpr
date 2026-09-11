@@ -26,6 +26,9 @@ use authz::PermissionLevel;
 /// The bound prevents active membership churn from becoming an unbounded request.
 pub(crate) const AUTHORIZATION_READ_ATTEMPTS: usize = 3;
 
+/// Required retry hint for a read that exhausts [`AUTHORIZATION_READ_ATTEMPTS`].
+pub(crate) const AUTHORIZATION_CHURN_RETRY_AFTER_MS: u64 = 200;
+
 /// One read request's authenticated principal and epoch snapshot.
 pub struct FlowReadContext {
     workspace_id: Uuid,
@@ -243,11 +246,9 @@ pub async fn ensure_epoch_current(state: &AppState, context: &FlowReadContext) -
     Ok(current == context.authz_epoch)
 }
 
-/// No frozen error code describes authorization churn after the bounded retries are exhausted.
-/// Keep the pre-existing fail-closed `Forbidden` wire behavior until the contract adds one;
-/// callers must not branch on this message.
+/// Stable retryable failure after the bounded authorization-read attempts are exhausted.
 pub(crate) fn authorization_read_unstable() -> ApiError {
-    ApiError::Forbidden("authorization changed repeatedly while the read was being evaluated".to_string())
+    ApiError::authorization_churn(AUTHORIZATION_CHURN_RETRY_AFTER_MS)
 }
 
 #[cfg(test)]

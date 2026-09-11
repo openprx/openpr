@@ -1705,6 +1705,12 @@ pub(super) fn map_write_rejection(rejected: &write::Rejected) -> ApiError {
                 .and_then(Value::as_i64);
             ApiError::resync_required("resync_required", minimum_snapshot_seq)
         }
+        RejectedCode::AuthorizationChurn => ApiError::authorization_churn(
+            details
+                .and_then(|details| details.get("retry_after_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(super::policy::AUTHORIZATION_CHURN_RETRY_AFTER_MS),
+        ),
         RejectedCode::LimitExceeded => {
             let (limit_kind, limit, observed, retry_after_ms) =
                 details.map_or(("unknown", None, None, None), |details| {

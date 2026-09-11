@@ -2334,6 +2334,7 @@
       "policy_rejected": "That action was rejected by policy.",
       "limit_exceeded": "Limit exceeded (max {limit}, got {observed}).",
       "resync_required": "Resync required, fetching the latest content…",
+      "authorization_churn": "Permissions changed repeatedly. Retrying…",
       "server_draining": {
         "drain": "The service is undergoing maintenance and will reconnect automatically.",
         "contention": "Retrying, please wait."

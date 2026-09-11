@@ -120,7 +120,12 @@ fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolR
 fn recoverable_business_error(code: &str) -> bool {
     matches!(
         code,
-        "unauthenticated" | "stale_frontier" | "limit_exceeded" | "resync_required" | "server_draining"
+        "unauthenticated"
+            | "stale_frontier"
+            | "limit_exceeded"
+            | "resync_required"
+            | "authorization_churn"
+            | "server_draining"
     )
 }
 
@@ -1384,6 +1389,36 @@ mod tests {
         assert_eq!(body["error"]["recoverable"], true);
         assert_eq!(body["error"]["details"]["reason"], "drain");
         assert_eq!(body["error"]["details"]["retry_after_ms"], 1500);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn flow_authorization_churn_preserves_retry_hint_as_a_recoverable_mcp_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let router = Router::new().route(
+            "/api/v1/flow/objects/{object_id}",
+            get(|| async {
+                Json(json!({
+                    "code": 409,
+                    "message": "authorization changed repeatedly",
+                    "data": null,
+                    "error_code": "authorization_churn",
+                    "details": {"retry_after_ms": 200}
+                }))
+            }),
+        );
+        let base_url = test_api::spawn(router).await?;
+        let client = test_api::client(base_url)?;
+        let result = get_flow_object(&client, json!({"object_id": "11111111-1111-4111-8111-111111111111"})).await;
+
+        assert_eq!(result.is_error, Some(true));
+        let Some(crate::protocol::ToolContent::Text { text }) = result.content.first() else {
+            return Err("missing MCP text content".into());
+        };
+        let body: serde_json::Value = serde_json::from_str(text)?;
+        assert_eq!(body["error"]["code"], "authorization_churn");
+        assert_eq!(body["error"]["recoverable"], true);
+        assert_eq!(body["error"]["details"]["retry_after_ms"], 200);
         Ok(())
     }
 
