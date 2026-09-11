@@ -3575,7 +3575,8 @@ mod database_tests {
         let state = state_for(scratch.db.clone());
         let fx = seed_workspace(&scratch.db).await;
 
-        let a = insert_raw_object(&scratch.db, fx.workspace_id, None).await;
+        let system_root = insert_raw_object(&scratch.db, fx.workspace_id, None).await;
+        let a = insert_raw_object(&scratch.db, fx.workspace_id, Some(system_root)).await;
         let b = insert_raw_object(&scratch.db, fx.workspace_id, Some(a)).await;
         exec(
             &scratch.db,

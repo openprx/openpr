@@ -3939,10 +3939,10 @@ mod database_tests {
         let collab = CollabRuntime::default();
         let fx = seed_workspace(&scratch.db).await;
 
-        // Root at depth 0, then 31 more hops: the deepest node sits at depth 31, so one more hop
-        // is legal (32) and two are not (33).
+        // The navigator root is structural depth. Add 32 visible pages so the deepest page sits
+        // at user depth 31: one more visible hop is legal (32) and two are not (33).
         let mut chain = vec![create(&state, &fx, "navigator", Some(fx.project_a), None).await];
-        for _ in 0..31 {
+        for _ in 0..32 {
             let parent = chain[chain.len() - 1];
             chain.push(create(&state, &fx, "page", Some(fx.project_a), Some(parent)).await);
         }
