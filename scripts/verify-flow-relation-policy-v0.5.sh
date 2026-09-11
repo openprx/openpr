@@ -144,7 +144,14 @@ test_log = pathlib.Path(test_log_s).read_text(encoding="utf-8", errors="replace"
 mutation_log = pathlib.Path(mutation_log_s).read_text(encoding="utf-8", errors="replace")
 
 contract_line = next((line for line in contract.splitlines() if "`RelationView`" in line), "")
-if not contract_line or "{visibility:\"unavailable\"}" not in contract_line or "invalid_update" not in contract_line:
+corruption_line = next((line for line in contract.splitlines() if "跨 workspace relation" in line), "")
+if (
+    not contract_line
+    or "{visibility:\"unavailable\"}" not in contract_line
+    or not corruption_line
+    or "invalid_update" not in corruption_line
+    or "integrity alert" not in corruption_line
+):
     raise SystemExit("contract parse failed: non-empty RelationView leak/fail-closed rule required")
 
 def exact_test_passed(name):
