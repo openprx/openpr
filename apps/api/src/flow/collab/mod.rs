@@ -45,10 +45,13 @@ pub mod write;
 /// The minimum effective permission shared by ticket issuance, WebSocket `open`, and post-commit
 /// revocation.
 ///
-/// The value remains `edit` until the contract conflict between ADR-0007's read+write
-/// admission and `collab-protocol-v1.md`'s view-only subscription is resolved by the contract
-/// owner; all three production decisions must move together when that happens.
-pub const MINIMUM_COLLAB_SESSION_LEVEL: authz::PermissionLevel = authz::PermissionLevel::Edit;
+/// `ADR-0018` RO-1 resolves the former wording conflict in favour of view-only subscriptions.
+/// Write authority remains a separate frame-level decision; all three admission/revocation
+/// decisions still move together through this one value.
+pub const MINIMUM_COLLAB_SESSION_LEVEL: authz::PermissionLevel = authz::PermissionLevel::View;
+
+/// The minimum permission that may submit a document update on an admitted collab session.
+pub const MINIMUM_COLLAB_WRITE_LEVEL: authz::PermissionLevel = authz::PermissionLevel::Edit;
 
 /// Collab tickets are user-only, so every admitted session is evaluated as the same principal
 /// kind during `open` and revocation.
@@ -82,7 +85,7 @@ mod tests {
 
     #[test]
     fn collab_admission_and_revocation_share_one_permission_threshold() {
-        assert_eq!(super::MINIMUM_COLLAB_SESSION_LEVEL, PermissionLevel::Edit);
+        assert_eq!(super::MINIMUM_COLLAB_SESSION_LEVEL, PermissionLevel::View);
         for level in [
             PermissionLevel::Denied,
             PermissionLevel::View,
@@ -99,5 +102,10 @@ mod tests {
                 "admission/revocation drifted at {level:?}"
             );
         }
+        assert_eq!(
+            super::MINIMUM_COLLAB_WRITE_LEVEL,
+            PermissionLevel::Edit,
+            "read-only admission must not lower the document-write threshold"
+        );
     }
 }

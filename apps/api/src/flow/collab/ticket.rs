@@ -74,7 +74,7 @@ fn validate_client_id(client_id: &str) -> Result<(), ApiError> {
 /// `BadRequest` for a malformed `client_id`/`origin`; `Forbidden` when the origin is not
 /// allowlisted, the caller is not a member of `workspace_id`, Flow is not enabled for that
 /// workspace (`error-mapping-v1.md`'s `feature_disabled`: `Forbidden` / 403 / HTTP 200), or the
-/// effective permission is below `edit` (`ADR-0007`: "document read+write ACL"); `NotFound` when
+/// effective permission is below `view` (`ADR-0018` RO-1); `NotFound` when
 /// `document_id` does not resolve to a `collab_documents` row whose object belongs to
 /// `workspace_id`. Propagates a database failure otherwise.
 pub async fn issue(
@@ -127,8 +127,9 @@ pub async fn issue(
     .map(|row| row.role)
     .ok_or_else(|| ApiError::Forbidden("not a member of this workspace".to_string()))?;
 
-    // `ADR-0007`: "签发前验证 `flow_enabled`、workspace membership、object/document read+write ACL
-    // 和 user token type". A workspace with the rollout flag off must not be able to obtain a
+    // `ADR-0018` clarifies ADR-0007's "read+write ACL" wording as checking both ACLs rather than
+    // requiring write authority: view and comment principals may obtain read-only sessions.
+    // A workspace with the rollout flag off must not be able to obtain a
     // ticket at all — not merely be stopped later, at the `open` frame.
     //
     // Deliberately *after* the membership and epoch-lock checks above and *before* the document
@@ -177,7 +178,7 @@ pub async fn issue(
     .await?;
     if !permission_admits_session(level) {
         return Err(ApiError::Forbidden(
-            "document read+write access is required to open a collab session".to_string(),
+            "document view access is required to open a collab session".to_string(),
         ));
     }
 

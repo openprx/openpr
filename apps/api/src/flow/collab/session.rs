@@ -30,7 +30,7 @@ use super::registry::{ConnectionLimit, OutboundEvent, PresenceLimit, Registratio
 use super::runtime;
 use super::ticket::ConsumedTicket;
 use super::write::{self, AcceptOutcome, UpdateRequest};
-use super::{COLLAB_SESSION_PRINCIPAL_KIND, MINIMUM_COLLAB_SESSION_LEVEL};
+use super::{COLLAB_SESSION_PRINCIPAL_KIND, MINIMUM_COLLAB_SESSION_LEVEL, MINIMUM_COLLAB_WRITE_LEVEL};
 use crate::error::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK};
 use crate::flow::event_origin::{CommandOrigin, EventSource, EventSurface};
 
@@ -522,6 +522,7 @@ impl Heartbeat {
 struct DocumentContext {
     object_id: Uuid,
     checked_epoch: i64,
+    permission_level: PermissionLevel,
 }
 
 enum OpenReverifyFailure {
@@ -816,6 +817,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
     }
 
     let checked_epoch = ctx.checked_epoch;
+    let may_write_document = ctx.permission_level >= MINIMUM_COLLAB_WRITE_LEVEL;
     let mut frame_limiter = RateLimiter::new(FRAMES_PER_CONNECTION_PER_SECOND, FRAME_BURST_MAX);
     let mut update_limiter = RateLimiter::new(UPDATES_PER_CONNECTION_PER_SECOND, UPDATE_BURST_MAX);
     // `collab-protocol-v1.md` "accepted 出站顺序": "snapshot.head_seq=H 后第一条 accepted 只能是
@@ -984,6 +986,7 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                             consumed.user_id,
                             &consumed.client_id,
                             checked_epoch,
+                            may_write_document,
                             frame,
                             &mut socket,
                             &mut sequencer,
@@ -1405,6 +1408,7 @@ async fn reverify_open(state: &AppState, consumed: &ConsumedTicket) -> Result<Do
     Ok(DocumentContext {
         object_id,
         checked_epoch,
+        permission_level: level,
     })
 }
 
@@ -1465,6 +1469,7 @@ async fn handle_client_frame(
     actor_id: Uuid,
     origin_client_id: &str,
     checked_epoch: i64,
+    may_write_document: bool,
     frame: Frame,
     socket: &mut WebSocket,
     sequencer: &mut EgressSequencer,
@@ -1516,6 +1521,14 @@ async fn handle_client_frame(
             message,
             ..
         } => {
+            if !may_write_document {
+                send(
+                    socket,
+                    &rejected_frame(document_id, RejectedCode::PolicyRejected, false, Some(update_id)),
+                )
+                .await;
+                return;
+            }
             if frame_document_id != document_id {
                 send(
                     socket,
@@ -2560,7 +2573,7 @@ mod tests {
         use uuid::Uuid;
 
         use crate::error::REPEATED_FAILURE_CLOSE_STREAK;
-        use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode};
+        use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION, RejectedCode, WriteState};
         use crate::flow::collab::limits::{UPDATE_BURST_MAX, WEBSOCKET_FRAME_BYTES_MAX};
         use crate::routes::collab::{create_ticket, ws_upgrade};
 
@@ -4612,6 +4625,123 @@ mod tests {
                 origin: "server-rejected-test".to_string(),
                 message: None,
             }
+        }
+
+        /// `ADR-0018` RO-1..RO-3: `view` crosses the admission boundary but not the write
+        /// boundary. The same live socket must receive durable update and presence fan-out, may
+        /// contribute only ephemeral presence, and must reject its own document update without
+        /// closing or touching any persistence counter.
+        #[tokio::test]
+        async fn view_session_is_live_read_only_and_receives_update_and_presence_fanout() {
+            let scratch = scratch_or_skip!("view-read-only-session");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let viewer_id = Uuid::new_v4();
+            exec(
+                &state,
+                "INSERT INTO users (id, email, password_hash, name, role, is_active) \
+                 VALUES ($1, $2, '!', 'viewer', 'user', true)",
+                vec![viewer_id.into(), format!("{viewer_id}@session-live-ws.test").into()],
+            )
+            .await;
+            exec(
+                &state,
+                "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'member')",
+                vec![workspace_id.into(), viewer_id.into()],
+            )
+            .await;
+            exec(
+                &state,
+                "UPDATE flow_workspace_settings SET default_member_level = 'view' WHERE workspace_id = $1",
+                vec![workspace_id.into()],
+            )
+            .await;
+
+            let addr = spawn_server(state.clone()).await;
+            let viewer_ticket =
+                issue_ticket(addr, &jwt_for(viewer_id), workspace_id, document_id, "readonly-viewer").await;
+            let (mut viewer, _, _, viewer_session) =
+                open_session_full(addr, &viewer_ticket, "readonly-viewer", document_id).await;
+            let owner_ticket =
+                issue_ticket(addr, &jwt_for(owner_id), workspace_id, document_id, "readonly-owner").await;
+            let (mut owner, _, _, owner_session) =
+                open_session_full(addr, &owner_ticket, "readonly-owner", document_id).await;
+
+            let owner_update = next_update_frame(&state, document_id).await;
+            let Frame::Update {
+                update_id: owner_update_id,
+                ..
+            } = &owner_update
+            else {
+                panic!("next_update_frame must return update");
+            };
+            let owner_update_id = *owner_update_id;
+            send_frame(&mut owner, &owner_update).await;
+            let owner_receipt = recv_frame(&mut owner).await;
+            assert!(
+                matches!(owner_receipt, Frame::Accepted { update_id, .. } if update_id == owner_update_id),
+                "the writable owner update must succeed: {owner_receipt:?}"
+            );
+            let viewer_update = recv_frame(&mut viewer).await;
+            assert!(
+                matches!(viewer_update, Frame::Update { update_id, .. } if update_id == owner_update_id),
+                "the read-only peer must receive the durable update: {viewer_update:?}"
+            );
+            let viewer_receipt = recv_frame(&mut viewer).await;
+            assert!(
+                matches!(viewer_receipt, Frame::Accepted { update_id, .. } if update_id == owner_update_id),
+                "the read-only peer must receive accepted fan-out: {viewer_receipt:?}"
+            );
+
+            send_frame(&mut owner, &presence_frame(document_id, 17, Some(30))).await;
+            let owner_presence = recv_frame(&mut viewer).await;
+            assert!(
+                matches!(owner_presence, Frame::Presence { session_id, ref payload, .. }
+                    if session_id == owner_session && payload["cursor"] == 17),
+                "the read-only peer must receive presence fan-out: {owner_presence:?}"
+            );
+
+            let updates_before = count_collab_updates(&state, document_id).await;
+            let head_before = read_head_seq(&state, document_id).await;
+            let dispatch_before = count_event_dispatch(&state, document_id).await;
+            let refused_update = next_update_frame(&state, document_id).await;
+            let Frame::Update {
+                update_id: refused_id, ..
+            } = &refused_update
+            else {
+                panic!("next_update_frame must return update");
+            };
+            let refused_id = *refused_id;
+            send_frame(&mut viewer, &refused_update).await;
+            let refusal = recv_frame(&mut viewer).await;
+            assert!(
+                matches!(refusal, Frame::Rejected {
+                    update_id: Some(update_id),
+                    code: RejectedCode::PolicyRejected,
+                    recoverable: false,
+                    write_state: WriteState::NotApplied,
+                    ..
+                } if update_id == refused_id),
+                "a view update must be a non-recoverable policy rejection: {refusal:?}"
+            );
+            assert_eq!(count_collab_updates(&state, document_id).await, updates_before);
+            assert_eq!(read_head_seq(&state, document_id).await, head_before);
+            assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_before);
+            sync(&mut viewer).await;
+
+            send_frame(&mut viewer, &presence_frame(document_id, 29, Some(30))).await;
+            let viewer_presence = recv_frame(&mut owner).await;
+            assert!(
+                matches!(viewer_presence, Frame::Presence { session_id, ref payload, .. }
+                    if session_id == viewer_session && payload["cursor"] == 29),
+                "ephemeral viewer presence must still fan out: {viewer_presence:?}"
+            );
+            assert_eq!(count_collab_updates(&state, document_id).await, updates_before);
+            assert_eq!(read_head_seq(&state, document_id).await, head_before);
+            assert_eq!(count_event_dispatch(&state, document_id).await, dispatch_before);
+
+            scratch.drop_self().await;
         }
 
         /// What the socket produced next: a control frame, or the server hanging up.
