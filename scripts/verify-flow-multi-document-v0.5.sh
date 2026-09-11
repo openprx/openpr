@@ -29,6 +29,7 @@ CONTRACTS_ROOT="/opt/working/sylvode-flow"
 EVIDENCE_ROOT="${TMPDIR:-/tmp}/openpr-flow-evidence/v0.5"
 ADR_PATH=""
 JSON_MODE=0
+STATIC_ONLY=0
 DATABASE_URL="postgresql://flowtest:flowtest@127.0.0.1:25433/postgres"
 
 usage() {
@@ -49,6 +50,8 @@ Options:
   --repo-root DIR         Repository containing apps/api and the Cargo
                           workspace. Default: this checkout.
   --json                  Required for CLI-contract compatibility.
+  --static-only           Run only the fail-closed R17 source scanner. This is
+                          intended for mutation/falsification checks.
   -h, --help              Show this help and exit 0.
 
 Exit codes: 0 all checks passed, 1 an assertion failed/not implemented,
@@ -63,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --evidence-root) EVIDENCE_ROOT="${2:?--evidence-root requires a DIR argument}"; shift 2 ;;
     --repo-root) REPO_ROOT="${2:?--repo-root requires a DIR argument}"; shift 2 ;;
     --json) JSON_MODE=1; shift ;;
+    --static-only) STATIC_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     *) echo "Unexpected argument: $1" >&2; usage >&2; exit 2 ;;
@@ -212,7 +216,7 @@ for path in sorted(flow_root.rglob("*.rs")):
 
 write = sources["collab/write.rs"]
 move = sources["move_object.rs"]
-authz = sources["collab/authz.rs"]
+authz_raw = read("collab/authz.rs")
 snapshot = sources["collab/snapshot.rs"]
 command = sources["command.rs"]
 
@@ -259,23 +263,6 @@ else:
     if "FROM collab_documents WHERE id = $1 FOR UPDATE" not in stage_body:
         head_violations.append("stage_one_document no longer takes the document row FOR UPDATE")
 
-    _, _, content_body = stage_locked
-    content_epoch = content_body.find("fence_epoch_for_share(")
-    content_stage = content_body.find("stage_one_document(")
-    if content_epoch < 0 or content_stage < 0 or content_epoch >= content_stage:
-        head_violations.append(
-            "content-write transaction does not take the workspace epoch lock before stage_one_document"
-        )
-
-    _, _, move_body = move_locked
-    move_epoch = move_body.find("lock_epoch_for_update(")
-    move_document = move_body.find("lock_document_head(")
-    move_stage = move_body.find("stage_one_document(")
-    if min(move_epoch, move_document, move_stage) < 0 or not (move_epoch < move_document < move_stage):
-        head_violations.append(
-            "move transaction does not take its epoch conflict lock before document locks/head advancement"
-        )
-
 call_sites = []
 for relative, src in sources.items():
     for match in re.finditer(r"(?:write::)?stage_one_document\s*\(", src):
@@ -285,16 +272,70 @@ for relative, src in sources.items():
         call_sites.append(
             {"file": f"apps/api/src/flow/{relative}", "line": line_at(src, match.start())}
         )
-if sorted(site["file"] for site in call_sites) != sorted(
-    ["apps/api/src/flow/collab/write.rs", "apps/api/src/flow/move_object.rs"]
-):
+caller_specs = [
+    ("collab/write.rs", "stage_locked_writes", "fence_epoch_for_share", None),
+    ("collections.rs", "execute_document_update", "fence_epoch_for_share", None),
+    ("collections.rs", "create_collection_embed", "fence_epoch_for_share", None),
+    ("move_object.rs", "run_locked_phase", "lock_epoch_for_update", "lock_document_head"),
+]
+caller_proofs = []
+for relative, function, epoch_helper, document_helper in caller_specs:
+    function_slice = fn_slice(sources[relative], function)
+    if function_slice is None:
+        head_violations.append(f"frozen stage_one_document caller disappeared: {relative}::{function}")
+        continue
+    function_start, _, body = function_slice
+    stage_matches = list(re.finditer(r"(?:write::)?stage_one_document\s*\(", body))
+    epoch_pos = body.find(f"{epoch_helper}(")
+    document_pos = body.find(f"{document_helper}(") if document_helper else None
+    ordered = (
+        len(stage_matches) == 1
+        and epoch_pos >= 0
+        and epoch_pos < stage_matches[0].start()
+        and (document_pos is None or epoch_pos < document_pos < stage_matches[0].start())
+    )
+    proof = {
+        "file": f"apps/api/src/flow/{relative}",
+        "function": function,
+        "epoch_helper": epoch_helper,
+        "epoch_line": line_at(sources[relative], function_start + epoch_pos) if epoch_pos >= 0 else None,
+        "document_lock_line": (
+            line_at(sources[relative], function_start + document_pos)
+            if document_pos is not None and document_pos >= 0 else None
+        ),
+        "stage_one_document_line": (
+            line_at(sources[relative], function_start + stage_matches[0].start())
+            if len(stage_matches) == 1 else None
+        ),
+        "epoch_before_document_before_stage": ordered,
+    }
+    caller_proofs.append(proof)
+    if not ordered:
+        head_violations.append(
+            f"frozen caller lacks epoch-before-document proof: {relative}::{function}"
+        )
+
+proof_sites = sorted(
+    (proof["file"], proof["stage_one_document_line"])
+    for proof in caller_proofs
+    if proof["stage_one_document_line"] is not None
+)
+discovered_sites = sorted((site["file"], site["line"]) for site in call_sites)
+if discovered_sites != proof_sites:
     head_violations.append(
         "stage_one_document production callers changed; every new caller requires an epoch-before-document proof"
     )
 
-if "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR SHARE" not in authz:
+share_fence = fn_slice(authz_raw, "fence_epoch_for_share")
+update_lock = fn_slice(authz_raw, "lock_epoch_for_update")
+share_body = share_fence[2] if share_fence is not None else ""
+update_body = update_lock[2] if update_lock is not None else ""
+if not all(fragment in share_body for fragment in [
+    "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR SHARE",
+    "row.authz_epoch != checked_epoch",
+]):
     head_violations.append("content epoch fence is not a workspace-row FOR SHARE lock")
-if "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE" not in authz:
+if "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE" not in update_body:
     head_violations.append("move epoch lock is not a workspace-row FOR UPDATE conflict lock")
 
 snapshot_info = {
@@ -368,7 +409,7 @@ if move_locked is not None:
         multi_violations.append(
             "the BoundedMany move transaction does not take epoch FOR UPDATE before document locks"
         )
-if "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE" not in authz:
+if "SELECT authz_epoch FROM flow_workspace_settings WHERE workspace_id = $1 FOR UPDATE" not in update_body:
     multi_violations.append("lock_epoch_for_update does not implement an epoch conflict lock")
 
 print(
@@ -378,6 +419,7 @@ print(
                 "status": "passed" if not head_violations else "failed",
                 "canonical_head_write_sites": head_write_sites,
                 "stage_one_document_call_sites": call_sites,
+                "stage_one_document_caller_proofs": caller_proofs,
                 "content_write_epoch_lock": "FOR SHARE",
                 "move_epoch_lock": "FOR UPDATE",
                 "snapshot_checkpoint": snapshot_info,
@@ -402,6 +444,18 @@ if ! jq -e . >/dev/null 2>&1 <<<"$STATIC_JSON"; then
   echo "FAIL: R17 static parser did not produce valid JSON" >&2
   echo "$STATIC_JSON" >&2
   exit 2
+fi
+if [[ $STATIC_ONLY -eq 1 ]]; then
+  static_artifact="$EVIDENCE_ROOT/r17-static-result.json"
+  static_tmp="$static_artifact.tmp.$$"
+  printf '%s\n' "$STATIC_JSON" | jq . >"$static_tmp"
+  mv "$static_tmp" "$static_artifact"
+  cat "$static_artifact"
+  jq -e '
+    .canonical_head_transactions_epoch_before_document_lock.passed == true and
+    .multi_document_transactions_epoch_conflict_lock.passed == true
+  ' >/dev/null <<<"$STATIC_JSON"
+  exit $?
 fi
 
 # ---- 2. Dynamic move/coordinator tests ----
