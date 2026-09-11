@@ -4208,7 +4208,6 @@ mod database_tests {
                 "total_ms": total_started.elapsed().as_millis(),
                 "matched_records": response.items.len(),
                 "typed_index_required": true,
-                "document_decode_attempts": 0,
             })
         );
         scratch.drop_self().await;
