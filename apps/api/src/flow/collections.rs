@@ -1932,7 +1932,7 @@ async fn collection_views<C: ConnectionTrait>(
 fn field_is_restricted(field: &CollectionFieldView) -> bool {
     match field.config.get("restricted") {
         None | Some(Value::Bool(false)) => false,
-        Some(Value::Bool(true)) | Some(_) => true,
+        Some(_) => true,
     }
 }
 
@@ -2822,8 +2822,7 @@ mod tests {
             matches!(triple, [verb, modifier, identifier]
                 if matches!(
                     (*verb, *modifier),
-                    ("insert", "into")
-                        | ("merge", "into")
+                    ("insert" | "merge", "into")
                         | ("delete", "from")
                         | ("update", "only")
                         | ("truncate", "table" | "only")
