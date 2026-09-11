@@ -691,6 +691,7 @@ def test_ok(name):
 observed = {gate: [] for gate in GATES}
 reason_codes = {gate: [] for gate in GATES}
 not_covered_reason_codes = {gate: [] for gate in GATES}
+excluded_reason_codes = {gate: [] for gate in GATES}
 
 def add(gate, criterion, passed, actual, evidence, reason=None):
     item = {
@@ -718,6 +719,19 @@ def add_not_covered(gate, criterion, actual, evidence, reason):
     observed[gate].append(item)
     if reason not in not_covered_reason_codes[gate]:
         not_covered_reason_codes[gate].append(reason)
+
+def add_excluded(gate, criterion, actual, evidence, reason):
+    item = {
+        "criterion": criterion,
+        "status": "excluded",
+        "passed": None,
+        "actual": actual,
+        "evidence": evidence if isinstance(evidence, list) else [evidence],
+        "reason_code": reason,
+    }
+    observed[gate].append(item)
+    if reason not in excluded_reason_codes[gate]:
+        excluded_reason_codes[gate].append(reason)
 
 def add_test(gate, criterion, name, reason="required_test_missing_or_failed"):
     ok = test_ok(name)
@@ -961,9 +975,14 @@ if has_collection:
         [str(files["migration"]), str(files["command"])],
         None if collection_fixture else "collection_container_tier_fixture_not_implemented")
 else:
-    add_not_covered(gate, "collection_container_tier",
-        {"schema_object_types": schema_types, "schema_supports_collection": False, "version_boundary": "v0.5"},
-        [str(files["migration"])], "collection_container_not_implemented_v0_5")
+    add_excluded(gate, "collection_container_tier",
+        {"schema_object_types": schema_types, "schema_supports_collection": False,
+         "excluded_from_release": "v0.5", "owning_release": "v0.6",
+         "paired_gate": "gates/v0.6-gate.yaml#collection_container_archive_tier",
+         "paired_gate_status": "contract_change_required"},
+        [str(files["migration"]), str(contracts / "versions/v0.6-collections.md"),
+         str(contracts / "gates/v0.6-gate.yaml")],
+        "excluded_from_v0_5_paired_to_v0_6_collection_container_archive_tier")
 retention_action = bool(re.search(r"permanent[_ -]?(?:delete|purge)|retention[_ -]?(?:delete|purge)", source["command"], re.I))
 if retention_action:
     retention_fixture = bool(re.search(r"fn\s+[a-z0-9_]*(?:retention|permanent)[a-z0-9_]*(?:archive|tier)", source["command"], re.I))
@@ -971,9 +990,14 @@ if retention_action:
         {"production_action_found": True, "constructive_fixture_found": retention_fixture}, [str(files["command"])],
         None if retention_fixture else "retention_cleanup_tier_fixture_not_implemented")
 else:
-    add_not_covered(gate, "retention_or_permanent_cleanup_tier",
-        {"production_action_found": False, "version_boundary": "v0.5"}, [str(files["command"])],
-        "retention_permanent_cleanup_not_implemented_v0_5")
+    add_excluded(gate, "retention_or_permanent_cleanup_tier",
+        {"production_action_found": False, "excluded_from_release": "v0.5",
+         "owning_release": "v0.8",
+         "paired_gate": "gates/v0.8-gate.yaml#object_retention_permanent_cleanup_archive_tier",
+         "paired_gate_status": "contract_change_required"},
+        [str(files["command"]), str(contracts / "versions/v0.8-hardening.md"),
+         str(contracts / "gates/v0.8-gate.yaml")],
+        "excluded_from_v0_5_paired_to_v0_8_object_retention_cleanup_archive_tier")
 member_baseline = baseline_result.get("member_baseline_no_behaviour_regression", {})
 baseline_passed = int(baseline_exit_s) == 0 and member_baseline.get("status") == "passed"
 baseline_violations = member_baseline.get("violations") or []
@@ -1120,7 +1144,7 @@ for gate in GATES:
     items = observed[gate]
     if not items:
         raise SystemExit(f"internal verifier error: zero observations for {gate}")
-    covered = [item for item in items if item["status"] != "not_covered"]
+    covered = [item for item in items if item["status"] not in ("not_covered", "excluded")]
     if not covered:
         raise SystemExit(f"internal verifier error: zero covered observations for {gate}")
     passed = all(item["passed"] for item in covered)
@@ -1129,6 +1153,7 @@ for gate in GATES:
         "passed": passed,
         "reason_codes": reason_codes[gate],
         "not_covered_reason_codes": not_covered_reason_codes[gate],
+        "excluded_reason_codes": excluded_reason_codes[gate],
         "observed": items,
     }
     hard_gates[gate] = details[gate]["status"]
