@@ -136,6 +136,7 @@ pub async fn load(db: &DatabaseConnection, document_id: Uuid) -> Result<Bootstra
         engine: String,
         format_version: String,
         snapshot: Vec<u8>,
+        snapshot_checksum: String,
         snapshot_frontier: Vec<u8>,
         snapshot_seq: i64,
         head_frontier: Vec<u8>,
@@ -143,7 +144,7 @@ pub async fn load(db: &DatabaseConnection, document_id: Uuid) -> Result<Bootstra
     }
     let doc = DocRow::find_by_statement(Statement::from_sql_and_values(
         sea_orm::DbBackend::Postgres,
-        "SELECT fo.workspace_id, cd.engine, cd.format_version, cd.snapshot, cd.snapshot_frontier, \
+        "SELECT fo.workspace_id, cd.engine, cd.format_version, cd.snapshot, cd.snapshot_checksum, cd.snapshot_frontier, \
                 cd.snapshot_seq, cd.head_frontier, cd.head_seq \
          FROM collab_documents cd JOIN flow_objects fo ON fo.id = cd.object_id \
          WHERE cd.id = $1",
@@ -153,6 +154,17 @@ pub async fn load(db: &DatabaseConnection, document_id: Uuid) -> Result<Bootstra
     .await?
     .ok_or_else(|| ApiError::NotFound("document not found".to_string()))?;
     let workspace_id = doc.workspace_id;
+
+    if content_hash(&doc.snapshot) != doc.snapshot_checksum {
+        tx.commit().await?;
+        return Err(resync_required(
+            db,
+            workspace_id,
+            document_id,
+            "snapshot checksum does not match its bytes",
+        )
+        .await);
+    }
 
     #[derive(FromQueryResult)]
     struct UpdateRow {

@@ -33,6 +33,7 @@ pub mod coordinator;
 pub mod egress;
 pub mod fanout;
 pub mod frame;
+pub mod integrity;
 pub mod limits;
 pub mod origin;
 pub mod permission_cache;

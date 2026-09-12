@@ -677,6 +677,7 @@ mod database_tests {
     use uuid::Uuid;
 
     use super::{AdvanceOutcome, SnapshotAdvancer, Trigger, advance, evaluate, read_tail_stats};
+    use crate::error::ApiError;
     use crate::events::{BusinessEventInput, insert_business_event};
     use crate::flow::collab::authz;
     use crate::flow::collab::bootstrap;
@@ -1462,6 +1463,49 @@ mod database_tests {
         assert_eq!(boot_before.snapshot_seq, boot_after.snapshot_seq);
 
         drop(restarted_db);
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_snapshot_bytes_that_no_longer_match_the_persisted_checksum() {
+        let scratch = scratch_or_skip!("snapshot-checksum-corruption");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        exec(
+            &state,
+            "UPDATE collab_documents \
+             SET snapshot = set_byte(snapshot, 0, (get_byte(snapshot, 0) + 1) % 256) \
+             WHERE id = $1",
+            vec![document_id.into()],
+        )
+        .await;
+        let error = bootstrap::load(&state.db, document_id)
+            .await
+            .expect_err("changed snapshot bytes must fail before any state is returned");
+        assert!(
+            matches!(error, ApiError::Conflict(ref message) if message == "resync_required"),
+            "snapshot checksum mismatch must fail closed as resync_required, got {error:?}"
+        );
+
+        #[derive(FromQueryResult)]
+        struct CountRow {
+            count: i64,
+        }
+        let alert = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS count FROM flow_integrity_records \
+             WHERE workspace_id = $1 AND subject_kind = 'collab_document' \
+               AND subject_id = $2 AND status = 'open'",
+            vec![workspace_id.into(), document_id.to_string().into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("integrity query runs")
+        .expect("integrity count returns");
+        assert_eq!(alert.count, 1, "the corruption must leave one durable integrity alert");
+
         scratch.drop_self().await;
     }
 
