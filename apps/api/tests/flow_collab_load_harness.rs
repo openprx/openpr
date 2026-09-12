@@ -87,6 +87,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -207,7 +208,7 @@ const LOCKED_PHASE_ALLOWED_STATEMENTS: &[(&str, &[&str])] = &[
     ("projection_update", &["update flow_object_projections"]),
 ];
 
-/// The container log trails the server under load; the harvest is retried until it accounts for
+/// The collector file trails the server under load; the harvest is retried until it accounts for
 /// every accepted update rather than trusting one early read.
 const HARVEST_ATTEMPTS_MAX: usize = 20;
 
@@ -224,6 +225,7 @@ const DEDICATED_PG_CONTAINER_ENV: &str = "OPENPR_FLOW_DEDICATED_PG_CONTAINER";
 const PG_LOG_CONTAINER_ENV: &str = "OPENPR_FLOW_PG_LOG_CONTAINER";
 const QUIET_PG_QUALIFIED_ENV: &str = "OPENPR_FLOW_QUIET_PG_QUALIFIED";
 const EVIDENCE_OUT_ENV: &str = "OPENPR_FLOW_LOAD_HARNESS_OUT";
+const DROP_LOG_EVERY_ENV: &str = "OPENPR_FLOW_TEST_DROP_LOG_EVERY";
 const TEST_ORIGIN: &str = "http://collab-load.local";
 const JWT_SECRET: &str = "collab-load-harness-secret";
 
@@ -1033,44 +1035,167 @@ fn group_transactions(per_pid: &BTreeMap<i32, Vec<LoggedStatement>>) -> (Vec<Log
     (transactions, unterminated)
 }
 
-/// Reads the `PostgreSQL` server log out of the container running the test database. The container
-/// engine and name are explicit inputs already qualified by the environment gate.
-fn harvest_pg_log(window_start: DateTime<Utc>) -> Result<String, String> {
+#[derive(Debug, Clone)]
+struct PgLogSource {
+    data_directory: String,
+}
+
+/// Qualifies the server-side file collector before the workload starts. Container stdout is not
+/// an admissible source: journald's default 10,000-message burst limit can discard the tail of a
+/// load run while `podman logs` still exits successfully.
+async fn qualify_pg_log_source(db: &DatabaseConnection) -> Result<PgLogSource, String> {
+    #[derive(FromQueryResult)]
+    struct SettingsRow {
+        logging_collector: String,
+        log_destination: String,
+        log_line_prefix: String,
+        data_directory: String,
+    }
+
+    let row = SettingsRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT current_setting('logging_collector') AS logging_collector, \
+                current_setting('log_destination') AS log_destination, \
+                current_setting('log_line_prefix') AS log_line_prefix, \
+                current_setting('data_directory') AS data_directory",
+        vec![],
+    ))
+    .one(db)
+    .await
+    .map_err(|err| format!("could not read PostgreSQL logging settings: {err}"))?
+    .ok_or_else(|| "PostgreSQL logging settings query returned no row".to_string())?;
+
+    if row.logging_collector != "on" {
+        return Err(
+            "logging_collector is not on; container stdout is rate-limited and is not an admissible load-log source"
+                .to_string(),
+        );
+    }
+    if !row.log_destination.split(',').any(|value| value.trim() == "stderr") {
+        return Err(format!(
+            "log_destination={:?} does not include stderr, so current_logfiles cannot supply the statement log",
+            row.log_destination
+        ));
+    }
+    if row.log_line_prefix != "%m [%p] " {
+        return Err(format!(
+            "log_line_prefix={:?}; the transaction parser requires the exact timestamp/backend-PID prefix %m [%p] ",
+            row.log_line_prefix
+        ));
+    }
+    Ok(PgLogSource {
+        data_directory: row.data_directory,
+    })
+}
+
+fn run_container_command(engine: &str, container: &str, arguments: &[String]) -> Result<String, String> {
+    let output = Command::new(engine)
+        .arg("exec")
+        .arg(container)
+        .args(arguments)
+        .output()
+        .map_err(|err| format!("{engine} exec {container}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{engine} exec {container} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn collector_log_paths(engine: &str, container: &str, data_directory: &str) -> Result<Vec<PathBuf>, String> {
+    let current_logfiles = Path::new(data_directory).join("current_logfiles");
+    let listing = run_container_command(
+        engine,
+        container,
+        &["cat".to_string(), current_logfiles.to_string_lossy().into_owned()],
+    )?;
+    let mut paths = Vec::new();
+    for line in listing.lines() {
+        let Some((destination, relative)) = line.split_once(' ') else {
+            continue;
+        };
+        if destination != "stderr" {
+            continue;
+        }
+        let relative = Path::new(relative.trim());
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(format!("current_logfiles contains unsafe path {}", relative.display()));
+        }
+        paths.push(Path::new(data_directory).join(relative));
+    }
+    if paths.is_empty() {
+        return Err(format!(
+            "{} names no stderr collector file; logging_collector output cannot be harvested",
+            current_logfiles.display()
+        ));
+    }
+    Ok(paths)
+}
+
+/// Reads `PostgreSQL`'s collector file inside the container. Unlike the journald-backed
+/// `podman logs` route this has no host message-rate limiter between `PostgreSQL` and the parser.
+fn harvest_pg_log(source: &PgLogSource) -> Result<String, String> {
     let engines: Vec<String> = std::env::var(PG_LOG_ENGINE_ENV).map_or_else(
         |_| vec!["podman".to_string(), "docker".to_string()],
         |value| vec![value],
     );
     let container =
         std::env::var(PG_LOG_CONTAINER_ENV).map_err(|_| format!("{PG_LOG_CONTAINER_ENV} is not declared"))?;
-    let since = (window_start - chrono::Duration::seconds(2))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
-
     let mut failures = Vec::new();
     for engine in engines {
-        match Command::new(&engine)
-            .args(["logs", "--since", &since, &container])
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                // PostgreSQL writes to stderr; the container engine keeps the streams separate.
-                let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-                combined.push('\n');
-                combined.push_str(&String::from_utf8_lossy(&output.stderr));
-                return Ok(combined);
+        let paths = match collector_log_paths(&engine, &container, &source.data_directory) {
+            Ok(paths) => paths,
+            Err(err) => {
+                failures.push(err);
+                continue;
             }
-            Ok(output) => failures.push(format!(
-                "{engine}: exit {:?}: {}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )),
-            Err(err) => failures.push(format!("{engine}: {err}")),
+        };
+        let mut combined = String::new();
+        let mut failed = None;
+        for path in paths {
+            match run_container_command(
+                &engine,
+                &container,
+                &["cat".to_string(), path.to_string_lossy().into_owned()],
+            ) {
+                Ok(raw) => {
+                    combined.push_str(&raw);
+                    if !combined.ends_with('\n') {
+                        combined.push('\n');
+                    }
+                }
+                Err(err) => {
+                    failed = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = failed {
+            failures.push(err);
+        } else {
+            return Ok(combined);
         }
     }
     Err(format!(
-        "could not read the PostgreSQL server log ({}); set {PG_LOG_ENGINE_ENV}/{PG_LOG_CONTAINER_ENV}",
+        "could not read the PostgreSQL collector file ({}); set {PG_LOG_ENGINE_ENV}/{PG_LOG_CONTAINER_ENV}",
         failures.join("; ")
     ))
+}
+
+fn drop_each_nth_log_line(raw: &str, every: usize) -> String {
+    raw.lines()
+        .enumerate()
+        .filter(|(index, _)| (index + 1) % every != 0)
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1345,6 +1470,8 @@ struct Report {
     bootstrap_transactions: usize,
     repeatable_read_read_only_transactions: usize,
     unterminated_transactions: usize,
+    log_sync_marker_observed: bool,
+    log_drop_mutation_every: Option<usize>,
     accepted_total: usize,
     rejections: Vec<(Uuid, String)>,
     parity: Vec<SurfaceObservation>,
@@ -1381,6 +1508,7 @@ impl Report {
                 "quiet_pg_preflight_qualified": std::env::var(QUIET_PG_QUALIFIED_ENV).as_deref() == Ok("1"),
                 "hold_ms_resolution": "±1ms (PostgreSQL %m log prefix is millisecond-quantized)",
                 "measurement_authority": "postgresql server statement log (log_min_duration_statement=0), not an in-process timer",
+                "log_transport": "logging_collector stderr file read inside the PostgreSQL container",
             },
             "10_client": {
                 "clients": CONCURRENT_CLIENTS,
@@ -1408,6 +1536,8 @@ impl Report {
                     "unresolved_statements": self.unresolved_statements,
                     "transactions_total": self.transactions_total,
                     "transactions_in_window": self.transactions_in_window,
+                    "sync_marker_observed": self.log_sync_marker_observed,
+                    "drop_every_nth_line_mutation": self.log_drop_mutation_every,
                 },
             },
             "bootstrap_parity": {
@@ -1681,12 +1811,16 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     };
 
     let logging_enabled = scratch.enable_statement_logging().await;
+    let log_source = qualify_pg_log_source(&scratch.db).await;
     // Everything logged from here on is harvested, but only transactions that *begin* after
     // `window_start` below are measured. The earlier lines still matter: they carry the `parse`
     // bodies that name the prepared statements the measured window reuses.
     let log_start = Utc::now();
     if !logging_enabled {
         report.fail("could not enable log_min_duration_statement on the scratch database: the lock-hold measurement has no authority to read");
+    }
+    if let Err(err) = &log_source {
+        report.fail(format!("PostgreSQL collector-file precondition failed: {err}"));
     }
 
     // Opened *after* `ALTER DATABASE`, so every connection in this pool logs its statements.
@@ -1781,9 +1915,6 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     parity.push(final_rest);
     parity.push(final_ws);
 
-    // Give PostgreSQL a moment to flush the tail of the window before harvesting.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
     // ---- distributions ----
     report.round_trip = Some(Distribution::of(&round_trip_ms));
     let (prepare_samples, apply_samples) = calibrate_prepare(addr, &harness.parity_token, object_id).await;
@@ -1792,17 +1923,33 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
 
     // ---- lock hold, read out of `PostgreSQL`'s own statement log ----
     //
-    // The container log lags the server by a noticeable margin under load, and a harvest taken too
-    // early returns a *prefix* of the window: a partial, time-biased sample that would still yield
-    // a plausible-looking p95. So the harvest is retried until it accounts for at least every
-    // accepted update, and the achieved coverage is asserted below either way.
+    // A unique statement after all writes is the explicit producer/collector synchronization
+    // point. The harvest is still required to account for every accepted update and contain no
+    // unterminated transaction; seeing the marker alone is not allowed to bless a partial file.
+    let log_sync_marker = format!("openpr_flow_log_sync_{}", Uuid::new_v4().simple());
+    state
+        .db
+        .execute_unprepared(&format!("SELECT '{log_sync_marker}'"))
+        .await
+        .expect("the PostgreSQL log synchronization marker executes");
+    let drop_every = std::env::var(DROP_LOG_EVERY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 1);
+    report.log_drop_mutation_every = drop_every;
     let mut reconstruction: Option<Reconstruction> = None;
     for _ in 0..HARVEST_ATTEMPTS_MAX {
         tokio::time::sleep(Duration::from_millis(HARVEST_RETRY_MS)).await;
-        match tokio::task::spawn_blocking(move || harvest_pg_log(log_start)).await {
+        let source = log_source.clone();
+        match tokio::task::spawn_blocking(move || source.and_then(|source| harvest_pg_log(&source))).await {
             Ok(Ok(raw)) => {
-                let candidate = reconstruct(&raw, log_start, window_start);
-                let complete = candidate.committed_writes() >= report.accepted_total;
+                report.log_sync_marker_observed = raw.contains(&log_sync_marker);
+                let reconstructed_raw =
+                    drop_every.map_or_else(|| raw.clone(), |every| drop_each_nth_log_line(&raw, every));
+                let candidate = reconstruct(&reconstructed_raw, log_start, window_start);
+                let complete = report.log_sync_marker_observed
+                    && candidate.committed_writes() >= report.accepted_total
+                    && candidate.unterminated == 0;
                 reconstruction = Some(candidate);
                 if complete {
                     break;
@@ -1828,6 +1975,9 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
         report.unterminated_transactions = candidate.unterminated;
         report.committed_write_transactions = candidate.committed_writes();
         report.absorb(analyze_transactions(&candidate.measured));
+    }
+    if !report.log_sync_marker_observed {
+        report.fail("the PostgreSQL collector file never exposed the post-workload synchronization marker");
     }
 
     // ---- seq contiguity and rebase-exhaustion zero-write ----
@@ -2057,8 +2207,8 @@ fn evaluate(report: &mut Report) {
 #[cfg(test)]
 mod harness_self_checks {
     use super::{
-        Distribution, LoggedStatement, LoggedTransaction, audit_locked_phase, group_transactions, parse_pg_log,
-        percentile_ms,
+        Distribution, LoggedStatement, LoggedTransaction, audit_locked_phase, drop_each_nth_log_line,
+        group_transactions, parse_pg_log, percentile_ms,
     };
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -2238,5 +2388,13 @@ mod harness_self_checks {
         let distribution = Distribution::of(&values);
         assert_eq!(distribution.samples, 100);
         assert!((distribution.max_ms - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn ten_percent_log_line_loss_is_not_hidden_by_the_mutation_helper() {
+        let raw = (1..=100).map(|value| value.to_string()).collect::<Vec<_>>().join("\n");
+        let mutated = drop_each_nth_log_line(&raw, 10);
+        assert_eq!(mutated.lines().count(), 90);
+        assert!(!mutated.lines().any(|line| line == "10" || line == "100"));
     }
 }
