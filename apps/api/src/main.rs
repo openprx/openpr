@@ -2265,6 +2265,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0061_flow_collections_query_indexes.sql",
         include_str!("../../../migrations/0061_flow_collections_query_indexes.sql"),
     ),
+    (
+        "0062_flow_forms_bridge.sql",
+        include_str!("../../../migrations/0062_flow_forms_bridge.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2594,6 +2598,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0061_flow_collections_query_indexes.sql",
         SchemaProbe::Relation("flow_collections_query_schema_guard"),
+    ),
+    (
+        "0062_flow_forms_bridge.sql",
+        SchemaProbe::Relation("flow_forms_bridge_schema_guard"),
     ),
 ];
 
