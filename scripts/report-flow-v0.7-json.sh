@@ -33,7 +33,7 @@ commands={
  "bridge_smoke":[str(repo/'scripts/smoke-flow-forms-bridge.sh'),"--evidence-root",str(evidence),"--json"],
  "migration_replay":[str(repo/'scripts/verify-flow-migration-replay-v0.7.sh'),"--repo-root",str(repo),"--evidence-root",str(evidence),"--json"],
  "forms_full":["bash","scripts/ci-universal-forms-gates.sh"],
- "flow_full":["cargo","test","-p","api","flow","--","--nocapture"],
+ "flow_full":["cargo","test","-p","api","--lib","--","--nocapture"],
  "cardinality":[str(repo/'scripts/verify-flow-cardinality-v0.7.sh'),"--adr",str(contracts/'decisions/ADR-0013-multi-document-atomicity.md'),"--since-release","0.6","--contracts-root",str(contracts),"--evidence-root",str(evidence),"--repo-root",str(repo),"--json"],
  "surface":[str(repo/'scripts/verify-flow-surface-coverage.sh'),"--release","0.7","--contracts-root",str(contracts),"--evidence-root",str(evidence),"--repo-root",str(repo),"--json"],
 }
@@ -53,8 +53,7 @@ for cid,cmd in commands.items():
   try: count=json.loads((evidence/'migration-replay-result.json').read_text()).get('executed_count',0)
   except Exception: count=0
  if cid=='forms_full':
-  count=len(re.findall(r'^PASS: ',p.stdout,re.M))
-  if 'Universal Forms CI Gates passed.' not in p.stdout or re.search(r'^FAIL: ',p.stdout,re.M): count=0
+  if 'Universal Forms static and Rust regression gates passed.' not in p.stdout or re.search(r'^FAIL: ',p.stdout,re.M): count=0
  if cid=='cardinality':
   try: count=json.loads((evidence/'cardinality-result.json').read_text()).get('new_commands_found',0)
   except Exception: count=0

@@ -48,25 +48,9 @@ for spec in api mcp frontend; do
   RESULTS="$(jq --argjson item "$result" '. + [$item]' <<<"$RESULTS")"
 done
 
-STATIC_LOG="$EVIDENCE_ROOT/logs/smoke-no-double-write.log"
-static_exit=0
-{
-  if rg -n 'CREATE[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?TRIGGER.*(flow_bridge|flow_conversion|flow_object_lineage)' migrations; then
-    echo 'FAIL: a bridge synchronization trigger exists'
-    static_exit=1
-  fi
-  if rg -n 'flow_bridge_references|flow_conversion_previews|flow_conversion_jobs|flow_object_lineage' apps/worker; then
-    echo 'FAIL: background worker references bridge persistence'
-    static_exit=1
-  fi
-  if [[ "$static_exit" == 0 ]]; then
-    echo 'PASS: no bridge synchronization trigger or worker persistence path'
-  fi
-} >"$STATIC_LOG" 2>&1
-static_result="$(jq -n --argjson exit_code "$static_exit" \
-  '{id:"no_double_write",command:"production trigger and worker source scan",exit_code:$exit_code,
-    duration_ms:0,log:"logs/smoke-no-double-write.log",status:(if $exit_code==0 then "passed" else "failed" end),executed_count:1}')"
-RESULTS="$(jq --argjson item "$static_result" '. + [$item]' <<<"$RESULTS")"
+runtime_result="$(run no_double_write cargo test -p api \
+  flow_bridge_record_conversion_runs_native_autonumber_and_validator_pipeline -- --nocapture)" || true
+RESULTS="$(jq --argjson item "$runtime_result" '. + [$item]' <<<"$RESULTS")"
 PASSED="$(jq 'all(.[]; .status=="passed") and length==4' <<<"$RESULTS")"
 OUT="$(jq -n --arg schema_version 'sylvode.flow.bridge-smoke-result.v1' \
   --arg source_head "$(git -C "$ROOT_DIR" rev-parse HEAD)" --argjson checks "$RESULTS" --argjson passed "$PASSED" \
