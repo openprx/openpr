@@ -245,12 +245,18 @@ findings["session_rs_drain_reason_literal_count"] = count(r'"reason"\s*:\s*"drai
 findings["write_rs_contention_reason_literal_count"] = count(r'"reason"\s*:\s*"contention"', write_rs_text)
 findings["session_rs_contention_reason_literal_count"] = count(r'"reason"\s*:\s*"contention"', session_rs_text)
 
-# ---- WS wire action for contention: does accepting a Rejected outcome
-# ever close the socket, or does it send a frame and keep the connection
-# open (`reject_keep_open`)? ----
-rejected_arm_m = re.search(r"Ok\(AcceptOutcome::Rejected\(rejected\)\)\s*=>\s*\{(.*?)\n\s*\}\n", session_rs_text, re.S)
-findings["session_rs_rejected_arm_calls_close"] = bool(rejected_arm_m and re.search(r"\bclose\(", rejected_arm_m.group(1)))
-findings["session_rs_rejected_arm_sends_frame"] = bool(rejected_arm_m and "send(" in rejected_arm_m.group(1))
+# ---- WS wire action for contention: the production write-error result carries an
+# action which the send branch consumes after emitting the Rejected frame. The dynamic
+# action test below is authoritative; these static findings prove the test is attached
+# to the executed branch instead of a dead helper.
+findings["session_rs_contention_action_declared"] = bool(
+    "WsRejectionAction::RejectKeepOpen" in session_rs_text
+    and '"reject_keep_open"' in session_rs_text
+)
+findings["session_rs_write_error_action_consumed"] = bool(
+    re.search(r"if let WsRejectionAction::Close\(close_code\) = rejection\.action", session_rs_text)
+    and "close(socket, close_code, rejection.action.contract_code()).await" in session_rs_text
+)
 
 # ---- WS 4410 close code: ever used? ----
 findings["session_rs_4410_literal_count"] = count(r"\b4410\b", session_rs_text)
@@ -386,6 +392,7 @@ echo "=== dynamic: cargo test groups ===" >&2
 run_group frame_serialization api "flow::collab::frame::tests::rejected_code_and_drain_reason_use_the_frozen_snake_case_vocabulary" "--lib"
 run_group shared_process_drain api "flow::collab::runtime::tests::process_drain_produces_the_drain_reason_on_every_surface_for_every_workspace" "--lib"
 run_group reason_mapping api "flow::command::typed_error_mapping_tests::server_draining_drain_and_contention_map_to_distinct_kinds" "--lib"
+run_group contention_ws_action api "flow::collab::session::tests::contention_ws_action_is_reject_keep_open" "--lib"
 run_group cli_exit_mapping mcp-server "server_draining_drain_and_contention_share_exit_9_but_never_the_same_message" "--lib"
 run_group mcp_business_error_shape mcp-server "call_tool_error_serializes_mcp_is_error_field" "--lib"
 run_group mcp_structured_flow_error mcp-server "flow_server_draining_is_a_structured_mcp_business_error" "--lib"
@@ -599,6 +606,7 @@ shared_drain_producer_test = dtest(
     "process_drain_produces_the_drain_reason_on_every_surface_for_every_workspace"
 )
 reason_mapping_test = dtest("server_draining_drain_and_contention_map_to_distinct_kinds")
+contention_ws_action_test = dtest("contention_ws_action_is_reject_keep_open")
 mcp_structured_test = dtest("flow_server_draining_is_a_structured_mcp_business_error")
 
 ui_gate = next(
@@ -625,7 +633,11 @@ ui_drain_coverage_ok = ui_gate_json_ok and ui_server_origin_assertion_ok and ui_
 rest_details_exists = f["rest_apiresponse_struct_has_details_field"]
 mcp_flow_wired = f["mcp_business_error_call_sites_in_objects_tool_rs"] > 0
 cli_reads_reason = f["cli_error_rs_reads_reason_field"]
-ws_contention_keep_open = (not f["session_rs_rejected_arm_calls_close"]) and f["session_rs_rejected_arm_sends_frame"]
+ws_contention_keep_open = bool(
+    contention_ws_action_test == "ok"
+    and f["session_rs_contention_action_declared"]
+    and f["session_rs_write_error_action_consumed"]
+)
 ws_drain_produced = (f["write_rs_drain_reason_literal_count"] + f["session_rs_drain_reason_literal_count"] + repo_wide_drain_hits) > 0
 ws_drain_close_4410_wired = (f["session_rs_4410_literal_count"] + f["frame_rs_4410_literal_count"] + repo_wide_4410_hits) > 0
 
@@ -824,6 +836,11 @@ result = {
             "test": "flow::command::typed_error_mapping_tests::server_draining_drain_and_contention_map_to_distinct_kinds",
             "status": reason_mapping_test,
             "proves": "stable code and CLI exit 9 are shared while WS close behavior and UI keys remain distinct",
+        },
+        "contention_ws_action_test": {
+            "test": "flow::collab::session::tests::contention_ws_action_is_reject_keep_open",
+            "status": contention_ws_action_test,
+            "proves": "the production write-error result names reject_keep_open and the socket branch consumes that action after sending Rejected",
         },
         "frontend_test_files_mentioning_server_draining": frontend_test_hits,
         "ui_state_gate": {

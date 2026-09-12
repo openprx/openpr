@@ -180,19 +180,53 @@ impl ServerRejectedStreak {
 /// retrying the locked-phase one, so it must not be dressed as contention either — this is the
 /// same rule `write::accept_update` applies internally, applied once more at the surface so a
 /// future `?` cannot quietly re-open the hole `server_rejected` exists to close.
-fn write_error_rejection(err: &ApiError) -> (RejectedCode, bool, serde_json::Value) {
-    if err.kind() == ApiErrorKind::ServerRejected || err.is_deterministic_database_failure() {
-        return (
-            RejectedCode::ServerRejected,
-            ApiErrorKind::ServerRejected.recoverable(),
-            serde_json::json!({"reason": SERVER_REJECTED_REASON_DATABASE}),
-        );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsRejectionAction {
+    RejectKeepOpen,
+    Close(u16),
+}
+
+impl WsRejectionAction {
+    const fn contract_code(self) -> &'static str {
+        match self {
+            Self::RejectKeepOpen => "reject_keep_open",
+            Self::Close(4410) => "close_4410",
+            Self::Close(_) => "close_other",
+        }
     }
-    (
-        RejectedCode::ServerDraining,
-        true,
-        serde_json::json!({"reason": "contention", "retry_after_ms": 500}),
-    )
+}
+
+const fn ws_rejection_action(kind: ApiErrorKind) -> WsRejectionAction {
+    match kind.ws_close_code() {
+        Some(code) => WsRejectionAction::Close(code),
+        None => WsRejectionAction::RejectKeepOpen,
+    }
+}
+
+struct WriteErrorRejection {
+    code: RejectedCode,
+    recoverable: bool,
+    details: serde_json::Value,
+    action: WsRejectionAction,
+}
+
+fn write_error_rejection(err: &ApiError) -> WriteErrorRejection {
+    if err.kind() == ApiErrorKind::ServerRejected || err.is_deterministic_database_failure() {
+        return WriteErrorRejection {
+            code: RejectedCode::ServerRejected,
+            recoverable: ApiErrorKind::ServerRejected.recoverable(),
+            details: serde_json::json!({"reason": SERVER_REJECTED_REASON_DATABASE}),
+            action: ws_rejection_action(ApiErrorKind::ServerRejected),
+        };
+    }
+    WriteErrorRejection {
+        code: RejectedCode::ServerDraining,
+        recoverable: true,
+        details: serde_json::json!({"reason": "contention", "retry_after_ms": 500}),
+        action: ws_rejection_action(ApiErrorKind::ServerDraining(
+            crate::error::ServerDrainingReason::Contention,
+        )),
+    }
 }
 
 /// `hello.capabilities` this server understands (`collab-protocol-v1.md`: "未知 required
@@ -267,9 +301,10 @@ const fn rejected_code_to_api_kind(code: RejectedCode) -> ApiErrorKind {
 /// The WS close code to send right after a `rejected`/failed-handshake `code` when this connection
 /// is being closed (`error-mapping-v1.md` via [`ApiErrorKind::ws_close_code`]).
 fn ws_close_code_for(code: RejectedCode) -> u16 {
-    rejected_code_to_api_kind(code)
-        .ws_close_code()
-        .unwrap_or(CLOSE_POLICY_VIOLATION)
+    match ws_rejection_action(rejected_code_to_api_kind(code)) {
+        WsRejectionAction::Close(code) => code,
+        WsRejectionAction::RejectKeepOpen => CLOSE_POLICY_VIOLATION,
+    }
 }
 
 /// Sends a `rejected` frame for `code` and immediately closes with the matching close code
@@ -1668,7 +1703,8 @@ async fn handle_client_frame(
                     // expressed a permanent server-side refusal and no close code was allocated
                     // for one. `collab-protocol-v1.md` (2026-09-01) allocated both, so the
                     // classification is now made instead of described.
-                    let (code, recoverable, details) = write_error_rejection(&err);
+                    let rejection = write_error_rejection(&err);
+                    let code = rejection.code;
                     if code == RejectedCode::ServerRejected {
                         *streak_effect = StreakEffect::PermanentRefusal;
                     }
@@ -1679,20 +1715,23 @@ async fn handle_client_frame(
                             document_id,
                             update_id: Some(update_id),
                             code,
-                            recoverable,
+                            recoverable: rejection.recoverable,
                             // Every `Err`-producing path either never opened a transaction, or
                             // rolled one back before returning: the locked phase's deterministic
                             // arm calls `tx.rollback()` first, and the forced-snapshot arm returns
                             // before touching this document's tail. So an `Err` here provably
                             // wrote nothing, whichever way it classifies above.
                             write_state: WriteState::NotApplied,
-                            details: Some(details),
+                            details: Some(rejection.details),
                             current_seq: None,
                             current_frontier: None,
                             audit_event_id: None,
                         },
                     )
                     .await;
+                    if let WsRejectionAction::Close(close_code) = rejection.action {
+                        close(socket, close_code, rejection.action.contract_code()).await;
+                    }
                 }
             }
         }
@@ -1887,8 +1926,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Frame, RateLimiter, RejectedCode, SERVER_REJECTED_CLOSE_CODE, ServerRejectedStreak, StreakEffect, bootstrap,
-        is_reopen_attempt, rejected_code_to_api_kind, write_error_rejection,
+        Frame, RateLimiter, RejectedCode, SERVER_REJECTED_CLOSE_CODE, ServerRejectedStreak, StreakEffect,
+        WsRejectionAction, bootstrap, is_reopen_attempt, rejected_code_to_api_kind, write_error_rejection,
     };
     use crate::error::{ApiError, ApiErrorKind, REPEATED_FAILURE_CLOSE_STREAK};
     use crate::flow::collab::limits;
@@ -2033,10 +2072,14 @@ mod tests {
     /// real socket by `live_ws::a_deterministic_refusal_arrives_as_server_rejected_and_the_session_survives`.
     #[test]
     fn an_unclassified_write_failure_stays_contention_and_a_classified_one_does_not() {
-        let (code, recoverable, details) = write_error_rejection(&ApiError::server_rejected("x"));
-        assert_eq!(code, RejectedCode::ServerRejected);
-        assert!(!recoverable, "a permanent refusal is never advertised as retryable");
-        assert_eq!(details["reason"], "deterministic_database_refusal");
+        let rejection = write_error_rejection(&ApiError::server_rejected("x"));
+        assert_eq!(rejection.code, RejectedCode::ServerRejected);
+        assert!(
+            !rejection.recoverable,
+            "a permanent refusal is never advertised as retryable"
+        );
+        assert_eq!(rejection.details["reason"], "deterministic_database_refusal");
+        assert_eq!(rejection.action, WsRejectionAction::RejectKeepOpen);
 
         for unclassified in [
             ApiError::Internal,
@@ -2045,19 +2088,19 @@ mod tests {
             ))),
             ApiError::Conflict("something else entirely".to_string()),
         ] {
-            let (code, recoverable, details) = write_error_rejection(&unclassified);
+            let rejection = write_error_rejection(&unclassified);
             assert_eq!(
-                code,
+                rejection.code,
                 RejectedCode::ServerDraining,
                 "an unclassified failure must stay retryable: {unclassified:?}"
             );
-            assert!(recoverable);
+            assert!(rejection.recoverable);
             // `error-mapping-v1.md` makes BOTH of `server_draining`'s details required
             // ("details required `{reason,retry_after_ms}`") and makes a missing one a producer
             // contract violation the tests "必须失败" on. Asserting only `reason` let this
             // producer drop `retry_after_ms` silently, which is what `flow::command`'s REST
             // mapping then reads back as `0`.
-            let object = details.as_object().expect("details is a JSON object");
+            let object = rejection.details.as_object().expect("details is a JSON object");
             let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
             keys.sort_unstable();
             assert_eq!(
@@ -2065,8 +2108,8 @@ mod tests {
                 vec!["reason", "retry_after_ms"],
                 "`server_draining` details are required to carry exactly the frozen pair, got {object:?}"
             );
-            assert_eq!(details["reason"], "contention");
-            let retry_after_ms = details["retry_after_ms"]
+            assert_eq!(rejection.details["reason"], "contention");
+            let retry_after_ms = rejection.details["retry_after_ms"]
                 .as_u64()
                 .expect("`retry_after_ms` must be a number, not a string or null");
             assert!(
@@ -2074,6 +2117,15 @@ mod tests {
                 "a retry hint of {retry_after_ms}ms tells a client to hammer the server immediately"
             );
         }
+    }
+
+    #[test]
+    fn contention_ws_action_is_reject_keep_open() {
+        let rejection = write_error_rejection(&ApiError::Internal);
+        assert_eq!(rejection.code, RejectedCode::ServerDraining);
+        assert_eq!(rejection.details["reason"], "contention");
+        assert_eq!(rejection.action, WsRejectionAction::RejectKeepOpen);
+        assert_eq!(rejection.action.contract_code(), "reject_keep_open");
     }
 
     /// The three `limits-v1.md` connection ceilings, each driven to refusal by the *real*
