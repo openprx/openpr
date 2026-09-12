@@ -163,7 +163,7 @@ WORKSPACE_B="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 OWNER_USER="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 BOT_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 BOT_TOKEN="opr_integrity_verify_${RUN_ID}"
-PARENT_OBJECT_B="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+PARENT_OBJECT_B=""
 
 # shellcheck disable=SC2317  # invoked only via `trap ... EXIT` below; shellcheck's
 # reachability analysis does not follow that call path.
@@ -224,10 +224,17 @@ VALUES ('$WORKSPACE_A', true, 'edit', 0, now());
 
 INSERT INTO workspace_bots (id, workspace_id, name, token_hash, token_prefix, permissions, created_by, is_active, created_at, updated_at)
 VALUES ('$BOT_ID', '$WORKSPACE_A', 'Integrity Verify Bot', '$BOT_TOKEN_HASH', '$BOT_TOKEN_PREFIX', '["read","write"]'::jsonb, '$OWNER_USER', true, now(), now());
-
-INSERT INTO flow_objects (id, workspace_id, object_type, lifecycle_status, created_by, updated_by, created_at, updated_at)
-VALUES ('$PARENT_OBJECT_B', '$WORKSPACE_B', 'navigator', 'active', '$OWNER_USER', '$OWNER_USER', now(), now());
 SQL
+
+# Migration 0059 creates one system navigator root transactionally with each
+# workspace. Reuse that canonical foreign parent; inserting a second root is a
+# stale-fixture unique-key failure and never reaches the integrity behavior.
+PARENT_OBJECT_B="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc \
+  "SELECT id FROM flow_objects WHERE workspace_id='$WORKSPACE_B' AND parent_id IS NULL AND governance_metadata->>'system_role'='workspace_navigator_root'")"
+if [[ -z "$PARENT_OBJECT_B" ]]; then
+  echo "FAIL: workspace B has no canonical navigator root after creation" >&2
+  exit 2
+fi
 
 echo "=== starting api on 127.0.0.1:$API_PORT ===" >&2
 "$API_BIN" --config "$APP_CONFIG" > "$API_LOG" 2>&1 &
@@ -249,6 +256,14 @@ fi
 VIOLATIONS=()
 IDEMPOTENCY_KEY="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 
+# Migration 0059 gives every workspace a canonical navigator root and its
+# paired collab document. Capture the real baseline so the rejection assertion
+# detects request-caused writes without misclassifying those required rows.
+FLOW_OBJECTS_A_BEFORE="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM flow_objects WHERE workspace_id='$WORKSPACE_A'")"
+BUSINESS_EVENTS_A_BEFORE="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM business_events WHERE workspace_id='$WORKSPACE_A'")"
+EVENT_DISPATCH_A_BEFORE="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM event_dispatch WHERE workspace_id='$WORKSPACE_A'")"
+COLLAB_DOCS_A_BEFORE="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM collab_documents cd JOIN flow_objects fo ON fo.id = cd.object_id WHERE fo.workspace_id='$WORKSPACE_A'")"
+
 echo "=== sending cross-workspace parent_object_id request ===" >&2
 RESPONSE="$(curl -sS -X POST "http://127.0.0.1:$API_PORT/api/v1/workspaces/$WORKSPACE_A/flow/objects" \
   -H "Authorization: Bearer $BOT_TOKEN" -H "Content-Type: application/json" \
@@ -266,20 +281,20 @@ fi
 
 # ---- zero canonical-state side effects for workspace A ----
 FLOW_OBJECTS_A="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM flow_objects WHERE workspace_id='$WORKSPACE_A'")"
-if [[ "$FLOW_OBJECTS_A" != "0" ]]; then
-  VIOLATIONS+=("flow_objects gained $FLOW_OBJECTS_A row(s) in workspace A -- request did not fail closed before writing canonical state")
+if [[ "$FLOW_OBJECTS_A" != "$FLOW_OBJECTS_A_BEFORE" ]]; then
+  VIOLATIONS+=("flow_objects count changed $FLOW_OBJECTS_A_BEFORE -> $FLOW_OBJECTS_A in workspace A -- request did not fail closed before writing canonical state")
 fi
 BUSINESS_EVENTS_A="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM business_events WHERE workspace_id='$WORKSPACE_A'")"
-if [[ "$BUSINESS_EVENTS_A" != "0" ]]; then
-  VIOLATIONS+=("business_events gained $BUSINESS_EVENTS_A row(s) in workspace A")
+if [[ "$BUSINESS_EVENTS_A" != "$BUSINESS_EVENTS_A_BEFORE" ]]; then
+  VIOLATIONS+=("business_events count changed $BUSINESS_EVENTS_A_BEFORE -> $BUSINESS_EVENTS_A in workspace A")
 fi
 EVENT_DISPATCH_A="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM event_dispatch WHERE workspace_id='$WORKSPACE_A'")"
-if [[ "$EVENT_DISPATCH_A" != "0" ]]; then
-  VIOLATIONS+=("event_dispatch gained $EVENT_DISPATCH_A row(s) in workspace A")
+if [[ "$EVENT_DISPATCH_A" != "$EVENT_DISPATCH_A_BEFORE" ]]; then
+  VIOLATIONS+=("event_dispatch count changed $EVENT_DISPATCH_A_BEFORE -> $EVENT_DISPATCH_A in workspace A")
 fi
 COLLAB_DOCS_A="$(psql "$DATABASE_URL" -Atc "SELECT count(*) FROM collab_documents cd JOIN flow_objects fo ON fo.id = cd.object_id WHERE fo.workspace_id='$WORKSPACE_A'")"
-if [[ "$COLLAB_DOCS_A" != "0" ]]; then
-  VIOLATIONS+=("collab_documents gained $COLLAB_DOCS_A row(s) for objects in workspace A")
+if [[ "$COLLAB_DOCS_A" != "$COLLAB_DOCS_A_BEFORE" ]]; then
+  VIOLATIONS+=("collab_documents count changed $COLLAB_DOCS_A_BEFORE -> $COLLAB_DOCS_A for objects in workspace A")
 fi
 
 # ---- exactly one flow_integrity_records row, with the right shape ----

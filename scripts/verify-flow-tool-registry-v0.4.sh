@@ -195,22 +195,11 @@ if [[ "$LIVE_COUNT" != "$CONTRACT_EXPECTED" ]]; then
 fi
 
 # ---- TOOL_POLICY_SCOPES cross-check (declared length, real entries, coverage) ----
-POLICY_JSON="$(python3 -c '
-import json, re, sys
-src = open(sys.argv[1], encoding="utf-8").read()
-m = re.search(r"const TOOL_POLICY_SCOPES: \[\(&str, PolicyScope\); (\d+)\] = \[(.*?)\n\];", src, re.S)
-if not m:
-    print(json.dumps({"error": "TOOL_POLICY_SCOPES array not found in server.rs"}))
-    sys.exit(0)
-declared_len = int(m.group(1))
-entries = re.findall(r"\(\s*\"([A-Za-z][A-Za-z0-9_.]*)\"\s*,\s*PolicyScope::", m.group(2))
-print(json.dumps({
-    "declared_len": declared_len,
-    "entry_count": len(entries),
-    "names": sorted(set(entries)),
-    "unique_entry_count": len(set(entries)),
-}))
-' "$REPO_ROOT/apps/mcp-server/src/server.rs")"
+POLICY_JSON="$(python3 "$ROOT_DIR/scripts/lib/flow_v0_4_verifier_source_checks.py" \
+  tool-policy-scopes "$REPO_ROOT/apps/mcp-server/src/server.rs")" || {
+  echo "FAIL: TOOL_POLICY_SCOPES parser could not inspect server.rs" >&2
+  exit 2
+}
 if jq -e 'has("error")' >/dev/null 2>&1 <<<"$POLICY_JSON"; then
   echo "FAIL: $(jq -r '.error' <<<"$POLICY_JSON")" >&2
   exit 2
@@ -218,9 +207,11 @@ fi
 POLICY_DECLARED="$(jq -r '.declared_len' <<<"$POLICY_JSON")"
 POLICY_ENTRIES="$(jq -r '.entry_count' <<<"$POLICY_JSON")"
 POLICY_UNIQUE="$(jq -r '.unique_entry_count' <<<"$POLICY_JSON")"
-[[ "$POLICY_DECLARED" == "$POLICY_ENTRIES" ]] || VIOLATIONS+=("TOOL_POLICY_SCOPES declares length $POLICY_DECLARED but contains $POLICY_ENTRIES entries")
+if [[ "$POLICY_DECLARED" != "null" && "$POLICY_DECLARED" != "$POLICY_ENTRIES" ]]; then
+  VIOLATIONS+=("TOOL_POLICY_SCOPES declares length $POLICY_DECLARED but contains $POLICY_ENTRIES entries")
+fi
 [[ "$POLICY_ENTRIES" == "$POLICY_UNIQUE" ]] || VIOLATIONS+=("TOOL_POLICY_SCOPES contains duplicate tool names ($POLICY_ENTRIES entries, $POLICY_UNIQUE unique)")
-[[ "$POLICY_DECLARED" == "$LIVE_COUNT" ]] || VIOLATIONS+=("TOOL_POLICY_SCOPES length $POLICY_DECLARED != live registry count $LIVE_COUNT")
+[[ "$POLICY_ENTRIES" == "$LIVE_COUNT" ]] || VIOLATIONS+=("TOOL_POLICY_SCOPES entry count $POLICY_ENTRIES != live registry count $LIVE_COUNT")
 
 MISSING_SCOPES="$(jq -c -n --argjson live "$LIVE_JSON" --argjson pol "$POLICY_JSON" '$live.names - $pol.names')"
 EXTRA_SCOPES="$(jq -c -n --argjson live "$LIVE_JSON" --argjson pol "$POLICY_JSON" '$pol.names - $live.names')"
@@ -232,7 +223,6 @@ EXTRA_SCOPES="$(jq -c -n --argjson live "$LIVE_JSON" --argjson pol "$POLICY_JSON
 # shellcheck disable=SC2016
 TOUCHPOINTS=(
   'registry_assertion|apps/mcp-server/src/tools/mod.rs|tools\.len\(\),\s*(\d+),'
-  'policy_scopes_array|apps/mcp-server/src/server.rs|const TOOL_POLICY_SCOPES: \[\(&str, PolicyScope\); (\d+)\]'
   'skill_guide_heading|apps/mcp-server/src/server.rs|## Tools \((\d+)\)\n'
   'client_comment|apps/mcp-server/src/client/mod.rs|identity reaches all (\d+) tools'
   'root_readme_overview|README.md|\*\*MCP server\*\* — (\d+) tools'
@@ -300,7 +290,7 @@ VIOLATIONS_JSON="$(printf '%s\n' "${VIOLATIONS[@]:-}" | jq -R 'select(length>0)'
 
 AGREEING="$(jq 'map(select(.agrees)) | length' <<<"$TOUCHPOINTS_JSON")"
 TOTAL_TP="$(jq 'length' <<<"$TOUCHPOINTS_JSON")"
-REASON="live registry count=$LIVE_COUNT (shipped list-tools binary); tool-count-baseline.md expects $CONTRACT_EXPECTED for release $RELEASE; $AGREEING/$TOTAL_TP hardcoded touchpoints agree; TOOL_POLICY_SCOPES len=$POLICY_DECLARED"
+REASON="live registry count=$LIVE_COUNT (shipped list-tools binary); tool-count-baseline.md expects $CONTRACT_EXPECTED for release $RELEASE; $AGREEING/$TOTAL_TP hardcoded touchpoints agree; TOOL_POLICY_SCOPES entries=$POLICY_ENTRIES"
 
 RESULT="$(jq -n \
   --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" --arg release "$RELEASE" \

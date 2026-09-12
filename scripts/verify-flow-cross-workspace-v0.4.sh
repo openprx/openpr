@@ -525,13 +525,13 @@ BOT_GET_B="$(curl -sS "$BASE/api/v1/flow/objects/$OBJ_B" -H "Authorization: Bear
 BOT_GET_B_CODE="$(envelope_code "$BOT_GET_B")"
 BOT_LIST_A="$(curl -sS "$BASE/api/v1/workspaces/$WS_A/flow/objects" -H "Authorization: Bearer $BOT_RW_TOKEN")"
 BOT_LIST_A_CODE="$(envelope_code "$BOT_LIST_A")"
-if [[ "$BOT_LIST_B_CODE" == "403" && "$BOT_GET_B_CODE" == "403" && "$BOT_LIST_A_CODE" == "0" ]]; then
+if [[ "$BOT_LIST_B_CODE" == "403" && "$BOT_GET_B_CODE" == "404" && "$BOT_LIST_A_CODE" == "0" ]]; then
   record "bot_token_confined_to_its_own_workspace" true \
-    "a workspace-A bot token => 403 on workspace B's list AND on an object owned by B, while the same token succeeds inside A" \
+    "a workspace-A bot token => 403 on workspace B's list and not-found-safe 404 on an object owned by B, while the same token succeeds inside A" \
     "list_b=$BOT_LIST_B_CODE get_b=$BOT_GET_B_CODE list_a=$BOT_LIST_A_CODE"
 else
   record "bot_token_confined_to_its_own_workspace" false \
-    "a workspace-A bot token => 403 on workspace B's list AND on an object owned by B, while the same token succeeds inside A" \
+    "a workspace-A bot token => 403 on workspace B's list and not-found-safe 404 on an object owned by B, while the same token succeeds inside A" \
     "list_b=$BOT_LIST_B_CODE get_b=$BOT_GET_B_CODE list_a=$BOT_LIST_A_CODE"
 fi
 

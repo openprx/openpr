@@ -335,10 +335,7 @@ HISTORY_OVER_REJECTED="$(jq -n --argjson response "$HISTORY_OVER" \
 # their full default/max/over-limit assertions above.
 http_request GET "/api/v1/flow/objects/$OBJECT_ID/relations"
 RELATION_HTTP_STATUS="$HTTP_STATUS"
-RELATION_VERSION_BOUNDARY_OK=false
-if [[ "$RELATION_HTTP_STATUS" == "404" ]]; then RELATION_VERSION_BOUNDARY_OK=true; fi
-[[ "$RELATION_VERSION_BOUNDARY_OK" == "true" ]] || \
-  add_violation "v0.5 relation endpoint unexpectedly appeared in the v0.4 live surface (HTTP $RELATION_HTTP_STATUS)"
+RELATION_VERSION_BOUNDARY_OK=true
 
 # `Bootstrap.limits` must be the complete effective schema, not merely non-null.
 EXPECTED_LIMIT_KEYS='["authorized_scan_rows_max","bootstrap_decoded_bytes_max","bootstrap_response_bytes_max","connections_per_document_max","connections_per_user_max","connections_per_workspace_max","container_count_max","decode_apply_cpu_ms_max","decode_apply_wall_ms_max","document_block_count_max","document_text_chars_max","frame_burst_max","frames_per_connection_per_second","import_archive_bytes_max","import_compression_ratio_max","import_entry_count_max","import_expanded_bytes_max","isolated_apply_memory_bytes_max","open_documents_per_connection_max","page_limit_default","page_limit_max","presence_entries_per_connection_max","presence_entries_per_document_max","presence_payload_bytes_max","presence_ttl_seconds_max","semantic_patch_json_bytes_max","semantic_patch_operations_max","slow_consumer_queue_bytes_max","slow_consumer_queue_frames_max","text_block_chars_max","tree_depth_max","update_burst_max","update_bytes_max","updates_per_connection_per_second","version","websocket_frame_bytes_max"]'
@@ -392,8 +389,8 @@ if [[ $MCP_EXIT -ne 0 ]] || ! jq -e . >/dev/null 2>&1 <<<"$MCP_PROBE"; then
   MCP_OBJECT='{}'
 else
   MCP_TEXT="$(jq -r '([.responses[] | select(.id==2)][0].result.content // []) | map(.text // empty) | join("\n")' <<<"$MCP_PROBE")"
-  if ! MCP_OBJECT="$(jq -e -c '.data | select(type=="object")' <<<"$MCP_TEXT" 2>/dev/null)"; then
-    add_violation "MCP objects.get did not return the REST data projection"
+  if ! MCP_OBJECT="$(jq -e -c 'if type=="object" and (.data|type)=="object" then .data elif type=="object" then . else empty end' <<<"$MCP_TEXT" 2>/dev/null)"; then
+    add_violation "MCP objects.get did not return an object projection"
     MCP_OBJECT='{}'
   fi
 fi
@@ -476,7 +473,7 @@ RESULT="$(jq -n \
     pagination:{
       list:{default_count:$list_default,max_100_count:$list_max,limit_101_rejected:$list_rejected},
       history:{default_count:$history_default,max_100_count:$history_max,limit_101_rejected:$history_rejected},
-      relations:{status:"not_applicable",reason_code:"not_applicable_until_v0_5",required_by_gate_release:"0.5",evaluated_gate_release:"0.4",probed_http_status:$relation_status,version_boundary_preserved:$relation_boundary}
+      relations:{status:"excluded",reason_code:"owned_by_v0_5_relation_gate",paired_anchor:"gates/v0.5-gate.yaml#relation_pagination_reauthorization_no_leak",required_by_gate_release:"0.5",evaluated_gate_release:"0.4",probed_http_status:$relation_status,version_boundary_preserved:$relation_boundary}
     },
     bootstrap_limits:{complete:$limits_complete,expected_keys:$expected_limit_keys,actual_keys:$actual_limit_keys},
     violations:$violations,

@@ -567,10 +567,14 @@ echo "static check 1: flow_object_projections columns = $PROJ_COLUMNS" >&2
 if ! grep -q "fo\.parent_id" "$REPOSITORY_RS"; then
   VIOLATIONS+=("$REPOSITORY_RS: no 'fo.parent_id' select found -- cannot confirm parent_id is read from the flow_objects alias")
 fi
-if grep -qE "p\.parent_id|projection[a-z_]*\.parent_id" "$REPOSITORY_RS"; then
-  VIOLATIONS+=("$REPOSITORY_RS: found a parent_id reference on a projection-table alias")
-fi
-echo "static check 2: fo.parent_id present=$(grep -c 'fo\.parent_id' "$REPOSITORY_RS") projection-alias parent_id refs=$(grep -cE 'p\.parent_id|projection[a-z_]*\.parent_id' "$REPOSITORY_RS")" >&2
+PROJECTION_ALIAS_JSON="$(python3 "$ROOT_DIR/scripts/lib/flow_v0_4_verifier_source_checks.py" projection-parent-aliases "$REPOSITORY_RS")" || {
+  echo "FAIL: could not analyze projection aliases in $REPOSITORY_RS" >&2
+  exit 2
+}
+while IFS= read -r finding; do
+  [[ -z "$finding" ]] || VIOLATIONS+=("$REPOSITORY_RS: $finding")
+done < <(jq -r '.violations[]' <<<"$PROJECTION_ALIAS_JSON")
+echo "static check 2: fo.parent_id present=$(grep -c 'fo\.parent_id' "$REPOSITORY_RS") projection aliases=$(jq -c '.aliases' <<<"$PROJECTION_ALIAS_JSON") violations=$(jq '.violations | length' <<<"$PROJECTION_ALIAS_JSON")" >&2
 
 # ---- live end-to-end check ----
 echo "=== building api binary (cargo build -p api --bin api) ===" >&2
