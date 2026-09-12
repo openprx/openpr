@@ -708,6 +708,19 @@ impl SessionRegistry {
         self.sessions.lock().get(&document_id).map_or(0, HashMap::len)
     }
 
+    /// Process-local connection count for one workspace. Cross-instance health combines this
+    /// instance signal with durable queue/storage facts rather than pretending an in-memory
+    /// registry is a cluster-wide authority.
+    #[must_use]
+    pub fn workspace_connection_count(&self, workspace_id: Uuid) -> usize {
+        self.connections
+            .lock()
+            .by_session
+            .values()
+            .filter(|meta| meta.workspace_id == workspace_id)
+            .count()
+    }
+
     /// Records one `ack` frame's `(seq, frontier)` for `session_id`.
     ///
     /// Monotonic by construction: `collab-protocol-v1.md` states an `ack` at or below what the

@@ -378,6 +378,219 @@ pub async fn post_flow_delivery_replay(
     Ok(ApiResponse::success(result).into_response())
 }
 
+fn require_exact_admin_tool(bot: Option<&Extension<BotAuthContext>>, expected: &str) -> Result<(), ApiError> {
+    if let Some(Extension(context)) = bot
+        && context.tool_name.as_deref() != Some(expected)
+    {
+        return Err(ApiError::Forbidden(format!(
+            "operation requires the exact {expected} tool policy"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactDocumentRequest {
+    pub dry_run: bool,
+    pub expected_head_seq: Option<i64>,
+    pub retain_after_seq: Option<i64>,
+    pub confirm_document_id: Option<Uuid>,
+    pub idempotency_key: String,
+}
+
+pub async fn post_flow_compact_document(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(document_id): Path<Uuid>,
+    Json(req): Json<CompactDocumentRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "collab.compact")?;
+    let extensions = build_auth_extensions(claims, bot);
+    let scope = crate::flow::operations::document_scope(&state.db, document_id).await?;
+    let (principal_id, _role, is_bot) =
+        policy::require_flow_workspace_admin_access(&state, &extensions, scope.workspace_id).await?;
+    let expected = req
+        .expected_head_seq
+        .ok_or_else(|| ApiError::BadRequest("expected_head_seq is required".to_string()))?;
+    if !req.dry_run && req.confirm_document_id != Some(document_id) {
+        return Err(ApiError::Forbidden(
+            "execute requires confirm_document_id matching the path document".to_string(),
+        ));
+    }
+    if req.retain_after_seq.is_some_and(|seq| seq != expected) {
+        return Err(ApiError::BadRequest(
+            "retain_after_seq currently must equal expected_head_seq".to_string(),
+        ));
+    }
+    Ok(ApiResponse::success(
+        crate::flow::operations::compact_document(
+            &state.db,
+            &scope,
+            req.dry_run,
+            expected,
+            !req.dry_run && req.retain_after_seq.is_none(),
+            crate::flow::operations::Principal {
+                id: principal_id,
+                is_bot,
+            },
+            &req.idempotency_key,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RebuildProjectionRequest {
+    pub dry_run: bool,
+    pub expected_head_seq: Option<i64>,
+    pub confirm_object_id: Option<Uuid>,
+    pub idempotency_key: String,
+}
+
+pub async fn post_flow_rebuild_projection(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Json(req): Json<RebuildProjectionRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "collab.rebuild_projection")?;
+    let extensions = build_auth_extensions(claims, bot);
+    let scope = crate::flow::operations::object_scope(&state.db, object_id).await?;
+    let (principal_id, _role, is_bot) =
+        policy::require_flow_workspace_admin_access(&state, &extensions, scope.workspace_id).await?;
+    let expected = req
+        .expected_head_seq
+        .ok_or_else(|| ApiError::BadRequest("expected_head_seq is required".to_string()))?;
+    if !req.dry_run && req.confirm_object_id != Some(object_id) {
+        return Err(ApiError::Forbidden(
+            "execute requires confirm_object_id matching the path object".to_string(),
+        ));
+    }
+    Ok(ApiResponse::success(
+        crate::flow::operations::rebuild_projection(
+            &state.db,
+            &scope,
+            req.dry_run,
+            expected,
+            crate::flow::operations::Principal {
+                id: principal_id,
+                is_bot,
+            },
+            &req.idempotency_key,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VerifyDocumentRequest {
+    pub dry_run: bool,
+    pub deep: bool,
+    pub expected_head_seq: Option<i64>,
+    pub idempotency_key: String,
+}
+
+pub async fn post_flow_verify_document(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(document_id): Path<Uuid>,
+    Json(req): Json<VerifyDocumentRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "objects.integrity")?;
+    if !req.dry_run {
+        return Err(ApiError::BadRequest("document verify is dry_run only".to_string()));
+    }
+    let extensions = build_auth_extensions(claims, bot);
+    let scope = crate::flow::operations::document_scope(&state.db, document_id).await?;
+    let (principal_id, _role, is_bot) =
+        policy::require_flow_workspace_admin_access(&state, &extensions, scope.workspace_id).await?;
+    let fingerprint = crate::flow::collab::integrity::document_fingerprint(&state.db, document_id).await?;
+    let expected = req.expected_head_seq.unwrap_or(fingerprint.head_seq);
+    Ok(ApiResponse::success(
+        crate::flow::operations::verify_document(
+            &state.db,
+            &scope,
+            expected,
+            req.deep,
+            crate::flow::operations::Principal {
+                id: principal_id,
+                is_bot,
+            },
+            &req.idempotency_key,
+        )
+        .await?,
+    ))
+}
+
+pub async fn get_flow_admin_health(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "collab.status")?;
+    let extensions = build_auth_extensions(claims, bot);
+    policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+    Ok(ApiResponse::success(
+        crate::flow::operations::workspace_health(&state.db, workspace_id).await?,
+    ))
+}
+
+pub async fn get_flow_admin_lag(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "collab.status")?;
+    let extensions = build_auth_extensions(claims, bot);
+    policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+    Ok(ApiResponse::success(
+        crate::flow::operations::workspace_lag(&state.db, workspace_id).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminIntegrityQuery {
+    pub scope: Option<String>,
+    pub cursor: Option<String>,
+    pub limit: Option<u64>,
+}
+
+pub async fn get_flow_admin_integrity(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Query(query): Query<AdminIntegrityQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "objects.integrity")?;
+    let extensions = build_auth_extensions(claims, bot);
+    policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+    if query.cursor.is_some() {
+        return Err(ApiError::BadRequest(
+            "integrity cursor is not available on the first v0.8 page".to_string(),
+        ));
+    }
+    let include_documents = match query.scope.as_deref().unwrap_or("summary") {
+        "summary" => false,
+        "documents" => true,
+        _ => return Err(ApiError::BadRequest("scope must be summary or documents".to_string())),
+    };
+    Ok(ApiResponse::success(
+        crate::flow::operations::workspace_integrity(
+            &state.db,
+            workspace_id,
+            include_documents,
+            query.limit.unwrap_or(50),
+        )
+        .await?,
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateFlowObjectRequest {
     pub object_type: String,
@@ -1155,7 +1368,11 @@ pub async fn set_flow_feature(
 mod flow_database_tests {
     use std::time::Duration;
 
-    use super::{GrantRequestBody, ReplayDeliveriesRequest, SetGrantsRequest, post_flow_delivery_replay};
+    use super::{
+        CompactDocumentRequest, GrantRequestBody, RebuildProjectionRequest, ReplayDeliveriesRequest, SetGrantsRequest,
+        VerifyDocumentRequest, get_flow_admin_health, get_flow_admin_integrity, get_flow_admin_lag,
+        post_flow_compact_document, post_flow_delivery_replay, post_flow_rebuild_projection, post_flow_verify_document,
+    };
     use axum::body::to_bytes;
     use axum::response::{IntoResponse, Response};
     use base64::Engine as _;
@@ -8776,6 +8993,263 @@ mod flow_database_tests {
             .await
             .is_err(),
             "same key with a changed semantic body must conflict"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_routes_require_exact_confirm_and_keep_dry_runs_canonical_zero_write() {
+        let scratch = scratch_or_skip!("v08-maintenance-routes");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "maintenance source").await;
+        let document_id = document_of(&state, object_id).await;
+
+        let health = body_json(to_response(
+            get_flow_admin_health(State(state.clone()), claims_for(owner_id), None, Path(workspace_id)).await,
+        ))
+        .await;
+        assert_eq!(health["code"], 0, "{health}");
+        assert!(health["data"]["dead_letter"]["delivery_failed"].is_number());
+        assert!(health["data"]["delivery_cancelled"].is_number());
+        let lag = body_json(to_response(
+            get_flow_admin_lag(State(state.clone()), claims_for(owner_id), None, Path(workspace_id)).await,
+        ))
+        .await;
+        assert_eq!(lag["code"], 0, "{lag}");
+        assert_eq!(lag["data"]["projection"]["max"], 0);
+        let integrity_summary = body_json(to_response(
+            get_flow_admin_integrity(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Query(super::AdminIntegrityQuery {
+                    scope: Some("documents".to_string()),
+                    cursor: None,
+                    limit: Some(50),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(integrity_summary["code"], 0, "{integrity_summary}");
+        assert_eq!(integrity_summary["data"]["counts"]["checked"], 2);
+        assert!(
+            integrity_summary["data"]["documents"]
+                .as_array()
+                .is_some_and(|documents| documents
+                    .iter()
+                    .any(|document| document["document_id"] == document_id.to_string())),
+            "the complete workspace page must include the requested document: {integrity_summary}"
+        );
+
+        let compact_request = CompactDocumentRequest {
+            dry_run: true,
+            expected_head_seq: Some(0),
+            retain_after_seq: None,
+            confirm_document_id: None,
+            idempotency_key: "compact-dry-key".to_string(),
+        };
+        let denied = post_flow_compact_document(
+            State(state.clone()),
+            claims_for(member_id),
+            None,
+            Path(document_id),
+            Json(compact_request.clone()),
+        )
+        .await;
+        assert!(denied.is_err(), "ordinary members cannot run admin maintenance");
+        let first = body_json(to_response(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(compact_request.clone()),
+            )
+            .await,
+        ))
+        .await;
+        let replayed = body_json(to_response(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(compact_request),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(first["code"], 0, "{first}");
+        assert_eq!(first["data"]["operation_id"], replayed["data"]["operation_id"]);
+        let snapshot_seq: i64 = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT snapshot_seq FROM collab_documents WHERE id=$1",
+                vec![document_id.into()],
+            ))
+            .await
+            .expect("snapshot query runs")
+            .expect("document row")
+            .try_get("", "snapshot_seq")
+            .expect("snapshot seq reads");
+        assert_eq!(
+            snapshot_seq, 0,
+            "compact dry-run must not advance canonical snapshot state"
+        );
+
+        let bad_compact = post_flow_compact_document(
+            State(state.clone()),
+            claims_for(owner_id),
+            None,
+            Path(document_id),
+            Json(CompactDocumentRequest {
+                dry_run: false,
+                expected_head_seq: Some(0),
+                retain_after_seq: Some(0),
+                confirm_document_id: Some(Uuid::new_v4()),
+                idempotency_key: "compact-bad-confirm".to_string(),
+            }),
+        )
+        .await;
+        assert!(
+            bad_compact.is_err(),
+            "execute must reject a non-matching document confirm"
+        );
+        let compact_execute = body_json(to_response(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(CompactDocumentRequest {
+                    dry_run: false,
+                    expected_head_seq: Some(0),
+                    retain_after_seq: Some(0),
+                    confirm_document_id: Some(document_id),
+                    idempotency_key: "compact-execute-key".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(compact_execute["code"], 0, "{compact_execute}");
+        assert_eq!(compact_execute["data"]["dry_run"], false);
+
+        let projection = body_json(to_response(
+            post_flow_rebuild_projection(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_id),
+                Json(RebuildProjectionRequest {
+                    dry_run: true,
+                    expected_head_seq: Some(0),
+                    confirm_object_id: None,
+                    idempotency_key: "projection-dry-key".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(projection["code"], 0, "{projection}");
+        assert_eq!(projection["data"]["result"]["executed"], false);
+        assert!(
+            post_flow_rebuild_projection(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_id),
+                Json(RebuildProjectionRequest {
+                    dry_run: false,
+                    expected_head_seq: Some(0),
+                    confirm_object_id: Some(Uuid::new_v4()),
+                    idempotency_key: "projection-bad-confirm".to_string(),
+                }),
+            )
+            .await
+            .is_err()
+        );
+        exec(
+            &state,
+            "UPDATE flow_object_projections SET title='CORRUPTED' WHERE object_id=$1",
+            vec![object_id.into()],
+        )
+        .await;
+        let projection_execute = body_json(to_response(
+            post_flow_rebuild_projection(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(object_id),
+                Json(RebuildProjectionRequest {
+                    dry_run: false,
+                    expected_head_seq: Some(0),
+                    confirm_object_id: Some(object_id),
+                    idempotency_key: "projection-execute-key".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(projection_execute["code"], 0, "{projection_execute}");
+        assert_eq!(projection_execute["data"]["result"]["executed"], true);
+        let rebuilt_title: String = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT title FROM flow_object_projections WHERE object_id=$1",
+                vec![object_id.into()],
+            ))
+            .await
+            .expect("projection query runs")
+            .expect("projection row")
+            .try_get("", "title")
+            .expect("projection title reads");
+        assert_eq!(rebuilt_title, "maintenance source");
+
+        let verified = body_json(to_response(
+            post_flow_verify_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(VerifyDocumentRequest {
+                    dry_run: true,
+                    deep: true,
+                    expected_head_seq: Some(0),
+                    idempotency_key: "verify-deep-key".to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(verified["code"], 0, "{verified}");
+        assert_eq!(
+            verified["data"]["result"]["fingerprint"]["document_id"],
+            document_id.to_string()
+        );
+
+        let operation_rows = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM flow_operation_runs WHERE workspace_id=$1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("operation count runs")
+            .expect("operation count row")
+            .try_get::<i64>("", "n")
+            .expect("operation count reads");
+        assert_eq!(
+            operation_rows, 5,
+            "three successful dry-runs and two exact-confirm executes write operation audit rows"
         );
 
         scratch.drop_self().await;

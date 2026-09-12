@@ -1575,6 +1575,50 @@ async fn main() -> anyhow::Result<()> {
                 middleware::bot_auth::bot_or_user_auth_middleware,
             )),
         )
+        .route(
+            "/api/v1/admin/flow/documents/{document_id}/verify",
+            post(routes::flow::post_flow_verify_document).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/admin/flow/documents/{document_id}/compact",
+            post(routes::flow::post_flow_compact_document).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/admin/flow/objects/{object_id}/rebuild-projection",
+            post(routes::flow::post_flow_rebuild_projection).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
+        .route(
+            "/api/v1/admin/workspaces/{workspace_id}/flow/health",
+            get(routes::flow::get_flow_admin_health).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/admin/workspaces/{workspace_id}/flow/lag",
+            get(routes::flow::get_flow_admin_lag).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/admin/workspaces/{workspace_id}/flow/integrity",
+            get(routes::flow::get_flow_admin_integrity).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
         // Collab tickets/diagnostics/verify (protected, user or bot per `rest-api-v1.md`); the
         // WebSocket upgrade route below is deliberately unprotected by this middleware — it
         // authenticates via the one-time ticket itself (`ADR-0007`), never a Bearer/cookie token.
@@ -2336,6 +2380,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0064_flow_v08_replay_requests.sql",
         include_str!("../../../migrations/0064_flow_v08_replay_requests.sql"),
     ),
+    (
+        "0065_flow_v08_operation_idempotency.sql",
+        include_str!("../../../migrations/0065_flow_v08_operation_idempotency.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2677,6 +2725,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0064_flow_v08_replay_requests.sql",
         SchemaProbe::Relation("flow_replay_requests"),
+    ),
+    (
+        "0065_flow_v08_operation_idempotency.sql",
+        SchemaProbe::Relation("idx_flow_operation_runs_idempotency"),
     ),
 ];
 
