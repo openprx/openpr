@@ -1729,6 +1729,20 @@ pub async fn execute_on(
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
+            Err(err @ ApiError::Database(_)) if !err.is_deterministic_database_failure() => {
+                // A lock/statement timeout is the same not-applied transient contention handled
+                // by the drift branch below: the transaction has been rolled back before any
+                // commit was issued, so it is safe to rebuild the document plans and retry.
+                let _ = tx.rollback().await;
+                if attempts >= MAX_REBASE_ATTEMPTS {
+                    return Err(ApiError::server_draining(
+                        crate::error::ServerDrainingReason::Contention,
+                        200,
+                        "server_draining",
+                    ));
+                }
+                continue;
+            }
             Err(err) => {
                 // `ADR-0013` §2.3: atomicity comes from the database. Any failure at any point
                 // rolls the whole transaction back — no partial parent change, no half-advanced

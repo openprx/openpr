@@ -1128,7 +1128,7 @@ async fn execute_document_update(
                 if attempt == MAX_REBASE_ATTEMPTS {
                     return Err(ApiError::server_draining(
                         crate::error::ServerDrainingReason::Contention,
-                        0,
+                        200,
                         "server_draining",
                     ));
                 }
@@ -1139,7 +1139,7 @@ async fn execute_document_update(
                 if attempt == MAX_REBASE_ATTEMPTS {
                     return Err(ApiError::server_draining(
                         crate::error::ServerDrainingReason::Contention,
-                        0,
+                        200,
                         "server_draining",
                     ));
                 }
@@ -2973,7 +2973,7 @@ mod tests {
 )]
 mod database_tests {
     use std::collections::BTreeSet;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use axum::body::to_bytes;
     use axum::{Extension, Router, routing::post};
@@ -2988,11 +2988,12 @@ mod database_tests {
     use uuid::Uuid;
 
     use super::{
-        CollectionCommandType, CountRow, EmbedFaultPoint, RecordFilter, RecordQueryPayload, RecordSort,
-        collection_operations, describe_collection, engine_at_head, execute_embed_with_fault, fail_next_projection_for,
-        node_id, query_collection_records, query_collection_records_requiring_typed_index, rebuild_typed_projections,
+        CollectionCommandType, CountRow, EmbedFaultPoint, MAX_REBASE_ATTEMPTS, RecordFilter, RecordQueryPayload,
+        RecordSort, collection_operations, describe_collection, engine_at_head, execute_embed_with_fault,
+        fail_next_projection_for, node_id, query_collection_records, query_collection_records_requiring_typed_index,
+        rebuild_typed_projections,
     };
-    use crate::error::ApiError;
+    use crate::error::{ApiError, ApiErrorKind, ServerDrainingReason};
     use crate::flow::collab::bootstrap;
     use crate::flow::command::{
         CreateObjectInput, ExecuteCommandInput, create_object, create_object_with_collection_schema, execute_command,
@@ -3168,23 +3169,43 @@ mod database_tests {
         payload: Value,
         key: String,
     ) -> Result<crate::flow::model::AcceptedChange, crate::error::ApiError> {
-        execute_command(
-            state,
-            ExecuteCommandInput {
-                object_id,
-                actor_id: owner_id,
-                principal_kind: "user".to_string(),
-                role: "owner".to_string(),
-                command_type: kind.to_string(),
-                payload,
-                expected_frontier: None,
-                idempotency_key: key,
-                message: None,
-                origin_client_id: format!("test:{owner_id}"),
-                origin: CommandOrigin::first_request_from(EventSurface::Rest),
-            },
-        )
-        .await
+        for retry in 0..=MAX_REBASE_ATTEMPTS {
+            match execute_command(
+                state,
+                ExecuteCommandInput {
+                    object_id,
+                    actor_id: owner_id,
+                    principal_kind: "user".to_string(),
+                    role: "owner".to_string(),
+                    command_type: kind.to_string(),
+                    payload: payload.clone(),
+                    expected_frontier: None,
+                    idempotency_key: key.clone(),
+                    message: None,
+                    origin_client_id: format!("test:{owner_id}"),
+                    origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                },
+            )
+            .await
+            {
+                Ok(change) => return Ok(change),
+                Err(error) => {
+                    let retry_after_ms = match &error {
+                        ApiError::Typed {
+                            kind: ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
+                            details: Some(details),
+                            ..
+                        } => details.get("retry_after_ms").and_then(Value::as_u64).unwrap_or(0),
+                        _ => 0,
+                    };
+                    if retry == MAX_REBASE_ATTEMPTS || retry_after_ms == 0 {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(retry_after_ms)).await;
+                }
+            }
+        }
+        Err(ApiError::Internal)
     }
 
     async fn read_access(
