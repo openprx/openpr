@@ -3002,6 +3002,42 @@ mod database_tests {
         .metadata
     }
 
+    async fn lifecycle_event_count(db: &DatabaseConnection, object_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM business_events \
+             WHERE aggregate_type = 'flow_object' AND aggregate_id = $1 \
+               AND event_type IN ('flow.object.archived', 'flow.object.restored')",
+            vec![object_id.to_string().into()],
+        ))
+        .one(db)
+        .await
+        .expect("lifecycle event count query runs")
+        .expect("lifecycle event count returns a row")
+        .n
+    }
+
+    async fn dispatch_count(db: &DatabaseConnection, event_id: Uuid) -> i64 {
+        #[derive(FromQueryResult)]
+        struct Row {
+            n: i64,
+        }
+        Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM event_dispatch WHERE event_id = $1",
+            vec![event_id.into()],
+        ))
+        .one(db)
+        .await
+        .expect("dispatch count query runs")
+        .expect("dispatch count returns a row")
+        .n
+    }
+
     async fn insert_raw_object(db: &DatabaseConnection, workspace_id: Uuid, parent_id: Option<Uuid>) -> Uuid {
         if parent_id.is_none() {
             return crate::flow::repository::fetch_workspace_navigator_root(db, workspace_id)
@@ -3195,6 +3231,341 @@ mod database_tests {
         .await
         .expect_err("navigator root still requires full_access");
         assert_eq!(err.kind(), ApiErrorKind::PolicyRejected, "navigator: {err:?}");
+
+        scratch.drop_self().await;
+    }
+
+    /// v0.6's Collection container closes the scope deliberately excluded from the v0.5 archive
+    /// gate.  This is a production-command fixture: the Collection and Page are created through
+    /// `create_object`, and every lifecycle transition goes through `execute_command`.
+    #[tokio::test]
+    async fn flow_collection_container_archive_tier_enforces_collection_and_page_contrast() {
+        let scratch = scratch_or_skip!("collection_archive_tier");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let navigator = create_typed_object(&state, &fx, "navigator", None).await;
+
+        let page = create_typed_object(&state, &fx, "page", Some(navigator)).await;
+        let page_archive = lifecycle_command(
+            &state,
+            &fx,
+            page,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("an edit member must retain ordinary non-root Page archive");
+        assert_eq!(page_archive.affected_object_ids, vec![page]);
+        assert_eq!(
+            event_metadata(&scratch.db, page_archive.event_id).await["affected_object_ids"],
+            serde_json::json!([page])
+        );
+        assert_eq!(dispatch_count(&scratch.db, page_archive.event_id).await, 1);
+        lifecycle_command(
+            &state,
+            &fx,
+            page,
+            fx.member_id,
+            "member",
+            "restore",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("an edit member must retain ordinary non-root Page restore");
+
+        let collection = create_typed_object(&state, &fx, "collection", Some(navigator)).await;
+        let before_denial_events = lifecycle_event_count(&scratch.db, collection).await;
+        let denied = lifecycle_command(
+            &state,
+            &fx,
+            collection,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect_err("an edit-only member must not archive a Collection container");
+        assert_eq!(
+            denied.kind(),
+            ApiErrorKind::PolicyRejected,
+            "collection denial: {denied:?}"
+        );
+        assert_eq!(lifecycle_statuses(&scratch.db, &[collection]).await[0].1, "active");
+        assert_eq!(
+            lifecycle_event_count(&scratch.db, collection).await,
+            before_denial_events
+        );
+
+        exec(
+            &scratch.db,
+            "INSERT INTO flow_object_grants \
+             (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, 'full_access')",
+            vec![fx.workspace_id.into(), collection.into(), fx.member_id.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+
+        let collection_archive = lifecycle_command(
+            &state,
+            &fx,
+            collection,
+            fx.member_id,
+            "member",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("an explicit full_access principal may archive a Collection container");
+        assert_eq!(collection_archive.affected_object_ids, vec![collection]);
+        let archive_metadata = event_metadata(&scratch.db, collection_archive.event_id).await;
+        assert_eq!(archive_metadata["affected_object_ids"], serde_json::json!([collection]));
+        assert_eq!(archive_metadata["cascade"], false);
+        assert_eq!(dispatch_count(&scratch.db, collection_archive.event_id).await, 1);
+
+        for attempt in 0..2 {
+            let restored = lifecycle_command(
+                &state,
+                &fx,
+                collection,
+                fx.member_id,
+                "member",
+                "restore",
+                false,
+                Uuid::new_v4().to_string(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("Collection restore attempt {attempt} must be idempotent: {err:?}"));
+            assert_eq!(restored.affected_object_ids, vec![collection]);
+        }
+        assert_eq!(lifecycle_statuses(&scratch.db, &[collection]).await[0].1, "active");
+
+        exec(
+            &scratch.db,
+            "DELETE FROM flow_object_grants \
+             WHERE workspace_id = $1 AND object_id = $2 AND principal_kind = 'user' AND principal_id = $3",
+            vec![fx.workspace_id.into(), collection.into(), fx.member_id.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+            vec![fx.workspace_id.into()],
+        )
+        .await;
+        lifecycle_command(
+            &state,
+            &fx,
+            collection,
+            fx.owner_id,
+            "owner",
+            "archive",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("workspace admin may archive a Collection container without an object grant");
+        lifecycle_command(
+            &state,
+            &fx,
+            collection,
+            fx.owner_id,
+            "owner",
+            "restore",
+            false,
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .expect("workspace admin may restore a Collection container");
+
+        scratch.drop_self().await;
+    }
+
+    /// Changing a Collection into a Page while archive is waiting on its row lock must invalidate
+    /// the prepared lifecycle plan.  Otherwise the transaction would authorize one object type
+    /// and commit another.
+    #[tokio::test]
+    async fn flow_collection_container_archive_tier_revalidates_object_type_and_impact_set() {
+        let scratch = scratch_or_skip!("collection_archive_type_drift");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let navigator = create_typed_object(&state, &fx, "navigator", None).await;
+        let collection = create_typed_object(&state, &fx, "collection", Some(navigator)).await;
+        let db_url = scratch
+            .admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("database url");
+        let blocker_db = Database::connect(&db_url).await.expect("blocker connects");
+        let blocker = blocker_db.begin().await.expect("blocker begins");
+        blocker
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM flow_objects WHERE id = $1 FOR UPDATE",
+                vec![collection.into()],
+            ))
+            .await
+            .expect("blocker locks the Collection");
+
+        let state_a = state_for(scratch.db.clone());
+        let owner = fx.owner_id;
+        let archive = tokio::spawn(async move {
+            execute_command(
+                &state_a,
+                ExecuteCommandInput {
+                    origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                    object_id: collection,
+                    actor_id: owner,
+                    principal_kind: "user".to_string(),
+                    role: "owner".to_string(),
+                    command_type: "archive".to_string(),
+                    payload: serde_json::json!({}),
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                    origin_client_id: "collection-archive-type-drift".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!archive.is_finished(), "archive must be waiting on the object row lock");
+        blocker
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE flow_objects SET object_type = 'page' WHERE id = $1",
+                vec![collection.into()],
+            ))
+            .await
+            .expect("the concurrent transaction changes the object type");
+        blocker.commit().await.expect("type drift commits");
+
+        let err = archive
+            .await
+            .expect("archive task joins")
+            .expect_err("the transaction must reject a rederived lifecycle plan");
+        assert!(matches!(err, ApiError::Conflict(_)), "type drift: {err:?}");
+        assert_eq!(lifecycle_statuses(&scratch.db, &[collection]).await[0].1, "active");
+        assert_eq!(lifecycle_event_count(&scratch.db, collection).await, 0);
+
+        scratch.drop_self().await;
+    }
+
+    /// The Collection path must hold the same commit-time authz epoch fence as every other
+    /// lifecycle transition.  Revocation can linearize before or after archive, never through it.
+    #[tokio::test]
+    async fn flow_collection_container_archive_tier_holds_current_authz_epoch_to_commit() {
+        let scratch = scratch_or_skip!("collection_archive_epoch");
+        let state = state_for(scratch.db.clone());
+        let fx = seed_workspace(&scratch.db).await;
+        let navigator = create_typed_object(&state, &fx, "navigator", None).await;
+        let collection = create_typed_object(&state, &fx, "collection", Some(navigator)).await;
+        exec(
+            &scratch.db,
+            "INSERT INTO flow_object_grants \
+             (workspace_id, object_id, principal_kind, principal_id, level) \
+             VALUES ($1, $2, 'user', $3, 'full_access')",
+            vec![fx.workspace_id.into(), collection.into(), fx.member_id.into()],
+        )
+        .await;
+        let original_epoch = authz::read_epoch(&scratch.db, fx.workspace_id)
+            .await
+            .expect("epoch reads");
+
+        let db_url = scratch
+            .admin_url
+            .rsplit_once('/')
+            .map(|(prefix, _)| format!("{prefix}/{}", scratch.name))
+            .expect("database url");
+        let blocker_db = Database::connect(&db_url).await.expect("blocker connects");
+        let blocker = blocker_db.begin().await.expect("blocker begins");
+        blocker
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM flow_objects WHERE id = $1 FOR UPDATE",
+                vec![collection.into()],
+            ))
+            .await
+            .expect("blocker locks the Collection");
+
+        let state_a = state_for(scratch.db.clone());
+        let member = fx.member_id;
+        let workspace = fx.workspace_id;
+        let archive = tokio::spawn(async move {
+            execute_command(
+                &state_a,
+                ExecuteCommandInput {
+                    origin: CommandOrigin::first_request_from(EventSurface::Rest),
+                    object_id: collection,
+                    actor_id: member,
+                    principal_kind: "user".to_string(),
+                    role: "member".to_string(),
+                    command_type: "archive".to_string(),
+                    payload: serde_json::json!({}),
+                    expected_frontier: None,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    message: None,
+                    origin_client_id: "collection-archive-epoch".to_string(),
+                },
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!archive.is_finished(), "archive must be waiting on the object row lock");
+
+        let revoker_db = Database::connect(&db_url).await.expect("revoker connects");
+        let (deleted_tx, deleted_rx) = tokio::sync::oneshot::channel();
+        let revoker = tokio::spawn(async move {
+            let tx = revoker_db.begin().await.expect("revoker begins");
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "DELETE FROM flow_object_grants WHERE workspace_id = $1 AND object_id = $2 AND principal_id = $3",
+                vec![workspace.into(), collection.into(), member.into()],
+            ))
+            .await
+            .expect("revoker removes full_access");
+            deleted_tx.send(()).expect("test waits for grant deletion");
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 WHERE workspace_id = $1",
+                vec![workspace.into()],
+            ))
+            .await
+            .expect("epoch update resumes after archive commits");
+            tx.commit().await.expect("revocation commits");
+        });
+        deleted_rx.await.expect("revoker reached the epoch update");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !revoker.is_finished(),
+            "archive must hold the epoch FOR SHARE through commit"
+        );
+
+        blocker.commit().await.expect("release the object lock");
+        archive
+            .await
+            .expect("archive task joins")
+            .expect("archive linearizes before revocation");
+        revoker.await.expect("revoker task joins");
+        assert_eq!(lifecycle_statuses(&scratch.db, &[collection]).await[0].1, "archived");
+        assert_eq!(
+            authz::read_epoch(&scratch.db, fx.workspace_id)
+                .await
+                .expect("epoch reads"),
+            original_epoch + 1
+        );
 
         scratch.drop_self().await;
     }

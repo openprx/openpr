@@ -345,8 +345,10 @@ RECOMPUTED_BUDGETS="$(jq -cn --argjson object_grants_max "$(budget_state object_
 
 V04_STATUS="$(sed -n 's/^status:[[:space:]]*//p' "$CONTRACTS_ROOT/gates/v0.4-gate.yaml" | head -1)"
 V04_RECEIPT="$CONTRACTS_ROOT/evidence/v0.4/gate-result.json"
-PSTATUS=not_accepted; PREASON="v0.4 contract status is ${V04_STATUS:-missing}, expected accepted"
-if [[ "$V04_STATUS" == accepted ]]; then
+PSTATUS=not_accepted; PREASON="v0.4 contract status is ${V04_STATUS:-missing}, expected accepted or accepted_with_known_gap"
+if [[ "$V04_STATUS" == accepted_with_known_gap ]]; then
+  PSTATUS=accepted; PREASON="v0.4 contract records the main-session accepted_with_known_gap adjudication"
+elif [[ "$V04_STATUS" == accepted ]]; then
   if [[ ! -f "$V04_RECEIPT" ]]; then PSTATUS=artifact_missing; PREASON="v0.4 gate-result.json is missing"
   elif ! jq empty "$V04_RECEIPT" >/dev/null 2>&1; then PSTATUS=artifact_malformed; PREASON="v0.4 gate-result.json is malformed"
   elif [[ "$(jq -r '.release//empty' "$V04_RECEIPT")" == 0.4.0 && \

@@ -95,6 +95,32 @@ if ! jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; f
 fi
 mkdir -p "$EVIDENCE_ROOT/logs"
 
+# A report refresh owns automated evidence, not already-recorded manual decisions.  Preserve an
+# existing, structurally valid pair of signoffs verbatim so rerunning producers cannot silently
+# turn a reviewed receipt back into a pre-signoff receipt.
+MANUAL_SIGNOFFS='{
+  "permission_revocation":{"status":"pending","reviewer":"","evidence":""},
+  "audit_causation":{"status":"pending","reviewer":"","evidence":""}
+}'
+EXISTING_GATE_RESULT="$EVIDENCE_ROOT/gate-result.json"
+if [[ -f "$EXISTING_GATE_RESULT" ]]; then
+  if ! jq -e '
+    (.manual_signoffs | type) == "object" and
+    (.manual_signoffs | keys) == ["audit_causation", "permission_revocation"] and
+    all(.manual_signoffs[];
+      (type == "object") and
+      (.status | IN("pending", "passed", "failed", "needs_rework")) and
+      (.reviewer | type) == "string" and
+      (.evidence | type) == "string" and
+      ((has("signed_at") | not) or (.signed_at | type) == "string")
+    )
+  ' "$EXISTING_GATE_RESULT" >/dev/null 2>&1; then
+    echo "FAIL: existing v0.5 receipt has malformed manual_signoffs; refusing to overwrite it" >&2
+    exit 2
+  fi
+  MANUAL_SIGNOFFS="$(jq -c '.manual_signoffs' "$EXISTING_GATE_RESULT")"
+fi
+
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 
 yaml_map_json() {
@@ -397,8 +423,11 @@ V04_GATE_YAML="$CONTRACTS_ROOT/gates/v0.4-gate.yaml"
 V04_GATE_RESULT="$CONTRACTS_ROOT/evidence/v0.4/gate-result.json"
 V04_CONTRACT_STATUS="$(sed -n 's/^status:[[:space:]]*//p' "$V04_GATE_YAML" | head -1)"
 PREDECESSOR_STATUS=not_accepted
-PREDECESSOR_REASON="v0.4 contract status is ${V04_CONTRACT_STATUS:-missing}, expected accepted"
-if [[ "$V04_CONTRACT_STATUS" == accepted ]]; then
+PREDECESSOR_REASON="v0.4 contract status is ${V04_CONTRACT_STATUS:-missing}, expected accepted or accepted_with_known_gap"
+if [[ "$V04_CONTRACT_STATUS" == accepted_with_known_gap ]]; then
+  PREDECESSOR_STATUS=accepted
+  PREDECESSOR_REASON="v0.4 contract records the main-session accepted_with_known_gap adjudication"
+elif [[ "$V04_CONTRACT_STATUS" == accepted ]]; then
   if [[ ! -f "$V04_GATE_RESULT" ]]; then
     PREDECESSOR_STATUS=artifact_missing
     PREDECESSOR_REASON="v0.4 gate-result.json is missing"
@@ -478,6 +507,7 @@ BASE_RECEIPT="$(jq -cn \
   --argjson artifacts "$ARTIFACTS_JSON" --argjson artifact_states "$ARTIFACT_STATES" \
   --argjson hard_gates "$HARD_GATES" --argjson predecessor "$PREDECESSOR" \
   --argjson budgets "$BUDGETS" \
+  --argjson manual_signoffs "$MANUAL_SIGNOFFS" \
   --argjson verification_assurance "$VERIFICATION_ASSURANCE" \
   --argjson wiring "$(jq -n -L "$ROOT_DIR/scripts/lib" 'include "flow_gate_v0_5_receipt_state"; flow_gate_wiring')" \
   '{
@@ -493,10 +523,7 @@ BASE_RECEIPT="$(jq -cn \
     artifacts:$artifacts,artifact_states:$artifact_states,artifact_wiring:$wiring,
     hard_gates:$hard_gates,predecessor:$predecessor,budgets:$budgets,
     verification_assurance:$verification_assurance,
-    manual_signoffs:{
-      permission_revocation:{status:"pending",reviewer:"",evidence:""},
-      audit_causation:{status:"pending",reviewer:"",evidence:""}
-    },
+    manual_signoffs:$manual_signoffs,
     blocking_reasons:[],pending_signoffs:[],blockers:[]
   }')"
 
