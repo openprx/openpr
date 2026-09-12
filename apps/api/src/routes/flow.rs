@@ -9114,6 +9114,24 @@ mod flow_database_tests {
         .await;
         assert_eq!(first["code"], 0, "{first}");
         assert_eq!(first["data"]["operation_id"], replayed["data"]["operation_id"]);
+        assert!(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(CompactDocumentRequest {
+                    dry_run: true,
+                    expected_head_seq: Some(1),
+                    retain_after_seq: None,
+                    confirm_document_id: None,
+                    idempotency_key: "compact-dry-key".to_string(),
+                }),
+            )
+            .await
+            .is_err(),
+            "the same idempotency key with a changed expected head must conflict"
+        );
         let snapshot_seq: i64 = state
             .db
             .query_one(Statement::from_sql_and_values(
