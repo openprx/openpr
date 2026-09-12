@@ -19,6 +19,12 @@ mkdir -p "$CACHE_ROOT" "$TARGET_DIR" "$LOG_DIR"
 cleanup
 git -C "$REPO_ROOT" worktree add --detach "$WORKTREE" HEAD >/dev/null
 
+# `accept_update` executes this production subprocess. A separate target directory starts empty;
+# omitting the build makes the green control fail `Internal` before compaction is reached.
+env -u RUST_TEST_THREADS CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$TARGET_DIR" \
+  cargo build --manifest-path "$WORKTREE/Cargo.toml" -p collab-core \
+    --bin collab-isolated-apply-worker >"$LOG_DIR/isolated-worker-build.log" 2>&1
+
 run_case() {
   local label=$1
   local expected=$2
