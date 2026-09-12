@@ -11,7 +11,7 @@ Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL 16**.
 - **Universal forms** — project-defined business data types with grid/detail views, decimal-safe amounts, record links and child tables, formulas, per-role permissions, import/export, electronic signatures.
 - **WASM plugins** — per-project sandboxed plugins for field validation, formulas, and event handlers.
 - **Events** — transactional business-event ledger and HMAC-signed webhooks.
-- **MCP server** — 119 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
+- **MCP server** — 122 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
 - **Scenario templates** — 6 ready-to-start setups: `code_delivery_default`, `contract_review_default`, `equipment_maintenance_default`, `quality_corrective_action_default`, `customer_delivery_default`, `restaurant_ordering_default`.
 
 ## Architecture
@@ -289,17 +289,17 @@ curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 
-### Tools (119)
+### Tools (122)
 
-Per-domain counts; the total is parsed from the frozen Flow MCP contract and compared with the live registry
-in `apps/mcp-server/src/tools/mod.rs`.
+Per-domain counts; the total and sorted-name hash are pinned in
+`apps/mcp-server/tool-registry-baseline.json` and checked against the live registry.
 
 | Domain                    | Count | Representative tools                                                      |
 | ------------------------- | ----: | ------------------------------------------------------------------------- |
 | Universal forms & events  |    34 | `forms.create`, `forms.update_schema`, `form_records.create`, `events.tail` |
 | Work items                |    11 | `work_items.create`, `work_items.get_by_identifier`, `work_items.search`   |
 | Scenario tools            |     9 | `code.change_proposal.create`, `documents.review_risk`, `approval.request` |
-| Flow (v0.5)               |    21 | `objects.create`, `objects.move`, `objects.grants_set`, `collab.projection_lag` |
+| Flow (v0.6)               |    24 | `objects.create`, `objects.move`, `collections.query`, `records.create`        |
 | Project types & resources |     6 | `project_types.get`, `project_resources.create`                            |
 | Projects                  |     5 | `projects.list`, `projects.create`                                         |
 | Labels                    |     5 | `labels.create`, `labels.list_by_project`                                  |
@@ -332,7 +332,7 @@ templates via `resources/templates/list`, including
 Besides `serve`, `mcp-server` exposes 9 command groups: `projects`,
 `work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`,
 `operation-logs list`, and `tools call`. The global `--format json|table` selects the output shape, and
-`tools call` reaches any of the 119 tools by name — a complete escape hatch for
+`tools call` reaches any of the 122 tools by name — a complete escape hatch for
 anything without a dedicated subcommand. A second `[[bin]]` in this same
 package, `sylvode`, is the native Flow CLI (`sylvode features flow get|set`,
 `sylvode objects create|patch|move|grants|get|inheritance|link|unlink|diff|relations|search` and

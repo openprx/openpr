@@ -35,5 +35,8 @@ tokio-stream = "0.1"
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+sha2 = "0.10"
+
 [lints]
 workspace = true

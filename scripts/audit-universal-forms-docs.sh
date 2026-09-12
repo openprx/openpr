@@ -522,8 +522,8 @@ contains "source coverage audit checks UI artifact collector atomic publish" "$R
 contains "README links universal forms docs" "$ROOT_DIR/README.md" "docs/universal-forms-and-plugins.md"
 contains "README links acceptance docs" "$ROOT_DIR/README.md" "docs/universal-forms-acceptance.md"
 contains "README links production runbook" "$ROOT_DIR/README.md" "docs/universal-forms-production.md"
-contains "README documents current MCP tool count" "$ROOT_DIR/README.md" "MCP server: 98 tools"
-contains "README tool reference uses current MCP count" "$ROOT_DIR/README.md" "### Tool Reference (98 tools)"
+contains "README documents current MCP tool count" "$ROOT_DIR/README.md" "MCP server** — $EXPECTED_TOOL_COUNT tools"
+contains "README tool reference uses current MCP count" "$ROOT_DIR/README.md" "### Tools ($EXPECTED_TOOL_COUNT)"
 contains "README tool reference includes universal forms" "$ROOT_DIR/README.md" "#### Universal Forms & Events (33)"
 contains "README tool reference includes form schema summary" "$ROOT_DIR/README.md" 'forms.schema_summary'
 contains "README tool reference includes form schema versions" "$ROOT_DIR/README.md" 'form_schema_versions.list'

@@ -170,19 +170,36 @@ fn flow_v05_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::{flow_v05_tool_definitions, flow_v06_tool_definitions, get_all_tool_definitions};
+    use sha2::{Digest, Sha256};
     use std::collections::HashSet;
 
     const FLOW_V05_SURFACE_SNAPSHOT: &str = include_str!("mcp-surface-v05.snapshot.md");
+    const TOOL_REGISTRY_BASELINE: &str = include_str!("../../tool-registry-baseline.json");
 
     #[test]
-    fn flow_v06_tools_are_registered_once_in_the_exact_122_tool_surface() {
+    fn flow_v06_tools_match_the_repository_registry_baseline() {
         let tools = get_all_tool_definitions();
         let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<HashSet<_>>();
+        let baseline: serde_json::Value =
+            serde_json::from_str(TOOL_REGISTRY_BASELINE).expect("tool registry baseline is valid JSON");
+        let expected_count = baseline["count"]
+            .as_u64()
+            .expect("tool registry baseline count is an integer") as usize;
+        let expected_hash = baseline["names_sha256"]
+            .as_str()
+            .expect("tool registry baseline names_sha256 is a string");
+        let mut sorted_names = names.clone();
+        sorted_names.sort_unstable();
+        let names_hash = format!("{:x}", Sha256::digest(sorted_names.join("\n").as_bytes()));
         assert_eq!(
             tools.len(),
-            122,
-            "v0.6 adds exactly three tools to the 119-tool v0.5 registry"
+            expected_count,
+            "live registry count must match the repository-owned baseline"
+        );
+        assert_eq!(
+            names_hash, expected_hash,
+            "live registry names must match the baseline hash"
         );
         assert_eq!(names.len(), unique.len(), "MCP tool names must remain unique");
 

@@ -190,8 +190,43 @@ if [[ "$CONTRACT_EXPECTED" == "null" ]]; then
   echo "FAIL: tool-count-baseline.md has no '版本预期' row for release $RELEASE" >&2
   exit 2
 fi
-if [[ "$LIVE_COUNT" != "$CONTRACT_EXPECTED" ]]; then
-  VIOLATIONS+=("live registry count=$LIVE_COUNT but contracts/tool-count-baseline.md expects $CONTRACT_EXPECTED for release $RELEASE (neither side is adjusted by this verifier; reconcile deliberately)")
+REPO_BASELINE_PATH="$REPO_ROOT/apps/mcp-server/tool-registry-baseline.json"
+if ! REPO_BASELINE_JSON="$(jq -e '
+  select(.schema_version == "openpr.mcp-tool-registry-baseline.v1")
+  | select(.source == "mcp_server::get_all_tool_definitions")
+  | select((.count | type) == "number" and .count > 0)
+  | select(.names_sha256 | test("^[0-9a-f]{64}$"))
+  | select(.v0_4_rebase.after_count == .count)
+  | select(.v0_4_rebase.before_count + .v0_4_rebase.added - .v0_4_rebase.removed == .count)
+' "$REPO_BASELINE_PATH" 2>/dev/null)"; then
+  echo "FAIL: invalid or missing repository tool registry baseline: $REPO_BASELINE_PATH" >&2
+  exit 2
+fi
+REPO_BASELINE_SHA="$(sha256sum "$REPO_BASELINE_PATH" | awk '{print $1}')"
+REPO_EXPECTED="$(jq -r '.count' <<<"$REPO_BASELINE_JSON")"
+REPO_NAMES_SHA="$(jq -r '.names_sha256' <<<"$REPO_BASELINE_JSON")"
+REBASE_VALID="$(jq -n \
+  --argjson baseline "$REPO_BASELINE_JSON" --argjson contract "$CONTRACT_JSON" \
+  --argjson live_count "$LIVE_COUNT" --arg live_hash "$NAMES_SHA" '
+  $baseline.v0_4_rebase.before_count == $contract.expected_total_for_release
+  and $baseline.v0_4_rebase.after_count == $live_count
+  and $baseline.count == $live_count
+  and $baseline.names_sha256 == $live_hash
+')"
+[[ "$REPO_EXPECTED" == "$LIVE_COUNT" ]] || VIOLATIONS+=("repository baseline count=$REPO_EXPECTED but live registry count=$LIVE_COUNT")
+[[ "$REPO_NAMES_SHA" == "$NAMES_SHA" ]] || VIOLATIONS+=("repository baseline names hash=$REPO_NAMES_SHA but live registry names hash=$NAMES_SHA")
+if [[ "$LIVE_COUNT" != "$CONTRACT_EXPECTED" && "$REBASE_VALID" != true ]]; then
+  VIOLATIONS+=("live registry count=$LIVE_COUNT differs from contract expectation=$CONTRACT_EXPECTED without a valid v0.4 rebase record")
+fi
+
+set +e
+DERIVED_COUNT="$(CARGO_BUILD_JOBS=4 python3 "$REPO_ROOT/skills/openpr-mcp/scripts/expected-tool-count.py" 2>"$EVIDENCE_ROOT/expected-tool-count.err.log")"
+DERIVED_COUNT_EXIT=$?
+set -e
+if [[ $DERIVED_COUNT_EXIT -ne 0 ]]; then
+  VIOLATIONS+=("expected-tool-count.py failed its independent live-registry check (exit=$DERIVED_COUNT_EXIT)")
+elif [[ "$DERIVED_COUNT" != "$LIVE_COUNT" ]]; then
+  VIOLATIONS+=("expected-tool-count.py returned $DERIVED_COUNT but live registry count=$LIVE_COUNT")
 fi
 
 # ---- TOOL_POLICY_SCOPES cross-check (declared length, real entries, coverage) ----
@@ -218,70 +253,79 @@ EXTRA_SCOPES="$(jq -c -n --argjson live "$LIVE_JSON" --argjson pol "$POLICY_JSON
 [[ "$MISSING_SCOPES" == "[]" ]] || VIOLATIONS+=("live tools with no TOOL_POLICY_SCOPES entry: $MISSING_SCOPES")
 [[ "$EXTRA_SCOPES" == "[]" ]] || VIOLATIONS+=("TOOL_POLICY_SCOPES names an unregistered tool: $EXTRA_SCOPES")
 
-# ---- the hardcoded touchpoints tool-count-baseline.md names ----
-# Each entry: id|relative path|python regex with one capturing group holding the count.
+# ---- the 27 historical touchpoints named by tool-count-baseline.md ----
+# Each entry is id|path|mode|regex|classification. Pinned prose must contain
+# exactly the live count. Derived sites must retain their link to the single
+# baseline reader. Three obsolete prose/assertion positions are explicitly
+# classified as retired instead of being mistaken for a bypass.
 # shellcheck disable=SC2016
 TOUCHPOINTS=(
-  'registry_assertion|apps/mcp-server/src/tools/mod.rs|tools\.len\(\),\s*(\d+),'
-  'skill_guide_heading|apps/mcp-server/src/server.rs|## Tools \((\d+)\)\n'
-  'client_comment|apps/mcp-server/src/client/mod.rs|identity reaches all (\d+) tools'
-  'root_readme_overview|README.md|\*\*MCP server\*\* — (\d+) tools'
-  'root_readme_tools_heading|README.md|### Tools \((\d+)\)'
-  'root_readme_assert|README.md|assert_eq!\(tools\.len\(\), (\d+)\)'
-  'root_readme_tools_call|README.md|`tools call` reaches any of the (\d+) tools'
-  'root_readme_verification|README.md|asserts the (\d+) tool count'
-  'mcp_readme|apps/mcp-server/README.md|\*\*(\d+) MCP Tools\*\*'
-  'mcp_agents_overview|apps/mcp-server/AGENTS.md|MCP server exposes (\d+) tools'
-  'mcp_agents_regression|apps/mcp-server/AGENTS.md|test all (\d+) tools across 3 transports'
-  'docs_index_server|docs/README.md|MCP server \((\d+) tools'
-  'docs_index_regression|docs/README.md|(\d+)-tool registry'
-  'forms_implementation_map|docs/universal-forms-implementation-map.md|(\d+)-tool MCP registry'
-  'test_mcp_sh|scripts/test-mcp.sh|EXPECTED_TOOL_COUNT="\$\{EXPECTED_TOOL_COUNT:-(\d+)\}"'
-  'skill_md_enumerate|skills/openpr-mcp/SKILL.md|enumerate all (\d+) tools'
-  'skill_md_regression|skills/openpr-mcp/SKILL.md|checks the (\d+)-tool registry'
-  'validate_mcp_sh_guard|skills/openpr-mcp/scripts/validate-mcp.sh|-eq (\d+) \]'
-  'validate_mcp_sh_message|skills/openpr-mcp/scripts/validate-mcp.sh|expected exactly (\d+) tools'
-  'mcp_regression_docstring|skills/openpr-mcp/scripts/mcp-regression.py|with (\d+)-tool registry checks'
-  'mcp_regression_predicate|skills/openpr-mcp/scripts/mcp-regression.py|def registry_has_(\d+)_tools_with'
-  'mcp_regression_len|skills/openpr-mcp/scripts/mcp-regression.py|len\(tools\) == (\d+)'
-  'mcp_regression_label|skills/openpr-mcp/scripts/mcp-regression.py|tools/list\.registry_(\d+)'
-  'mcp_regression_banner|skills/openpr-mcp/scripts/mcp-regression.py|\((\d+)工具注册面'
-  'audit_production_readiness|scripts/audit-universal-forms-production-readiness.sh|MCP validation requires exact (\d+) tools'
-  'audit_source_coverage|scripts/audit-universal-forms-source-coverage.sh|MCP registry expected count is (\d+)'
-  'audit_docs|scripts/audit-universal-forms-docs.sh|MCP regression validates (\d+)-tool registry'
+  'registry_assertion|apps/mcp-server/src/tools/mod.rs|derived|TOOL_REGISTRY_BASELINE|count and names hash derive from the machine baseline'
+  'skill_guide_heading|apps/mcp-server/src/server.rs|pinned|## Tools \((\d+)\)\n|embedded markdown cannot load a file at runtime and is pinned by this gate'
+  'client_comment|apps/mcp-server/src/client/mod.rs|retired|-|numeric client comment was replaced by every live registry tool because the client is count agnostic'
+  'root_readme_overview|README.md|pinned|\*\*MCP server\*\* — (\d+) tools|current user documentation'
+  'root_readme_tools_heading|README.md|pinned|### Tools \((\d+)\)|current user documentation'
+  'root_readme_assert|README.md|retired|-|obsolete Rust snippet was removed when README switched to executable list-tools guidance'
+  'root_readme_tools_call|README.md|pinned|`tools call` reaches any of the (\d+) tools|current user documentation'
+  'root_readme_verification|README.md|retired|-|obsolete verification-table prose was removed with the old table'
+  'mcp_readme|apps/mcp-server/README.md|pinned|\*\*(\d+) MCP Tools\*\*|current user documentation'
+  'mcp_agents_overview|apps/mcp-server/AGENTS.md|pinned|MCP server exposes (\d+) tools|current agent documentation'
+  'mcp_agents_regression|apps/mcp-server/AGENTS.md|pinned|test all (\d+) tools across 3 transports|current agent documentation'
+  'docs_index_server|docs/README.md|pinned|MCP server \((\d+) tools|current docs index'
+  'docs_index_regression|docs/README.md|pinned|(\d+)-tool registry|current docs index'
+  'forms_implementation_map|docs/universal-forms-implementation-map.md|pinned|(\d+)-tool MCP registry|current implementation map'
+  'test_mcp_sh|scripts/test-mcp.sh|derived|expected-tool-count\.py|runtime exact count derives from the machine baseline reader'
+  'skill_md_enumerate|skills/openpr-mcp/SKILL.md|pinned|enumerate all (\d+) tools|installed skill prose'
+  'skill_md_regression|skills/openpr-mcp/SKILL.md|pinned|checks the (\d+)-tool registry|installed skill prose'
+  'validate_mcp_sh_guard|skills/openpr-mcp/scripts/validate-mcp.sh|derived|-eq "\$EXPECTED_TOOL_COUNT"|runtime guard derives from the machine baseline reader'
+  'validate_mcp_sh_message|skills/openpr-mcp/scripts/validate-mcp.sh|derived|expected exactly \$EXPECTED_TOOL_COUNT tools|runtime failure reports the derived count'
+  'mcp_regression_docstring|skills/openpr-mcp/scripts/mcp-regression.py|derived|snapshot-derived registry checks|description no longer duplicates a number'
+  'mcp_regression_predicate|skills/openpr-mcp/scripts/mcp-regression.py|derived|def registry_matches_expected_tools_with_forms_and_plugins|predicate no longer bakes a number into its name'
+  'mcp_regression_len|skills/openpr-mcp/scripts/mcp-regression.py|derived|len\(tools\) == EXPECTED_TOOL_COUNT|all three transports use the derived count'
+  'mcp_regression_label|skills/openpr-mcp/scripts/mcp-regression.py|derived|tools/list\.registry_\{EXPECTED_TOOL_COUNT\}|label renders the derived count'
+  'mcp_regression_banner|skills/openpr-mcp/scripts/mcp-regression.py|derived|EXPECTED_TOOL_COUNT\}工具注册面|banner renders the derived count'
+  'audit_production_readiness|scripts/audit-universal-forms-production-readiness.sh|derived|EXPECTED_TOOL_COUNT=.*expected-tool-count\.py|audit derives the live-validated baseline'
+  'audit_source_coverage|scripts/audit-universal-forms-source-coverage.sh|derived|EXPECTED_TOOL_COUNT=.*expected-tool-count\.py|audit derives the live-validated baseline'
+  'audit_docs|scripts/audit-universal-forms-docs.sh|derived|EXPECTED_TOOL_COUNT=.*expected-tool-count\.py|audit derives the live-validated baseline'
 )
 
 TOUCHPOINTS_JSON="[]"
 for entry in "${TOUCHPOINTS[@]}"; do
-  IFS='|' read -r tp_id tp_path tp_re <<<"$entry"
+  IFS='|' read -r tp_id tp_path tp_mode tp_re tp_note <<<"$entry"
   abs="$REPO_ROOT/$tp_path"
   if [[ ! -f "$abs" ]]; then
     VIOLATIONS+=("touchpoint '$tp_id': file not found: $tp_path")
     TOUCHPOINTS_JSON="$(jq -c --arg id "$tp_id" --arg path "$tp_path" '. + [{id:$id, path:$path, found:false, values:[], agrees:false}]' <<<"$TOUCHPOINTS_JSON")"
     continue
   fi
-  found_json="$(python3 -c '
+  agrees=false
+  found_json="[]"
+  if [[ "$tp_mode" == retired ]]; then
+    agrees=true
+  elif [[ "$tp_mode" == derived ]]; then
+    if [[ $DERIVED_COUNT_EXIT -eq 0 ]] && python3 -c 'import re,sys; text=open(sys.argv[1],encoding="utf-8",errors="replace").read(); raise SystemExit(0 if re.search(sys.argv[2],text) else 1)' "$abs" "$tp_re"; then
+      agrees=true
+    else
+      VIOLATIONS+=("touchpoint '$tp_id' ($tp_path) cannot derive a live-validated count or lost its single-source marker")
+    fi
+  else
+    found_json="$(python3 -c '
 import json, re, sys
 text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
 vals = sorted({int(m) for m in re.findall(sys.argv[2], text)})
 print(json.dumps(vals))
 ' "$abs" "$tp_re")"
-  n_found="$(jq 'length' <<<"$found_json")"
-  agrees=false
-  if [[ "$n_found" -eq 0 ]]; then
-    VIOLATIONS+=("touchpoint '$tp_id' ($tp_path): no hardcoded count matched its pattern -- the assertion site was renamed or removed, so the count can now drift there unnoticed")
-  elif [[ "$n_found" -gt 1 ]]; then
-    VIOLATIONS+=("touchpoint '$tp_id' ($tp_path): pattern matched several different counts $found_json -- ambiguous, cannot certify")
-  else
-    v="$(jq -r '.[0]' <<<"$found_json")"
-    if [[ "$v" == "$LIVE_COUNT" ]]; then
-      agrees=true
+    n_found="$(jq 'length' <<<"$found_json")"
+    if [[ "$n_found" -eq 1 && "$(jq -r '.[0]' <<<"$found_json")" == "$LIVE_COUNT" ]]; then
+        agrees=true
+    elif [[ "$n_found" -eq 0 ]]; then
+      VIOLATIONS+=("touchpoint '$tp_id' ($tp_path) lost its pinned current count")
     else
-      VIOLATIONS+=("touchpoint '$tp_id' ($tp_path) hardcodes $v but the live registry has $LIVE_COUNT")
+      VIOLATIONS+=("touchpoint '$tp_id' ($tp_path) pins $found_json but live registry count=$LIVE_COUNT")
     fi
   fi
-  TOUCHPOINTS_JSON="$(jq -c --arg id "$tp_id" --arg path "$tp_path" --argjson values "$found_json" --argjson agrees "$agrees" \
-    '. + [{id:$id, path:$path, found:true, values:$values, agrees:$agrees}]' <<<"$TOUCHPOINTS_JSON")"
+  TOUCHPOINTS_JSON="$(jq -c --arg id "$tp_id" --arg path "$tp_path" --arg mode "$tp_mode" --arg note "$tp_note" --argjson values "$found_json" --argjson agrees "$agrees" \
+    '. + [{id:$id, path:$path, mode:$mode, classification:$note, found:true, values:$values, agrees:$agrees}]' <<<"$TOUCHPOINTS_JSON")"
 done
 
 PASSED=$([[ ${#VIOLATIONS[@]} -eq 0 ]] && echo true || echo false)
@@ -290,12 +334,14 @@ VIOLATIONS_JSON="$(printf '%s\n' "${VIOLATIONS[@]:-}" | jq -R 'select(length>0)'
 
 AGREEING="$(jq 'map(select(.agrees)) | length' <<<"$TOUCHPOINTS_JSON")"
 TOTAL_TP="$(jq 'length' <<<"$TOUCHPOINTS_JSON")"
-REASON="live registry count=$LIVE_COUNT (shipped list-tools binary); tool-count-baseline.md expects $CONTRACT_EXPECTED for release $RELEASE; $AGREEING/$TOTAL_TP hardcoded touchpoints agree; TOOL_POLICY_SCOPES entries=$POLICY_ENTRIES"
+REASON="live registry count=$LIVE_COUNT (shipped list-tools binary); contract expects $CONTRACT_EXPECTED and rebase_valid=$REBASE_VALID; $AGREEING/$TOTAL_TP current/derived/retired touchpoints classified; TOOL_POLICY_SCOPES entries=$POLICY_ENTRIES"
 
 RESULT="$(jq -n \
   --arg head "$SOURCE_HEAD" --arg generated_at "$GENERATED_AT" --arg release "$RELEASE" \
   --arg baseline "$BASELINE_PATH" --arg baseline_sha "$BASELINE_SHA" \
+  --arg repo_baseline "$REPO_BASELINE_PATH" --arg repo_baseline_sha "$REPO_BASELINE_SHA" \
   --argjson live "$LIVE_JSON" --argjson contract "$CONTRACT_JSON" --argjson policy "$POLICY_JSON" \
+  --argjson repo_registry_baseline "$REPO_BASELINE_JSON" --argjson rebase_valid "$REBASE_VALID" \
   --argjson touchpoints "$TOUCHPOINTS_JSON" \
   --arg names_sha "$NAMES_SHA" \
   --argjson violations "$VIOLATIONS_JSON" --argjson passed "$PASSED" \
@@ -306,6 +352,8 @@ RESULT="$(jq -n \
     generated_at: $generated_at,
     release: $release,
     baseline_contract: {path: $baseline, sha256: $baseline_sha},
+    repository_baseline: ($repo_registry_baseline + {path: $repo_baseline, sha256: $repo_baseline_sha}),
+    rebase_valid: $rebase_valid,
     live_registry: {
       source: "cargo build -p mcp-server --bin list-tools && ./list-tools (mcp_server::get_all_tool_definitions)",
       header_declared_total: $live.declared_total,

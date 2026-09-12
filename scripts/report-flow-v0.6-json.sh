@@ -97,7 +97,7 @@ commands = {
     "metadata_redaction": ["cargo", "test", "-p", "api", "delivery_metadata_withholds_record_content_and_internal_replay_receipts", "--", "--nocapture"],
     "ticket_guard": ["cargo", "test", "-p", "api", "collection_and_record_documents_cannot_receive_collab_tickets", "--", "--nocapture"],
     "mcp_cli": ["cargo", "test", "-p", "mcp-server", "--test", "flow_collections_e2e", "--", "--nocapture"],
-    "tool_registry": ["cargo", "test", "-p", "mcp-server", "flow_v06_tools_are_registered_once_in_the_exact_122_tool_surface", "--", "--nocapture"],
+    "tool_registry": ["cargo", "test", "-p", "mcp-server", "flow_v06_tools_match_the_repository_registry_baseline", "--", "--nocapture"],
     "capacity": [str(repo / "scripts/benchmark-flow-collections.sh"), "--records", "10000", "--evidence-root", str(evidence), "--repo-root", str(repo), "--json"],
     "cardinality": [str(repo / "scripts/verify-flow-cardinality-v0.6.sh"), "--adr", str(contracts / "decisions/ADR-0013-multi-document-atomicity.md"), "--since-release", "0.5", "--contracts-root", str(contracts), "--evidence-root", str(evidence), "--repo-root", str(repo), "--json"],
     "surface": [str(repo / "scripts/verify-flow-surface-coverage.sh"), "--release", "0.6", "--contracts-root", str(contracts), "--evidence-root", str(evidence), "--repo-root", str(repo), "--json"],
