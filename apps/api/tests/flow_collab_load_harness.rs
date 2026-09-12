@@ -216,6 +216,10 @@ const HARVEST_ATTEMPTS_MAX: usize = 20;
 /// this much noise. Any calibrated comparison has to clear it by a real margin or say it cannot
 /// decide.
 const PG_LOG_TIMESTAMP_RESOLUTION_MS: f64 = 1.0;
+/// A calibrated reference must span at least two timestamp-resolution units. One unit can be
+/// swallowed by endpoint quantization; two units leave a full unit beyond that noise floor, so
+/// the reference can distinguish an in-lock application gap from timestamp aliasing.
+const CALIBRATION_RESOLUTION_MULTIPLE_MIN: f64 = 2.0;
 const CALIBRATION_ITERATIONS: usize = 10;
 const HARVEST_RETRY_MS: u64 = 500;
 
@@ -1481,6 +1485,64 @@ struct Report {
     postgres_version: String,
 }
 
+fn calibrated_gap_resolution_status(measured_reference_ms: f64) -> (&'static str, bool) {
+    let satisfied = measured_reference_ms.is_finite()
+        && measured_reference_ms >= CALIBRATION_RESOLUTION_MULTIPLE_MIN * PG_LOG_TIMESTAMP_RESOLUTION_MS;
+    if satisfied {
+        ("satisfied", true)
+    } else {
+        ("inconclusive_below_instrument_resolution", false)
+    }
+}
+
+fn absolute_gap_budget_resolution_status() -> (&'static str, bool) {
+    let satisfied = INTRA_LOCK_APP_GAP_MS_MAX >= CALIBRATION_RESOLUTION_MULTIPLE_MIN * PG_LOG_TIMESTAMP_RESOLUTION_MS;
+    if satisfied {
+        ("satisfied", true)
+    } else {
+        ("inconclusive_below_instrument_resolution", false)
+    }
+}
+
+fn measurement_preconditions_json(report: &Report) -> Value {
+    let (calibrated_status, calibrated_satisfied) = calibrated_gap_resolution_status(report.out_of_lock_prepare_ms_p50);
+    let (absolute_status, absolute_satisfied) = absolute_gap_budget_resolution_status();
+    let observed_p95_ms = report.intra_lock_app_gap.as_ref().map(|gap| gap.p95_ms);
+    json!({
+        "calibrated_intra_lock_gap": {
+            "status": calibrated_status,
+            "satisfied": calibrated_satisfied,
+            "measured_reference": "out_of_lock_prepare_ms_p50",
+            "measured_reference_ms": report.out_of_lock_prepare_ms_p50,
+            "instrument_resolution_ms": PG_LOG_TIMESTAMP_RESOLUTION_MS,
+            "minimum_resolution_multiple": CALIBRATION_RESOLUTION_MULTIPLE_MIN,
+            "minimum_measurable_reference_ms": CALIBRATION_RESOLUTION_MULTIPLE_MIN * PG_LOG_TIMESTAMP_RESOLUTION_MS,
+            "predicate": "out_of_lock_prepare_ms_p50 >= minimum_resolution_multiple * instrument_resolution_ms",
+            "rationale": "one resolution unit can be lost to endpoint quantization; two units leave one full unit beyond the noise floor",
+            "fallback_verdict_basis": if calibrated_satisfied {
+                Value::Null
+            } else {
+                json!(["locked_phase_statement_inventory", "absolute_intra_lock_app_gap_budget"])
+            },
+        },
+        "absolute_intra_lock_app_gap_budget": {
+            "status": absolute_status,
+            "satisfied": absolute_satisfied,
+            "budget_ms": INTRA_LOCK_APP_GAP_MS_MAX,
+            "instrument_resolution_ms": PG_LOG_TIMESTAMP_RESOLUTION_MS,
+            "budget_resolution_multiple": INTRA_LOCK_APP_GAP_MS_MAX / PG_LOG_TIMESTAMP_RESOLUTION_MS,
+            "minimum_resolution_multiple": CALIBRATION_RESOLUTION_MULTIPLE_MIN,
+            "observed_p95_ms": observed_p95_ms,
+            "decision": observed_p95_ms.map(|observed| if observed > INTRA_LOCK_APP_GAP_MS_MAX {
+                "budget_exceeded"
+            } else {
+                "within_budget"
+            }),
+            "rationale": "the fixed 5ms decision boundary spans five 1ms resolution units, exceeding the same two-unit admissibility floor",
+        },
+    })
+}
+
 impl Report {
     fn fail(&mut self, message: impl Into<String>) {
         self.violations.push(message.into());
@@ -1499,6 +1561,7 @@ impl Report {
     }
 
     fn to_json(&self) -> Value {
+        let measurement_preconditions = measurement_preconditions_json(self);
         json!({
             "schema_version": "sylvode.flow.collab-load-harness.v1",
             "environment": {
@@ -1520,6 +1583,7 @@ impl Report {
                 "round_trip_p95": self.round_trip.as_ref().map(Distribution::to_json),
             },
             "lock": {
+                "measurement_preconditions": measurement_preconditions,
                 "lock_hold_p95": self.lock_hold.as_ref().map(Distribution::to_json),
                 "lock_wait": self.lock_wait.as_ref().map(Distribution::to_json),
                 "commit_wal_flush": self.commit.as_ref().map(Distribution::to_json),
@@ -2092,7 +2156,13 @@ fn evaluate(report: &mut Report) {
     }
 
     if let Some(gap) = report.intra_lock_app_gap.clone() {
-        if gap.p95_ms > INTRA_LOCK_APP_GAP_MS_MAX {
+        let (absolute_status, absolute_satisfied) = absolute_gap_budget_resolution_status();
+        if !absolute_satisfied {
+            report.fail(format!(
+                "absolute intra-lock gap budget is {absolute_status}: {INTRA_LOCK_APP_GAP_MS_MAX:.1}ms is below \
+                 {CALIBRATION_RESOLUTION_MULTIPLE_MIN:.0}x the {PG_LOG_TIMESTAMP_RESOLUTION_MS:.1}ms instrument resolution"
+            ));
+        } else if gap.p95_ms > INTRA_LOCK_APP_GAP_MS_MAX {
             report.fail(format!(
                 "write transactions stay open with no SQL executing for p95={:.1}ms (budget {INTRA_LOCK_APP_GAP_MS_MAX:.0}ms) — \
                  non-database work is happening inside the lock (p50={:.1} max={:.1} n={})",
@@ -2106,20 +2176,12 @@ fn evaluate(report: &mut Report) {
         // quantization by a real margin — below that the two are indistinguishable and claiming a
         // pass would be claiming a check that could not have failed.
         let prepare = report.out_of_lock_prepare_ms_p50;
-        if prepare.is_finite() && prepare > 2.0 * PG_LOG_TIMESTAMP_RESOLUTION_MS {
-            if gap.p95_ms >= prepare {
-                report.fail(format!(
-                    "in-lock idle gap p95 ({:.2}ms) is at least as large as one measured out-of-lock prepare \
-                     ({prepare:.2}ms) — consistent with prepare/apply running inside the lock",
-                    gap.p95_ms
-                ));
-            }
-        } else {
-            report.notes.push(format!(
-                "the calibrated in-lock-gap check is inconclusive on this host: one out-of-lock prepare measures \
-                 {prepare:.2}ms, within {:.0}x the log's {PG_LOG_TIMESTAMP_RESOLUTION_MS:.0}ms timestamp resolution; \
-                 the statement inventory and the absolute gap budget carry the verdict instead",
-                2.0
+        let (_calibrated_status, calibrated_satisfied) = calibrated_gap_resolution_status(prepare);
+        if calibrated_satisfied && gap.p95_ms >= prepare {
+            report.fail(format!(
+                "in-lock idle gap p95 ({:.2}ms) is at least as large as one measured out-of-lock prepare \
+                 ({prepare:.2}ms) — consistent with prepare/apply running inside the lock",
+                gap.p95_ms
             ));
         }
         if gap.max_ms > INTRA_LOCK_APP_GAP_MS_MAX {
@@ -2207,8 +2269,8 @@ fn evaluate(report: &mut Report) {
 #[cfg(test)]
 mod harness_self_checks {
     use super::{
-        Distribution, LoggedStatement, LoggedTransaction, audit_locked_phase, drop_each_nth_log_line,
-        group_transactions, parse_pg_log, percentile_ms,
+        Distribution, LoggedStatement, LoggedTransaction, absolute_gap_budget_resolution_status, audit_locked_phase,
+        calibrated_gap_resolution_status, drop_each_nth_log_line, group_transactions, parse_pg_log, percentile_ms,
     };
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -2396,5 +2458,15 @@ mod harness_self_checks {
         let mutated = drop_each_nth_log_line(&raw, 10);
         assert_eq!(mutated.lines().count(), 90);
         assert!(!mutated.lines().any(|line| line == "10" || line == "100"));
+    }
+
+    #[test]
+    fn instrument_resolution_preconditions_are_explicit_and_boundary_inclusive() {
+        assert_eq!(
+            calibrated_gap_resolution_status(1.99),
+            ("inconclusive_below_instrument_resolution", false)
+        );
+        assert_eq!(calibrated_gap_resolution_status(2.0), ("satisfied", true));
+        assert_eq!(absolute_gap_budget_resolution_status(), ("satisfied", true));
     }
 }
