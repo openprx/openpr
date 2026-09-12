@@ -15,7 +15,6 @@ use serde_json::json;
 use uuid::Uuid;
 
 mod flow;
-mod flow_projection;
 
 /// Operation-log retention runs once per day; the first run happens at worker startup.
 const OPERATION_LOG_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
@@ -178,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
         // ADR-0009 search projection: content is copied only from the accepted projection table.
         // This is intentionally independent from the event dispatcher; a lost/duplicated event
         // cannot make the rebuildable search index diverge permanently from accepted state.
-        match flow_projection::run_tick(&db, args.concurrency.saturating_mul(10)).await {
+        match flow::search::run_tick(&db, args.concurrency.saturating_mul(10)).await {
             Ok(changed) => tracing::debug!(changed, "flow projection index tick"),
             Err(error) => tracing::warn!(error = %error, "flow projection index tick failed"),
         }
@@ -186,6 +185,16 @@ async fn main() -> anyhow::Result<()> {
         match flow::compaction::run_tick(&db, args.concurrency.saturating_mul(4)).await {
             Ok(report) => tracing::debug!(?report, "flow compaction tick"),
             Err(error) => tracing::warn!(error = %error, "flow compaction tick failed"),
+        }
+
+        match flow::projection::run_tick(&db, args.concurrency.saturating_mul(4)).await {
+            Ok(report) => tracing::debug!(?report, "flow projection rebuild tick"),
+            Err(error) => tracing::warn!(error = %error, "flow projection rebuild tick failed"),
+        }
+
+        match flow::integrity::run_tick(&db, args.concurrency.saturating_mul(4)).await {
+            Ok(report) => tracing::debug!(?report, "flow integrity scan tick"),
+            Err(error) => tracing::warn!(error = %error, "flow integrity scan tick failed"),
         }
 
         tokio::select! {

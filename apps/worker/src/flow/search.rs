@@ -1,4 +1,4 @@
-//! Accepted-only Flow full-text projection worker.
+//! Accepted-only Flow full-text search projection worker.
 //!
 //! `flow_object_projections` is the sole content source. The search table deliberately does not
 //! read snapshots, updates, pending client data, or event payloads. A rebuild may replace an

@@ -31,6 +31,7 @@ pub mod event_origin;
 pub mod event_policy;
 pub mod grants;
 pub mod import;
+pub mod maintenance;
 pub mod model;
 pub mod move_object;
 pub mod policy;
