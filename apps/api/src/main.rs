@@ -2320,6 +2320,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0062_flow_forms_bridge.sql",
         include_str!("../../../migrations/0062_flow_forms_bridge.sql"),
     ),
+    (
+        "0063_flow_v08_hardening.sql",
+        include_str!("../../../migrations/0063_flow_v08_hardening.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2653,6 +2657,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0062_flow_forms_bridge.sql",
         SchemaProbe::Relation("flow_forms_bridge_schema_guard"),
+    ),
+    (
+        "0063_flow_v08_hardening.sql",
+        SchemaProbe::Relation("flow_operation_runs"),
     ),
 ];
 

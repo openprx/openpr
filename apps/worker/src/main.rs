@@ -14,6 +14,7 @@ use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde_json::json;
 use uuid::Uuid;
 
+mod flow;
 mod flow_projection;
 
 /// Operation-log retention runs once per day; the first run happens at worker startup.
@@ -180,6 +181,11 @@ async fn main() -> anyhow::Result<()> {
         match flow_projection::run_tick(&db, args.concurrency.saturating_mul(10)).await {
             Ok(changed) => tracing::debug!(changed, "flow projection index tick"),
             Err(error) => tracing::warn!(error = %error, "flow projection index tick failed"),
+        }
+
+        match flow::compaction::run_tick(&db, args.concurrency.saturating_mul(4)).await {
+            Ok(report) => tracing::debug!(?report, "flow compaction tick"),
+            Err(error) => tracing::warn!(error = %error, "flow compaction tick failed"),
         }
 
         tokio::select! {

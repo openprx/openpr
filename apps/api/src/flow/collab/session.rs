@@ -811,6 +811,18 @@ pub async fn run(mut socket: WebSocket, state: AppState, consumed: ConsumedTicke
                 }
             };
 
+        if let Err(error) = super::compaction::begin_client_view(&state.db, document_id, &consumed.client_id).await {
+            tracing::error!(%document_id, %error, "collab open could not persist its compaction lease");
+            reject_and_close(
+                &mut socket,
+                document_id,
+                RejectedCode::ResyncRequired,
+                "client view durability failed",
+            )
+            .await;
+            return;
+        }
+
         match register_after_bootstrap(&state, &collab.registry, &consumed, session_id, ctx).await {
             Ok((registered, ctx)) => {
                 for frame in &opening_frames {
@@ -1863,9 +1875,39 @@ async fn handle_client_frame(
                 .await;
                 return;
             }
-            // A repeat at or below the recorded position is ignored rather than rejected
-            // (`collab-protocol-v1.md`: "`seq<=last_applied_seq` 是幂等重复,忽略但可重发 ack").
-            collab.registry.record_ack(session_id, seq, frontier);
+            let Ok(frontier_bytes) = BASE64.decode(frontier.as_bytes()) else {
+                send(
+                    socket,
+                    &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
+                )
+                .await;
+                return;
+            };
+            // Persist only an ack whose exact seq/frontier pair exists in PostgreSQL. Compaction
+            // is cross-instance, so the in-memory registry alone is not a safe deletion oracle.
+            match super::compaction::record_client_ack(&state.db, document_id, origin_client_id, seq, &frontier_bytes)
+                .await
+            {
+                Ok(true) => {
+                    // A repeat at or below the recorded position is ignored rather than rejected.
+                    collab.registry.record_ack(session_id, seq, frontier);
+                }
+                Ok(false) => {
+                    send(
+                        socket,
+                        &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    tracing::error!(%document_id, %error, "collab ack durability check failed closed");
+                    send(
+                        socket,
+                        &rejected_frame(document_id, RejectedCode::ResyncRequired, true, None),
+                    )
+                    .await;
+                }
+            }
         }
         // `Frame::Open` is already handled by the early `is_reopen_attempt` return above, before
         // this match ever runs -- this arm can never actually observe one at runtime, but stays

@@ -153,6 +153,12 @@ pub struct Candidate {
     pub head_seq: i64,
     pub head_frontier: Vec<u8>,
     pub snapshot_bytes: Vec<u8>,
+    /// SHA-256 of `snapshot_bytes`, persisted beside the snapshot so restore/integrity tooling can
+    /// verify the exact bytes without decoding them first.
+    pub snapshot_checksum: String,
+    /// Hash of the decoded semantic state.  Compaction tests compare this across the pre/post
+    /// boundary; a byte-identical checksum alone would not prove the reconstructed document.
+    pub semantic_hash: String,
     pub rebuild_wall_ms: u64,
 }
 
@@ -241,6 +247,8 @@ pub async fn build_candidate(db: &DatabaseConnection, document_id: Uuid) -> Resu
     Ok(Some(Candidate {
         head_seq: boot.head_seq,
         head_frontier: boot.head_frontier,
+        snapshot_checksum: bootstrap::content_hash(&snapshot_bytes),
+        semantic_hash: expected_hash,
         snapshot_bytes,
         rebuild_wall_ms,
     }))
@@ -312,7 +320,8 @@ pub async fn commit_candidate(
         DbBackend::Postgres,
         r"
             UPDATE collab_documents
-            SET snapshot = $2, snapshot_frontier = $3, snapshot_seq = $4, updated_at = now()
+            SET snapshot = $2, snapshot_frontier = $3, snapshot_seq = $4,
+                snapshot_checksum = $5, updated_at = now()
             WHERE id = $1
         ",
         vec![
@@ -320,6 +329,7 @@ pub async fn commit_candidate(
             candidate.snapshot_bytes.clone().into(),
             candidate.head_frontier.clone().into(),
             candidate.head_seq.into(),
+            candidate.snapshot_checksum.clone().into(),
         ],
     ))
     .await?;
@@ -671,6 +681,7 @@ mod database_tests {
     use crate::flow::collab::authz;
     use crate::flow::collab::bootstrap;
     use crate::flow::collab::cache::WarmCache;
+    use crate::flow::collab::compaction::{self, HistoryDisposition};
     use crate::flow::collab::coordinator::DocumentCoordinator;
     use crate::flow::collab::frame::{RejectedCode, WriteState};
     use crate::flow::collab::write::{self, AcceptOutcome, UpdateRequest};
@@ -1575,6 +1586,117 @@ mod database_tests {
             verify_engine.import_update(&tail.bytes).expect("tail replays");
         }
         assert_eq!(verify_engine.frontier().as_bytes(), boot.head_frontier.as_slice());
+
+        scratch.drop_self().await;
+    }
+
+    /// v0.8 compaction proof: equality is asserted on the recovered document itself, not merely
+    /// by counting rows.  The first run proves a lagging ack retains updates; the second proves an
+    /// explicit forced-resync atomically marks that client before pruning, while both runs preserve
+    /// the exact document head, frontier and semantic hash.
+    #[tokio::test]
+    async fn compaction_preserves_head_frontier_and_hash_and_never_swallows_a_lagging_ack() {
+        let scratch = scratch_or_skip!("v08-compaction-equality");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let doc = read_doc(&state, document_id).await;
+        let mut engine = LoroCollabEngine::load(&doc.snapshot).expect("loads");
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let advancer = SnapshotAdvancer::new();
+        for label in ["compact-a", "compact-b", "compact-c"] {
+            write_one_update(
+                &state,
+                &cache,
+                &coordinator,
+                &advancer,
+                &mut engine,
+                document_id,
+                workspace_id,
+                owner_id,
+                label,
+            )
+            .await;
+        }
+
+        let before = bootstrap::load(&state.db, document_id)
+            .await
+            .expect("pre-compaction load");
+        let before_head = before.head_seq;
+        let before_frontier = before.head_frontier.clone();
+        let before_hash = engine
+            .semantic_snapshot()
+            .expect("pre-compaction semantic state")
+            .semantic_hash();
+        let rows_before = total_update_rows(&state, document_id).await;
+        assert_eq!(rows_before, 3, "fixture must cross the empty-implementation threshold");
+
+        exec(
+            &state,
+            "INSERT INTO flow_collab_client_acks \
+             (document_id, client_id, ack_seq, ack_frontier) VALUES ($1, 'lagging-client', 0, ''::bytea)",
+            vec![document_id.into()],
+        )
+        .await;
+
+        let retained = compaction::compact(&state.db, document_id, before_head, false)
+            .await
+            .expect("safe compaction succeeds while retaining lagging history");
+        assert_eq!(retained.disposition, HistoryDisposition::RetainForLaggingClients);
+        assert_eq!(retained.deleted_updates, 0);
+        assert_eq!(total_update_rows(&state, document_id).await, rows_before);
+        assert_eq!(retained.head_seq, before_head);
+        assert_eq!(retained.head_frontier, before_frontier);
+        assert_eq!(retained.semantic_hash, before_hash);
+
+        let forced = compaction::compact(&state.db, document_id, before_head, true)
+            .await
+            .expect("explicit forced-resync compaction succeeds");
+        assert_eq!(forced.disposition, HistoryDisposition::ForceResyncAndPrune);
+        assert_eq!(forced.forced_resync_clients, 1);
+        assert_eq!(
+            forced.deleted_updates,
+            u64::try_from(rows_before).expect("positive row count")
+        );
+        assert_eq!(total_update_rows(&state, document_id).await, 0);
+
+        #[derive(FromQueryResult)]
+        struct AckRow {
+            resync_required: bool,
+            resync_reason: Option<String>,
+        }
+        let ack = AckRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT resync_required, resync_reason FROM flow_collab_client_acks \
+             WHERE document_id = $1 AND client_id = 'lagging-client'",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("ack query runs")
+        .expect("ack row remains as a durable resync obligation");
+        assert!(ack.resync_required);
+        assert_eq!(ack.resync_reason.as_deref(), Some("compaction_boundary"));
+
+        let after = bootstrap::load(&state.db, document_id)
+            .await
+            .expect("post-compaction load");
+        let after_engine = LoroCollabEngine::load(&after.snapshot).expect("compacted snapshot decodes");
+        let after_hash = after_engine
+            .semantic_snapshot()
+            .expect("post-compaction semantic state")
+            .semantic_hash();
+        assert_eq!(
+            after.head_seq, before_head,
+            "compaction must not move the document head"
+        );
+        assert_eq!(
+            after.head_frontier, before_frontier,
+            "frontier must be byte-for-byte equal"
+        );
+        assert_eq!(after_hash, before_hash, "recovered semantic hash must be exactly equal");
+        assert_eq!(after.snapshot_seq, after.head_seq);
 
         scratch.drop_self().await;
     }

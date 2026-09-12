@@ -28,6 +28,7 @@
 pub mod authz;
 pub mod bootstrap;
 pub mod cache;
+pub mod compaction;
 pub mod coordinator;
 pub mod egress;
 pub mod frame;
