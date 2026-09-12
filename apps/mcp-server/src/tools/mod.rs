@@ -130,6 +130,7 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
     ];
     tools.extend(flow_v05_tool_definitions());
     tools.extend(flow_v06_tool_definitions());
+    tools.extend(flow_v07_tool_definitions());
     tools.extend([
         legacy_pages::legacy_pages_inventory_tool(),
         legacy_pages::legacy_pages_import_preview_tool(),
@@ -137,6 +138,17 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         legacy_pages::legacy_pages_import_status_tool(),
     ]);
     tools
+}
+
+fn flow_v07_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        objects::reference_flow_object_tool(),
+        objects::unreference_flow_object_tool(),
+        objects::convert_preview_tool(),
+        objects::convert_commit_tool(),
+        objects::convert_status_tool(),
+        objects::convert_retry_tool(),
+    ]
 }
 
 fn flow_v06_tool_definitions() -> Vec<ToolDefinition> {
@@ -169,7 +181,9 @@ fn flow_v05_tool_definitions() -> Vec<ToolDefinition> {
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_v05_tool_definitions, flow_v06_tool_definitions, get_all_tool_definitions};
+    use super::{
+        flow_v05_tool_definitions, flow_v06_tool_definitions, flow_v07_tool_definitions, get_all_tool_definitions,
+    };
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
 
@@ -177,7 +191,7 @@ mod tests {
     const TOOL_REGISTRY_BASELINE: &str = include_str!("../../tool-registry-baseline.json");
 
     #[test]
-    fn flow_v06_tools_match_the_repository_registry_baseline() {
+    fn flow_v07_tools_match_the_repository_registry_baseline() {
         let tools = get_all_tool_definitions();
         let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<HashSet<_>>();
@@ -218,6 +232,22 @@ mod tests {
                 "records.create".to_string(),
             ]),
             "the live v0.6 delta must be the frozen three-tool surface"
+        );
+        let live_v07 = flow_v07_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            live_v07,
+            HashSet::from([
+                "objects.reference".to_string(),
+                "objects.unreference".to_string(),
+                "objects.convert_preview".to_string(),
+                "objects.convert_commit".to_string(),
+                "objects.convert_status".to_string(),
+                "objects.convert_retry".to_string(),
+            ]),
+            "the live v0.7 delta must be exactly the frozen six-tool bridge surface"
         );
     }
 

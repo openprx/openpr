@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (122)
+## Tools (128)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -27,7 +27,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
 ### Other: members.list, search.all, bot_operation_logs.list
-### Flow (v0.6): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, collab.projection_lag, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
+### Flow (v0.7): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, objects.reference, objects.unreference, objects.convert_preview, objects.convert_commit, objects.convert_status, objects.convert_retry, collab.projection_lag, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -192,6 +192,8 @@ enum OwnerLookup {
     /// iron rules ban. Extend [`OwnerLookup::argument`] and
     /// [`McpServer::resolve_flow_object_owner`] when those tools land.
     FlowObject,
+    /// `preview_id` / `job_id` -> the conversion's source Flow object owner endpoint.
+    FlowConversion,
 }
 
 impl OwnerLookup {
@@ -206,6 +208,7 @@ impl OwnerLookup {
             Self::Sprint => "sprint_id",
             Self::Comment => "comment_id",
             Self::FlowObject => "object_id, source_object_id or collection_id",
+            Self::FlowConversion => "preview_id or job_id",
         }
     }
 }
@@ -217,7 +220,7 @@ impl OwnerLookup {
 /// labels carry no project column (`migrations/0012_governance_phase1.sql`,
 /// `migrations/0003_labels.sql`), and `resource_id` only ever appears next to a
 /// `project_id` that already scopes the request path.
-const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 12] = [
+const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 14] = [
     ("record_id", OwnerLookup::FormData),
     ("form_id", OwnerLookup::FormData),
     ("attachment_id", OwnerLookup::FormData),
@@ -230,6 +233,8 @@ const OWNERSHIP_ARGUMENTS: [(&str, OwnerLookup); 12] = [
     ("object_id", OwnerLookup::FlowObject),
     ("source_object_id", OwnerLookup::FlowObject),
     ("collection_id", OwnerLookup::FlowObject),
+    ("preview_id", OwnerLookup::FlowConversion),
+    ("job_id", OwnerLookup::FlowConversion),
 ];
 
 /// The policy scope of every registered tool.
@@ -414,6 +419,21 @@ const TOOL_POLICY_SCOPES: &[(&str, PolicyScope)] = &[
     ("collections.describe", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
     ("collections.query", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
     ("records.create", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.reference", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.unreference", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.convert_preview", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    (
+        "objects.convert_commit",
+        PolicyScope::OwnedBy(OwnerLookup::FlowConversion),
+    ),
+    (
+        "objects.convert_status",
+        PolicyScope::OwnedBy(OwnerLookup::FlowConversion),
+    ),
+    (
+        "objects.convert_retry",
+        PolicyScope::OwnedBy(OwnerLookup::FlowConversion),
+    ),
     (
         "collab.projection_lag",
         PolicyScope::DeclaredProject { required: false },
@@ -718,6 +738,9 @@ impl McpServer {
     /// Dispatches a tool *after* it has been authorized. Private on purpose: `call_tool`
     /// is the only entry point, so no transport (stdio, HTTP, CLI) can reach a tool
     /// without passing the project policy gate and the audit trail.
+    // The exhaustive static dispatcher intentionally keeps every registered name in one match so
+    // registry/scope tests can prove two-way coverage. Each arm is awaited immediately.
+    #[allow(clippy::large_stack_frames)]
     async fn execute_tool(&self, name: &str, args: Value) -> CallToolResult {
         match name {
             // Projects
@@ -859,6 +882,12 @@ impl McpServer {
             "collections.describe" => tools::objects::describe_collection(&self.client, args).await,
             "collections.query" => tools::objects::query_collection(&self.client, args).await,
             "records.create" => tools::objects::create_collection_record(&self.client, args).await,
+            "objects.reference" => tools::objects::reference_flow_object(&self.client, args).await,
+            "objects.unreference" => tools::objects::unreference_flow_object(&self.client, args).await,
+            "objects.convert_preview" => tools::objects::convert_preview(&self.client, args).await,
+            "objects.convert_commit" => tools::objects::convert_commit(&self.client, args).await,
+            "objects.convert_status" => tools::objects::convert_status(&self.client, args).await,
+            "objects.convert_retry" => tools::objects::convert_retry(&self.client, args).await,
             "legacy_pages.inventory" => tools::legacy_pages::legacy_pages_inventory(&self.client, args).await,
             "legacy_pages.import_preview" => tools::legacy_pages::legacy_pages_import_preview(&self.client, args).await,
             "legacy_pages.import_commit" => tools::legacy_pages::legacy_pages_import_commit(&self.client, args).await,
@@ -907,6 +936,14 @@ impl McpServer {
             // mandatory.
             PolicyScope::OwnedBy(OwnerLookup::FlowObject) => {
                 let owner = self.resolve_flow_object_owner(tool_name, args).await?;
+                match &owner {
+                    Some(project_id) => self.reject_foreign_project_claims(tool_name, args, project_id)?,
+                    None => self.reject_any_project_claim(tool_name, args)?,
+                }
+                Ok(owner)
+            }
+            PolicyScope::OwnedBy(OwnerLookup::FlowConversion) => {
+                let owner = self.resolve_flow_conversion_owner(tool_name, args).await?;
                 match &owner {
                     Some(project_id) => self.reject_foreign_project_claims(tool_name, args, project_id)?,
                     None => self.reject_any_project_claim(tool_name, args)?,
@@ -965,6 +1002,9 @@ impl McpServer {
                      resolve_flow_object_owner, not resolve_owning_project"
                 ))
             }
+            OwnerLookup::FlowConversion => Err(format!(
+                "Tool '{tool_name}' is refused: FlowConversion ownership must be resolved through its source lookup"
+            )),
             OwnerLookup::FormData => self.resolve_form_data_owner(tool_name, args).await,
             OwnerLookup::Sprint | OwnerLookup::Comment => {
                 let id = required_owner_argument(tool_name, lookup, args)?;
@@ -1041,6 +1081,20 @@ impl McpServer {
         let data = response
             .get("data")
             .ok_or_else(|| format!("API response for flow object {object_id} carries no data"))?;
+        Ok(data.get("project_id").and_then(Value::as_str).map(str::to_string))
+    }
+
+    async fn resolve_flow_conversion_owner(&self, tool_name: &str, args: &Value) -> Result<Option<String>, String> {
+        let conversion_id = required_owner_argument(tool_name, OwnerLookup::FlowConversion, args)?;
+        let path = format!("/api/v1/flow/conversions/{conversion_id}/owner");
+        let response: Value = self
+            .client
+            .get(&path)
+            .await
+            .map_err(|error| format!("Failed to resolve conversion source owner {conversion_id}: {error}"))?;
+        let data = response
+            .get("data")
+            .ok_or_else(|| format!("API response for conversion {conversion_id} carries no data"))?;
         Ok(data.get("project_id").and_then(Value::as_str).map(str::to_string))
     }
 

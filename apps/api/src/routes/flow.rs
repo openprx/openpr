@@ -142,6 +142,18 @@ pub async fn get_flow_conversion(
     ))
 }
 
+pub async fn get_flow_conversion_owner(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(conversion_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    Ok(ApiResponse::success(
+        crate::flow::bridge::conversion_owner(&state, &extensions, conversion_id).await?,
+    ))
+}
+
 pub async fn post_flow_conversion_retry(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,

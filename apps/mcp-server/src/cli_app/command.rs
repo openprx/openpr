@@ -162,6 +162,61 @@ pub enum ObjectsAction {
         #[arg(long = "idempotency-key")]
         idempotency_key: String,
     },
+    /// Reference a Form or Form record without copying target data
+    Reference {
+        source: String,
+        #[arg(long = "target-type", value_parser = ["form", "form-record"])]
+        target_type: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long = "display-file")]
+        display_file: Option<PathBuf>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Remove a reference without deleting its target
+    Unreference {
+        source: String,
+        #[arg(long = "reference")]
+        reference_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Preview a Flow-to-Forms conversion
+    ConvertPreview {
+        source: String,
+        #[arg(long = "source-frontier")]
+        source_frontier: String,
+        #[arg(long = "target-type", value_parser = ["form", "form-record"])]
+        target_type: String,
+        #[arg(long = "mapping-file")]
+        mapping_file: PathBuf,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Commit a frozen conversion preview
+    ConvertCommit {
+        #[arg(long = "preview")]
+        preview_id: String,
+        #[arg(long = "source-frontier")]
+        source_frontier: String,
+        #[arg(long = "target-schema-version")]
+        target_schema_version: i32,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Read conversion status
+    ConvertStatus { job: String },
+    /// Retry a failed conversion
+    ConvertRetry {
+        job: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
     /// Read a semantic diff
     Diff {
         id: String,
@@ -524,6 +579,77 @@ mod tests {
         ];
         for line in lines {
             Cli::try_parse_from(line).expect("the exact v0.5 contract line should parse");
+        }
+    }
+
+    #[test]
+    fn parses_every_v07_bridge_command_line() {
+        const ID: &str = "11111111-1111-4111-8111-111111111111";
+        const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+        let lines = [
+            vec![
+                "sylvode",
+                "objects",
+                "reference",
+                ID,
+                "--target-type",
+                "form",
+                "--target",
+                OTHER,
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "sylvode",
+                "objects",
+                "unreference",
+                ID,
+                "--reference",
+                OTHER,
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "sylvode",
+                "objects",
+                "convert-preview",
+                ID,
+                "--source-frontier",
+                "F",
+                "--target-type",
+                "form-record",
+                "--mapping-file",
+                "mapping.json",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "sylvode",
+                "objects",
+                "convert-commit",
+                "--preview",
+                ID,
+                "--source-frontier",
+                "F",
+                "--target-schema-version",
+                "1",
+                "--confirm",
+                "--idempotency-key",
+                "k",
+            ],
+            vec!["sylvode", "objects", "convert-status", ID],
+            vec![
+                "sylvode",
+                "objects",
+                "convert-retry",
+                ID,
+                "--confirm",
+                "--idempotency-key",
+                "k",
+            ],
+        ];
+        for line in lines {
+            Cli::try_parse_from(line).expect("frozen v0.7 bridge command must parse");
         }
     }
 

@@ -1502,6 +1502,13 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route(
+            "/api/v1/flow/conversions/{conversion_id}/owner",
+            get(routes::flow::get_flow_conversion_owner).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
             "/api/v1/flow/conversions/{job_id}/retry",
             post(routes::flow::post_flow_conversion_retry).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),

@@ -60,6 +60,12 @@ fn command_name(command: &Commands) -> String {
             },
             ObjectsAction::Link { .. } => "objects.link".to_string(),
             ObjectsAction::Unlink { .. } => "objects.unlink".to_string(),
+            ObjectsAction::Reference { .. } => "objects.reference".to_string(),
+            ObjectsAction::Unreference { .. } => "objects.unreference".to_string(),
+            ObjectsAction::ConvertPreview { .. } => "objects.convert-preview".to_string(),
+            ObjectsAction::ConvertCommit { .. } => "objects.convert-commit".to_string(),
+            ObjectsAction::ConvertStatus { .. } => "objects.convert-status".to_string(),
+            ObjectsAction::ConvertRetry { .. } => "objects.convert-retry".to_string(),
             ObjectsAction::Diff { .. } => "objects.diff".to_string(),
             ObjectsAction::Relations { .. } => "objects.relations".to_string(),
             ObjectsAction::Search { .. } => "objects.search".to_string(),
@@ -249,6 +255,118 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 let body = flow_command("move_object", &payload, idempotency_key);
                 let path = format!("/api/v1/flow/objects/{id}/commands");
                 api_data(client.post_structured::<Value, _>(&path, &body).await)
+            }
+            ObjectsAction::Reference {
+                source,
+                target_type,
+                target,
+                display_file,
+                idempotency_key,
+            } => {
+                let source = checked_uuid("source", source)?;
+                let target = checked_uuid("--target", target)?;
+                checked_idempotency_key(idempotency_key)?;
+                let display = display_file
+                    .as_ref()
+                    .map(|path| read_json_file(path))
+                    .transpose()?
+                    .unwrap_or_else(|| json!({}));
+                if !display.is_object() {
+                    return Err(CliError::usage("--display-file must contain a JSON object"));
+                }
+                let path = format!("/api/v1/flow/objects/{source}/references");
+                api_data(
+                    client
+                        .post_structured::<Value, _>(
+                            &path,
+                            &json!({
+                    "target_type":target_type.replace('-', "_"),"target_id":target,"display":display,
+                    "idempotency_key":idempotency_key}),
+                        )
+                        .await,
+                )
+            }
+            ObjectsAction::Unreference {
+                source,
+                reference_id,
+                idempotency_key,
+            } => {
+                let source = checked_uuid("source", source)?;
+                let reference_id = checked_uuid("--reference", reference_id)?;
+                checked_idempotency_key(idempotency_key)?;
+                let path = format!("/api/v1/flow/objects/{source}/references/{reference_id}");
+                api_data(
+                    client
+                        .delete_structured_with_idempotency::<Value>(&path, idempotency_key)
+                        .await,
+                )
+            }
+            ObjectsAction::ConvertPreview {
+                source,
+                source_frontier,
+                target_type,
+                mapping_file,
+                idempotency_key,
+            } => {
+                let source = checked_uuid("source", source)?;
+                checked_idempotency_key(idempotency_key)?;
+                let mapping = read_json_file(mapping_file)?;
+                if !mapping.is_object() {
+                    return Err(CliError::usage("--mapping-file must contain a JSON object"));
+                }
+                api_data(
+                    client
+                        .post_structured::<Value, _>(
+                            "/api/v1/flow/conversions/preview",
+                            &json!({
+                    "source_object_id":source,"source_frontier":source_frontier,
+                    "target_type":target_type.replace('-', "_"),"mapping":mapping,"idempotency_key":idempotency_key}),
+                        )
+                        .await,
+                )
+            }
+            ObjectsAction::ConvertCommit {
+                preview_id,
+                source_frontier,
+                target_schema_version,
+                confirm,
+                idempotency_key,
+            } => {
+                let preview_id = checked_uuid("--preview", preview_id)?;
+                checked_idempotency_key(idempotency_key)?;
+                if !confirm {
+                    return Err(CliError::usage("--confirm is required"));
+                }
+                api_data(client.post_structured::<Value, _>("/api/v1/flow/conversions", &json!({
+                    "preview_id":preview_id,"source_frontier":source_frontier,"target_schema_version":target_schema_version,
+                    "confirm":true,"idempotency_key":idempotency_key})).await)
+            }
+            ObjectsAction::ConvertStatus { job } => {
+                let job = checked_uuid("job", job)?;
+                api_data(
+                    client
+                        .get_structured::<Value>(&format!("/api/v1/flow/conversions/{job}"))
+                        .await,
+                )
+            }
+            ObjectsAction::ConvertRetry {
+                job,
+                confirm,
+                idempotency_key,
+            } => {
+                let job = checked_uuid("job", job)?;
+                checked_idempotency_key(idempotency_key)?;
+                if !confirm {
+                    return Err(CliError::usage("--confirm is required"));
+                }
+                api_data(
+                    client
+                        .post_structured::<Value, _>(
+                            &format!("/api/v1/flow/conversions/{job}/retry"),
+                            &json!({"confirm":true,"idempotency_key":idempotency_key}),
+                        )
+                        .await,
+                )
             }
             ObjectsAction::Grants(grants) => match &grants.action {
                 GrantsAction::Get { id } => {

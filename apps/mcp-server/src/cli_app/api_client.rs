@@ -175,4 +175,17 @@ impl OpenPrClient {
         let url = format!("{}{path}", self.base_url);
         self.send_structured(self.client.put(&url).json(body), path).await
     }
+
+    pub async fn delete_structured_with_idempotency<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        idempotency_key: &str,
+    ) -> Result<T, StructuredApiError> {
+        let url = format!("{}{path}", self.base_url);
+        self.send_structured(
+            self.client.delete(&url).header("Idempotency-Key", idempotency_key),
+            path,
+        )
+        .await
+    }
 }

@@ -113,6 +113,20 @@ async fn put_structured(client: &OpenPrClient, path: &str, body: &Value) -> Resu
     send_structured(client, client.client.put(&url).json(body), path).await
 }
 
+async fn delete_structured_with_key(
+    client: &OpenPrClient,
+    path: &str,
+    idempotency_key: &str,
+) -> Result<Value, StructuredApiError> {
+    let url = format!("{}{path}", client.base_url);
+    send_structured(
+        client,
+        client.client.delete(&url).header("Idempotency-Key", idempotency_key),
+        path,
+    )
+    .await
+}
+
 fn parse_input<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, CallToolResult> {
     serde_json::from_value(args).map_err(|err| CallToolResult::error(format!("Invalid input: {err}")))
 }
@@ -159,6 +173,238 @@ fn respond_data(result: Result<Value, StructuredApiError>) -> CallToolResult {
 /// tools use the richer envelope reader. Downstream code may still call the String-returning
 /// helpers directly.
 fn retain_client_method<T>(_method: T) {}
+
+pub fn reference_flow_object_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "objects.reference".to_string(),
+        description: "Create a permission-aware reference from a Flow object to a Form or Form record.".to_string(),
+        input_schema: json!({"type":"object","properties":{
+            "object_id":{"type":"string"},"target_type":{"type":"string","enum":["form","form_record"]},
+            "target_id":{"type":"string"},"display":{"type":"object"},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}},
+            "required":["object_id","target_type","target_id","idempotency_key"],"additionalProperties":false}),
+    }
+}
+
+pub fn unreference_flow_object_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "objects.unreference".to_string(),
+        description: "Remove a Flow-to-Forms reference without deleting its target.".to_string(),
+        input_schema: json!({"type":"object","properties":{
+            "object_id":{"type":"string"},"reference_id":{"type":"string"},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}},
+            "required":["object_id","reference_id","idempotency_key"],"additionalProperties":false}),
+    }
+}
+
+pub fn convert_preview_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "objects.convert_preview".to_string(),
+        description: "Preview a frozen Flow-to-Forms conversion for 15 minutes.".to_string(),
+        input_schema: json!({"type":"object","properties":{
+            "source_object_id":{"type":"string"},"source_frontier":{"type":"string"},
+            "target_type":{"type":"string","enum":["form","form_record"]},"mapping":{"type":"object"},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}},
+            "required":["source_object_id","source_frontier","target_type","mapping","idempotency_key"],
+            "additionalProperties":false}),
+    }
+}
+
+pub fn convert_commit_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "objects.convert_commit".to_string(),
+        description: "Commit a previously previewed conversion with frozen source and target versions.".to_string(),
+        input_schema: json!({"type":"object","properties":{
+            "preview_id":{"type":"string"},"source_frontier":{"type":"string"},
+            "target_schema_version":{"type":"integer"},"confirm":{"const":true},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}},
+            "required":["preview_id","source_frontier","target_schema_version","confirm","idempotency_key"],
+            "additionalProperties":false}),
+    }
+}
+
+pub fn convert_status_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "objects.convert_status".to_string(),
+        description: "Read a conversion job after reauthorizing its Flow source.".to_string(),
+        input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"}},
+            "required":["job_id"],"additionalProperties":false}),
+    }
+}
+
+pub fn convert_retry_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "objects.convert_retry".to_string(),
+        description: "Idempotently retry a failed conversion with all permissions rechecked.".to_string(),
+        input_schema: json!({"type":"object","properties":{"job_id":{"type":"string"},"confirm":{"const":true},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}},
+            "required":["job_id","confirm","idempotency_key"],"additionalProperties":false}),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceInput {
+    object_id: String,
+    target_type: String,
+    target_id: String,
+    display: Option<Value>,
+    idempotency_key: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreferenceInput {
+    object_id: String,
+    reference_id: String,
+    idempotency_key: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConvertPreviewInput {
+    source_object_id: String,
+    source_frontier: String,
+    target_type: String,
+    mapping: Value,
+    idempotency_key: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConvertCommitInput {
+    preview_id: String,
+    source_frontier: String,
+    target_schema_version: i32,
+    confirm: bool,
+    idempotency_key: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConvertStatusInput {
+    job_id: String,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConvertRetryInput {
+    job_id: String,
+    confirm: bool,
+    idempotency_key: String,
+}
+
+pub async fn reference_flow_object(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: ReferenceInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if required_write_key(&input.idempotency_key).is_err() || uuid::Uuid::parse_str(&input.target_id).is_err() {
+        return CallToolResult::error("target_id must be a UUID and idempotency_key must be non-empty".to_string());
+    }
+    let path = format!(
+        "/api/v1/flow/objects/{}/references",
+        encode_query_component(&input.object_id)
+    );
+    respond_data(
+        post_structured(
+            client,
+            &path,
+            &json!({"target_type":input.target_type,"target_id":input.target_id,
+        "display":input.display.unwrap_or_else(|| json!({})),"idempotency_key":input.idempotency_key}),
+        )
+        .await,
+    )
+}
+
+pub async fn unreference_flow_object(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: UnreferenceInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if let Err(result) = required_write_key(&input.idempotency_key) {
+        return result;
+    }
+    let path = format!(
+        "/api/v1/flow/objects/{}/references/{}",
+        encode_query_component(&input.object_id),
+        encode_query_component(&input.reference_id)
+    );
+    respond_data(delete_structured_with_key(client, &path, &input.idempotency_key).await)
+}
+
+pub async fn convert_preview(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: ConvertPreviewInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if let Err(result) = required_write_key(&input.idempotency_key) {
+        return result;
+    }
+    respond_data(
+        post_structured(
+            client,
+            "/api/v1/flow/conversions/preview",
+            &serde_json::to_value(input).unwrap_or_default(),
+        )
+        .await,
+    )
+}
+
+pub async fn convert_commit(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: ConvertCommitInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if !input.confirm {
+        return CallToolResult::error("confirm must be true".to_string());
+    }
+    if let Err(result) = required_write_key(&input.idempotency_key) {
+        return result;
+    }
+    respond_data(
+        post_structured(
+            client,
+            "/api/v1/flow/conversions",
+            &serde_json::to_value(input).unwrap_or_default(),
+        )
+        .await,
+    )
+}
+
+pub async fn convert_status(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: ConvertStatusInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    respond_data(
+        get_structured(
+            client,
+            &format!("/api/v1/flow/conversions/{}", encode_query_component(&input.job_id)),
+        )
+        .await,
+    )
+}
+
+pub async fn convert_retry(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let input: ConvertRetryInput = match parse_input(args) {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    if !input.confirm {
+        return CallToolResult::error("confirm must be true".to_string());
+    }
+    if let Err(result) = required_write_key(&input.idempotency_key) {
+        return result;
+    }
+    let path = format!(
+        "/api/v1/flow/conversions/{}/retry",
+        encode_query_component(&input.job_id)
+    );
+    respond_data(
+        post_structured(
+            client,
+            &path,
+            &json!({"confirm":true,"idempotency_key":input.idempotency_key}),
+        )
+        .await,
+    )
+}
 
 // ---- objects.get ----
 

@@ -46,6 +46,11 @@ pub struct AuthorizedFlowObject {
     context: FlowReadContext,
 }
 
+#[derive(sea_orm::FromQueryResult)]
+struct WorkspaceRoleRow {
+    role: String,
+}
+
 impl AuthorizedFlowObject {
     #[must_use]
     pub const fn object_id(&self) -> Uuid {
@@ -124,11 +129,7 @@ pub(crate) async fn resolve_flow_principal(
         return require_workspace_access_from_auth(state, claims, Some(bot), workspace_id).await;
     }
     let actor_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
-    #[derive(sea_orm::FromQueryResult)]
-    struct RoleRow {
-        role: String,
-    }
-    let role = RoleRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+    let role = WorkspaceRoleRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
         sea_orm::DbBackend::Postgres,
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
         vec![workspace_id.into(), actor_id.into()],

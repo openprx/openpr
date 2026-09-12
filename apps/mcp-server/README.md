@@ -16,7 +16,7 @@ The MCP Server provides AI models with tools to interact with OpenPR's project m
 
 ## Features
 
-- **122 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, scenario toolkit, and Sylvode Flow (v0.6)
+- **128 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, scenario toolkit, and Sylvode Flow (v0.7)
 - **Three Transport Modes**: stdio (for MCP clients), HTTP JSON-RPC, and SSE
 - **JSON Schema Validation**: All tool parameters are strongly typed
 - **OpenPR API Backend**: Calls the OpenPR API with workspace-scoped bot credentials

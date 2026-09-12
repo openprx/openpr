@@ -5,6 +5,8 @@
 //! that same state as read-only and visibly unconfigured. The bridge computes one intersection
 //! decision and every reference, embed and conversion path consumes it.
 
+#![allow(clippy::items_after_statements)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::http::Extensions;
@@ -52,6 +54,7 @@ pub enum BridgeAccess {
 }
 
 /// Public permission shape. It says what the caller can do, never why another action was denied.
+///
 /// In particular it contains no target-existence bit, policy JSON, denied field names, record
 /// owner identity or record-scope expression (ADR-0019 BR-3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -100,8 +103,7 @@ fn flow_action_ceiling(level: PermissionLevel) -> BTreeMap<&'static str, bool> {
             "form.view" => level >= PermissionLevel::View,
             "record.create" | "record.update" => level >= PermissionLevel::Edit,
             "record.delete" | "record.export" => level >= PermissionLevel::FullAccess,
-            // BR-2: schema authority never crosses the bridge.
-            "form.design" => false,
+            // BR-2: schema authority and unknown actions never cross the bridge.
             _ => false,
         };
         actions.insert(action, allowed);
@@ -263,7 +265,7 @@ pub enum BridgeReferenceView {
         status: String,
         summary: Value,
         display: Value,
-        permission_state: BridgePermissionState,
+        permission_state: Box<BridgePermissionState>,
     },
     Unavailable,
 }
@@ -591,12 +593,10 @@ pub async fn create_reference(
         .one(&tx)
         .await?
         .ok_or(ApiError::Internal)?;
-        if existing.source_object_id != source.id
-            || existing.target_type != input.target_type
-            || existing.target_id != input.target_id
-            || existing.display != input.display
-            || existing.removed_at.is_some()
-        {
+        let same_source = existing.source_object_id == source.id;
+        let same_target = existing.target_type == input.target_type && existing.target_id == input.target_id;
+        let same_display = existing.display == input.display;
+        if !same_source || !same_target || !same_display || existing.removed_at.is_some() {
             return Err(ApiError::policy_rejected(
                 "idempotency key was used for another reference",
             ));
@@ -700,7 +700,7 @@ pub async fn list_references(
             status: target.status,
             summary,
             display: row.display,
-            permission_state,
+            permission_state: Box::new(permission_state),
         });
     }
     Ok(ReferenceList { items })
@@ -815,6 +815,12 @@ pub struct ConversionJobResponse {
     pub created_target_ids: Vec<Uuid>,
     pub warnings: Value,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversionOwnerResponse {
+    pub source_object_id: Uuid,
+    pub project_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromQueryResult, Clone)]
@@ -1472,6 +1478,35 @@ pub async fn conversion_status(
         return Err(ApiError::NotFound("conversion job not found".to_string()));
     }
     load_job(&state.db, job_id).await
+}
+
+pub async fn conversion_owner(
+    state: &AppState,
+    extensions: &Extensions,
+    conversion_id: Uuid,
+) -> Result<ConversionOwnerResponse, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Scope {
+        source_object_id: Uuid,
+        actor_id: Uuid,
+    }
+    let scope = Scope::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT source_object_id, actor_id FROM flow_conversion_previews WHERE id=$1 \
+         UNION ALL SELECT source_object_id, actor_id FROM flow_conversion_jobs WHERE id=$1 LIMIT 1",
+        vec![conversion_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("conversion not found".to_string()))?;
+    let (source, actor) = source_actor(state, extensions, scope.source_object_id, PermissionLevel::View).await?;
+    if actor.id != scope.actor_id && !matches!(actor.role.as_str(), "owner" | "admin") {
+        return Err(ApiError::NotFound("conversion not found".to_string()));
+    }
+    Ok(ConversionOwnerResponse {
+        source_object_id: source.id,
+        project_id: source.project_id,
+    })
 }
 
 pub async fn retry_conversion(
