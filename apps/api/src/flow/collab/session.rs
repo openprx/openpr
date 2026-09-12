@@ -1830,6 +1830,11 @@ async fn handle_client_frame(
             )
             .await;
         }
+        // `run` records every inbound frame before dispatching it here, so this is the second
+        // half of the server heartbeat contract: a `pong` has already cleared the outstanding
+        // deadline and requires no response. Treating it as `invalid_update` made every healthy
+        // quiet client accumulate a rejection each time it answered the server's own ping.
+        Frame::Pong { .. } => {}
         Frame::Ack {
             document_id: frame_document_id,
             seq,
@@ -1872,8 +1877,7 @@ async fn handle_client_frame(
         | Frame::Snapshot { .. }
         | Frame::Accepted { .. }
         | Frame::Rejected { .. }
-        | Frame::Resync { .. }
-        | Frame::Pong { .. } => {
+        | Frame::Resync { .. } => {
             send(
                 socket,
                 &rejected_frame(document_id, RejectedCode::InvalidUpdate, false, None),
@@ -2975,6 +2979,48 @@ mod tests {
             .expect("head_seq query runs")
             .expect("document row exists")
             .head_seq
+        }
+
+        /// A protocol `pong` is the required answer to the server's idle heartbeat. It is
+        /// consumed without a reply; the following ping must therefore be the first outbound
+        /// frame. This uses the real upgraded socket and production dispatcher so moving `Pong`
+        /// back into the invalid-frame catch-all makes the assertion fail with `Rejected`.
+        #[tokio::test]
+        async fn heartbeat_pong_is_consumed_without_rejection() {
+            let scratch = scratch_or_skip!("heartbeat-pong");
+            let state = state_for(scratch.db.clone());
+            let (workspace_id, owner_id) = seed_workspace(&state).await;
+            let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+            let token = jwt_for(owner_id);
+            let addr = spawn_server(state).await;
+            let client_id = "heartbeat-pong-client";
+            let ticket = issue_ticket(addr, &token, workspace_id, document_id, client_id).await;
+            let (mut ws, _) = open_session(addr, &ticket, client_id, document_id).await;
+
+            send_frame(
+                &mut ws,
+                &Frame::Pong {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "server-heartbeat".to_string(),
+                },
+            )
+            .await;
+            send_frame(
+                &mut ws,
+                &Frame::Ping {
+                    protocol_version: PROTOCOL_VERSION,
+                    nonce: "after-heartbeat".to_string(),
+                },
+            )
+            .await;
+
+            let reply = recv_frame(&mut ws).await;
+            let Frame::Pong { nonce, .. } = reply else {
+                panic!("a heartbeat pong must be consumed without rejection, got {reply:?}");
+            };
+            assert_eq!(nonce, "after-heartbeat");
+
+            scratch.drop_self().await;
         }
 
         #[tokio::test]
