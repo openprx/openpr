@@ -4016,6 +4016,30 @@ mod flow_database_tests {
             .expect("target count");
         assert_eq!(target_count.try_get::<i64>("", "n").expect("count"), 1);
 
+        exec(
+            &state,
+            "UPDATE flow_workspace_settings SET bridge_enabled=false WHERE workspace_id=$1",
+            vec![workspace_id.into()],
+        )
+        .await;
+        let disabled = body_json(to_response(
+            post_flow_object_reference(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source_id),
+                Json(crate::flow::bridge::CreateReferenceInput {
+                    target_type: "form".to_string(),
+                    target_id: form_id,
+                    display: json!({}),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(disabled["code"], 403, "{disabled}");
+
         scratch.drop_self().await;
     }
 
@@ -4127,6 +4151,13 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(rejected["code"], 403, "{rejected}");
+        let rejected_actions = rejected["details"]["permission_state"]["actions"]
+            .as_array()
+            .expect("permission actions");
+        assert!(
+            rejected_actions.contains(&json!("form.view")) && !rejected_actions.contains(&json!("record.create")),
+            "commit rejection must return the current decision with record.create removed: {rejected}"
+        );
 
         let zero = state
             .db
@@ -4143,17 +4174,46 @@ mod flow_database_tests {
         assert_eq!(zero.try_get::<i64>("", "lineage").expect("lineage"), 0);
 
         assert_eq!(body_json(to_response(set_policy(true).await)).await["code"], 0);
+        let preview_key = Uuid::new_v4().to_string();
         let preview = body_json(to_response(
             post_flow_conversion_preview(
                 State(state.clone()),
                 claims_for(owner_id),
                 None,
-                Json(preview_request(Uuid::new_v4().to_string())),
+                Json(preview_request(preview_key.clone())),
             )
             .await,
         ))
         .await;
         let preview_id = Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+        let preview_replay = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(preview_request(preview_key.clone())),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(preview_replay["data"]["preview_id"], preview_id.to_string());
+        let preview_collision = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(crate::flow::bridge::ConversionPreviewInput {
+                    source_object_id: source_id,
+                    source_frontier: frontier.clone(),
+                    target_type: "form_record".to_string(),
+                    mapping: json!({"target_form_id":form_id,"title":"different","values":{}}),
+                    idempotency_key: preview_key,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(preview_collision["code"], 400, "{preview_collision}");
         let commit_key = Uuid::new_v4().to_string();
         let commit_input = || crate::flow::bridge::ConversionCommitInput {
             preview_id,
@@ -4256,6 +4316,60 @@ mod flow_database_tests {
             assert_eq!(retried["data"]["created_target_ids"].as_array().map(Vec::len), Some(1));
         }
 
+        let expiring_preview = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(preview_request(Uuid::new_v4().to_string())),
+            )
+            .await,
+        ))
+        .await;
+        let expiring_preview_id =
+            Uuid::parse_str(expiring_preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+        crate::flow::bridge::set_conversion_fault_for_test(1);
+        let expired_failed = body_json(to_response(
+            post_flow_conversion(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(crate::flow::bridge::ConversionCommitInput {
+                    preview_id: expiring_preview_id,
+                    source_frontier: frontier.clone(),
+                    target_schema_version: 1,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    confirm: true,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        crate::flow::bridge::set_conversion_fault_for_test(0);
+        let expired_job_id =
+            Uuid::parse_str(expired_failed["data"]["job_id"].as_str().expect("failed job id")).expect("UUID");
+        exec(
+            &state,
+            "UPDATE flow_conversion_previews SET expires_at=now()-interval '1 second' WHERE id=$1",
+            vec![expiring_preview_id.into()],
+        )
+        .await;
+        let expired_retry = body_json(to_response(
+            post_flow_conversion_retry(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(expired_job_id),
+                Json(crate::flow::bridge::ConversionRetryInput {
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    confirm: true,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(expired_retry["code"], 403, "{expired_retry}");
+
         let preview = body_json(to_response(
             post_flow_conversion_preview(
                 State(state.clone()),
@@ -4304,6 +4418,197 @@ mod flow_database_tests {
             .expect("conversion totals");
         assert_eq!(totals.try_get::<i64>("", "records").expect("records"), 4);
         assert_eq!(totals.try_get::<i64>("", "lineage").expect("lineage"), 4);
+
+        let events = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT \
+                   (SELECT count(*) FROM form_events WHERE form_id=$1 AND event_type='form.record.created' \
+                    AND source->>'type'='flow_conversion') AS native_events, \
+                   (SELECT count(*) FROM business_events WHERE project_id=$2 AND event_type='form.record.created' \
+                    AND source->>'type'='flow_conversion') AS native_business_events, \
+                   (SELECT count(*) FROM business_events WHERE workspace_id=$3 \
+                    AND event_type='flow.conversion.completed') AS completed_events",
+                vec![form_id.into(), project_id.into(), workspace_id.into()],
+            ))
+            .await
+            .expect("event totals query")
+            .expect("event totals");
+        assert_eq!(events.try_get::<i64>("", "native_events").expect("native events"), 4);
+        assert_eq!(
+            events
+                .try_get::<i64>("", "native_business_events")
+                .expect("native business events"),
+            4
+        );
+        assert_eq!(
+            events.try_get::<i64>("", "completed_events").expect("completed events"),
+            4
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn conversion_commit_rechecks_flow_permission_through_production_feature_route() {
+        use base64::Engine as _;
+
+        #[derive(FromQueryResult)]
+        struct Frontier {
+            head_frontier: Vec<u8>,
+        }
+
+        let scratch = scratch_or_skip!("bridge-conversion-flow-shrink");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let enabled = body_json(to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: Some(true),
+                    default_member_level: Some("edit".to_string()),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(enabled["code"], 0, "{enabled}");
+
+        let project_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'FSH', 'Flow shrink test', $3)",
+            vec![project_id.into(), workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        let form = body_json(to_response(
+            create_project_form(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(project_id),
+                Json(CreateFormRequest {
+                    key: "flow_shrink_target".to_string(),
+                    name: "Flow shrink target".to_string(),
+                    description: None,
+                    icon: None,
+                    color: None,
+                    title_template: None,
+                    schema: None,
+                    detail_layout: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let form_id = Uuid::parse_str(form["data"]["id"].as_str().expect("form id")).expect("UUID");
+        let forms_policy = body_json(to_response(
+            update_form_permissions(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(form_id),
+                Json(UpdateFormPermissionsRequest {
+                    policies: vec![UpsertFormPermissionPolicy {
+                        subject_type: "role".to_string(),
+                        subject_id: "member".to_string(),
+                        policy: json!({"actions":{"form.view":true,"record.create":true}}),
+                    }],
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(forms_policy["code"], 0, "{forms_policy}");
+
+        let source_id = create_page_as_owner(&state, workspace_id, owner_id, "flow shrink source").await;
+        let head = Frontier::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_frontier FROM collab_documents WHERE object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("frontier query")
+        .expect("frontier");
+        let frontier = base64::engine::general_purpose::STANDARD.encode(head.head_frontier);
+        let preview = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Json(crate::flow::bridge::ConversionPreviewInput {
+                    source_object_id: source_id,
+                    source_frontier: frontier.clone(),
+                    target_type: "form_record".to_string(),
+                    mapping: json!({"target_form_id":form_id,"values":{}}),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(preview["code"], 0, "{preview}");
+        let preview_id = Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+
+        let narrowed = body_json(to_response(
+            set_flow_feature(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(SetFlowFeatureRequest {
+                    enabled: None,
+                    default_member_level: Some("view".to_string()),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(narrowed["code"], 0, "{narrowed}");
+        let rejected = body_json(to_response(
+            post_flow_conversion(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Json(crate::flow::bridge::ConversionCommitInput {
+                    preview_id,
+                    source_frontier: frontier,
+                    target_schema_version: 1,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    confirm: true,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(rejected["code"], 403, "{rejected}");
+        assert_eq!(
+            rejected["details"]["permission_state"]["actions"],
+            json!(["form.view"]),
+            "Flow shrink must return the current intersection: {rejected}"
+        );
+        let zero = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT (SELECT count(*) FROM form_records WHERE form_id=$1) AS records, \
+                        (SELECT count(*) FROM flow_object_lineage WHERE source_object_id=$2) AS lineage",
+                vec![form_id.into(), source_id.into()],
+            ))
+            .await
+            .expect("zero-write query")
+            .expect("counts");
+        assert_eq!(zero.try_get::<i64>("", "records").expect("records"), 0);
+        assert_eq!(zero.try_get::<i64>("", "lineage").expect("lineage"), 0);
 
         scratch.drop_self().await;
     }

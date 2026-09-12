@@ -21,7 +21,7 @@ use super::collab::authz::PermissionLevel;
 use super::event_origin::CommandOrigin;
 use super::{collab::authz, policy, repository};
 use crate::error::ApiError;
-use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
+use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_business_event, insert_flow_event};
 use crate::forms::permissions::{permission_policy_field_allows, permission_policy_record_scope};
 
 pub const BRIDGE_ACTIONS: [&str; 6] = [
@@ -32,6 +32,16 @@ pub const BRIDGE_ACTIONS: [&str; 6] = [
     "record.export",
     "form.design",
 ];
+
+#[cfg(test)]
+fn bridge_test_mutation(name: &str) -> bool {
+    std::env::var("OPENPR_FLOW_TEST_BRIDGE_MUTATION").is_ok_and(|value| value == name)
+}
+
+#[cfg(not(test))]
+const fn bridge_test_mutation(_name: &str) -> bool {
+    false
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeCommandType {
@@ -75,14 +85,14 @@ pub enum BridgePrincipal {
     Guest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyConfiguration {
     Explicit,
     Unconfigured,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BridgeAccess {
     ReadOnly,
@@ -93,7 +103,7 @@ pub enum BridgeAccess {
 ///
 /// In particular it contains no target-existence bit, policy JSON, denied field names, record
 /// owner identity or record-scope expression (ADR-0019 BR-3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BridgePermissionState {
     pub access: BridgeAccess,
     pub configuration: PolicyConfiguration,
@@ -101,6 +111,36 @@ pub struct BridgePermissionState {
     pub field_read_limited: bool,
     pub field_write_limited: bool,
     pub record_limited: bool,
+}
+
+fn denied_permission_state(configuration: PolicyConfiguration) -> BridgePermissionState {
+    BridgePermissionState {
+        access: BridgeAccess::ReadOnly,
+        configuration,
+        actions: Vec::new(),
+        field_read_limited: false,
+        field_write_limited: false,
+        record_limited: false,
+    }
+}
+
+fn bridge_policy_rejected(message: impl Into<String>, state: &BridgePermissionState) -> ApiError {
+    ApiError::policy_rejected_with_details(message, json!({ "permission_state": state }))
+}
+
+fn permission_state_after_flow_change(snapshot: &Value, level: PermissionLevel) -> BridgePermissionState {
+    let mut state = serde_json::from_value::<BridgePermissionState>(snapshot.clone())
+        .unwrap_or_else(|_| denied_permission_state(PolicyConfiguration::Unconfigured));
+    let ceiling = flow_action_ceiling(level);
+    state
+        .actions
+        .retain(|action| ceiling.get(action.as_str()).copied().unwrap_or(false));
+    state.access = if state.actions.iter().any(|action| action != "form.view") {
+        BridgeAccess::Controlled
+    } else {
+        BridgeAccess::ReadOnly
+    };
+    state
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +200,9 @@ pub fn bridge_permission(
     forms_policy: Option<&Value>,
     record_owner_matches: Option<bool>,
 ) -> Option<BridgePermissionDecision> {
-    if flow_level == PermissionLevel::Denied || principal == BridgePrincipal::Guest {
+    if flow_level == PermissionLevel::Denied
+        || (principal == BridgePrincipal::Guest && !bridge_test_mutation("guest_as_member"))
+    {
         return None;
     }
 
@@ -168,12 +210,13 @@ pub fn bridge_permission(
     let (configuration, policy_actions, denied_read_fields, denied_write_fields, record_scope) = forms_policy
         .map_or_else(
             || {
+                let inherit_forms_default_allow = bridge_test_mutation("br4_default_allow");
                 let actions = BTreeMap::from([
                     ("form.view", true),
-                    ("record.create", false),
-                    ("record.update", false),
-                    ("record.delete", false),
-                    ("record.export", false),
+                    ("record.create", inherit_forms_default_allow),
+                    ("record.update", inherit_forms_default_allow),
+                    ("record.delete", inherit_forms_default_allow),
+                    ("record.export", inherit_forms_default_allow),
                     ("form.design", false),
                 ]);
                 (
@@ -472,6 +515,7 @@ async fn lock_and_reauthorize_source(
     tx: &sea_orm::DatabaseTransaction,
     source: &repository::ObjectViewRow,
     actor: &mut BridgeActor,
+    permission_snapshot: Option<&Value>,
 ) -> Result<(), ApiError> {
     #[derive(FromQueryResult)]
     struct SettingsRow {
@@ -514,6 +558,12 @@ async fn lock_and_reauthorize_source(
     )
     .await?;
     if actor.flow_level < PermissionLevel::Edit {
+        if let Some(snapshot) = permission_snapshot {
+            return Err(bridge_policy_rejected(
+                "bridge permission changed before commit",
+                &permission_state_after_flow_change(snapshot, actor.flow_level),
+            ));
+        }
         return Err(ApiError::policy_rejected("bridge permission changed before commit"));
     }
     Ok(())
@@ -526,7 +576,7 @@ async fn lock_and_reauthorize_reference(
     target_type: &str,
     target_id: Uuid,
 ) -> Result<(TargetView, BridgePermissionDecision), ApiError> {
-    lock_and_reauthorize_source(tx, source, actor).await?;
+    lock_and_reauthorize_source(tx, source, actor, None).await?;
 
     let form_id = match target_type {
         "form" => target_id,
@@ -872,6 +922,7 @@ struct PreviewRow {
     target_form_id: Option<Uuid>,
     target_schema_version: i32,
     mapping: Value,
+    permission_snapshot: Value,
     expires_at: DateTime<Utc>,
 }
 
@@ -975,10 +1026,22 @@ pub async fn preview_conversion(
             let target = target_view(&state.db, source.workspace_id, "form", form_id)
                 .await?
                 .ok_or_else(|| ApiError::NotFound("bridge target not found".to_string()))?;
-            let permission = target_permission(&state.db, &actor, &target)
-                .await?
-                .filter(|decision| decision.allows("record.create"))
-                .ok_or_else(|| ApiError::policy_rejected("target record creation is not permitted"))?;
+            let permission = target_permission(&state.db, &actor, &target).await?;
+            let permission = match permission {
+                Some(decision) if decision.allows("record.create") => decision,
+                Some(decision) => {
+                    return Err(bridge_policy_rejected(
+                        "target record creation is not permitted",
+                        &decision.state,
+                    ));
+                }
+                None => {
+                    return Err(bridge_policy_rejected(
+                        "target record creation is not permitted",
+                        &denied_permission_state(PolicyConfiguration::Explicit),
+                    ));
+                }
+            };
             let (project_id, schema_version, _) = form_schema(&state.db, source.workspace_id, form_id)
                 .await?
                 .ok_or_else(|| ApiError::NotFound("bridge target not found".to_string()))?;
@@ -991,27 +1054,39 @@ pub async fn preview_conversion(
         }
     };
 
-    #[derive(FromQueryResult)]
-    struct Existing {
-        id: Uuid,
-        expires_at: DateTime<Utc>,
-    }
-    if let Some(existing) = Existing::find_by_statement(Statement::from_sql_and_values(
+    if let Some(existing) = PreviewRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT id, expires_at FROM flow_conversion_previews WHERE workspace_id = $1 AND idempotency_key = $2",
+        "SELECT id, workspace_id, actor_id, actor_kind, source_object_id, source_frontier, target_type, \
+         target_project_id, target_form_id, target_schema_version, mapping, permission_snapshot, expires_at \
+         FROM flow_conversion_previews WHERE workspace_id = $1 AND idempotency_key = $2",
         vec![source.workspace_id.into(), input.idempotency_key.clone().into()],
     ))
     .one(&state.db)
     .await?
     {
+        if existing.actor_id != actor.id
+            || existing.source_object_id != source.id
+            || existing.source_frontier != frontier
+            || existing.target_type != input.target_type
+            || existing.target_project_id != target_project_id
+            || existing.target_form_id != target_form_id
+            || existing.target_schema_version != target_schema_version
+            || existing.mapping != input.mapping
+        {
+            return Err(ApiError::BadRequest(
+                "idempotency_key was already used with different conversion preview input".to_string(),
+            ));
+        }
+        let permission_decision =
+            serde_json::from_value(existing.permission_snapshot).map_err(|_| ApiError::Internal)?;
         return Ok(ConversionPreviewResponse {
             preview_id: existing.id,
             expires_at: existing.expires_at,
-            source_frontier: frontier,
-            target_schema_version,
-            mapping: input.mapping,
+            source_frontier: existing.source_frontier,
+            target_schema_version: existing.target_schema_version,
+            mapping: existing.mapping,
             warnings: Vec::new(),
-            permission_decision: permission,
+            permission_decision,
             estimated_objects: 1,
         });
     }
@@ -1061,7 +1136,7 @@ async fn load_preview<C: ConnectionTrait>(conn: &C, preview_id: Uuid) -> Result<
     PreviewRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT id, workspace_id, actor_id, actor_kind, source_object_id, source_frontier, target_type, \
-         target_project_id, target_form_id, target_schema_version, mapping, expires_at \
+         target_project_id, target_form_id, target_schema_version, mapping, permission_snapshot, expires_at \
          FROM flow_conversion_previews WHERE id = $1",
         vec![preview_id.into()],
     ))
@@ -1145,6 +1220,85 @@ async fn conversion_event(
     .event_id)
 }
 
+async fn native_forms_conversion_event(
+    tx: &sea_orm::DatabaseTransaction,
+    preview: &PreviewRow,
+    target_id: Uuid,
+    event_type: &str,
+    actor: &BridgeActor,
+    origin: &CommandOrigin,
+    idempotency_key: &str,
+    payload: Value,
+) -> Result<(), ApiError> {
+    let form_id = preview.target_form_id.unwrap_or(target_id);
+    let record_id = preview.target_form_id.map(|_| target_id);
+    #[derive(FromQueryResult)]
+    struct FormKey {
+        key: String,
+    }
+    let aggregate_type = if record_id.is_some() {
+        let form = FormKey::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT key FROM project_forms WHERE id=$1 AND workspace_id=$2",
+            vec![form_id.into(), preview.workspace_id.into()],
+        ))
+        .one(tx)
+        .await?
+        .ok_or(ApiError::Internal)?;
+        format!("form.{}", form.key)
+    } else {
+        "form".to_string()
+    };
+    let source = json!({
+        "type": "flow_conversion",
+        "source_object_id": preview.source_object_id,
+        "correlation_id": origin.correlation_id,
+    });
+    let actor_id = (!actor.is_bot).then_some(actor.id);
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO form_events \
+         (id, workspace_id, project_id, form_id, record_id, event_type, actor_id, source, payload, created_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())",
+        vec![
+            Uuid::new_v4().into(),
+            preview.workspace_id.into(),
+            preview.target_project_id.into(),
+            form_id.into(),
+            record_id.into(),
+            event_type.into(),
+            actor_id.into(),
+            source.clone().into(),
+            payload.clone().into(),
+        ],
+    ))
+    .await?;
+    insert_business_event(
+        tx,
+        BusinessEventInput {
+            workspace_id: preview.workspace_id,
+            project_id: Some(preview.target_project_id),
+            event_type: event_type.to_string(),
+            aggregate_type,
+            aggregate_id: record_id.unwrap_or(form_id).to_string(),
+            actor_id,
+            source,
+            payload,
+            metadata: json!({
+                "form_id": form_id,
+                "record_id": record_id,
+                "legacy_form_events": true,
+                "derived_from": preview.source_object_id,
+            }),
+            correlation_id: Some(origin.correlation_id),
+            causation_id: None,
+            idempotency_key: Some(format!("forms-conversion-target:{idempotency_key}")),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn record_failed_conversion(
     state: &AppState,
     preview: &PreviewRow,
@@ -1200,12 +1354,21 @@ async fn execute_conversion(
     origin: CommandOrigin,
     retry: bool,
 ) -> Result<ConversionJobResponse, ApiError> {
-    let (source, mut actor) = source_actor(state, extensions, preview.source_object_id, PermissionLevel::Edit).await?;
+    let (source, mut actor) = source_actor(state, extensions, preview.source_object_id, PermissionLevel::View).await?;
     if actor.id != preview.actor_id && !matches!(actor.role.as_str(), "owner" | "admin") {
         return Err(ApiError::NotFound("conversion job not found".to_string()));
     }
     let tx = state.db.begin().await?;
-    lock_and_reauthorize_source(&tx, &source, &mut actor).await?;
+    if preview.expires_at <= Utc::now() {
+        return Err(ApiError::policy_rejected("conversion preview expired"));
+    }
+    if !bridge_enabled(&tx, preview.workspace_id).await? {
+        return Err(bridge_policy_rejected(
+            "forms bridge conversion is not permitted",
+            &denied_permission_state(PolicyConfiguration::Unconfigured),
+        ));
+    }
+    lock_and_reauthorize_source(&tx, &source, &mut actor, Some(&preview.permission_snapshot)).await?;
     let frontier = current_frontier(&source);
     if frontier != preview.source_frontier {
         return Err(ApiError::stale_frontier(
@@ -1225,22 +1388,40 @@ async fn execute_conversion(
         let target = target_view(&tx, preview.workspace_id, "form", form_id)
             .await?
             .ok_or_else(|| ApiError::policy_rejected("target form changed before commit"))?;
-        let permission = target_permission(&tx, &actor, &target)
-            .await?
-            .filter(|decision| decision.allows("record.create"))
-            .ok_or_else(|| ApiError::policy_rejected("target record creation is not permitted"))?;
+        let permission = target_permission(&tx, &actor, &target).await?;
+        let permission = match permission {
+            Some(decision) if decision.allows("record.create") => decision,
+            Some(decision) => {
+                return Err(bridge_policy_rejected(
+                    "target record creation is not permitted",
+                    &decision.state,
+                ));
+            }
+            None => {
+                return Err(bridge_policy_rejected(
+                    "target record creation is not permitted",
+                    &denied_permission_state(PolicyConfiguration::Explicit),
+                ));
+            }
+        };
         let (_, version, schema) = form_schema(&tx, preview.workspace_id, form_id)
             .await?
             .ok_or_else(|| ApiError::policy_rejected("target form changed before commit"))?;
         if version != preview.target_schema_version {
-            return Err(ApiError::policy_rejected("target schema version changed before commit"));
+            return Err(bridge_policy_rejected(
+                "target schema version changed before commit",
+                &permission.state,
+            ));
         }
         (Some(schema), Some(permission))
     } else {
         if !matches!(actor.role.as_str(), "owner" | "admin")
             || !project_exists(&tx, preview.workspace_id, preview.target_project_id).await?
         {
-            return Err(ApiError::policy_rejected("target form creation is not permitted"));
+            return Err(bridge_policy_rejected(
+                "target form creation is not permitted",
+                &denied_permission_state(PolicyConfiguration::Explicit),
+            ));
         }
         (None, None)
     };
@@ -1299,7 +1480,7 @@ async fn execute_conversion(
     }
 
     let target_id = Uuid::new_v4();
-    let target_version =
+    let (target_version, native_event_type, native_event_payload) =
         if let Some(form_id) = preview.target_form_id {
             let schema = schema.as_ref().ok_or(ApiError::Internal)?;
             let values = preview.mapping.get("values").cloned().unwrap_or_else(|| json!({}));
@@ -1346,7 +1527,11 @@ async fn execute_conversion(
                 &values,
             )
             .await?;
-            preview.target_schema_version
+            (
+                preview.target_schema_version,
+                "form.record.created",
+                json!({"record_id": target_id, "values": values}),
+            )
         } else {
             let key = preview
                 .mapping
@@ -1377,8 +1562,8 @@ async fn execute_conversion(
                     target_id.into(),
                     preview.workspace_id.into(),
                     preview.target_project_id.into(),
-                    key.into(),
-                    name.into(),
+                    key.clone().into(),
+                    name.to_string().into(),
                     schema.clone().into(),
                     (!actor.is_bot).then_some(actor.id).into(),
                 ],
@@ -1390,8 +1575,23 @@ async fn execute_conversion(
              VALUES ($1,1,$2,'{}'::jsonb,$3,'created from Flow conversion')",
             vec![target_id.into(), schema.into(), (!actor.is_bot).then_some(actor.id).into()],
         )).await?;
-            1
+            (
+                1,
+                "form.created",
+                json!({"form_id": target_id, "key": key, "name": name}),
+            )
         };
+    native_forms_conversion_event(
+        &tx,
+        &preview,
+        target_id,
+        native_event_type,
+        &actor,
+        &origin,
+        &idempotency_key,
+        native_event_payload,
+    )
+    .await?;
     if conversion_fault("after_target_create_before_lineage") {
         tx.rollback().await?;
         return record_failed_conversion(
@@ -1468,15 +1668,21 @@ pub async fn commit_conversion(
     #[derive(FromQueryResult)]
     struct Existing {
         id: Uuid,
+        preview_id: Uuid,
     }
     if let Some(existing) = Existing::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT id FROM flow_conversion_jobs WHERE workspace_id=$1 AND idempotency_key=$2",
+        "SELECT id, preview_id FROM flow_conversion_jobs WHERE workspace_id=$1 AND idempotency_key=$2",
         vec![preview.workspace_id.into(), input.idempotency_key.clone().into()],
     ))
     .one(&state.db)
     .await?
     {
+        if existing.preview_id != preview.id {
+            return Err(ApiError::BadRequest(
+                "idempotency_key was already used with a different conversion preview".to_string(),
+            ));
+        }
         return load_job(&state.db, existing.id).await;
     }
     execute_conversion(

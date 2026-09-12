@@ -126,6 +126,26 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.permission.baseline_changed",
         public_payload(&["workspace_id", "old_level", "new_level"]),
     ),
+    (
+        "flow.reference.created",
+        public_payload(&["reference_id", "source_object_id", "target_type", "target_id"]),
+    ),
+    (
+        "flow.reference.removed",
+        public_payload(&["reference_id", "source_object_id", "target_type", "target_id"]),
+    ),
+    (
+        "flow.conversion.started",
+        public_payload(&["job_id", "source_object_id", "target_type"]),
+    ),
+    (
+        "flow.conversion.completed",
+        public_payload(&["job_id", "source_object_id", "target_type", "target_id", "lineage_id"]),
+    ),
+    (
+        "flow.conversion.failed",
+        public_payload(&["job_id", "source_object_id", "error"]),
+    ),
 ];
 
 /// Event type prefix owned by the Flow module, for the same completeness-scan role
@@ -342,6 +362,7 @@ mod tests {
             "grants.rs",
             "move_object.rs",
             "relations.rs",
+            "bridge.rs",
             "collab/snapshot.rs",
             "collab/write.rs",
         ] {

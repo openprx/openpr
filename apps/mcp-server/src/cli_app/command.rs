@@ -185,11 +185,11 @@ pub enum ObjectsAction {
     /// Preview a Flow-to-Forms conversion
     ConvertPreview {
         source: String,
-        #[arg(long = "source-frontier")]
+        #[arg(long = "frontier")]
         source_frontier: String,
-        #[arg(long = "target-type", value_parser = ["form", "form-record"])]
+        #[arg(long = "to", value_parser = ["form", "form-record"])]
         target_type: String,
-        #[arg(long = "mapping-file")]
+        #[arg(long = "mapping")]
         mapping_file: PathBuf,
         #[arg(long = "idempotency-key")]
         idempotency_key: String,
@@ -198,9 +198,9 @@ pub enum ObjectsAction {
     ConvertCommit {
         #[arg(long = "preview")]
         preview_id: String,
-        #[arg(long = "source-frontier")]
+        #[arg(long = "frontier")]
         source_frontier: String,
-        #[arg(long = "target-schema-version")]
+        #[arg(long = "schema-version")]
         target_schema_version: i32,
         #[arg(long)]
         confirm: bool,
