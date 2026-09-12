@@ -841,6 +841,14 @@ struct SemanticEventRewrite {
     payload: Value,
 }
 
+#[cfg(test)]
+static TRANSIENT_PROJECTION_FAILURE: parking_lot::Mutex<Option<Uuid>> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn fail_next_projection_for(collection_id: Uuid) {
+    *TRANSIENT_PROJECTION_FAILURE.lock() = Some(collection_id);
+}
+
 async fn semantic_event_rewrite(
     tx: &sea_orm::DatabaseTransaction,
     input: &ExecuteCommandInput,
@@ -850,6 +858,22 @@ async fn semantic_event_rewrite(
     let collection_id = match sync {
         ProjectionSync::Collection { collection_id } | ProjectionSync::Record { collection_id, .. } => collection_id,
     };
+    #[cfg(test)]
+    let should_fail = {
+        let mut target = TRANSIENT_PROJECTION_FAILURE.lock();
+        if *target == Some(collection_id) {
+            *target = None;
+            true
+        } else {
+            false
+        }
+    };
+    #[cfg(test)]
+    if should_fail {
+        return Err(ApiError::Database(sea_orm::DbErr::Custom(
+            "injected transient collection projection failure".to_string(),
+        )));
+    }
     let required_uuid = |key: &str| {
         input
             .payload
@@ -977,6 +1001,12 @@ async fn execute_document_update(
     response_object_id: Uuid,
     sync: ProjectionSync,
 ) -> Result<AcceptedChange, ApiError> {
+    enum AttemptOutcome {
+        Ready(write::StagedWrite),
+        Rebase,
+        EpochMismatch,
+    }
+
     let boot = bootstrap::load(&state.db, document_id).await?;
     let bytes = export_operations(&boot, operations)?;
     let expected_frontier = input
@@ -1012,15 +1042,6 @@ async fn execute_document_update(
             }
         };
         let tx = state.db.begin().await?;
-        write::set_locked_phase_statement_budgets(&tx, 1).await?;
-        match authz::fence_epoch_for_share(&tx, workspace_id, checked_epoch).await {
-            Ok(()) => {}
-            Err(ApiError::Conflict(_)) => {
-                tx.rollback().await?;
-                return Err(ApiError::policy_rejected("authorization changed before commit"));
-            }
-            Err(err) => return Err(err),
-        }
         let request = write::UpdateRequest {
             document_id,
             update_id,
@@ -1036,59 +1057,99 @@ async fn execute_document_update(
             expected_frontier: expected_frontier.clone(),
             origin: input.origin.clone(),
         };
-        let staged = write::stage_one_document(
-            &tx,
-            &request,
-            &prepared,
-            crate::config::runtime().flow.dispatch_max_attempts,
-        )
-        .await?;
-        let write::StagedOutcome::Ready(staged) = staged else {
-            tx.rollback().await?;
-            if matches!(staged, write::StagedOutcome::EpochMismatch) {
+        // Keep every pre-commit database statement inside one classified attempt. The generic
+        // collab writer already retries transient SQLSTATEs (including PostgreSQL 57014 from the
+        // contractual statement timeout); this collection-specific projection tail used to leak
+        // them through `?`, making the same command randomly non-retryable under database load.
+        let attempt_outcome = async {
+            write::set_locked_phase_statement_budgets(&tx, 1).await?;
+            match authz::fence_epoch_for_share(&tx, workspace_id, checked_epoch).await {
+                Ok(()) => {}
+                Err(ApiError::Conflict(_)) => return Ok(AttemptOutcome::EpochMismatch),
+                Err(err) => return Err(err),
+            }
+            let staged = match write::stage_one_document(
+                &tx,
+                &request,
+                &prepared,
+                crate::config::runtime().flow.dispatch_max_attempts,
+            )
+            .await?
+            {
+                write::StagedOutcome::Ready(staged) => staged,
+                write::StagedOutcome::Rebase => return Ok(AttemptOutcome::Rebase),
+                write::StagedOutcome::EpochMismatch => return Ok(AttemptOutcome::EpochMismatch),
+            };
+            let semantic_event = semantic_event_rewrite(&tx, input, sync, staged.new_head_seq).await?;
+            match sync {
+                ProjectionSync::Collection { collection_id } => {
+                    sync_collection_projection(&tx, collection_id, staged.new_head_seq, &prepared.candidate).await?;
+                }
+                ProjectionSync::Record {
+                    collection_id,
+                    record_id,
+                } => {
+                    sync_record_projection(&tx, collection_id, record_id, staged.new_head_seq, &prepared.candidate)
+                        .await?;
+                }
+            }
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE business_events SET event_type = $2, aggregate_type = $3, aggregate_id = $4, \
+                 payload = $5, metadata = metadata || $6::jsonb WHERE id = $1",
+                vec![
+                    staged.event_id.into(),
+                    semantic_event.event_type.into(),
+                    semantic_event.aggregate_type.into(),
+                    semantic_event.aggregate_id.into(),
+                    semantic_event.payload.into(),
+                    json!({"semantic_summary": {"action": input.command_type}}).into(),
+                ],
+            ))
+            .await?;
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "UPDATE event_dispatch SET event_type = $2, document_id = NULL, accepted_seq = NULL WHERE event_id = $1",
+                vec![staged.event_id.into(), semantic_event.event_type.into()],
+            ))
+            .await?;
+            Ok::<_, ApiError>(AttemptOutcome::Ready(staged))
+        }
+        .await;
+
+        let staged = match attempt_outcome {
+            Ok(AttemptOutcome::Ready(staged)) => staged,
+            Ok(AttemptOutcome::EpochMismatch) => {
+                tx.rollback().await?;
                 return Err(ApiError::policy_rejected("authorization changed before commit"));
             }
-            if attempt == MAX_REBASE_ATTEMPTS {
-                return Err(ApiError::server_draining(
-                    crate::error::ServerDrainingReason::Contention,
-                    0,
-                    "server_draining",
-                ));
+            Ok(AttemptOutcome::Rebase) => {
+                tx.rollback().await?;
+                if attempt == MAX_REBASE_ATTEMPTS {
+                    return Err(ApiError::server_draining(
+                        crate::error::ServerDrainingReason::Contention,
+                        0,
+                        "server_draining",
+                    ));
+                }
+                continue;
             }
-            continue;
+            Err(err @ ApiError::Database(_)) if !err.is_deterministic_database_failure() => {
+                let _ = tx.rollback().await;
+                if attempt == MAX_REBASE_ATTEMPTS {
+                    return Err(ApiError::server_draining(
+                        crate::error::ServerDrainingReason::Contention,
+                        0,
+                        "server_draining",
+                    ));
+                }
+                continue;
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
         };
-        let semantic_event = semantic_event_rewrite(&tx, input, sync, staged.new_head_seq).await?;
-        match sync {
-            ProjectionSync::Collection { collection_id } => {
-                sync_collection_projection(&tx, collection_id, staged.new_head_seq, &prepared.candidate).await?;
-            }
-            ProjectionSync::Record {
-                collection_id,
-                record_id,
-            } => {
-                sync_record_projection(&tx, collection_id, record_id, staged.new_head_seq, &prepared.candidate).await?;
-            }
-        }
-        tx.execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE business_events SET event_type = $2, aggregate_type = $3, aggregate_id = $4, \
-             payload = $5, metadata = metadata || $6::jsonb WHERE id = $1",
-            vec![
-                staged.event_id.into(),
-                semantic_event.event_type.into(),
-                semantic_event.aggregate_type.into(),
-                semantic_event.aggregate_id.into(),
-                semantic_event.payload.into(),
-                json!({"semantic_summary": {"action": input.command_type}}).into(),
-            ],
-        ))
-        .await?;
-        tx.execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "UPDATE event_dispatch SET event_type = $2, document_id = NULL, accepted_seq = NULL WHERE event_id = $1",
-            vec![staged.event_id.into(), semantic_event.event_type.into()],
-        ))
-        .await?;
         tx.commit().await?;
 
         let before_frontier = prepared.observed.head_frontier.clone();
@@ -2928,8 +2989,8 @@ mod database_tests {
 
     use super::{
         CollectionCommandType, CountRow, EmbedFaultPoint, RecordFilter, RecordQueryPayload, RecordSort,
-        collection_operations, describe_collection, engine_at_head, execute_embed_with_fault, node_id,
-        query_collection_records, query_collection_records_requiring_typed_index, rebuild_typed_projections,
+        collection_operations, describe_collection, engine_at_head, execute_embed_with_fault, fail_next_projection_for,
+        node_id, query_collection_records, query_collection_records_requiring_typed_index, rebuild_typed_projections,
     };
     use crate::error::ApiError;
     use crate::flow::collab::bootstrap;
@@ -3194,6 +3255,10 @@ mod database_tests {
             .await
             .expect("field creates");
         }
+        // The first attempt reaches the production transaction tail and fails after staging the
+        // canonical document writes. A successful command therefore proves both that the
+        // transient database error was retried and that its first transaction was rolled back.
+        fail_next_projection_for(collection_id);
         command(
             &state,
             owner_id,
