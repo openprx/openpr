@@ -50,6 +50,11 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+use parking_lot::Mutex;
+#[cfg(test)]
+use std::sync::{Arc, LazyLock};
+
 use collab_core::{CollabEngine, CollabError, InputLimits, LoroCollabEngine};
 use sea_orm::{
     ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, FromQueryResult, Statement, TransactionTrait,
@@ -79,6 +84,42 @@ use super::snapshot::{self, SnapshotAdvancer, Trigger};
 ///
 /// Deliberately does **not** cover `COMMIT`: see [`run_locked_phase`].
 const LOCKED_PHASE_STAGING_BUDGET: Duration = Duration::from_millis(DOCUMENT_LOCK_HOLD_MS_MAX.saturating_mul(4));
+
+#[cfg(test)]
+struct PreparedPause {
+    document_id: Uuid,
+    remaining: u8,
+    barrier: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+static PREPARED_PAUSE: LazyLock<Mutex<Option<PreparedPause>>> = LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn install_two_writer_prepared_pause(document_id: Uuid) {
+    *PREPARED_PAUSE.lock() = Some(PreparedPause {
+        document_id,
+        remaining: 2,
+        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+    });
+}
+
+#[cfg(test)]
+async fn pause_two_writers_after_prepare(document_id: Uuid) {
+    let barrier = {
+        let mut slot = PREPARED_PAUSE.lock();
+        let Some(pause) = slot.as_mut().filter(|pause| pause.document_id == document_id) else {
+            return;
+        };
+        let barrier = Arc::clone(&pause.barrier);
+        pause.remaining -= 1;
+        if pause.remaining == 0 {
+            *slot = None;
+        }
+        barrier
+    };
+    barrier.wait().await;
+}
 
 pub struct UpdateRequest {
     pub document_id: Uuid,
@@ -1291,6 +1332,9 @@ pub async fn accept_update(
             HydrateOutcome::Rejected(outcome) => return Ok(outcome),
         };
 
+        #[cfg(test)]
+        pause_two_writers_after_prepare(request.document_id).await;
+
         match run_locked_phase(
             db,
             &request,
@@ -1521,7 +1565,7 @@ mod database_tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    use super::{AcceptOutcome, SnapshotAdvancer, UpdateRequest, accept_update};
+    use super::{AcceptOutcome, SnapshotAdvancer, UpdateRequest, accept_update, install_two_writer_prepared_pause};
     use crate::flow::collab::authz;
     use crate::flow::collab::bootstrap;
     use crate::flow::collab::bootstrap::fetch_update_range;
@@ -1938,6 +1982,133 @@ mod database_tests {
         .expect("notice query runs")
         .expect("committed update has one durable fanout pointer");
         assert_eq!(notice.document_seq, Some(accepted.head_seq));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn independent_api_instances_allocate_distinct_contiguous_document_sequences() {
+        let scratch = scratch_or_skip!("multi-instance-seq");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        let mut client_a = LoroCollabEngine::new_empty(101);
+        let base_a = client_a.frontier();
+        client_a.set_title("instance-a").expect("A title sets");
+        let bytes_a = client_a.export_from(&base_a).expect("A update exports");
+        let mut client_b = LoroCollabEngine::new_empty(202);
+        let base_b = client_b.frontier();
+        client_b.set_title("instance-b").expect("B title sets");
+        let bytes_b = client_b.export_from(&base_b).expect("B update exports");
+
+        let (prefix, _) = scratch.admin_url.rsplit_once('/').expect("admin URL has database");
+        let db_url = format!("{prefix}/{}", scratch.name);
+        let db_a = Database::connect(&db_url).await.expect("instance A connects");
+        let db_b = Database::connect(&db_url).await.expect("instance B connects");
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        install_two_writer_prepared_pause(document_id);
+        let update_a = Uuid::new_v4();
+        let update_b = Uuid::new_v4();
+
+        let barrier_a = std::sync::Arc::clone(&barrier);
+        let task_a = tokio::spawn(async move {
+            barrier_a.wait().await;
+            accept_update(
+                &db_a,
+                &WarmCache::new(),
+                &DocumentCoordinator::new(),
+                &SessionRegistry::new(),
+                &SnapshotAdvancer::new(),
+                10,
+                None,
+                UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
+                    document_id,
+                    update_id: update_a,
+                    bytes: bytes_a,
+                    idempotency_key: None,
+                    event_idempotency_key: None,
+                    origin_client_id: Some("api-instance-a".to_string()),
+                    message: None,
+                    actor_id: owner_id,
+                    actor_is_bot: false,
+                    workspace_id,
+                    checked_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await
+        });
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let task_b = tokio::spawn(async move {
+            barrier_b.wait().await;
+            accept_update(
+                &db_b,
+                &WarmCache::new(),
+                &DocumentCoordinator::new(),
+                &SessionRegistry::new(),
+                &SnapshotAdvancer::new(),
+                10,
+                None,
+                UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
+                    document_id,
+                    update_id: update_b,
+                    bytes: bytes_b,
+                    idempotency_key: None,
+                    event_idempotency_key: None,
+                    origin_client_id: Some("api-instance-b".to_string()),
+                    message: None,
+                    actor_id: owner_id,
+                    actor_is_bot: false,
+                    workspace_id,
+                    checked_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await
+        });
+        let (result_a, result_b) = tokio::join!(task_a, task_b);
+        let outcomes = [result_a.expect("A joins"), result_b.expect("B joins")];
+        let mut allocated = Vec::new();
+        for outcome in outcomes {
+            let AcceptOutcome::Accepted(accepted) = outcome.expect("instance write has no hard error") else {
+                panic!("both independent instance writes must commit");
+            };
+            allocated.push(accepted.head_seq);
+        }
+        allocated.sort_unstable();
+        assert_eq!(allocated, vec![1, 2]);
+
+        #[derive(FromQueryResult)]
+        struct SeqRow {
+            seq: i64,
+        }
+        let persisted = SeqRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT seq FROM collab_updates WHERE document_id=$1 ORDER BY seq",
+            vec![document_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("persisted seq query");
+        assert_eq!(persisted.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![1, 2]);
+        let notices = SeqRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT document_seq AS seq FROM flow_fanout_notices \
+             WHERE document_id=$1 AND notice_kind='document_update' ORDER BY document_seq",
+            vec![document_id.into()],
+        ))
+        .all(&state.db)
+        .await
+        .expect("notice seq query");
+        assert_eq!(notices.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![1, 2]);
 
         scratch.drop_self().await;
     }
