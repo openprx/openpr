@@ -85,6 +85,8 @@ if baseline['reviewed_head']!=head or baseline['rust_workspace_version']!=versio
 if not predecessor.get('accepted'): blockers.append('predecessor_not_accepted')
 if dirty: blockers.append('source_dirty')
 failed=[k for k,v in gates.items() if v!='passed']; blockers += [f'hard_gate_failed:{x}' for x in failed]
+failed_checks=[item['id'] for item in checks if item['status']!='passed']
+blockers += [f'producer_failed:{x}' for x in failed_checks]
 candidate=not blockers
 accepted=candidate and all(v.get('status')=='passed' for v in manual.values())
 receipt={"schema_version":"sylvode.flow.gate-result.v1","schema_path":"gates/v0.7-gate.yaml","release":"0.7.0","source_baseline":baseline,
