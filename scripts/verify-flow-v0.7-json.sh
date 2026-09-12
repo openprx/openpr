@@ -72,6 +72,12 @@ rust_version = re.search(r"\[workspace\.package\].*?version\s*=\s*\"([^\"]+)\"",
 frontend_version = json.loads((repo / "frontend/package.json").read_text())["version"]
 same("source.rust_workspace_version", receipt.get("source", {}).get("rust_workspace_version"), rust_version)
 same("source.frontend_package_version", receipt.get("source", {}).get("frontend_package_version"), frontend_version)
+dirty_entries = subprocess.check_output(
+    ["git", "-C", str(repo), "status", "--porcelain=v1", "--", "apps", "crates", "migrations", "Cargo.toml", "Cargo.lock"],
+    text=True,
+).splitlines()
+same("source.dirty", receipt.get("source", {}).get("dirty"), bool(dirty_entries))
+same("source.dirty_entries", receipt.get("source", {}).get("dirty_entries"), dirty_entries)
 
 checks = receipt.get("checks", [])
 if not isinstance(checks, list) or any(not isinstance(item, dict) for item in checks):
@@ -118,9 +124,8 @@ for item in checks:
             child_text = (evidence / child.get("log", "")).read_text()
             child_parsed = libtest(child_text)
             if child.get("id") == "frontend":
-                child_ok = bool(re.search(r"\b\d+\s+pass(?:ed)?\b", child_text, re.I)) and not re.search(
-                    r"\b\d+\s+fail(?:ed)?\b", child_text, re.I
-                )
+                child_ok = bool(re.search(r"^ok\s+Flow bridge Web adapter maps all 6 contract operations$", child_text, re.M))
+                child_ok = child_ok and not re.search(r"^(?:not ok|FAIL)|\bfail(?:ed)?\b", child_text, re.I | re.M)
             else:
                 child_ok = child_parsed["executed_count"] > 0 and child_parsed["passed"]
             outcomes.append(child_ok)
@@ -190,7 +195,7 @@ baseline_match = (
     and baseline.get("frontend_package_version") == frontend_version
 )
 predecessor = bool(receipt.get("predecessor", {}).get("accepted"))
-source_clean = not source.get("dirty")
+source_clean = not dirty_entries
 candidate = not failed_gates and all_producers and artifact_ok and contract_active and baseline_match and predecessor and source_clean
 same("candidate_ready", receipt.get("candidate_ready"), candidate)
 manual = receipt.get("manual_signoffs", {})
