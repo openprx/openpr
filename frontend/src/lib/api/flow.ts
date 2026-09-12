@@ -144,6 +144,47 @@ export interface FlowFeatureFlags {
 	updated_by: string | null;
 }
 
+export interface BridgePermissionState {
+	access: 'read_only' | 'controlled';
+	configuration: 'explicit' | 'unconfigured';
+	actions: string[];
+	field_read_limited: boolean;
+	field_write_limited: boolean;
+	record_limited: boolean;
+}
+
+export interface FlowReferenceReceipt {
+	reference_id: string;
+	source_object_id: string;
+	target_type: 'form' | 'form_record';
+	target_id: string;
+	lineage_id: string | null;
+	permission_state: BridgePermissionState;
+}
+
+export interface FlowConversionPreview {
+	preview_id: string;
+	expires_at: string;
+	source_frontier: string;
+	target_schema_version: number;
+	mapping: Record<string, unknown>;
+	warnings: string[];
+	permission_decision: BridgePermissionState;
+	estimated_objects: number;
+}
+
+export interface FlowConversionJob {
+	job_id: string;
+	status: 'started' | 'completed' | 'failed';
+	source_object_id: string;
+	source_frontier: string;
+	target_schema_version: number;
+	lineage_id: string | null;
+	created_target_ids: string[];
+	warnings: unknown[];
+	error: string | null;
+}
+
 /** v0.4 command types (`rest-api-v1.md`'s `POST .../commands` row). */
 export type FlowCommandType =
 	| 'set_title'
@@ -218,11 +259,17 @@ function buildQuery(params: Record<string, string | number | boolean | undefined
 }
 
 export const flowApi = {
-	createObject(workspaceId: string, input: CreateFlowObjectInput): Promise<ApiResult<AcceptedChange>> {
+	createObject(
+		workspaceId: string,
+		input: CreateFlowObjectInput
+	): Promise<ApiResult<AcceptedChange>> {
 		return apiClient.post<AcceptedChange>(`/api/v1/workspaces/${workspaceId}/flow/objects`, input);
 	},
 
-	listObjects(workspaceId: string, query: ListFlowObjectsQuery = {}): Promise<ApiResult<FlowObjectListResponse>> {
+	listObjects(
+		workspaceId: string,
+		query: ListFlowObjectsQuery = {}
+	): Promise<ApiResult<FlowObjectListResponse>> {
 		const qs = buildQuery({
 			project_id: query.project_id,
 			unprojected: query.unprojected,
@@ -233,7 +280,9 @@ export const flowApi = {
 			limit: query.limit,
 			include_archived: query.include_archived
 		});
-		return apiClient.get<FlowObjectListResponse>(`/api/v1/workspaces/${workspaceId}/flow/objects${qs}`);
+		return apiClient.get<FlowObjectListResponse>(
+			`/api/v1/workspaces/${workspaceId}/flow/objects${qs}`
+		);
 	},
 
 	getNavigator(
@@ -271,7 +320,9 @@ export const flowApi = {
 	},
 
 	getCollabDiagnostics(objectId: string): Promise<ApiResult<CollabDiagnostics>> {
-		return apiClient.get<CollabDiagnostics>(`/api/v1/flow/objects/${objectId}/collab?include_sizes=true`);
+		return apiClient.get<CollabDiagnostics>(
+			`/api/v1/flow/objects/${objectId}/collab?include_sizes=true`
+		);
 	},
 
 	/**
@@ -285,8 +336,68 @@ export const flowApi = {
 		return apiClient.get<FlowFeatureFlags>(`/api/v1/workspaces/${workspaceId}/features/flow`);
 	},
 
-	executeCommand(objectId: string, input: ExecuteFlowCommandInput): Promise<ApiResult<AcceptedChange>> {
+	executeCommand(
+		objectId: string,
+		input: ExecuteFlowCommandInput
+	): Promise<ApiResult<AcceptedChange>> {
 		return apiClient.post<AcceptedChange>(`/api/v1/flow/objects/${objectId}/commands`, input);
+	},
+
+	referenceObject(
+		objectId: string,
+		input: {
+			target_type: 'form' | 'form_record';
+			target_id: string;
+			display?: Record<string, unknown>;
+			idempotency_key: string;
+		}
+	): Promise<ApiResult<FlowReferenceReceipt>> {
+		return apiClient.post<FlowReferenceReceipt>(
+			`/api/v1/flow/objects/${objectId}/references`,
+			input
+		);
+	},
+
+	unreferenceObject(
+		objectId: string,
+		referenceId: string,
+		idempotencyKey: string
+	): Promise<ApiResult<{ removed: boolean; event_id: string }>> {
+		return apiClient.deleteWithHeaders<{ removed: boolean; event_id: string }>(
+			`/api/v1/flow/objects/${objectId}/references/${referenceId}`,
+			{ 'Idempotency-Key': idempotencyKey }
+		);
+	},
+
+	previewConversion(input: {
+		source_object_id: string;
+		source_frontier: string;
+		target_type: 'form' | 'form_record';
+		mapping: Record<string, unknown>;
+		idempotency_key: string;
+	}): Promise<ApiResult<FlowConversionPreview>> {
+		return apiClient.post<FlowConversionPreview>('/api/v1/flow/conversions/preview', input);
+	},
+
+	commitConversion(input: {
+		preview_id: string;
+		source_frontier: string;
+		target_schema_version: number;
+		idempotency_key: string;
+		confirm: true;
+	}): Promise<ApiResult<FlowConversionJob>> {
+		return apiClient.post<FlowConversionJob>('/api/v1/flow/conversions', input);
+	},
+
+	getConversion(jobId: string): Promise<ApiResult<FlowConversionJob>> {
+		return apiClient.get<FlowConversionJob>(`/api/v1/flow/conversions/${jobId}`);
+	},
+
+	retryConversion(jobId: string, idempotencyKey: string): Promise<ApiResult<FlowConversionJob>> {
+		return apiClient.post<FlowConversionJob>(`/api/v1/flow/conversions/${jobId}/retry`, {
+			idempotency_key: idempotencyKey,
+			confirm: true
+		});
 	},
 
 	getBootstrap(

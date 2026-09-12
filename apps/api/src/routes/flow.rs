@@ -3877,7 +3877,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn reference_embed_reauthorizes_forms_policy_and_missing_policy_is_read_only() {
+    async fn flow_bridge_reference_embed_reauthorizes_forms_policy_and_missing_policy_is_read_only() {
         let scratch = scratch_or_skip!("bridge-reference-reauth");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
@@ -4044,7 +4044,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn conversion_commit_rechecks_policy_and_is_idempotent_without_rewriting_source() {
+    async fn flow_bridge_conversion_commit_rechecks_policy_and_is_idempotent_without_rewriting_source() {
         use base64::Engine as _;
 
         #[derive(FromQueryResult)]
@@ -4451,7 +4451,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn conversion_commit_rechecks_flow_permission_through_production_feature_route() {
+    async fn flow_bridge_conversion_commit_rechecks_flow_permission_through_production_feature_route() {
         use base64::Engine as _;
 
         #[derive(FromQueryResult)]

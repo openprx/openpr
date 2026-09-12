@@ -149,7 +149,8 @@ class ApiClient {
 		method: string,
 		endpoint: string,
 		body?: unknown,
-		retryAfterRefresh: boolean = true
+		retryAfterRefresh: boolean = true,
+		additionalHeaders: Record<string, string> = {}
 	): Promise<ApiResult<T>> {
 		const url = `${this.baseUrl}${endpoint}`;
 		const headers = new Headers();
@@ -157,6 +158,7 @@ class ApiClient {
 		if (this.token) {
 			headers.set('Authorization', `Bearer ${this.token}`);
 		}
+		for (const [name, value] of Object.entries(additionalHeaders)) headers.set(name, value);
 
 		try {
 			const res = await fetch(url, {
@@ -180,7 +182,7 @@ class ApiClient {
 				if (!isRefreshEndpoint && retryAfterRefresh) {
 					const refreshed = await this.refreshAccessTokenOnce();
 					if (refreshed) {
-						return this.request<T>(method, endpoint, body, false);
+						return this.request<T>(method, endpoint, body, false, additionalHeaders);
 					}
 				}
 				this.clearAuth();
@@ -215,6 +217,10 @@ class ApiClient {
 
 	delete<T>(endpoint: string): Promise<ApiResult<T>> {
 		return this.request<T>('DELETE', endpoint);
+	}
+
+	deleteWithHeaders<T>(endpoint: string, headers: Record<string, string>): Promise<ApiResult<T>> {
+		return this.request<T>('DELETE', endpoint, undefined, true, headers);
 	}
 }
 

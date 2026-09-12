@@ -1,7 +1,7 @@
 {
 	"name": "frontend",
 	"private": true,
-	"version": "0.2.97",
+	"version": "0.2.98",
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
@@ -22,6 +22,7 @@
 		"test:flow-navigator-equivalence": "bun tests/flow-navigator-equivalence.test.ts",
 		"test:flow-ui-state": "bun tests/flow-ui-state.test.ts",
 		"test:flow-static-build": "bun tests/flow-static-build-deep-route.test.ts",
+		"test:flow-bridge": "bun tests/flow-bridge.test.ts",
 		"smoke:restaurant-ordering": "node scripts/smoke-restaurant-ordering.mjs",
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write ."
