@@ -2811,6 +2811,15 @@ pub async fn update_form_permissions(
     }
 
     let tx = state.db.begin().await?;
+    // ADR-0019 BR-6: bridge preview/commit and reference creation acquire the same per-form
+    // transaction lock before reading policy. A policy shrink therefore linearizes before their
+    // recheck or waits until their transaction has committed; it cannot slip between check/write.
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 19019))",
+        vec![form.id.to_string().into()],
+    ))
+    .await?;
     let mut updated_subjects = Vec::new();
     for policy in req.policies {
         let subject_type = normalize_permission_subject_type(&policy.subject_type)?;

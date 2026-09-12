@@ -1465,6 +1465,22 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route(
+            "/api/v1/flow/objects/{object_id}/references",
+            get(routes::flow::get_flow_object_references)
+                .post(routes::flow::post_flow_object_reference)
+                .route_layer(axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                )),
+        )
+        .route(
+            "/api/v1/flow/objects/{object_id}/references/{reference_id}",
+            delete(routes::flow::delete_flow_object_reference).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
             "/api/v1/flow/objects/{object_id}/bootstrap",
             get(routes::flow::get_flow_object_bootstrap).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),

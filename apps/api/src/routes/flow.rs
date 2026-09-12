@@ -29,6 +29,7 @@
 use axum::{
     Extension, Json,
     extract::{Path, Query, State},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use platform::{app::AppState, auth::JwtClaims};
@@ -50,6 +51,60 @@ use crate::{
     },
     response::ApiResponse,
 };
+
+/// `POST /api/v1/flow/objects/{object_id}/references`.
+pub async fn post_flow_object_reference(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Json(input): Json<crate::flow::bridge::CreateReferenceInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let receipt =
+        crate::flow::bridge::create_reference(&state, &extensions, object_id, input, request_origin(&extensions))
+            .await?;
+    Ok(ApiResponse::success(receipt))
+}
+
+/// Request-time permission resolution for Reference cards and Embed views.
+pub async fn get_flow_object_references(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    Ok(ApiResponse::success(
+        crate::flow::bridge::list_references(&state, &extensions, object_id).await?,
+    ))
+}
+
+/// `DELETE /api/v1/flow/objects/{object_id}/references/{reference_id}`.
+pub async fn delete_flow_object_reference(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path((object_id, reference_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let extensions = build_auth_extensions(claims, bot);
+    let receipt = crate::flow::bridge::remove_reference(
+        &state,
+        &extensions,
+        object_id,
+        reference_id,
+        key,
+        request_origin(&extensions),
+    )
+    .await?;
+    Ok(ApiResponse::success(receipt))
+}
 
 /// The origin every write handler in this module stamps on the events its command produces.
 ///
@@ -913,11 +968,12 @@ mod flow_database_tests {
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectDiffQuery,
         FlowObjectHistoryQuery, FlowRelationsQuery, FlowSearchQuery, GetFlowNavigatorQuery,
         GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, ProjectionLagQuery,
-        SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, get_flow_feature, get_flow_navigator,
-        get_flow_object, get_flow_object_bootstrap, get_flow_object_diff, get_flow_object_grants,
-        get_flow_object_history, get_flow_object_relations, get_flow_projection_lag, get_flow_search,
-        list_flow_objects, post_flow_object_command, put_flow_object_grants, put_flow_object_inheritance,
-        request_origin, set_flow_feature,
+        SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, delete_flow_object_reference,
+        get_flow_feature, get_flow_navigator, get_flow_object, get_flow_object_bootstrap, get_flow_object_diff,
+        get_flow_object_grants, get_flow_object_history, get_flow_object_references, get_flow_object_relations,
+        get_flow_projection_lag, get_flow_search, list_flow_objects, post_flow_object_command,
+        post_flow_object_reference, put_flow_object_grants, put_flow_object_inheritance, request_origin,
+        set_flow_feature,
     };
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::{
@@ -926,10 +982,15 @@ mod flow_database_tests {
         registry::OutboundEvent,
     };
     use crate::routes::bot::{CreateBotRequest, create_bot};
+    use crate::routes::form::{
+        CreateFormRequest, UpdateFormPermissionsRequest, UpsertFormPermissionPolicy, create_project_form,
+        update_form_permissions,
+    };
     use crate::routes::member::{
         AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
     };
     use axum::extract::{Path, Query, State};
+    use axum::http::HeaderMap;
     use axum::{Extension, Json};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -3750,6 +3811,149 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(hidden["code"], 404, "{hidden}");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn reference_embed_reauthorizes_forms_policy_and_missing_policy_is_read_only() {
+        let scratch = scratch_or_skip!("bridge-reference-reauth");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let project_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'BRG', 'Bridge test', $3)",
+            vec![project_id.into(), workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        let form = body_json(to_response(
+            create_project_form(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(project_id),
+                Json(CreateFormRequest {
+                    key: "bridge_form".to_string(),
+                    name: "Sensitive form".to_string(),
+                    description: Some("must not be cached".to_string()),
+                    icon: None,
+                    color: None,
+                    title_template: None,
+                    schema: None,
+                    detail_layout: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(form["code"], 0, "{form}");
+        let form_id = Uuid::parse_str(form["data"]["id"].as_str().expect("form id")).expect("UUID");
+        let source_id = create_page_as_owner(&state, workspace_id, owner_id, "bridge source").await;
+
+        let reference_key = Uuid::new_v4().to_string();
+        let create_input = || crate::flow::bridge::CreateReferenceInput {
+            target_type: "form".to_string(),
+            target_id: form_id,
+            display: json!({"mode": "embed"}),
+            idempotency_key: reference_key.clone(),
+        };
+        let created = body_json(to_response(
+            post_flow_object_reference(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source_id),
+                Json(create_input()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(created["code"], 0, "{created}");
+        assert_eq!(created["data"]["permission_state"]["access"], "read_only");
+        assert_eq!(created["data"]["permission_state"]["configuration"], "unconfigured");
+        assert_eq!(created["data"]["permission_state"]["actions"], json!(["form.view"]));
+        let reference_id =
+            Uuid::parse_str(created["data"]["reference_id"].as_str().expect("reference id")).expect("UUID");
+
+        let replay = body_json(to_response(
+            post_flow_object_reference(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source_id),
+                Json(create_input()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(replay["code"], 0, "{replay}");
+        assert_eq!(replay["data"]["reference_id"], reference_id.to_string());
+
+        let before = body_json(to_response(
+            get_flow_object_references(State(state.clone()), claims_for(owner_id), None, Path(source_id)).await,
+        ))
+        .await;
+        assert_eq!(before["code"], 0, "{before}");
+        assert_eq!(before["data"]["items"][0]["visibility"], "available");
+        assert_eq!(before["data"]["items"][0]["title"], "Sensitive form");
+
+        let policy = body_json(to_response(
+            update_form_permissions(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(form_id),
+                Json(UpdateFormPermissionsRequest {
+                    policies: vec![UpsertFormPermissionPolicy {
+                        subject_type: "role".to_string(),
+                        subject_id: "owner".to_string(),
+                        policy: json!({"actions": {"form.view": false}}),
+                    }],
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(policy["code"], 0, "{policy}");
+
+        let after = body_json(to_response(
+            get_flow_object_references(State(state.clone()), claims_for(owner_id), None, Path(source_id)).await,
+        ))
+        .await;
+        assert_eq!(after["code"], 0, "{after}");
+        assert_eq!(after["data"]["items"], json!([{"visibility": "unavailable"}]));
+
+        let remove_key = Uuid::new_v4().to_string();
+        let removed = body_json(to_response(
+            delete_flow_object_reference(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path((source_id, reference_id)),
+                HeaderMap::from_iter([(
+                    axum::http::header::HeaderName::from_static("idempotency-key"),
+                    axum::http::HeaderValue::from_str(&remove_key).expect("header"),
+                )]),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(removed["code"], 0, "{removed}");
+        assert_eq!(removed["data"]["removed"], true);
+
+        let target_count = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM project_forms WHERE id = $1",
+                vec![form_id.into()],
+            ))
+            .await
+            .expect("target count query")
+            .expect("target count");
+        assert_eq!(target_count.try_get::<i64>("", "n").expect("count"), 1);
 
         scratch.drop_self().await;
     }
