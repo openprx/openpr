@@ -307,11 +307,17 @@ for ((i = 0; i < CHECKS_COUNT; i++)); do
   cid="$(jq -r ".checks[$i].id // empty" "$GATE_RESULT_PATH")"
   cstatus="$(jq -r ".checks[$i].status // empty" "$GATE_RESULT_PATH")"
   cexit="$(jq -r ".checks[$i].exit_code // empty" "$GATE_RESULT_PATH")"
+  cexecuted="$(jq -r ".checks[$i].executed_count // empty" "$GATE_RESULT_PATH")"
   crel="$(jq -r ".checks[$i].evidence // empty" "$GATE_RESULT_PATH")"
   csha="$(jq -r ".checks[$i].sha256 // empty" "$GATE_RESULT_PATH")"
   if [[ -z "$cid" || -z "$crel" || -z "$csha" ]]; then
     DRIFT+=("checks[$i] is missing 'id', 'evidence' or 'sha256'")
     continue
+  fi
+  if ! [[ "$cexecuted" =~ ^[0-9]+$ ]]; then
+    DRIFT+=("check '$cid': executed_count='$cexecuted' is not a nonnegative integer")
+  elif [[ "$cstatus" == "passed" && "$cexecuted" -eq 0 ]]; then
+    DRIFT+=("check '$cid': status='passed' with executed_count=0")
   fi
   cabs="$REPO_ROOT/$crel"
   if [[ ! -f "$cabs" ]]; then
@@ -372,7 +378,9 @@ if [[ $ANY_HARD_GATE_NOT_PASSED -eq 1 ]]; then
   DRIFT+=("at least one hard gate does not recompute to 'passed' -- automation is not fully green")
 fi
 
-# ---- required_commands: producer/report commands must have passed. The three
+# ---- required_commands: producer/report commands must have passed. Every
+# declared producer must map to exactly one runtime check with one execution.
+# The three
 # commands that are ordered after report may truthfully be not_run with no exit
 # code in report's initial artifact. A recorded failure is never equivalent to
 # that state and remains drift.
@@ -383,6 +391,7 @@ while IFS= read -r key; do
     continue
   fi
   status="$(jq -r --arg k "$key" '.required_commands[$k].status // empty' "$GATE_RESULT_PATH")"
+  executed_count="$(jq -r --arg k "$key" '.required_commands[$k].executed_count // empty' "$GATE_RESULT_PATH")"
   has_exit_code="$(jq --arg k "$key" '.required_commands[$k] | has("exit_code")' "$GATE_RESULT_PATH")"
   exit_code_type="$(jq -r --arg k "$key" '.required_commands[$k].exit_code | type' "$GATE_RESULT_PATH")"
   if [[ "$has_exit_code" != "true" ]]; then
@@ -391,8 +400,28 @@ while IFS= read -r key; do
     if [[ "$exit_code_type" != "null" ]]; then
       DRIFT+=("required_commands.$key status='not_run' must carry exit_code=null")
     fi
+    if [[ "$executed_count" != "0" ]]; then
+      DRIFT+=("required_commands.$key status='not_run' must carry executed_count=0")
+    fi
   elif [[ "$status" != "passed" ]]; then
     DRIFT+=("required_commands.$key status='$status' (must be 'passed')")
+  fi
+
+  if ! [[ "$executed_count" =~ ^[0-9]+$ ]]; then
+    DRIFT+=("required_commands.$key executed_count='$executed_count' is not a nonnegative integer")
+  elif [[ "$key" == "report" ]]; then
+    [[ "$executed_count" -eq 1 ]] || DRIFT+=("required_commands.report executed_count=$executed_count (expected 1)")
+  elif [[ "$key" != "verify" && "$key" != "gate" && "$key" != "manual_signoff" ]]; then
+    check_id="required.$key"
+    matching_count="$(jq --arg id "$check_id" '[.checks[] | select(.id == $id)] | length' "$GATE_RESULT_PATH")"
+    if [[ "$matching_count" -ne 1 ]]; then
+      DRIFT+=("required producer '$key' has $matching_count runtime checks (expected exactly 1)")
+    else
+      check_projection="$(jq -c --arg id "$check_id" '[.checks[] | select(.id == $id)][0] | {status,exit_code,duration_ms,executed_count,evidence,sha256}' "$GATE_RESULT_PATH")"
+      command_projection="$(jq -c --arg k "$key" '.required_commands[$k] | {status,exit_code,duration_ms,executed_count,evidence,sha256}' "$GATE_RESULT_PATH")"
+      [[ "$check_projection" == "$command_projection" ]] || DRIFT+=("required_commands.$key does not match its runtime check")
+    fi
+    [[ "$executed_count" -eq 1 ]] || DRIFT+=("required producer '$key' executed_count=$executed_count (expected 1)")
   fi
 done < <(union_keys required_commands)
 

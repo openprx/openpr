@@ -24,7 +24,7 @@ set -euo pipefail
 # three-hop environment is unavailable; report invokes it instead of pretending
 # its script is absent.
 #
-# Every invocation (pass or fail) also writes an atomic run log so a
+# Every invocation (pass or fail) records executed_count=1 and also writes an atomic run log so a
 # failed report is never silently lost, per "有失败 exit 1，但仍保留报告".
 #
 # Exit codes: 0 = all required checks passed and gate-result.json was written.
@@ -224,8 +224,9 @@ run_step() {
   CHECKS_JSON="$(jq -c \
     --arg id "$id" --arg status "$status" --arg command "$cmd_str" \
     --argjson exit_code "$exit_code" --argjson duration_ms "$duration" \
+    --argjson executed_count 1 \
     --arg evidence "evidence/v0.4/logs/${id}.log" --arg sha256 "$log_sha" \
-    '. + [{id:$id, status:$status, command:$command, exit_code:$exit_code, duration_ms:$duration_ms, evidence:$evidence, sha256:$sha256}]' \
+    '. + [{id:$id, status:$status, command:$command, exit_code:$exit_code, duration_ms:$duration_ms, executed_count:$executed_count, evidence:$evidence, sha256:$sha256}]' \
     <<<"$CHECKS_JSON")"
   echo "[$status] $id (exit=$exit_code, ${duration}ms): $cmd_str"
   if [[ $exit_code -ne 0 ]]; then
@@ -321,6 +322,27 @@ run_step required.cross_workspace_verify "$ROOT_DIR/scripts/verify-flow-cross-wo
 
 echo "=== Sylvode Flow v0.4 report: deployed three-hop WebSocket verify ==="
 run_step required.deployed_chain_websocket_upgrade "$ROOT_DIR/scripts/verify-flow-deployed-websocket-v0.4.sh" --chain caddy,nginx,api --evidence-root "$EVIDENCE_ROOT" --repo-root "$REPO_ROOT" --json || true
+
+# Every required command before report/verify/gate/manual_signoff is a producer
+# owned by this report run. Check the runtime ledger rather than trusting the
+# presence of a hard-coded shell line: deleting an invocation, duplicating one,
+# or recording zero executions must make this run red.
+PRODUCER_KEYS="$(jq -r 'keys[] | select(. != "report" and . != "verify" and . != "gate" and . != "manual_signoff")' <<<"$YAML_REQUIRED_COMMANDS")"
+PRODUCER_EXECUTION_ERRORS=()
+while IFS= read -r key; do
+  [[ -z "$key" ]] && continue
+  check_id="required.$key"
+  matching_count="$(jq --arg id "$check_id" '[.[] | select(.id == $id)] | length' <<<"$CHECKS_JSON")"
+  executed_count="$(jq --arg id "$check_id" '[.[] | select(.id == $id) | .executed_count] | add // 0' <<<"$CHECKS_JSON")"
+  if [[ "$matching_count" -ne 1 || "$executed_count" -ne 1 ]]; then
+    PRODUCER_EXECUTION_ERRORS+=("$key: matching_checks=$matching_count executed_count=$executed_count")
+    OVERALL_FAILED=1
+  fi
+done <<<"$PRODUCER_KEYS"
+if [[ ${#PRODUCER_EXECUTION_ERRORS[@]} -gt 0 ]]; then
+  echo "FAIL: required producer execution ledger is incomplete or duplicated:" >&2
+  printf '  - %s\n' "${PRODUCER_EXECUTION_ERRORS[@]}" >&2
+fi
 
 SOURCE_HEAD="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 RUST_WORKSPACE_VERSION="$(sed -n '/^\[workspace.package\]$/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$REPO_ROOT/Cargo.toml" | head -1)"
@@ -428,8 +450,8 @@ HARD_GATE_NON_PASS_COUNT="$(jq '[.hard_gates[] | select(. != "passed")] | length
 echo "REPORT: recomputed hard gates: $(jq -c '.hard_gates | to_entries | group_by(.value) | map({(.[0].value):length}) | add' <<<"$RECOMPUTE_JSON")" >&2
 
 get_check() {
-  jq -c --arg id "$1" '[.[] | select(.id==$id)][0] // {status:"failed",command:"(not run)",exit_code:2,duration_ms:0,evidence:"",sha256:("0" * 64)}' <<<"$CHECKS_JSON" | \
-    jq -c '{command:.command, status:.status, exit_code:.exit_code, duration_ms:.duration_ms, evidence:.evidence, sha256:.sha256}'
+  jq -c --arg id "$1" '[.[] | select(.id==$id)][0] // {status:"failed",command:"(not run)",exit_code:2,duration_ms:0,executed_count:0,evidence:"",sha256:("0" * 64)}' <<<"$CHECKS_JSON" | \
+    jq -c '{command:.command, status:.status, exit_code:.exit_code, duration_ms:.duration_ms, executed_count:.executed_count, evidence:.evidence, sha256:.sha256}'
 }
 ZERO_SHA="$(printf '%064d' 0)"
 if [[ $OVERALL_FAILED -eq 0 ]]; then
@@ -489,10 +511,10 @@ REQUIRED_COMMANDS_JSON="$(jq -n \
     cli_contract_verify:$cli_contract_verify,
     transport_auth_verify:$transport_auth_verify,
     cross_workspace_verify:$cross_workspace_verify,
-    report:{command:"scripts/report-flow-v0.4-json.sh", status:$report_status, exit_code:$report_exit, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
-    verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
-    gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
-    manual_signoff:{command:"scripts/record-flow-v0.4-manual-signoff.sh", status:"not_run", exit_code:null, duration_ms:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha}
+    report:{command:"scripts/report-flow-v0.4-json.sh", status:$report_status, exit_code:$report_exit, duration_ms:0, executed_count:1, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
+    verify:{command:"scripts/verify-flow-v0.4-json.sh evidence/v0.4/gate-result.json --json", status:"not_run", exit_code:null, duration_ms:0, executed_count:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
+    gate:{command:"scripts/gate-flow-v0.4.sh --json", status:"not_run", exit_code:null, duration_ms:0, executed_count:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha},
+    manual_signoff:{command:"scripts/record-flow-v0.4-manual-signoff.sh", status:"not_run", exit_code:null, duration_ms:0, executed_count:0, evidence:"evidence/v0.4/gate-result.json", sha256:$zero_sha}
   }')"
 
 if ! jq -e --argjson expected "$SCHEMA_REQUIRED_COMMAND_KEYS" 'keys == $expected' >/dev/null <<<"$REQUIRED_COMMANDS_JSON"; then

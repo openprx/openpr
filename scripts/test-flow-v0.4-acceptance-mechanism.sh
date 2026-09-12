@@ -34,7 +34,7 @@ jq -n '{
   mode: "blocked",
   gate_passed: false,
   counts: {},
-  checks: [{id:"generic.test_mcp",status:"passed",command:"bash scripts/test-mcp.sh",exit_code:0,duration_ms:1,evidence:"test.log",sha256:("0"*64)}],
+  checks: [{id:"generic.test_mcp",status:"passed",command:"bash scripts/test-mcp.sh",exit_code:0,duration_ms:1,executed_count:1,evidence:"test.log",sha256:("0"*64)}],
   required_commands: {
     mcp_transport_verify: {status:"passed"},
     tool_registry_verify: {status:"passed"}
@@ -68,6 +68,12 @@ FAILED="$TMP_DIR/failed.json"
 jq '.checks[0].status="failed" | .checks[0].exit_code=1' "$BASE" | jq -f "$STATE_FILTER" > "$FAILED"
 assert_jq "an automated failure is named in blockers and blocks the receipt" \
   '.mode == "blocked" and .gate_passed == false and .counts.failed == 1 and .counts.unresolved == 4 and (.blockers | index("automated-check-failed:generic.test_mcp")) != null' "$FAILED"
+
+ZERO_EXECUTION="$TMP_DIR/zero-execution.json"
+jq '.checks[0].executed_count=0' "$BASE" | jq -f "$STATE_FILTER" > "$ZERO_EXECUTION"
+assert_jq "a passed check with zero executions is a named automated failure" \
+  '.mode == "blocked" and .gate_passed == false and .counts.passed == 0 and .counts.failed == 1
+   and (.blockers | index("automated-check-not-executed:generic.test_mcp")) != null' "$ZERO_EXECUTION"
 
 DIRTY="$TMP_DIR/dirty.json"
 jq '.source={dirty:true}' "$BASE" | jq -f "$STATE_FILTER" > "$DIRTY"

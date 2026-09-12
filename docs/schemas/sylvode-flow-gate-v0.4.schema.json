@@ -873,6 +873,7 @@
         "command",
         "exit_code",
         "duration_ms",
+        "executed_count",
         "evidence",
         "sha256"
       ],
@@ -898,6 +899,11 @@
           "type": "integer",
           "minimum": 0
         },
+        "executed_count": {
+          "description": "Number of times this exact check was invoked by the report run. A passed check must be greater than zero.",
+          "type": "integer",
+          "minimum": 0
+        },
         "evidence": {
           "type": "string"
         },
@@ -914,6 +920,7 @@
         "status",
         "exit_code",
         "duration_ms",
+        "executed_count",
         "evidence",
         "sha256"
       ],
@@ -936,6 +943,11 @@
           ]
         },
         "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "executed_count": {
+          "description": "Number of producer invocations observed by report. Downstream verify, gate and manual-signoff commands remain zero until separately run.",
           "type": "integer",
           "minimum": 0
         },

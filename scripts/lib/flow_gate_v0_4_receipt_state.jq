@@ -4,7 +4,13 @@
 # Keeping this as one jq program prevents the two writers from drifting.
 
 def check_failures:
-  [.checks[] | select(.status == "failed") | "automated-check-failed:" + .id];
+  [.checks[] |
+    if .status == "failed" then
+      "automated-check-failed:" + .id
+    elif .status == "passed" and
+         (((.executed_count | type) != "number") or .executed_count <= 0) then
+      "automated-check-not-executed:" + .id
+    else empty end];
 
 def hard_gate_failures:
   [.hard_gates | to_entries[] | select(.value != "passed") |
@@ -50,8 +56,8 @@ def source_blocking:
 | manual_pending as $pending
 | manual_deferred as $deferred
 | .counts.automated = (.checks | length)
-| .counts.passed = ([.checks[] | select(.status == "passed")] | length)
-| .counts.failed = ([.checks[] | select(.status == "failed")] | length)
+| .counts.passed = ([.checks[] | select(.status == "passed" and (.executed_count | type) == "number" and .executed_count > 0)] | length)
+| .counts.failed = ([.checks[] | select(.status == "failed" or (.status == "passed" and (((.executed_count | type) != "number") or .executed_count <= 0)))] | length)
 | .counts.environment_unavailable = ([.checks[] | select(.status == "environment_unavailable")] | length)
 | .counts.manual_pending = ($pending | length)
 | .counts.manual_deferred_to_frontend_track = ($deferred | length)
