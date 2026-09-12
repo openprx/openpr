@@ -300,7 +300,7 @@ const fn rejected_code_to_api_kind(code: RejectedCode) -> ApiErrorKind {
 
 /// The WS close code to send right after a `rejected`/failed-handshake `code` when this connection
 /// is being closed (`error-mapping-v1.md` via [`ApiErrorKind::ws_close_code`]).
-fn ws_close_code_for(code: RejectedCode) -> u16 {
+const fn ws_close_code_for(code: RejectedCode) -> u16 {
     match ws_rejection_action(rejected_code_to_api_kind(code)) {
         WsRejectionAction::Close(code) => code,
         WsRejectionAction::RejectKeepOpen => CLOSE_POLICY_VIOLATION,

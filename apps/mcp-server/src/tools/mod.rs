@@ -183,11 +183,14 @@ mod tests {
         let unique = names.iter().copied().collect::<HashSet<_>>();
         let baseline: serde_json::Value =
             serde_json::from_str(TOOL_REGISTRY_BASELINE).expect("tool registry baseline is valid JSON");
-        let expected_count = baseline["count"]
-            .as_u64()
-            .expect("tool registry baseline count is an integer") as usize;
-        let expected_hash = baseline["names_sha256"]
-            .as_str()
+        let expected_count = baseline
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .expect("tool registry baseline count fits usize");
+        let expected_hash = baseline
+            .get("names_sha256")
+            .and_then(serde_json::Value::as_str)
             .expect("tool registry baseline names_sha256 is a string");
         let mut sorted_names = names.clone();
         sorted_names.sort_unstable();
