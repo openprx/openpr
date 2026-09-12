@@ -202,6 +202,11 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => tracing::warn!(error = %error, "flow integrity scan tick failed"),
         }
 
+        match flow::retention::run_tick(&db, args.concurrency.saturating_mul(4)).await {
+            Ok(report) => tracing::debug!(?report, "flow irreversible object retention tick"),
+            Err(error) => tracing::warn!(error = %error, "flow irreversible object retention tick failed"),
+        }
+
         tokio::select! {
             () = &mut shutdown => {
                 tracing::info!("worker shutting down");

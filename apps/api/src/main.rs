@@ -2384,6 +2384,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0065_flow_v08_operation_idempotency.sql",
         include_str!("../../../migrations/0065_flow_v08_operation_idempotency.sql"),
     ),
+    (
+        "0066_flow_v08_object_retention.sql",
+        include_str!("../../../migrations/0066_flow_v08_object_retention.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2729,6 +2733,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0065_flow_v08_operation_idempotency.sql",
         SchemaProbe::Relation("idx_flow_operation_runs_idempotency"),
+    ),
+    (
+        "0066_flow_v08_object_retention.sql",
+        SchemaProbe::Relation("idx_flow_objects_permanent_cleanup"),
     ),
 ];
 

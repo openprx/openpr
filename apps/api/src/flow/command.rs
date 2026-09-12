@@ -20,7 +20,7 @@
 
 use collab_core::{CollabEngine, CollabError, LoroCollabEngine, NodeId, NodeKind, Operation};
 use platform::app::AppState;
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -1100,6 +1100,10 @@ enum LifecycleDurability {
     Reversible,
     Irreversible,
 }
+
+/// Proposed v0.8 retention for objects whose archive tier is already irreversible/full-access.
+/// Ordinary edit-tier Page archives never receive a cleanup deadline.
+pub const OBJECT_PERMANENT_CLEANUP_RETENTION_DAYS: i64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LifecycleTierFacts<'a> {
@@ -2185,6 +2189,14 @@ async fn execute_lifecycle_command(
     } else {
         None
     };
+    if target_status == "active" {
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE flow_objects SET permanent_cleanup_after=NULL WHERE id = ANY($1)",
+            vec![affected_object_ids.clone().into()],
+        ))
+        .await?;
+    }
     let changed = repository::set_objects_lifecycle(
         &tx,
         &affected_object_ids,
@@ -2199,6 +2211,20 @@ async fn execute_lifecycle_command(
             "the lifecycle impact set changed while it was being updated; retry".to_string(),
         ));
     }
+
+    let required_tier = rechecked.required_permission_level(input.object_id)?;
+    let permanent_cleanup_after =
+        if kind == LifecycleCommandType::Archive && required_tier == authz::PermissionLevel::FullAccess {
+            archived_at.map(|at| at + chrono::Duration::days(OBJECT_PERMANENT_CLEANUP_RETENTION_DAYS))
+        } else {
+            None
+        };
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_objects SET permanent_cleanup_after=$2 WHERE id = ANY($1)",
+        vec![affected_object_ids.clone().into(), permanent_cleanup_after.into()],
+    ))
+    .await?;
 
     let dispatch_max_attempts = crate::config::runtime().flow.dispatch_max_attempts;
     let event_id = insert_flow_event(
@@ -3264,6 +3290,22 @@ mod database_tests {
             serde_json::json!([page])
         );
         assert_eq!(dispatch_count(&scratch.db, page_archive.event_id).await, 1);
+        let page_cleanup: Option<chrono::DateTime<chrono::Utc>> = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT permanent_cleanup_after FROM flow_objects WHERE id=$1",
+                vec![page.into()],
+            ))
+            .await
+            .expect("page cleanup query runs")
+            .expect("page row exists")
+            .try_get("", "permanent_cleanup_after")
+            .expect("page cleanup reads");
+        assert_eq!(
+            page_cleanup, None,
+            "edit-tier soft archive must never schedule deletion"
+        );
         lifecycle_command(
             &state,
             &fx,
@@ -3334,6 +3376,22 @@ mod database_tests {
         assert_eq!(archive_metadata["affected_object_ids"], serde_json::json!([collection]));
         assert_eq!(archive_metadata["cascade"], false);
         assert_eq!(dispatch_count(&scratch.db, collection_archive.event_id).await, 1);
+        let collection_cleanup: Option<chrono::DateTime<chrono::Utc>> = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT permanent_cleanup_after FROM flow_objects WHERE id=$1",
+                vec![collection.into()],
+            ))
+            .await
+            .expect("collection cleanup query runs")
+            .expect("collection row exists")
+            .try_get("", "permanent_cleanup_after")
+            .expect("collection cleanup reads");
+        assert!(
+            collection_cleanup.is_some(),
+            "full-access archive must schedule irreversible cleanup"
+        );
 
         for attempt in 0..2 {
             let restored = lifecycle_command(
@@ -3351,6 +3409,22 @@ mod database_tests {
             assert_eq!(restored.affected_object_ids, vec![collection]);
         }
         assert_eq!(lifecycle_statuses(&scratch.db, &[collection]).await[0].1, "active");
+        let restored_cleanup: Option<chrono::DateTime<chrono::Utc>> = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT permanent_cleanup_after FROM flow_objects WHERE id=$1",
+                vec![collection.into()],
+            ))
+            .await
+            .expect("restored cleanup query runs")
+            .expect("restored collection exists")
+            .try_get("", "permanent_cleanup_after")
+            .expect("restored cleanup reads");
+        assert_eq!(
+            restored_cleanup, None,
+            "restore must cancel a pending irreversible cleanup"
+        );
 
         exec(
             &scratch.db,
