@@ -34,6 +34,42 @@ pub const BRIDGE_ACTIONS: [&str; 6] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeCommandType {
+    Reference,
+    Unreference,
+    ConvertPreview,
+    ConvertCommit,
+    ConvertStatus,
+    ConvertRetry,
+}
+
+impl BridgeCommandType {
+    #[must_use]
+    pub const fn existing_document_cardinality(self) -> u8 {
+        match self {
+            Self::Reference
+            | Self::Unreference
+            | Self::ConvertPreview
+            | Self::ConvertCommit
+            | Self::ConvertStatus
+            | Self::ConvertRetry => 0,
+        }
+    }
+}
+
+#[must_use]
+pub fn v0_7_command_cardinality_registry() -> [(BridgeCommandType, &'static str); 6] {
+    [
+        (BridgeCommandType::Reference, "objects.reference"),
+        (BridgeCommandType::Unreference, "objects.unreference"),
+        (BridgeCommandType::ConvertPreview, "objects.convert_preview"),
+        (BridgeCommandType::ConvertCommit, "objects.convert_commit"),
+        (BridgeCommandType::ConvertStatus, "objects.convert_status"),
+        (BridgeCommandType::ConvertRetry, "objects.convert_retry"),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgePrincipal {
     WorkspaceRole,
     Guest,
