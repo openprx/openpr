@@ -349,6 +349,19 @@ mod database_tests {
         assert!(executed.changed);
         assert!(executed.executed);
         assert_eq!(executed.after_hash, plan.after_hash);
+        let rebuilt_title: String = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT title FROM flow_object_projections WHERE object_id=$1",
+                vec![object_id.into()],
+            ))
+            .await
+            .expect("rebuilt title query")
+            .expect("rebuilt projection exists")
+            .try_get("", "title")
+            .expect("rebuilt title reads");
+        assert_eq!(rebuilt_title, "canonical title");
         let clean = rebuild_projection(&scratch.db, object_id, Some(0), false)
             .await
             .expect("verification dry run succeeds");
