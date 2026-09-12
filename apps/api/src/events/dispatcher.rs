@@ -5380,11 +5380,24 @@ mod dispatcher_database_tests {
         };
         exec(
             &scratch.db,
+            "UPDATE event_delivery_sources SET created_at=$2 WHERE delivery_id=$1",
+            vec![delivery_id.into(), (now - chrono::Duration::days(40)).into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
             "UPDATE event_deliveries SET status='dispatched', terminated_at=$2 WHERE id=$1",
             vec![delivery_id.into(), (now - chrono::Duration::days(31)).into()],
         )
         .await;
         assert_eq!(reap_delivery_retention(&scratch.db, now).await.expect("reaper runs"), 1);
+        assert_eq!(
+            reap_delivery_source_tombstones(&scratch.db, now)
+                .await
+                .expect("source reaper runs"),
+            0,
+            "a 40-day source tombstone must survive the proposed 90-day retention"
+        );
         assert_eq!(
             count(
                 &scratch.db,
