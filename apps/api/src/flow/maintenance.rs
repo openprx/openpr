@@ -552,6 +552,10 @@ mod database_tests {
             .try_get("", "title")
             .expect("search title reads");
         assert_eq!(rebuilt_search_title, "canonical title");
+        assert!(matches!(
+            rebuild_search(&scratch.db, object_id, Some(1), true).await,
+            Err(ApiError::Conflict(_))
+        ));
 
         scratch.drop_self().await;
     }
