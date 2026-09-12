@@ -289,7 +289,7 @@ curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 
-### Tools (122)
+### Tools (128)
 
 Per-domain counts; the total and sorted-name hash are pinned in
 `apps/mcp-server/tool-registry-baseline.json` and checked against the live registry.
@@ -299,7 +299,7 @@ Per-domain counts; the total and sorted-name hash are pinned in
 | Universal forms & events  |    34 | `forms.create`, `forms.update_schema`, `form_records.create`, `events.tail` |
 | Work items                |    11 | `work_items.create`, `work_items.get_by_identifier`, `work_items.search`   |
 | Scenario tools            |     9 | `code.change_proposal.create`, `documents.review_risk`, `approval.request` |
-| Flow (v0.6)               |    24 | `objects.create`, `objects.move`, `collections.query`, `records.create`        |
+| Flow (v0.7)               |    30 | `objects.create`, `objects.reference`, `objects.convert_commit`, `records.create` |
 | Project types & resources |     6 | `project_types.get`, `project_resources.create`                            |
 | Projects                  |     5 | `projects.list`, `projects.create`                                         |
 | Labels                    |     5 | `labels.create`, `labels.list_by_project`                                  |
