@@ -11,9 +11,56 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[cfg(test)]
+use parking_lot::Mutex;
+#[cfg(test)]
+use std::sync::{Arc, LazyLock};
+#[cfg(test)]
+use tokio::sync::{Notify, oneshot};
+
 use super::limits;
 use crate::error::ApiError;
 use crate::flow::repository::{self, IntegrityRecordInput};
+
+#[cfg(test)]
+struct LoadPause {
+    document_id: Uuid,
+    reached: oneshot::Sender<()>,
+    resume: Arc<Notify>,
+}
+
+#[cfg(test)]
+static LOAD_PAUSE: LazyLock<Mutex<Option<LoadPause>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Installs a one-shot test-only pause immediately after the loader has established its MVCC
+/// snapshot by reading the document row, but before it reads retained updates.
+#[cfg(test)]
+pub(super) fn install_load_pause(document_id: Uuid) -> (oneshot::Receiver<()>, Arc<Notify>) {
+    let (reached_tx, reached_rx) = oneshot::channel();
+    let resume = Arc::new(Notify::new());
+    *LOAD_PAUSE.lock() = Some(LoadPause {
+        document_id,
+        reached: reached_tx,
+        resume: Arc::clone(&resume),
+    });
+    (reached_rx, resume)
+}
+
+#[cfg(test)]
+async fn pause_after_document_read(document_id: Uuid) {
+    let pause = {
+        let mut slot = LOAD_PAUSE.lock();
+        if slot.as_ref().is_some_and(|pause| pause.document_id == document_id) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        pause.resume.notified().await;
+    }
+}
 
 #[derive(Debug)]
 pub struct TailUpdateRow {
@@ -165,6 +212,9 @@ pub async fn load(db: &DatabaseConnection, document_id: Uuid) -> Result<Bootstra
         )
         .await);
     }
+
+    #[cfg(test)]
+    pause_after_document_read(document_id).await;
 
     #[derive(FromQueryResult)]
     struct UpdateRow {

@@ -1509,6 +1509,92 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
+    #[tokio::test]
+    async fn bootstrap_racing_compaction_observes_one_complete_mvcc_view_without_a_gap() {
+        let scratch = scratch_or_skip!("bootstrap-compaction-mvcc");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+        let doc = read_doc(&state, document_id).await;
+        let mut engine = LoroCollabEngine::load(&doc.snapshot).expect("loads");
+        let cache = WarmCache::new();
+        let coordinator = DocumentCoordinator::new();
+        let advancer = SnapshotAdvancer::new();
+        for label in ["mvcc-a", "mvcc-b", "mvcc-c"] {
+            write_one_update(
+                &state,
+                &cache,
+                &coordinator,
+                &advancer,
+                &mut engine,
+                document_id,
+                workspace_id,
+                owner_id,
+                label,
+            )
+            .await;
+        }
+        let expected_hash = engine
+            .semantic_snapshot()
+            .expect("semantic state reads")
+            .semantic_hash();
+        let expected_frontier = engine.frontier().as_bytes().to_vec();
+        let expected_head = 3;
+        assert_eq!(total_update_rows(&state, document_id).await, expected_head);
+
+        let (reached, resume) = bootstrap::install_load_pause(document_id);
+        let (prefix, _) = scratch.admin_url.rsplit_once('/').expect("admin URL has database");
+        let loader_db = Database::connect(format!("{prefix}/{}", scratch.name))
+            .await
+            .expect("independent loader connects");
+        let old_view_task = tokio::spawn(async move { bootstrap::load(&loader_db, document_id).await });
+        reached.await.expect("loader reaches the interleaving point");
+
+        let compacted = compaction::compact(&state.db, document_id, expected_head, false)
+            .await
+            .expect("concurrent compaction succeeds");
+        assert_eq!(compacted.deleted_updates, 3);
+        assert_eq!(total_update_rows(&state, document_id).await, 0);
+        resume.notify_one();
+
+        let old_view = old_view_task
+            .await
+            .expect("loader task joins")
+            .expect("old MVCC view stays complete");
+        assert_eq!(old_view.snapshot_seq, 0);
+        assert_eq!(old_view.tail_updates.len(), 3);
+        assert_eq!(old_view.head_seq, expected_head);
+        let mut old_engine = LoroCollabEngine::load(&old_view.snapshot).expect("old snapshot loads");
+        for update in &old_view.tail_updates {
+            old_engine.import_update(&update.bytes).expect("old tail replays");
+        }
+        assert_eq!(old_engine.frontier().as_bytes(), expected_frontier);
+        assert_eq!(
+            old_engine
+                .semantic_snapshot()
+                .expect("old semantic state")
+                .semantic_hash(),
+            expected_hash
+        );
+
+        let new_view = bootstrap::load(&state.db, document_id)
+            .await
+            .expect("new MVCC view stays complete");
+        assert_eq!(new_view.snapshot_seq, expected_head);
+        assert!(new_view.tail_updates.is_empty());
+        assert_eq!(new_view.head_frontier, expected_frontier);
+        let new_engine = LoroCollabEngine::load(&new_view.snapshot).expect("new snapshot loads");
+        assert_eq!(
+            new_engine
+                .semantic_snapshot()
+                .expect("new semantic state")
+                .semantic_hash(),
+            expected_hash
+        );
+
+        scratch.drop_self().await;
+    }
+
     /// Gate 9 groundwork: a real concurrent race between snapshot advancement and the normal
     /// write path, on two independent connections, repeated several rounds to make actual overlap
     /// likely rather than merely possible. Not the full gate 9 fixture (`gate-commands.md`'s
