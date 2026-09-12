@@ -3168,7 +3168,8 @@ mod tests {
                 "0058_flow_search_index.sql",
                 "0059_flow_navigator_root.sql",
                 "0060_flow_collections_core.sql",
-                "0061_flow_collections_query_indexes.sql"
+                "0061_flow_collections_query_indexes.sql",
+                "0062_flow_forms_bridge.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );
