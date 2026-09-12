@@ -1632,6 +1632,19 @@ mod database_tests {
         let rows_before = total_update_rows(&state, document_id).await;
         assert_eq!(rows_before, 3, "fixture must cross the empty-implementation threshold");
 
+        assert!(
+            !compaction::record_client_ack(&state.db, document_id, "forged-client", before_head, b"invented")
+                .await
+                .expect("forged ack check executes"),
+            "an invented frontier must not make history eligible for deletion"
+        );
+        assert!(
+            compaction::record_client_ack(&state.db, document_id, "verified-client", before_head, &before_frontier,)
+                .await
+                .expect("real ack check executes"),
+            "the actual head/frontier pair must be accepted"
+        );
+
         exec(
             &state,
             "INSERT INTO flow_collab_client_acks \
