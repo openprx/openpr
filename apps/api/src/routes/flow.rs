@@ -389,6 +389,34 @@ fn require_exact_admin_tool(bot: Option<&Extension<BotAuthContext>>, expected: &
     Ok(())
 }
 
+#[cfg(test)]
+mod v08_admin_tool_tests {
+    use super::{BotAuthContext, Extension, require_exact_admin_tool};
+    use uuid::Uuid;
+
+    fn bot(tool_name: Option<&str>) -> Extension<BotAuthContext> {
+        Extension(BotAuthContext {
+            bot_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            permissions: vec!["admin".to_string()],
+            surface: crate::flow::event_origin::EventSurface::McpHttp,
+            tool_name: tool_name.map(str::to_string),
+            request_id: Uuid::new_v4(),
+        })
+    }
+
+    #[test]
+    fn dangerous_admin_tools_require_an_exact_registered_name_without_blocking_native_users() {
+        let correct = bot(Some("collab.compact"));
+        let wrong = bot(Some("collab.rebuild_projection"));
+        let missing = bot(None);
+        assert!(require_exact_admin_tool(Some(&correct), "collab.compact").is_ok());
+        assert!(require_exact_admin_tool(Some(&wrong), "collab.compact").is_err());
+        assert!(require_exact_admin_tool(Some(&missing), "collab.compact").is_err());
+        assert!(require_exact_admin_tool(None, "collab.compact").is_ok());
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactDocumentRequest {
     pub dry_run: bool,
