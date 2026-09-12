@@ -336,7 +336,11 @@ for ((i = 0; i < CHECKS_COUNT; i++)); do
   if [[ "$actual_sha" != "$csha" ]]; then
     DRIFT+=("check '$cid': recorded sha256 does not match actual log at $crel")
   fi
-  if [[ "$cstatus" == "environment_unavailable" ]]; then
+  if [[ "$cstatus" == "deferred_to_frontend_track" ]]; then
+    if [[ "$cid" != "generic.bun_check" && "$cid" != "generic.bun_build" ]]; then
+      DRIFT+=("check '$cid' uses deferred_to_frontend_track outside the two ADR-0017 frontend bundle checks")
+    fi
+  elif [[ "$cstatus" == "environment_unavailable" ]]; then
     if [[ "$cid" != "generic.test_mcp" ]]; then
       DRIFT+=("check '$cid' uses environment_unavailable, which is only defined for generic.test_mcp")
     elif [[ "$cexit" != "69" ]]; then
@@ -369,7 +373,7 @@ while IFS= read -r key; do
   if [[ "$claimed" != "$recomputed" ]]; then
     DRIFT+=("hard_gate '$key': gate-result.json claims '$claimed' but independent recomputation says '$recomputed'")
   fi
-  if [[ "$recomputed" != "passed" ]]; then
+  if [[ "$recomputed" != "passed" && "$recomputed" != "deferred_to_frontend_track" ]]; then
     ANY_HARD_GATE_NOT_PASSED=1
   fi
 done < <(union_keys hard_gates)

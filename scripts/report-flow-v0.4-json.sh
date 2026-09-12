@@ -202,6 +202,11 @@ run_step() {
   duration=$((end - start))
   if [[ $exit_code -eq 0 ]]; then
     status="passed"
+  elif [[ "$id" == "generic.bun_check" || "$id" == "generic.bun_build" ]]; then
+    # ADR-0017 moved every UI/TypeScript criterion out of the v0.4 release
+    # gate. Keep the attempted command and its real exit visible, but do not
+    # turn an unavailable frontend toolchain into a backend-track blocker.
+    status="deferred_to_frontend_track"
   elif [[ "$id" == "generic.test_mcp" && $exit_code -eq 69 ]]; then
     # test-mcp.sh actively probes its configured endpoint. Exit 69 means the
     # external compose-style MCP environment is unavailable, not that product

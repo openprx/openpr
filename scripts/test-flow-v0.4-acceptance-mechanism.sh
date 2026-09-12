@@ -64,6 +64,21 @@ assert_jq "deferred rows stay visible, are counted, and are not passed" \
    and (.deferred_signoffs | sort) == ["manual-signoff-deferred:navigator_a11y","manual-signoff-deferred:page_editor"]
    and ([.manual_signoffs[] | select(.status == "passed")] | length) == 0' "$BASE"
 
+AUTOMATED_DEFERRED="$TMP_DIR/automated-deferred.json"
+jq '.checks += [{id:"generic.bun_check",status:"deferred_to_frontend_track",command:"bun check",exit_code:127,duration_ms:1,executed_count:1,evidence:"bun.log",sha256:("0"*64)}]' \
+  "$BASE" | jq -f "$STATE_FILTER" > "$AUTOMATED_DEFERRED"
+assert_jq "an ADR-0017 frontend check stays visible without blocking v0.4" \
+  '.mode == "pre_signoff" and .counts.automated_deferred_to_frontend_track == 1
+   and .counts.failed == 0 and ([.blockers[] | select(contains("generic.bun_check"))] | length) == 0' "$AUTOMATED_DEFERRED"
+
+HARD_GATE_DEFERRED="$TMP_DIR/hard-gate-deferred.json"
+jq '.hard_gates.web_ime_undo_selection_and_sync_state="deferred_to_frontend_track"' \
+  "$BASE" | jq -f "$STATE_FILTER" > "$HARD_GATE_DEFERRED"
+assert_jq "a paired pure-UI hard gate stays visible without blocking the backend track" \
+  '.hard_gates.web_ime_undo_selection_and_sync_state == "deferred_to_frontend_track"
+   and .counts.failed == 0
+   and ([.blockers[] | select(contains("web_ime_undo_selection_and_sync_state"))] | length) == 0' "$HARD_GATE_DEFERRED"
+
 FAILED="$TMP_DIR/failed.json"
 jq '.checks[0].status="failed" | .checks[0].exit_code=1' "$BASE" | jq -f "$STATE_FILTER" > "$FAILED"
 assert_jq "an automated failure is named in blockers and blocks the receipt" \

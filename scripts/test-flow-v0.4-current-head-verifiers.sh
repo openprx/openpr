@@ -61,3 +61,8 @@ fi
 grep -Fq 'FLOW_OBJECTS_A_BEFORE=' "$ROOT_DIR/scripts/verify-flow-integrity-records-v0.4.sh" \
   || fail "integrity fixture does not compare request side effects against the migrated baseline"
 echo "PASS: later-version relation coverage is paired and the integrity fixture reuses the canonical root"
+
+grep -Fq "root.governance_metadata->>'system_role'='workspace_navigator_root'" \
+  "$ROOT_DIR/scripts/lib/flow_cardinality_live_probe.py" \
+  || fail "cardinality collision fixture does not satisfy the current navigator-root parent invariant"
+echo "PASS: cardinality collision fixture targets the duplicate key after satisfying current parent invariants"

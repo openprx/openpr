@@ -20,6 +20,7 @@
     "hard_gates",
     "artifacts",
     "manual_signoffs",
+    "deferred_signoffs",
     "blockers"
   ],
   "properties": {
@@ -98,7 +99,9 @@
         "passed",
         "failed",
         "environment_unavailable",
+        "automated_deferred_to_frontend_track",
         "manual_pending",
+        "manual_deferred_to_frontend_track",
         "unresolved"
       ],
       "properties": {
@@ -119,7 +122,17 @@
           "type": "integer",
           "minimum": 0
         },
+        "automated_deferred_to_frontend_track": {
+          "description": "Executed UI/TypeScript bundle checks deferred by ADR-0017 to the frontend track.",
+          "type": "integer",
+          "minimum": 0
+        },
         "manual_pending": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "manual_deferred_to_frontend_track": {
+          "description": "Manual UI criteria deferred by ADR-0017 to the frontend track.",
           "type": "integer",
           "minimum": 0
         },
@@ -463,7 +476,8 @@
             "passed",
             "failed",
             "not_verified",
-            "not_covered"
+            "not_covered",
+            "deferred_to_frontend_track"
           ]
         },
         "navigator_keyboard_drag_equivalence": {
@@ -471,7 +485,8 @@
             "passed",
             "failed",
             "not_verified",
-            "not_covered"
+            "not_covered",
+            "deferred_to_frontend_track"
           ]
         },
         "i18n_zh_en_flow_key_parity": {
@@ -479,7 +494,8 @@
             "passed",
             "failed",
             "not_verified",
-            "not_covered"
+            "not_covered",
+            "deferred_to_frontend_track"
           ]
         },
         "vite_wasm_static_build_and_deep_route": {
@@ -487,7 +503,8 @@
             "passed",
             "failed",
             "not_verified",
-            "not_covered"
+            "not_covered",
+            "deferred_to_frontend_track"
           ]
         },
         "feature_flag_navigation_and_direct_url": {
@@ -495,7 +512,8 @@
             "passed",
             "failed",
             "not_verified",
-            "not_covered"
+            "not_covered",
+            "deferred_to_frontend_track"
           ]
         },
         "feature_flag_mcp_read_admin_write_and_cli_equivalence": {
@@ -848,6 +866,12 @@
         }
       }
     },
+    "deferred_signoffs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "blockers": {
       "type": "array",
       "items": {
@@ -886,7 +910,8 @@
             "passed",
             "failed",
             "skipped",
-            "environment_unavailable"
+            "environment_unavailable",
+            "deferred_to_frontend_track"
           ]
         },
         "command": {

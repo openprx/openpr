@@ -164,7 +164,12 @@ def main() -> int:
     collision_sql = (
         "BEGIN; "
         f"UPDATE flow_workspace_settings SET authz_epoch=authz_epoch+1000 WHERE workspace_id='{workspace}'; "
-        f"INSERT INTO flow_objects(id,workspace_id,object_type,created_by) SELECT '{proposed_target_id}',id,'page',created_by FROM workspaces WHERE id='{workspace}'; "
+        "INSERT INTO flow_objects(id,workspace_id,parent_id,object_type,created_by) "
+        f"SELECT '{proposed_target_id}',w.id,root.id,'page',w.created_by "
+        "FROM workspaces w JOIN flow_objects root ON root.workspace_id=w.id "
+        "AND root.parent_id IS NULL "
+        "AND root.governance_metadata->>'system_role'='workspace_navigator_root' "
+        f"WHERE w.id='{workspace}'; "
         "COMMIT;"
     )
     collision = sql(args.database_url, collision_sql, check=False)

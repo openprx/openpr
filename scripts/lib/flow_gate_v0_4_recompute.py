@@ -81,6 +81,19 @@ ALL_HARD_GATES = [
     "legacy_pages_drop_requires_separate_adr",
 ]
 
+# The dispatch explicitly applies ADR-0017's track split to every pure
+# UI/TypeScript v0.4 criterion. Keep these rows visible and non-passing, but
+# do not let them block the backend release ledger. Anchors marked proposed
+# are contract changes for the read-only Sylvode Flow checkout; the receipt
+# reports them for the owning session to add there.
+FRONTEND_TRACK_HANDOFFS = {
+    "web_ime_undo_selection_and_sync_state": "gates/vF-frontend-gate.yaml#page_editor",
+    "navigator_keyboard_drag_equivalence": "gates/vF-frontend-gate.yaml#navigator_a11y",
+    "i18n_zh_en_flow_key_parity": "gates/vF-frontend-gate.yaml#i18n_flow_key_parity_v0_4 (proposed)",
+    "vite_wasm_static_build_and_deep_route": "gates/vF-frontend-gate.yaml#page_editor",
+    "feature_flag_navigation_and_direct_url": "gates/vF-frontend-gate.yaml#feature_flag_ui_v0_4 (proposed)",
+}
+
 # Ledger invariant: duplicate identifiers would be collapsed by the output
 # dictionary and make a quoted denominator larger than the number of distinct
 # decisions. report/verify additionally require this exact key set to equal the
@@ -731,6 +744,13 @@ def recompute(evidence_root: str, repo_root: str) -> dict:
         gates,
         reasons,
     )
+
+    # Apply the handoff after both UI-producing bridges so their historical
+    # v0.4 verdicts cannot round a frontend-track criterion up to "passed".
+    # Backend faces of mixed gates remain independently enforced.
+    for gate_name, anchor in FRONTEND_TRACK_HANDOFFS.items():
+        gates[gate_name] = "deferred_to_frontend_track"
+        reasons[gate_name] = f"ADR-0017 frontend-track handoff; paired_anchor={anchor}"
 
     # ---- forms regression: backs exactly 1 gate ----
     # scripts/verify-flow-forms-regression-v0.4.sh runs the repository's

@@ -13,7 +13,8 @@ def check_failures:
     else empty end];
 
 def hard_gate_failures:
-  [.hard_gates | to_entries[] | select(.value != "passed") |
+  [.hard_gates | to_entries[] |
+    select(.value != "passed" and .value != "deferred_to_frontend_track") |
     "hard-gate-not-passed:" + .key + ":" + .value];
 
 def manual_pending:
@@ -59,6 +60,7 @@ def source_blocking:
 | .counts.passed = ([.checks[] | select(.status == "passed" and (.executed_count | type) == "number" and .executed_count > 0)] | length)
 | .counts.failed = ([.checks[] | select(.status == "failed" or (.status == "passed" and (((.executed_count | type) != "number") or .executed_count <= 0)))] | length)
 | .counts.environment_unavailable = ([.checks[] | select(.status == "environment_unavailable")] | length)
+| .counts.automated_deferred_to_frontend_track = ([.checks[] | select(.status == "deferred_to_frontend_track")] | length)
 | .counts.manual_pending = ($pending | length)
 | .counts.manual_deferred_to_frontend_track = ($deferred | length)
 | .deferred_signoffs = $deferred
