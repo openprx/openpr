@@ -1044,8 +1044,8 @@ mod flow_database_tests {
     };
     use crate::routes::bot::{CreateBotRequest, create_bot};
     use crate::routes::form::{
-        CreateFormRequest, UpdateFormPermissionsRequest, UpsertFormPermissionPolicy, create_project_form,
-        delete_form, update_form_permissions,
+        CreateFormRequest, UpdateFormPermissionsRequest, UpsertFormPermissionPolicy, create_project_form, delete_form,
+        update_form_permissions,
     };
     use crate::routes::member::{
         AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
@@ -1186,6 +1186,35 @@ mod flow_database_tests {
             db,
             flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
         }
+    }
+
+    fn validator_ok_wasm() -> Vec<u8> {
+        wat::parse_str(
+            r#"
+            (module
+              (memory (export "memory") 1)
+              (global $heap (mut i32) (i32.const 4096))
+              (data (i32.const 1024) "{\"ok\":true}")
+              (func (export "openpr_plugin_abi_version") (result i32)
+                i32.const 1)
+              (func (export "openpr_alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                global.get $heap
+                local.set $ptr
+                global.get $heap
+                local.get $len
+                i32.add
+                global.set $heap
+                local.get $ptr)
+              (func (export "openpr_invoke") (param $ptr i32) (param $len i32) (result i64)
+                i64.const 1024
+                i64.const 32
+                i64.shl
+                i64.const 11
+                i64.or))
+            "#,
+        )
+        .expect("validator WAT should compile")
     }
 
     async fn exec(state: &AppState, sql: &str, values: Vec<sea_orm::Value>) {
@@ -4045,13 +4074,7 @@ mod flow_database_tests {
         assert_eq!(create_form_preview["code"], 404, "{create_form_preview}");
 
         let archived = body_json(to_response(
-            delete_form(
-                State(state.clone()),
-                claims_for(owner_id),
-                None,
-                Path(form_id),
-            )
-            .await,
+            delete_form(State(state.clone()), claims_for(owner_id), None, Path(form_id)).await,
         ))
         .await;
         assert_eq!(archived["code"], 0, "{archived}");
@@ -4635,6 +4658,192 @@ mod flow_database_tests {
             events.try_get::<i64>("", "completed_events").expect("completed events"),
             4
         );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_bridge_record_conversion_runs_native_autonumber_and_validator_pipeline() {
+        use base64::Engine as _;
+
+        #[derive(FromQueryResult)]
+        struct Frontier {
+            head_frontier: Vec<u8>,
+        }
+
+        let scratch = scratch_or_skip!("bridge-native-record-pipeline");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let project_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'BNP', 'Bridge native pipeline', $3)",
+            vec![project_id.into(), workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        let form = body_json(to_response(
+            create_project_form(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(project_id),
+                Json(CreateFormRequest {
+                    key: "native_pipeline".to_string(),
+                    name: "Native pipeline".to_string(),
+                    description: None,
+                    icon: None,
+                    color: None,
+                    title_template: Some("{ticket_no}".to_string()),
+                    schema: Some(json!({
+                        "version":"openpr.form.schema.v1",
+                        "fields":[
+                            {
+                                "field_id":"fld_ticket_no",
+                                "key":"ticket_no",
+                                "type":"autonumber",
+                                "required":true,
+                                "autonumber":{"prefix":"BR-","width":4}
+                            },
+                            {
+                                "field_id":"fld_checked",
+                                "key":"checked",
+                                "type":"text",
+                                "required":true
+                            }
+                        ]
+                    })),
+                    detail_layout: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(form["code"], 0, "{form}");
+        let form_id = Uuid::parse_str(form["data"]["id"].as_str().expect("form id")).expect("UUID");
+        let policy = body_json(to_response(
+            update_form_permissions(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(form_id),
+                Json(UpdateFormPermissionsRequest {
+                    policies: vec![UpsertFormPermissionPolicy {
+                        subject_type: "role".to_string(),
+                        subject_id: "owner".to_string(),
+                        policy: json!({"actions":{"form.view":true,"record.create":true}}),
+                    }],
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(policy["code"], 0, "{policy}");
+
+        exec(
+            &state,
+            "INSERT INTO plugins \
+             (id, workspace_id, project_id, key, name, version, manifest, wasm_bytes, status, installed_by) \
+             VALUES ($1,$2,$3,'bridge_validator','Bridge validator','1.0.0',$4,$5,'active',$6)",
+            vec![
+                Uuid::new_v4().into(),
+                workspace_id.into(),
+                project_id.into(),
+                json!({
+                    "schema_version":"openpr.plugin.v1",
+                    "key":"bridge_validator",
+                    "name":"Bridge validator",
+                    "version":"1.0.0",
+                    "capabilities":{
+                        "hooks":[{
+                            "kind":"field_validator",
+                            "form_key":"native_pipeline",
+                            "field_key":"checked"
+                        }],
+                        "runtime":{"timeout_ms":500,"fuel":100_000,"memory_bytes":1_048_576}
+                    }
+                })
+                .into(),
+                validator_ok_wasm().into(),
+                owner_id.into(),
+            ],
+        )
+        .await;
+
+        let source_id = create_page_as_owner(&state, workspace_id, owner_id, "native pipeline source").await;
+        let head = Frontier::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_frontier FROM collab_documents WHERE object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("frontier query")
+        .expect("frontier");
+        let frontier = base64::engine::general_purpose::STANDARD.encode(head.head_frontier);
+        let preview = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(crate::flow::bridge::ConversionPreviewInput {
+                    source_object_id: source_id,
+                    source_frontier: frontier.clone(),
+                    target_type: "form_record".to_string(),
+                    mapping: json!({"target_form_id":form_id,"values":{"checked":"yes"}}),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(preview["code"], 0, "{preview}");
+        let preview_id = Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+        let committed = body_json(to_response(
+            post_flow_conversion(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(crate::flow::bridge::ConversionCommitInput {
+                    preview_id,
+                    source_frontier: frontier,
+                    target_schema_version: 1,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    confirm: true,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(committed["code"], 0, "{committed}");
+        let target_id = Uuid::parse_str(
+            committed["data"]["created_target_ids"][0]
+                .as_str()
+                .expect("created target id"),
+        )
+        .expect("UUID");
+        let proof = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT r.values->>'ticket_no' AS ticket_no, r.title, \
+                    (SELECT count(*) FROM plugin_invocations i WHERE i.project_id=$2 \
+                     AND i.hook_kind='field_validator' AND i.status='completed') AS validator_calls \
+                 FROM form_records r WHERE r.id=$1",
+                vec![target_id.into(), project_id.into()],
+            ))
+            .await
+            .expect("native pipeline proof query")
+            .expect("converted record");
+        assert_eq!(
+            proof.try_get::<String>("", "ticket_no").expect("ticket number"),
+            "BR-0001"
+        );
+        assert_eq!(
+            proof.try_get::<String>("", "title").expect("title"),
+            "native pipeline source"
+        );
+        assert_eq!(proof.try_get::<i64>("", "validator_calls").expect("validator calls"), 1);
 
         scratch.drop_self().await;
     }

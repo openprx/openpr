@@ -76,8 +76,8 @@ use crate::{
         signature_media::{
             annotate_signature_audit_entries, append_signature_audit_source,
             cleanup_expired_replaced_signature_audit_entries, cleanup_expired_signature_values,
-            materialize_signature_values_with_audit, materialize_signature_values_with_existing_audit,
-            signature_lifecycle_summary, signature_workflow_verification_summary, verify_signature_audit_source,
+            materialize_signature_values_with_existing_audit, signature_lifecycle_summary,
+            signature_workflow_verification_summary, verify_signature_audit_source,
         },
         validation::{
             validate_and_normalize_values, validate_and_normalize_values_with_existing,
@@ -638,56 +638,30 @@ pub async fn create_project_form(
 ) -> Result<impl IntoResponse, ApiError> {
     let (workspace_id, actor_id) =
         ensure_project_actor(&state, &claims, bot.as_ref().map(|b| &b.0), project_id).await?;
-    let key = normalize_key(&req.key).map_err(ApiError::BadRequest)?;
-    let name = required_trimmed(&req.name, "name")?;
-    let schema = ensure_schema_field_ids(
-        req.schema
-            .unwrap_or_else(|| json!({ "version": "openpr.form.schema.v1", "fields": [] })),
-    )
-    .map_err(ApiError::BadRequest)?;
-    validate_schema(&schema).map_err(ApiError::BadRequest)?;
-    let detail_layout = ensure_json_object(req.detail_layout.unwrap_or_else(|| json!({})), "detail_layout")?;
-    let form_id = Uuid::new_v4();
     let source = json!({ "type": if actor_id.is_some() { "user" } else { "bot" }, "actor_id": actor_id });
     let tx = state.db.begin().await?;
-
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-                INSERT INTO project_forms (
-                    id, workspace_id, project_id, key, name, description, icon, color,
-                    title_template, schema, detail_layout, created_by, created_at, updated_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), now())
-            ",
-        vec![
-            form_id.into(),
-            workspace_id.into(),
-            project_id.into(),
-            key.into(),
-            name.into(),
-            req.description.unwrap_or_default().into(),
-            req.icon.into(),
-            req.color.into(),
-            req.title_template.unwrap_or_else(|| "{id}".to_string()).into(),
-            schema.into(),
-            detail_layout.into(),
-            actor_id.into(),
-        ],
-    ))
-    .await?;
-    let form = find_form_with_conn(&tx, form_id).await?;
-    insert_form_event(
+    let form = crate::forms::native_create::create_form_in_transaction(
         &tx,
-        &form,
-        None,
-        "form.created",
-        actor_id,
-        source,
-        json!({ "form_id": form.id, "key": form.key, "name": form.name }),
+        crate::forms::native_create::NativeFormCreateRequest {
+            form_id: None,
+            workspace_id,
+            project_id,
+            key: req.key,
+            name: req.name,
+            description: req.description.unwrap_or_default(),
+            icon: req.icon,
+            color: req.color,
+            title_template: req.title_template,
+            schema: req
+                .schema
+                .unwrap_or_else(|| json!({"version":"openpr.form.schema.v1","fields":[]})),
+            detail_layout: req.detail_layout.unwrap_or_else(|| json!({})),
+            created_by: actor_id,
+            source,
+            change_summary: "initial schema".to_string(),
+        },
     )
     .await?;
-    insert_schema_version(&tx, &form, actor_id, "initial schema").await?;
     tx.commit().await?;
 
     Ok(ApiResponse::success(form))
@@ -2941,7 +2915,7 @@ fn record_claimed_object_keys(values: &Value, existing_values: Option<&Value>) -
 }
 
 /// Reject a record write that points at an upload object another workspace already owns.
-async fn ensure_record_objects_claimable(
+pub(crate) async fn ensure_record_objects_claimable(
     state: &AppState,
     workspace_id: Uuid,
     values: &Value,
@@ -3345,110 +3319,30 @@ async fn create_record_for_form(
     req: CreateRecordRequest,
 ) -> Result<RecordResponse, ApiError> {
     let idempotency_key = normalize_optional_idempotency_key(req.idempotency_key)?;
-    if let Some(record) = find_idempotent_record(state, form, idempotency_key.as_deref(), "form.record.created").await?
-    {
-        return Ok(record);
-    }
-    ensure_field_write_policy_allows(state, form.id, role, &req.values).await?;
-    let values_with_formula = run_formula_hooks(
-        state,
-        form.workspace_id,
-        form.project_id,
-        form.id,
-        &form.key,
-        req.values,
-    )
-    .await?;
-    let record_id = Uuid::new_v4();
-    let created_by = if is_bot { None } else { Some(actor_id) };
     let source = ensure_json_object(
         req.source
             .unwrap_or_else(|| json!({ "type": if is_bot { "bot" } else { "user" }, "actor_id": actor_id })),
         "source",
     )?;
     let tx = state.db.begin().await?;
-    let calculated = calculate_values(state, form, None, values_with_formula).await?;
-    let with_autonumber = apply_autonumber_values(&tx, form, None, calculated).await?;
-    let normalized = validate_and_normalize_values(&form.schema, with_autonumber).map_err(ApiError::BadRequest)?;
-    let signature_materialization = materialize_signature_values_with_audit(&form.schema, normalized).await?;
-    let normalized = signature_materialization.values;
-    ensure_record_objects_claimable(state, form.workspace_id, &normalized, None).await?;
-    let signature_audit_entries = annotate_signature_audit_entries(
-        signature_materialization.audit_entries,
-        if is_bot { "bot" } else { "user" },
-        actor_id,
-        "record.create",
-        form.id,
-        record_id,
-        form.schema_version,
-    );
-    let source = append_signature_audit_source(source, signature_audit_entries)?;
-    run_field_validator_hooks(
+    let creation = crate::forms::native_create::create_record_in_transaction(
         state,
-        form.workspace_id,
-        form.project_id,
-        form.id,
-        &form.key,
-        &form.schema,
-        &normalized,
-    )
-    .await?;
-    let title = req
-        .title
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| render_title(&form.title_template, record_id, &normalized));
-
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            INSERT INTO form_records (
-                id, workspace_id, project_id, form_id, title, values, source,
-                schema_version, created_by, updated_by, created_at, updated_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, now(), now())
-        ",
-        vec![
-            record_id.into(),
-            form.workspace_id.into(),
-            form.project_id.into(),
-            form.id.into(),
-            title.into(),
-            normalized.clone().into(),
-            source.clone().into(),
-            form.schema_version.into(),
-            created_by.into(),
-        ],
-    ))
-    .await?;
-    refresh_record_projection(&tx, form.project_id, form.id, record_id, &form.schema, &normalized).await?;
-    let event_payload = json!({ "record_id": record_id, "values": normalized });
-    insert_form_event_with_idempotency(
         &tx,
         form,
-        Some(record_id),
-        "form.record.created",
-        created_by,
-        source,
-        event_payload.clone(),
-        idempotency_key,
+        actor_id,
+        role,
+        is_bot,
+        crate::forms::native_create::NativeRecordCreateRequest {
+            record_id: None,
+            values: req.values,
+            title: req.title,
+            source,
+            idempotency_key,
+        },
     )
     .await?;
     tx.commit().await?;
-    run_event_handler_hooks(
-        state,
-        form.workspace_id,
-        form.project_id,
-        form.id,
-        &form.key,
-        Some(record_id),
-        "form.record.created",
-        event_payload,
-    )
-    .await?;
-
-    recalculate_parent_records_for_child(state, record_id, created_by).await?;
-
-    find_record(state, record_id).await
+    crate::forms::native_create::finish_record_creation(state, form, &creation).await
 }
 
 pub async fn preview_form_record_recalculation(
@@ -4676,7 +4570,7 @@ async fn calculate_and_normalize_values(
     validate_and_normalize_values(&form.schema, calculated).map_err(ApiError::BadRequest)
 }
 
-async fn calculate_values(
+pub(crate) async fn calculate_values(
     state: &AppState,
     form: &FormResponse,
     record_id: Option<Uuid>,
@@ -4707,7 +4601,7 @@ async fn calculate_values_with_existing(
     overlay_calculated_values(values, &seeded, &calculated).map_err(ApiError::BadRequest)
 }
 
-async fn apply_autonumber_values(
+pub(crate) async fn apply_autonumber_values(
     tx: &DatabaseTransaction,
     form: &FormResponse,
     existing_values: Option<&Value>,
@@ -5079,7 +4973,7 @@ const RECALCULATE_PARENT_RECORDS_SQL: &str = r"
       AND parent.project_id = child.project_id
 ";
 
-async fn recalculate_parent_records_for_child(
+pub(crate) async fn recalculate_parent_records_for_child(
     state: &AppState,
     child_record_id: Uuid,
     actor_id: Option<Uuid>,
@@ -6175,7 +6069,7 @@ async fn find_form(state: &AppState, form_id: Uuid) -> Result<FormResponse, ApiE
     find_form_with_conn(&state.db, form_id).await
 }
 
-async fn find_form_with_conn<C>(db: &C, form_id: Uuid) -> Result<FormResponse, ApiError>
+pub(crate) async fn find_form_with_conn<C>(db: &C, form_id: Uuid) -> Result<FormResponse, ApiError>
 where
     C: ConnectionTrait,
 {
@@ -6194,7 +6088,7 @@ where
     .ok_or_else(|| ApiError::NotFound("form not found".to_string()))
 }
 
-async fn find_record(state: &AppState, record_id: Uuid) -> Result<RecordResponse, ApiError> {
+pub(crate) async fn find_record(state: &AppState, record_id: Uuid) -> Result<RecordResponse, ApiError> {
     RecordResponse::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
@@ -6368,7 +6262,7 @@ fn normalize_optional_idempotency_key(value: Option<String>) -> Result<Option<St
     }
 }
 
-async fn find_idempotent_record(
+pub(crate) async fn find_idempotent_record(
     state: &AppState,
     form: &FormResponse,
     idempotency_key: Option<&str>,
@@ -6565,7 +6459,7 @@ where
     insert_form_event_with_idempotency(db, form, record_id, event_type, actor_id, source, payload, None).await
 }
 
-async fn insert_form_event_with_idempotency<C>(
+pub(crate) async fn insert_form_event_with_idempotency<C>(
     db: &C,
     form: &FormResponse,
     record_id: Option<Uuid>,
@@ -6661,7 +6555,7 @@ where
     Ok(())
 }
 
-async fn insert_schema_version<C>(
+pub(crate) async fn insert_schema_version<C>(
     db: &C,
     form: &FormResponse,
     changed_by: Option<Uuid>,
@@ -6931,7 +6825,7 @@ fn required_trimmed(value: &str, field: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
-fn ensure_json_object(value: Value, field: &str) -> Result<Value, ApiError> {
+pub(crate) fn ensure_json_object(value: Value, field: &str) -> Result<Value, ApiError> {
     if value.is_object() {
         Ok(value)
     } else {
@@ -7038,7 +6932,7 @@ fn normalize_event_type(raw: &str) -> Result<String, ApiError> {
     Ok(event_type)
 }
 
-fn render_title(template: &str, record_id: Uuid, values: &Value) -> String {
+pub(crate) fn render_title(template: &str, record_id: Uuid, values: &Value) -> String {
     let mut title = template.replace("{id}", &record_id.to_string());
     if let Some(object) = values.as_object() {
         for (key, value) in object {

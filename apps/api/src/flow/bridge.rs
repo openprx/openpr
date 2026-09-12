@@ -21,7 +21,7 @@ use super::collab::authz::PermissionLevel;
 use super::event_origin::CommandOrigin;
 use super::{collab::authz, policy, repository};
 use crate::error::ApiError;
-use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_business_event, insert_flow_event};
+use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 use crate::forms::permissions::{permission_policy_field_allows, permission_policy_record_scope};
 
 pub const BRIDGE_ACTIONS: [&str; 6] = [
@@ -1203,85 +1203,6 @@ async fn conversion_event(
     .event_id)
 }
 
-async fn native_forms_conversion_event(
-    tx: &sea_orm::DatabaseTransaction,
-    preview: &PreviewRow,
-    target_id: Uuid,
-    event_type: &str,
-    actor: &BridgeActor,
-    origin: &CommandOrigin,
-    idempotency_key: &str,
-    payload: Value,
-) -> Result<(), ApiError> {
-    let form_id = preview.target_form_id.unwrap_or(target_id);
-    let record_id = preview.target_form_id.map(|_| target_id);
-    #[derive(FromQueryResult)]
-    struct FormKey {
-        key: String,
-    }
-    let aggregate_type = if record_id.is_some() {
-        let form = FormKey::find_by_statement(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT key FROM project_forms WHERE id=$1 AND workspace_id=$2",
-            vec![form_id.into(), preview.workspace_id.into()],
-        ))
-        .one(tx)
-        .await?
-        .ok_or(ApiError::Internal)?;
-        format!("form.{}", form.key)
-    } else {
-        "form".to_string()
-    };
-    let source = json!({
-        "type": "flow_conversion",
-        "source_object_id": preview.source_object_id,
-        "correlation_id": origin.correlation_id,
-    });
-    let actor_id = (!actor.is_bot).then_some(actor.id);
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "INSERT INTO form_events \
-         (id, workspace_id, project_id, form_id, record_id, event_type, actor_id, source, payload, created_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())",
-        vec![
-            Uuid::new_v4().into(),
-            preview.workspace_id.into(),
-            preview.target_project_id.into(),
-            form_id.into(),
-            record_id.into(),
-            event_type.into(),
-            actor_id.into(),
-            source.clone().into(),
-            payload.clone().into(),
-        ],
-    ))
-    .await?;
-    insert_business_event(
-        tx,
-        BusinessEventInput {
-            workspace_id: preview.workspace_id,
-            project_id: Some(preview.target_project_id),
-            event_type: event_type.to_string(),
-            aggregate_type,
-            aggregate_id: record_id.unwrap_or(form_id).to_string(),
-            actor_id,
-            source,
-            payload,
-            metadata: json!({
-                "form_id": form_id,
-                "record_id": record_id,
-                "legacy_form_events": true,
-                "derived_from": preview.source_object_id,
-            }),
-            correlation_id: Some(origin.correlation_id),
-            causation_id: None,
-            idempotency_key: Some(format!("forms-conversion-target:{idempotency_key}")),
-        },
-    )
-    .await?;
-    Ok(())
-}
-
 async fn record_failed_conversion(
     state: &AppState,
     preview: &PreviewRow,
@@ -1361,7 +1282,7 @@ async fn execute_conversion(
         ));
     }
 
-    let (schema, permission) = if let Some(form_id) = preview.target_form_id {
+    let (_schema, permission) = if let Some(form_id) = preview.target_form_id {
         tx.execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 19019))",
@@ -1462,119 +1383,90 @@ async fn execute_conversion(
         .await;
     }
 
-    let target_id = Uuid::new_v4();
-    let (target_version, native_event_type, native_event_payload) =
-        if let Some(form_id) = preview.target_form_id {
-            let schema = schema.as_ref().ok_or(ApiError::Internal)?;
-            let values = preview.mapping.get("values").cloned().unwrap_or_else(|| json!({}));
-            if let Some(decision) = permission.as_ref()
-                && values
-                    .as_object()
-                    .is_some_and(|object| object.keys().any(|key| !decision.field_allows(key, "write")))
-            {
-                return Err(ApiError::policy_rejected(
-                    "mapped values include a field that is not writable",
-                ));
-            }
-            let values = crate::forms::validation::validate_and_normalize_values(schema, values)
-                .map_err(ApiError::BadRequest)?;
-            let title = preview
-                .mapping
-                .get("title")
-                .and_then(Value::as_str)
-                .unwrap_or(&source.projection_title);
-            tx.execute(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "INSERT INTO form_records \
-             (id, workspace_id, project_id, form_id, title, values, source, schema_version, created_by, updated_by) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)",
-                vec![
-                    target_id.into(),
-                    preview.workspace_id.into(),
-                    preview.target_project_id.into(),
-                    form_id.into(),
-                    title.into(),
-                    values.clone().into(),
-                    json!({"type":"flow_conversion","source_object_id":source.id}).into(),
-                    preview.target_schema_version.into(),
-                    (!actor.is_bot).then_some(actor.id).into(),
-                ],
-            ))
-            .await?;
-            crate::forms::projections::refresh_record_projection(
-                &tx,
-                preview.target_project_id,
-                form_id,
-                target_id,
-                schema,
-                &values,
-            )
-            .await?;
-            (
-                preview.target_schema_version,
-                "form.record.created",
-                json!({"record_id": target_id, "values": values}),
-            )
-        } else {
-            let key = preview
-                .mapping
-                .get("key")
-                .and_then(Value::as_str)
-                .unwrap_or("converted_flow");
-            let key = crate::forms::schema::normalize_key(key).map_err(ApiError::BadRequest)?;
-            let name = preview
-                .mapping
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(&source.projection_title);
-            let schema = crate::forms::schema::ensure_schema_field_ids(
-                preview
+    let mut native_record = None;
+    let (target_id, target_version) = if let Some(form_id) = preview.target_form_id {
+        let values = preview.mapping.get("values").cloned().unwrap_or_else(|| json!({}));
+        if let Some(decision) = permission.as_ref()
+            && values
+                .as_object()
+                .is_some_and(|object| object.keys().any(|key| !decision.field_allows(key, "write")))
+        {
+            return Err(ApiError::policy_rejected(
+                "mapped values include a field that is not writable",
+            ));
+        }
+        let title = preview
+            .mapping
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(source.projection_title.clone()));
+        let form = crate::routes::form::find_form_with_conn(&tx, form_id).await?;
+        let creation = crate::forms::native_create::create_record_in_transaction(
+            state,
+            &tx,
+            &form,
+            actor.id,
+            &actor.role,
+            actor.is_bot,
+            crate::forms::native_create::NativeRecordCreateRequest {
+                record_id: Some(Uuid::new_v4()),
+                values,
+                title,
+                source: json!({
+                    "type":"flow_conversion",
+                    "source_object_id":source.id,
+                    "correlation_id":origin.correlation_id,
+                }),
+                idempotency_key: Some(format!("forms-conversion-target:{idempotency_key}")),
+            },
+        )
+        .await?;
+        let target_id = creation.record_id;
+        native_record = Some((form, creation));
+        (target_id, preview.target_schema_version)
+    } else {
+        let target_id = Uuid::new_v4();
+        let key = preview
+            .mapping
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("converted_flow");
+        let name = preview
+            .mapping
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(&source.projection_title);
+        let form = crate::forms::native_create::create_form_in_transaction(
+            &tx,
+            crate::forms::native_create::NativeFormCreateRequest {
+                form_id: Some(target_id),
+                workspace_id: preview.workspace_id,
+                project_id: preview.target_project_id,
+                key: key.to_string(),
+                name: name.to_string(),
+                description: String::new(),
+                icon: None,
+                color: None,
+                title_template: None,
+                schema: preview
                     .mapping
                     .get("schema")
                     .cloned()
                     .unwrap_or_else(|| json!({"version":"openpr.form.schema.v1","fields":[]})),
-            )
-            .map_err(ApiError::BadRequest)?;
-            crate::forms::schema::validate_schema(&schema).map_err(ApiError::BadRequest)?;
-            tx.execute(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "INSERT INTO project_forms \
-             (id, workspace_id, project_id, key, name, description, title_template, schema, detail_layout, created_by) \
-             VALUES ($1,$2,$3,$4,$5,'','{id}',$6,'{}'::jsonb,$7)",
-                vec![
-                    target_id.into(),
-                    preview.workspace_id.into(),
-                    preview.target_project_id.into(),
-                    key.clone().into(),
-                    name.to_string().into(),
-                    schema.clone().into(),
-                    (!actor.is_bot).then_some(actor.id).into(),
-                ],
-            ))
-            .await?;
-            tx.execute(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "INSERT INTO form_schema_versions (form_id, version, schema, detail_layout, changed_by, change_summary) \
-             VALUES ($1,1,$2,'{}'::jsonb,$3,'created from Flow conversion')",
-            vec![target_id.into(), schema.into(), (!actor.is_bot).then_some(actor.id).into()],
-        )).await?;
-            (
-                1,
-                "form.created",
-                json!({"form_id": target_id, "key": key, "name": name}),
-            )
-        };
-    native_forms_conversion_event(
-        &tx,
-        &preview,
-        target_id,
-        native_event_type,
-        &actor,
-        &origin,
-        &idempotency_key,
-        native_event_payload,
-    )
-    .await?;
+                detail_layout: json!({}),
+                created_by: (!actor.is_bot).then_some(actor.id),
+                source: json!({
+                    "type":"flow_conversion",
+                    "source_object_id":source.id,
+                    "correlation_id":origin.correlation_id,
+                }),
+                change_summary: "created from Flow conversion".to_string(),
+            },
+        )
+        .await?;
+        (target_id, form.schema_version)
+    };
     if conversion_fault("after_target_create_before_lineage") {
         tx.rollback().await?;
         return record_failed_conversion(
@@ -1617,6 +1509,9 @@ async fn execute_conversion(
     )
     .await?;
     tx.commit().await?;
+    if let Some((form, creation)) = native_record.as_ref() {
+        crate::forms::native_create::finish_record_creation(state, form, creation).await?;
+    }
     if conversion_fault("after_commit_before_response") {
         return Err(ApiError::Internal);
     }
@@ -1779,21 +1674,13 @@ mod tests {
     #[test]
     fn bridge_permission_is_the_intersection_in_both_directions() {
         let forms_denies_update = json!({"actions": {"form.view": true, "record.update": false}});
-        let full = bridge_permission(
-            PermissionLevel::FullAccess,
-            Some(&forms_denies_update),
-            None,
-        )
-        .expect("view remains visible");
+        let full = bridge_permission(PermissionLevel::FullAccess, Some(&forms_denies_update), None)
+            .expect("view remains visible");
         assert!(!full.allows("record.update"), "Forms denial must beat Flow FullAccess");
 
         let forms_allows_delete = json!({"actions": {"form.view": true, "record.delete": true}});
-        let view = bridge_permission(
-            PermissionLevel::View,
-            Some(&forms_allows_delete),
-            None,
-        )
-        .expect("view remains visible");
+        let view =
+            bridge_permission(PermissionLevel::View, Some(&forms_allows_delete), None).expect("view remains visible");
         assert!(
             !view.allows("record.delete"),
             "Flow View must beat a Forms delete allowance"
@@ -1803,12 +1690,8 @@ mod tests {
     #[test]
     fn bridge_never_grants_form_design() {
         let policy = json!({"actions": {"form.view": true, "form.design": true}});
-        let decision = bridge_permission(
-            PermissionLevel::FullAccess,
-            Some(&policy),
-            None,
-        )
-        .expect("view remains visible");
+        let decision =
+            bridge_permission(PermissionLevel::FullAccess, Some(&policy), None).expect("view remains visible");
         assert!(!decision.allows("form.design"));
     }
 
@@ -1836,20 +1719,11 @@ mod tests {
             "record_scope": "owned"
         });
         assert!(
-            bridge_permission(
-                PermissionLevel::Edit,
-                Some(&policy),
-                Some(false)
-            )
-            .is_none(),
+            bridge_permission(PermissionLevel::Edit, Some(&policy), Some(false)).is_none(),
             "an out-of-scope record must not produce a placeholder"
         );
-        let decision = bridge_permission(
-            PermissionLevel::Edit,
-            Some(&policy),
-            Some(true),
-        )
-        .expect("the owned record is visible");
+        let decision =
+            bridge_permission(PermissionLevel::Edit, Some(&policy), Some(true)).expect("the owned record is visible");
         assert!(!decision.field_allows("private", "read"));
         assert!(!decision.field_allows("private", "write"));
         assert!(decision.state.field_read_limited);
