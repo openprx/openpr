@@ -4044,6 +4044,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::items_after_statements)]
     async fn flow_bridge_conversion_commit_rechecks_policy_and_is_idempotent_without_rewriting_source() {
         use base64::Engine as _;
 

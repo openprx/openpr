@@ -68,7 +68,7 @@ impl BridgeCommandType {
 }
 
 #[must_use]
-pub fn v0_7_command_cardinality_registry() -> [(BridgeCommandType, &'static str); 6] {
+pub const fn v0_7_command_cardinality_registry() -> [(BridgeCommandType, &'static str); 6] {
     [
         (BridgeCommandType::Reference, "objects.reference"),
         (BridgeCommandType::Unreference, "objects.unreference"),
@@ -113,7 +113,7 @@ pub struct BridgePermissionState {
     pub record_limited: bool,
 }
 
-fn denied_permission_state(configuration: PolicyConfiguration) -> BridgePermissionState {
+const fn denied_permission_state(configuration: PolicyConfiguration) -> BridgePermissionState {
     BridgePermissionState {
         access: BridgeAccess::ReadOnly,
         configuration,
