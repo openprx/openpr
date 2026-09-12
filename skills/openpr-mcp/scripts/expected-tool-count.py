@@ -14,7 +14,8 @@ baseline_path = repo / "apps/mcp-server/tool-registry-baseline.json"
 baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
 expected_count = baseline.get("count")
 expected_hash = baseline.get("names_sha256")
-rebase = baseline.get("v0_4_rebase", {})
+v0_4_rebase = baseline.get("v0_4_rebase", {})
+latest_rebase = baseline.get("v0_7_rebase", v0_4_rebase)
 if (
     baseline.get("schema_version") != "openpr.mcp-tool-registry-baseline.v1"
     or baseline.get("source") != "mcp_server::get_all_tool_definitions"
@@ -22,8 +23,12 @@ if (
     or expected_count <= 0
     or not isinstance(expected_hash, str)
     or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
-    or rebase.get("after_count") != expected_count
-    or rebase.get("before_count", 0) + rebase.get("added", 0) - rebase.get("removed", 0) != expected_count
+    or v0_4_rebase.get("before_count", 0) + v0_4_rebase.get("added", 0) - v0_4_rebase.get("removed", 0)
+    != v0_4_rebase.get("after_count")
+    or latest_rebase.get("after_count") != expected_count
+    or latest_rebase.get("before_count", 0) + latest_rebase.get("added", 0) - latest_rebase.get("removed", 0)
+    != expected_count
+    or ("v0_7_rebase" in baseline and latest_rebase.get("before_count") != v0_4_rebase.get("after_count"))
 ):
     raise SystemExit(f"invalid MCP tool registry baseline: {baseline_path}")
 

@@ -11,7 +11,7 @@ Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL 16**.
 - **Universal forms** — project-defined business data types with grid/detail views, decimal-safe amounts, record links and child tables, formulas, per-role permissions, import/export, electronic signatures.
 - **WASM plugins** — per-project sandboxed plugins for field validation, formulas, and event handlers.
 - **Events** — transactional business-event ledger and HMAC-signed webhooks.
-- **MCP server** — 122 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
+- **MCP server** — 128 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
 - **Scenario templates** — 6 ready-to-start setups: `code_delivery_default`, `contract_review_default`, `equipment_maintenance_default`, `quality_corrective_action_default`, `customer_delivery_default`, `restaurant_ordering_default`.
 
 ## Architecture
@@ -332,7 +332,7 @@ templates via `resources/templates/list`, including
 Besides `serve`, `mcp-server` exposes 9 command groups: `projects`,
 `work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`,
 `operation-logs list`, and `tools call`. The global `--format json|table` selects the output shape, and
-`tools call` reaches any of the 122 tools by name — a complete escape hatch for
+`tools call` reaches any of the 128 tools by name — a complete escape hatch for
 anything without a dedicated subcommand. A second `[[bin]]` in this same
 package, `sylvode`, is the native Flow CLI (`sylvode features flow get|set`,
 `sylvode objects create|patch|move|grants|get|inheritance|link|unlink|diff|relations|search` and

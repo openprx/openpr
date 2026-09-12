@@ -2846,6 +2846,7 @@ mod tests {
             "apps/api/src/routes/form.rs",
             "apps/api/src/routes/project.rs",
         ];
+        let reviewed_bridge_writers = ["apps/api/src/flow/bridge.rs"];
         let mut production_files = Vec::new();
         for root in ["apps/api/src", "apps/worker/src", "apps/mcp-server/src", "crates"] {
             production_files.extend(rust_files_below(&workspace.join(root)));
@@ -2868,7 +2869,8 @@ mod tests {
                 .any(|table| source_mutates_table(&normalized_sql, table));
             if mutates_forms {
                 assert!(
-                    allowed_forms_writers.contains(&relative.as_str()),
+                    allowed_forms_writers.contains(&relative.as_str())
+                        || reviewed_bridge_writers.contains(&relative.as_str()),
                     "production source outside the reviewed Forms owners mutates a Forms table: {relative}"
                 );
             }
