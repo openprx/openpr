@@ -430,13 +430,11 @@ async fn target_permission<C: ConnectionTrait>(
     ))
 }
 
-async fn lock_and_reauthorize_reference(
+async fn lock_and_reauthorize_source(
     tx: &sea_orm::DatabaseTransaction,
     source: &repository::ObjectViewRow,
     actor: &mut BridgeActor,
-    target_type: &str,
-    target_id: Uuid,
-) -> Result<(TargetView, BridgePermissionDecision), ApiError> {
+) -> Result<(), ApiError> {
     #[derive(FromQueryResult)]
     struct SettingsRow {
         bridge_enabled: bool,
@@ -480,6 +478,17 @@ async fn lock_and_reauthorize_reference(
     if actor.flow_level < PermissionLevel::Edit {
         return Err(ApiError::policy_rejected("bridge permission changed before commit"));
     }
+    Ok(())
+}
+
+async fn lock_and_reauthorize_reference(
+    tx: &sea_orm::DatabaseTransaction,
+    source: &repository::ObjectViewRow,
+    actor: &mut BridgeActor,
+    target_type: &str,
+    target_id: Uuid,
+) -> Result<(TargetView, BridgePermissionDecision), ApiError> {
+    lock_and_reauthorize_source(tx, source, actor).await?;
 
     let form_id = match target_type {
         "form" => target_id,
@@ -757,6 +766,748 @@ pub async fn remove_reference(
         removed: true,
         event_id: outcome.event_id,
     })
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConversionPreviewInput {
+    pub source_object_id: Uuid,
+    pub source_frontier: String,
+    pub target_type: String,
+    pub mapping: Value,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversionPreviewResponse {
+    pub preview_id: Uuid,
+    pub expires_at: DateTime<Utc>,
+    pub source_frontier: String,
+    pub target_schema_version: i32,
+    pub mapping: Value,
+    pub warnings: Vec<String>,
+    pub permission_decision: BridgePermissionState,
+    pub estimated_objects: i32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConversionCommitInput {
+    pub preview_id: Uuid,
+    pub source_frontier: String,
+    pub target_schema_version: i32,
+    pub idempotency_key: String,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConversionRetryInput {
+    pub idempotency_key: String,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Serialize, FromQueryResult, Clone)]
+pub struct ConversionJobResponse {
+    pub job_id: Uuid,
+    pub status: String,
+    pub source_object_id: Uuid,
+    pub source_frontier: String,
+    pub target_schema_version: i32,
+    pub lineage_id: Option<Uuid>,
+    pub created_target_ids: Vec<Uuid>,
+    pub warnings: Value,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, FromQueryResult, Clone)]
+struct PreviewRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    actor_id: Uuid,
+    actor_kind: String,
+    source_object_id: Uuid,
+    source_frontier: String,
+    target_type: String,
+    target_project_id: Uuid,
+    target_form_id: Option<Uuid>,
+    target_schema_version: i32,
+    mapping: Value,
+    expires_at: DateTime<Utc>,
+}
+
+fn mapping_uuid(mapping: &Value, key: &str) -> Result<Uuid, ApiError> {
+    mapping
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest(format!("mapping.{key} is required")))
+        .and_then(|value| Uuid::parse_str(value).map_err(|_| ApiError::BadRequest(format!("mapping.{key} is invalid"))))
+}
+
+fn current_frontier(source: &repository::ObjectViewRow) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(&source.document_frontier)
+}
+
+async fn project_exists<C: ConnectionTrait>(conn: &C, workspace_id: Uuid, project_id: Uuid) -> Result<bool, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        present: bool,
+    }
+    Ok(Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1 AND workspace_id = $2) AS present",
+        vec![project_id.into(), workspace_id.into()],
+    ))
+    .one(conn)
+    .await?
+    .is_some_and(|row| row.present))
+}
+
+async fn form_schema<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    form_id: Uuid,
+) -> Result<Option<(Uuid, i32, Value)>, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Row {
+        project_id: Uuid,
+        schema_version: i32,
+        schema: Value,
+    }
+    Ok(Row::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT project_id, schema_version, schema FROM project_forms \
+         WHERE id = $1 AND workspace_id = $2 AND archived_at IS NULL",
+        vec![form_id.into(), workspace_id.into()],
+    ))
+    .one(conn)
+    .await?
+    .map(|row| (row.project_id, row.schema_version, row.schema)))
+}
+
+pub async fn preview_conversion(
+    state: &AppState,
+    extensions: &Extensions,
+    input: ConversionPreviewInput,
+) -> Result<ConversionPreviewResponse, ApiError> {
+    if input.idempotency_key.trim().is_empty() || !input.mapping.is_object() {
+        return Err(ApiError::BadRequest(
+            "idempotency_key and object mapping are required".to_string(),
+        ));
+    }
+    let (source, actor) = source_actor(state, extensions, input.source_object_id, PermissionLevel::Edit).await?;
+    if actor.role == "__flow_guest" || !bridge_enabled(&state.db, source.workspace_id).await? {
+        return Err(ApiError::policy_rejected("forms bridge conversion is not permitted"));
+    }
+    let frontier = current_frontier(&source);
+    if input.source_frontier != frontier {
+        return Err(ApiError::stale_frontier(
+            "source frontier changed",
+            Some(source.document_seq),
+            Some(&frontier),
+        ));
+    }
+
+    let (target_project_id, target_form_id, target_schema_version, permission) = match input.target_type.as_str() {
+        "form" => {
+            let project_id = mapping_uuid(&input.mapping, "target_project_id")?;
+            if !matches!(actor.role.as_str(), "owner" | "admin")
+                || !project_exists(&state.db, source.workspace_id, project_id).await?
+            {
+                return Err(ApiError::policy_rejected("target form creation is not permitted"));
+            }
+            (
+                project_id,
+                None,
+                0,
+                BridgePermissionState {
+                    access: BridgeAccess::Controlled,
+                    configuration: PolicyConfiguration::Explicit,
+                    actions: vec!["form.view".to_string(), "record.create".to_string()],
+                    field_read_limited: false,
+                    field_write_limited: false,
+                    record_limited: false,
+                },
+            )
+        }
+        "form_record" => {
+            let form_id = mapping_uuid(&input.mapping, "target_form_id")?;
+            let target = target_view(&state.db, source.workspace_id, "form", form_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("bridge target not found".to_string()))?;
+            let permission = target_permission(&state.db, &actor, &target)
+                .await?
+                .filter(|decision| decision.allows("record.create"))
+                .ok_or_else(|| ApiError::policy_rejected("target record creation is not permitted"))?;
+            let (project_id, schema_version, _) = form_schema(&state.db, source.workspace_id, form_id)
+                .await?
+                .ok_or_else(|| ApiError::NotFound("bridge target not found".to_string()))?;
+            (project_id, Some(form_id), schema_version, permission.state)
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "target_type must be form or form_record".to_string(),
+            ));
+        }
+    };
+
+    #[derive(FromQueryResult)]
+    struct Existing {
+        id: Uuid,
+        expires_at: DateTime<Utc>,
+    }
+    if let Some(existing) = Existing::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id, expires_at FROM flow_conversion_previews WHERE workspace_id = $1 AND idempotency_key = $2",
+        vec![source.workspace_id.into(), input.idempotency_key.clone().into()],
+    ))
+    .one(&state.db)
+    .await?
+    {
+        return Ok(ConversionPreviewResponse {
+            preview_id: existing.id,
+            expires_at: existing.expires_at,
+            source_frontier: frontier,
+            target_schema_version,
+            mapping: input.mapping,
+            warnings: Vec::new(),
+            permission_decision: permission,
+            estimated_objects: 1,
+        });
+    }
+
+    let preview_id = Uuid::new_v4();
+    let expires_at = Utc::now() + chrono::Duration::minutes(15);
+    let permission_snapshot = serde_json::to_value(&permission).map_err(|_| ApiError::Internal)?;
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO flow_conversion_previews \
+             (id, workspace_id, actor_id, actor_kind, source_object_id, source_frontier, target_type, \
+              target_project_id, target_form_id, target_schema_version, mapping, permission_snapshot, \
+              idempotency_key, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+            vec![
+                preview_id.into(),
+                source.workspace_id.into(),
+                actor.id.into(),
+                (if actor.is_bot { "bot" } else { "user" }).into(),
+                source.id.into(),
+                frontier.clone().into(),
+                input.target_type.into(),
+                target_project_id.into(),
+                target_form_id.into(),
+                target_schema_version.into(),
+                input.mapping.clone().into(),
+                permission_snapshot.into(),
+                input.idempotency_key.into(),
+                expires_at.into(),
+            ],
+        ))
+        .await?;
+    Ok(ConversionPreviewResponse {
+        preview_id,
+        expires_at,
+        source_frontier: frontier,
+        target_schema_version,
+        mapping: input.mapping,
+        warnings: Vec::new(),
+        permission_decision: permission,
+        estimated_objects: 1,
+    })
+}
+
+async fn load_preview<C: ConnectionTrait>(conn: &C, preview_id: Uuid) -> Result<PreviewRow, ApiError> {
+    PreviewRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id, workspace_id, actor_id, actor_kind, source_object_id, source_frontier, target_type, \
+         target_project_id, target_form_id, target_schema_version, mapping, expires_at \
+         FROM flow_conversion_previews WHERE id = $1",
+        vec![preview_id.into()],
+    ))
+    .one(conn)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("conversion preview not found".to_string()))
+}
+
+async fn load_job<C: ConnectionTrait>(conn: &C, job_id: Uuid) -> Result<ConversionJobResponse, ApiError> {
+    ConversionJobResponse::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id AS job_id, status, source_object_id, source_frontier, target_schema_version, lineage_id, \
+         created_target_ids, warnings, error_code AS error FROM flow_conversion_jobs WHERE id = $1",
+        vec![job_id.into()],
+    ))
+    .one(conn)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("conversion job not found".to_string()))
+}
+
+#[cfg(test)]
+fn conversion_fault(point: &str) -> bool {
+    use std::sync::atomic::Ordering;
+    let selected = CONVERSION_FAULT_FOR_TEST.load(Ordering::SeqCst);
+    let selected_point = match selected {
+        1 => "before_target_create",
+        2 => "after_target_create_before_lineage",
+        3 => "after_commit_before_response",
+        _ => "",
+    };
+    selected_point == point || std::env::var("OPENPR_FLOW_TEST_CONVERSION_FAULT").is_ok_and(|value| value == point)
+}
+
+#[cfg(test)]
+static CONVERSION_FAULT_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_conversion_fault_for_test(point: u8) {
+    use std::sync::atomic::Ordering;
+    CONVERSION_FAULT_FOR_TEST.store(point, Ordering::SeqCst);
+}
+
+#[cfg(not(test))]
+const fn conversion_fault(_point: &str) -> bool {
+    false
+}
+
+async fn conversion_event(
+    tx: &sea_orm::DatabaseTransaction,
+    preview: &PreviewRow,
+    job_id: Uuid,
+    event_type: &str,
+    origin: &CommandOrigin,
+    idempotency_key: &str,
+    causation_id: Option<Uuid>,
+    payload: Value,
+) -> Result<Uuid, ApiError> {
+    Ok(insert_flow_event(
+        tx,
+        BusinessEventInput {
+            workspace_id: preview.workspace_id,
+            project_id: Some(preview.target_project_id),
+            event_type: event_type.to_string(),
+            aggregate_type: "flow_conversion".to_string(),
+            aggregate_id: job_id.to_string(),
+            actor_id: (preview.actor_kind == "user").then_some(preview.actor_id),
+            source: origin.source_json(),
+            payload,
+            metadata: json!({}),
+            correlation_id: Some(origin.correlation_id),
+            causation_id,
+            idempotency_key: Some(idempotency_key.to_string()),
+        },
+        Some(FlowDispatchSpec {
+            max_attempts: crate::config::runtime().flow.dispatch_max_attempts,
+            document_id: None,
+            accepted_seq: None,
+        }),
+    )
+    .await?
+    .event_id)
+}
+
+async fn record_failed_conversion(
+    state: &AppState,
+    preview: &PreviewRow,
+    job_id: Uuid,
+    idempotency_key: &str,
+    origin: &CommandOrigin,
+    error_code: &str,
+) -> Result<ConversionJobResponse, ApiError> {
+    let tx = state.db.begin().await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO flow_conversion_jobs \
+         (id, workspace_id, preview_id, actor_id, actor_kind, source_object_id, source_frontier, target_type, \
+          target_schema_version, status, error_code, idempotency_key) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'failed',$10,$11) \
+         ON CONFLICT (preview_id) DO UPDATE SET status='failed', error_code=EXCLUDED.error_code, updated_at=now()",
+        vec![
+            job_id.into(),
+            preview.workspace_id.into(),
+            preview.id.into(),
+            preview.actor_id.into(),
+            preview.actor_kind.clone().into(),
+            preview.source_object_id.into(),
+            preview.source_frontier.clone().into(),
+            preview.target_type.clone().into(),
+            preview.target_schema_version.into(),
+            error_code.into(),
+            idempotency_key.into(),
+        ],
+    ))
+    .await?;
+    conversion_event(
+        &tx,
+        preview,
+        job_id,
+        "flow.conversion.failed",
+        origin,
+        &format!("conversion-failed:{idempotency_key}"),
+        None,
+        json!({"job_id": job_id, "source_object_id": preview.source_object_id, "error": error_code}),
+    )
+    .await?;
+    tx.commit().await?;
+    load_job(&state.db, job_id).await
+}
+
+async fn execute_conversion(
+    state: &AppState,
+    extensions: &Extensions,
+    preview: PreviewRow,
+    job_id: Uuid,
+    idempotency_key: String,
+    origin: CommandOrigin,
+    retry: bool,
+) -> Result<ConversionJobResponse, ApiError> {
+    let (source, mut actor) = source_actor(state, extensions, preview.source_object_id, PermissionLevel::Edit).await?;
+    if actor.id != preview.actor_id && !matches!(actor.role.as_str(), "owner" | "admin") {
+        return Err(ApiError::NotFound("conversion job not found".to_string()));
+    }
+    let tx = state.db.begin().await?;
+    lock_and_reauthorize_source(&tx, &source, &mut actor).await?;
+    let frontier = current_frontier(&source);
+    if frontier != preview.source_frontier {
+        return Err(ApiError::stale_frontier(
+            "source frontier changed",
+            Some(source.document_seq),
+            Some(&frontier),
+        ));
+    }
+
+    let (schema, permission) = if let Some(form_id) = preview.target_form_id {
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 19019))",
+            vec![form_id.to_string().into()],
+        ))
+        .await?;
+        let target = target_view(&tx, preview.workspace_id, "form", form_id)
+            .await?
+            .ok_or_else(|| ApiError::policy_rejected("target form changed before commit"))?;
+        let permission = target_permission(&tx, &actor, &target)
+            .await?
+            .filter(|decision| decision.allows("record.create"))
+            .ok_or_else(|| ApiError::policy_rejected("target record creation is not permitted"))?;
+        let (_, version, schema) = form_schema(&tx, preview.workspace_id, form_id)
+            .await?
+            .ok_or_else(|| ApiError::policy_rejected("target form changed before commit"))?;
+        if version != preview.target_schema_version {
+            return Err(ApiError::policy_rejected("target schema version changed before commit"));
+        }
+        (Some(schema), Some(permission))
+    } else {
+        if !matches!(actor.role.as_str(), "owner" | "admin")
+            || !project_exists(&tx, preview.workspace_id, preview.target_project_id).await?
+        {
+            return Err(ApiError::policy_rejected("target form creation is not permitted"));
+        }
+        (None, None)
+    };
+
+    if retry {
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE flow_conversion_jobs SET status='started', error_code=NULL, idempotency_key=$2, updated_at=now() \
+             WHERE id=$1 AND status='failed'",
+            vec![job_id.into(), idempotency_key.clone().into()],
+        ))
+        .await?;
+    } else {
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO flow_conversion_jobs \
+             (id, workspace_id, preview_id, actor_id, actor_kind, source_object_id, source_frontier, target_type, \
+              target_schema_version, status, idempotency_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'started',$10)",
+            vec![
+                job_id.into(),
+                preview.workspace_id.into(),
+                preview.id.into(),
+                preview.actor_id.into(),
+                preview.actor_kind.clone().into(),
+                preview.source_object_id.into(),
+                preview.source_frontier.clone().into(),
+                preview.target_type.clone().into(),
+                preview.target_schema_version.into(),
+                idempotency_key.clone().into(),
+            ],
+        ))
+        .await?;
+    }
+    let started_event = conversion_event(
+        &tx,
+        &preview,
+        job_id,
+        "flow.conversion.started",
+        &origin,
+        &format!("conversion-started:{idempotency_key}"),
+        None,
+        json!({"job_id": job_id, "source_object_id": preview.source_object_id, "target_type": preview.target_type}),
+    )
+    .await?;
+    if conversion_fault("before_target_create") {
+        tx.rollback().await?;
+        return record_failed_conversion(
+            state,
+            &preview,
+            job_id,
+            &idempotency_key,
+            &origin,
+            "injected_before_target_create",
+        )
+        .await;
+    }
+
+    let target_id = Uuid::new_v4();
+    let target_version =
+        if let Some(form_id) = preview.target_form_id {
+            let schema = schema.as_ref().ok_or(ApiError::Internal)?;
+            let values = preview.mapping.get("values").cloned().unwrap_or_else(|| json!({}));
+            if let Some(decision) = permission.as_ref()
+                && values
+                    .as_object()
+                    .is_some_and(|object| object.keys().any(|key| !decision.field_allows(key, "write")))
+            {
+                return Err(ApiError::policy_rejected(
+                    "mapped values include a field that is not writable",
+                ));
+            }
+            let values = crate::forms::validation::validate_and_normalize_values(schema, values)
+                .map_err(ApiError::BadRequest)?;
+            let title = preview
+                .mapping
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(&source.projection_title);
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO form_records \
+             (id, workspace_id, project_id, form_id, title, values, source, schema_version, created_by, updated_by) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)",
+                vec![
+                    target_id.into(),
+                    preview.workspace_id.into(),
+                    preview.target_project_id.into(),
+                    form_id.into(),
+                    title.into(),
+                    values.clone().into(),
+                    json!({"type":"flow_conversion","source_object_id":source.id}).into(),
+                    preview.target_schema_version.into(),
+                    (!actor.is_bot).then_some(actor.id).into(),
+                ],
+            ))
+            .await?;
+            crate::forms::projections::refresh_record_projection(
+                &tx,
+                preview.target_project_id,
+                form_id,
+                target_id,
+                schema,
+                &values,
+            )
+            .await?;
+            preview.target_schema_version
+        } else {
+            let key = preview
+                .mapping
+                .get("key")
+                .and_then(Value::as_str)
+                .unwrap_or("converted_flow");
+            let key = crate::forms::schema::normalize_key(key).map_err(ApiError::BadRequest)?;
+            let name = preview
+                .mapping
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&source.projection_title);
+            let schema = crate::forms::schema::ensure_schema_field_ids(
+                preview
+                    .mapping
+                    .get("schema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"version":"openpr.form.schema.v1","fields":[]})),
+            )
+            .map_err(ApiError::BadRequest)?;
+            crate::forms::schema::validate_schema(&schema).map_err(ApiError::BadRequest)?;
+            tx.execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO project_forms \
+             (id, workspace_id, project_id, key, name, description, title_template, schema, detail_layout, created_by) \
+             VALUES ($1,$2,$3,$4,$5,'','{id}',$6,'{}'::jsonb,$7)",
+                vec![
+                    target_id.into(),
+                    preview.workspace_id.into(),
+                    preview.target_project_id.into(),
+                    key.into(),
+                    name.into(),
+                    schema.clone().into(),
+                    (!actor.is_bot).then_some(actor.id).into(),
+                ],
+            ))
+            .await?;
+            tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO form_schema_versions (form_id, version, schema, detail_layout, changed_by, change_summary) \
+             VALUES ($1,1,$2,'{}'::jsonb,$3,'created from Flow conversion')",
+            vec![target_id.into(), schema.into(), (!actor.is_bot).then_some(actor.id).into()],
+        )).await?;
+            1
+        };
+    if conversion_fault("after_target_create_before_lineage") {
+        tx.rollback().await?;
+        return record_failed_conversion(
+            state,
+            &preview,
+            job_id,
+            &idempotency_key,
+            &origin,
+            "injected_after_target_create",
+        )
+        .await;
+    }
+
+    let lineage_id = Uuid::new_v4();
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO flow_object_lineage \
+         (id, workspace_id, source_object_id, source_frontier, target_type, target_id, target_version, relation, created_by) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'derived_from',$8)",
+        vec![lineage_id.into(), preview.workspace_id.into(), preview.source_object_id.into(), preview.source_frontier.clone().into(),
+            preview.target_type.clone().into(), target_id.into(), target_version.into(), actor.id.into()],
+    )).await?;
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_conversion_jobs SET status='completed', lineage_id=$2, created_target_ids=ARRAY[$3]::uuid[], \
+         error_code=NULL, updated_at=now() WHERE id=$1",
+        vec![job_id.into(), lineage_id.into(), target_id.into()],
+    ))
+    .await?;
+    conversion_event(
+        &tx,
+        &preview,
+        job_id,
+        "flow.conversion.completed",
+        &origin,
+        &format!("conversion-completed:{idempotency_key}"),
+        Some(started_event),
+        json!({"job_id":job_id,"source_object_id":preview.source_object_id,"target_type":preview.target_type,
+            "target_id":target_id,"lineage_id":lineage_id}),
+    )
+    .await?;
+    tx.commit().await?;
+    if conversion_fault("after_commit_before_response") {
+        return Err(ApiError::Internal);
+    }
+    load_job(&state.db, job_id).await
+}
+
+pub async fn commit_conversion(
+    state: &AppState,
+    extensions: &Extensions,
+    input: ConversionCommitInput,
+    origin: CommandOrigin,
+) -> Result<ConversionJobResponse, ApiError> {
+    if !input.confirm || input.idempotency_key.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "confirm=true and idempotency_key are required".to_string(),
+        ));
+    }
+    let preview = load_preview(&state.db, input.preview_id).await?;
+    if preview.expires_at <= Utc::now() {
+        return Err(ApiError::policy_rejected("conversion preview expired"));
+    }
+    if input.source_frontier != preview.source_frontier {
+        return Err(ApiError::stale_frontier(
+            "source frontier differs from preview",
+            None,
+            Some(&preview.source_frontier),
+        ));
+    }
+    if input.target_schema_version != preview.target_schema_version {
+        return Err(ApiError::policy_rejected("target schema version differs from preview"));
+    }
+    #[derive(FromQueryResult)]
+    struct Existing {
+        id: Uuid,
+    }
+    if let Some(existing) = Existing::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id FROM flow_conversion_jobs WHERE workspace_id=$1 AND idempotency_key=$2",
+        vec![preview.workspace_id.into(), input.idempotency_key.clone().into()],
+    ))
+    .one(&state.db)
+    .await?
+    {
+        return load_job(&state.db, existing.id).await;
+    }
+    execute_conversion(
+        state,
+        extensions,
+        preview,
+        Uuid::new_v4(),
+        input.idempotency_key,
+        origin,
+        false,
+    )
+    .await
+}
+
+pub async fn conversion_status(
+    state: &AppState,
+    extensions: &Extensions,
+    job_id: Uuid,
+) -> Result<ConversionJobResponse, ApiError> {
+    #[derive(FromQueryResult)]
+    struct Scope {
+        source_object_id: Uuid,
+        actor_id: Uuid,
+    }
+    let scope = Scope::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT source_object_id, actor_id FROM flow_conversion_jobs WHERE id=$1",
+        vec![job_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("conversion job not found".to_string()))?;
+    let (_, actor) = source_actor(state, extensions, scope.source_object_id, PermissionLevel::View).await?;
+    if actor.id != scope.actor_id && !matches!(actor.role.as_str(), "owner" | "admin") {
+        return Err(ApiError::NotFound("conversion job not found".to_string()));
+    }
+    load_job(&state.db, job_id).await
+}
+
+pub async fn retry_conversion(
+    state: &AppState,
+    extensions: &Extensions,
+    job_id: Uuid,
+    input: ConversionRetryInput,
+    origin: CommandOrigin,
+) -> Result<ConversionJobResponse, ApiError> {
+    if !input.confirm || input.idempotency_key.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "confirm=true and idempotency_key are required".to_string(),
+        ));
+    }
+    #[derive(FromQueryResult)]
+    struct Job {
+        preview_id: Uuid,
+        status: String,
+        idempotency_key: String,
+    }
+    let job = Job::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT preview_id, status, idempotency_key FROM flow_conversion_jobs WHERE id=$1",
+        vec![job_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("conversion job not found".to_string()))?;
+    if job.status == "completed" || job.idempotency_key == input.idempotency_key {
+        return load_job(&state.db, job_id).await;
+    }
+    if job.status != "failed" {
+        return Err(ApiError::policy_rejected("only failed conversion jobs can be retried"));
+    }
+    let preview = load_preview(&state.db, job.preview_id).await?;
+    execute_conversion(state, extensions, preview, job_id, input.idempotency_key, origin, true).await
 }
 
 #[cfg(test)]

@@ -106,6 +106,55 @@ pub async fn delete_flow_object_reference(
     Ok(ApiResponse::success(receipt))
 }
 
+pub async fn post_flow_conversion_preview(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Json(input): Json<crate::flow::bridge::ConversionPreviewInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    Ok(ApiResponse::success(
+        crate::flow::bridge::preview_conversion(&state, &extensions, input).await?,
+    ))
+}
+
+pub async fn post_flow_conversion(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Json(input): Json<crate::flow::bridge::ConversionCommitInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    Ok(ApiResponse::success(
+        crate::flow::bridge::commit_conversion(&state, &extensions, input, request_origin(&extensions)).await?,
+    ))
+}
+
+pub async fn get_flow_conversion(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    Ok(ApiResponse::success(
+        crate::flow::bridge::conversion_status(&state, &extensions, job_id).await?,
+    ))
+}
+
+pub async fn post_flow_conversion_retry(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(job_id): Path<Uuid>,
+    Json(input): Json<crate::flow::bridge::ConversionRetryInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    Ok(ApiResponse::success(
+        crate::flow::bridge::retry_conversion(&state, &extensions, job_id, input, request_origin(&extensions)).await?,
+    ))
+}
+
 /// The origin every write handler in this module stamps on the events its command produces.
 ///
 /// **This is the point of the whole `CommandOrigin` plumbing**, and the one place any Flow route
@@ -971,9 +1020,9 @@ mod flow_database_tests {
         SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, delete_flow_object_reference,
         get_flow_feature, get_flow_navigator, get_flow_object, get_flow_object_bootstrap, get_flow_object_diff,
         get_flow_object_grants, get_flow_object_history, get_flow_object_references, get_flow_object_relations,
-        get_flow_projection_lag, get_flow_search, list_flow_objects, post_flow_object_command,
-        post_flow_object_reference, put_flow_object_grants, put_flow_object_inheritance, request_origin,
-        set_flow_feature,
+        get_flow_projection_lag, get_flow_search, list_flow_objects, post_flow_conversion,
+        post_flow_conversion_preview, post_flow_conversion_retry, post_flow_object_command, post_flow_object_reference,
+        put_flow_object_grants, put_flow_object_inheritance, request_origin, set_flow_feature,
     };
     use crate::error::{ApiError, ApiErrorKind};
     use crate::flow::collab::{
@@ -3954,6 +4003,295 @@ mod flow_database_tests {
             .expect("target count query")
             .expect("target count");
         assert_eq!(target_count.try_get::<i64>("", "n").expect("count"), 1);
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn conversion_commit_rechecks_policy_and_is_idempotent_without_rewriting_source() {
+        use base64::Engine as _;
+
+        #[derive(FromQueryResult)]
+        struct SourceHead {
+            head_seq: i64,
+            head_frontier: Vec<u8>,
+        }
+
+        let scratch = scratch_or_skip!("bridge-conversion-policy");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let project_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'CNV', 'Conversion test', $3)",
+            vec![project_id.into(), workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        let form = body_json(to_response(
+            create_project_form(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(project_id),
+                Json(CreateFormRequest {
+                    key: "conversion_target".to_string(),
+                    name: "Conversion target".to_string(),
+                    description: None,
+                    icon: None,
+                    color: None,
+                    title_template: None,
+                    schema: None,
+                    detail_layout: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        let form_id = Uuid::parse_str(form["data"]["id"].as_str().expect("form id")).expect("UUID");
+        let set_policy = |allowed: bool| {
+            update_form_permissions(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(form_id),
+                Json(UpdateFormPermissionsRequest {
+                    policies: vec![UpsertFormPermissionPolicy {
+                        subject_type: "role".to_string(),
+                        subject_id: "owner".to_string(),
+                        policy: json!({"actions":{"form.view":true,"record.create":allowed}}),
+                    }],
+                }),
+            )
+        };
+        assert_eq!(body_json(to_response(set_policy(true).await)).await["code"], 0);
+
+        let source_id = create_page_as_owner(&state, workspace_id, owner_id, "conversion source").await;
+        let source_head = SourceHead::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT d.head_seq, d.head_frontier FROM collab_documents d WHERE d.object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("source head query")
+        .expect("source head");
+        let frontier = base64::engine::general_purpose::STANDARD.encode(&source_head.head_frontier);
+        let preview_request = |key: String| crate::flow::bridge::ConversionPreviewInput {
+            source_object_id: source_id,
+            source_frontier: frontier.clone(),
+            target_type: "form_record".to_string(),
+            mapping: json!({"target_form_id":form_id,"title":"Converted","values":{}}),
+            idempotency_key: key,
+        };
+        let preview = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(preview_request(Uuid::new_v4().to_string())),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(preview["code"], 0, "{preview}");
+        let preview_id = Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+
+        assert_eq!(body_json(to_response(set_policy(false).await)).await["code"], 0);
+        let rejected = body_json(to_response(
+            post_flow_conversion(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(crate::flow::bridge::ConversionCommitInput {
+                    preview_id,
+                    source_frontier: frontier.clone(),
+                    target_schema_version: 1,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                    confirm: true,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(rejected["code"], 403, "{rejected}");
+
+        let zero = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT (SELECT count(*) FROM form_records WHERE form_id=$1) AS records, \
+                    (SELECT count(*) FROM flow_object_lineage WHERE source_object_id=$2) AS lineage",
+                vec![form_id.into(), source_id.into()],
+            ))
+            .await
+            .expect("zero-write query")
+            .expect("counts");
+        assert_eq!(zero.try_get::<i64>("", "records").expect("records"), 0);
+        assert_eq!(zero.try_get::<i64>("", "lineage").expect("lineage"), 0);
+
+        assert_eq!(body_json(to_response(set_policy(true).await)).await["code"], 0);
+        let preview = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(preview_request(Uuid::new_v4().to_string())),
+            )
+            .await,
+        ))
+        .await;
+        let preview_id = Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+        let commit_key = Uuid::new_v4().to_string();
+        let commit_input = || crate::flow::bridge::ConversionCommitInput {
+            preview_id,
+            source_frontier: frontier.clone(),
+            target_schema_version: 1,
+            idempotency_key: commit_key.clone(),
+            confirm: true,
+        };
+        let committed_result =
+            post_flow_conversion(State(state.clone()), claims_for(owner_id), None, Json(commit_input())).await;
+        if let Err(error) = &committed_result {
+            panic!("conversion commit failed: {error:?}");
+        }
+        let committed = body_json(to_response(committed_result)).await;
+        assert_eq!(committed["code"], 0, "{committed}");
+        assert_eq!(committed["data"]["status"], "completed");
+        assert_eq!(
+            committed["data"]["created_target_ids"].as_array().map(Vec::len),
+            Some(1)
+        );
+        let replay = body_json(to_response(
+            post_flow_conversion(State(state.clone()), claims_for(owner_id), None, Json(commit_input())).await,
+        ))
+        .await;
+        assert_eq!(replay["data"]["job_id"], committed["data"]["job_id"]);
+        assert_eq!(
+            replay["data"]["created_target_ids"],
+            committed["data"]["created_target_ids"]
+        );
+
+        let after_head = SourceHead::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT d.head_seq, d.head_frontier FROM collab_documents d WHERE d.object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("source head query")
+        .expect("source head");
+        assert_eq!(after_head.head_seq, source_head.head_seq);
+        assert_eq!(after_head.head_frontier, source_head.head_frontier);
+
+        struct FaultReset;
+        impl Drop for FaultReset {
+            fn drop(&mut self) {
+                crate::flow::bridge::set_conversion_fault_for_test(0);
+            }
+        }
+        let _fault_reset = FaultReset;
+        for fault in [1_u8, 2_u8] {
+            let preview = body_json(to_response(
+                post_flow_conversion_preview(
+                    State(state.clone()),
+                    claims_for(owner_id),
+                    None,
+                    Json(preview_request(Uuid::new_v4().to_string())),
+                )
+                .await,
+            ))
+            .await;
+            let fault_preview_id =
+                Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+            crate::flow::bridge::set_conversion_fault_for_test(fault);
+            let failed = body_json(to_response(
+                post_flow_conversion(
+                    State(state.clone()),
+                    claims_for(owner_id),
+                    None,
+                    Json(crate::flow::bridge::ConversionCommitInput {
+                        preview_id: fault_preview_id,
+                        source_frontier: frontier.clone(),
+                        target_schema_version: 1,
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        confirm: true,
+                    }),
+                )
+                .await,
+            ))
+            .await;
+            crate::flow::bridge::set_conversion_fault_for_test(0);
+            assert_eq!(failed["code"], 0, "fault {fault}: {failed}");
+            assert_eq!(failed["data"]["status"], "failed", "fault {fault}: {failed}");
+            let failed_job_id = Uuid::parse_str(failed["data"]["job_id"].as_str().expect("job id")).expect("UUID");
+            let retried = body_json(to_response(
+                post_flow_conversion_retry(
+                    State(state.clone()),
+                    claims_for(owner_id),
+                    None,
+                    Path(failed_job_id),
+                    Json(crate::flow::bridge::ConversionRetryInput {
+                        idempotency_key: Uuid::new_v4().to_string(),
+                        confirm: true,
+                    }),
+                )
+                .await,
+            ))
+            .await;
+            assert_eq!(retried["code"], 0, "fault {fault} retry: {retried}");
+            assert_eq!(retried["data"]["status"], "completed");
+            assert_eq!(retried["data"]["created_target_ids"].as_array().map(Vec::len), Some(1));
+        }
+
+        let preview = body_json(to_response(
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(preview_request(Uuid::new_v4().to_string())),
+            )
+            .await,
+        ))
+        .await;
+        let last_preview_id =
+            Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
+        let last_key = Uuid::new_v4().to_string();
+        let last_input = || crate::flow::bridge::ConversionCommitInput {
+            preview_id: last_preview_id,
+            source_frontier: frontier.clone(),
+            target_schema_version: 1,
+            idempotency_key: last_key.clone(),
+            confirm: true,
+        };
+        crate::flow::bridge::set_conversion_fault_for_test(3);
+        let lost_response =
+            post_flow_conversion(State(state.clone()), claims_for(owner_id), None, Json(last_input())).await;
+        crate::flow::bridge::set_conversion_fault_for_test(0);
+        assert!(
+            lost_response.is_err(),
+            "post-commit response injection must surface an error"
+        );
+        let recovered = body_json(to_response(
+            post_flow_conversion(State(state.clone()), claims_for(owner_id), None, Json(last_input())).await,
+        ))
+        .await;
+        assert_eq!(recovered["code"], 0, "{recovered}");
+        assert_eq!(recovered["data"]["status"], "completed");
+
+        let totals = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT (SELECT count(*) FROM form_records WHERE form_id=$1) AS records, \
+                        (SELECT count(*) FROM flow_object_lineage WHERE source_object_id=$2) AS lineage",
+                vec![form_id.into(), source_id.into()],
+            ))
+            .await
+            .expect("conversion totals query")
+            .expect("conversion totals");
+        assert_eq!(totals.try_get::<i64>("", "records").expect("records"), 4);
+        assert_eq!(totals.try_get::<i64>("", "lineage").expect("lineage"), 4);
 
         scratch.drop_self().await;
     }

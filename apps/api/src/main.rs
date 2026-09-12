@@ -1481,6 +1481,34 @@ async fn main() -> anyhow::Result<()> {
             )),
         )
         .route(
+            "/api/v1/flow/conversions/preview",
+            post(routes::flow::post_flow_conversion_preview).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/conversions",
+            post(routes::flow::post_flow_conversion).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/conversions/{job_id}",
+            get(routes::flow::get_flow_conversion).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
+            "/api/v1/flow/conversions/{job_id}/retry",
+            post(routes::flow::post_flow_conversion_retry).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
+        .route(
             "/api/v1/flow/objects/{object_id}/bootstrap",
             get(routes::flow::get_flow_object_bootstrap).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),
