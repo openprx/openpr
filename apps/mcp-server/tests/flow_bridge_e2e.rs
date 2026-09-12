@@ -65,17 +65,19 @@ async fn all_six_bridge_tools_call_the_frozen_rest_contract() -> Result<(), Box<
     ];
     assert!(results.iter().all(|result| result.is_error.is_none()));
 
-    let calls = calls.lock().await;
-    assert_eq!(calls.len(), 6);
+    let calls = calls.lock().await.clone();
+    let [reference, unreference, preview, commit, status, retry] = calls.as_slice() else {
+        return Err(format!("expected six calls, got {}", calls.len()).into());
+    };
     assert_eq!(
-        (&calls[0].0, &calls[0].1),
+        (&reference.0, &reference.1),
         (
             &"POST".to_string(),
             &format!("/api/v1/flow/objects/{SOURCE}/references")
         )
     );
     assert_eq!(
-        (&calls[1].0, &calls[1].1, calls[1].3.as_deref()),
+        (&unreference.0, &unreference.1, unreference.3.as_deref()),
         (
             &"DELETE".to_string(),
             &format!("/api/v1/flow/objects/{SOURCE}/references/{REFERENCE}"),
@@ -83,21 +85,21 @@ async fn all_six_bridge_tools_call_the_frozen_rest_contract() -> Result<(), Box<
         )
     );
     assert_eq!(
-        (&calls[2].0, &calls[2].1),
+        (&preview.0, &preview.1),
         (&"POST".to_string(), &"/api/v1/flow/conversions/preview".to_string())
     );
-    assert_eq!(calls[2].2["source_frontier"], "frontier");
+    assert_eq!(preview.2.pointer("/source_frontier"), Some(&json!("frontier")));
     assert_eq!(
-        (&calls[3].0, &calls[3].1),
+        (&commit.0, &commit.1),
         (&"POST".to_string(), &"/api/v1/flow/conversions".to_string())
     );
-    assert_eq!(calls[3].2["confirm"], true);
+    assert_eq!(commit.2.pointer("/confirm"), Some(&json!(true)));
     assert_eq!(
-        (&calls[4].0, &calls[4].1),
+        (&status.0, &status.1),
         (&"GET".to_string(), &format!("/api/v1/flow/conversions/{JOB}"))
     );
     assert_eq!(
-        (&calls[5].0, &calls[5].1),
+        (&retry.0, &retry.1),
         (&"POST".to_string(), &format!("/api/v1/flow/conversions/{JOB}/retry"))
     );
     Ok(())
