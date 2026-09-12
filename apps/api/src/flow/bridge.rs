@@ -1105,29 +1105,28 @@ async fn load_job<C: ConnectionTrait>(conn: &C, job_id: Uuid) -> Result<Conversi
 }
 
 #[cfg(test)]
-fn conversion_fault(point: &str) -> bool {
-    use std::sync::atomic::Ordering;
-    let selected = CONVERSION_FAULT_FOR_TEST.load(Ordering::SeqCst);
+fn conversion_fault(preview_id: Uuid, point: &str) -> bool {
+    let (selected_preview, selected) = *CONVERSION_FAULT_FOR_TEST.lock();
     let selected_point = match selected {
         1 => "before_target_create",
         2 => "after_target_create_before_lineage",
         3 => "after_commit_before_response",
         _ => "",
     };
-    selected_point == point || std::env::var("OPENPR_FLOW_TEST_CONVERSION_FAULT").is_ok_and(|value| value == point)
+    (selected_preview == Some(preview_id) && selected_point == point)
+        || std::env::var("OPENPR_FLOW_TEST_CONVERSION_FAULT").is_ok_and(|value| value == point)
 }
 
 #[cfg(test)]
-static CONVERSION_FAULT_FOR_TEST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static CONVERSION_FAULT_FOR_TEST: parking_lot::Mutex<(Option<Uuid>, u8)> = parking_lot::Mutex::new((None, 0));
 
 #[cfg(test)]
-pub(crate) fn set_conversion_fault_for_test(point: u8) {
-    use std::sync::atomic::Ordering;
-    CONVERSION_FAULT_FOR_TEST.store(point, Ordering::SeqCst);
+pub(crate) fn set_conversion_fault_for_test(preview_id: Option<Uuid>, point: u8) {
+    *CONVERSION_FAULT_FOR_TEST.lock() = (preview_id, point);
 }
 
 #[cfg(not(test))]
-const fn conversion_fault(_point: &str) -> bool {
+const fn conversion_fault(_preview_id: Uuid, _point: &str) -> bool {
     false
 }
 
@@ -1334,7 +1333,7 @@ async fn execute_conversion(
         json!({"job_id": job_id, "source_object_id": preview.source_object_id, "target_type": preview.target_type}),
     )
     .await?;
-    if conversion_fault("before_target_create") {
+    if conversion_fault(preview.id, "before_target_create") {
         tx.rollback().await?;
         return record_failed_conversion(
             state,
@@ -1431,7 +1430,7 @@ async fn execute_conversion(
         .await?;
         (target_id, form.schema_version)
     };
-    if conversion_fault("after_target_create_before_lineage") {
+    if conversion_fault(preview.id, "after_target_create_before_lineage") {
         tx.rollback().await?;
         return record_failed_conversion(
             state,
@@ -1476,7 +1475,7 @@ async fn execute_conversion(
     if let Some((form, creation)) = native_record.as_ref() {
         crate::forms::native_create::finish_record_creation(state, form, creation).await?;
     }
-    if conversion_fault("after_commit_before_response") {
+    if conversion_fault(preview.id, "after_commit_before_response") {
         return Err(ApiError::Internal);
     }
     load_job(&state.db, job_id).await

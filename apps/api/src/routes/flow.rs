@@ -4695,7 +4695,7 @@ mod flow_database_tests {
         struct FaultReset;
         impl Drop for FaultReset {
             fn drop(&mut self) {
-                crate::flow::bridge::set_conversion_fault_for_test(0);
+                crate::flow::bridge::set_conversion_fault_for_test(None, 0);
             }
         }
         let _fault_reset = FaultReset;
@@ -4712,7 +4712,7 @@ mod flow_database_tests {
             .await;
             let fault_preview_id =
                 Uuid::parse_str(preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
-            crate::flow::bridge::set_conversion_fault_for_test(fault);
+            crate::flow::bridge::set_conversion_fault_for_test(Some(fault_preview_id), fault);
             let failed = body_json(to_response(
                 post_flow_conversion(
                     State(state.clone()),
@@ -4729,7 +4729,7 @@ mod flow_database_tests {
                 .await,
             ))
             .await;
-            crate::flow::bridge::set_conversion_fault_for_test(0);
+            crate::flow::bridge::set_conversion_fault_for_test(None, 0);
             assert_eq!(failed["code"], 0, "fault {fault}: {failed}");
             assert_eq!(failed["data"]["status"], "failed", "fault {fault}: {failed}");
             let failed_job_id = Uuid::parse_str(failed["data"]["job_id"].as_str().expect("job id")).expect("UUID");
@@ -4764,7 +4764,7 @@ mod flow_database_tests {
         .await;
         let expiring_preview_id =
             Uuid::parse_str(expiring_preview["data"]["preview_id"].as_str().expect("preview id")).expect("UUID");
-        crate::flow::bridge::set_conversion_fault_for_test(1);
+        crate::flow::bridge::set_conversion_fault_for_test(Some(expiring_preview_id), 1);
         let expired_failed = body_json(to_response(
             post_flow_conversion(
                 State(state.clone()),
@@ -4781,7 +4781,7 @@ mod flow_database_tests {
             .await,
         ))
         .await;
-        crate::flow::bridge::set_conversion_fault_for_test(0);
+        crate::flow::bridge::set_conversion_fault_for_test(None, 0);
         let expired_job_id =
             Uuid::parse_str(expired_failed["data"]["job_id"].as_str().expect("failed job id")).expect("UUID");
         exec(
@@ -4826,10 +4826,10 @@ mod flow_database_tests {
             idempotency_key: last_key.clone(),
             confirm: true,
         };
-        crate::flow::bridge::set_conversion_fault_for_test(3);
+        crate::flow::bridge::set_conversion_fault_for_test(Some(last_preview_id), 3);
         let lost_response =
             post_flow_conversion(State(state.clone()), claims_for(owner_id), None, Json(last_input())).await;
-        crate::flow::bridge::set_conversion_fault_for_test(0);
+        crate::flow::bridge::set_conversion_fault_for_test(None, 0);
         assert!(
             lost_response.is_err(),
             "post-commit response injection must surface an error"

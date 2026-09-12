@@ -1729,7 +1729,7 @@ pub async fn execute_on(
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(err @ ApiError::Database(_)) if !err.is_deterministic_database_failure() => {
+            Err(err @ ApiError::Database(_)) if err.is_known_transient_database_failure() => {
                 // A lock/statement timeout is the same not-applied transient contention handled
                 // by the drift branch below: the transaction has been rolled back before any
                 // commit was issued, so it is safe to rebuild the document plans and retry.

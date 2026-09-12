@@ -60,6 +60,14 @@ pub fn classify_db_failure(err: &sea_orm::DbErr) -> DbFailureClass {
     sqlstate(err).map_or(DbFailureClass::Transient, |code| classify_sqlstate(&code))
 }
 
+fn is_known_transient_sqlstate(code: &str) -> bool {
+    matches!(code, "40001" | "40P01" | "40003" | "55P03" | "55006" | "57014")
+        || code.starts_with("08")
+        || code.starts_with("53")
+        || code.starts_with("57")
+        || code.starts_with("58")
+}
+
 /// The `SQLSTATE` → class mapping, split out from [`classify_db_failure`] so it is reachable
 /// without a live database error: a `sqlx::Error::Database` cannot be constructed in a unit test,
 /// which would otherwise leave the actual decision table provable only by mutating production
@@ -70,16 +78,9 @@ pub fn classify_sqlstate(code: &str) -> DbFailureClass {
         // Retryable by definition, and the whole reason a rebase loop exists at all.
         // 40001 serialization_failure, 40P01 deadlock_detected, 40003 statement_completion_unknown,
         // 55P03 lock_not_available, 55006 object_in_use, 57014 query_canceled (statement timeout).
-        "40001" | "40P01" | "40003" | "55P03" | "55006" | "57014" => DbFailureClass::Transient,
+        code if is_known_transient_sqlstate(code) => DbFailureClass::Transient,
         // 08 connection exception, 53 insufficient resources, 57 operator intervention,
         // 58 system error. All about the server or the link, none about this statement.
-        code if code.starts_with("08")
-            || code.starts_with("53")
-            || code.starts_with("57")
-            || code.starts_with("58") =>
-        {
-            DbFailureClass::Transient
-        }
         // 23 integrity constraint violation (23502 not-null, 23503 foreign key, 23505 unique,
         // 23514 check, 23P01 exclusion), 22 data exception, 42 syntax error or access rule
         // violation. Every one of these is a statement the database will refuse identically on
@@ -94,7 +95,7 @@ pub fn classify_sqlstate(code: &str) -> DbFailureClass {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod sqlstate_tests {
-    use super::{DbFailureClass, classify_db_failure, classify_sqlstate};
+    use super::{DbFailureClass, classify_db_failure, classify_sqlstate, is_known_transient_sqlstate};
 
     /// The decision table that stops a permanent failure being advertised as temporary.
     ///
@@ -118,6 +119,7 @@ mod sqlstate_tests {
             "57P01", // admin_shutdown
             "58030", // io_error
         ] {
+            assert!(is_known_transient_sqlstate(transient));
             assert_eq!(
                 classify_sqlstate(transient),
                 DbFailureClass::Transient,
@@ -125,6 +127,11 @@ mod sqlstate_tests {
                  would discard writes that a retry would have landed"
             );
         }
+
+        assert!(
+            !is_known_transient_sqlstate("P0001"),
+            "an application-defined trigger exception must surface instead of being retried as contention"
+        );
 
         // Refused by the data or the schema, identically, forever.
         for deterministic in [
@@ -610,6 +617,16 @@ impl ApiError {
     #[must_use]
     pub fn is_deterministic_database_failure(&self) -> bool {
         matches!(self, Self::Database(err) if classify_db_failure(err) == DbFailureClass::Deterministic)
+    }
+
+    /// Whether `PostgreSQL` identified this error as one of the transient server/transaction
+    /// conditions that an in-process command loop may safely retry. Unlike
+    /// [`classify_db_failure`], this deliberately does not default an unknown SQLSTATE (or an
+    /// error without one) to transient: callers such as fault-injection tests must still observe
+    /// application-defined exceptions rather than having them converted into contention.
+    #[must_use]
+    pub fn is_known_transient_database_failure(&self) -> bool {
+        matches!(self, Self::Database(err) if sqlstate(err).is_some_and(|code| is_known_transient_sqlstate(&code)))
     }
 
     /// Constructs a [`Self::Typed`] error with no structured `details`.
