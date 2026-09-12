@@ -31,6 +31,7 @@ pub mod cache;
 pub mod compaction;
 pub mod coordinator;
 pub mod egress;
+pub mod fanout;
 pub mod frame;
 pub mod limits;
 pub mod origin;

@@ -12,7 +12,7 @@
 //!   -> [layer 1] SELECT authz_epoch ... FOR SHARE, held to commit; CAS against checked_epoch
 //!   -> SELECT collab_documents ... FOR UPDATE
 //!   -> if locked head != prepared head: rollback, bounded rebase outside the lock
-//!   -> allocate seq; insert update + head + projection + business event + one event_dispatch row
+//!   -> allocate seq; insert update + head + projection + business event + event_dispatch + fanout notice
 //!   -> commit
 //!   -> update the warm cache to the committed head
 //! ```
@@ -25,7 +25,7 @@
 //! check_snapshot`) runs inside a resource-ceilinged worker process spawned by
 //! `collab_core::isolation::isolated_apply` (`ADR-0014`; see `crates/collab-core/src/isolation/
 //! host.rs`'s module doc), not in this process at all. The only work [`run_locked_phase`] does is
-//! the epoch fence, the row lock, the head-match recheck, and the five fixed, parameterized
+//! the epoch fence, the row lock, the head-match recheck, and the fixed, parameterized
 //! inserts/updates — no engine call, no cache call, and no broadcast happen inside it or between
 //! its `begin`/`commit`.
 //!
@@ -867,6 +867,8 @@ pub(crate) async fn stage_one_document(
         ],
     ))
     .await?;
+
+    super::fanout::stage_document_update(tx, request.workspace_id, request.document_id, new_head_seq).await?;
 
     Ok(StagedOutcome::Ready(StagedWrite {
         event_id,
@@ -1843,6 +1845,16 @@ mod database_tests {
         .expect("count query runs")
         .expect("count query returns a row");
         assert_eq!(count.n, 0, "a refused write must leave no `collab_updates` row");
+        let notice_count = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM flow_fanout_notices WHERE document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("notice count query runs")
+        .expect("notice count returns a row");
+        assert_eq!(notice_count.n, 0, "a rolled-back write must not leave a durable notice");
 
         scratch.drop_self().await;
     }
@@ -1911,6 +1923,129 @@ mod database_tests {
         assert_eq!(accepted.head_seq, 1);
         assert_eq!(accepted.update_id, update_id);
         assert_eq!(count_collab_updates(&state, document_id, update_id).await, 1);
+        #[derive(FromQueryResult)]
+        struct NoticeRow {
+            document_seq: Option<i64>,
+        }
+        let notice = NoticeRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT document_seq FROM flow_fanout_notices \
+             WHERE document_id = $1 AND notice_kind = 'document_update'",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("notice query runs")
+        .expect("committed update has one durable fanout pointer");
+        assert_eq!(notice.document_seq, Some(accepted.head_seq));
+
+        scratch.drop_self().await;
+    }
+
+    /// The durable fanout pointer is part of the canonical write transaction, not a best-effort
+    /// after-commit side effect. A refusal at that final insert must roll back the update and head.
+    #[tokio::test]
+    async fn fanout_notice_failure_rolls_back_the_canonical_update_and_head() {
+        let scratch = scratch_or_skip!("fanout-atomicity");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state).await;
+        let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
+
+        #[derive(FromQueryResult)]
+        struct DocumentRow {
+            head_seq: i64,
+            snapshot: Vec<u8>,
+        }
+        let before = DocumentRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_seq, snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("document query runs")
+        .expect("document exists");
+        let (update_bytes, _engine) = a_valid_update_against(&before.snapshot);
+        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+
+        // Fail only this document's fanout insert. The SQLSTATE is a deterministic constraint
+        // refusal, matching the class production schemas can produce without relying on a mock.
+        state
+            .db
+            .execute_unprepared(&format!(
+                "CREATE FUNCTION reject_test_fanout() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN IF NEW.document_id = '{document_id}'::uuid THEN \
+                   RAISE EXCEPTION 'test fanout refusal' USING ERRCODE = '23514'; \
+                 END IF; RETURN NEW; END $$; \
+                 CREATE TRIGGER reject_test_fanout BEFORE INSERT ON flow_fanout_notices \
+                 FOR EACH ROW EXECUTE FUNCTION reject_test_fanout();"
+            ))
+            .await
+            .expect("fault trigger installs");
+
+        let update_id = Uuid::new_v4();
+        let outcome = accept_update(
+            &state.db,
+            &WarmCache::new(),
+            &DocumentCoordinator::new(),
+            &SessionRegistry::new(),
+            &SnapshotAdvancer::new(),
+            10,
+            None,
+            UpdateRequest {
+                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                    crate::flow::event_origin::EventSurface::Rest,
+                ),
+                document_id,
+                update_id,
+                bytes: update_bytes,
+                idempotency_key: None,
+                event_idempotency_key: None,
+                origin_client_id: Some("fanout-atomicity-test".to_string()),
+                message: None,
+                actor_id: owner_id,
+                actor_is_bot: false,
+                workspace_id,
+                checked_epoch,
+                expected_frontier: None,
+            },
+        )
+        .await
+        .expect("deterministic refusal is classified");
+        let AcceptOutcome::Rejected(rejected) = outcome else {
+            panic!("fanout refusal must reject the whole write");
+        };
+        assert_eq!(rejected.code, RejectedCode::ServerRejected);
+        assert_eq!(rejected.write_state, WriteState::NotApplied);
+        assert_eq!(count_collab_updates(&state, document_id, update_id).await, 0);
+
+        #[derive(FromQueryResult)]
+        struct CountRow {
+            n: i64,
+        }
+        let notice_count = CountRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT count(*) AS n FROM flow_fanout_notices WHERE document_id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("notice count query runs")
+        .expect("notice count returns a row");
+        assert_eq!(notice_count.n, 0);
+        let after = DocumentRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_seq, snapshot FROM collab_documents WHERE id = $1",
+            vec![document_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("document query runs")
+        .expect("document exists");
+        assert_eq!(
+            after.head_seq, before.head_seq,
+            "fanout failure must not advance the head"
+        );
 
         scratch.drop_self().await;
     }

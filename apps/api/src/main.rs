@@ -76,6 +76,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         flow_permission_cache: platform::app::FlowPermissionCacheSlot::default(),
     };
+    api::flow::collab::fanout::spawn_listener(state.db.clone(), &api::flow::collab::runtime::runtime().registry);
     let auth_state = state.clone();
     // Proposal settlement deliberately does not run here. It used to run both as an API
     // background task and inline on `GET /api/v1/proposals*`, which made a read request write
