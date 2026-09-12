@@ -121,11 +121,12 @@ set -euo pipefail
 #                                      out of the EFFECTIVE in-container config, are
 #                                      each strictly greater than 120 s
 #                                      (`limits-v1.md` warm_cache_idle_ttl_seconds).
-#   quiet_socket_survives_idle_ttl     the socket then stays completely silent for
-#                                      --idle-seconds (default 130, refused below
-#                                      121) and afterwards still exchanges a protocol
-#                                      frame: a `ping` with a random nonce answered by
-#                                      a `pong` carrying the same nonce.
+#   quiet_socket_survives_idle_ttl     the socket then stays free of business
+#                                      traffic for --idle-seconds (default 130,
+#                                      refused below 121). The raw client answers only
+#                                      the protocol's server heartbeat pings, as a real
+#                                      client must, and afterwards exchanges a fresh
+#                                      `ping`/matching-`pong` pair on the same socket.
 #
 #   Plus a hard post-condition: the assembled evidence is scanned for the ticket, the
 #   account password, the access token and any Authorization/Cookie value before it
@@ -781,23 +782,69 @@ idle = {"requested_seconds": IDLE_SECONDS, "idle_ttl_seconds": IDLE_TTL_SECONDS}
 idle_ok = False
 if protocol_ok and reader is not None:
     try:
-        nonce = uuid.uuid4().hex
         started = time.monotonic()
+        deadline = started + IDLE_SECONDS
+        heartbeat_pings_answered = 0
+        unexpected_frames = []
         idle["quiet_from"] = now()
-        time.sleep(IDLE_SECONDS)
+        # "Quiet" means no business work from the client. The Flow protocol nevertheless
+        # requires a live client to answer the server's application-level heartbeat pings. A
+        # browser WebSocket client does this in its protocol adapter; this deliberately tiny raw
+        # client must do the same instead of buffering the first ping and letting the API close a
+        # healthy connection 60 seconds into a 130-second proxy test.
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                inbound = reader.frame(min(remaining, 35))
+            except TimeoutError:
+                continue
+            if inbound.get("type") == "ping" and inbound.get("nonce"):
+                ws_send_text(sock, json.dumps({
+                    "type": "pong",
+                    "protocol_version": 1,
+                    "nonce": inbound["nonce"],
+                }))
+                heartbeat_pings_answered += 1
+            else:
+                unexpected_frames.append(inbound.get("type"))
         idle["quiet_until"] = now()
         idle["measured_seconds"] = round(time.monotonic() - started, 3)
+        idle["business_frames_sent_during_quiet"] = 0
+        idle["heartbeat_pings_answered"] = heartbeat_pings_answered
+        idle["unexpected_frame_types"] = unexpected_frames
+
+        nonce = uuid.uuid4().hex
         ws_send_text(sock, json.dumps({"type": "ping", "protocol_version": 1, "nonce": nonce}))
-        pong = reader.frame(30)
+        pong = None
+        probe_deadline = time.monotonic() + 30
+        while time.monotonic() < probe_deadline:
+            candidate = reader.frame(probe_deadline - time.monotonic())
+            if candidate.get("type") == "ping" and candidate.get("nonce"):
+                ws_send_text(sock, json.dumps({
+                    "type": "pong",
+                    "protocol_version": 1,
+                    "nonce": candidate["nonce"],
+                }))
+                heartbeat_pings_answered += 1
+                idle["heartbeat_pings_answered"] = heartbeat_pings_answered
+                continue
+            pong = candidate
+            if pong.get("type") == "pong" and pong.get("nonce") == nonce:
+                break
+            unexpected_frames.append(pong.get("type"))
+        if pong is None:
+            raise TimeoutError("timed out waiting for the post-idle protocol pong")
         idle["response_type"] = pong.get("type")
         idle["nonce_echoed"] = pong.get("nonce") == nonce
         idle_ok = (pong.get("type") == "pong" and pong.get("nonce") == nonce
-                   and idle["measured_seconds"] > IDLE_TTL_SECONDS)
+                   and idle["measured_seconds"] > IDLE_TTL_SECONDS
+                   and not unexpected_frames)
     except Exception as exc:                                 # noqa: BLE001
         idle["error"] = str(exc)[:300]
 check("quiet_socket_survives_idle_ttl", idle_ok,
-      "after %s s of complete silence -- past the %d s warm_cache_idle_ttl_seconds -- the same "
-      "socket still exchanged a protocol frame (ping -> pong with the same nonce)"
+      "after %s s without business traffic -- past the %d s warm_cache_idle_ttl_seconds, "
+      "while answering only required server heartbeats -- the same socket still exchanged a "
+      "protocol frame (ping -> pong with the same nonce)"
       % (idle.get("measured_seconds"), IDLE_TTL_SECONDS) if idle_ok else
       "the quiet socket did not survive the idle TTL, or the post-idle frame exchange failed",
       **idle)
