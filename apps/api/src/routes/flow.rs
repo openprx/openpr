@@ -32,9 +32,12 @@ use axum::{
     http::HeaderMap,
     response::IntoResponse,
 };
+use chrono::{DateTime, Utc};
 use platform::{app::AppState, auth::JwtClaims};
-use serde::Deserialize;
+use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::middleware::bot_auth::{BotAuthContext, require_workspace_access};
@@ -233,6 +236,146 @@ fn build_auth_extensions(claims: JwtClaims, bot: Option<Extension<BotAuthContext
         extensions.insert(bot_ctx);
     }
     extensions
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReplayDeliveriesRequest {
+    pub mode: crate::events::dispatcher::ReplayMode,
+    pub event_type: Option<String>,
+    pub subscriber_kind: Option<String>,
+    pub subscriber_id: Option<Uuid>,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub dry_run: bool,
+    pub confirm: bool,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ReplayIdempotencyRow {
+    request_hash: String,
+    status: String,
+    result_redacted: Option<Value>,
+}
+
+/// `POST /api/v1/admin/workspaces/{workspace_id}/flow/deliveries/replay`.
+pub async fn post_flow_delivery_replay(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Json(req): Json<ReplayDeliveriesRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    if !req.confirm || req.idempotency_key.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "confirm=true and a non-empty idempotency_key are required".to_string(),
+        ));
+    }
+    if let Some(Extension(context)) = &bot
+        && context.tool_name.as_deref() != Some("deliveries.replay")
+    {
+        return Err(ApiError::Forbidden(
+            "delivery replay requires the exact deliveries.replay tool policy".to_string(),
+        ));
+    }
+    let extensions = build_auth_extensions(claims, bot);
+    let (principal_id, _role, is_bot) =
+        policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+    let principal_kind = if is_bot { "bot" } else { "user" };
+    let request_bytes = serde_json::to_vec(&req).map_err(|_| ApiError::Internal)?;
+    let request_hash = format!("{:x}", Sha256::digest(request_bytes));
+
+    let inserted = state
+        .db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO flow_replay_requests \
+               (workspace_id,principal_kind,principal_id,idempotency_key,request_hash) \
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+            vec![
+                workspace_id.into(),
+                principal_kind.into(),
+                principal_id.into(),
+                req.idempotency_key.clone().into(),
+                request_hash.clone().into(),
+            ],
+        ))
+        .await?
+        .rows_affected();
+    if inserted == 0 {
+        let prior = ReplayIdempotencyRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT request_hash,status,result_redacted FROM flow_replay_requests \
+              WHERE workspace_id=$1 AND principal_kind=$2 AND principal_id=$3 AND idempotency_key=$4",
+            vec![
+                workspace_id.into(),
+                principal_kind.into(),
+                principal_id.into(),
+                req.idempotency_key.into(),
+            ],
+        ))
+        .one(&state.db)
+        .await?
+        .ok_or(ApiError::Internal)?;
+        if prior.request_hash != request_hash {
+            return Err(ApiError::Conflict("idempotency key body drift".to_string()));
+        }
+        if prior.status != "completed" {
+            return Err(ApiError::Conflict(
+                "identical replay request is still running".to_string(),
+            ));
+        }
+        return Ok(ApiResponse::success(prior.result_redacted.ok_or(ApiError::Internal)?).into_response());
+    }
+
+    let request = crate::events::dispatcher::ReplayRequest {
+        workspace_id,
+        mode: req.mode,
+        event_type: req.event_type,
+        subscriber_kind: req.subscriber_kind,
+        subscriber_id: req.subscriber_id,
+        from: req.from,
+        to: req.to,
+        dry_run: req.dry_run,
+    };
+    let result = match crate::events::dispatcher::replay_deliveries(&state.db, &request, Utc::now()).await {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = state
+                .db
+                .execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "DELETE FROM flow_replay_requests \
+                      WHERE workspace_id=$1 AND principal_kind=$2 AND principal_id=$3 \
+                        AND idempotency_key=$4 AND status='running'",
+                    vec![
+                        workspace_id.into(),
+                        principal_kind.into(),
+                        principal_id.into(),
+                        req.idempotency_key.into(),
+                    ],
+                ))
+                .await;
+            return Err(error);
+        }
+    };
+    let result_json = serde_json::to_value(&result).map_err(|_| ApiError::Internal)?;
+    state
+        .db
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE flow_replay_requests SET status='completed',result_redacted=$5,finished_at=now() \
+              WHERE workspace_id=$1 AND principal_kind=$2 AND principal_id=$3 AND idempotency_key=$4",
+            vec![
+                workspace_id.into(),
+                principal_kind.into(),
+                principal_id.into(),
+                req.idempotency_key.into(),
+                result_json.into(),
+            ],
+        ))
+        .await?;
+    Ok(ApiResponse::success(result).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1012,7 +1155,7 @@ pub async fn set_flow_feature(
 mod flow_database_tests {
     use std::time::Duration;
 
-    use super::{GrantRequestBody, SetGrantsRequest};
+    use super::{GrantRequestBody, ReplayDeliveriesRequest, SetGrantsRequest, post_flow_delivery_replay};
     use axum::body::to_bytes;
     use axum::response::{IntoResponse, Response};
     use base64::Engine as _;
@@ -8547,6 +8690,93 @@ mod flow_database_tests {
         assert!(page["data"].get("total").is_none());
         assert!(page["data"].get("filtered_count").is_none());
         assert!(page["data"].get("examined").is_none());
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_replay_route_requires_admin_and_replays_identical_idempotency_key() {
+        let scratch = scratch_or_skip!("delivery-replay-route");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let now = chrono::Utc::now();
+        let request = ReplayDeliveriesRequest {
+            mode: crate::events::dispatcher::ReplayMode::Rebuild,
+            event_type: None,
+            subscriber_kind: Some("webhook".to_string()),
+            subscriber_id: None,
+            from: now - chrono::Duration::hours(2),
+            to: now - chrono::Duration::hours(1),
+            dry_run: true,
+            confirm: true,
+            idempotency_key: "replay-route-key".to_string(),
+        };
+        let denied = post_flow_delivery_replay(
+            State(state.clone()),
+            claims_for(member_id),
+            None,
+            Path(workspace_id),
+            Json(request.clone()),
+        )
+        .await;
+        assert!(denied.is_err(), "a non-admin member must be rejected");
+
+        let first = body_json(to_response(
+            post_flow_delivery_replay(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(request.clone()),
+            )
+            .await,
+        ))
+        .await;
+        let second = body_json(to_response(
+            post_flow_delivery_replay(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(request.clone()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(first["code"], 0, "{first}");
+        assert_eq!(
+            first["data"], second["data"],
+            "identical replay must return the stored result"
+        );
+        let ledger_rows = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM flow_replay_requests WHERE workspace_id=$1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("ledger count runs")
+            .expect("ledger count row")
+            .try_get::<i64>("", "n")
+            .expect("ledger count reads");
+        assert_eq!(ledger_rows, 1);
+
+        let mut drift = request;
+        drift.event_type = Some("flow.object.created".to_string());
+        assert!(
+            post_flow_delivery_replay(
+                State(state),
+                claims_for(owner_id),
+                None,
+                Path(workspace_id),
+                Json(drift),
+            )
+            .await
+            .is_err(),
+            "same key with a changed semantic body must conflict"
+        );
 
         scratch.drop_self().await;
     }

@@ -1568,6 +1568,13 @@ async fn main() -> anyhow::Result<()> {
                     middleware::bot_auth::bot_or_user_auth_middleware,
                 )),
         )
+        .route(
+            "/api/v1/admin/workspaces/{workspace_id}/flow/deliveries/replay",
+            post(routes::flow::post_flow_delivery_replay).route_layer(axum_middleware::from_fn_with_state(
+                auth_state.clone(),
+                middleware::bot_auth::bot_or_user_auth_middleware,
+            )),
+        )
         // Collab tickets/diagnostics/verify (protected, user or bot per `rest-api-v1.md`); the
         // WebSocket upgrade route below is deliberately unprotected by this middleware — it
         // authenticates via the one-time ticket itself (`ADR-0007`), never a Bearer/cookie token.
@@ -2325,6 +2332,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0063_flow_v08_hardening.sql",
         include_str!("../../../migrations/0063_flow_v08_hardening.sql"),
     ),
+    (
+        "0064_flow_v08_replay_requests.sql",
+        include_str!("../../../migrations/0064_flow_v08_replay_requests.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2662,6 +2673,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0063_flow_v08_hardening.sql",
         SchemaProbe::Relation("flow_operation_runs"),
+    ),
+    (
+        "0064_flow_v08_replay_requests.sql",
+        SchemaProbe::Relation("flow_replay_requests"),
     ),
 ];
 

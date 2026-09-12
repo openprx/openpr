@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use chrono::{DateTime, Utc};
 use platform::app::AppState;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -226,6 +227,14 @@ const DISPATCH_FAILED_RETENTION_DAYS: i64 = 90;
 /// documented `>= delivery_retention_days` floor with 3x headroom and leaves an operator a full
 /// quarter to look up what a dead-lettered delivery covered before its dedup evidence disappears.
 const DELIVERY_SOURCE_RETENTION_DAYS: i64 = 90;
+
+/// `replay_max_window_days`, proposed for the v0.8 reviewed budget lock.
+///
+/// Sixty days keeps replay strictly inside the independently retained 90-day source tombstone
+/// window and leaves one full `delivery_retention_days` cleanup cycle of safety margin.  The
+/// contract remains the authority: this value must be copied into its reviewed budget artifact
+/// before an official candidate can pass.
+pub const REPLAY_MAX_WINDOW_DAYS: i64 = 60;
 
 /// Header carrying the immutable consumer dedup key (`events-v1.md` "投递报文与 `delivery_id` 的
 /// 位置"). `delivery.id` in the body is the same value; both are written together below.
@@ -1420,6 +1429,243 @@ pub async fn requeue_failed(db: &DatabaseConnection, workspace_id: Uuid, now: Da
     Ok(result.rows_affected())
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayMode {
+    Rebuild,
+    RequeueFailed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayRequest {
+    pub workspace_id: Uuid,
+    pub mode: ReplayMode,
+    pub event_type: Option<String>,
+    pub subscriber_kind: Option<String>,
+    pub subscriber_id: Option<Uuid>,
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReplayWindow {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ReplayResult {
+    Rebuild {
+        replayed: u64,
+        skipped_already_delivered: u64,
+        rebuilt_delivery_ids: Vec<Uuid>,
+        window: ReplayWindow,
+    },
+    RequeueFailed {
+        requeued: u64,
+        skipped_not_failed: u64,
+        requeued_delivery_ids: Vec<Uuid>,
+        window: ReplayWindow,
+    },
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ReplayCandidate {
+    event_id: Uuid,
+    subscriber_id: Uuid,
+    already_delivered: bool,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RequeueCandidate {
+    id: Uuid,
+    status: String,
+}
+
+fn validate_replay_window(request: &ReplayRequest, now: DateTime<Utc>) -> Result<(), ApiError> {
+    if request.from >= request.to || request.to > now {
+        return Err(ApiError::BadRequest(
+            "replay window must be non-empty, half-open, and not extend into the future".to_string(),
+        ));
+    }
+    let oldest = now - chrono::Duration::days(REPLAY_MAX_WINDOW_DAYS);
+    if request.from <= oldest {
+        return Err(ApiError::BadRequest(
+            "replay window is outside replay_max_window_days".to_string(),
+        ));
+    }
+    if request.subscriber_kind.as_deref().is_some_and(|kind| kind != "webhook") {
+        return Err(ApiError::BadRequest("unsupported subscriber_kind".to_string()));
+    }
+    Ok(())
+}
+
+/// Rebuilds missing webhook deliveries or revives failed deliveries inside one exact window.
+///
+/// `rebuild` filters source events by `business_events.created_at`, reserves the existing
+/// `(subscriber, source_event)` dedup key before it creates a delivery, and binds both rows in one
+/// transaction. `requeue_failed` instead filters `event_deliveries.terminated_at` and preserves
+/// each delivery id. Dry-run executes the same candidate queries but performs zero writes.
+pub async fn replay_deliveries(
+    db: &DatabaseConnection,
+    request: &ReplayRequest,
+    now: DateTime<Utc>,
+) -> Result<ReplayResult, ApiError> {
+    validate_replay_window(request, now)?;
+    let window = ReplayWindow {
+        from: request.from,
+        to: request.to,
+    };
+    match request.mode {
+        ReplayMode::Rebuild => {
+            let candidates = ReplayCandidate::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    SELECT be.id AS event_id, wh.id AS subscriber_id,
+                           EXISTS (
+                             SELECT 1 FROM event_delivery_sources src
+                              WHERE src.subscriber_kind = 'webhook'
+                                AND src.subscriber_id = wh.id
+                                AND src.source_event_id = be.id
+                           ) AS already_delivered
+                      FROM business_events be
+                      JOIN webhooks wh ON wh.workspace_id = be.workspace_id
+                                      AND wh.active = true
+                                      AND wh.events ? be.event_type
+                     WHERE be.workspace_id = $1
+                       AND be.created_at >= $2 AND be.created_at < $3
+                       AND ($4::text IS NULL OR be.event_type = $4)
+                       AND ($5::uuid IS NULL OR wh.id = $5)
+                     ORDER BY be.created_at, be.id, wh.id
+                ",
+                vec![
+                    request.workspace_id.into(),
+                    request.from.into(),
+                    request.to.into(),
+                    request.event_type.clone().into(),
+                    request.subscriber_id.into(),
+                ],
+            ))
+            .all(db)
+            .await?;
+            let skipped = candidates.iter().filter(|row| row.already_delivered).count() as u64;
+            let planned = candidates.len() as u64 - skipped;
+            if request.dry_run {
+                return Ok(ReplayResult::Rebuild {
+                    replayed: planned,
+                    skipped_already_delivered: skipped,
+                    rebuilt_delivery_ids: Vec::new(),
+                    window,
+                });
+            }
+
+            let tx = db.begin().await?;
+            let mut rebuilt = Vec::new();
+            let mut concurrent_skips = 0_u64;
+            for candidate in candidates.into_iter().filter(|row| !row.already_delivered) {
+                let reserved = ReservedSourceRow::find_by_statement(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO event_delivery_sources \
+                       (workspace_id, delivery_id, subscriber_kind, subscriber_id, source_event_id) \
+                     VALUES ($1, NULL, 'webhook', $2, $3) \
+                     ON CONFLICT (subscriber_kind, subscriber_id, source_event_id) DO NOTHING \
+                     RETURNING id",
+                    vec![
+                        request.workspace_id.into(),
+                        candidate.subscriber_id.into(),
+                        candidate.event_id.into(),
+                    ],
+                ))
+                .one(&tx)
+                .await?;
+                let Some(reserved) = reserved else {
+                    concurrent_skips += 1;
+                    continue;
+                };
+                let delivery_id = Uuid::new_v4();
+                tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "INSERT INTO event_deliveries \
+                       (id, dispatch_id, event_id, workspace_id, subscriber_kind, subscriber_id, \
+                        document_id, status, next_attempt_at) \
+                     VALUES ($1, NULL, $2, $3, 'webhook', $4, NULL, 'pending', $5)",
+                    vec![
+                        delivery_id.into(),
+                        candidate.event_id.into(),
+                        request.workspace_id.into(),
+                        candidate.subscriber_id.into(),
+                        now.into(),
+                    ],
+                ))
+                .await?;
+                tx.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE event_delivery_sources SET delivery_id = $1 WHERE id = $2",
+                    vec![delivery_id.into(), reserved.id.into()],
+                ))
+                .await?;
+                rebuilt.push(delivery_id);
+            }
+            tx.commit().await?;
+            Ok(ReplayResult::Rebuild {
+                replayed: rebuilt.len() as u64,
+                skipped_already_delivered: skipped + concurrent_skips,
+                rebuilt_delivery_ids: rebuilt,
+                window,
+            })
+        }
+        ReplayMode::RequeueFailed => {
+            let candidates = RequeueCandidate::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                r"
+                    SELECT d.id, d.status
+                      FROM event_deliveries d
+                      JOIN business_events be ON be.id = d.event_id
+                     WHERE d.workspace_id = $1
+                       AND d.terminated_at >= $2 AND d.terminated_at < $3
+                       AND ($4::text IS NULL OR be.event_type = $4)
+                       AND ($5::uuid IS NULL OR d.subscriber_id = $5)
+                     ORDER BY d.terminated_at, d.id
+                ",
+                vec![
+                    request.workspace_id.into(),
+                    request.from.into(),
+                    request.to.into(),
+                    request.event_type.clone().into(),
+                    request.subscriber_id.into(),
+                ],
+            ))
+            .all(db)
+            .await?;
+            let ids = candidates
+                .iter()
+                .filter(|row| row.status == "failed")
+                .map(|row| row.id)
+                .collect::<Vec<_>>();
+            let skipped = candidates.len() as u64 - ids.len() as u64;
+            if !request.dry_run && !ids.is_empty() {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE event_deliveries \
+                        SET status='pending', document_id=NULL, terminated_at=NULL, attempts=0, \
+                            next_attempt_at=$2, lease_token=NULL, lease_expires_at=NULL, last_error_code=NULL \
+                      WHERE workspace_id=$1 AND status='failed' AND id = ANY($3)",
+                    vec![request.workspace_id.into(), now.into(), ids.clone().into()],
+                ))
+                .await?;
+            }
+            Ok(ReplayResult::RequeueFailed {
+                requeued: ids.len() as u64,
+                skipped_not_failed: skipped,
+                requeued_delivery_ids: if request.dry_run { Vec::new() } else { ids },
+                window,
+            })
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Real-database tests (opt-in via `OPENPR_TEST_DATABASE_URL`, matching
 // `apps/api/src/routes/flow.rs`'s `flow_database_tests` — own throwaway database per run,
@@ -1443,11 +1689,12 @@ mod dispatcher_database_tests {
 
     use super::{
         BusinessEventRow, DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B,
-        OLDEST_PENDING_AGE_ALERT_MS, SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body,
-        dispatcher_is_live, dispatcher_is_live_since, ensure_workspace_subscriber_slot, envelope_json, expand_one,
-        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_source_tombstones,
-        reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases, requeue_failed, run_tick, send_one,
-        workspace_subscriber_count,
+        OLDEST_PENDING_AGE_ALERT_MS, REPLAY_MAX_WINDOW_DAYS, ReplayMode, ReplayRequest, ReplayResult,
+        SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body, dispatcher_is_live,
+        dispatcher_is_live_since, ensure_workspace_subscriber_slot, envelope_json, expand_one,
+        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_retention,
+        reap_delivery_source_tombstones, reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases,
+        replay_deliveries, requeue_failed, run_tick, send_one, workspace_subscriber_count,
     };
     use crate::error::ApiError;
     use crate::events::{BusinessEventInput, insert_business_event};
@@ -5050,6 +5297,245 @@ mod dispatcher_database_tests {
             .await,
             1,
             "no second delivery row was minted by the re-expansion"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn replay_is_windowed_deduplicated_and_crosses_delivery_retention_without_duplication() {
+        let scratch = scratch_or_skip!("v08-replay-retention");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let now = Utc::now();
+        let event_id = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.object.created",
+            None,
+            None,
+            json!({"object_id": Uuid::new_v4()}),
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "DELETE FROM event_dispatch WHERE event_id=$1",
+            vec![event_id.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE business_events SET created_at=$2 WHERE id=$1",
+            vec![event_id.into(), (now - chrono::Duration::days(40)).into()],
+        )
+        .await;
+        let request = ReplayRequest {
+            workspace_id,
+            mode: ReplayMode::Rebuild,
+            event_type: Some("flow.object.created".to_string()),
+            subscriber_kind: Some("webhook".to_string()),
+            subscriber_id: Some(webhook_id),
+            from: now - chrono::Duration::days(41),
+            to: now - chrono::Duration::days(39),
+            dry_run: true,
+        };
+
+        let preview = replay_deliveries(&scratch.db, &request, now)
+            .await
+            .expect("preview succeeds");
+        assert!(matches!(
+            preview,
+            ReplayResult::Rebuild {
+                replayed: 1,
+                skipped_already_delivered: 0,
+                ref rebuilt_delivery_ids,
+                ..
+            } if rebuilt_delivery_ids.is_empty()
+        ));
+        assert_eq!(
+            count(&scratch.db, "SELECT count(*) AS n FROM event_deliveries", vec![]).await,
+            0,
+            "dry-run must write no canonical delivery or source row"
+        );
+
+        let mut execute = request.clone();
+        execute.dry_run = false;
+        let first = replay_deliveries(&scratch.db, &execute, now)
+            .await
+            .expect("rebuild succeeds");
+        let delivery_id = match first {
+            ReplayResult::Rebuild {
+                replayed: 1,
+                skipped_already_delivered: 0,
+                rebuilt_delivery_ids,
+                ..
+            } => rebuilt_delivery_ids[0],
+            other => panic!("unexpected first replay result: {other:?}"),
+        };
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET status='dispatched', terminated_at=$2 WHERE id=$1",
+            vec![delivery_id.into(), (now - chrono::Duration::days(31)).into()],
+        )
+        .await;
+        assert_eq!(reap_delivery_retention(&scratch.db, now).await.expect("reaper runs"), 1);
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources \
+                  WHERE source_event_id=$1 AND delivery_id IS NULL",
+                vec![event_id.into()],
+            )
+            .await,
+            1,
+            "the source tombstone must outlive the 30-day delivery"
+        );
+
+        let second = replay_deliveries(&scratch.db, &execute, now)
+            .await
+            .expect("second replay succeeds");
+        assert!(matches!(
+            second,
+            ReplayResult::Rebuild {
+                replayed: 0,
+                skipped_already_delivered: 1,
+                ref rebuilt_delivery_ids,
+                ..
+            } if rebuilt_delivery_ids.is_empty()
+        ));
+        assert_eq!(
+            count(&scratch.db, "SELECT count(*) AS n FROM event_deliveries", vec![]).await,
+            0,
+            "a retained source tombstone must prevent a replacement delivery"
+        );
+
+        let mut exact_boundary = request;
+        exact_boundary.from = now - chrono::Duration::days(REPLAY_MAX_WINDOW_DAYS);
+        assert!(replay_deliveries(&scratch.db, &exact_boundary, now).await.is_err());
+        exact_boundary.from += chrono::Duration::milliseconds(1);
+        assert!(replay_deliveries(&scratch.db, &exact_boundary, now).await.is_ok());
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn requeue_failed_filters_terminated_time_and_preserves_delivery_id() {
+        let scratch = scratch_or_skip!("v08-requeue-failed");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let now = Utc::now();
+        let event_id = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.object.created",
+            None,
+            None,
+            json!({"object_id": Uuid::new_v4()}),
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "DELETE FROM event_dispatch WHERE event_id=$1",
+            vec![event_id.into()],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "UPDATE business_events SET created_at=$2 WHERE id=$1",
+            vec![event_id.into(), (now - chrono::Duration::days(120)).into()],
+        )
+        .await;
+        let delivery_id = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO event_deliveries \
+               (id,event_id,workspace_id,subscriber_kind,subscriber_id,document_id,status,attempts,terminated_at) \
+             VALUES ($1,$2,$3,'webhook',$4,$5,'failed',10,$6)",
+            vec![
+                delivery_id.into(),
+                event_id.into(),
+                workspace_id.into(),
+                webhook_id.into(),
+                Uuid::new_v4().into(),
+                (now - chrono::Duration::days(1)).into(),
+            ],
+        )
+        .await;
+        exec(
+            &scratch.db,
+            "INSERT INTO event_delivery_sources \
+               (workspace_id,delivery_id,subscriber_kind,subscriber_id,source_event_id) \
+             VALUES ($1,$2,'webhook',$3,$4)",
+            vec![
+                workspace_id.into(),
+                delivery_id.into(),
+                webhook_id.into(),
+                event_id.into(),
+            ],
+        )
+        .await;
+        let request = ReplayRequest {
+            workspace_id,
+            mode: ReplayMode::RequeueFailed,
+            event_type: Some("flow.object.created".to_string()),
+            subscriber_kind: Some("webhook".to_string()),
+            subscriber_id: Some(webhook_id),
+            from: now - chrono::Duration::days(2),
+            to: now,
+            dry_run: false,
+        };
+        let result = replay_deliveries(&scratch.db, &request, now)
+            .await
+            .expect("requeue succeeds");
+        assert_eq!(
+            result,
+            ReplayResult::RequeueFailed {
+                requeued: 1,
+                skipped_not_failed: 0,
+                requeued_delivery_ids: vec![delivery_id],
+                window: super::ReplayWindow {
+                    from: request.from,
+                    to: request.to,
+                },
+            }
+        );
+        let status: String = get_col(
+            &scratch.db,
+            "SELECT status FROM event_deliveries WHERE id=$1",
+            vec![delivery_id.into()],
+            "status",
+        )
+        .await;
+        let document_id: Option<Uuid> = get_col(
+            &scratch.db,
+            "SELECT document_id FROM event_deliveries WHERE id=$1",
+            vec![delivery_id.into()],
+            "document_id",
+        )
+        .await;
+        assert_eq!(status, "pending");
+        assert_eq!(document_id, None);
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources WHERE delivery_id=$1",
+                vec![delivery_id.into()],
+            )
+            .await,
+            1,
+            "requeue must not replace or duplicate the source tombstone"
         );
 
         scratch.drop_self().await;
