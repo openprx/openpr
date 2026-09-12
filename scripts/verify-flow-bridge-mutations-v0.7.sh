@@ -139,7 +139,7 @@ elif case == "new_form_admin_preview_commit":
 ''')
 elif case == "flow_shrink_commit":
     replace(bridge, '''    if actor.flow_level < PermissionLevel::Edit {
-''', '''    if actor.flow_level < PermissionLevel::View {
+''', '''    if actor.flow_level < PermissionLevel::Denied {
 ''')
 elif case == "native_autonumber":
     replace(native, '''    let with_autonumber = apply_autonumber_values(tx, form, None, calculated).await?;
@@ -217,7 +217,7 @@ CASES=(
 for spec in "${CASES[@]}"; do
   mutation="${spec%%:*}"
   group="${spec#*:}"
-  tree="$RUN_ROOT/$mutation"
+  tree="$RUN_ROOT/worktree"
   git -C "$REPO_ROOT" worktree add --detach "$tree" "$SOURCE_HEAD" >/dev/null
   WORKTREES+=("$tree")
   mutate_case "$tree" "$mutation"

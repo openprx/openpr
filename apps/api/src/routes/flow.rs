@@ -5091,7 +5091,7 @@ mod flow_database_tests {
                 None,
                 Json(crate::flow::bridge::ConversionCommitInput {
                     preview_id,
-                    source_frontier: frontier,
+                    source_frontier: frontier.clone(),
                     target_schema_version: 1,
                     idempotency_key: Uuid::new_v4().to_string(),
                     confirm: true,
@@ -5462,7 +5462,7 @@ mod flow_database_tests {
                 None,
                 Json(crate::flow::bridge::ConversionCommitInput {
                     preview_id,
-                    source_frontier: frontier,
+                    source_frontier: frontier.clone(),
                     target_schema_version: 1,
                     idempotency_key: Uuid::new_v4().to_string(),
                     confirm: true,
@@ -5472,6 +5472,10 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(rejected["code"], 403, "{rejected}");
+        assert_eq!(
+            rejected["message"], "bridge permission changed before commit",
+            "the Flow shrink gate must reject before target reauthorization"
+        );
         assert_eq!(
             rejected["details"]["permission_state"]["actions"],
             json!(["form.view"]),
