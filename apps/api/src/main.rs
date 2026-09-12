@@ -3621,6 +3621,84 @@ mod migration_runner_database_tests {
         scratch.drop_self().await;
     }
 
+    async fn flow_forms_bridge_schema_snapshot(db: &DatabaseConnection) -> String {
+        db.query_one(Statement::from_string(
+            DbBackend::Postgres,
+            "SELECT jsonb_build_object( \
+                 'columns', ( \
+                   SELECT coalesce(jsonb_agg(jsonb_build_array(table_name, column_name, data_type, \
+                     is_nullable, column_default) ORDER BY table_name, ordinal_position), '[]'::jsonb) \
+                   FROM information_schema.columns \
+                   WHERE table_schema = current_schema() AND ( \
+                     table_name IN ('flow_bridge_references', 'flow_conversion_previews', \
+                       'flow_conversion_jobs', 'flow_object_lineage') OR \
+                     (table_name = 'workspace_bots' AND column_name = 'transport_surface') OR \
+                     (table_name = 'flow_workspace_settings' AND column_name = 'bridge_enabled') \
+                   ) \
+                 ), \
+                 'constraints', ( \
+                   SELECT coalesce(jsonb_agg(jsonb_build_array(rel.relname, con.conname, \
+                     pg_get_constraintdef(con.oid)) ORDER BY rel.relname, con.conname), '[]'::jsonb) \
+                   FROM pg_constraint con JOIN pg_class rel ON rel.oid = con.conrelid \
+                   JOIN pg_namespace ns ON ns.oid = rel.relnamespace \
+                   WHERE ns.nspname = current_schema() AND rel.relname IN ( \
+                     'workspace_bots', 'flow_bridge_references', 'flow_conversion_previews', \
+                     'flow_conversion_jobs', 'flow_object_lineage') \
+                 ), \
+                 'indexes', ( \
+                   SELECT coalesce(jsonb_agg(jsonb_build_array(tablename, indexname, indexdef) \
+                     ORDER BY tablename, indexname), '[]'::jsonb) \
+                   FROM pg_indexes WHERE schemaname = current_schema() AND tablename IN ( \
+                     'flow_bridge_references', 'flow_conversion_previews', \
+                     'flow_conversion_jobs', 'flow_object_lineage') \
+                 ), \
+                 'view', pg_get_viewdef('flow_forms_bridge_schema_guard'::regclass, true), \
+                 'rows', jsonb_build_array( \
+                   (SELECT count(*) FROM flow_bridge_references), \
+                   (SELECT count(*) FROM flow_conversion_previews), \
+                   (SELECT count(*) FROM flow_conversion_jobs), \
+                   (SELECT count(*) FROM flow_object_lineage) \
+                 ) \
+               )::text AS snapshot"
+                .to_string(),
+        ))
+        .await
+        .expect("bridge schema snapshot query runs")
+        .expect("bridge schema snapshot query returns one row")
+        .try_get("", "snapshot")
+        .expect("bridge schema snapshot is text")
+    }
+
+    /// 0062 is after the adoption cutoff, so an existing database may execute it after some or
+    /// all of its objects already exist. Execute the exact migration twice and compare the
+    /// complete bridge schema plus row counts; syntax-only `IF NOT EXISTS` scans are insufficient.
+    #[tokio::test]
+    async fn flow_forms_bridge_migration_is_replay_safe() {
+        let scratch = scratch_or_skip!("flow_forms_bridge_replay");
+        seed_pre_ledger_schema(&scratch.db, Some("0062_flow_forms_bridge.sql")).await;
+
+        let migration = std::env::var("OPENPR_TEST_FLOW_BRIDGE_MIGRATION_PATH").map_or_else(
+            |_| include_str!("../../../migrations/0062_flow_forms_bridge.sql").to_string(),
+            |path| std::fs::read_to_string(path).expect("test migration override is readable"),
+        );
+        scratch
+            .db
+            .execute_unprepared(&migration)
+            .await
+            .expect("0062 first execution succeeds");
+        let first = flow_forms_bridge_schema_snapshot(&scratch.db).await;
+
+        scratch
+            .db
+            .execute_unprepared(&migration)
+            .await
+            .expect("0062 second execution succeeds");
+        let second = flow_forms_bridge_schema_snapshot(&scratch.db).await;
+        assert_eq!(second, first, "0062 replay must preserve schema objects and row counts");
+
+        scratch.drop_self().await;
+    }
+
     /// ADR-0018 NR-1..NR-4 is a data migration, not just a final CHECK constraint: it must create
     /// one addressable root aggregate, reparent compatible legacy rows, survive replay, and make
     /// the old NULL-parent page shape impossible afterward.

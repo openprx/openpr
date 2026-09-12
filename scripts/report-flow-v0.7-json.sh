@@ -31,6 +31,7 @@ commands={
  "mcp_policy":["cargo","test","-p","mcp-server","tool_policy_scopes_match_the_registered_tool_schemas","--","--nocapture"],
  "cli_bridge":["cargo","test","-p","mcp-server","parses_every_v07_bridge_command_line","--","--nocapture"],
  "bridge_smoke":[str(repo/'scripts/smoke-flow-forms-bridge.sh'),"--evidence-root",str(evidence),"--json"],
+ "migration_replay":[str(repo/'scripts/verify-flow-migration-replay-v0.7.sh'),"--repo-root",str(repo),"--evidence-root",str(evidence),"--json"],
  "forms_full":["bash","scripts/ci-universal-forms-gates.sh"],
  "flow_full":["cargo","test","-p","api","flow","--","--nocapture"],
  "cardinality":[str(repo/'scripts/verify-flow-cardinality-v0.7.sh'),"--adr",str(contracts/'decisions/ADR-0013-multi-document-atomicity.md'),"--since-release","0.6","--contracts-root",str(contracts),"--evidence-root",str(evidence),"--repo-root",str(repo),"--json"],
@@ -47,6 +48,9 @@ for cid,cmd in commands.items():
   except Exception: count=0
  if cid=='bridge_smoke':
   try: count=json.loads((evidence/'bridge-smoke-result.json').read_text()).get('executed_count',0)
+  except Exception: count=0
+ if cid=='migration_replay':
+  try: count=json.loads((evidence/'migration-replay-result.json').read_text()).get('executed_count',0)
   except Exception: count=0
  if cid=='forms_full':
   count=len(re.findall(r'^PASS: ',p.stdout,re.M))
@@ -66,9 +70,9 @@ gates={
  "reference_and_unreference_policy":verdict('reference_embed','bridge_permission','bridge_mutations'),"embed_request_time_permission":verdict('reference_embed','bridge_permission','bridge_mutations'),
  "preview_commit_frontier_and_schema_freeze":verdict('conversion_fault_lineage'),"conversion_retry_idempotent":verdict('conversion_fault_lineage'),
  "fault_injection_no_partial_bridge":verdict('conversion_fault_lineage'),"lineage_complete_no_double_write":verdict('conversion_fault_lineage','bridge_smoke'),
- "forms_gate_full_regression":verdict('forms_full'),"mcp_cli_bridge_equivalence":verdict('mcp_registry','mcp_policy','cli_bridge','bridge_smoke'),
+ "forms_gate_full_regression":verdict('forms_full','migration_replay'),"mcp_cli_bridge_equivalence":verdict('mcp_registry','mcp_policy','cli_bridge','bridge_smoke'),
  "tool_registry_expected_128_or_rebased":verdict('mcp_registry'),"bridge_event_registry_causation_and_redaction":verdict('reference_embed','conversion_fault_lineage','event_policy')}
-artifact_map={"bridge-contract-result.json":['reference_embed'],"embed-permission-result.json":['bridge_permission','bridge_mutations','reference_embed'],"conversion-fault-result.json":['conversion_fault_lineage'],"lineage-result.json":['conversion_fault_lineage'],"forms-regression-result.json":['forms_full']}
+artifact_map={"bridge-contract-result.json":['reference_embed'],"embed-permission-result.json":['bridge_permission','bridge_mutations','reference_embed'],"conversion-fault-result.json":['conversion_fault_lineage'],"lineage-result.json":['conversion_fault_lineage'],"forms-regression-result.json":['forms_full','migration_replay']}
 for name,ids in artifact_map.items():
  value={"schema_version":"sylvode.flow.check-result.v1","release":"0.7.0","source_head":head,"status":verdict(*ids),"passed":ok(*ids),"checks":[by[x] for x in ids],"executed_count":sum(by[x]['executed_count'] for x in ids)}
  (evidence/name).write_text(json.dumps(value,sort_keys=True,indent=2)+'\n')

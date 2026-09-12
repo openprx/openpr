@@ -17,7 +17,7 @@ same('schema_version',r.get('schema_version'),'sylvode.flow.gate-result.v1');sam
 head=subprocess.check_output(['git','-C',str(repo),'rev-parse','HEAD'],text=True).strip();same('source.head',r.get('source',{}).get('head'),head)
 same('gate_contract.sha256',r.get('gate_contract',{}).get('sha256'),hashlib.sha256(gate.read_bytes()).hexdigest())
 checks=r.get('checks',[]); by={x.get('id'):x for x in checks if isinstance(x,dict)}
-expected={'credential_binding','bridge_permission','bridge_mutations','reference_embed','conversion_fault_lineage','event_policy','mcp_registry','mcp_policy','cli_bridge','bridge_smoke','forms_full','flow_full','cardinality','surface'}
+expected={'credential_binding','bridge_permission','bridge_mutations','reference_embed','conversion_fault_lineage','event_policy','mcp_registry','mcp_policy','cli_bridge','bridge_smoke','migration_replay','forms_full','flow_full','cardinality','surface'}
 same('checks.keys',set(by),expected)
 for cid,item in by.items():
  p=evidence/item.get('log','');
@@ -33,12 +33,12 @@ expected_gates={
  'reference_and_unreference_policy':['reference_embed','bridge_permission','bridge_mutations'],'embed_request_time_permission':['reference_embed','bridge_permission','bridge_mutations'],
  'preview_commit_frontier_and_schema_freeze':['conversion_fault_lineage'],'conversion_retry_idempotent':['conversion_fault_lineage'],
  'fault_injection_no_partial_bridge':['conversion_fault_lineage'],'lineage_complete_no_double_write':['conversion_fault_lineage','bridge_smoke'],
- 'forms_gate_full_regression':['forms_full'],'mcp_cli_bridge_equivalence':['mcp_registry','mcp_policy','cli_bridge','bridge_smoke'],
+ 'forms_gate_full_regression':['forms_full','migration_replay'],'mcp_cli_bridge_equivalence':['mcp_registry','mcp_policy','cli_bridge','bridge_smoke'],
  'tool_registry_expected_128_or_rebased':['mcp_registry'],'bridge_event_registry_causation_and_redaction':['reference_embed','conversion_fault_lineage','event_policy']}
 for gate_id, producer_ids in expected_gates.items():
  expected_status='passed' if all(by.get(cid,{}).get('status')=='passed' for cid in producer_ids) else 'failed'
  same(f'hard_gates.{gate_id}',r.get('hard_gates',{}).get(gate_id),expected_status)
-required_artifacts=['bridge-contract-result.json','embed-permission-result.json','conversion-fault-result.json','lineage-result.json','forms-regression-result.json','cardinality-result.json','surface-coverage-result.json']
+required_artifacts=['bridge-contract-result.json','embed-permission-result.json','conversion-fault-result.json','lineage-result.json','forms-regression-result.json','migration-replay-result.json','cardinality-result.json','surface-coverage-result.json']
 for name in required_artifacts:
  try:
   a=json.loads((evidence/name).read_text());
