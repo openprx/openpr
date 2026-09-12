@@ -98,12 +98,9 @@ fn request_origin(extensions: &axum::http::Extensions) -> CommandOrigin {
     let source = crate::middleware::bot_auth::extract_bot_context(extensions).map_or_else(
         || EventSource::new(EventSurface::Rest).with_request(Uuid::new_v4().to_string()),
         |bot| {
-            // ADR-0018 AO-1: the allow-listed transport header is still controlled by the bot
-            // credential holder. Until v0.7 binds a transport to that credential, every bot
-            // route is explicitly self-reported -- including a bot that presents as plain REST.
-            let source = EventSource::new(bot.surface)
-                .self_reported()
-                .with_request(bot.request_id.to_string());
+            // ADR-0019 AO-1: middleware constructed this context only after the presented
+            // transport matched the surface registered with the bot credential.
+            let source = EventSource::new(bot.surface).with_request(bot.request_id.to_string());
             match bot.tool_name.as_deref() {
                 Some(tool) => source.with_tool(tool),
                 None => source,
@@ -937,11 +934,10 @@ mod flow_database_tests {
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
-    /// AO-1's transport-wide criterion at the production resolver. The set includes a bot with
-    /// no transport header (`Rest`): its label is still not credential-bound, so it must not gain
-    /// stronger provenance than the five explicitly selectable bot transports.
+    /// AO-1's transport-wide criterion at the production resolver. Middleware has already bound
+    /// every represented surface to the bot credential before constructing this context.
     #[test]
-    fn every_bot_transport_is_self_reported_while_direct_jwt_rest_is_attested() {
+    fn every_credential_bound_bot_transport_is_attested() {
         use crate::flow::event_origin::EventSurface;
 
         let direct = request_origin(&axum::http::Extensions::new()).source_json();
@@ -968,8 +964,8 @@ mod flow_database_tests {
             assert_eq!(source["surface"], surface.as_wire());
             assert_eq!(
                 source["attestation"],
-                "self_reported",
-                "bot surface {} must remain explicitly unverified",
+                "attested",
+                "credential-bound bot surface {} must be attested",
                 surface.as_wire()
             );
         }
@@ -3640,6 +3636,125 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
+    async fn external_guest_sees_only_objects_reached_by_an_explicit_flow_grant() {
+        let scratch = scratch_or_skip!("external-guest-grant");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let guest_id = seed_user(&state).await;
+        let visible_id = create_page_as_owner(&state, workspace_id, owner_id, "guest-visible").await;
+        let hidden_id = create_page_as_owner(&state, workspace_id, owner_id, "guest-hidden").await;
+
+        let before = body_json(to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Path(workspace_id),
+                Query(ListFlowObjectsQuery {
+                    project_id: None,
+                    unprojected: false,
+                    object_type: None,
+                    parent_id: None,
+                    q: None,
+                    cursor: None,
+                    limit: None,
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(before["code"], 0, "{before}");
+        assert!(before["data"]["items"].as_array().expect("items").is_empty());
+
+        let granted = body_json(to_response(
+            put_flow_object_grants(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(visible_id),
+                Json(SetGrantsRequest {
+                    grants: vec![GrantRequestBody {
+                        principal_kind: "user".to_string(),
+                        principal_id: guest_id,
+                        level: "view".to_string(),
+                    }],
+                    confirm_self_lockout: true,
+                    dry_run: false,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(granted["code"], 0, "{granted}");
+
+        let after = body_json(to_response(
+            list_flow_objects(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Path(workspace_id),
+                Query(ListFlowObjectsQuery {
+                    project_id: None,
+                    unprojected: false,
+                    object_type: None,
+                    parent_id: None,
+                    q: None,
+                    cursor: None,
+                    limit: None,
+                    include_archived: false,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(after["code"], 0, "{after}");
+        let ids: Vec<String> = after["data"]["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(ids, vec![visible_id.to_string()]);
+        assert!(!ids.contains(&hidden_id.to_string()));
+
+        let visible = body_json(to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Path(visible_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(visible["code"], 0, "{visible}");
+
+        let hidden = body_json(to_response(
+            get_flow_object(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Path(hidden_id),
+                Query(GetFlowObjectQuery {
+                    at_seq: None,
+                    render: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(hidden["code"], 404, "{hidden}");
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn member_mutation_without_flow_settings_succeeds_without_creating_them() {
         let scratch = scratch_or_skip!("member-no-flow-settings");
         let state = state_for(scratch.db.clone());
@@ -3691,6 +3806,7 @@ mod flow_database_tests {
                 Json(CreateBotRequest {
                     name: "epoch bot".to_string(),
                     permissions: Some(vec!["read".to_string()]),
+                    transport_surface: None,
                     expires_at: None,
                 }),
             )
@@ -5942,8 +6058,10 @@ mod flow_database_tests {
         };
         exec(
             &state,
-            "INSERT INTO workspace_bots (id, workspace_id, name, token_hash, token_prefix, permissions, is_active) \
-             VALUES ($1, $2, 'attribution-bot', $3, $4, '[\"read\",\"write\",\"admin\"]'::jsonb, true)",
+            "INSERT INTO workspace_bots \
+             (id, workspace_id, name, token_hash, token_prefix, permissions, transport_surface, is_active) \
+             VALUES ($1, $2, 'attribution-bot', $3, $4, '[\"read\",\"write\",\"admin\"]'::jsonb, \
+             'mcp_stdio', true)",
             vec![
                 bot_id.into(),
                 workspace_id.into(),
@@ -6013,8 +6131,8 @@ mod flow_database_tests {
             event.source
         );
         assert_eq!(
-            event.source["attestation"], "self_reported",
-            "a real bot request must never present its caller-controlled transport as attested"
+            event.source["attestation"], "attested",
+            "a real bot request whose transport matches its credential must be attested"
         );
         assert_eq!(
             event.source["tool"], "flow.object_create",
@@ -6401,18 +6519,14 @@ mod flow_database_tests {
         );
         for row in &rows {
             let surface = row.source["surface"].as_str().unwrap_or_default();
+            assert_eq!(row.source["attestation"], "attested");
             if surface == "rest" {
-                assert_eq!(row.source["attestation"], "attested");
                 assert!(
                     row.source.get("tool").is_none(),
                     "a JWT-direct REST call has no tool concept, so the key must be omitted: {:?}",
                     row.source
                 );
             } else {
-                assert_eq!(
-                    row.source["attestation"], "self_reported",
-                    "every bot-selected transport must disclose that it is not credential-bound"
-                );
                 assert_eq!(
                     row.source["tool"], "objects.grants_set",
                     "an MCP call must carry the exact registered tool the middleware resolved: {:?}",

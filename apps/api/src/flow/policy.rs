@@ -6,12 +6,14 @@
 
 use axum::http::Extensions;
 use platform::app::AppState;
+use sea_orm::FromQueryResult;
 #[cfg(test)]
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::middleware::bot_auth::require_workspace_access;
+use crate::middleware::bot_auth::{extract_bot_context, require_workspace_access_from_auth};
 
 use super::repository;
 use super::{
@@ -104,13 +106,47 @@ pub async fn require_flow_workspace_access(
     Ok(actor)
 }
 
+/// Authenticated Flow principal, including ADR-0019's user-without-workspace-seat guest.
+///
+/// Bots remain workspace-bound. A JWT user without a `workspace_members` row receives the
+/// internal `__flow_guest` role, whose authorization baseline is [`PermissionLevel::Denied`];
+/// every existing list/search/navigator row filter can therefore reuse the same evaluator and
+/// reveal only objects reached by explicit `flow_object_grants` rows.
+pub(crate) async fn resolve_flow_principal(
+    state: &AppState,
+    extensions: &Extensions,
+    workspace_id: Uuid,
+) -> Result<(Uuid, String, bool), ApiError> {
+    let claims = extensions
+        .get::<platform::auth::JwtClaims>()
+        .ok_or_else(|| ApiError::Unauthorized("missing auth context".to_string()))?;
+    if let Some(bot) = extract_bot_context(extensions) {
+        return require_workspace_access_from_auth(state, claims, Some(bot), workspace_id).await;
+    }
+    let actor_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Unauthorized("invalid user id".to_string()))?;
+    #[derive(sea_orm::FromQueryResult)]
+    struct RoleRow {
+        role: String,
+    }
+    let role = RoleRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Postgres,
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+        vec![workspace_id.into(), actor_id.into()],
+    ))
+    .one(&state.db)
+    .await?
+    .map_or_else(|| "__flow_guest".to_string(), |row| row.role);
+    Ok((actor_id, role, false))
+}
+
 /// Starts a list/read request with workspace membership, feature flag, and a current epoch.
 pub async fn begin_flow_read(
     state: &AppState,
     extensions: &Extensions,
     workspace_id: Uuid,
 ) -> Result<FlowReadContext, ApiError> {
-    let (actor_id, role, is_bot) = require_flow_workspace_access(state, extensions, workspace_id).await?;
+    let (actor_id, role, is_bot) = resolve_flow_principal(state, extensions, workspace_id).await?;
+    require_flow_enabled(state, workspace_id).await?;
     let authz_epoch = authz::read_epoch(&state.db, workspace_id).await?;
     Ok(FlowReadContext {
         workspace_id,
@@ -137,7 +173,7 @@ pub async fn require_flow_object_access(
     object_id: Uuid,
     minimum: PermissionLevel,
 ) -> Result<Option<AuthorizedFlowObject>, ApiError> {
-    let actor = require_workspace_access(state, extensions, workspace_id)
+    let actor = resolve_flow_principal(state, extensions, workspace_id)
         .await
         .map_err(collapse_object_denial)?;
     require_flow_enabled(state, workspace_id).await?;

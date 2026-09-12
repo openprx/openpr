@@ -31,6 +31,8 @@ pub struct CreateBotRequest {
     /// `["write"]` and `["read","write"]` are the same token. An empty array is rejected rather
     /// than issued as a token that can do nothing.
     pub permissions: Option<Vec<String>>,
+    /// Transport identity cryptographically bound to this token row.
+    pub transport_surface: Option<String>,
     /// RFC3339 expiry, None = never
     pub expires_at: Option<String>,
 }
@@ -44,6 +46,7 @@ pub struct CreateBotResponse {
     pub token: String, // raw token, returned ONCE
     pub token_prefix: String,
     pub permissions: Vec<String>,
+    pub transport_surface: String,
     pub expires_at: Option<String>,
     pub created_at: String,
 }
@@ -56,6 +59,7 @@ pub struct BotResponse {
     pub name: String,
     pub token_prefix: String,
     pub permissions: Vec<String>,
+    pub transport_surface: String,
     pub is_active: bool,
     pub last_used_at: Option<String>,
     pub expires_at: Option<String>,
@@ -122,6 +126,18 @@ fn normalize_bot_permissions(permissions: Vec<String>) -> Result<Vec<String>, Ap
     Ok(normalized)
 }
 
+fn normalize_transport_surface(value: Option<String>) -> Result<String, ApiError> {
+    let value = value.unwrap_or_else(|| "rest".to_string());
+    let value = value.trim();
+    if ["rest", "mcp_http", "mcp_sse", "mcp_stdio", "cli", "cli_tools_call"].contains(&value) {
+        Ok(value.to_string())
+    } else {
+        Err(ApiError::BadRequest(
+            "transport_surface must be rest, mcp_http, mcp_sse, mcp_stdio, cli, or cli_tools_call".to_string(),
+        ))
+    }
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -150,6 +166,7 @@ pub async fn create_bot(
     }
 
     let perms = normalize_bot_permissions(req.permissions.unwrap_or_else(|| vec!["read".to_string()]))?;
+    let transport_surface = normalize_transport_surface(req.transport_surface)?;
 
     let expires_at: Option<chrono::DateTime<Utc>> = match req.expires_at {
         Some(ref s) => Some(
@@ -204,9 +221,9 @@ pub async fn create_bot(
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"INSERT INTO workspace_bots
-           (id, workspace_id, name, token_hash, token_prefix, permissions,
+           (id, workspace_id, name, token_hash, token_prefix, permissions, transport_surface,
             created_by, expires_at, is_active, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $9)",
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, $10, $10)",
         vec![
             bot_id.into(),
             workspace_id.into(),
@@ -214,6 +231,7 @@ pub async fn create_bot(
             token_hash.into(),
             token_prefix.clone().into(),
             perms_json.into(),
+            transport_surface.clone().into(),
             user_id.into(),
             expires_at.into(),
             now.into(),
@@ -233,6 +251,7 @@ pub async fn create_bot(
         token: raw_token,
         token_prefix,
         permissions: perms,
+        transport_surface,
         expires_at: expires_at.map(|t| t.to_rfc3339()),
         created_at: now.to_rfc3339(),
     }))
@@ -262,6 +281,7 @@ pub async fn list_bots(
         name: String,
         token_prefix: String,
         permissions: serde_json::Value,
+        transport_surface: String,
         is_active: bool,
         last_used_at: Option<chrono::DateTime<Utc>>,
         expires_at: Option<chrono::DateTime<Utc>>,
@@ -270,7 +290,7 @@ pub async fn list_bots(
 
     let bots = BotRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r"SELECT id, workspace_id, name, token_prefix, permissions,
+        r"SELECT id, workspace_id, name, token_prefix, permissions, transport_surface,
                   is_active, last_used_at, expires_at, created_at
            FROM workspace_bots
            WHERE workspace_id = $1
@@ -294,6 +314,7 @@ pub async fn list_bots(
                 name: b.name,
                 token_prefix: b.token_prefix,
                 permissions: perms,
+                transport_surface: b.transport_surface,
                 is_active: b.is_active,
                 last_used_at: b.last_used_at.map(|t| t.to_rfc3339()),
                 expires_at: b.expires_at.map(|t| t.to_rfc3339()),

@@ -423,7 +423,8 @@ async fn set_inherit_flag(
 }
 
 /// The `workspace_members.role` of each named user, for the workspace baseline half of
-/// `effective_permission`. Missing users fall back to `"member"`, the least privileged reading.
+/// `effective_permission`. A missing row is an external Flow guest, not a member: ADR-0019 makes
+/// `default_member_level` inapplicable and only an explicit object grant may authorize it.
 async fn roles_of<C: ConnectionTrait>(
     conn: &C,
     workspace_id: Uuid,
@@ -512,7 +513,7 @@ async fn summarize(
             PrincipalKind::User => roles
                 .iter()
                 .find(|(user_id, _)| *user_id == id)
-                .map_or("member", |(_, role)| role.as_str()),
+                .map_or("__flow_guest", |(_, role)| role.as_str()),
             PrincipalKind::Bot => "member",
         };
         out.push((kind, id, level_of(tx, workspace_id, object_id, kind, id, role).await?));

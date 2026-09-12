@@ -543,6 +543,11 @@ async fn workspace_baseline<C: ConnectionTrait>(
     workspace_id: Uuid,
     role: &str,
 ) -> Result<PermissionLevel, ApiError> {
+    // ADR-0019's external principal has no workspace seat. Its explicit object grants are real,
+    // but `default_member_level` is a member baseline and must never be inherited by a guest.
+    if role == "__flow_guest" {
+        return Ok(PermissionLevel::Denied);
+    }
     if role == "owner" || role == "admin" {
         return Ok(PermissionLevel::FullAccess);
     }
