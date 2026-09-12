@@ -1030,9 +1030,9 @@ mod flow_database_tests {
         FlowObjectHistoryQuery, FlowRelationsQuery, FlowSearchQuery, GetFlowNavigatorQuery,
         GetFlowObjectBootstrapQuery, GetFlowObjectQuery, ListFlowObjectsQuery, ProjectionLagQuery,
         SetFlowFeatureRequest, SetInheritanceRequest, create_flow_object, delete_flow_object_reference,
-        get_flow_feature, get_flow_navigator, get_flow_object, get_flow_object_bootstrap, get_flow_object_diff,
-        get_flow_object_grants, get_flow_object_history, get_flow_object_references, get_flow_object_relations,
-        get_flow_projection_lag, get_flow_search, list_flow_objects, post_flow_conversion,
+        get_flow_conversion, get_flow_feature, get_flow_navigator, get_flow_object, get_flow_object_bootstrap,
+        get_flow_object_diff, get_flow_object_grants, get_flow_object_history, get_flow_object_references,
+        get_flow_object_relations, get_flow_projection_lag, get_flow_search, list_flow_objects, post_flow_conversion,
         post_flow_conversion_preview, post_flow_conversion_retry, post_flow_object_command, post_flow_object_reference,
         put_flow_object_grants, put_flow_object_inheritance, request_origin, set_flow_feature,
     };
@@ -4089,6 +4089,12 @@ mod flow_database_tests {
 
     #[tokio::test]
     async fn flow_bridge_reference_embed_reauthorizes_forms_policy_and_missing_policy_is_read_only() {
+        #[derive(FromQueryResult, PartialEq, Eq, Debug)]
+        struct SourceHead {
+            head_seq: i64,
+            head_frontier: Vec<u8>,
+        }
+
         let scratch = scratch_or_skip!("bridge-reference-reauth");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
@@ -4214,6 +4220,15 @@ mod flow_database_tests {
             .expect("member reference count query")
             .expect("member reference count");
         assert_eq!(no_member_write.try_get::<i64>("", "n").expect("count"), 0);
+        let source_head = SourceHead::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_seq, head_frontier FROM collab_documents WHERE object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("source head query")
+        .expect("source head");
 
         let reference_key = Uuid::new_v4().to_string();
         let create_input = || crate::flow::bridge::CreateReferenceInput {
@@ -4403,6 +4418,19 @@ mod flow_database_tests {
         .await;
         assert_eq!(removed["code"], 0, "{removed}");
         assert_eq!(removed["data"]["removed"], true);
+        let after_reference_commands = SourceHead::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_seq, head_frontier FROM collab_documents WHERE object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("source head query")
+        .expect("source head");
+        assert_eq!(
+            after_reference_commands, source_head,
+            "reference and unreference must not advance an existing document head"
+        );
 
         let target_count = state
             .db
@@ -4635,6 +4663,13 @@ mod flow_database_tests {
             committed["data"]["created_target_ids"].as_array().map(Vec::len),
             Some(1)
         );
+        let job_id = Uuid::parse_str(committed["data"]["job_id"].as_str().expect("job id")).expect("UUID");
+        let status = body_json(to_response(
+            get_flow_conversion(State(state.clone()), claims_for(owner_id), None, Path(job_id)).await,
+        ))
+        .await;
+        assert_eq!(status["code"], 0, "{status}");
+        assert_eq!(status["data"]["status"], "completed");
         let replay = body_json(to_response(
             post_flow_conversion(State(state.clone()), claims_for(owner_id), None, Json(commit_input())).await,
         ))
@@ -5010,8 +5045,7 @@ mod flow_database_tests {
         .await;
         assert_eq!(field_denied["code"], 403, "{field_denied}");
         assert_eq!(
-            field_denied["message"],
-            "mapped values include a field that is not writable",
+            field_denied["message"], "mapped values include a field that is not writable",
             "the bridge commit field-policy branch must run before native persistence: {field_denied}"
         );
         let allow_field = body_json(to_response(
