@@ -79,12 +79,6 @@ pub const fn v0_7_command_cardinality_registry() -> [(BridgeCommandType, &'stati
     ]
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BridgePrincipal {
-    WorkspaceRole,
-    Guest,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyConfiguration {
@@ -196,13 +190,10 @@ fn flow_action_ceiling(level: PermissionLevel) -> BTreeMap<&'static str, bool> {
 #[must_use]
 pub fn bridge_permission(
     flow_level: PermissionLevel,
-    principal: BridgePrincipal,
     forms_policy: Option<&Value>,
     record_owner_matches: Option<bool>,
 ) -> Option<BridgePermissionDecision> {
-    if flow_level == PermissionLevel::Denied
-        || (principal == BridgePrincipal::Guest && !bridge_test_mutation("guest_as_member"))
-    {
+    if flow_level == PermissionLevel::Denied {
         return None;
     }
 
@@ -299,12 +290,6 @@ pub fn bridge_permission(
         denied_write_fields,
         record_scope,
     })
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BridgeDisplay {
-    #[serde(default)]
-    pub mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -505,7 +490,6 @@ async fn target_permission<C: ConnectionTrait>(
     .await?;
     Ok(bridge_permission(
         actor.flow_level,
-        BridgePrincipal::WorkspaceRole,
         policy.as_ref().map(|row| &row.policy),
         Some(target.created_by == Some(actor.id)),
     ))
@@ -612,7 +596,7 @@ async fn lock_and_reauthorize_reference(
         .ok_or_else(|| ApiError::NotFound("bridge target not found".to_string()))?;
     let permission = target_permission(tx, actor, &target)
         .await?
-        .ok_or_else(|| ApiError::policy_rejected("bridge permission changed before commit"))?;
+        .ok_or_else(|| ApiError::NotFound("bridge target not found".to_string()))?;
     Ok((target, permission))
 }
 
@@ -756,7 +740,6 @@ pub async fn list_references(
             continue;
         };
         let Some(permission) = target_permission(&state.db, &actor, &target).await? else {
-            items.push(BridgeReferenceView::Unavailable);
             continue;
         };
         let summary = if row.target_type == "form_record" {
@@ -987,7 +970,10 @@ pub async fn preview_conversion(
         ));
     }
     let (source, actor) = source_actor(state, extensions, input.source_object_id, PermissionLevel::Edit).await?;
-    if actor.role == "__flow_guest" || !bridge_enabled(&state.db, source.workspace_id).await? {
+    if actor.role == "__flow_guest" {
+        return Err(ApiError::NotFound("bridge target not found".to_string()));
+    }
+    if !bridge_enabled(&state.db, source.workspace_id).await? {
         return Err(ApiError::policy_rejected("forms bridge conversion is not permitted"));
     }
     let frontier = current_frontier(&source);
@@ -1036,10 +1022,7 @@ pub async fn preview_conversion(
                     ));
                 }
                 None => {
-                    return Err(bridge_policy_rejected(
-                        "target record creation is not permitted",
-                        &denied_permission_state(PolicyConfiguration::Explicit),
-                    ));
+                    return Err(ApiError::NotFound("bridge target not found".to_string()));
                 }
             };
             let (project_id, schema_version, _) = form_schema(&state.db, source.workspace_id, form_id)
@@ -1789,7 +1772,7 @@ pub async fn retry_conversion(
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeAccess, BridgePrincipal, PolicyConfiguration, bridge_permission};
+    use super::{BridgeAccess, PolicyConfiguration, bridge_permission};
     use crate::flow::collab::authz::PermissionLevel;
     use serde_json::json;
 
@@ -1798,7 +1781,6 @@ mod tests {
         let forms_denies_update = json!({"actions": {"form.view": true, "record.update": false}});
         let full = bridge_permission(
             PermissionLevel::FullAccess,
-            BridgePrincipal::WorkspaceRole,
             Some(&forms_denies_update),
             None,
         )
@@ -1808,7 +1790,6 @@ mod tests {
         let forms_allows_delete = json!({"actions": {"form.view": true, "record.delete": true}});
         let view = bridge_permission(
             PermissionLevel::View,
-            BridgePrincipal::WorkspaceRole,
             Some(&forms_allows_delete),
             None,
         )
@@ -1824,7 +1805,6 @@ mod tests {
         let policy = json!({"actions": {"form.view": true, "form.design": true}});
         let decision = bridge_permission(
             PermissionLevel::FullAccess,
-            BridgePrincipal::WorkspaceRole,
             Some(&policy),
             None,
         )
@@ -1834,7 +1814,7 @@ mod tests {
 
     #[test]
     fn unconfigured_forms_are_read_only_and_honestly_labelled() {
-        let decision = bridge_permission(PermissionLevel::FullAccess, BridgePrincipal::WorkspaceRole, None, None)
+        let decision = bridge_permission(PermissionLevel::FullAccess, None, None)
             .expect("the BR-4 read-only floor remains visible");
         assert_eq!(decision.state.configuration, PolicyConfiguration::Unconfigured);
         assert_eq!(decision.state.access, BridgeAccess::ReadOnly);
@@ -1843,26 +1823,9 @@ mod tests {
     }
 
     #[test]
-    fn guests_and_flow_denied_principals_get_no_reference_shape() {
+    fn flow_denied_principals_get_no_reference_shape() {
         let permissive = json!({"actions": {"form.view": true, "record.update": true}});
-        assert!(
-            bridge_permission(
-                PermissionLevel::FullAccess,
-                BridgePrincipal::Guest,
-                Some(&permissive),
-                None
-            )
-            .is_none()
-        );
-        assert!(
-            bridge_permission(
-                PermissionLevel::Denied,
-                BridgePrincipal::WorkspaceRole,
-                Some(&permissive),
-                None
-            )
-            .is_none()
-        );
+        assert!(bridge_permission(PermissionLevel::Denied, Some(&permissive), None).is_none());
     }
 
     #[test]
@@ -1875,7 +1838,6 @@ mod tests {
         assert!(
             bridge_permission(
                 PermissionLevel::Edit,
-                BridgePrincipal::WorkspaceRole,
                 Some(&policy),
                 Some(false)
             )
@@ -1884,7 +1846,6 @@ mod tests {
         );
         let decision = bridge_permission(
             PermissionLevel::Edit,
-            BridgePrincipal::WorkspaceRole,
             Some(&policy),
             Some(true),
         )

@@ -1045,7 +1045,7 @@ mod flow_database_tests {
     use crate::routes::bot::{CreateBotRequest, create_bot};
     use crate::routes::form::{
         CreateFormRequest, UpdateFormPermissionsRequest, UpsertFormPermissionPolicy, create_project_form,
-        update_form_permissions,
+        delete_form, update_form_permissions,
     };
     use crate::routes::member::{
         AddMemberRequest, UpdateMemberRoleRequest, add_member, remove_member, update_member_role,
@@ -3877,6 +3877,194 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
+    async fn flow_bridge_guest_routes_hide_reference_cardinality_and_target_existence() {
+        use base64::Engine as _;
+
+        #[derive(FromQueryResult)]
+        struct Frontier {
+            head_frontier: Vec<u8>,
+        }
+
+        let scratch = scratch_or_skip!("bridge-guest-non-enumeration");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let guest_id = seed_user(&state).await;
+        let project_id = Uuid::new_v4();
+        exec(
+            &state,
+            "INSERT INTO projects (id, workspace_id, key, name, created_by) \
+             VALUES ($1, $2, 'BGN', 'Bridge guest non-enumeration', $3)",
+            vec![project_id.into(), workspace_id.into(), owner_id.into()],
+        )
+        .await;
+        let form = body_json(to_response(
+            create_project_form(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(project_id),
+                Json(CreateFormRequest {
+                    key: "guest_hidden_form".to_string(),
+                    name: "Guest hidden form".to_string(),
+                    description: None,
+                    icon: None,
+                    color: None,
+                    title_template: None,
+                    schema: None,
+                    detail_layout: None,
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(form["code"], 0, "{form}");
+        let form_id = Uuid::parse_str(form["data"]["id"].as_str().expect("form id")).expect("UUID");
+        let source_id = create_page_as_owner(&state, workspace_id, owner_id, "guest bridge source").await;
+
+        let created = body_json(to_response(
+            post_flow_object_reference(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source_id),
+                Json(crate::flow::bridge::CreateReferenceInput {
+                    target_type: "form".to_string(),
+                    target_id: form_id,
+                    display: json!({"mode":"embed"}),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(created["code"], 0, "{created}");
+
+        let set_guest_level = |level: &str| {
+            put_flow_object_grants(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(source_id),
+                Json(SetGrantsRequest {
+                    grants: vec![GrantRequestBody {
+                        principal_kind: "user".to_string(),
+                        principal_id: guest_id,
+                        level: level.to_string(),
+                    }],
+                    confirm_self_lockout: true,
+                    dry_run: false,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+        };
+        assert_eq!(body_json(to_response(set_guest_level("view").await)).await["code"], 0);
+        let view_only_create = body_json(to_response(
+            post_flow_object_reference(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Path(source_id),
+                Json(crate::flow::bridge::CreateReferenceInput {
+                    target_type: "form".to_string(),
+                    target_id: form_id,
+                    display: json!({}),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(view_only_create["code"], 404, "{view_only_create}");
+
+        assert_eq!(body_json(to_response(set_guest_level("edit").await)).await["code"], 0);
+        let guest_list = body_json(to_response(
+            get_flow_object_references(State(state.clone()), claims_for(guest_id), None, Path(source_id)).await,
+        ))
+        .await;
+        assert_eq!(guest_list["code"], 0, "{guest_list}");
+        assert_eq!(guest_list["data"]["items"], json!([]), "{guest_list}");
+
+        let create_as_guest = |target_id| {
+            post_flow_object_reference(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Path(source_id),
+                Json(crate::flow::bridge::CreateReferenceInput {
+                    target_type: "form".to_string(),
+                    target_id,
+                    display: json!({}),
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+        };
+        let existing_reference = body_json(to_response(create_as_guest(form_id).await)).await;
+        let missing_reference = body_json(to_response(create_as_guest(Uuid::new_v4()).await)).await;
+        assert_eq!(existing_reference, missing_reference);
+        assert_eq!(existing_reference["code"], 404, "{existing_reference}");
+        assert!(existing_reference.get("details").is_none());
+
+        let frontier = Frontier::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_frontier FROM collab_documents WHERE object_id=$1",
+            vec![source_id.into()],
+        ))
+        .one(&state.db)
+        .await
+        .expect("frontier query")
+        .expect("frontier");
+        let frontier = base64::engine::general_purpose::STANDARD.encode(frontier.head_frontier);
+        let preview_as_guest = |target_type: &str, mapping: Value| {
+            post_flow_conversion_preview(
+                State(state.clone()),
+                claims_for(guest_id),
+                None,
+                Json(crate::flow::bridge::ConversionPreviewInput {
+                    source_object_id: source_id,
+                    source_frontier: frontier.clone(),
+                    target_type: target_type.to_string(),
+                    mapping,
+                    idempotency_key: Uuid::new_v4().to_string(),
+                }),
+            )
+        };
+        let existing_preview = body_json(to_response(
+            preview_as_guest("form_record", json!({"target_form_id":form_id,"values":{}})).await,
+        ))
+        .await;
+        let missing_preview = body_json(to_response(
+            preview_as_guest("form_record", json!({"target_form_id":Uuid::new_v4(),"values":{}})).await,
+        ))
+        .await;
+        assert_eq!(existing_preview, missing_preview);
+        assert_eq!(existing_preview["code"], 404, "{existing_preview}");
+        let create_form_preview = body_json(to_response(
+            preview_as_guest("form", json!({"target_project_id":project_id,"schema":{"fields":[]}})).await,
+        ))
+        .await;
+        assert_eq!(create_form_preview["code"], 404, "{create_form_preview}");
+
+        let archived = body_json(to_response(
+            delete_form(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(form_id),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(archived["code"], 0, "{archived}");
+        let unavailable = body_json(to_response(
+            get_flow_object_references(State(state.clone()), claims_for(owner_id), None, Path(source_id)).await,
+        ))
+        .await;
+        assert_eq!(unavailable["data"]["items"], json!([{"visibility":"unavailable"}]));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn flow_bridge_reference_embed_reauthorizes_forms_policy_and_missing_policy_is_read_only() {
         let scratch = scratch_or_skip!("bridge-reference-reauth");
         let state = state_for(scratch.db.clone());
@@ -3984,7 +4172,7 @@ mod flow_database_tests {
         ))
         .await;
         assert_eq!(after["code"], 0, "{after}");
-        assert_eq!(after["data"]["items"], json!([{"visibility": "unavailable"}]));
+        assert_eq!(after["data"]["items"], json!([]));
 
         let remove_key = Uuid::new_v4().to_string();
         let removed = body_json(to_response(
