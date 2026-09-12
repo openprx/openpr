@@ -112,6 +112,72 @@ pub async fn run_tick(db: &DatabaseConnection, requested_batch_size: usize) -> a
         .saturating_add(archived))
 }
 
+#[derive(Debug, FromQueryResult)]
+struct RebuildJob {
+    id: Uuid,
+    document_id: Uuid,
+    dry_run: bool,
+    expected_head_seq: Option<i64>,
+}
+
+/// Claims and executes explicitly scoped search rebuild operations.
+pub async fn run_rebuild_jobs(db: &DatabaseConnection, requested_batch_size: usize) -> anyhow::Result<u64> {
+    let mut completed = 0_u64;
+    for _ in 0..requested_batch_size.clamp(1, 100) {
+        let job = RebuildJob::find_by_statement(Statement::from_string(
+            DbBackend::Postgres,
+            "UPDATE flow_operation_runs SET status='running' \
+             WHERE id=(SELECT id FROM flow_operation_runs \
+               WHERE operation='rebuild_search' AND status='planned' \
+               ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1) \
+             RETURNING id,scope_id AS document_id,dry_run,expected_head_seq"
+                .to_string(),
+        ))
+        .one(db)
+        .await?;
+        let Some(job) = job else { break };
+        let object_id: Option<Uuid> = db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT object_id FROM collab_documents WHERE id=$1",
+                vec![job.document_id.into()],
+            ))
+            .await?
+            .and_then(|row| row.try_get("", "object_id").ok());
+        let outcome = if let Some(object_id) = object_id {
+            api::flow::maintenance::rebuild_search(db, object_id, job.expected_head_seq, !job.dry_run)
+                .await
+                .map(|result| serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({})))
+        } else {
+            Err(api::error::ApiError::NotFound("collab document not found".to_string()))
+        };
+        match outcome {
+            Ok(result) => {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE flow_operation_runs SET status='completed',result_redacted=$2, \
+                     finished_at=now() WHERE id=$1",
+                    vec![job.id.into(), result.into()],
+                ))
+                .await?;
+                completed += 1;
+            }
+            Err(error) => {
+                db.execute(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "UPDATE flow_operation_runs SET status='failed', \
+                     result_redacted=jsonb_build_object('reason','search_rebuild_failed'), \
+                     finished_at=now() WHERE id=$1",
+                    vec![job.id.into()],
+                ))
+                .await?;
+                tracing::warn!(job_id=%job.id,%error,"flow search rebuild job failed");
+            }
+        }
+    }
+    Ok(completed)
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};

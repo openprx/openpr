@@ -22,6 +22,17 @@ pub struct ProjectionRebuildResult {
     pub executed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SearchRebuildResult {
+    pub object_id: Uuid,
+    pub document_id: Uuid,
+    pub head_seq: i64,
+    pub before_hash: Option<String>,
+    pub after_hash: String,
+    pub changed: bool,
+    pub executed: bool,
+}
+
 #[derive(FromQueryResult)]
 struct DocumentIdentity {
     workspace: Uuid,
@@ -44,7 +55,21 @@ struct ProjectionRow {
     plain_text: String,
 }
 
+#[derive(Debug, FromQueryResult, Serialize)]
+struct SearchRow {
+    indexed_seq: i64,
+    indexed_frontier: Vec<u8>,
+    title: String,
+    plain_text: String,
+}
+
 fn projection_hash(row: &ProjectionRow) -> Result<String, ApiError> {
+    serde_json::to_vec(row)
+        .map(|bytes| bootstrap::content_hash(&bytes))
+        .map_err(|_| ApiError::Internal)
+}
+
+fn search_hash(row: &SearchRow) -> Result<String, ApiError> {
     serde_json::to_vec(row)
         .map(|bytes| bootstrap::content_hash(&bytes))
         .map_err(|_| ApiError::Internal)
@@ -55,6 +80,17 @@ async fn projection_row<C: ConnectionTrait>(conn: &C, object_id: Uuid) -> Result
         DbBackend::Postgres,
         "SELECT document_seq, document_frontier, title, state, plain_text \
          FROM flow_object_projections WHERE object_id = $1",
+        vec![object_id.into()],
+    ))
+    .one(conn)
+    .await?)
+}
+
+async fn search_row<C: ConnectionTrait>(conn: &C, object_id: Uuid) -> Result<Option<SearchRow>, ApiError> {
+    Ok(SearchRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT indexed_seq, indexed_frontier, title, plain_text \
+         FROM flow_search_index WHERE object_id = $1",
         vec![object_id.into()],
     ))
     .one(conn)
@@ -174,6 +210,108 @@ pub async fn rebuild_projection(
     })
 }
 
+/// Plans or executes a search-index rebuild from the accepted projection for one object.
+pub async fn rebuild_search(
+    db: &DatabaseConnection,
+    object_id: Uuid,
+    expected_head_seq: Option<i64>,
+    execute: bool,
+) -> Result<SearchRebuildResult, ApiError> {
+    let identity = DocumentIdentity::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT fo.workspace_id AS workspace, fo.id AS object, cd.id AS document \
+         FROM flow_objects fo JOIN collab_documents cd ON cd.object_id = fo.id WHERE fo.id = $1",
+        vec![object_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("flow object not found".to_string()))?;
+    let source = projection_row(db, object_id)
+        .await?
+        .ok_or_else(|| ApiError::Conflict("accepted projection missing".to_string()))?;
+    if let Some(expected) = expected_head_seq
+        && expected != source.document_seq
+    {
+        return Err(ApiError::Conflict(
+            "expected_head_seq does not match projection head".to_string(),
+        ));
+    }
+    if execute && expected_head_seq.is_none() {
+        return Err(ApiError::BadRequest(
+            "expected_head_seq is required for execute".to_string(),
+        ));
+    }
+    let desired = SearchRow {
+        indexed_seq: source.document_seq,
+        indexed_frontier: source.document_frontier.clone(),
+        title: source.title.clone(),
+        plain_text: source.plain_text.clone(),
+    };
+    let before = search_row(db, object_id).await?;
+    let before_hash = before.as_ref().map(search_hash).transpose()?;
+    let after_hash = search_hash(&desired)?;
+    let changed = before_hash.as_deref() != Some(after_hash.as_str());
+
+    if execute && changed {
+        let tx = db.begin().await?;
+        super::collab::write::set_locked_phase_statement_budgets(&tx, 1).await?;
+        let locked = LockedHead::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT head_seq, head_frontier FROM collab_documents WHERE id = $1 FOR UPDATE",
+            vec![identity.document.into()],
+        ))
+        .one(&tx)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("collab document not found".to_string()))?;
+        let locked_source = projection_row(&tx, object_id)
+            .await?
+            .ok_or_else(|| ApiError::Conflict("accepted projection missing".to_string()))?;
+        if locked.head_seq != source.document_seq
+            || locked.head_frontier != source.document_frontier
+            || projection_hash(&locked_source)? != projection_hash(&source)?
+        {
+            tx.rollback().await?;
+            return Err(ApiError::Conflict(
+                "projection changed during search rebuild".to_string(),
+            ));
+        }
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "INSERT INTO flow_search_index \
+               (object_id,indexed_seq,indexed_frontier,title,plain_text,updated_at) \
+             VALUES ($1,$2,$3,$4,$5,now()) \
+             ON CONFLICT (object_id) DO UPDATE SET indexed_seq=EXCLUDED.indexed_seq, \
+               indexed_frontier=EXCLUDED.indexed_frontier,title=EXCLUDED.title, \
+               plain_text=EXCLUDED.plain_text,updated_at=now()",
+            vec![
+                object_id.into(),
+                desired.indexed_seq.into(),
+                desired.indexed_frontier.clone().into(),
+                desired.title.clone().into(),
+                desired.plain_text.clone().into(),
+            ],
+        ))
+        .await?;
+        tx.commit().await?;
+        let persisted = search_row(db, object_id)
+            .await?
+            .ok_or_else(|| ApiError::Conflict("search row missing after rebuild".to_string()))?;
+        if search_hash(&persisted)? != after_hash {
+            return Err(ApiError::Conflict("search checksum mismatch after rebuild".to_string()));
+        }
+    }
+
+    Ok(SearchRebuildResult {
+        object_id: identity.object,
+        document_id: identity.document,
+        head_seq: source.document_seq,
+        before_hash,
+        after_hash,
+        changed,
+        executed: execute,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::print_stderr)]
 mod database_tests {
@@ -181,7 +319,7 @@ mod database_tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
     use uuid::Uuid;
 
-    use super::rebuild_projection;
+    use super::{rebuild_projection, rebuild_search};
     use crate::error::ApiError;
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
@@ -371,6 +509,49 @@ mod database_tests {
             rebuild_projection(&scratch.db, object_id, Some(1), true).await,
             Err(ApiError::Conflict(_))
         ));
+
+        scratch
+            .db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "INSERT INTO flow_search_index \
+                   (object_id,indexed_seq,indexed_frontier,title,plain_text) \
+                 VALUES ($1,0,$2,'stale search','stale body')",
+                vec![object_id.into(), engine.frontier().as_bytes().to_vec().into()],
+            ))
+            .await
+            .expect("stale search row seeds");
+        let search_plan = rebuild_search(&scratch.db, object_id, Some(0), false)
+            .await
+            .expect("search dry-run succeeds");
+        assert!(search_plan.changed);
+        assert!(!search_plan.executed);
+        let search_execution = rebuild_search(&scratch.db, object_id, Some(0), true)
+            .await
+            .expect("search execute succeeds");
+        assert!(search_execution.changed);
+        assert_eq!(search_execution.after_hash, search_plan.after_hash);
+        let search_clean = rebuild_search(&scratch.db, object_id, Some(0), false)
+            .await
+            .expect("search verification succeeds");
+        assert!(!search_clean.changed);
+        assert_eq!(
+            search_clean.before_hash.as_deref(),
+            Some(search_clean.after_hash.as_str())
+        );
+        let rebuilt_search_title: String = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT title FROM flow_search_index WHERE object_id=$1",
+                vec![object_id.into()],
+            ))
+            .await
+            .expect("search title query")
+            .expect("search row exists")
+            .try_get("", "title")
+            .expect("search title reads");
+        assert_eq!(rebuilt_search_title, "canonical title");
 
         scratch.drop_self().await;
     }

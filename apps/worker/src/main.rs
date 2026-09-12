@@ -182,6 +182,11 @@ async fn main() -> anyhow::Result<()> {
             Err(error) => tracing::warn!(error = %error, "flow projection index tick failed"),
         }
 
+        match flow::search::run_rebuild_jobs(&db, args.concurrency.saturating_mul(4)).await {
+            Ok(completed) => tracing::debug!(completed, "flow search rebuild job tick"),
+            Err(error) => tracing::warn!(error = %error, "flow search rebuild job tick failed"),
+        }
+
         match flow::compaction::run_tick(&db, args.concurrency.saturating_mul(4)).await {
             Ok(report) => tracing::debug!(?report, "flow compaction tick"),
             Err(error) => tracing::warn!(error = %error, "flow compaction tick failed"),
