@@ -65,3 +65,6 @@ __pycache__/
 
 # Local deployment descriptor: carries a gate account password and machine paths
 deploy/flow-deployed-websocket.json
+
+# Local release-gate evidence; authoritative contracts live in the separate read-only checkout.
+/.flow-gate/
