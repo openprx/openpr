@@ -1,0 +1,14 @@
+{
+  "schema": "openpr.flow.wire-corpus.v0.8",
+  "cases": [
+    {"id": "corrupt_update_bytes", "expected": "typed_decode_error_and_unchanged_frontier"},
+    {"id": "truncated_update_bytes", "expected": "typed_decode_error_and_unchanged_frontier"},
+    {"id": "duplicate_update_bytes", "expected": "second_import_is_noop"},
+    {"id": "out_of_order_update_bytes", "expected": "eventual_exact_semantic_convergence"},
+    {"id": "corrupt_response_crc", "expected": "invalid_data"},
+    {"id": "truncated_response_frame", "expected": "unexpected_eof"},
+    {"id": "cpu_under_and_over_ceiling", "expected": "under_accepted_over_killed_as_cpu"},
+    {"id": "wall_under_and_over_ceiling", "expected": "under_accepted_over_killed_as_wall"},
+    {"id": "memory_exact_and_plus_one", "expected": "exact_accepted_plus_one_rejected"}
+  ]
+}
