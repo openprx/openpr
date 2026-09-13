@@ -166,7 +166,7 @@ hard={key:"passed" if hard.get(key,False) else "failed" for key in gate.get("har
 # 50-client target. Re-running until green would destroy evidence; report records it as consumed.
 checks.append({"id":"capacity_preserved_first_run","status":"failed","exit_code":int(capacity.get("runs",[{},{}])[-1].get("exit_code",1)),
  "executed_count":int(capacity.get("executed_count",0)),"command":"scripts/benchmark-flow-capacity.sh --clients 10,50 --json",
- "artifact":"capacity-result.json","reason":"first official run retained; 50-client result failed and committed-write reconstruction was incomplete"})
+ "artifact":"capacity-result.json","reason":"official run retained; functional failures and unset approved budgets are preserved in the artifact"})
 
 bootstrap_result={"schema_version":"sylvode.flow.bootstrap-compaction-consistency-result.v1","release":"0.8.0","source_head":head,
  "checks":[by.get("worker_compaction",{}),by.get("bootstrap_compaction",{})],

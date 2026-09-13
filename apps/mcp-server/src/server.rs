@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (139)
+## Tools (140)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -2746,7 +2746,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
 
-            let expected = if tool.name == "objects.integrity" {
+            let expected = if matches!(tool.name.as_str(), "objects.integrity" | "collab.repair_quarantine") {
                 PolicyScope::WorkspaceOrFlowObject
             } else if WORKSPACE_ADMIN_TOOLS.contains(&tool.name.as_str()) {
                 PolicyScope::WorkspaceWideAdmin

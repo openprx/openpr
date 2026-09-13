@@ -84,12 +84,12 @@ run_case compact_execute_ignores_exact_document_confirm red "$ROUTE_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
 perl -0pi -e 's/    if dry_run \{\n        let candidates = repair_candidates/    if false {\n        let candidates = repair_candidates/' "$OPERATIONS"
-sed -n '/pub async fn repair_quarantine/,/pub async fn compact_document/p' "$OPERATIONS" | grep -Fq 'if false {'
+sed -n '/pub async fn repair_quarantine/,/pub async fn compact_document/p' "$OPERATIONS" | grep -F 'if false {' >/dev/null
 run_case repair_dry_run_writes_canonical_state red "$REPAIR_TEST"
 git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
 
 perl -0pi -e 's/(pub async fn post_flow_repair_quarantine.*?PermissionLevel::)FullAccess/${1}Edit/s' "$ROUTES"
-sed -n '/pub async fn post_flow_repair_quarantine/,/pub async fn post_flow_verify_document/p' "$ROUTES" | grep -Fq 'PermissionLevel::Edit'
+sed -n '/pub async fn post_flow_repair_quarantine/,/pub async fn post_flow_verify_document/p' "$ROUTES" | grep -F 'PermissionLevel::Edit' >/dev/null
 run_case repair_accepts_edit_principal red "$REPAIR_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
@@ -99,7 +99,7 @@ run_case repair_missing_scope_defaults_to_all red "$REPAIR_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
 perl -0pi -e 's/if !req\.dry_run && req\.confirm_quarantine != Some\(true\) \{/if false {/' "$ROUTES"
-sed -n '/pub async fn post_flow_repair_quarantine/,/pub async fn post_flow_verify_document/p' "$ROUTES" | grep -Fq 'if false {'
+sed -n '/pub async fn post_flow_repair_quarantine/,/pub async fn post_flow_verify_document/p' "$ROUTES" | grep -F 'if false {' >/dev/null
 run_case repair_execute_ignores_confirm red "$REPAIR_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
@@ -128,12 +128,12 @@ git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
 git -C "$WORKTREE" restore migrations/0065_flow_v08_operation_idempotency.sql
 
 perl -0pi -e 's/(pub async fn post_flow_compact_document.*?let expected = req\s*\.expected_head_seq\s*)\.ok_or_else\(\|\| ApiError::BadRequest\("expected_head_seq is required"\.to_string\(\)\)\)\?;/${1}.unwrap_or(0);/s' "$ROUTES"
-sed -n '/pub async fn post_flow_compact_document/,/pub async fn post_flow_rebuild_projection/p' "$ROUTES" | grep -Fq '.unwrap_or(0);'
+sed -n '/pub async fn post_flow_compact_document/,/pub async fn post_flow_rebuild_projection/p' "$ROUTES" | grep -F '.unwrap_or(0);' >/dev/null
 run_case compact_missing_expected_head_is_accepted red "$ROUTE_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
 perl -0pi -e 's/(pub async fn post_flow_compact_document.*?policy::)require_flow_workspace_admin_access/${1}require_flow_workspace_access/s' "$ROUTES"
-sed -n '/pub async fn post_flow_compact_document/,/pub async fn post_flow_rebuild_projection/p' "$ROUTES" | grep -Fq 'require_flow_workspace_access'
+sed -n '/pub async fn post_flow_compact_document/,/pub async fn post_flow_rebuild_projection/p' "$ROUTES" | grep -F 'require_flow_workspace_access' >/dev/null
 run_case compact_accepts_non_admin_member red "$ROUTE_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
@@ -144,7 +144,7 @@ git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
 MCP_OBJECTS="$WORKTREE/apps/mcp-server/src/tools/objects.rs"
 perl -0pi -e 's/(pub async fn compact_flow_document.*?pointer\("\/data\/document_id"\)\.and_then\(Value::as_str\) )== Some\(document_id\)/${1}!= Some(document_id)/s' "$MCP_OBJECTS"
-sed -n '/pub async fn compact_flow_document/,/pub async fn replay_flow_deliveries/p' "$MCP_OBJECTS" | grep -Fq '!= Some(document_id)'
+sed -n '/pub async fn compact_flow_document/,/pub async fn replay_flow_deliveries/p' "$MCP_OBJECTS" | grep -F '!= Some(document_id)' >/dev/null
 run_mcp_case mcp_compact_scope_comparison_is_inverted red
 
 printf 'PASS: 4 green controls passed and 13/13 production-source mutations were detected\n'

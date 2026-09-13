@@ -238,7 +238,7 @@ const DELIVERY_SOURCE_RETENTION_DAYS: i64 = 90;
 /// window and leaves one full `delivery_retention_days` cleanup cycle of safety margin.  The
 /// contract remains the authority: this value must be copied into its reviewed budget artifact
 /// before an official candidate can pass.
-pub const REPLAY_MAX_WINDOW_DAYS: i64 = 60;
+pub const REPLAY_MAX_WINDOW_DAYS: i64 = 30;
 
 /// Header carrying the immutable consumer dedup key (`events-v1.md` "投递报文与 `delivery_id` 的
 /// 位置"). `delivery.id` in the body is the same value; both are written together below.
@@ -6133,7 +6133,7 @@ mod dispatcher_database_tests {
         exec(
             &scratch.db,
             "UPDATE business_events SET created_at=$2 WHERE id=$1",
-            vec![event_id.into(), (now - chrono::Duration::days(40)).into()],
+            vec![event_id.into(), (now - chrono::Duration::days(29)).into()],
         )
         .await;
         let request = ReplayRequest {
@@ -6142,8 +6142,8 @@ mod dispatcher_database_tests {
             event_type: Some("flow.object.created".to_string()),
             subscriber_kind: Some("webhook".to_string()),
             subscriber_id: Some(webhook_id),
-            from: now - chrono::Duration::days(41),
-            to: now - chrono::Duration::days(39),
+            from: now - chrono::Duration::days(REPLAY_MAX_WINDOW_DAYS) + chrono::Duration::milliseconds(1),
+            to: now - chrono::Duration::days(28),
             dry_run: true,
         };
 

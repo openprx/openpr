@@ -47,21 +47,21 @@ pub enum RepairQuarantineScope {
 }
 
 impl RepairQuarantineScope {
-    fn workspace_id(&self) -> Uuid {
+    const fn workspace_id(&self) -> Uuid {
         match self {
             Self::Workspace { workspace_id } => *workspace_id,
             Self::Document(scope) => scope.workspace_id,
         }
     }
 
-    fn kind(&self) -> &'static str {
+    const fn kind(&self) -> &'static str {
         match self {
             Self::Workspace { .. } => "workspace",
             Self::Document(_) => "document",
         }
     }
 
-    fn id(&self) -> Uuid {
+    const fn id(&self) -> Uuid {
         match self {
             Self::Workspace { workspace_id } => *workspace_id,
             Self::Document(scope) => scope.document_id,
@@ -319,9 +319,10 @@ fn repair_affected(scope: &RepairQuarantineScope, candidates: &[RepairCandidate]
     })
 }
 
-/// Plans or irreversibly quarantines all currently-open integrity findings in one explicit
-/// workspace/document scope. A dry-run deliberately writes no operation claim: the same
-/// idempotency key remains available to execute exactly the plan the caller just inspected.
+/// Plans or irreversibly quarantines open integrity findings in one explicit scope.
+///
+/// A dry-run deliberately writes no operation claim: the same idempotency key remains available
+/// to execute exactly the plan the caller just inspected.
 pub async fn repair_quarantine(
     db: &DatabaseConnection,
     scope: RepairQuarantineScope,
@@ -436,7 +437,12 @@ pub async fn repair_quarantine(
         ))
         .await?;
     }
-    let affected_object_ids = affected["affected_object_ids"].clone();
+    let affected_object_ids = candidates
+        .iter()
+        .filter_map(|candidate| candidate.object_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let event = insert_flow_event(
         &tx,
         BusinessEventInput {
@@ -452,7 +458,7 @@ pub async fn repair_quarantine(
                 "kind": "quarantine",
                 "scope_kind": scope.kind(),
                 "scope_id": scope.id(),
-                "integrity_record_count": affected["integrity_record_count"],
+                "integrity_record_count": candidates.len(),
             }),
             metadata: json!({"affected_object_ids": affected_object_ids}),
             correlation_id: Some(origin.correlation_id),

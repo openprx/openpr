@@ -287,10 +287,11 @@ mod tests {
                     "collab.compact",
                     "deliveries.replay",
                     "collab.rebuild_projection",
+                    "collab.repair_quarantine",
                 ]
                 .map(str::to_string)
             ),
-            "the live v0.8 delta must be exactly the frozen eleven-tool hardening surface"
+            "the live v0.8 delta must be exactly the twelve-tool hardening surface"
         );
         for name in ["objects.import_artifact", "objects.integrity"] {
             let schema = tools

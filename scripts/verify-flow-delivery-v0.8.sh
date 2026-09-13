@@ -142,8 +142,8 @@ relationship_ok = (
 )
 limits_text = limits.read_text()
 def authority_cell(key):
-    match = re.search(rf"\| `{key}` \| `([^`]*)` \|", limits_text)
-    return match.group(1) if match else None
+    match = re.search(rf"\| `{key}` \|\s*([^|]+?)\s*\|", limits_text)
+    return match.group(1).strip().strip("`*").strip() if match else None
 
 budget_cells = {
     "delivery_source_retention_days": authority_cell("delivery_source_retention_days"),
