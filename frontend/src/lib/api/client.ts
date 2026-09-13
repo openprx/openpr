@@ -150,11 +150,13 @@ class ApiClient {
 		endpoint: string,
 		body?: unknown,
 		retryAfterRefresh: boolean = true,
-		additionalHeaders: Record<string, string> = {}
+		additionalHeaders: Record<string, string> = {},
+		signal?: AbortSignal
 	): Promise<ApiResult<T>> {
 		const url = `${this.baseUrl}${endpoint}`;
 		const headers = new Headers();
-		headers.set('Content-Type', 'application/json');
+		const isFormData = typeof FormData !== 'undefined' && body instanceof FormData;
+		if (!isFormData) headers.set('Content-Type', 'application/json');
 		if (this.token) {
 			headers.set('Authorization', `Bearer ${this.token}`);
 		}
@@ -164,7 +166,8 @@ class ApiClient {
 			const res = await fetch(url, {
 				method,
 				headers,
-				body: body ? JSON.stringify(body) : undefined,
+				body: isFormData ? body : body ? JSON.stringify(body) : undefined,
+				signal,
 				credentials: 'include'
 			});
 
@@ -182,7 +185,7 @@ class ApiClient {
 				if (!isRefreshEndpoint && retryAfterRefresh) {
 					const refreshed = await this.refreshAccessTokenOnce();
 					if (refreshed) {
-						return this.request<T>(method, endpoint, body, false, additionalHeaders);
+						return this.request<T>(method, endpoint, body, false, additionalHeaders, signal);
 					}
 				}
 				this.clearAuth();
@@ -205,6 +208,15 @@ class ApiClient {
 
 	post<T>(endpoint: string, data?: unknown): Promise<ApiResult<T>> {
 		return this.request<T>('POST', endpoint, data);
+	}
+
+	postFormData<T>(
+		endpoint: string,
+		data: FormData,
+		headers: Record<string, string> = {},
+		signal?: AbortSignal
+	): Promise<ApiResult<T>> {
+		return this.request<T>('POST', endpoint, data, true, headers, signal);
 	}
 
 	patch<T>(endpoint: string, data?: unknown): Promise<ApiResult<T>> {

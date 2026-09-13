@@ -185,6 +185,54 @@ export interface FlowConversionJob {
 	error: string | null;
 }
 
+export type FlowPackageConflictPolicy = 'reject_existing' | 'reuse_import_lineage';
+export type FlowPackageExternalReferencePolicy = 'reject' | 'detach';
+
+export interface FlowPackageArtifactReceipt {
+	artifact_id: string;
+	package_sha256: string;
+	size: number;
+	expires_at: string;
+}
+
+export interface FlowPackageImportPreview {
+	preview_id: string;
+	package_id: string;
+	package_sha256: string;
+	mapping_hash: string;
+	mapping: Record<string, unknown>;
+	conflicts: string[];
+	warnings: string[];
+	estimated_changes: Record<string, number>;
+	expires_at: string;
+}
+
+export interface FlowPackageImportJobReceipt {
+	job_id: string;
+	import_id: string;
+	status: string;
+}
+
+export interface FlowPackageImportReport {
+	import_id: string;
+	package_id: string;
+	package_sha256: string;
+	source_workspace_id: string;
+	target_workspace_id: string;
+	status: string;
+	mapping_hash: string;
+	conflict_policy: FlowPackageConflictPolicy;
+	counts: Record<string, number>;
+	object_mapping: Record<string, string>;
+	document_mapping: Record<string, string>;
+	detached_references: string[];
+	warnings: string[];
+	started_at: string;
+	finished_at: string;
+	actor: string;
+	audit_event_id: string;
+}
+
 /** v0.4 command types (`rest-api-v1.md`'s `POST .../commands` row). */
 export type FlowCommandType =
 	| 'set_title'
@@ -398,6 +446,66 @@ export const flowApi = {
 			idempotency_key: idempotencyKey,
 			confirm: true
 		});
+	},
+
+	uploadPackageArtifact(
+		workspaceId: string,
+		file: Blob,
+		filename: string,
+		idempotencyKey: string,
+		signal?: AbortSignal
+	): Promise<ApiResult<FlowPackageArtifactReceipt>> {
+		const body = new FormData();
+		body.append('package', file, filename);
+		return apiClient.postFormData<FlowPackageArtifactReceipt>(
+			`/api/v1/workspaces/${workspaceId}/flow/import-artifacts`,
+			body,
+			{ 'Idempotency-Key': idempotencyKey },
+			signal
+		);
+	},
+
+	previewPackageImport(
+		workspaceId: string,
+		input: {
+			artifact_id: string;
+			project_mapping: Record<string, string | null>;
+			external_reference_policy: FlowPackageExternalReferencePolicy;
+			conflict_policy: FlowPackageConflictPolicy;
+			include_history: boolean;
+			idempotency_key: string;
+		}
+	): Promise<ApiResult<FlowPackageImportPreview>> {
+		return apiClient.post<FlowPackageImportPreview>(
+			`/api/v1/workspaces/${workspaceId}/flow/imports/preview`,
+			input
+		);
+	},
+
+	commitPackageImport(
+		workspaceId: string,
+		importId: string,
+		input: {
+			package_sha256: string;
+			mapping_hash: string;
+			conflict_policy: FlowPackageConflictPolicy;
+			confirm: true;
+			idempotency_key: string;
+		}
+	): Promise<ApiResult<FlowPackageImportJobReceipt>> {
+		return apiClient.post<FlowPackageImportJobReceipt>(
+			`/api/v1/workspaces/${workspaceId}/flow/imports/${importId}/commit`,
+			input
+		);
+	},
+
+	getPackageImport(
+		workspaceId: string,
+		importId: string
+	): Promise<ApiResult<FlowPackageImportReport>> {
+		return apiClient.get<FlowPackageImportReport>(
+			`/api/v1/workspaces/${workspaceId}/flow/imports/${importId}`
+		);
 	},
 
 	getBootstrap(
