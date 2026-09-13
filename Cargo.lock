@@ -129,7 +129,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "api"
-version = "0.2.234"
+version = "0.2.235"
 dependencies = [
  "anyhow",
  "axum",
@@ -312,6 +312,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
@@ -624,7 +625,7 @@ dependencies = [
 
 [[package]]
 name = "collab-core"
-version = "0.2.234"
+version = "0.2.235"
 dependencies = [
  "crc32fast",
  "libc",
@@ -2398,7 +2399,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-server"
-version = "0.2.234"
+version = "0.2.235"
 dependencies = [
  "anyhow",
  "api",
@@ -2501,6 +2502,23 @@ checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]
@@ -2840,7 +2858,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform"
-version = "0.2.234"
+version = "0.2.235"
 dependencies = [
  "chrono",
  "jsonwebtoken",
@@ -5730,7 +5748,7 @@ dependencies = [
 
 [[package]]
 name = "worker"
-version = "0.2.234"
+version = "0.2.235"
 dependencies = [
  "anyhow",
  "api",

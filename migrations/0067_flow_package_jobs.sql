@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS flow_package_artifacts (
   actor_id UUID NOT NULL,
   purpose TEXT NOT NULL,
   package_sha256 CHAR(64) NOT NULL,
+  idempotency_key TEXT,
+  request_hash CHAR(64),
   size_bytes BIGINT NOT NULL,
   package_bytes BYTEA NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
@@ -16,11 +18,16 @@ CREATE TABLE IF NOT EXISTS flow_package_artifacts (
   CONSTRAINT flow_package_artifacts_hash_check CHECK (package_sha256 ~ '^[0-9a-f]{64}$'),
   CONSTRAINT flow_package_artifacts_size_check
     CHECK (size_bytes >= 0 AND size_bytes = octet_length(package_bytes)),
-  CONSTRAINT flow_package_artifacts_expiry_check CHECK (expires_at > created_at)
+  CONSTRAINT flow_package_artifacts_expiry_check CHECK (expires_at > created_at),
+  CONSTRAINT flow_package_artifacts_idempotency_pair_check
+    CHECK ((idempotency_key IS NULL) = (request_hash IS NULL))
 );
 
 CREATE INDEX IF NOT EXISTS idx_flow_package_artifacts_expiry
   ON flow_package_artifacts(expires_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_package_artifacts_import_idempotency
+  ON flow_package_artifacts(workspace_id, actor_kind, actor_id, purpose, idempotency_key)
+  WHERE purpose = 'import' AND idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS flow_export_jobs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

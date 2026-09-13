@@ -245,6 +245,16 @@ impl<A: Write, E: Write> BoundedImportStager<A, E> {
     pub const fn entry_count(&self) -> u64 {
         self.entry_count
     }
+
+    /// Returns the isolated sinks only after the archive phase has been sealed and no expanded
+    /// entry remains open. Multipart and inline-base64 adapters use this to pass the exact bounded
+    /// archive bytes to the package verifier without reaching into the stager's counters.
+    pub fn into_stages(self) -> Result<(A, E), ApiError> {
+        if self.poisoned || !self.archive_finished || self.current_entry.is_some() {
+            return Err(ApiError::invalid_update("import staging is incomplete"));
+        }
+        Ok((self.archive_stage, self.expanded_stage))
+    }
 }
 
 fn check_limit(observed: u64, limit: u64, limit_kind: &'static str, message: &'static str) -> Result<(), ApiError> {

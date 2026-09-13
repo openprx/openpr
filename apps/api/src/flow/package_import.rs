@@ -16,7 +16,7 @@ use crate::error::ApiError;
 use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
 use super::package::{ExportPackageManifest, VerifiedPackage, verify_package};
-use super::{projection, repository};
+use super::{import::BoundedImportStager, projection, repository};
 
 const IMPORT_ARTIFACT_TTL_MINUTES: i64 = 30;
 
@@ -69,6 +69,7 @@ pub struct PreviewImportRequest {
     pub project_map: BTreeMap<Uuid, Option<Uuid>>,
     pub external_reference_policy: ExternalReferencePolicy,
     pub conflict_policy: ConflictPolicy,
+    pub include_history: bool,
     pub idempotency_key: String,
     pub principal: ImportPrincipal,
 }
@@ -204,29 +205,61 @@ struct ExistingPreviewRow {
     expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct ExistingArtifactRow {
+    id: Uuid,
+    package_sha256: String,
+    request_hash: Option<String>,
+    expires_at: DateTime<Utc>,
+}
+
 pub async fn upload_package_artifact(
     db: &DatabaseConnection,
     workspace_id: Uuid,
     principal: &ImportPrincipal,
     bytes: Vec<u8>,
     expected_package_sha256: Option<&str>,
+    idempotency_key: &str,
 ) -> Result<(Uuid, String, DateTime<Utc>), ApiError> {
     enforce_admin(principal)?;
+    validate_key(idempotency_key)?;
     let verified = verify_package(Cursor::new(&bytes), expected_package_sha256)?;
+    let request_hash = verified.package_sha256.clone();
+    if let Some(existing) = ExistingArtifactRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT id,package_sha256,request_hash,expires_at FROM flow_package_artifacts \
+         WHERE workspace_id=$1 AND actor_kind=$2 AND actor_id=$3 AND purpose='import' AND idempotency_key=$4",
+        vec![
+            workspace_id.into(),
+            principal.kind.clone().into(),
+            principal.id.into(),
+            idempotency_key.into(),
+        ],
+    ))
+    .one(db)
+    .await?
+    {
+        if existing.request_hash.as_deref() != Some(request_hash.as_str()) {
+            return Err(ApiError::Conflict("artifact idempotency key body drift".to_string()));
+        }
+        return Ok((existing.id, existing.package_sha256, existing.expires_at));
+    }
     let id = Uuid::new_v4();
     let expires_at = Utc::now() + Duration::minutes(IMPORT_ARTIFACT_TTL_MINUTES);
     let size = i64::try_from(bytes.len()).map_err(|_| ApiError::Internal)?;
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "INSERT INTO flow_package_artifacts \
-         (id,workspace_id,actor_kind,actor_id,purpose,package_sha256,size_bytes,package_bytes,expires_at) \
-         VALUES ($1,$2,$3,$4,'import',$5,$6,$7,$8)",
+         (id,workspace_id,actor_kind,actor_id,purpose,package_sha256,idempotency_key,request_hash,size_bytes,package_bytes,expires_at) \
+         VALUES ($1,$2,$3,$4,'import',$5,$6,$7,$8,$9,$10)",
         vec![
             id.into(),
             workspace_id.into(),
             principal.kind.clone().into(),
             principal.id.into(),
             verified.package_sha256.clone().into(),
+            idempotency_key.into(),
+            request_hash.into(),
             size.into(),
             bytes.into(),
             expires_at.into(),
@@ -234,6 +267,44 @@ pub async fn upload_package_artifact(
     ))
     .await?;
     Ok((id, verified.package_sha256, expires_at))
+}
+
+pub async fn upload_inline_base64_artifact(
+    db: &DatabaseConnection,
+    workspace_id: Uuid,
+    principal: &ImportPrincipal,
+    encoded: &[u8],
+    expected_package_sha256: Option<&str>,
+    idempotency_key: &str,
+) -> Result<(Uuid, String, DateTime<Utc>), ApiError> {
+    let mut stager = BoundedImportStager::new(Vec::new(), std::io::sink());
+    stager.stage_inline_base64_archive(Cursor::new(encoded))?;
+    stager.finish_archive()?;
+    let (bytes, _) = stager.into_stages()?;
+    upload_package_artifact(
+        db,
+        workspace_id,
+        principal,
+        bytes,
+        expected_package_sha256,
+        idempotency_key,
+    )
+    .await
+}
+
+pub async fn get_import_report(
+    db: &DatabaseConnection,
+    workspace_id: Uuid,
+    import_id: Uuid,
+    principal: &ImportPrincipal,
+) -> Result<ImportReport, ApiError> {
+    enforce_admin(principal)?;
+    let job = repository::fetch_import_job(db, workspace_id, import_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("import not found".to_string()))?;
+    job.report
+        .ok_or_else(|| ApiError::Conflict("import has not completed".to_string()))
+        .and_then(|value| serde_json::from_value(value).map_err(|_| ApiError::Internal))
 }
 
 pub async fn preview_package_import(
@@ -244,12 +315,18 @@ pub async fn preview_package_import(
     enforce_admin(&request.principal)?;
     let artifact = load_artifact(db, request.workspace_id, request.artifact_id, &request.principal).await?;
     let plan = parse_plan(&artifact.package_bytes, &artifact.package_sha256)?;
+    if request.include_history != plan.verified.manifest.history.included {
+        return Err(ApiError::BadRequest(
+            "include_history must match the uploaded package manifest".to_string(),
+        ));
+    }
     validate_projects(db, request.workspace_id, &request.project_map, &plan.objects).await?;
     let request_json = json!({
         "artifact_id": request.artifact_id,
         "project_map": request.project_map,
         "external_reference_policy": request.external_reference_policy,
         "conflict_policy": request.conflict_policy,
+        "include_history": request.include_history,
     });
     let request_hash = sha256_json(&request_json)?;
     if let Some(existing) = existing_preview(db, request, &request_hash).await? {
@@ -1412,9 +1489,24 @@ mod tests {
         label: &str,
     ) -> (ImportPreviewReceipt, CommitImportRequest) {
         let principal = principal(owner_id);
-        let (artifact_id, package_sha256, _) = upload_package_artifact(db, workspace_id, &principal, package, None)
-            .await
-            .unwrap();
+        let replay_package = package.clone();
+        let artifact_key = format!("artifact-{label}");
+        let (artifact_id, package_sha256, _) =
+            upload_package_artifact(db, workspace_id, &principal, package, None, &artifact_key)
+                .await
+                .unwrap();
+        let replay = upload_package_artifact(
+            db,
+            workspace_id,
+            &principal,
+            replay_package,
+            Some(&package_sha256),
+            &artifact_key,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.0, artifact_id);
+        assert_eq!(replay.1, package_sha256);
         let preview = preview_package_import(
             db,
             &PreviewImportRequest {
@@ -1423,6 +1515,7 @@ mod tests {
                 project_map: BTreeMap::new(),
                 external_reference_policy: ExternalReferencePolicy::Detach,
                 conflict_policy: ConflictPolicy::RejectExisting,
+                include_history: true,
                 idempotency_key: format!("preview-{label}"),
                 principal: principal.clone(),
             },
@@ -1483,10 +1576,16 @@ mod tests {
         assert_eq!(replay.audit_event_id, report.audit_event_id);
 
         let target_principal = principal(target_owner);
-        let (reuse_artifact, reuse_sha, _) =
-            upload_package_artifact(&state.db, target_workspace, &target_principal, reuse_package, None)
-                .await
-                .unwrap();
+        let (reuse_artifact, reuse_sha, _) = upload_package_artifact(
+            &state.db,
+            target_workspace,
+            &target_principal,
+            reuse_package,
+            None,
+            "artifact-reuse",
+        )
+        .await
+        .unwrap();
         let reuse_preview = preview_package_import(
             &state.db,
             &PreviewImportRequest {
@@ -1495,6 +1594,7 @@ mod tests {
                 project_map: BTreeMap::new(),
                 external_reference_policy: ExternalReferencePolicy::Detach,
                 conflict_policy: ConflictPolicy::ReuseImportLineage,
+                include_history: true,
                 idempotency_key: "preview-reuse".to_string(),
                 principal: target_principal.clone(),
             },
@@ -1581,6 +1681,7 @@ mod tests {
                 },
                 Vec::new(),
                 None,
+                "artifact-denied",
             )
             .await,
             Err(ApiError::Forbidden(_))

@@ -28,15 +28,15 @@
 
 use axum::{
     Extension, Json,
-    extract::{Path, Query, State},
-    http::HeaderMap,
+    extract::{FromRequest, Multipart, Path, Query, Request, State},
+    http::{HeaderMap, HeaderValue, header},
     response::IntoResponse,
 };
 use chrono::{DateTime, Utc};
 use platform::{app::AppState, auth::JwtClaims};
 use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -54,6 +54,379 @@ use crate::{
     },
     response::ApiResponse,
 };
+
+#[derive(Debug, Deserialize)]
+pub struct PackageExportRequest {
+    pub format: String,
+    #[serde(default)]
+    pub include_history: bool,
+    pub project_id: Option<Uuid>,
+    pub at_seq: Option<i64>,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InlinePackageSource {
+    pub kind: String,
+    pub package_base64: String,
+    pub package_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PackageArtifactRequest {
+    pub source: InlinePackageSource,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PackageImportPreviewRequest {
+    pub artifact_id: Uuid,
+    #[serde(default)]
+    pub project_mapping: std::collections::BTreeMap<Uuid, Option<Uuid>>,
+    pub external_reference_policy: crate::flow::package_import::ExternalReferencePolicy,
+    pub conflict_policy: crate::flow::package_import::ConflictPolicy,
+    #[serde(default)]
+    pub include_history: bool,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PackageImportCommitRequest {
+    pub package_sha256: String,
+    pub mapping_hash: String,
+    pub conflict_policy: crate::flow::package_import::ConflictPolicy,
+    pub confirm: bool,
+    pub idempotency_key: String,
+}
+
+fn package_import_principal(id: Uuid, role: String, is_bot: bool) -> crate::flow::package_import::ImportPrincipal {
+    crate::flow::package_import::ImportPrincipal {
+        id,
+        kind: if is_bot { "bot" } else { "user" }.to_string(),
+        role,
+    }
+}
+
+fn package_export_principal(id: Uuid, role: String, is_bot: bool) -> crate::flow::export::ExportPrincipal {
+    crate::flow::export::ExportPrincipal {
+        id,
+        kind: if is_bot { "bot" } else { "user" }.to_string(),
+        workspace_export_capability: is_bot && role == "admin",
+        role,
+    }
+}
+
+fn package_source_head() -> Result<String, ApiError> {
+    let head = env!("OPENPR_EMBEDDED_GIT_COMMIT");
+    if head.len() != 40
+        || !head
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ApiError::Internal);
+    }
+    Ok(head.to_string())
+}
+
+fn require_package_tool(bot: Option<&Extension<BotAuthContext>>, expected: &str) -> Result<(), ApiError> {
+    if let Some(Extension(context)) = bot
+        && context.tool_name.as_deref().is_some_and(|tool| tool != expected)
+    {
+        return Err(ApiError::Forbidden(format!(
+            "package operation requires the exact {expected} tool policy"
+        )));
+    }
+    Ok(())
+}
+
+async fn package_workspace_principal(
+    state: &AppState,
+    claims: JwtClaims,
+    bot: Option<Extension<BotAuthContext>>,
+    workspace_id: Uuid,
+) -> Result<(crate::flow::package_import::ImportPrincipal, axum::http::Extensions), ApiError> {
+    let extensions = build_auth_extensions(claims, bot);
+    let (actor_id, role, is_bot) =
+        policy::require_flow_workspace_admin_access(state, &extensions, workspace_id).await?;
+    Ok((package_import_principal(actor_id, role, is_bot), extensions))
+}
+
+pub async fn post_flow_object_export(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(object_id): Path<Uuid>,
+    Json(req): Json<PackageExportRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_package_tool(bot.as_ref(), "objects.export")?;
+    if req.format != "package" || req.project_id.is_some() || req.at_seq.is_some() {
+        return Err(ApiError::invalid_update(
+            "this v0.8 endpoint currently accepts only complete package head exports",
+        ));
+    }
+    let extensions = build_auth_extensions(claims, bot);
+    let (_, caller) = authorization_caller(&state, &extensions, object_id).await?;
+    let receipt = crate::flow::export::create_package_export(
+        &state.db,
+        &crate::flow::export::CreateExportRequest {
+            scope: crate::flow::export::ExportScope::Object(object_id),
+            include_history: req.include_history,
+            idempotency_key: req.idempotency_key,
+            source_head: package_source_head()?,
+            principal: package_export_principal(caller.actor_id, caller.role, caller.principal_kind == "bot"),
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(receipt))
+}
+
+pub async fn post_flow_workspace_export(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Json(req): Json<PackageExportRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_package_tool(bot.as_ref(), "objects.export_workspace")?;
+    if req.format != "package" || req.at_seq.is_some() {
+        return Err(ApiError::invalid_update(
+            "workspace export requires format=package at the accepted head",
+        ));
+    }
+    let extensions = build_auth_extensions(claims, bot);
+    let (actor_id, role, is_bot) =
+        policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+    let receipt = crate::flow::export::create_package_export(
+        &state.db,
+        &crate::flow::export::CreateExportRequest {
+            scope: crate::flow::export::ExportScope::Workspace {
+                workspace_id,
+                project_id: req.project_id,
+            },
+            include_history: req.include_history,
+            idempotency_key: req.idempotency_key,
+            source_head: package_source_head()?,
+            principal: package_export_principal(actor_id, role, is_bot),
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(receipt))
+}
+
+async fn export_job_workspace(db: &sea_orm::DatabaseConnection, job_id: Uuid) -> Result<Uuid, ApiError> {
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT workspace_id FROM flow_export_jobs WHERE id=$1",
+            vec![job_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| ApiError::NotFound("export job not found".to_string()))?;
+    row.try_get("", "workspace_id").map_err(Into::into)
+}
+
+pub async fn get_flow_export(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let workspace_id = export_job_workspace(&state.db, job_id).await?;
+    let extensions = build_auth_extensions(claims, bot);
+    let (actor_id, role, is_bot) = require_workspace_access(&state, &extensions, workspace_id).await?;
+    let receipt =
+        crate::flow::export::get_package_export(&state.db, job_id, &package_export_principal(actor_id, role, is_bot))
+            .await?;
+    Ok(ApiResponse::success(
+        json!({"download_url":format!("/api/v1/flow/exports/{job_id}/artifact"),"job":receipt}),
+    ))
+}
+
+pub async fn get_flow_export_artifact(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(job_id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    let workspace_id = export_job_workspace(&state.db, job_id).await?;
+    let extensions = build_auth_extensions(claims, bot);
+    let (actor_id, role, is_bot) = require_workspace_access(&state, &extensions, workspace_id).await?;
+    let (bytes, hash) = crate::flow::export::download_package_export(
+        &state.db,
+        job_id,
+        &package_export_principal(actor_id, role, is_bot),
+    )
+    .await?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.sylvode.flow-package+zip;version=1"),
+    );
+    headers.insert(
+        "x-flow-package-sha256",
+        HeaderValue::from_str(&hash).map_err(|_| ApiError::Internal)?,
+    );
+    Ok((headers, bytes))
+}
+
+pub async fn post_flow_import_artifact(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    request: Request,
+) -> Result<impl IntoResponse, ApiError> {
+    require_package_tool(bot.as_ref(), "objects.import_artifact")?;
+    let (principal, _) = package_workspace_principal(&state, claims, bot, workspace_id).await?;
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let multipart_idempotency_key = request
+        .headers()
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let (artifact_id, package_sha256, expires_at) = if content_type.starts_with("multipart/form-data") {
+        let mut multipart = Multipart::from_request(request, &state)
+            .await
+            .map_err(|_| ApiError::BadRequest("invalid multipart package upload".to_string()))?;
+        let mut stager = crate::flow::import::BoundedImportStager::new(Vec::new(), std::io::sink());
+        let mut seen = false;
+        while let Some(mut field) = multipart
+            .next_field()
+            .await
+            .map_err(|_| ApiError::invalid_update("multipart package stream failed"))?
+        {
+            if field.name() != Some("package") || seen {
+                return Err(ApiError::BadRequest(
+                    "multipart upload requires exactly one package field".to_string(),
+                ));
+            }
+            seen = true;
+            while let Some(chunk) = field
+                .chunk()
+                .await
+                .map_err(|_| ApiError::invalid_update("multipart package stream failed"))?
+            {
+                stager.write_archive_chunk(&chunk)?;
+            }
+        }
+        if !seen {
+            return Err(ApiError::BadRequest("multipart package field is missing".to_string()));
+        }
+        stager.finish_archive()?;
+        let (bytes, _) = stager.into_stages()?;
+        crate::flow::package_import::upload_package_artifact(
+            &state.db,
+            workspace_id,
+            &principal,
+            bytes,
+            None,
+            &multipart_idempotency_key,
+        )
+        .await?
+    } else {
+        let Json(req) = Json::<PackageArtifactRequest>::from_request(request, &state)
+            .await
+            .map_err(|_| ApiError::BadRequest("invalid import artifact JSON".to_string()))?;
+        if req.source.kind != "inline_base64" || req.idempotency_key.trim().is_empty() {
+            return Err(ApiError::BadRequest(
+                "JSON artifact source must be inline_base64 with idempotency_key".to_string(),
+            ));
+        }
+        crate::flow::package_import::upload_inline_base64_artifact(
+            &state.db,
+            workspace_id,
+            &principal,
+            req.source.package_base64.as_bytes(),
+            req.source.package_sha256.as_deref(),
+            &req.idempotency_key,
+        )
+        .await?
+    };
+    let size: i64 = state
+        .db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT size_bytes FROM flow_package_artifacts WHERE id=$1",
+            vec![artifact_id.into()],
+        ))
+        .await?
+        .ok_or(ApiError::Internal)?
+        .try_get("", "size_bytes")?;
+    Ok(ApiResponse::success(
+        json!({"artifact_id":artifact_id,"package_sha256":package_sha256,"size":size,"expires_at":expires_at}),
+    ))
+}
+
+pub async fn post_flow_import_preview(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path(workspace_id): Path<Uuid>,
+    Json(req): Json<PackageImportPreviewRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_package_tool(bot.as_ref(), "objects.import_preview")?;
+    let (principal, _) = package_workspace_principal(&state, claims, bot, workspace_id).await?;
+    let receipt = crate::flow::package_import::preview_package_import(
+        &state.db,
+        &crate::flow::package_import::PreviewImportRequest {
+            workspace_id,
+            artifact_id: req.artifact_id,
+            project_map: req.project_mapping,
+            external_reference_policy: req.external_reference_policy,
+            conflict_policy: req.conflict_policy,
+            include_history: req.include_history,
+            idempotency_key: req.idempotency_key,
+            principal,
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(receipt))
+}
+
+pub async fn post_flow_import_commit(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path((workspace_id, import_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<PackageImportCommitRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_package_tool(bot.as_ref(), "objects.import_commit")?;
+    let (principal, _) = package_workspace_principal(&state, claims, bot, workspace_id).await?;
+    let report = crate::flow::package_import::commit_package_import(
+        &state.db,
+        &crate::flow::package_import::CommitImportRequest {
+            workspace_id,
+            preview_id: import_id,
+            package_sha256: req.package_sha256,
+            mapping_hash: req.mapping_hash,
+            conflict_policy: req.conflict_policy,
+            confirm: req.confirm,
+            idempotency_key: req.idempotency_key,
+            principal,
+        },
+    )
+    .await?;
+    Ok(ApiResponse::success(
+        json!({"job_id":report.import_id,"import_id":report.import_id,"status":report.status}),
+    ))
+}
+
+pub async fn get_flow_import(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Path((workspace_id, import_id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (principal, _) = package_workspace_principal(&state, claims, bot, workspace_id).await?;
+    Ok(ApiResponse::success(
+        crate::flow::package_import::get_import_report(&state.db, workspace_id, import_id, &principal).await?,
+    ))
+}
 
 /// `POST /api/v1/flow/objects/{object_id}/references`.
 pub async fn post_flow_object_reference(
@@ -9298,6 +9671,202 @@ mod flow_database_tests {
             "three successful dry-runs and two exact-confirm executes write operation audit rows"
         );
 
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn package_export_upload_preview_commit_status_runs_through_real_http_shapes() {
+        use tower::ServiceExt as _;
+
+        let scratch = scratch_or_skip!("package-route-chain");
+        let state = state_for(scratch.db.clone());
+        let (source_workspace, source_owner) = seed_workspace(&state, true).await;
+        let (target_workspace, target_owner) = seed_workspace(&state, true).await;
+        create_page_as_owner(&state, source_workspace, source_owner, "route package source").await;
+
+        let source_app = axum::Router::new()
+            .route(
+                "/api/v1/workspaces/{workspace_id}/flow/exports",
+                axum::routing::post(super::post_flow_workspace_export),
+            )
+            .route(
+                "/api/v1/flow/exports/{job_id}",
+                axum::routing::get(super::get_flow_export),
+            )
+            .route(
+                "/api/v1/flow/exports/{job_id}/artifact",
+                axum::routing::get(super::get_flow_export_artifact),
+            )
+            .layer(claims_for(source_owner))
+            .with_state(state.clone());
+        let export_response = source_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/workspaces/{source_workspace}/flow/exports"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"format":"package","include_history":false,"idempotency_key":"route-export"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let export_body = body_json(export_response).await;
+        assert_eq!(export_body["code"], 0, "{export_body}");
+        let job_id = export_body["data"]["job_id"].as_str().unwrap();
+        let status_response = source_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/flow/exports/{job_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = body_json(status_response).await;
+        assert_eq!(status["data"]["job"]["checksum"], export_body["data"]["checksum"]);
+        let artifact_response = source_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/flow/exports/{job_id}/artifact"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            artifact_response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/vnd.sylvode.flow-package+zip;version=1"
+        );
+        let artifact_bytes = to_bytes(artifact_response.into_body(), usize::MAX).await.unwrap();
+
+        let target_app = axum::Router::new()
+            .route(
+                "/api/v1/workspaces/{workspace_id}/flow/import-artifacts",
+                axum::routing::post(super::post_flow_import_artifact),
+            )
+            .route(
+                "/api/v1/workspaces/{workspace_id}/flow/imports/preview",
+                axum::routing::post(super::post_flow_import_preview),
+            )
+            .route(
+                "/api/v1/workspaces/{workspace_id}/flow/imports/{import_id}/commit",
+                axum::routing::post(super::post_flow_import_commit),
+            )
+            .route(
+                "/api/v1/workspaces/{workspace_id}/flow/imports/{import_id}",
+                axum::routing::get(super::get_flow_import),
+            )
+            .layer(claims_for(target_owner))
+            .with_state(state.clone());
+        let upload_response = target_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/import-artifacts"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "source":{"kind":"inline_base64","package_base64":base64::engine::general_purpose::STANDARD.encode(&artifact_bytes)},
+                            "idempotency_key":"route-upload"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let upload = body_json(upload_response).await;
+        assert_eq!(upload["code"], 0, "{upload}");
+        let mut multipart_body = b"--flow-boundary\r\nContent-Disposition: form-data; name=\"package\"; filename=\"flow.sylvode-flow.zip\"\r\nContent-Type: application/vnd.sylvode.flow-package+zip;version=1\r\n\r\n".to_vec();
+        multipart_body.extend_from_slice(&artifact_bytes);
+        multipart_body.extend_from_slice(b"\r\n--flow-boundary--\r\n");
+        let multipart_response = target_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/import-artifacts"))
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=flow-boundary",
+                    )
+                    .header("idempotency-key", "route-multipart-upload")
+                    .body(axum::body::Body::from(multipart_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let multipart_upload = body_json(multipart_response).await;
+        assert_eq!(multipart_upload["code"], 0, "{multipart_upload}");
+        assert_eq!(
+            multipart_upload["data"]["package_sha256"],
+            upload["data"]["package_sha256"]
+        );
+        assert_ne!(multipart_upload["data"]["artifact_id"], upload["data"]["artifact_id"]);
+        let preview_response = target_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/imports/preview"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "artifact_id":upload["data"]["artifact_id"],"project_mapping":{},
+                            "external_reference_policy":"detach","conflict_policy":"reject_existing",
+                            "include_history":false,"idempotency_key":"route-preview"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let preview = body_json(preview_response).await;
+        assert_eq!(preview["code"], 0, "{preview}");
+        let import_id = preview["data"]["preview_id"].as_str().unwrap();
+        let commit_response = target_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/v1/workspaces/{target_workspace}/flow/imports/{import_id}/commit"
+                    ))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "package_sha256":preview["data"]["package_sha256"],
+                            "mapping_hash":preview["data"]["mapping_hash"],"conflict_policy":"reject_existing",
+                            "confirm":true,"idempotency_key":"route-commit"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let committed = body_json(commit_response).await;
+        assert_eq!(committed["code"], 0, "{committed}");
+        let job_id = committed["data"]["job_id"].as_str().unwrap();
+        let report_response = target_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/imports/{job_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let report = body_json(report_response).await;
+        assert_eq!(report["data"]["status"], "completed", "{report}");
+        assert_eq!(report["data"]["counts"]["created"], 1);
         scratch.drop_self().await;
     }
 }

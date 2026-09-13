@@ -156,6 +156,20 @@ struct ExistingJob {
     expires_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct ExportAccessRow {
+    id: Uuid,
+    workspace_id: Uuid,
+    object_id: Option<Uuid>,
+    actor_kind: String,
+    actor_id: Uuid,
+    status: String,
+    package_sha256: Option<String>,
+    size_bytes: Option<i64>,
+    expires_at: Option<DateTime<Utc>>,
+    package_bytes: Option<Vec<u8>>,
+}
+
 pub async fn create_package_export(
     db: &DatabaseConnection,
     request: &CreateExportRequest,
@@ -383,6 +397,83 @@ pub async fn create_package_export(
         package.package_sha256,
     )
     .await
+}
+
+pub async fn get_package_export(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    principal: &ExportPrincipal,
+) -> Result<ExportJobReceipt, ApiError> {
+    let row = export_access_row(db, job_id).await?;
+    authorize_export_access(db, &row, principal).await?;
+    access_receipt(&row)
+}
+
+pub async fn download_package_export(
+    db: &DatabaseConnection,
+    job_id: Uuid,
+    principal: &ExportPrincipal,
+) -> Result<(Vec<u8>, String), ApiError> {
+    let row = export_access_row(db, job_id).await?;
+    authorize_export_access(db, &row, principal).await?;
+    if row.expires_at.is_none_or(|expires| expires <= Utc::now()) {
+        return Err(ApiError::NotFound("export artifact expired".to_string()));
+    }
+    Ok((
+        row.package_bytes
+            .ok_or_else(|| ApiError::NotFound("export artifact not found".to_string()))?,
+        row.package_sha256.ok_or(ApiError::Internal)?,
+    ))
+}
+
+async fn export_access_row(db: &DatabaseConnection, job_id: Uuid) -> Result<ExportAccessRow, ApiError> {
+    ExportAccessRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT j.id,j.workspace_id,j.object_id,j.actor_kind,j.actor_id,j.status,j.package_sha256,j.size_bytes,j.expires_at,a.package_bytes \
+         FROM flow_export_jobs j LEFT JOIN flow_package_artifacts a ON a.id=j.artifact_id WHERE j.id=$1",
+        vec![job_id.into()],
+    ))
+    .one(db)
+    .await?
+    .ok_or_else(|| ApiError::NotFound("export job not found".to_string()))
+}
+
+async fn authorize_export_access(
+    db: &DatabaseConnection,
+    row: &ExportAccessRow,
+    principal: &ExportPrincipal,
+) -> Result<(), ApiError> {
+    let initiating = row.actor_kind == principal.kind && row.actor_id == principal.id;
+    if !(initiating || principal.kind == "user" && matches!(principal.role.as_str(), "owner" | "admin")) {
+        return Err(ApiError::NotFound("export job not found".to_string()));
+    }
+    let tx = db.begin().await?;
+    lock_authorization_epoch(&tx, row.workspace_id).await?;
+    if let Some(object_id) = row.object_id {
+        authorize_all(&tx, row.workspace_id, &[object_id], principal, "export download").await?;
+    } else if !((principal.kind == "user" && matches!(principal.role.as_str(), "owner" | "admin"))
+        || (principal.kind == "bot" && principal.workspace_export_capability))
+    {
+        return Err(ApiError::Forbidden(
+            "workspace export permission is required".to_string(),
+        ));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+fn access_receipt(row: &ExportAccessRow) -> Result<ExportJobReceipt, ApiError> {
+    Ok(ExportJobReceipt {
+        job_id: row.id,
+        status: row.status.clone(),
+        format: "package".to_string(),
+        workspace_id: row.workspace_id,
+        object_id: row.object_id,
+        package_schema: "v1".to_string(),
+        checksum: row.package_sha256.clone().ok_or(ApiError::Internal)?,
+        size: u64::try_from(row.size_bytes.ok_or(ApiError::Internal)?).map_err(|_| ApiError::Internal)?,
+        expires_at: row.expires_at.ok_or(ApiError::Internal)?.to_rfc3339(),
+    })
 }
 
 fn validate_request(request: &CreateExportRequest) -> Result<(), ApiError> {
