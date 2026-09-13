@@ -6,7 +6,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 CACHE_ROOT=/opt/worker/.cache/openpr-v08-authz-broadcast-mutations
 WORKTREE="$CACHE_ROOT/worktree"
-TARGET_DIR="$CACHE_ROOT/target"
+TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
 TEST_NAME=flow::grants::database_tests::multi_instance_revocation_closes_subtree_sessions_without_skipping_log_epochs
 

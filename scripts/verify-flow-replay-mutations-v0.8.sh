@@ -6,7 +6,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 CACHE_ROOT=/opt/worker/.cache/openpr-v08-replay-mutations
 WORKTREE="$CACHE_ROOT/worktree"
-TARGET_DIR="$CACHE_ROOT/target"
+TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
 RETENTION_TEST=events::dispatcher::dispatcher_database_tests::replay_is_windowed_deduplicated_and_crosses_delivery_retention_without_duplication
 ANCHOR_TEST=events::dispatcher::dispatcher_database_tests::requeue_failed_filters_terminated_time_and_preserves_delivery_id

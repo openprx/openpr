@@ -6,7 +6,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 CACHE_ROOT=/opt/worker/.cache/openpr-v08-fanout-mutations
 WORKTREE="$CACHE_ROOT/worktree"
-TARGET_DIR="$CACHE_ROOT/target"
+TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
 ATOMIC_TEST=flow::collab::write::database_tests::fanout_notice_failure_rolls_back_the_canonical_update_and_head
 CURSOR_TEST=flow::collab::fanout::tests::transient_reconstruction_failure_retains_the_durable_cursor

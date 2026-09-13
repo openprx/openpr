@@ -6,7 +6,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 CACHE_ROOT=/opt/worker/.cache/openpr-v08-worker-compaction-mutations
 WORKTREE="$CACHE_ROOT/worktree"
-TARGET_DIR="$CACHE_ROOT/target"
+TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
 TEST_NAME=flow::compaction::tests::flow_compaction_worker_preserves_exact_document_fingerprint
 

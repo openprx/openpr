@@ -6,7 +6,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 CACHE_ROOT=/opt/worker/.cache/openpr-v08-object-retention-mutations
 WORKTREE="$CACHE_ROOT/worktree"
-TARGET_DIR="$CACHE_ROOT/target"
+TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
 TIER_TEST=flow::command::database_tests::flow_collection_container_archive_tier_enforces_collection_and_page_contrast
 WORKER_TEST=flow::retention::tests::worker_deletes_only_expired_full_access_archives_not_edit_tier_soft_archives
