@@ -3,14 +3,18 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RESULT=
 [[ $# -eq 0 || $1 == --* ]] || { RESULT=$1; shift; }
-EVIDENCE="$ROOT/.flow-gate/evidence/v0.8"; CONTRACTS=/opt/working/sylvode-flow; REPO=$ROOT
+EVIDENCE="$ROOT/.flow-gate/evidence/v0.8"; CONTRACTS=/opt/working/sylvode-flow; REPO=$ROOT; PREDECESSOR=
 while (($#)); do case "$1" in
   --evidence-root) EVIDENCE=${2:?}; shift 2;; --contracts-root) CONTRACTS=${2:?}; shift 2;;
-  --repo-root) REPO=${2:?}; shift 2;; --json) shift;; *) echo "FAIL: unsupported argument: $1" >&2; exit 2;; esac; done
+  --repo-root) REPO=${2:?}; shift 2;;
+  --predecessor-gate-result|--predecessor-evidence) PREDECESSOR=${2:?}; shift 2;;
+  --json) shift;; *) echo "FAIL: unsupported argument: $1" >&2; exit 2;; esac; done
 [[ -n $RESULT ]] || RESULT="$EVIDENCE/gate-result.json"
-python3 - "$RESULT" "$EVIDENCE" "$REPO" "$CONTRACTS/gates/v0.8-gate.yaml" <<'PY'
+WORKSPACE_ROOT=$(cd "$REPO/../.." && pwd)
+[[ -n $PREDECESSOR ]] || PREDECESSOR="$WORKSPACE_ROOT/evidence/v0.7/gate-result.json"
+python3 - "$RESULT" "$EVIDENCE" "$REPO" "$CONTRACTS/gates/v0.8-gate.yaml" "$PREDECESSOR" <<'PY'
 import hashlib,json,pathlib,re,subprocess,sys,yaml
-result,evidence,repo,gate_path=map(lambda p:pathlib.Path(p).resolve(),sys.argv[1:]); drift=[]
+result,evidence,repo,gate_path,predecessor_path=map(lambda p:pathlib.Path(p).resolve(),sys.argv[1:]); drift=[]
 try: receipt=json.loads(result.read_text()); gate=yaml.safe_load(gate_path.read_text())
 except Exception as exc: print(json.dumps({"receipt_consistent":False,"errors":[str(exc)]})); raise SystemExit(2)
 def same(field,actual,expected):
@@ -20,6 +24,13 @@ same("schema_version",receipt.get("schema_version"),"sylvode.flow.gate-result.v1
 same("source.head",receipt.get("source",{}).get("head"),head)
 same("gate_contract.sha256",receipt.get("gate_contract",{}).get("sha256"),hashlib.sha256(gate_path.read_bytes()).hexdigest())
 same("hard_gates.keys",set(receipt.get("hard_gates",{})),set(gate.get("hard_gates",{})))
+try:
+    predecessor_doc=json.loads(predecessor_path.read_text())
+    predecessor={"path":str(predecessor_path),"accepted":predecessor_doc.get("accepted") is True,
+                 "release":predecessor_doc.get("release")}
+except Exception as exc:
+    predecessor={"path":str(predecessor_path),"accepted":False,"error":str(exc)}
+same("predecessor",receipt.get("predecessor"),predecessor)
 for row in receipt.get("checks",[]):
     if int(row.get("executed_count",0))<=0: drift.append({"field":f"checks.{row.get('id')}.executed_count","error":"must be nonzero"})
     if "log" in row:
@@ -40,7 +51,7 @@ failed=[key for key,value in receipt.get("hard_gates",{}).items() if value!="pas
 same("automated_gate_count",receipt.get("automated_gate_count"),len(gate.get("hard_gates",{})))
 same("automated_failed",receipt.get("automated_failed"),len(failed))
 same("automated_passed",receipt.get("automated_passed"),len(gate.get("hard_gates",{}))-len(failed))
-candidate=(not failed and gate.get("status")=="active" and receipt.get("predecessor",{}).get("accepted") is True
+candidate=(not failed and gate.get("status")=="active" and predecessor.get("accepted") is True
            and receipt.get("source",{}).get("dirty") is False
            and all(value.get("status")!="unset" for value in gate.get("budgets",{}).values()))
 same("candidate_ready",receipt.get("candidate_ready"),candidate)

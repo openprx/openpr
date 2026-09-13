@@ -13,7 +13,7 @@ while (($#)); do
     --contracts-root) CONTRACTS_ROOT=${2:?}; shift 2 ;;
     --evidence-root) EVIDENCE_ROOT=${2:?}; shift 2 ;;
     --gate-yaml) GATE_YAML=${2:?}; shift 2 ;;
-    --predecessor-gate-result) PREDECESSOR=${2:?}; shift 2 ;;
+    --predecessor-gate-result|--predecessor-evidence) PREDECESSOR=${2:?}; shift 2 ;;
     --manual-signoffs-from) MANUAL_FROM=${2:?}; shift 2 ;;
     --json) shift ;;
     *) echo "FAIL: unsupported argument: $1" >&2; exit 2 ;;
@@ -24,7 +24,8 @@ for name in OPENPR_TEST_DATABASE_URL OPENPR_BACKUP_SOURCE_DATABASE_URL OPENPR_BA
 done
 [[ -n $EVIDENCE_ROOT ]] || EVIDENCE_ROOT="$REPO_ROOT/.flow-gate/evidence/v0.8"
 [[ -n $GATE_YAML ]] || GATE_YAML="$CONTRACTS_ROOT/gates/v0.8-gate.yaml"
-[[ -n $PREDECESSOR ]] || PREDECESSOR="$CONTRACTS_ROOT/evidence/v0.7/gate-result.json"
+WORKSPACE_ROOT=$(cd "$REPO_ROOT/../.." && pwd)
+[[ -n $PREDECESSOR ]] || PREDECESSOR="$WORKSPACE_ROOT/evidence/v0.7/gate-result.json"
 [[ -n $MANUAL_FROM ]] || MANUAL_FROM="$EVIDENCE_ROOT/gate-result.json"
 mkdir -p "$EVIDENCE_ROOT/logs"
 ROWS=$(mktemp "$EVIDENCE_ROOT/.report-rows.XXXXXX")

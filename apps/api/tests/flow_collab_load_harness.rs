@@ -935,6 +935,11 @@ fn parse_pg_log(raw: &str, from: DateTime<Utc>) -> BTreeMap<i32, Vec<LoggedState
     if let Some(parsed) = pending.take() {
         flush_log_line(parsed, from, &mut prepared, &mut per_pid);
     }
+    // Multiple collector files need not be returned in chronological filename order. The stable
+    // sort retains collector order for records sharing PostgreSQL's millisecond timestamp.
+    for statements in per_pid.values_mut() {
+        statements.sort_by_key(|statement| statement.at);
+    }
     per_pid
 }
 
@@ -1051,6 +1056,11 @@ fn group_transactions(per_pid: &BTreeMap<i32, Vec<LoggedStatement>>) -> (Vec<Log
 #[derive(Debug, Clone)]
 struct PgLogSource {
     data_directory: String,
+    /// Collector files that existed before the measured workload. The file named by
+    /// `current_logfiles` at qualification time must always be retained; files created after
+    /// qualification are rotations that can contain an earlier slice of the same run.
+    initial_files: BTreeSet<PathBuf>,
+    starting_paths: Vec<PathBuf>,
 }
 
 /// Qualifies the server-side file collector before the workload starts. Container stdout is not
@@ -1096,8 +1106,11 @@ async fn qualify_pg_log_source(db: &DatabaseConnection) -> Result<PgLogSource, S
             row.log_line_prefix
         ));
     }
+    let (initial_files, starting_paths) = snapshot_collector_files(&row.data_directory)?;
     Ok(PgLogSource {
         data_directory: row.data_directory,
+        initial_files,
+        starting_paths,
     })
 }
 
@@ -1152,9 +1165,43 @@ fn collector_log_paths(engine: &str, container: &str, data_directory: &str) -> R
     Ok(paths)
 }
 
-/// Reads `PostgreSQL`'s collector file inside the container. Unlike the journald-backed
-/// `podman logs` route this has no host message-rate limiter between `PostgreSQL` and the parser.
-fn harvest_pg_log(source: &PgLogSource) -> Result<String, String> {
+fn collector_directory_files(
+    engine: &str,
+    container: &str,
+    current_paths: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>, String> {
+    let directories: BTreeSet<&Path> = current_paths.iter().filter_map(|path| path.parent()).collect();
+    let mut files = BTreeSet::new();
+    for directory in directories {
+        let listing = run_container_command(
+            engine,
+            container,
+            &[
+                "find".to_string(),
+                directory.to_string_lossy().into_owned(),
+                "-maxdepth".to_string(),
+                "1".to_string(),
+                "-type".to_string(),
+                "f".to_string(),
+                "-print".to_string(),
+            ],
+        )?;
+        for line in listing.lines().filter(|line| !line.trim().is_empty()) {
+            let path = PathBuf::from(line.trim());
+            if path.parent() != Some(directory) {
+                return Err(format!(
+                    "collector directory listing escaped {}: {}",
+                    directory.display(),
+                    path.display()
+                ));
+            }
+            files.insert(path);
+        }
+    }
+    Ok(files)
+}
+
+fn snapshot_collector_files(data_directory: &str) -> Result<(BTreeSet<PathBuf>, Vec<PathBuf>), String> {
     let engines: Vec<String> = std::env::var(PG_LOG_ENGINE_ENV).map_or_else(
         |_| vec!["podman".to_string(), "docker".to_string()],
         |value| vec![value],
@@ -1163,13 +1210,57 @@ fn harvest_pg_log(source: &PgLogSource) -> Result<String, String> {
         std::env::var(PG_LOG_CONTAINER_ENV).map_err(|_| format!("{PG_LOG_CONTAINER_ENV} is not declared"))?;
     let mut failures = Vec::new();
     for engine in engines {
-        let paths = match collector_log_paths(&engine, &container, &source.data_directory) {
+        let starting_paths = match collector_log_paths(&engine, &container, data_directory) {
             Ok(paths) => paths,
             Err(err) => {
                 failures.push(err);
                 continue;
             }
         };
+        match collector_directory_files(&engine, &container, &starting_paths) {
+            Ok(files) => return Ok((files, starting_paths)),
+            Err(err) => failures.push(err),
+        }
+    }
+    Err(format!(
+        "could not snapshot PostgreSQL collector files ({}); set {PG_LOG_ENGINE_ENV}/{PG_LOG_CONTAINER_ENV}",
+        failures.join("; ")
+    ))
+}
+
+/// Reads `PostgreSQL`'s collector file inside the container. Unlike the journald-backed
+/// `podman logs` route this has no host message-rate limiter between `PostgreSQL` and the parser.
+fn harvest_pg_log(source: &PgLogSource) -> Result<(String, Vec<String>), String> {
+    let engines: Vec<String> = std::env::var(PG_LOG_ENGINE_ENV).map_or_else(
+        |_| vec!["podman".to_string(), "docker".to_string()],
+        |value| vec![value],
+    );
+    let container =
+        std::env::var(PG_LOG_CONTAINER_ENV).map_err(|_| format!("{PG_LOG_CONTAINER_ENV} is not declared"))?;
+    let mut failures = Vec::new();
+    for engine in engines {
+        let current_paths = match collector_log_paths(&engine, &container, &source.data_directory) {
+            Ok(paths) => paths,
+            Err(err) => {
+                failures.push(err);
+                continue;
+            }
+        };
+        let current_files = match collector_directory_files(&engine, &container, &current_paths) {
+            Ok(files) => files,
+            Err(err) => {
+                failures.push(err);
+                continue;
+            }
+        };
+        // `current_logfiles` only names the *latest* collector file. A size/age rotation during
+        // the workload moves complete transactions to the former current file; reading only the
+        // new file therefore reports zero unterminated transactions while silently losing a
+        // prefix. Read the file current at qualification plus every file created since then.
+        let mut paths: BTreeSet<PathBuf> = source.starting_paths.iter().cloned().collect();
+        paths.extend(current_files.difference(&source.initial_files).cloned());
+        paths.extend(current_paths);
+        let harvested_paths: Vec<String> = paths.iter().map(|path| path.display().to_string()).collect();
         let mut combined = String::new();
         let mut failed = None;
         for path in paths {
@@ -1193,7 +1284,7 @@ fn harvest_pg_log(source: &PgLogSource) -> Result<String, String> {
         if let Some(err) = failed {
             failures.push(err);
         } else {
-            return Ok(combined);
+            return Ok((combined, harvested_paths));
         }
     }
     Err(format!(
@@ -1478,7 +1569,9 @@ struct Report {
     /// Reconstruction coverage, so a silently truncated or mis-parsed log can never masquerade as
     /// "the implementation only did this many writes".
     harvested_log_lines: usize,
+    harvested_log_files: Vec<String>,
     parsed_statements: usize,
+    statement_counts_per_second: BTreeMap<String, usize>,
     unresolved_statements: usize,
     transactions_total: usize,
     transactions_in_window: usize,
@@ -1611,7 +1704,9 @@ impl Report {
                 "locked_phase_statement_inventory": self.locked_phase_statements,
                 "reconstruction": {
                     "harvested_log_lines": self.harvested_log_lines,
+                    "harvested_log_files": self.harvested_log_files,
                     "parsed_statements": self.parsed_statements,
+                    "statement_counts_per_second": self.statement_counts_per_second,
                     "unresolved_statements": self.unresolved_statements,
                     "transactions_total": self.transactions_total,
                     "transactions_in_window": self.transactions_in_window,
@@ -1688,6 +1783,7 @@ const fn build_profile() -> &'static str {
 struct Reconstruction {
     harvested_log_lines: usize,
     parsed_statements: usize,
+    statement_counts_per_second: BTreeMap<String, usize>,
     unresolved_statements: usize,
     transactions_total: usize,
     unterminated: usize,
@@ -1703,9 +1799,19 @@ impl Reconstruction {
     }
 }
 
+fn reconstruction_covers_accepted_updates(reconstruction: &Reconstruction, accepted_total: usize) -> bool {
+    reconstruction.committed_writes() >= accepted_total && reconstruction.unterminated == 0
+}
+
 fn reconstruct(raw: &str, log_start: DateTime<Utc>, window_start: DateTime<Utc>) -> Reconstruction {
     let per_pid = parse_pg_log(raw, log_start);
     let parsed_statements = per_pid.values().map(Vec::len).sum();
+    let mut statement_counts_per_second = BTreeMap::new();
+    for statement in per_pid.values().flatten() {
+        *statement_counts_per_second
+            .entry(statement.at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .or_insert(0) += 1;
+    }
     let unresolved_statements = per_pid
         .values()
         .flatten()
@@ -1725,6 +1831,7 @@ fn reconstruct(raw: &str, log_start: DateTime<Utc>, window_start: DateTime<Utc>)
     Reconstruction {
         harvested_log_lines: raw.lines().count(),
         parsed_statements,
+        statement_counts_per_second,
         unresolved_statements,
         transactions_total,
         unterminated,
@@ -2025,14 +2132,14 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
         tokio::time::sleep(Duration::from_millis(HARVEST_RETRY_MS)).await;
         let source = log_source.clone();
         match tokio::task::spawn_blocking(move || source.and_then(|source| harvest_pg_log(&source))).await {
-            Ok(Ok(raw)) => {
+            Ok(Ok((raw, paths))) => {
+                report.harvested_log_files = paths;
                 report.log_sync_marker_observed = raw.contains(&log_sync_marker);
                 let reconstructed_raw =
                     drop_every.map_or_else(|| raw.clone(), |every| drop_each_nth_log_line(&raw, every));
                 let candidate = reconstruct(&reconstructed_raw, log_start, window_start);
                 let complete = report.log_sync_marker_observed
-                    && candidate.committed_writes() >= report.accepted_total
-                    && candidate.unterminated == 0;
+                    && reconstruction_covers_accepted_updates(&candidate, report.accepted_total);
                 reconstruction = Some(candidate);
                 if complete {
                     break;
@@ -2052,6 +2159,7 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     if let Some(candidate) = reconstruction {
         report.harvested_log_lines = candidate.harvested_log_lines;
         report.parsed_statements = candidate.parsed_statements;
+        report.statement_counts_per_second = candidate.statement_counts_per_second.clone();
         report.unresolved_statements = candidate.unresolved_statements;
         report.transactions_total = candidate.transactions_total;
         report.transactions_in_window = candidate.measured.len();
@@ -2290,6 +2398,7 @@ mod harness_self_checks {
     use super::{
         Distribution, LoggedStatement, LoggedTransaction, absolute_gap_budget_resolution_status, audit_locked_phase,
         calibrated_gap_resolution_status, drop_each_nth_log_line, group_transactions, parse_pg_log, percentile_ms,
+        reconstruct, reconstruction_covers_accepted_updates,
     };
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -2473,10 +2582,31 @@ mod harness_self_checks {
 
     #[test]
     fn ten_percent_log_line_loss_is_not_hidden_by_the_mutation_helper() {
-        let raw = (1..=100).map(|value| value.to_string()).collect::<Vec<_>>().join("\n");
+        let mut lines = Vec::new();
+        for transaction in 0..10 {
+            let second = transaction * 3;
+            lines.push(format!(
+                "2026-08-30 22:00:{second:02}.000 UTC [42] LOG:  duration: 0.020 ms  statement: BEGIN"
+            ));
+            lines.push(format!(
+                "2026-08-30 22:00:{:02}.001 UTC [42] LOG:  duration: 0.100 ms  statement: SELECT head_seq FROM collab_documents WHERE id = $1 FOR UPDATE",
+                second + 1
+            ));
+            lines.push(format!(
+                "2026-08-30 22:00:{:02}.002 UTC [42] LOG:  duration: 1.000 ms  statement: COMMIT",
+                second + 2
+            ));
+        }
+        let raw = lines.join("\n");
+        let complete = reconstruct(&raw, at(0, 0) - chrono::Duration::seconds(60), at(0, 0));
+        assert!(reconstruction_covers_accepted_updates(&complete, 10));
         let mutated = drop_each_nth_log_line(&raw, 10);
-        assert_eq!(mutated.lines().count(), 90);
-        assert!(!mutated.lines().any(|line| line == "10" || line == "100"));
+        assert_eq!(mutated.lines().count(), 27);
+        let incomplete = reconstruct(&mutated, at(0, 0) - chrono::Duration::seconds(60), at(0, 0));
+        assert!(
+            !reconstruction_covers_accepted_updates(&incomplete, 10),
+            "dropping 10% of authoritative log lines must make the coverage verdict red"
+        );
     }
 
     #[test]
