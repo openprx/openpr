@@ -94,6 +94,10 @@ const DISPATCH_BACKOFF_CAP_MS: i64 = 150_000;
 const DELIVERY_BACKOFF_STEP_MS: i64 = 30_000;
 const DELIVERY_BACKOFF_CAP_MS: i64 = 300_000;
 
+fn delivery_backoff_ms(attempts: i64) -> i64 {
+    (attempts * DELIVERY_BACKOFF_STEP_MS).min(DELIVERY_BACKOFF_CAP_MS)
+}
+
 /// `webhook_request_timeout_ms`. Matches the worker's existing outbound `reqwest::Client` (built
 /// in `apps/worker/src/main.rs` with `timeout(10s)`) so this dispatcher's requests are governed by
 /// the same budget as the AI-task webhook dispatch that client already serves.
@@ -1118,7 +1122,7 @@ async fn retry_or_fail_delivery(db: &DatabaseConnection, delivery: &DeliveryLeas
     } else {
         "sealed"
     };
-    let backoff_ms = (next_attempts * DELIVERY_BACKOFF_STEP_MS).min(DELIVERY_BACKOFF_CAP_MS);
+    let backoff_ms = delivery_backoff_ms(next_attempts);
 
     let result = db
         .execute(Statement::from_sql_and_values(
@@ -1690,7 +1694,7 @@ mod dispatcher_database_tests {
     use super::{
         BusinessEventRow, DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B,
         OLDEST_PENDING_AGE_ALERT_MS, REPLAY_MAX_WINDOW_DAYS, ReplayMode, ReplayRequest, ReplayResult,
-        SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body, dispatcher_is_live,
+        SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body, delivery_backoff_ms, dispatcher_is_live,
         dispatcher_is_live_since, ensure_workspace_subscriber_slot, envelope_json, expand_one,
         oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_retention,
         reap_delivery_source_tombstones, reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases,
@@ -1700,6 +1704,16 @@ mod dispatcher_database_tests {
     use crate::events::{BusinessEventInput, insert_business_event};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    #[test]
+    fn flow_delivery_retry_backoff_matches_every_frozen_attempt() {
+        assert_eq!(
+            (1..=10).map(delivery_backoff_ms).collect::<Vec<_>>(),
+            vec![
+                30_000, 60_000, 90_000, 120_000, 150_000, 180_000, 210_000, 240_000, 270_000, 300_000
+            ]
+        );
+    }
 
     #[test]
     fn delivery_envelope_redacts_record_content_from_metadata() {
