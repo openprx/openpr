@@ -97,7 +97,7 @@ run_case idempotency_hash_ignores_expected_head red "$ROUTE_TEST"
 git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
 
 perl -0pi -e 's/if idempotency_key\.trim\(\)\.is_empty\(\) \{/if false {/' "$OPERATIONS"
-grep -A8 -F 'async fn claim' "$OPERATIONS" | grep -Fq 'if false {'
+grep -Fq 'if false {' "$OPERATIONS"
 run_case empty_idempotency_key_is_accepted red "$ROUTE_TEST"
 git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
 
