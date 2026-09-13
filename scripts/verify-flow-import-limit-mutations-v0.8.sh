@@ -67,6 +67,11 @@ restore_sources
 
 perl -0pi -e 's/let entry_count_max = effective_import_limits\(\)\.entry_count;/let entry_count_max = u64::MAX;/' "$PACKAGE_SOURCE"
 grep -Fq 'let entry_count_max = u64::MAX;' "$PACKAGE_SOURCE"
+perl -0pi -e 's/effective_import_limits\(\)\.entry_count/u64::MAX/' "$IMPORT_SOURCE"
+if grep -Fq 'effective_import_limits().entry_count' "$IMPORT_SOURCE"; then
+  echo 'FAIL: streaming entry-count mutation did not apply' >&2
+  exit 1
+fi
 run_case entry_count_preflight_bypassed red
 restore_sources
 
