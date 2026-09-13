@@ -193,6 +193,7 @@ pub async fn create_package_export(
         authorize_all(&tx, workspace_id, &object_ids, &request.principal, "history export").await?;
     }
 
+    let selected: HashSet<Uuid> = object_ids.iter().copied().collect();
     let mut members = Vec::new();
     let mut through_seq_by_document = BTreeMap::new();
     let mut update_count = 0u64;
@@ -210,7 +211,7 @@ pub async fn create_package_export(
             "object_type": object.object_type,
             "lifecycle_status": object.lifecycle_status,
             "project_id": object.project_id,
-            "parent_object_id": object.parent_id,
+            "parent_object_id": object.parent_id.filter(|parent| selected.contains(parent)),
             "governance_metadata": object.governance_metadata,
             "source_document_id": object.document_id,
             "engine": object.engine,
@@ -247,7 +248,6 @@ pub async fn create_package_export(
         through_seq_by_document.insert(object.document_id.to_string(), object.head_seq);
     }
 
-    let selected: HashSet<Uuid> = object_ids.iter().copied().collect();
     let relations = load_relations(&tx, workspace_id, &object_ids).await?;
     let external_ids: Vec<Uuid> = relations
         .iter()
@@ -456,12 +456,20 @@ async fn load_scope<C: ConnectionTrait>(conn: &C, scope: ExportScope) -> Result<
         FROM flow_objects fo JOIN collab_documents cd ON cd.object_id=fo.id \
         JOIN flow_object_projections fp ON fp.object_id=fo.id";
     let (sql, values): (String, Vec<DbValue>) = match scope {
-        ExportScope::Object(object_id) => (format!("{base} WHERE fo.id=$1 ORDER BY fo.id"), vec![object_id.into()]),
+        ExportScope::Object(object_id) => (
+            format!(
+                "{base} WHERE fo.id=$1 AND NOT flow_is_system_navigator_root(fo.object_type,fo.parent_id,fo.governance_metadata) ORDER BY fo.id"
+            ),
+            vec![object_id.into()],
+        ),
         ExportScope::Workspace {
             workspace_id,
             project_id,
         } => (
-            format!("{base} WHERE fo.workspace_id=$1 AND ($2::uuid IS NULL OR fo.project_id=$2) ORDER BY fo.id"),
+            format!(
+                "{base} WHERE fo.workspace_id=$1 AND ($2::uuid IS NULL OR fo.project_id=$2) \
+                 AND NOT flow_is_system_navigator_root(fo.object_type,fo.parent_id,fo.governance_metadata) ORDER BY fo.id"
+            ),
             vec![workspace_id.into(), project_id.into()],
         ),
     };
@@ -959,8 +967,8 @@ mod tests {
         assert_eq!(receipt.checksum, replay.checksum);
         let package = artifact_bytes(&scratch.db, receipt.job_id).await;
         let verified = verify_package(Cursor::new(&package), Some(&receipt.checksum)).unwrap();
-        assert_eq!(verified.manifest.counts.objects, 2);
-        assert_eq!(verified.manifest.counts.documents, 2);
+        assert_eq!(verified.manifest.counts.objects, 1);
+        assert_eq!(verified.manifest.counts.documents, 1);
         assert_eq!(verified.manifest.counts.updates, 0);
         assert!(!verified.manifest.history.included);
         assert_eq!(

@@ -103,6 +103,13 @@ ALTER TABLE flow_import_lineage
   DROP CONSTRAINT IF EXISTS flow_import_lineage_same_workspace_check,
   DROP CONSTRAINT IF EXISTS flow_import_lineage_idempotency_key;
 
+-- Package provenance may name a workspace from another installation. It is an opaque source id,
+-- never a local canonical workspace reference; the target workspace keeps its foreign key.
+ALTER TABLE flow_import_jobs
+  DROP CONSTRAINT IF EXISTS flow_import_jobs_source_workspace_id_fkey;
+ALTER TABLE flow_import_lineage
+  DROP CONSTRAINT IF EXISTS flow_import_lineage_source_workspace_id_fkey;
+
 ALTER TABLE flow_import_lineage
   ADD COLUMN IF NOT EXISTS package_sha256 CHAR(64),
   ADD COLUMN IF NOT EXISTS target_kind TEXT,
@@ -115,13 +122,23 @@ ALTER TABLE flow_import_lineage
   ALTER COLUMN target_document_id DROP NOT NULL;
 
 ALTER TABLE flow_import_lineage
+  DROP CONSTRAINT IF EXISTS flow_import_lineage_target_shape_check,
+  DROP CONSTRAINT IF EXISTS flow_import_lineage_same_workspace_check,
   ADD CONSTRAINT flow_import_lineage_source_kind_check
     CHECK (source_kind IN ('legacy_pages', 'flow_package')),
   ADD CONSTRAINT flow_import_lineage_source_table_check
-    CHECK ((source_kind = 'legacy_pages' AND source_table = 'pages') OR source_kind = 'flow_package'),
+    CHECK (
+      (source_kind = 'legacy_pages' AND source_table = 'pages') OR
+      (source_kind = 'flow_package' AND source_table IS NULL)
+    ),
+  ADD CONSTRAINT flow_import_lineage_same_workspace_check
+    CHECK (source_kind = 'flow_package' OR source_workspace_id = target_workspace_id),
   ADD CONSTRAINT flow_import_lineage_target_shape_check CHECK (
-    (source_kind = 'legacy_pages' AND target_object_id IS NOT NULL AND target_document_id IS NOT NULL) OR
-    (source_kind = 'flow_package' AND package_sha256 IS NOT NULL AND target_kind IS NOT NULL AND target_id IS NOT NULL)
+    (source_kind = 'legacy_pages' AND target_object_id IS NOT NULL AND target_document_id IS NOT NULL
+      AND package_sha256 IS NULL AND target_kind IS NULL AND target_id IS NULL) OR
+    (source_kind = 'flow_package' AND package_sha256 ~ '^[0-9a-f]{64}$'
+      AND target_kind IN ('object', 'document', 'relation') AND target_id IS NOT NULL
+      AND target_object_id IS NULL AND target_document_id IS NULL)
   );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_import_lineage_legacy_idempotency

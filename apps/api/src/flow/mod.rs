@@ -37,6 +37,7 @@ pub mod model;
 pub mod move_object;
 pub mod operations;
 pub mod package;
+pub mod package_import;
 pub mod policy;
 pub mod projection;
 pub mod query;
