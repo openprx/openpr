@@ -105,7 +105,7 @@ grep -Fq '"source_event_ids": vec![first_event.id],' "$DISPATCHER"
 run_case coalesced_consumer_uses_event_id red "$COALESCED_CONSUMER_TEST"
 git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
 
-perl -0pi -e 's/ON CONFLICT \(subscriber_kind, subscriber_id, source_event_id\) DO NOTHING/ON CONFLICT (subscriber_kind, subscriber_id, source_event_id) DO UPDATE SET created_at = event_delivery_sources.created_at/' "$DISPATCHER"
+perl -0pi -e 's/(pub async fn replay_deliveries.*?ON CONFLICT \(subscriber_kind, subscriber_id, source_event_id\) )DO NOTHING/${1}DO UPDATE SET created_at = event_delivery_sources.created_at/s' "$DISPATCHER"
 grep -Fq 'DO UPDATE SET created_at = event_delivery_sources.created_at' "$DISPATCHER"
 run_case replay_check_then_build_race red "$CONCURRENT_REPLAY_TEST"
 git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
