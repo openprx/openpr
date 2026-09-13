@@ -98,8 +98,12 @@ git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
 
 perl -0pi -e 's/if idempotency_key\.trim\(\)\.is_empty\(\) \{/if false {/' "$OPERATIONS"
 grep -Fq 'if false {' "$OPERATIONS"
+IDEMPOTENCY_MIGRATION="$WORKTREE/migrations/0065_flow_v08_operation_idempotency.sql"
+perl -0pi -e 's/\(idempotency_key IS NULL OR length\(trim\(idempotency_key\)\) > 0\)/(idempotency_key IS NULL OR true)/' "$IDEMPOTENCY_MIGRATION"
+grep -Fq '(idempotency_key IS NULL OR true)' "$IDEMPOTENCY_MIGRATION"
 run_case empty_idempotency_key_is_accepted red "$ROUTE_TEST"
 git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
+git -C "$WORKTREE" restore migrations/0065_flow_v08_operation_idempotency.sql
 
 perl -0pi -e 's/(pub async fn post_flow_compact_document.*?let expected = req\s*\.expected_head_seq\s*)\.ok_or_else\(\|\| ApiError::BadRequest\("expected_head_seq is required"\.to_string\(\)\)\)\?;/${1}.unwrap_or(0);/s' "$ROUTES"
 sed -n '/pub async fn post_flow_compact_document/,/pub async fn post_flow_rebuild_projection/p' "$ROUTES" | grep -Fq '.unwrap_or(0);'
