@@ -27,14 +27,25 @@ run_case() {
   local label=$1
   local expected=$2
   local log="$LOG_DIR/$label.log"
-  set +e
-  env -u RUST_TEST_THREADS \
-    OPENPR_TEST_DATABASE_URL=postgresql://flowtest:flowtest@127.0.0.1:25433/postgres \
-    CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$TARGET_DIR" \
-    cargo test --manifest-path "$WORKTREE/Cargo.toml" -p api --lib \
-      flow::package_import::tests:: -- --nocapture >"$log" 2>&1
-  local status=$?
-  set -e
+  local status=0
+  : >"$log"
+  local test_name
+  for test_name in \
+    flow::package_import::tests::preview_writes_no_canonical_state_and_commit_remaps_exact_document_heads \
+    flow::package_import::tests::promotion_fault_rolls_back_every_canonical_row_and_completion_event
+  do
+    set +e
+    env -u RUST_TEST_THREADS \
+      OPENPR_TEST_DATABASE_URL=postgresql://flowtest:flowtest@127.0.0.1:25433/postgres \
+      CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$TARGET_DIR" \
+      cargo test --manifest-path "$WORKTREE/Cargo.toml" -p api --lib \
+        "$test_name" -- --exact --nocapture >>"$log" 2>&1
+    local test_status=$?
+    set -e
+    if [[ $test_status -ne 0 ]]; then
+      status=$test_status
+    fi
+  done
   if [[ $expected == green && $status -ne 0 ]]; then
     tail -120 "$log" >&2
     echo "FAIL: green control exited $status" >&2
