@@ -161,6 +161,27 @@ pub fn v0_6_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
     registry
 }
 
+/// v0.8 hardening command delta. Import commit currently creates only brand-new documents, so its
+/// contended *existing* document cardinality is zero; any future in-place merge or restore must
+/// change that declaration and acquire ADR-0013's bounded-many lock path first.
+#[must_use]
+pub fn v0_8_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
+    use ExistingDocumentCardinality::{One, Zero};
+    vec![
+        ("objects.export", Zero),
+        ("objects.export_workspace", Zero),
+        ("objects.import_artifact", Zero),
+        ("objects.import_preview", Zero),
+        ("objects.import_commit", Zero),
+        ("objects.import_status", Zero),
+        ("objects.integrity", Zero),
+        ("collab.status", Zero),
+        ("collab.compact", One),
+        ("collab.rebuild_projection", Zero),
+        ("deliveries.replay", Zero),
+    ]
+}
+
 /// The value a `REFERENCES users(id)` column may take for this actor: the actor's own id when it
 /// is a user, `None` when it is a bot.
 ///
@@ -2269,7 +2290,55 @@ async fn execute_lifecycle_command(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod cardinality_gate_tests {
-    use super::{ExistingDocumentCardinality, v0_4_command_cardinality_registry, v0_5_command_cardinality_registry};
+    use super::{
+        ExistingDocumentCardinality, v0_4_command_cardinality_registry, v0_5_command_cardinality_registry,
+        v0_8_command_cardinality_registry,
+    };
+
+    #[test]
+    fn v0_8_hardening_registry_declares_every_new_command_cardinality() {
+        let registry = v0_8_command_cardinality_registry();
+        let names = registry
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = [
+            "objects.export",
+            "objects.export_workspace",
+            "objects.import_artifact",
+            "objects.import_preview",
+            "objects.import_commit",
+            "objects.import_status",
+            "objects.integrity",
+            "collab.status",
+            "collab.compact",
+            "collab.rebuild_projection",
+            "deliveries.replay",
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(registry.len(), 11);
+        assert_eq!(
+            names, expected,
+            "a new v0.8 command is undeclared or a stale name remains"
+        );
+        assert_eq!(
+            registry
+                .iter()
+                .find(|(name, _)| *name == "collab.compact")
+                .map(|(_, cardinality)| *cardinality),
+            Some(ExistingDocumentCardinality::One)
+        );
+        for (name, cardinality) in registry {
+            if name != "collab.compact" {
+                assert_eq!(
+                    cardinality,
+                    ExistingDocumentCardinality::Zero,
+                    "{name} unexpectedly contends an existing document head"
+                );
+            }
+        }
+    }
 
     /// `command_contended_document_cardinality` (`ADR-0013` §1, v0.4): "v0.4 的竞争文档集合恒
     /// ≤ 1". Every command this package registers — content, lifecycle, and the two
