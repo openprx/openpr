@@ -318,14 +318,14 @@ or a `tools/list` JSON-RPC call.
 
 ### Resources
 
-Four static resources — `openpr://skills/openpr-mcp`, `openpr://guides/agents`,
-`openpr://guides/workflows`, `openpr://scenario-templates` — plus 19 resource
-templates via `resources/templates/list`, including
-`openpr://projects/{project_id}/forms`, `openpr://forms/{form_id}/records`,
-`openpr://form-records/{record_id}/events`,
-`openpr://projects/{project_id}/context`,
-`openpr://projects/{project_id}/release-readiness`, and
-`openpr://issues/{identifier}`.
+Four static resources — `sylvode://skills/openpr-mcp`, `sylvode://guides/agents`,
+`sylvode://guides/workflows`, `sylvode://scenario-templates` — plus 22 resource
+templates are returned by `resources/templates/list`. The templates include the existing
+project, Forms, scenario and issue resources plus all five frozen Flow resources:
+`sylvode://objects/{object_id}`, object history and schema, Collection records, and the
+workspace/project navigator. The registry lists only `sylvode://` canonical identities;
+`resources/read` continues to accept the corresponding `openpr://` alias for every one and
+returns `_meta.canonical_uri` with the canonical identity.
 
 ### The same binary is a CLI
 

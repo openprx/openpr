@@ -175,9 +175,11 @@ cargo build -p mcp-server --release
 - `objects.grants_get`, `objects.grants_set`, `objects.inheritance_set` — object authorization tools with dry-run support
 - `legacy_pages.inventory`, `legacy_pages.import_preview`, `legacy_pages.import_commit`, `legacy_pages.import_status` — ADR-0003 conditional migration tools; this deployment's inventory is zero, so the import tools always answer `not_required_zero_inventory`
 
-No new Resources ship in v0.4: Flow's first Resource templates start at v0.5. The
-native `sylvode` CLI (a second `[[bin]]` in this package) covers the same v0.4 surface
-plus `sylvode collab inspect|verify`, which have no MCP tool of their own in v0.4.
+The v0.9 registry exposes four static resources and 22 templates under the canonical
+`sylvode://` scheme, including all five frozen Flow resource templates. The matching
+`openpr://` identity remains a read alias for every registry row and resolves to the same
+payload and policy subject; aliases are not duplicated in list results. The native `sylvode`
+CLI (a second `[[bin]]` in this package) shares the same client and command contracts.
 
 ## Usage Examples
 

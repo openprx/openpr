@@ -607,7 +607,9 @@ impl McpServer {
             "tools/call" => self.handle_call_tool(req.id, req.params).await,
             "resources/list" => self.handle_resources_list(req.id),
             "resources/templates/list" => self.handle_resources_templates_list(req.id),
-            "resources/read" => self.handle_resources_read(req.id, req.params).await,
+            "resources/read" => {
+                attach_canonical_resource_metadata(self.handle_resources_read(req.id, req.params).await)
+            }
             _ => JsonRpcResponse::error(
                 req.id,
                 JsonRpcError::method_not_found(format!("Unknown method: {}", req.method)),
@@ -1427,25 +1429,25 @@ impl McpServer {
     fn handle_resources_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let resources = vec![
             json!({
-                "uri": "openpr://skills/openpr-mcp",
-                "name": "OpenPR MCP Skill Guide",
-                "description": "Complete guide for using OpenPR MCP tools: workflow patterns, field reference, and templates.",
+                "uri": "sylvode://skills/openpr-mcp",
+                "name": "Sylvode MCP Skill Guide",
+                "description": "Complete guide for using Sylvode MCP tools: workflow patterns, field reference, and templates.",
                 "mimeType": "text/markdown"
             }),
             json!({
-                "uri": "openpr://guides/agents",
-                "name": "OpenPR Agent Development Guide",
+                "uri": "sylvode://guides/agents",
+                "name": "Sylvode Agent Development Guide",
                 "description": "Repository guidelines, build commands, coding style, and testing procedures.",
                 "mimeType": "text/markdown"
             }),
             json!({
-                "uri": "openpr://guides/workflows",
+                "uri": "sylvode://guides/workflows",
                 "name": "Common Workflow Patterns",
                 "description": "Bug report, sprint planning, code review, and triage workflow templates.",
                 "mimeType": "text/markdown"
             }),
             json!({
-                "uri": "openpr://scenario-templates",
+                "uri": "sylvode://scenario-templates",
                 "name": "Scenario Templates",
                 "description": "Project creation templates with workflow, fields, resources, AI roles, governance, and connection suggestions.",
                 "mimeType": "application/json"
@@ -1465,105 +1467,135 @@ impl McpServer {
     fn handle_resources_templates_list(&self, id: Option<Value>) -> JsonRpcResponse {
         let templates = vec![
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/issues",
+                "uriTemplate": "sylvode://projects/{project_id}/issues",
                 "name": "Project Issues",
                 "description": "List issues for a specific project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/forms",
+                "uriTemplate": "sylvode://projects/{project_id}/forms",
                 "name": "Project Forms",
                 "description": "List universal forms for a specific project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://forms/{form_id}",
+                "uriTemplate": "sylvode://forms/{form_id}",
                 "name": "Form Schema",
                 "description": "Read one universal form schema and display metadata",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://forms/{form_id}/records",
+                "uriTemplate": "sylvode://forms/{form_id}/records",
                 "name": "Form Records",
                 "description": "List records for one universal form",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://forms/{form_id}/events",
+                "uriTemplate": "sylvode://forms/{form_id}/events",
                 "name": "Form Events",
                 "description": "Read recent business events for one universal form",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://form-records/{record_id}",
+                "uriTemplate": "sylvode://form-records/{record_id}",
                 "name": "Form Record",
                 "description": "Read one universal form record",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://form-records/{record_id}/events",
+                "uriTemplate": "sylvode://form-records/{record_id}/events",
                 "name": "Form Record Events",
                 "description": "Read recent business events for one universal form record",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://scenario-templates/{key}",
+                "uriTemplate": "sylvode://scenario-templates/{key}",
                 "name": "Scenario Template",
                 "description": "Read one project creation scenario template by key",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/context",
+                "uriTemplate": "sylvode://projects/{project_id}/context",
                 "name": "Project Context",
                 "description": "Read project type, resources, governance, workflow, and policy in one context payload",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/governance",
+                "uriTemplate": "sylvode://projects/{project_id}/governance",
                 "name": "Project Governance",
                 "description": "Read governance, workflow, and recent decision context for a project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/agent-policy",
+                "uriTemplate": "sylvode://projects/{project_id}/agent-policy",
                 "name": "Project Agent Policy",
                 "description": "Read effective MCP/AI action policy for a project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/release-readiness",
+                "uriTemplate": "sylvode://projects/{project_id}/release-readiness",
                 "name": "Project Release Readiness",
                 "description": "Read acceptance gates, blockers, and release readiness evidence for a project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/type",
+                "uriTemplate": "sylvode://projects/{project_id}/type",
                 "name": "Project Type",
                 "description": "Read project type, settings, and scenario metadata for a project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/resources",
+                "uriTemplate": "sylvode://projects/{project_id}/resources",
                 "name": "Project Resources",
                 "description": "Read project resources such as repositories, directories, documents, equipment, or business records",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/recent-decisions",
+                "uriTemplate": "sylvode://projects/{project_id}/recent-decisions",
                 "name": "Project Recent Decisions",
                 "description": "Read recent decision context available to project agents",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://projects/{project_id}/sprints",
+                "uriTemplate": "sylvode://projects/{project_id}/sprints",
                 "name": "Project Sprints",
                 "description": "List sprints for a specific project",
                 "mimeType": "application/json"
             }),
             json!({
-                "uriTemplate": "openpr://issues/{identifier}",
+                "uriTemplate": "sylvode://issues/{identifier}",
                 "name": "Issue by Identifier",
                 "description": "Get issue details by human-readable identifier (e.g. PRX-42)",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uriTemplate": "sylvode://objects/{object_id}",
+                "name": "Flow Object",
+                "description": "Read one Flow object's semantic JSON projection",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uriTemplate": "sylvode://objects/{object_id}/history?limit={limit}",
+                "name": "Flow Object History",
+                "description": "Read a bounded history page for one Flow object",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uriTemplate": "sylvode://objects/{object_id}/schema",
+                "name": "Flow Object Schema",
+                "description": "Read the visible schema for one Flow object",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uriTemplate": "sylvode://collections/{collection_id}/records?cursor={cursor}&limit={limit}",
+                "name": "Flow Collection Records",
+                "description": "Read one policy-filtered page of Collection records",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uriTemplate": "sylvode://workspaces/{workspace_id}/navigator?project_id={project_id}",
+                "name": "Flow Navigator",
+                "description": "Read a policy-filtered workspace or project navigator",
                 "mimeType": "application/json"
             }),
         ];
@@ -1572,7 +1604,7 @@ impl McpServer {
     }
 
     async fn handle_resources_read(&self, id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
-        let uri = match params
+        let requested_uri = match params
             .as_ref()
             .and_then(|value| value.get("uri"))
             .and_then(Value::as_str)
@@ -1582,6 +1614,7 @@ impl McpServer {
                 return JsonRpcResponse::error(id, JsonRpcError::invalid_params("Missing required field: uri"));
             }
         };
+        let uri = canonical_resource_uri(&requested_uri).unwrap_or(requested_uri);
 
         // `resources/read` serves the same project owned payloads `tools/call` does, so it
         // is gated by the same project agent policy. Without this the resource door is a
@@ -1595,7 +1628,7 @@ impl McpServer {
         }
 
         match uri.as_str() {
-            "openpr://skills/openpr-mcp" => {
+            "sylvode://skills/openpr-mcp" => {
                 return JsonRpcResponse::success(
                     id,
                     json!({
@@ -1607,7 +1640,7 @@ impl McpServer {
                     }),
                 );
             }
-            "openpr://guides/agents" => {
+            "sylvode://guides/agents" => {
                 return JsonRpcResponse::success(
                     id,
                     json!({
@@ -1619,7 +1652,7 @@ impl McpServer {
                     }),
                 );
             }
-            "openpr://guides/workflows" => {
+            "sylvode://guides/workflows" => {
                 return JsonRpcResponse::success(
                     id,
                     json!({
@@ -1631,7 +1664,7 @@ impl McpServer {
                     }),
                 );
             }
-            "openpr://scenario-templates" => {
+            "sylvode://scenario-templates" => {
                 return match self.client.list_scenario_templates(None, None).await {
                     Ok(templates) => JsonRpcResponse::success(
                         id,
@@ -1650,6 +1683,68 @@ impl McpServer {
                 };
             }
             _ => {}
+        }
+
+        if let Some((object_id, query)) = parse_flow_object_resource_uri(&uri, "/history") {
+            return match self.client.get_flow_object_history(object_id, query).await {
+                Ok(history) => resource_read_success(id, &uri, "application/json", &history.to_string()),
+                Err(error) => JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::internal_error(format!("Failed to read Flow object history resource: {error}")),
+                ),
+            };
+        }
+
+        if let Some((object_id, query)) = parse_flow_object_resource_uri(&uri, "/schema") {
+            return match self
+                .client
+                .get::<Value>(&format!("/api/v1/flow/objects/{object_id}/schema{query}"))
+                .await
+            {
+                Ok(schema) => resource_read_success(id, &uri, "application/json", &schema.to_string()),
+                Err(error) => JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::internal_error(format!("Failed to read Flow object schema resource: {error}")),
+                ),
+            };
+        }
+
+        if let Some((object_id, query)) = parse_flow_object_resource_uri(&uri, "") {
+            return match self.client.get_flow_object(object_id, query).await {
+                Ok(object) => resource_read_success(id, &uri, "application/json", &object.to_string()),
+                Err(error) => JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::internal_error(format!("Failed to read Flow object resource: {error}")),
+                ),
+            };
+        }
+
+        if let Some((collection_id, query)) = parse_collection_records_resource_uri(&uri) {
+            return match self
+                .client
+                .get::<Value>(&format!("/api/v1/flow/collections/{collection_id}/records{query}"))
+                .await
+            {
+                Ok(records) => resource_read_success(id, &uri, "application/json", &records.to_string()),
+                Err(error) => JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::internal_error(format!("Failed to read Flow Collection records resource: {error}")),
+                ),
+            };
+        }
+
+        if let Some((workspace_id, query)) = parse_navigator_resource_uri(&uri) {
+            return match self
+                .client
+                .get::<Value>(&format!("/api/v1/workspaces/{workspace_id}/flow/navigator{query}"))
+                .await
+            {
+                Ok(navigator) => resource_read_success(id, &uri, "application/json", &navigator.to_string()),
+                Err(error) => JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::internal_error(format!("Failed to read Flow navigator resource: {error}")),
+                ),
+            };
         }
 
         if let Some(key) = parse_scenario_template_uri(&uri) {
@@ -2001,6 +2096,32 @@ impl McpServer {
     }
 }
 
+fn resource_read_success(id: Option<Value>, uri: &str, mime_type: &str, text: &str) -> JsonRpcResponse {
+    JsonRpcResponse::success(id, json!({"contents":[{"uri":uri,"mimeType":mime_type,"text":text}]}))
+}
+
+/// Every successful resource payload names the canonical identity, including reads addressed
+/// through the legacy `openpr://` alias. Keeping this at the one JSON-RPC dispatch boundary makes
+/// it impossible for a newly registered read branch to forget the migration metadata.
+fn attach_canonical_resource_metadata(mut response: JsonRpcResponse) -> JsonRpcResponse {
+    if let Some(contents) = response
+        .result
+        .as_mut()
+        .and_then(|result| result.get_mut("contents"))
+        .and_then(Value::as_array_mut)
+    {
+        for content in contents {
+            let Some(uri) = content.get("uri").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            if let Some(object) = content.as_object_mut() {
+                object.insert("_meta".to_string(), json!({"canonical_uri":uri}));
+            }
+        }
+    }
+    response
+}
+
 /// `openpr://projects/{project_id}/<suffix>` -> the tool whose project agent policy
 /// governs the very same payload.
 ///
@@ -2057,17 +2178,59 @@ enum ResourceSubject {
 /// value is interpolated into the API URL that both the policy lookup and the read
 /// itself address, so a value that could reshape that URL must never reach either.
 fn resource_policy_subject(uri: &str) -> Result<ResourceSubject, String> {
+    let canonical = canonical_resource_uri(uri);
+    let uri = canonical.as_deref().unwrap_or(uri);
     // The three guides are compile time constants and the scenario catalogue is a global
     // catalogue served by `scenario_templates.list`/`get`, both `WorkspaceWide`.
     if matches!(
         uri,
-        "openpr://skills/openpr-mcp"
-            | "openpr://guides/agents"
-            | "openpr://guides/workflows"
-            | "openpr://scenario-templates"
+        "sylvode://skills/openpr-mcp"
+            | "sylvode://guides/agents"
+            | "sylvode://guides/workflows"
+            | "sylvode://scenario-templates"
     ) || parse_scenario_template_uri(uri).is_some()
     {
         return Ok(ResourceSubject::Ungoverned);
+    }
+
+    if let Some((object_id, _)) = parse_flow_object_resource_uri(uri, "/history") {
+        return Ok(ResourceSubject::Tool {
+            tool: "objects.history",
+            args: json!({"object_id":canonical_resource_id(object_id,"object_id")?}),
+        });
+    }
+    if let Some((object_id, _)) = parse_flow_object_resource_uri(uri, "/schema") {
+        return Ok(ResourceSubject::Tool {
+            tool: "objects.get",
+            args: json!({"object_id":canonical_resource_id(object_id,"object_id")?}),
+        });
+    }
+    if let Some((object_id, _)) = parse_flow_object_resource_uri(uri, "") {
+        return Ok(ResourceSubject::Tool {
+            tool: "objects.get",
+            args: json!({"object_id":canonical_resource_id(object_id,"object_id")?}),
+        });
+    }
+    if let Some((collection_id, _)) = parse_collection_records_resource_uri(uri) {
+        return Ok(ResourceSubject::Tool {
+            tool: "collections.query",
+            args: json!({"collection_id":canonical_resource_id(collection_id,"collection_id")?}),
+        });
+    }
+    if let Some((workspace_id, query)) = parse_navigator_resource_uri(uri) {
+        let mut args = json!({"workspace_id":canonical_resource_id(workspace_id,"workspace_id")?});
+        if let Some(project_id) = resource_query_parameter(query, "project_id") {
+            args.as_object_mut()
+                .ok_or("navigator policy arguments were not an object")?
+                .insert(
+                    "project_id".to_string(),
+                    json!(canonical_resource_id(project_id, "project_id")?),
+                );
+        }
+        return Ok(ResourceSubject::Tool {
+            tool: "objects.query",
+            args,
+        });
     }
 
     for (suffix, tool) in PROJECT_RESOURCE_POLICY_TOOLS {
@@ -2130,8 +2293,58 @@ fn canonical_resource_id(raw: &str, field: &str) -> Result<String, String> {
     })
 }
 
+fn canonical_resource_uri(uri: &str) -> Option<String> {
+    if uri.starts_with("sylvode://") {
+        Some(uri.to_string())
+    } else {
+        uri.strip_prefix("openpr://").map(|rest| format!("sylvode://{rest}"))
+    }
+}
+
+fn split_resource_query(uri: &str) -> (&str, &str) {
+    match uri.split_once('?') {
+        Some((path, _query)) => (path, &uri[path.len()..]),
+        None => (uri, ""),
+    }
+}
+
+fn resource_query_parameter<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query
+        .strip_prefix('?')?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(name, value)| (name == key && !value.is_empty()).then_some(value))
+}
+
+fn parse_flow_object_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<(&'a str, &'a str)> {
+    let (path, query) = split_resource_query(uri);
+    let object_id = path.strip_prefix("sylvode://objects/")?.strip_suffix(suffix)?;
+    if object_id.is_empty() || object_id.contains('/') {
+        return None;
+    }
+    Some((object_id, query))
+}
+
+fn parse_collection_records_resource_uri(uri: &str) -> Option<(&str, &str)> {
+    let (path, query) = split_resource_query(uri);
+    let collection_id = path.strip_prefix("sylvode://collections/")?.strip_suffix("/records")?;
+    if collection_id.is_empty() || collection_id.contains('/') {
+        return None;
+    }
+    Some((collection_id, query))
+}
+
+fn parse_navigator_resource_uri(uri: &str) -> Option<(&str, &str)> {
+    let (path, query) = split_resource_query(uri);
+    let workspace_id = path.strip_prefix("sylvode://workspaces/")?.strip_suffix("/navigator")?;
+    if workspace_id.is_empty() || workspace_id.contains('/') {
+        return None;
+    }
+    Some((workspace_id, query))
+}
+
 fn parse_project_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str> {
-    let project_id = uri.strip_prefix("openpr://projects/")?.strip_suffix(suffix)?;
+    let project_id = uri.strip_prefix("sylvode://projects/")?.strip_suffix(suffix)?;
     if project_id.is_empty() || project_id.contains('/') {
         return None;
     }
@@ -2139,7 +2352,7 @@ fn parse_project_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str>
 }
 
 fn parse_form_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str> {
-    let form_id = uri.strip_prefix("openpr://forms/")?.strip_suffix(suffix)?;
+    let form_id = uri.strip_prefix("sylvode://forms/")?.strip_suffix(suffix)?;
     if form_id.is_empty() || form_id.contains('/') {
         return None;
     }
@@ -2147,7 +2360,7 @@ fn parse_form_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str> {
 }
 
 fn parse_form_record_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a str> {
-    let record_id = uri.strip_prefix("openpr://form-records/")?.strip_suffix(suffix)?;
+    let record_id = uri.strip_prefix("sylvode://form-records/")?.strip_suffix(suffix)?;
     if record_id.is_empty() || record_id.contains('/') {
         return None;
     }
@@ -2155,7 +2368,7 @@ fn parse_form_record_resource_uri<'a>(uri: &'a str, suffix: &str) -> Option<&'a 
 }
 
 fn parse_issue_identifier_uri(uri: &str) -> Option<String> {
-    let identifier = uri.strip_prefix("openpr://issues/")?;
+    let identifier = uri.strip_prefix("sylvode://issues/")?;
     if identifier.is_empty() || identifier.contains('/') {
         return None;
     }
@@ -2164,7 +2377,7 @@ fn parse_issue_identifier_uri(uri: &str) -> Option<String> {
 }
 
 fn parse_scenario_template_uri(uri: &str) -> Option<String> {
-    let key = uri.strip_prefix("openpr://scenario-templates/")?;
+    let key = uri.strip_prefix("sylvode://scenario-templates/")?;
     if key.is_empty() || key.contains('/') {
         return None;
     }
@@ -2405,7 +2618,7 @@ mod tests {
         is_tool_enabled_by_policy, redact_tool_arguments, resource_policy_subject, summarize_tool_result,
         tool_policy_scope,
     };
-    use crate::protocol::{CallToolResult, ToolContent};
+    use crate::protocol::{CallToolResult, JsonRpcRequest, ToolContent};
     use axum::{
         Json, Router,
         routing::{delete, get, post},
@@ -2446,6 +2659,139 @@ mod tests {
 
     fn server(base_url: String) -> Result<super::McpServer, String> {
         Ok(super::McpServer::new(crate::client::test_api::client(base_url)?))
+    }
+
+    fn request(id: i64, method: &str, params: Option<Value>) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(json!(id)),
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    fn expand_resource_template(template: &str) -> String {
+        template
+            .replace("{project_id}", PROJECT)
+            .replace("{workspace_id}", PROJECT)
+            .replace("{form_id}", FORM)
+            .replace("{record_id}", RECORD)
+            .replace("{object_id}", RESOURCE)
+            .replace("{collection_id}", RESOURCE)
+            .replace("{identifier}", "PRX-42")
+            .replace("{key}", "software-delivery")
+            .replace("{cursor}", "cursor-1")
+            .replace("{limit}", "10")
+    }
+
+    /// The v0.9 migration gate is deliberately enumerated from both sides: the expected table
+    /// names every frozen resource, while the observed table comes from the live registry methods.
+    /// Equality of the sets and counts prevents a representative sample from masquerading as
+    /// all-resources coverage. Every observed identity is then read through both schemes.
+    #[tokio::test]
+    async fn every_registered_resource_has_a_byte_identical_openpr_alias() -> TestResult {
+        let router = Router::new().fallback(get(|| async {
+            Json(json!({
+                "code":0,
+                "data":{
+                    "project_id":PROJECT,
+                    "form_id":FORM,
+                    "recent_decisions":[],
+                    "mcp":{"tool_registry":{}}
+                }
+            }))
+        }));
+        let server = server(crate::client::test_api::spawn(router).await?)?;
+        let resources = server
+            .handle_request(request(1, "resources/list", None))
+            .await
+            .and_then(|response| response.result)
+            .and_then(|result| result.get("resources").and_then(Value::as_array).cloned())
+            .ok_or("resources/list did not return an array")?;
+        let templates = server
+            .handle_request(request(2, "resources/templates/list", None))
+            .await
+            .and_then(|response| response.result)
+            .and_then(|result| result.get("resourceTemplates").and_then(Value::as_array).cloned())
+            .ok_or("resources/templates/list did not return an array")?;
+
+        let expected = [
+            "sylvode://skills/openpr-mcp",
+            "sylvode://guides/agents",
+            "sylvode://guides/workflows",
+            "sylvode://scenario-templates",
+            "sylvode://projects/{project_id}/issues",
+            "sylvode://projects/{project_id}/forms",
+            "sylvode://forms/{form_id}",
+            "sylvode://forms/{form_id}/records",
+            "sylvode://forms/{form_id}/events",
+            "sylvode://form-records/{record_id}",
+            "sylvode://form-records/{record_id}/events",
+            "sylvode://scenario-templates/{key}",
+            "sylvode://projects/{project_id}/context",
+            "sylvode://projects/{project_id}/governance",
+            "sylvode://projects/{project_id}/agent-policy",
+            "sylvode://projects/{project_id}/release-readiness",
+            "sylvode://projects/{project_id}/type",
+            "sylvode://projects/{project_id}/resources",
+            "sylvode://projects/{project_id}/recent-decisions",
+            "sylvode://projects/{project_id}/sprints",
+            "sylvode://issues/{identifier}",
+            "sylvode://objects/{object_id}",
+            "sylvode://objects/{object_id}/history?limit={limit}",
+            "sylvode://objects/{object_id}/schema",
+            "sylvode://collections/{collection_id}/records?cursor={cursor}&limit={limit}",
+            "sylvode://workspaces/{workspace_id}/navigator?project_id={project_id}",
+        ];
+        let observed = resources
+            .iter()
+            .filter_map(|row| row.get("uri").and_then(Value::as_str))
+            .chain(
+                templates
+                    .iter()
+                    .filter_map(|row| row.get("uriTemplate").and_then(Value::as_str)),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(resources.len(), 4, "static resource registry cardinality drifted");
+        assert_eq!(templates.len(), 22, "template registry cardinality drifted");
+        assert_eq!(
+            observed.len(),
+            expected.len(),
+            "enumeration did not cover the live registry"
+        );
+        assert_eq!(observed, expected, "resource registry identities or order drifted");
+
+        for (index, registered) in observed.into_iter().enumerate() {
+            let index = i64::try_from(index)?;
+            let canonical = expand_resource_template(registered);
+            let alias = canonical.replacen("sylvode://", "openpr://", 1);
+            let canonical_response = server
+                .handle_request(request(100 + index, "resources/read", Some(json!({"uri":canonical}))))
+                .await
+                .ok_or("canonical resources/read returned no response")?;
+            let alias_response = server
+                .handle_request(request(200 + index, "resources/read", Some(json!({"uri":alias}))))
+                .await
+                .ok_or("alias resources/read returned no response")?;
+            assert!(
+                canonical_response.error.is_none(),
+                "canonical read failed: {canonical_response:?}"
+            );
+            assert!(alias_response.error.is_none(), "alias read failed: {alias_response:?}");
+            assert_eq!(
+                canonical_response.result, alias_response.result,
+                "alias bytes differ for {registered}"
+            );
+            let result = canonical_response.result.ok_or("resource read had no result")?;
+            assert_eq!(
+                result
+                    .pointer("/contents/0/_meta/canonical_uri")
+                    .and_then(Value::as_str),
+                result.pointer("/contents/0/uri").and_then(Value::as_str),
+                "canonical metadata missing for {registered}"
+            );
+        }
+        Ok(())
     }
 
     fn policy_route(enabled_tools: Value) -> axum::routing::MethodRouter {

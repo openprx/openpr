@@ -50,7 +50,8 @@ The runtime REST and MCP surfaces expose the same shape as
 `GET /api/v1/scenario-templates/{key}`,
 `POST /api/v1/projects/{project_id}/scenario-templates/{template_key}/install`,
 `scenario_templates.list`, `scenario_templates.get`, `scenario_templates.install`,
-and the `openpr://scenario-templates` MCP resource.
+and the `sylvode://scenario-templates` MCP resource. The legacy
+`openpr://scenario-templates` identity remains an exact read alias.
 That keeps operator onboarding, AI routing, connector setup, and template
 marketplace consumers on the same contract as the generated delivery catalog.
 

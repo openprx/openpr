@@ -662,7 +662,7 @@ The schema pins the three operator entrypoints, pins the six built-in templates
 in catalog order, and the verifier rejects extra fields inside operator
 entrypoint and template objects.
 The live scenario template API and MCP tools return the same runtime
-`usage_guide` shape on list, detail, and `openpr://scenario-templates`
+`usage_guide` shape on list, detail, and `sylvode://scenario-templates`
 resource reads, so production onboarding, AI routing, connector setup, and
 template marketplace consumers use the same contract as the delivery catalog.
 

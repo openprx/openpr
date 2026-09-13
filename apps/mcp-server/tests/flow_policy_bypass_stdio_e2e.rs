@@ -441,6 +441,193 @@ async fn sse_call(server: &NetworkedServer, request: &Value) -> Result<Value, Bo
     }
 }
 
+fn resource_request(id: i64, uri: &str) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id":id,
+        "method":"resources/read",
+        "params":{"uri":uri}
+    })
+}
+
+fn registry_request(id: i64, method: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":method})
+}
+
+fn registry_identities(list: &Value, templates: &Value) -> Result<Vec<String>, Box<dyn Error>> {
+    let resources = json_at(list, "/result/resources")?
+        .as_array()
+        .ok_or("resources/list result is not an array")?;
+    let templates = json_at(templates, "/result/resourceTemplates")?
+        .as_array()
+        .ok_or("resources/templates/list result is not an array")?;
+    resources
+        .iter()
+        .map(|row| {
+            row.get("uri")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "registry resource has no uri".into())
+        })
+        .chain(templates.iter().map(|row| {
+            row.get("uriTemplate")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "registry template has no uriTemplate".into())
+        }))
+        .collect()
+}
+
+fn expand_resource_identity(template: &str) -> String {
+    template
+        .replace("{project_id}", OWNING_PROJECT)
+        .replace("{workspace_id}", WORKSPACE)
+        .replace("{form_id}", OWNED_OBJECT)
+        .replace("{record_id}", PROJECTLESS_OBJECT)
+        .replace("{object_id}", OWNED_OBJECT)
+        .replace("{collection_id}", OWNED_OBJECT)
+        .replace("{identifier}", "PRX-42")
+        .replace("{key}", "software-delivery")
+        .replace("{cursor}", "cursor-1")
+        .replace("{limit}", "10")
+}
+
+fn alias_api_router() -> Router {
+    Router::new().fallback(get(|| async {
+        Json(json!({
+            "code":0,
+            "message":"ok",
+            "data":{
+                "id":OWNED_OBJECT,
+                "workspace_id":WORKSPACE,
+                "project_id":OWNING_PROJECT,
+                "form_id":OWNED_OBJECT,
+                "recent_decisions":[],
+                "mcp":{"tool_registry":{}}
+            }
+        }))
+    }))
+}
+
+/// Enumerates the actual registry through every shipped transport and reads every single row
+/// through both schemes. The explicit expected list catches a registry row disappearing at the
+/// same time as its test; the observed count catches a new row added without alias coverage.
+#[tokio::test]
+#[allow(clippy::print_stdout)]
+async fn all_resource_aliases_are_identical_over_stdio_http_and_sse() -> TestResult {
+    let api_url = spawn_router(alias_api_router()).await?;
+    let mut stdio = StdioClient::spawn(&api_url)?;
+    let http = NetworkedServer::spawn(&api_url, "http").await?;
+    let sse = NetworkedServer::spawn(&api_url, "sse").await?;
+
+    let stdio_list = stdio.call(&registry_request(1, "resources/list")).await?;
+    let stdio_templates = stdio.call(&registry_request(2, "resources/templates/list")).await?;
+    let http_list = http_call(&http, &registry_request(3, "resources/list")).await?;
+    let http_templates = http_call(&http, &registry_request(4, "resources/templates/list")).await?;
+    let sse_list = sse_call(&sse, &registry_request(5, "resources/list")).await?;
+    let sse_templates = sse_call(&sse, &registry_request(6, "resources/templates/list")).await?;
+
+    let mut observed = registry_identities(&stdio_list, &stdio_templates)?;
+    assert_eq!(registry_identities(&http_list, &http_templates)?, observed);
+    assert_eq!(registry_identities(&sse_list, &sse_templates)?, observed);
+    let expected = [
+        "sylvode://skills/openpr-mcp",
+        "sylvode://guides/agents",
+        "sylvode://guides/workflows",
+        "sylvode://scenario-templates",
+        "sylvode://projects/{project_id}/issues",
+        "sylvode://projects/{project_id}/forms",
+        "sylvode://forms/{form_id}",
+        "sylvode://forms/{form_id}/records",
+        "sylvode://forms/{form_id}/events",
+        "sylvode://form-records/{record_id}",
+        "sylvode://form-records/{record_id}/events",
+        "sylvode://scenario-templates/{key}",
+        "sylvode://projects/{project_id}/context",
+        "sylvode://projects/{project_id}/governance",
+        "sylvode://projects/{project_id}/agent-policy",
+        "sylvode://projects/{project_id}/release-readiness",
+        "sylvode://projects/{project_id}/type",
+        "sylvode://projects/{project_id}/resources",
+        "sylvode://projects/{project_id}/recent-decisions",
+        "sylvode://projects/{project_id}/sprints",
+        "sylvode://issues/{identifier}",
+        "sylvode://objects/{object_id}",
+        "sylvode://objects/{object_id}/history?limit={limit}",
+        "sylvode://objects/{object_id}/schema",
+        "sylvode://collections/{collection_id}/records?cursor={cursor}&limit={limit}",
+        "sylvode://workspaces/{workspace_id}/navigator?project_id={project_id}",
+    ];
+    if std::env::var("OPENPR_TEST_URI_ALIAS_MUTATION").as_deref() == Ok("drop-last-registry") {
+        observed.pop();
+    }
+    assert_eq!(
+        observed.len(),
+        expected.len(),
+        "enumerated count != live registry count"
+    );
+    assert_eq!(observed, expected, "explicit resource enumeration drifted");
+
+    let mut rows = Vec::new();
+    for (index, registered) in observed.iter().enumerate() {
+        let index = i64::try_from(index)?;
+        let canonical = expand_resource_identity(registered);
+        let alias = if index == 0 && std::env::var("OPENPR_TEST_URI_ALIAS_MUTATION").as_deref() == Ok("break-one-alias")
+        {
+            canonical.replacen("sylvode://", "openpr-broken://", 1)
+        } else {
+            canonical.replacen("sylvode://", "openpr://", 1)
+        };
+        let id = 1000 + (index * 10);
+        let stdio_canonical = stdio.call(&resource_request(id, &canonical)).await?;
+        let stdio_alias = stdio.call(&resource_request(id + 1, &alias)).await?;
+        let http_canonical = http_call(&http, &resource_request(id + 2, &canonical)).await?;
+        let http_alias = http_call(&http, &resource_request(id + 3, &alias)).await?;
+        let sse_canonical = sse_call(&sse, &resource_request(id + 4, &canonical)).await?;
+        let sse_alias = sse_call(&sse, &resource_request(id + 5, &alias)).await?;
+        for (transport, canonical_response, alias_response) in [
+            ("stdio", stdio_canonical, stdio_alias),
+            ("http", http_canonical, http_alias),
+            ("sse", sse_canonical, sse_alias),
+        ] {
+            assert!(
+                canonical_response.get("error").is_none(),
+                "{transport} canonical {registered}: {canonical_response}"
+            );
+            assert!(
+                alias_response.get("error").is_none(),
+                "{transport} alias {registered}: {alias_response}"
+            );
+            assert_eq!(
+                canonical_response.get("result"),
+                alias_response.get("result"),
+                "{transport} alias payload differs for {registered}"
+            );
+            assert_eq!(
+                json_at(&canonical_response, "/result/contents/0/_meta/canonical_uri")?,
+                json_at(&canonical_response, "/result/contents/0/uri")?,
+                "{transport} canonical metadata differs for {registered}"
+            );
+            rows.push(json!({"resource":registered,"transport":transport,"passed":true}));
+        }
+    }
+    println!(
+        "V09_URI_ALIAS_RESULT {}",
+        json!({
+            "schema_version":"sylvode.flow.mcp-uri-alias-result.v1",
+            "registry_actual_count":observed.len(),
+            "enumerated_resource_count":expected.len(),
+            "transport_count":3,
+            "executed_count":rows.len(),
+            "rows":rows,
+            "passed":true
+        })
+    );
+    stdio.shutdown().await?;
+    http.shutdown().await?;
+    sse.shutdown().await
+}
+
 #[tokio::test]
 async fn one_flow_write_has_identical_semantic_results_over_stdio_http_and_sse() -> TestResult {
     let api_url = spawn_router(flow_router()).await?;
