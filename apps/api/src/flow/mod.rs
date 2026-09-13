@@ -43,4 +43,5 @@ pub mod projection;
 pub mod query;
 pub mod relations;
 pub mod repository;
+pub mod rollback;
 pub mod search;

@@ -40,6 +40,9 @@ async fn run_tick_with_thresholds(
     tail_updates_soft_max: i64,
     tail_bytes_soft_max: i64,
 ) -> anyhow::Result<TickReport> {
+    if api::flow::rollback::control(db).await?.compaction_paused {
+        return Ok(TickReport::default());
+    }
     let limit = requested_batch_size.clamp(1, MAX_BATCH_SIZE);
     let rows = CandidateRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
@@ -98,7 +101,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use uuid::Uuid;
 
-    use super::run_tick_with_thresholds;
+    use super::{TickReport, run_tick_with_thresholds};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
@@ -247,6 +250,38 @@ mod tests {
         let before = document_fingerprint(&scratch.db, created.object.document_id)
             .await
             .expect("pre-compaction fingerprint");
+        exec(
+            &scratch.db,
+            "UPDATE flow_v08_rollback_control SET compaction_paused=true,reason='v0.7 rollback test',changed_at=now() WHERE singleton=true",
+            vec![],
+        )
+        .await;
+        let paused = run_tick_with_thresholds(&scratch.db, 1, 1, i64::MAX)
+            .await
+            .expect("paused compaction tick succeeds without work");
+        assert_eq!(paused, TickReport::default());
+        let retained_while_paused: i64 = scratch
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*)::bigint AS count FROM collab_updates WHERE document_id=$1",
+                vec![created.object.document_id.into()],
+            ))
+            .await
+            .expect("paused tail count query")
+            .expect("paused tail count row")
+            .try_get("", "count")
+            .expect("paused tail count");
+        assert_eq!(
+            retained_while_paused, 1,
+            "rollback pause must retain the real compaction candidate"
+        );
+        exec(
+            &scratch.db,
+            "UPDATE flow_v08_rollback_control SET compaction_paused=false,reason=NULL,changed_at=now() WHERE singleton=true",
+            vec![],
+        )
+        .await;
         let report = run_tick_with_thresholds(&scratch.db, 1, 1, i64::MAX)
             .await
             .expect("worker compaction tick succeeds");

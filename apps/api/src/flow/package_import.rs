@@ -437,6 +437,14 @@ pub async fn commit_package_import(
             .and_then(|value| serde_json::from_value(value).map_err(|_| ApiError::Internal));
     }
 
+    if super::rollback::control(db).await?.import_promotion_paused {
+        return Err(ApiError::server_draining(
+            crate::error::ServerDrainingReason::Drain,
+            5_000,
+            "package import promotion is paused for application rollback",
+        ));
+    }
+
     let tx = db.begin().await?;
     lock_authorization_epoch(&tx, request.workspace_id).await?;
     let preview = load_preview(&tx, request).await?;
@@ -1603,6 +1611,26 @@ mod tests {
             preview.mapping.object_map.keys().collect::<Vec<_>>(),
             preview.mapping.object_map.values().collect::<Vec<_>>()
         );
+        exec(
+            &state.db,
+            "UPDATE flow_v08_rollback_control SET import_promotion_paused=true,reason='v0.7 rollback test',changed_at=now() WHERE singleton=true",
+            vec![],
+        )
+        .await;
+        let paused = commit_package_import(&state.db, &commit)
+            .await
+            .expect_err("rollback pause must reject a valid frozen promotion before any canonical write");
+        assert_eq!(
+            paused.kind(),
+            crate::error::ApiErrorKind::ServerDraining(crate::error::ServerDrainingReason::Drain)
+        );
+        assert_eq!(canonical_count(&state.db, target_workspace).await, before);
+        exec(
+            &state.db,
+            "UPDATE flow_v08_rollback_control SET import_promotion_paused=false,reason=NULL,changed_at=now() WHERE singleton=true",
+            vec![],
+        )
+        .await;
         let report = commit_package_import(&state.db, &commit).await.unwrap();
         assert_eq!(report.counts["created"], 1);
         assert_eq!(canonical_count(&state.db, target_workspace).await, before + 1);

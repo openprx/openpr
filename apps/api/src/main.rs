@@ -2452,6 +2452,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0068_flow_authz_revocations.sql",
         include_str!("../../../migrations/0068_flow_authz_revocations.sql"),
     ),
+    (
+        "0069_flow_v08_rollback_control.sql",
+        include_str!("../../../migrations/0069_flow_v08_rollback_control.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2805,6 +2809,14 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0067_flow_package_jobs.sql",
         SchemaProbe::Relation("flow_package_artifacts"),
+    ),
+    (
+        "0068_flow_authz_revocations.sql",
+        SchemaProbe::Relation("flow_authz_revocations"),
+    ),
+    (
+        "0069_flow_v08_rollback_control.sql",
+        SchemaProbe::Relation("flow_v08_rollback_control"),
     ),
 ];
 

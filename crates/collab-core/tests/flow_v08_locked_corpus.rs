@@ -37,14 +37,25 @@ fn locked_update_corpus_rejects_damage_and_converges_duplicates_and_reordering()
     let stable_frontier = stable.frontier();
     assert!(stable.import_update(b"not-a-loro-update").is_err());
     assert_eq!(stable.frontier(), stable_frontier, "corrupt input must be atomic");
-    assert!(first_delta.len() > 8, "fixture delta is large enough to truncate meaningfully");
+    assert!(
+        first_delta.len() > 8,
+        "fixture delta is large enough to truncate meaningfully"
+    );
     assert!(stable.import_update(&first_delta[..first_delta.len() / 2]).is_err());
     assert_eq!(stable.frontier(), stable_frontier, "truncated input must be atomic");
 
     let mut duplicate = LoroCollabEngine::new_empty(303);
-    assert!(duplicate.import_update(&first_delta).expect("first import decodes").changed);
     assert!(
-        !duplicate.import_update(&first_delta).expect("duplicate import decodes").changed,
+        duplicate
+            .import_update(&first_delta)
+            .expect("first import decodes")
+            .changed
+    );
+    assert!(
+        !duplicate
+            .import_update(&first_delta)
+            .expect("duplicate import decodes")
+            .changed,
         "byte-for-byte duplicate replay must be a no-op"
     );
 

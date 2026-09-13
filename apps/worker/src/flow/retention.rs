@@ -28,6 +28,9 @@ async fn run_tick_at(
     requested_batch_size: usize,
     now: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<TickReport> {
+    if api::flow::rollback::control(db).await?.retention_paused {
+        return Ok(TickReport::default());
+    }
     let limit = i64::try_from(requested_batch_size.clamp(1, 100)).unwrap_or(100);
     let tx = db.begin().await?;
     let candidates = Candidate::find_by_statement(Statement::from_sql_and_values(
@@ -75,7 +78,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::run_tick_at;
+    use super::{TickReport, run_tick_at};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
 
@@ -238,6 +241,36 @@ mod tests {
             .await
             .expect("owner archives collection at full-access tier");
 
+        exec(
+            &scratch.db,
+            "UPDATE flow_v08_rollback_control SET retention_paused=true,reason='v0.7 rollback test',changed_at=now() WHERE singleton=true",
+            vec![],
+        )
+        .await;
+        let paused = run_tick_at(&scratch.db, 10, chrono::Utc::now() + chrono::Duration::days(31))
+            .await
+            .expect("paused retention tick succeeds without work");
+        assert_eq!(paused, TickReport::default());
+        let paused_survivors = scratch
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT id FROM flow_objects WHERE id=ANY($1)",
+                vec![vec![page, collection].into()],
+            ))
+            .await
+            .expect("paused survivors query");
+        assert_eq!(
+            paused_survivors.len(),
+            2,
+            "rollback pause must preserve the eligible archive"
+        );
+        exec(
+            &scratch.db,
+            "UPDATE flow_v08_rollback_control SET retention_paused=false,reason=NULL,changed_at=now() WHERE singleton=true",
+            vec![],
+        )
+        .await;
         let report = run_tick_at(&scratch.db, 10, chrono::Utc::now() + chrono::Duration::days(31))
             .await
             .expect("retention tick succeeds");
