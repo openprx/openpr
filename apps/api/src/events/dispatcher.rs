@@ -5829,9 +5829,8 @@ mod dispatcher_database_tests {
         let source_ids = body["delivery"]["source_event_ids"].as_array().expect("array");
         assert_eq!(source_ids.len(), 2);
         assert!(source_ids.contains(&json!(event_1)));
-        let correct_consumer_keys = [body["delivery"]["id"].clone()]
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
+        let correct_consumer_keys =
+            std::iter::once(body["delivery"]["id"].clone()).collect::<std::collections::HashSet<_>>();
         let wrong_event_id_consumer_keys = source_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
         assert_eq!(
             correct_consumer_keys.len(),
@@ -6303,7 +6302,9 @@ mod dispatcher_database_tests {
             .iter()
             .map(|result| match result {
                 ReplayResult::Rebuild { replayed, .. } => *replayed,
-                other => panic!("unexpected concurrent replay result: {other:?}"),
+                other @ ReplayResult::RequeueFailed { .. } => {
+                    panic!("unexpected concurrent replay result: {other:?}")
+                }
             })
             .sum::<u64>();
         let skipped = results
@@ -6313,7 +6314,9 @@ mod dispatcher_database_tests {
                     skipped_already_delivered,
                     ..
                 } => *skipped_already_delivered,
-                other => panic!("unexpected concurrent replay result: {other:?}"),
+                other @ ReplayResult::RequeueFailed { .. } => {
+                    panic!("unexpected concurrent replay result: {other:?}")
+                }
             })
             .sum::<u64>();
         assert_eq!(

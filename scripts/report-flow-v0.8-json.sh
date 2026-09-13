@@ -99,7 +99,9 @@ for raw in rows.read_text().splitlines():
     executed=sum(int(p)+int(f) for _,p,f,_ in summaries); ignored=sum(int(i) for *_,i in summaries)
     artifact=None
     if cid in artifact_by_check:
-        try: artifact=json.loads((evidence/artifact_by_check[cid]).read_text()); executed=int(artifact.get("executed_count",0))
+        try:
+            artifact=json.loads((evidence/artifact_by_check[cid]).read_text())
+            executed=int(artifact.get("executed_count",artifact.get("counts",{}).get("matrix_rows",0)))
         except Exception: artifact=None; executed=0
     elif cid.startswith("frontend_") or cid=="clippy_full": executed=int(code==0)
     ok=code==0 and executed>0

@@ -2835,6 +2835,17 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
             let declares_project_id = properties.contains_key("project_id");
+            // The frozen v0.8 MCP contract explicitly gives this workspace-admin export an
+            // optional project subset. The route still authorizes the workspace admin and then
+            // reauthorizes every selected object; this is not a DeclaredProject policy target.
+            if tool.name == "objects.export_workspace" {
+                assert_eq!(tool_policy_scope(&tool.name), PolicyScope::WorkspaceWideAdmin);
+                assert!(
+                    declares_project_id,
+                    "the contracted optional project subset disappeared"
+                );
+                continue;
+            }
             if tool_policy_scope(&tool.name) == (PolicyScope::DeclaredProject { required: false }) {
                 if !declares_project_id {
                     optional_scope_without_project_id.push(tool.name.clone());

@@ -77,10 +77,10 @@ async fn api_fixture(State(fixture): State<Fixture>, request: Request) -> Respon
     if body.get("expected_head_seq").and_then(Value::as_i64).is_none() {
         return error(StatusCode::BAD_REQUEST, "expected_head_seq is required");
     }
-    if !body
+    if body
         .get("idempotency_key")
         .and_then(Value::as_str)
-        .is_some_and(|value| !value.is_empty())
+        .is_none_or(str::is_empty)
     {
         return error(StatusCode::BAD_REQUEST, "idempotency_key is required");
     }
@@ -156,7 +156,7 @@ async fn mcp_admin_operations_fail_closed_and_only_exact_execute_changes_canonic
             json!({"object_id":OBJECT,"document_id":DOCUMENT,"dry_run":false,"expected_head_seq":7,"confirm_document_id":FOREIGN_DOCUMENT,"idempotency_key":"wrong-confirm"}),
         ),
     ] {
-        assert!(compact_flow_document(client, args).await.is_error == Some(true));
+        assert_eq!(compact_flow_document(client, args).await.is_error, Some(true));
         assert_eq!(fixture.canonical_writes.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -181,7 +181,7 @@ async fn mcp_admin_operations_fail_closed_and_only_exact_execute_changes_canonic
         json!({"object_id":OBJECT,"dry_run":true,"expected_head_seq":7,"idempotency_key":""}),
         json!({"object_id":OBJECT,"dry_run":false,"expected_head_seq":7,"confirm_object_id":FOREIGN_OBJECT,"idempotency_key":"wrong-confirm"}),
     ] {
-        assert!(rebuild_flow_projection(&admin, args).await.is_error == Some(true));
+        assert_eq!(rebuild_flow_projection(&admin, args).await.is_error, Some(true));
         assert_eq!(fixture.canonical_writes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
     assert!(
@@ -219,5 +219,6 @@ async fn mcp_admin_operations_fail_closed_and_only_exact_execute_changes_canonic
     assert!(calls.iter().any(|call| {
         call.method == "POST" && call.uri.ends_with("/rebuild-projection") && call.body["confirm_object_id"] == OBJECT
     }));
+    drop(calls);
     Ok(())
 }

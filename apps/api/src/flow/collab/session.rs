@@ -1875,6 +1875,18 @@ async fn handle_client_frame(
                 .await;
                 return;
             }
+            // Once this exact session has durably acknowledged a position, an acknowledgement
+            // at or behind it is the protocol's idempotent replay. Ignore it before decoding its
+            // now-irrelevant frontier: the replay must neither rewind the durable row nor create
+            // a rejection. A session without a verified ack still takes the database-backed
+            // frontier check below, so an invented first ack cannot bypass compaction safety.
+            if collab
+                .registry
+                .acked(session_id)
+                .is_some_and(|recorded| seq <= recorded.seq)
+            {
+                return;
+            }
             let Ok(frontier_bytes) = BASE64.decode(frontier.as_bytes()) else {
                 send(
                     socket,
@@ -5746,6 +5758,7 @@ mod database_tests {
         config::{AppConfig, Secret},
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, FromQueryResult};
+    use sha2::Digest;
     use uuid::Uuid;
 
     use super::{Frame, GapResolution, PROTOCOL_VERSION, plan_gap_resolution, register_after_bootstrap, reverify_open};
@@ -6223,7 +6236,9 @@ mod database_tests {
     /// hashes or otherwise validates `snapshot` bytes, only the tail's `content_hash` chain, and
     /// this document has zero tail rows) at the exact ceiling (accepted) and one byte over
     /// (rejected `limit_exceeded`), against the real `collab_documents` row through a real
-    /// database.
+    /// database. The fixture also updates the persisted checksum: v0.8 verifies snapshots before
+    /// applying the decoded-size ceiling, so stale checksum metadata would test corruption rather
+    /// than the intended exact/+1 size boundary.
     #[tokio::test]
     async fn bootstrap_load_enforces_the_decoded_bytes_ceiling_against_a_real_document_row() {
         let scratch = scratch_or_skip!("bootstrap-decoded-bytes-ceiling");
@@ -6232,10 +6247,11 @@ mod database_tests {
         let (_object_id, document_id) = create_page(&state, workspace_id, owner_id).await;
 
         let at_ceiling = vec![0u8; usize::try_from(limits::BOOTSTRAP_DECODED_BYTES_MAX).expect("fits usize")];
+        let at_ceiling_checksum = hex::encode(sha2::Sha256::digest(&at_ceiling));
         exec(
             &state,
-            "UPDATE collab_documents SET snapshot = $1 WHERE id = $2",
-            vec![at_ceiling.into(), document_id.into()],
+            "UPDATE collab_documents SET snapshot = $1, snapshot_checksum = $2 WHERE id = $3",
+            vec![at_ceiling.into(), at_ceiling_checksum.into(), document_id.into()],
         )
         .await;
         let accepted = bootstrap::load(&state.db, document_id).await;
@@ -6245,10 +6261,11 @@ mod database_tests {
         );
 
         let over_ceiling = vec![0u8; usize::try_from(limits::BOOTSTRAP_DECODED_BYTES_MAX).expect("fits usize") + 1];
+        let over_ceiling_checksum = hex::encode(sha2::Sha256::digest(&over_ceiling));
         exec(
             &state,
-            "UPDATE collab_documents SET snapshot = $1 WHERE id = $2",
-            vec![over_ceiling.into(), document_id.into()],
+            "UPDATE collab_documents SET snapshot = $1, snapshot_checksum = $2 WHERE id = $3",
+            vec![over_ceiling.into(), over_ceiling_checksum.into(), document_id.into()],
         )
         .await;
         match bootstrap::load(&state.db, document_id).await {

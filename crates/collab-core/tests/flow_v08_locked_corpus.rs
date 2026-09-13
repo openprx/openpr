@@ -7,12 +7,20 @@ const CORPUS: &str = include_str!("../../../testing/fixtures/flow-wire-v08/corpu
 #[test]
 fn locked_update_corpus_rejects_damage_and_converges_duplicates_and_reordering() {
     let manifest: serde_json::Value = serde_json::from_str(CORPUS).expect("locked corpus manifest parses");
-    assert_eq!(manifest["schema"], "openpr.flow.wire-corpus.v0.8");
-    let ids = manifest["cases"]
-        .as_array()
+    assert_eq!(
+        manifest.get("schema").and_then(serde_json::Value::as_str),
+        Some("openpr.flow.wire-corpus.v0.8")
+    );
+    let ids = manifest
+        .get("cases")
+        .and_then(serde_json::Value::as_array)
         .expect("cases is an array")
         .iter()
-        .map(|case| case["id"].as_str().expect("case id is a string"))
+        .map(|case| {
+            case.get("id")
+                .and_then(serde_json::Value::as_str)
+                .expect("case id is a string")
+        })
         .collect::<BTreeSet<_>>();
     for required in [
         "corrupt_update_bytes",
@@ -41,7 +49,10 @@ fn locked_update_corpus_rejects_damage_and_converges_duplicates_and_reordering()
         first_delta.len() > 8,
         "fixture delta is large enough to truncate meaningfully"
     );
-    assert!(stable.import_update(&first_delta[..first_delta.len() / 2]).is_err());
+    let truncated = first_delta
+        .get(..first_delta.len() / 2)
+        .expect("the checked non-empty delta has a midpoint");
+    assert!(stable.import_update(truncated).is_err());
     assert_eq!(stable.frontier(), stable_frontier, "truncated input must be atomic");
 
     let mut duplicate = LoroCollabEngine::new_empty(303);

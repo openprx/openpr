@@ -2985,6 +2985,7 @@ mod database_tests {
     };
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
     use serde_json::{Value, json};
+    use sha2::Digest;
     use uuid::Uuid;
 
     use super::{
@@ -3537,11 +3538,12 @@ mod database_tests {
                 .expect("legacy corruption fixture applies");
         }
         let snapshot = corrupt.export_snapshot().expect("legacy corrupt snapshot exports");
+        let snapshot_checksum = hex::encode(sha2::Sha256::digest(&snapshot));
         let frontier = corrupt.frontier().as_bytes().to_vec();
         exec(
             &state.db,
-            "UPDATE collab_documents SET snapshot = $2, snapshot_frontier = $3, head_frontier = $3 WHERE id = $1",
-            vec![collection.document_id.into(), snapshot.into(), frontier.into()],
+            "UPDATE collab_documents SET snapshot = $2, snapshot_checksum = $3, snapshot_frontier = $4, head_frontier = $4 WHERE id = $1",
+            vec![collection.document_id.into(), snapshot.into(), snapshot_checksum.into(), frontier.into()],
         )
         .await;
 

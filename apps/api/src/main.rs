@@ -3333,7 +3333,14 @@ mod tests {
                 "0059_flow_navigator_root.sql",
                 "0060_flow_collections_core.sql",
                 "0061_flow_collections_query_indexes.sql",
-                "0062_flow_forms_bridge.sql"
+                "0062_flow_forms_bridge.sql",
+                "0063_flow_v08_hardening.sql",
+                "0064_flow_v08_replay_requests.sql",
+                "0065_flow_v08_operation_idempotency.sql",
+                "0066_flow_v08_object_retention.sql",
+                "0067_flow_package_jobs.sql",
+                "0068_flow_authz_revocations.sql",
+                "0069_flow_v08_rollback_control.sql"
             ],
             "everything past the cutoff re-runs on an adopted database and must be idempotent"
         );

@@ -43,9 +43,11 @@ pub(crate) struct AuthorizationRevocation {
     pub(crate) subtree_root_ids: Vec<Uuid>,
 }
 
-/// Records a pointer to one already-committed update and emits a best-effort wakeup. Failure is
-/// returned for observability, but the caller must not roll back or misreport the canonical write:
-/// the protocol explicitly makes committed update sequence, not the notification layer, durable.
+/// Records a pointer to one already-committed update and emits a best-effort wakeup.
+///
+/// Failure is returned for observability, but the caller must not roll back or misreport the
+/// canonical write: the protocol explicitly makes committed update sequence, not the notification
+/// layer, durable.
 pub async fn publish_document_update(
     db: &DatabaseConnection,
     workspace_id: Uuid,

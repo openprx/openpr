@@ -1034,7 +1034,7 @@ pub async fn advance_epoch_for_roots<C: ConnectionTrait>(
         DbBackend::Postgres,
         "WITH advanced AS (\
              UPDATE flow_workspace_settings \
-                SET authz_epoch = authz_epoch + 1, updated_at = now() \
+                SET authz_epoch = authz_epoch + 1 \
               WHERE workspace_id = $1 \
           RETURNING workspace_id, authz_epoch\
          ), logged AS (\
@@ -1074,7 +1074,7 @@ pub async fn advance_epoch_if_present<C: ConnectionTrait>(
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "WITH advanced AS (\
-             UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1, updated_at = now() \
+             UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 \
               WHERE workspace_id = $1 RETURNING workspace_id, authz_epoch\
          ), logged AS (\
              INSERT INTO flow_authz_revocations (workspace_id, authz_epoch, subtree_root_ids) \
