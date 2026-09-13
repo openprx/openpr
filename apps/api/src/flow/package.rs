@@ -1006,6 +1006,60 @@ mod tests {
     }
 
     #[test]
+    fn raw_header_validator_itself_rejects_flag_disagreement_forbidden_descriptor_and_non_zip64() {
+        let built = build_package(fixture_manifest(), fixture_inputs()).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(&built.bytes)).unwrap();
+        let file = archive.by_index(0).unwrap();
+        let local = usize::try_from(file.header_start()).unwrap();
+        let central = usize::try_from(file.central_header_start()).unwrap();
+        let path = file.name().to_string();
+
+        let mut unequal = built.bytes.clone();
+        unequal[local + 6..local + 8].copy_from_slice(&(1u16 << 2).to_le_bytes());
+        assert_kind(
+            validate_raw_headers(&unequal, &file, &path).unwrap_err(),
+            ApiErrorKind::UnsupportedFormat,
+        );
+
+        let mut descriptor = built.bytes.clone();
+        descriptor[local + 6..local + 8].copy_from_slice(&FLAG_DATA_DESCRIPTOR.to_le_bytes());
+        descriptor[central + 8..central + 10].copy_from_slice(&FLAG_DATA_DESCRIPTOR.to_le_bytes());
+        assert_kind(
+            validate_raw_headers(&descriptor, &file, &path).unwrap_err(),
+            ApiErrorKind::UnsupportedFormat,
+        );
+
+        let plain = raw_zip(vec![(MANIFEST_PATH.to_string(), b"{}".to_vec())], false);
+        let mut plain_archive = ZipArchive::new(Cursor::new(&plain)).unwrap();
+        let plain_file = plain_archive.by_index(0).unwrap();
+        assert_kind(
+            validate_raw_headers(&plain, &plain_file, MANIFEST_PATH).unwrap_err(),
+            ApiErrorKind::UnsupportedFormat,
+        );
+    }
+
+    #[test]
+    fn input_path_validator_rejects_casefold_collision_before_manifest_layout() {
+        let lower = "abababab-abab-4bab-8bab-abababababab";
+        let inputs = vec![
+            PackageMemberInput {
+                path: format!("objects/{lower}/object.json"),
+                kind: "object".to_string(),
+                bytes: Vec::new(),
+            },
+            PackageMemberInput {
+                path: format!("objects/{}/object.json", lower.to_ascii_uppercase()),
+                kind: "object".to_string(),
+                bytes: Vec::new(),
+            },
+        ];
+        assert_kind(
+            validate_input_paths(&inputs).unwrap_err(),
+            ApiErrorKind::UnsupportedFormat,
+        );
+    }
+
+    #[test]
     fn writer_rejects_unknown_paths_casefold_collisions_kind_drift_and_history_leakage() {
         let mut unknown = fixture_inputs();
         unknown.push(PackageMemberInput {
