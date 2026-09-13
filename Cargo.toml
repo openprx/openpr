@@ -15,7 +15,7 @@ members = [
 authors = ["g1e2x87"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.2.231"
+version = "0.2.232"
 description = "Open-source project management platform"
 repository = "https://github.com/openprx/openpr"
 
@@ -36,6 +36,7 @@ sea-orm = { version = "1", default-features = false, features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+semver = "1"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 base64 = "0.22"
 thiserror = "1.0"
@@ -52,6 +53,10 @@ parking_lot = "0.12"
 bcrypt = "0.16"
 wasmtime = "47"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+serde_jcs = "0.2"
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
