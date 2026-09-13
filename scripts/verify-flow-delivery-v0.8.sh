@@ -87,12 +87,17 @@ expected_green = {
     "retention_green_control", "terminated_anchor_green_control",
     "admin_idempotency_green_control", "delivery_backoff_green_control",
     "delivery_recovery_green_control", "consumer_dedupe_green_control",
+    "concurrent_replay_green_control", "block_union_green_control",
+    "lease_pair_green_control", "current_target_green_control", "backlog_cancel_green_control",
 }
 expected_red = {
     "source_tombstone_expires_with_delivery", "requeue_filters_source_event_time",
     "replay_exact_oldest_boundary_allowed", "delivery_backoff_step_drift",
     "successful_delivery_never_terminalizes", "delivery_crash_lease_not_reclaimed",
     "coalesced_consumer_uses_event_id", "replay_accepts_non_admin_member",
+    "replay_check_then_build_race", "changed_block_union_ceiling_drift",
+    "lease_pair_constraint_removed", "delivery_uses_stale_endpoint_snapshot",
+    "subscriber_gone_inflates_dead_letter",
 }
 mutation_rows = []
 mutation_executed = 0

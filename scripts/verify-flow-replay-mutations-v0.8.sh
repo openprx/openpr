@@ -14,6 +14,11 @@ ROUTE_TEST=routes::flow::flow_database_tests::delivery_replay_route_requires_adm
 BACKOFF_TEST=events::dispatcher::dispatcher_database_tests::delivery_attempts_one_through_ten_write_the_frozen_database_backoff_and_never_attempt_eleven
 RECOVERY_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_failure_then_fresh_dispatcher_delivers_once_with_the_same_delivery_id
 COALESCED_CONSUMER_TEST=events::dispatcher::dispatcher_database_tests::golden_wire_fixture_coalesced_delivery_body_matches_the_frozen_shape
+CONCURRENT_REPLAY_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_v08_concurrent_replay_reserves_before_building_and_never_merges
+BLOCK_UNION_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_v08_changed_block_union_exact_limit_and_plus_one_truncation
+LEASE_PAIR_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_v08_dispatch_and_delivery_lease_pairs_reject_both_unreachable_halves
+CURRENT_TARGET_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_v08_reads_the_current_endpoint_and_rotated_secret_only_at_send_time
+BACKLOG_CANCEL_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_v08_deleting_a_subscriber_cancels_its_entire_backlog_without_dead_letter_or_audit_loss
 
 cleanup() {
   git -C "$REPO_ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
@@ -56,6 +61,11 @@ run_case admin_idempotency_green_control green "$ROUTE_TEST"
 run_case delivery_backoff_green_control green "$BACKOFF_TEST"
 run_case delivery_recovery_green_control green "$RECOVERY_TEST"
 run_case consumer_dedupe_green_control green "$COALESCED_CONSUMER_TEST"
+run_case concurrent_replay_green_control green "$CONCURRENT_REPLAY_TEST"
+run_case block_union_green_control green "$BLOCK_UNION_TEST"
+run_case lease_pair_green_control green "$LEASE_PAIR_TEST"
+run_case current_target_green_control green "$CURRENT_TARGET_TEST"
+run_case backlog_cancel_green_control green "$BACKLOG_CANCEL_TEST"
 
 DISPATCHER="$WORKTREE/apps/api/src/events/dispatcher.rs"
 ROUTES="$WORKTREE/apps/api/src/routes/flow.rs"
@@ -95,8 +105,34 @@ grep -Fq '"source_event_ids": vec![first_event.id],' "$DISPATCHER"
 run_case coalesced_consumer_uses_event_id red "$COALESCED_CONSUMER_TEST"
 git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
 
+perl -0pi -e 's/ON CONFLICT \(subscriber_kind, subscriber_id, source_event_id\) DO NOTHING/ON CONFLICT (subscriber_kind, subscriber_id, source_event_id) DO UPDATE SET created_at = event_delivery_sources.created_at/' "$DISPATCHER"
+grep -Fq 'DO UPDATE SET created_at = event_delivery_sources.created_at' "$DISPATCHER"
+run_case replay_check_then_build_race red "$CONCURRENT_REPLAY_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
+
+perl -0pi -e 's/const CHANGED_BLOCK_IDS_PER_DELIVERY_MAX: usize = 200;/const CHANGED_BLOCK_IDS_PER_DELIVERY_MAX: usize = 201;/' "$DISPATCHER"
+grep -Fq 'const CHANGED_BLOCK_IDS_PER_DELIVERY_MAX: usize = 201;' "$DISPATCHER"
+run_case changed_block_union_ceiling_drift red "$BLOCK_UNION_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
+
+MIGRATION="$WORKTREE/migrations/0054_flow_data_layer.sql"
+perl -0pi -e 's/CHECK \(\(lease_token IS NULL\) = \(lease_expires_at IS NULL\)\)/CHECK (true)/g' "$MIGRATION"
+[[ $(grep -Fc 'CHECK (true)' "$MIGRATION") -eq 2 ]]
+run_case lease_pair_constraint_removed red "$LEASE_PAIR_TEST"
+git -C "$WORKTREE" restore migrations/0054_flow_data_layer.sql
+
+perl -0pi -e "s/SELECT url, secret FROM webhooks/SELECT 'http:\/\/old.example.invalid\/hook' AS url, secret FROM webhooks/" "$DISPATCHER"
+grep -Fq "SELECT 'http://old.example.invalid/hook' AS url" "$DISPATCHER"
+run_case delivery_uses_stale_endpoint_snapshot red "$CURRENT_TARGET_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
+
+perl -0pi -e "s/SET status = 'cancelled'/SET status = 'failed'/" "$DISPATCHER"
+grep -A18 -F 'async fn cancel_delivery' "$DISPATCHER" | grep -Fq "SET status = 'failed'"
+run_case subscriber_gone_inflates_dead_letter red "$BACKLOG_CANCEL_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
+
 perl -0pi -e 's/(pub async fn post_flow_delivery_replay.*?policy::)require_flow_workspace_admin_access/$1require_flow_workspace_access/s' "$ROUTES"
 grep -A30 -F 'pub async fn post_flow_delivery_replay' "$ROUTES" | grep -Fq 'require_flow_workspace_access'
 run_case replay_accepts_non_admin_member red "$ROUTE_TEST"
 
-printf 'PASS: 6 green controls passed and 8/8 production-source mutations were detected\n'
+printf 'PASS: 11 green controls passed and 13/13 production-source mutations were detected\n'

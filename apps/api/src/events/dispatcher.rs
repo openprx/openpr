@@ -991,6 +991,7 @@ struct WebhookRow {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_ALLOW_PRIVATE_DELIVERY_TARGET: bool;
+    static TEST_REPLAY_CANDIDATE_BARRIER: std::sync::Arc<tokio::sync::Barrier>;
 }
 
 async fn validate_delivery_target(raw: &str) -> Result<reqwest::Url, String> {
@@ -1570,6 +1571,10 @@ pub async fn replay_deliveries(
             ))
             .all(db)
             .await?;
+            #[cfg(test)]
+            if let Ok(barrier) = TEST_REPLAY_CANDIDATE_BARRIER.try_with(Clone::clone) {
+                barrier.wait().await;
+            }
             let skipped = candidates.iter().filter(|row| row.already_delivered).count() as u64;
             let planned = candidates.len() as u64 - skipped;
             if request.dry_run {
@@ -1712,12 +1717,12 @@ mod dispatcher_database_tests {
     use super::{
         BusinessEventRow, DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B,
         OLDEST_PENDING_AGE_ALERT_MS, REPLAY_MAX_WINDOW_DAYS, ReplayMode, ReplayRequest, ReplayResult,
-        SUBSCRIBERS_PER_WORKSPACE_MAX, TEST_ALLOW_PRIVATE_DELIVERY_TARGET, backlog_alert, build_delivery_body,
-        delivery_backoff_ms, dispatcher_is_live, dispatcher_is_live_since, ensure_workspace_subscriber_slot,
-        envelope_json, expand_one, oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms,
-        reap_delivery_retention, reap_delivery_source_tombstones, reclaim_expired_delivery_leases,
-        reclaim_expired_dispatch_leases, replay_deliveries, requeue_failed, run_tick, send_one,
-        workspace_subscriber_count,
+        SUBSCRIBERS_PER_WORKSPACE_MAX, TEST_ALLOW_PRIVATE_DELIVERY_TARGET, TEST_REPLAY_CANDIDATE_BARRIER,
+        backlog_alert, build_delivery_body, delivery_backoff_ms, dispatcher_is_live, dispatcher_is_live_since,
+        ensure_workspace_subscriber_slot, envelope_json, expand_one, oldest_pending_delivery_age_ms,
+        oldest_pending_dispatch_age_ms, reap_delivery_retention, reap_delivery_source_tombstones,
+        reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases, replay_deliveries, requeue_failed, run_tick,
+        send_one, workspace_subscriber_count,
     };
     use crate::error::ApiError;
     use crate::events::{BusinessEventInput, insert_business_event};
@@ -2699,7 +2704,7 @@ mod dispatcher_database_tests {
 
         let scratch = scratch_or_skip!("delivery-backoff-database");
         let workspace_id = seed_workspace(&scratch.db).await;
-        seed_webhook(
+        let webhook_id = seed_webhook(
             &scratch.db,
             workspace_id,
             &format!("http://{address}/hook"),
@@ -2708,14 +2713,65 @@ mod dispatcher_database_tests {
         .await;
         let event_id =
             commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
-        expand_one(&scratch.db).await.expect("expansion runs");
-        let delivery_id: Uuid = get_col(
+        exec(
             &scratch.db,
-            "SELECT id FROM event_deliveries WHERE event_id=$1",
+            "DELETE FROM event_dispatch WHERE event_id=$1",
             vec![event_id.into()],
-            "id",
         )
         .await;
+        let now = Utc::now();
+        let replay = replay_deliveries(
+            &scratch.db,
+            &ReplayRequest {
+                workspace_id,
+                mode: ReplayMode::Rebuild,
+                event_type: Some("flow.object.created".to_string()),
+                subscriber_kind: Some("webhook".to_string()),
+                subscriber_id: Some(webhook_id),
+                from: now - chrono::Duration::minutes(1),
+                to: now,
+                dry_run: false,
+            },
+            now,
+        )
+        .await
+        .expect("admin replay builds a delivery");
+        let delivery_id = match replay {
+            ReplayResult::Rebuild {
+                replayed: 1,
+                rebuilt_delivery_ids,
+                ..
+            } => rebuilt_delivery_ids[0],
+            other => panic!("unexpected replay result: {other:?}"),
+        };
+        #[derive(FromQueryResult)]
+        struct ReplayShape {
+            dispatch_id: Option<Uuid>,
+            document_id: Option<Uuid>,
+            first_seq: Option<i64>,
+            latest_seq: Option<i64>,
+            status: String,
+        }
+        let replay_shape = ReplayShape::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT dispatch_id,document_id,first_seq,latest_seq,status FROM event_deliveries WHERE id=$1",
+            vec![delivery_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("replay shape query runs")
+        .expect("replay delivery exists");
+        assert_eq!(
+            (
+                replay_shape.dispatch_id,
+                replay_shape.document_id,
+                replay_shape.first_seq,
+                replay_shape.latest_seq,
+                replay_shape.status.as_str(),
+            ),
+            (None, None, None, None, "pending"),
+            "replay rows bypass event_dispatch and cannot enter live document coalescing"
+        );
         let state = state_for(scratch.db.clone());
         let client = reqwest::Client::new();
 
@@ -2994,6 +3050,96 @@ mod dispatcher_database_tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(second_body).unwrap()["delivery"]["attempt"],
             2
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_delivery_v08_reads_the_current_endpoint_and_rotated_secret_only_at_send_time() {
+        async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.expect("request is readable");
+                assert!(read > 0, "request ended before its declared body");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content-length is numeric"))
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    return String::from_utf8(bytes).expect("request is UTF-8");
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let address = listener.local_addr().expect("listener address is available");
+        let receiver = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("delivery connection arrives");
+            let request = read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("response writes");
+            request
+        });
+
+        let scratch = scratch_or_skip!("current-endpoint-secret");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://old.example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db)
+            .await
+            .expect("expansion takes the subscriber snapshot");
+        exec(
+            &scratch.db,
+            "UPDATE webhooks SET url=$2,secret='rotated-secret' WHERE id=$1",
+            vec![webhook_id.into(), format!("http://{address}/new-hook").into()],
+        )
+        .await;
+        let outcome = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+            .scope(true, send_one(&state_for(scratch.db.clone()), &reqwest::Client::new()))
+            .await
+            .expect("send runs");
+        assert_eq!(outcome, Some(true), "the old expansion-time endpoint was not retained");
+        let request = receiver.await.expect("receiver completes");
+        assert!(request.starts_with("POST /new-hook "));
+        let (headers, body) = request.split_once("\r\n\r\n").expect("request has a body boundary");
+        let signature = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case(super::WEBHOOK_SIGNATURE_HEADER)
+                    .then(|| value.trim())
+            })
+            .expect("signature header exists");
+        let expected = super::sign_payload("rotated-secret", body).expect("rotated payload signs");
+        assert_eq!(signature, format!("sha256={expected}"));
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE event_id=$1 AND status='dispatched'",
+                vec![event_id.into()],
+            )
+            .await,
+            1
         );
 
         scratch.drop_self().await;
@@ -5228,6 +5374,135 @@ mod dispatcher_database_tests {
     }
 
     #[tokio::test]
+    async fn flow_delivery_v08_deleting_a_subscriber_cancels_its_entire_backlog_without_dead_letter_or_audit_loss() {
+        let scratch = scratch_or_skip!("subscriber-backlog-cancelled");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let mut event_ids = Vec::new();
+        for _ in 0..3 {
+            let event_id =
+                commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+            event_ids.push(event_id);
+            expand_one(&scratch.db).await.expect("expansion runs");
+        }
+        delete_webhook(&scratch.db, webhook_id).await;
+        let state = state_for(scratch.db.clone());
+        let client = reqwest::Client::new();
+        for _ in 0..3 {
+            assert_eq!(
+                send_one(&state, &client).await.expect("cancellation attempt runs"),
+                Some(false)
+            );
+        }
+        assert_eq!(send_one(&state, &client).await.expect("queue scan runs"), None);
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries \
+                  WHERE subscriber_id=$1 AND status='cancelled' AND last_error_code='subscriber_gone'",
+                vec![webhook_id.into()],
+            )
+            .await,
+            3
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE workspace_id=$1 AND status='failed'",
+                vec![workspace_id.into()],
+            )
+            .await,
+            0,
+            "cancelled backlog cannot inflate dead-letter count or oldest_failed_age"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM business_events WHERE id=ANY($1)",
+                vec![event_ids.into()],
+            )
+            .await,
+            3,
+            "subscriber removal must not delete audit facts"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_delivery_v08_dispatch_and_delivery_lease_pairs_reject_both_unreachable_halves() {
+        let scratch = scratch_or_skip!("lease-pair-checks");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        let dispatch_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_dispatch WHERE event_id=$1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+        for sql in [
+            "UPDATE event_dispatch SET lease_token='impossible' WHERE id=$1",
+            "UPDATE event_dispatch SET lease_expires_at=now()+interval '1 minute' WHERE id=$1",
+        ] {
+            assert!(
+                scratch
+                    .db
+                    .execute(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        sql,
+                        vec![dispatch_id.into()],
+                    ))
+                    .await
+                    .is_err(),
+                "dispatch lease half-pair must violate its CHECK: {sql}"
+            );
+        }
+
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id=$1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+        for sql in [
+            "UPDATE event_deliveries SET lease_token='impossible' WHERE id=$1",
+            "UPDATE event_deliveries SET lease_expires_at=now()+interval '1 minute' WHERE id=$1",
+        ] {
+            assert!(
+                scratch
+                    .db
+                    .execute(Statement::from_sql_and_values(
+                        DbBackend::Postgres,
+                        sql,
+                        vec![delivery_id.into()],
+                    ))
+                    .await
+                    .is_err(),
+                "delivery lease half-pair must violate its CHECK: {sql}"
+            );
+        }
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn delivery_dead_letter_row_is_visible_immediately_and_survives_until_its_own_retention_window() {
         let scratch = scratch_or_skip!("dead-letter-visibility");
         let workspace_id = seed_workspace(&scratch.db).await;
@@ -5583,6 +5858,126 @@ mod dispatcher_database_tests {
     }
 
     #[tokio::test]
+    async fn flow_delivery_v08_changed_block_union_exact_limit_and_plus_one_truncation() {
+        let scratch = scratch_or_skip!("changed-block-union-boundary");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.content.accepted"],
+        )
+        .await;
+        let document_id = Uuid::new_v4();
+        let block_ids = (0..super::CHANGED_BLOCK_IDS_PER_DELIVERY_MAX)
+            .map(|_| Uuid::new_v4())
+            .collect::<Vec<_>>();
+        let event_1 = commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(1),
+            json!({ "changed_block_ids": &block_ids[..100] }),
+        )
+        .await;
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(2),
+            json!({ "changed_block_ids": &block_ids[100..] }),
+        )
+        .await;
+        expand_one(&scratch.db).await.expect("first expansion runs");
+        expand_one(&scratch.db).await.expect("second expansion runs");
+
+        #[derive(FromQueryResult)]
+        struct DeliveryRange {
+            id: Uuid,
+            first_seq: Option<i64>,
+            latest_seq: Option<i64>,
+        }
+        let row = DeliveryRange::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id,first_seq,latest_seq FROM event_deliveries WHERE subscriber_kind='webhook' AND document_id=$1",
+            vec![document_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("delivery query runs")
+        .expect("coalesced row exists");
+        let lease = super::DeliveryLeaseRow {
+            id: row.id,
+            event_id: event_1,
+            subscriber_id: Uuid::new_v4(),
+            document_id: Some(document_id),
+            attempts: 0,
+            max_attempts: 10,
+            first_seq: row.first_seq,
+            latest_seq: row.latest_seq,
+        };
+        let exact = build_delivery_body(&scratch.db, &lease)
+            .await
+            .expect("exact body builds");
+        assert_eq!(exact["delivery"]["block_ids_truncated"], json!(false));
+        let exact_ids = exact["event"]["payload"]["changed_block_ids"]
+            .as_array()
+            .expect("exact union is present");
+        assert_eq!(exact_ids.len(), super::CHANGED_BLOCK_IDS_PER_DELIVERY_MAX);
+        assert_eq!(
+            exact_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            block_ids.len()
+        );
+
+        let forbidden_body_id = Uuid::new_v4();
+        commit_dispatch_work(
+            &scratch.db,
+            workspace_id,
+            "flow.content.accepted",
+            Some(document_id),
+            Some(3),
+            json!({ "changed_block_ids": [forbidden_body_id], "body": "MUST-NOT-LEAK" }),
+        )
+        .await;
+        expand_one(&scratch.db).await.expect("plus-one expansion runs");
+        let plus_one_range = DeliveryRange::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id,first_seq,latest_seq FROM event_deliveries WHERE id=$1",
+            vec![row.id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("delivery query runs")
+        .expect("same delivery remains");
+        let plus_one = build_delivery_body(
+            &scratch.db,
+            &super::DeliveryLeaseRow {
+                latest_seq: plus_one_range.latest_seq,
+                ..lease
+            },
+        )
+        .await
+        .expect("plus-one body builds");
+        assert_eq!(plus_one["delivery"]["range"], json!({"first_seq": 1, "latest_seq": 3}));
+        assert_eq!(plus_one["delivery"]["block_ids_truncated"], json!(true));
+        assert_eq!(
+            plus_one["event"]["payload"],
+            json!({"changed_block_ids_truncated": true})
+        );
+        let encoded = serde_json::to_string(&plus_one).expect("body serializes");
+        assert!(!encoded.contains(&forbidden_body_id.to_string()));
+        assert!(!encoded.contains("MUST-NOT-LEAK"));
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn golden_wire_fixture_retry_reuses_delivery_id_and_only_advances_attempt() {
         let scratch = scratch_or_skip!("golden-retry");
         let workspace_id = seed_workspace(&scratch.db).await;
@@ -5843,6 +6238,137 @@ mod dispatcher_database_tests {
         exact_boundary.from += chrono::Duration::milliseconds(1);
         assert!(replay_deliveries(&scratch.db, &exact_boundary, now).await.is_ok());
 
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_delivery_v08_concurrent_replay_reserves_before_building_and_never_merges() {
+        let scratch = scratch_or_skip!("v08-concurrent-replay");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        let webhook_id = seed_webhook(
+            &scratch.db,
+            workspace_id,
+            "http://example.invalid/hook",
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        exec(
+            &scratch.db,
+            "DELETE FROM event_dispatch WHERE event_id=$1",
+            vec![event_id.into()],
+        )
+        .await;
+
+        // Negative fixture for an implementation that copies a document id into replay rows: a
+        // live content row already occupies the partial-unique coalescing key. Correct replay rows
+        // keep document_id/dispatch_id/range NULL, so they insert independently.
+        let live_content_delivery = Uuid::new_v4();
+        exec(
+            &scratch.db,
+            "INSERT INTO event_deliveries \
+               (id,event_id,workspace_id,subscriber_kind,subscriber_id,document_id,status,next_attempt_at) \
+             VALUES ($1,$2,$3,'webhook',$4,$5,'pending',now()+interval '1 hour')",
+            vec![
+                live_content_delivery.into(),
+                event_id.into(),
+                workspace_id.into(),
+                webhook_id.into(),
+                Uuid::new_v4().into(),
+            ],
+        )
+        .await;
+
+        let now = Utc::now();
+        let request = ReplayRequest {
+            workspace_id,
+            mode: ReplayMode::Rebuild,
+            event_type: Some("flow.object.created".to_string()),
+            subscriber_kind: Some("webhook".to_string()),
+            subscriber_id: Some(webhook_id),
+            from: now - chrono::Duration::minutes(1),
+            to: now,
+            dry_run: false,
+        };
+        let second = scratch.second_connection().await;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let (left, right) = tokio::join!(
+            TEST_REPLAY_CANDIDATE_BARRIER.scope(barrier.clone(), replay_deliveries(&scratch.db, &request, now),),
+            TEST_REPLAY_CANDIDATE_BARRIER.scope(barrier, replay_deliveries(&second, &request, now)),
+        );
+        let results = [
+            left.expect("first concurrent replay completes"),
+            right.expect("second concurrent replay completes"),
+        ];
+        let replayed = results
+            .iter()
+            .map(|result| match result {
+                ReplayResult::Rebuild { replayed, .. } => *replayed,
+                other => panic!("unexpected concurrent replay result: {other:?}"),
+            })
+            .sum::<u64>();
+        let skipped = results
+            .iter()
+            .map(|result| match result {
+                ReplayResult::Rebuild {
+                    skipped_already_delivered,
+                    ..
+                } => *skipped_already_delivered,
+                other => panic!("unexpected concurrent replay result: {other:?}"),
+            })
+            .sum::<u64>();
+        assert_eq!(
+            (replayed, skipped),
+            (1, 1),
+            "the source unique key is a write-before-build reservation"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_delivery_sources \
+                  WHERE subscriber_id=$1 AND source_event_id=$2",
+                vec![webhook_id.into(), event_id.into()],
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries \
+                  WHERE subscriber_id=$1 AND event_id=$2 AND dispatch_id IS NULL AND document_id IS NULL \
+                    AND first_seq IS NULL AND latest_seq IS NULL AND status='pending'",
+                vec![webhook_id.into(), event_id.into()],
+            )
+            .await,
+            1,
+            "exactly one standalone replay row is created beside the active content row"
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM event_deliveries WHERE id=$1 AND status='pending'",
+                vec![live_content_delivery.into()],
+            )
+            .await,
+            1,
+            "replay must neither collide with nor merge into the active content delivery"
+        );
+        let third = replay_deliveries(&scratch.db, &request, now)
+            .await
+            .expect("sequential replay completes");
+        assert!(matches!(
+            third,
+            ReplayResult::Rebuild {
+                replayed: 0,
+                skipped_already_delivered: 1,
+                ref rebuilt_delivery_ids,
+                ..
+            } if rebuilt_delivery_ids.is_empty()
+        ));
+
+        second.close().await.expect("second connection closes");
         scratch.drop_self().await;
     }
 
