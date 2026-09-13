@@ -21,7 +21,7 @@ use super::{import::BoundedImportStager, projection, repository};
 const IMPORT_ARTIFACT_TTL_MINUTES: i64 = 30;
 
 #[cfg(test)]
-static FAIL_PROMOTION_AFTER_OBJECT: std::sync::Mutex<Option<Uuid>> = std::sync::Mutex::new(None);
+static FAIL_PROMOTION_AFTER_OBJECT: parking_lot::Mutex<Option<Uuid>> = parking_lot::Mutex::new(None);
 
 #[derive(Debug, Clone)]
 pub struct ImportPrincipal {
@@ -1074,12 +1074,7 @@ async fn promote_objects<C: ConnectionTrait>(
             inserted.insert(source_id);
             created = created.saturating_add(1);
             #[cfg(test)]
-            if FAIL_PROMOTION_AFTER_OBJECT
-                .lock()
-                .map_err(|_| ApiError::Internal)?
-                .as_ref()
-                == Some(&request.preview_id)
-            {
+            if FAIL_PROMOTION_AFTER_OBJECT.lock().as_ref() == Some(&request.preview_id) {
                 return Err(ApiError::Internal);
             }
         }
@@ -1316,7 +1311,15 @@ fn import_event(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::print_stderr,
+    clippy::struct_field_names
+)]
 mod tests {
     use super::*;
     use crate::flow::command::{
@@ -1431,6 +1434,8 @@ mod tests {
                     workspace_id: source_workspace,
                     project_id: None,
                 },
+                format: "package".to_string(),
+                at_seq: None,
                 include_history: true,
                 idempotency_key: format!("export-{label}"),
                 source_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1701,9 +1706,9 @@ mod tests {
         let package = exported_fixture(&state, source_workspace, source_owner, "rollback").await;
         let before = canonical_count(&state.db, target_workspace).await;
         let (_, commit) = prepare_preview(&state.db, target_workspace, target_owner, package, "rollback").await;
-        *FAIL_PROMOTION_AFTER_OBJECT.lock().unwrap() = Some(commit.preview_id);
+        *FAIL_PROMOTION_AFTER_OBJECT.lock() = Some(commit.preview_id);
         let result = commit_package_import(&state.db, &commit).await;
-        *FAIL_PROMOTION_AFTER_OBJECT.lock().unwrap() = None;
+        *FAIL_PROMOTION_AFTER_OBJECT.lock() = None;
         assert!(matches!(result, Err(ApiError::Internal)));
         assert_eq!(canonical_count(&state.db, target_workspace).await, before);
         let rows = state.db.query_one(Statement::from_sql_and_values(

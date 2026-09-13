@@ -66,15 +66,17 @@ pub struct PackageExportRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct InlinePackageSource {
+pub struct PackageArtifactSource {
     pub kind: String,
-    pub package_base64: String,
+    pub package_base64: Option<String>,
     pub package_sha256: Option<String>,
+    pub object_key: Option<String>,
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct PackageArtifactRequest {
-    pub source: InlinePackageSource,
+    pub source: PackageArtifactSource,
     pub idempotency_key: String,
 }
 
@@ -159,10 +161,8 @@ pub async fn post_flow_object_export(
     Json(req): Json<PackageExportRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_package_tool(bot.as_ref(), "objects.export")?;
-    if req.format != "package" || req.project_id.is_some() || req.at_seq.is_some() {
-        return Err(ApiError::invalid_update(
-            "this v0.8 endpoint currently accepts only complete package head exports",
-        ));
+    if req.project_id.is_some() {
+        return Err(ApiError::invalid_update("object export does not accept project_id"));
     }
     let extensions = build_auth_extensions(claims, bot);
     let (_, caller) = authorization_caller(&state, &extensions, object_id).await?;
@@ -170,6 +170,8 @@ pub async fn post_flow_object_export(
         &state.db,
         &crate::flow::export::CreateExportRequest {
             scope: crate::flow::export::ExportScope::Object(object_id),
+            format: req.format,
+            at_seq: req.at_seq,
             include_history: req.include_history,
             idempotency_key: req.idempotency_key,
             source_head: package_source_head()?,
@@ -203,6 +205,8 @@ pub async fn post_flow_workspace_export(
                 workspace_id,
                 project_id: req.project_id,
             },
+            format: req.format,
+            at_seq: req.at_seq,
             include_history: req.include_history,
             idempotency_key: req.idempotency_key,
             source_head: package_source_head()?,
@@ -237,9 +241,12 @@ pub async fn get_flow_export(
     let receipt =
         crate::flow::export::get_package_export(&state.db, job_id, &package_export_principal(actor_id, role, is_bot))
             .await?;
-    Ok(ApiResponse::success(
-        json!({"download_url":format!("/api/v1/flow/exports/{job_id}/artifact"),"job":receipt}),
-    ))
+    let mut data = serde_json::to_value(receipt).map_err(|_| ApiError::Internal)?;
+    data.as_object_mut().ok_or(ApiError::Internal)?.insert(
+        "download_url".to_string(),
+        json!(format!("/api/v1/flow/exports/{job_id}/artifact")),
+    );
+    Ok(ApiResponse::success(data))
 }
 
 pub async fn get_flow_export_artifact(
@@ -251,17 +258,21 @@ pub async fn get_flow_export_artifact(
     let workspace_id = export_job_workspace(&state.db, job_id).await?;
     let extensions = build_auth_extensions(claims, bot);
     let (actor_id, role, is_bot) = require_workspace_access(&state, &extensions, workspace_id).await?;
-    let (bytes, hash) = crate::flow::export::download_package_export(
+    let (bytes, hash, format) = crate::flow::export::download_package_export(
         &state.db,
         job_id,
         &package_export_principal(actor_id, role, is_bot),
     )
     .await?;
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/vnd.sylvode.flow-package+zip;version=1"),
-    );
+    let content_type = match format.as_str() {
+        "json" => "application/json; charset=utf-8",
+        "markdown" => "text/markdown; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "package" => "application/vnd.sylvode.flow-package+zip;version=1",
+        _ => return Err(ApiError::Internal),
+    };
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(
         "x-flow-package-sha256",
         HeaderValue::from_str(&hash).map_err(|_| ApiError::Internal)?,
@@ -289,64 +300,121 @@ pub async fn post_flow_import_artifact(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let (artifact_id, package_sha256, expires_at) = if content_type.starts_with("multipart/form-data") {
-        let mut multipart = Multipart::from_request(request, &state)
-            .await
-            .map_err(|_| ApiError::BadRequest("invalid multipart package upload".to_string()))?;
-        let mut stager = crate::flow::import::BoundedImportStager::new(Vec::new(), std::io::sink());
-        let mut seen = false;
-        while let Some(mut field) = multipart
-            .next_field()
-            .await
-            .map_err(|_| ApiError::invalid_update("multipart package stream failed"))?
-        {
-            if field.name() != Some("package") || seen {
-                return Err(ApiError::BadRequest(
-                    "multipart upload requires exactly one package field".to_string(),
-                ));
-            }
-            seen = true;
-            while let Some(chunk) = field
-                .chunk()
+    let (artifact_id, package_sha256, expires_at) =
+        if content_type.starts_with("multipart/form-data") {
+            let mut multipart = Multipart::from_request(request, &state)
+                .await
+                .map_err(|_| ApiError::BadRequest("invalid multipart package upload".to_string()))?;
+            let mut stager = crate::flow::import::BoundedImportStager::new(Vec::new(), std::io::sink());
+            let mut seen = false;
+            while let Some(mut field) = multipart
+                .next_field()
                 .await
                 .map_err(|_| ApiError::invalid_update("multipart package stream failed"))?
             {
-                stager.write_archive_chunk(&chunk)?;
+                if field.name() != Some("package") || seen {
+                    return Err(ApiError::BadRequest(
+                        "multipart upload requires exactly one package field".to_string(),
+                    ));
+                }
+                seen = true;
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::invalid_update("multipart package stream failed"))?
+                {
+                    stager.write_archive_chunk(&chunk)?;
+                }
             }
-        }
-        if !seen {
-            return Err(ApiError::BadRequest("multipart package field is missing".to_string()));
-        }
-        stager.finish_archive()?;
-        let (bytes, _) = stager.into_stages()?;
-        crate::flow::package_import::upload_package_artifact(
-            &state.db,
-            workspace_id,
-            &principal,
-            bytes,
-            None,
-            &multipart_idempotency_key,
-        )
-        .await?
-    } else {
-        let Json(req) = Json::<PackageArtifactRequest>::from_request(request, &state)
-            .await
-            .map_err(|_| ApiError::BadRequest("invalid import artifact JSON".to_string()))?;
-        if req.source.kind != "inline_base64" || req.idempotency_key.trim().is_empty() {
-            return Err(ApiError::BadRequest(
-                "JSON artifact source must be inline_base64 with idempotency_key".to_string(),
-            ));
-        }
-        crate::flow::package_import::upload_inline_base64_artifact(
-            &state.db,
-            workspace_id,
-            &principal,
-            req.source.package_base64.as_bytes(),
-            req.source.package_sha256.as_deref(),
-            &req.idempotency_key,
-        )
-        .await?
-    };
+            if !seen {
+                return Err(ApiError::BadRequest("multipart package field is missing".to_string()));
+            }
+            stager.finish_archive()?;
+            let (bytes, _) = stager.into_stages()?;
+            crate::flow::package_import::upload_package_artifact(
+                &state.db,
+                workspace_id,
+                &principal,
+                bytes,
+                None,
+                &multipart_idempotency_key,
+            )
+            .await?
+        } else {
+            let Json(req) = Json::<PackageArtifactRequest>::from_request(request, &state)
+                .await
+                .map_err(|_| ApiError::BadRequest("invalid import artifact JSON".to_string()))?;
+            if req.idempotency_key.trim().is_empty() {
+                return Err(ApiError::BadRequest(
+                    "JSON artifact source requires idempotency_key".to_string(),
+                ));
+            }
+            match req.source.kind.as_str() {
+                "inline_base64" => {
+                    let encoded = req.source.package_base64.as_deref().ok_or_else(|| {
+                        ApiError::BadRequest("inline_base64 source requires package_base64".to_string())
+                    })?;
+                    if req.source.object_key.is_some() || req.source.size.is_some() {
+                        return Err(ApiError::BadRequest(
+                            "inline_base64 source cannot carry staged object fields".to_string(),
+                        ));
+                    }
+                    crate::flow::package_import::upload_inline_base64_artifact(
+                        &state.db,
+                        workspace_id,
+                        &principal,
+                        encoded.as_bytes(),
+                        req.source.package_sha256.as_deref(),
+                        &req.idempotency_key,
+                    )
+                    .await?
+                }
+                "staged_object" => {
+                    if req.source.package_base64.is_some() {
+                        return Err(ApiError::BadRequest(
+                            "staged_object source cannot carry package_base64".to_string(),
+                        ));
+                    }
+                    let object_key =
+                        req.source.object_key.as_deref().ok_or_else(|| {
+                            ApiError::BadRequest("staged_object source requires object_key".to_string())
+                        })?;
+                    let expected_size = req
+                        .source
+                        .size
+                        .ok_or_else(|| ApiError::BadRequest("staged_object source requires size".to_string()))?;
+                    let expected_hash = req.source.package_sha256.as_deref().ok_or_else(|| {
+                        ApiError::BadRequest("staged_object source requires package_sha256".to_string())
+                    })?;
+                    let trusted_prefix = format!("flow-package-staging/{workspace_id}/");
+                    if !object_key.starts_with(&trusted_prefix) {
+                        return Err(ApiError::Forbidden(
+                            "staged package object is not bound to the target workspace".to_string(),
+                        ));
+                    }
+                    let bytes = crate::services::object_storage::ObjectStorage::from_runtime_config()?
+                        .get(object_key)
+                        .await?;
+                    if u64::try_from(bytes.len()).ok() != Some(expected_size) {
+                        return Err(ApiError::BadRequest("staged package size does not match".to_string()));
+                    }
+                    crate::flow::package_import::upload_package_artifact(
+                        &state.db,
+                        workspace_id,
+                        &principal,
+                        bytes,
+                        Some(expected_hash),
+                        &req.idempotency_key,
+                    )
+                    .await?
+                }
+                _ => {
+                    return Err(ApiError::BadRequest(
+                        "artifact source kind must be inline_base64 or staged_object".to_string(),
+                    ));
+                }
+            }
+        };
     let size: i64 = state
         .db
         .query_one(Statement::from_sql_and_values(
@@ -9716,23 +9784,23 @@ mod flow_database_tests {
             .unwrap();
         let export_body = body_json(export_response).await;
         assert_eq!(export_body["code"], 0, "{export_body}");
-        let job_id = export_body["data"]["job_id"].as_str().unwrap();
+        let export_job_id = export_body["data"]["job_id"].as_str().unwrap();
         let status_response = source_app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(format!("/api/v1/flow/exports/{job_id}"))
+                    .uri(format!("/api/v1/flow/exports/{export_job_id}"))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         let status = body_json(status_response).await;
-        assert_eq!(status["data"]["job"]["checksum"], export_body["data"]["checksum"]);
+        assert_eq!(status["data"]["checksum"], export_body["data"]["checksum"]);
         let artifact_response = source_app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(format!("/api/v1/flow/exports/{job_id}/artifact"))
+                    .uri(format!("/api/v1/flow/exports/{export_job_id}/artifact"))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )
@@ -9830,14 +9898,14 @@ mod flow_database_tests {
             .unwrap();
         let preview = body_json(preview_response).await;
         assert_eq!(preview["code"], 0, "{preview}");
-        let import_id = preview["data"]["preview_id"].as_str().unwrap();
+        let preview_import_id = preview["data"]["preview_id"].as_str().unwrap();
         let commit_response = target_app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
                     .uri(format!(
-                        "/api/v1/workspaces/{target_workspace}/flow/imports/{import_id}/commit"
+                        "/api/v1/workspaces/{target_workspace}/flow/imports/{preview_import_id}/commit"
                     ))
                     .header(axum::http::header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
@@ -9854,11 +9922,13 @@ mod flow_database_tests {
             .unwrap();
         let committed = body_json(commit_response).await;
         assert_eq!(committed["code"], 0, "{committed}");
-        let job_id = committed["data"]["job_id"].as_str().unwrap();
+        let committed_import_job_id = committed["data"]["job_id"].as_str().unwrap();
         let report_response = target_app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/imports/{job_id}"))
+                    .uri(format!(
+                        "/api/v1/workspaces/{target_workspace}/flow/imports/{committed_import_job_id}"
+                    ))
                     .body(axum::body::Body::empty())
                     .unwrap(),
             )

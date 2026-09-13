@@ -131,6 +131,7 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
     tools.extend(flow_v05_tool_definitions());
     tools.extend(flow_v06_tool_definitions());
     tools.extend(flow_v07_tool_definitions());
+    tools.extend(flow_v08_tool_definitions());
     tools.extend([
         legacy_pages::legacy_pages_inventory_tool(),
         legacy_pages::legacy_pages_import_preview_tool(),
@@ -138,6 +139,22 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
         legacy_pages::legacy_pages_import_status_tool(),
     ]);
     tools
+}
+
+fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        objects::export_flow_object_tool(),
+        objects::export_flow_workspace_tool(),
+        objects::import_flow_artifact_tool(),
+        objects::import_flow_preview_tool(),
+        objects::import_flow_commit_tool(),
+        objects::import_flow_status_tool(),
+        objects::flow_collab_status_tool(),
+        objects::flow_integrity_tool(),
+        objects::compact_flow_document_tool(),
+        objects::replay_flow_deliveries_tool(),
+        objects::rebuild_flow_projection_tool(),
+    ]
 }
 
 fn flow_v07_tool_definitions() -> Vec<ToolDefinition> {
@@ -182,7 +199,8 @@ fn flow_v05_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::{
-        flow_v05_tool_definitions, flow_v06_tool_definitions, flow_v07_tool_definitions, get_all_tool_definitions,
+        flow_v05_tool_definitions, flow_v06_tool_definitions, flow_v07_tool_definitions, flow_v08_tool_definitions,
+        get_all_tool_definitions,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
@@ -191,7 +209,7 @@ mod tests {
     const TOOL_REGISTRY_BASELINE: &str = include_str!("../../tool-registry-baseline.json");
 
     #[test]
-    fn flow_v07_tools_match_the_repository_registry_baseline() {
+    fn flow_v08_tools_match_the_repository_registry_baseline() {
         let tools = get_all_tool_definitions();
         let names = tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>();
         let unique = names.iter().copied().collect::<HashSet<_>>();
@@ -249,6 +267,43 @@ mod tests {
             ]),
             "the live v0.7 delta must be exactly the frozen six-tool bridge surface"
         );
+        let live_v08 = flow_v08_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            live_v08,
+            HashSet::from(
+                [
+                    "objects.export",
+                    "objects.export_workspace",
+                    "objects.import_artifact",
+                    "objects.import_preview",
+                    "objects.import_commit",
+                    "objects.import_status",
+                    "collab.status",
+                    "objects.integrity",
+                    "collab.compact",
+                    "deliveries.replay",
+                    "collab.rebuild_projection",
+                ]
+                .map(str::to_string)
+            ),
+            "the live v0.8 delta must be exactly the frozen eleven-tool hardening surface"
+        );
+        for name in ["objects.import_artifact", "objects.integrity"] {
+            let schema = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("v0.8 tool is registered")
+                .input_schema
+                .clone();
+            assert_eq!(
+                schema.get("oneOf").and_then(serde_json::Value::as_array).map(Vec::len),
+                Some(2),
+                "{name} must reject both and neither scope/source"
+            );
+        }
     }
 
     #[derive(Debug, PartialEq, Eq)]

@@ -12,8 +12,8 @@ pub mod render;
 
 use crate::client::{OpenPrClient, encode_query_component};
 use command::{
-    Cli, CollabAction, CollectionsAction, Commands, FeaturesAction, FlowFeatureAction, GrantsAction, InheritanceAction,
-    ObjectsAction, RecordsAction,
+    Cli, CollabAction, CollectionsAction, Commands, DeliveriesAction, FeaturesAction, FlowFeatureAction, GrantsAction,
+    InheritanceAction, ObjectsAction, RecordsAction,
 };
 use error::CliError;
 use serde_json::{Value, json};
@@ -48,6 +48,7 @@ fn command_name(command: &Commands) -> String {
             },
         },
         Commands::Objects(cmd) => match &cmd.action {
+            ObjectsAction::Export { .. } => "objects.export".to_string(),
             ObjectsAction::Create { .. } => "objects.create".to_string(),
             ObjectsAction::Patch { .. } => "objects.patch".to_string(),
             ObjectsAction::Move { .. } => "objects.move".to_string(),
@@ -82,9 +83,20 @@ fn command_name(command: &Commands) -> String {
             RecordsAction::Patch { .. } => "records.patch".to_string(),
         },
         Commands::Collab(cmd) => match &cmd.action {
+            CollabAction::Status { .. } => "collab.status".to_string(),
             CollabAction::Inspect { .. } => "collab.inspect".to_string(),
             CollabAction::Verify { .. } => "collab.verify".to_string(),
             CollabAction::ProjectionLag { .. } => "collab.projection-lag".to_string(),
+            CollabAction::Compact { .. } => "collab.compact".to_string(),
+            CollabAction::RebuildProjection { .. } => "collab.rebuild-projection".to_string(),
+            CollabAction::Export { .. } => "collab.export".to_string(),
+            CollabAction::ExportWorkspace { .. } => "collab.export-workspace".to_string(),
+            CollabAction::ImportPreview { .. } => "collab.import-preview".to_string(),
+            CollabAction::ImportCommit { .. } => "collab.import-commit".to_string(),
+            CollabAction::ImportStatus { .. } => "collab.import-status".to_string(),
+        },
+        Commands::Deliveries(cmd) => match &cmd.action {
+            DeliveriesAction::Replay { .. } => "deliveries.replay".to_string(),
         },
     }
 }
@@ -130,6 +142,36 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
             },
         },
         Commands::Objects(cmd) => match &cmd.action {
+            ObjectsAction::Export {
+                id,
+                render,
+                at_seq,
+                wait,
+                idempotency_key,
+            } => {
+                let id = checked_uuid("object id", id)?;
+                checked_idempotency_key(idempotency_key)?;
+                let body =
+                    json!({"format":render,"at_seq":at_seq,"include_history":false,"idempotency_key":idempotency_key});
+                let created = api_data(
+                    client
+                        .post_structured::<Value, _>(&format!("/api/v1/flow/objects/{id}/exports"), &body)
+                        .await,
+                )?;
+                if *wait {
+                    let job_id = created
+                        .get("job_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| CliError::usage("export response has no job_id"))?;
+                    api_data(
+                        client
+                            .get_structured::<Value>(&format!("/api/v1/flow/exports/{job_id}"))
+                            .await,
+                    )
+                } else {
+                    Ok(created)
+                }
+            }
             ObjectsAction::Create {
                 workspace,
                 project,
@@ -676,6 +718,27 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
             }
         }
         Commands::Collab(cmd) => match &cmd.action {
+            CollabAction::Status { workspace } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                let health = api_data(
+                    client
+                        .get_structured::<Value>(&format!("/api/v1/admin/workspaces/{workspace}/flow/health"))
+                        .await,
+                )?;
+                let lag = api_data(
+                    client
+                        .get_structured::<Value>(&format!("/api/v1/admin/workspaces/{workspace}/flow/lag"))
+                        .await,
+                )?;
+                let integrity = api_data(
+                    client
+                        .get_structured::<Value>(&format!(
+                            "/api/v1/admin/workspaces/{workspace}/flow/integrity?scope=summary"
+                        ))
+                        .await,
+                )?;
+                Ok(json!({"health":health,"lag":lag,"integrity":integrity}))
+            }
             CollabAction::Inspect { id } => {
                 let id = checked_uuid("object id", id)?;
                 // `include_sizes=true` is always sent: the endpoint reports `byte_size`, never
@@ -687,13 +750,22 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 let path = format!("/api/v1/flow/objects/{id}/collab?include_sizes=true");
                 api_data(client.get_structured::<Value>(&path).await)
             }
-            CollabAction::Verify { id, expected_head } => {
+            CollabAction::Verify {
+                id,
+                deep,
+                expected_head,
+            } => {
                 let id = checked_uuid("object id", id)?;
-                let mut body = json!({ "deep": false, "idempotency_key": Uuid::new_v4().to_string() });
+                let mut body = json!({ "dry_run": true, "deep": deep, "idempotency_key": Uuid::new_v4().to_string() });
                 if let (Some(expected_head), Some(object)) = (expected_head, body.as_object_mut()) {
                     object.insert("expected_head_seq".to_string(), json!(expected_head));
                 }
-                let path = format!("/api/v1/flow/objects/{id}/collab/verify");
+                let path = if *deep {
+                    format!("/api/v1/admin/flow/documents/{id}/verify")
+                } else {
+                    body.as_object_mut().map(|object| object.remove("dry_run"));
+                    format!("/api/v1/flow/objects/{id}/collab/verify")
+                };
                 let envelope: Value = client
                     .post_structured(&path, &body)
                     .await
@@ -725,6 +797,146 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 );
                 api_data(client.get_structured::<Value>(&path).await)
             }
+            CollabAction::Compact {
+                id,
+                dry_run,
+                execute,
+                expected_head,
+                confirm,
+                idempotency_key,
+            } => {
+                let id = checked_uuid("document id", id)?;
+                let mode = checked_admin_mode(*dry_run, *execute, confirm.as_deref(), &id)?;
+                checked_idempotency_key(idempotency_key)?;
+                api_data(client.post_structured::<Value, _>(&format!("/api/v1/admin/flow/documents/{id}/compact"), &json!({"dry_run":mode,"expected_head_seq":expected_head,"confirm_document_id":confirm,"idempotency_key":idempotency_key})).await)
+            }
+            CollabAction::RebuildProjection {
+                id,
+                dry_run,
+                execute,
+                expected_head,
+                confirm,
+                idempotency_key,
+            } => {
+                let id = checked_uuid("object id", id)?;
+                let mode = checked_admin_mode(*dry_run, *execute, confirm.as_deref(), &id)?;
+                checked_idempotency_key(idempotency_key)?;
+                api_data(client.post_structured::<Value, _>(&format!("/api/v1/admin/flow/objects/{id}/rebuild-projection"), &json!({"dry_run":mode,"expected_head_seq":expected_head,"confirm_object_id":confirm,"idempotency_key":idempotency_key})).await)
+            }
+            CollabAction::Export { id, idempotency_key } => {
+                let id = checked_uuid("object id", id)?;
+                checked_idempotency_key(idempotency_key)?;
+                api_data(
+                    client
+                        .post_structured::<Value, _>(
+                            &format!("/api/v1/flow/objects/{id}/exports"),
+                            &json!({"format":"package","include_history":true,"idempotency_key":idempotency_key}),
+                        )
+                        .await,
+                )
+            }
+            CollabAction::ExportWorkspace {
+                workspace,
+                include_history,
+                idempotency_key,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                checked_idempotency_key(idempotency_key)?;
+                api_data(client.post_structured::<Value, _>(&format!("/api/v1/workspaces/{workspace}/flow/exports"), &json!({"format":"package","include_history":include_history,"idempotency_key":idempotency_key})).await)
+            }
+            CollabAction::ImportPreview {
+                workspace,
+                package_file,
+                mapping_file,
+                idempotency_key,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                checked_idempotency_key(idempotency_key)?;
+                let upload_path = format!("/api/v1/workspaces/{workspace}/flow/import-artifacts");
+                let artifact = api_data(
+                    client
+                        .post_package_file_structured::<Value>(&upload_path, package_file, idempotency_key)
+                        .await,
+                )?;
+                let artifact_id = artifact
+                    .get("artifact_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CliError::usage("artifact response has no artifact_id"))?;
+                let mapping = read_json_file(mapping_file)?;
+                let project_mapping = mapping
+                    .get("project_mapping")
+                    .cloned()
+                    .unwrap_or_else(|| mapping.clone());
+                let external_policy = mapping
+                    .get("external_reference_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("drop");
+                let conflict_policy = mapping
+                    .get("conflict_policy")
+                    .and_then(Value::as_str)
+                    .unwrap_or("new_ids");
+                let include_history = mapping.get("include_history").and_then(Value::as_bool).unwrap_or(false);
+                api_data(client.post_structured::<Value, _>(&format!("/api/v1/workspaces/{workspace}/flow/imports/preview"), &json!({"artifact_id":artifact_id,"project_mapping":project_mapping,"external_reference_policy":external_policy,"conflict_policy":conflict_policy,"include_history":include_history,"idempotency_key":idempotency_key})).await)
+            }
+            CollabAction::ImportCommit {
+                workspace,
+                import_id,
+                package_hash,
+                mapping_hash,
+                conflict_policy,
+                confirm,
+                idempotency_key,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                let import_id = checked_uuid("--import", import_id)?;
+                if !*confirm {
+                    return Err(CliError::usage("--confirm is required"));
+                }
+                checked_idempotency_key(idempotency_key)?;
+                api_data(client.post_structured::<Value, _>(&format!("/api/v1/workspaces/{workspace}/flow/imports/{import_id}/commit"), &json!({"package_sha256":package_hash,"mapping_hash":mapping_hash,"conflict_policy":conflict_policy.replace('-', "_"),"confirm":true,"idempotency_key":idempotency_key})).await)
+            }
+            CollabAction::ImportStatus {
+                workspace,
+                import_id,
+                wait: _,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                let import_id = checked_uuid("--import", import_id)?;
+                api_data(
+                    client
+                        .get_structured::<Value>(&format!("/api/v1/workspaces/{workspace}/flow/imports/{import_id}"))
+                        .await,
+                )
+            }
+        },
+        Commands::Deliveries(cmd) => match &cmd.action {
+            DeliveriesAction::Replay {
+                workspace,
+                mode,
+                from_time,
+                to_time,
+                event_type,
+                subscriber,
+                dry_run,
+                execute,
+                confirm,
+                idempotency_key,
+            } => {
+                let workspace = checked_uuid("--workspace", workspace)?;
+                if *dry_run == *execute {
+                    return Err(CliError::usage("exactly one of --dry-run or --execute is required"));
+                }
+                if !*confirm {
+                    return Err(CliError::usage("--confirm is required"));
+                }
+                checked_idempotency_key(idempotency_key)?;
+                let (subscriber_kind, subscriber_id) = subscriber
+                    .as_deref()
+                    .map(parse_subscriber)
+                    .transpose()?
+                    .unwrap_or((None, None));
+                api_data(client.post_structured::<Value, _>(&format!("/api/v1/admin/workspaces/{workspace}/flow/deliveries/replay"), &json!({"mode":mode.replace('-', "_"),"event_type":event_type,"subscriber_kind":subscriber_kind,"subscriber_id":subscriber_id,"from":from_time,"to":to_time,"dry_run":dry_run,"confirm":true,"idempotency_key":idempotency_key})).await)
+            }
         },
     }
 }
@@ -737,6 +949,32 @@ fn checked_idempotency_key(value: &str) -> Result<(), CliError> {
             "--idempotency-key must contain between 1 and 128 bytes",
         ))
     }
+}
+
+fn checked_admin_mode(dry_run: bool, execute: bool, confirm: Option<&str>, target: &str) -> Result<bool, CliError> {
+    if dry_run == execute {
+        return Err(CliError::usage("exactly one of --dry-run or --execute is required"));
+    }
+    if execute {
+        let confirmed = confirm.ok_or_else(|| CliError::usage("--execute requires --confirm ID"))?;
+        let confirmed = checked_uuid("--confirm", confirmed)?;
+        if confirmed != target {
+            return Err(CliError::usage("--confirm must exactly match the target ID"));
+        }
+    } else if confirm.is_some() {
+        return Err(CliError::usage("--confirm is only valid with --execute"));
+    }
+    Ok(dry_run)
+}
+
+fn parse_subscriber(value: &str) -> Result<(Option<String>, Option<String>), CliError> {
+    let (kind, id) = value
+        .split_once(':')
+        .ok_or_else(|| CliError::usage("--subscriber must use KIND:ID"))?;
+    if kind.is_empty() {
+        return Err(CliError::usage("--subscriber kind must not be empty"));
+    }
+    Ok((Some(kind.to_string()), Some(checked_uuid("--subscriber ID", id)?)))
 }
 
 fn flow_command(command_type: &str, payload: &Value, idempotency_key: &str) -> Value {

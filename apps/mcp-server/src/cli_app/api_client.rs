@@ -167,6 +167,44 @@ impl OpenPrClient {
         self.send_structured(self.client.post(&url).json(body), path).await
     }
 
+    pub async fn post_package_file_structured<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        package_path: &std::path::Path,
+        idempotency_key: &str,
+    ) -> Result<T, StructuredApiError> {
+        let file = tokio::fs::File::open(package_path).await.map_err(|error| {
+            StructuredApiError::transport(format!("Failed to open {}: {error}", package_path.display()))
+        })?;
+        let length = file
+            .metadata()
+            .await
+            .map_err(|error| {
+                StructuredApiError::transport(format!("Failed to stat {}: {error}", package_path.display()))
+            })?
+            .len();
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+        let file_name = package_path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("flow-package.zip");
+        let part = reqwest::multipart::Part::stream_with_length(body, length)
+            .file_name(file_name.to_string())
+            .mime_str("application/vnd.sylvode.flow-package+zip;version=1")
+            .map_err(|error| StructuredApiError::transport(format!("Failed to build package upload: {error}")))?;
+        let form = reqwest::multipart::Form::new().part("package", part);
+        let url = format!("{}{path}", self.base_url);
+        self.send_structured(
+            self.client
+                .post(&url)
+                .header("Idempotency-Key", idempotency_key)
+                .multipart(form),
+            path,
+        )
+        .await
+    }
+
     pub async fn put_structured<T: DeserializeOwned, B: Serialize + Sync>(
         &self,
         path: &str,

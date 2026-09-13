@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 
-## Tools (128)
+## Tools (139)
 
 ### Projects: projects.list, projects.get, projects.create, projects.update, projects.delete
 ### Project Types: project_types.list, project_types.get
@@ -27,7 +27,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
 ### Other: members.list, search.all, bot_operation_logs.list
-### Flow (v0.7): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, objects.reference, objects.unreference, objects.convert_preview, objects.convert_commit, objects.convert_status, objects.convert_retry, collab.projection_lag, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
+### Flow (v0.8): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, objects.reference, objects.unreference, objects.convert_preview, objects.convert_commit, objects.convert_status, objects.convert_retry, objects.export, objects.export_workspace, objects.import_artifact, objects.import_preview, objects.import_commit, objects.import_status, objects.integrity, collab.projection_lag, collab.status, collab.compact, collab.rebuild_projection, deliveries.replay, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -154,6 +154,8 @@ enum PolicyScope {
     /// decision is, consistently with every other admin-gated surface in this codebase, made
     /// once by the REST endpoint the call actually reaches.
     WorkspaceWideAdmin,
+    /// A read-only integrity probe whose schema selects exactly one workspace or Flow object.
+    WorkspaceOrFlowObject,
 }
 
 /// The API read that maps a resource id to its owning project.
@@ -433,6 +435,20 @@ const TOOL_POLICY_SCOPES: &[(&str, PolicyScope)] = &[
     (
         "objects.convert_retry",
         PolicyScope::OwnedBy(OwnerLookup::FlowConversion),
+    ),
+    ("objects.export", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("objects.export_workspace", PolicyScope::WorkspaceWideAdmin),
+    ("objects.import_artifact", PolicyScope::WorkspaceWideAdmin),
+    ("objects.import_preview", PolicyScope::WorkspaceWideAdmin),
+    ("objects.import_commit", PolicyScope::WorkspaceWideAdmin),
+    ("objects.import_status", PolicyScope::WorkspaceWideAdmin),
+    ("collab.status", PolicyScope::WorkspaceWideAdmin),
+    ("objects.integrity", PolicyScope::WorkspaceOrFlowObject),
+    ("collab.compact", PolicyScope::OwnedBy(OwnerLookup::FlowObject)),
+    ("deliveries.replay", PolicyScope::WorkspaceWideAdmin),
+    (
+        "collab.rebuild_projection",
+        PolicyScope::OwnedBy(OwnerLookup::FlowObject),
     ),
     (
         "collab.projection_lag",
@@ -888,6 +904,17 @@ impl McpServer {
             "objects.convert_commit" => tools::objects::convert_commit(&self.client, args).await,
             "objects.convert_status" => tools::objects::convert_status(&self.client, args).await,
             "objects.convert_retry" => tools::objects::convert_retry(&self.client, args).await,
+            "objects.export" => tools::objects::export_flow_object(&self.client, args).await,
+            "objects.export_workspace" => tools::objects::export_flow_workspace(&self.client, args).await,
+            "objects.import_artifact" => tools::objects::import_flow_artifact(&self.client, args).await,
+            "objects.import_preview" => tools::objects::import_flow_preview(&self.client, args).await,
+            "objects.import_commit" => tools::objects::import_flow_commit(&self.client, args).await,
+            "objects.import_status" => tools::objects::import_flow_status(&self.client, args).await,
+            "collab.status" => tools::objects::flow_collab_status(&self.client, args).await,
+            "objects.integrity" => tools::objects::flow_integrity(&self.client, args).await,
+            "collab.compact" => tools::objects::compact_flow_document(&self.client, args).await,
+            "deliveries.replay" => tools::objects::replay_flow_deliveries(&self.client, args).await,
+            "collab.rebuild_projection" => tools::objects::rebuild_flow_projection(&self.client, args).await,
             "legacy_pages.inventory" => tools::legacy_pages::legacy_pages_inventory(&self.client, args).await,
             "legacy_pages.import_preview" => tools::legacy_pages::legacy_pages_import_preview(&self.client, args).await,
             "legacy_pages.import_commit" => tools::legacy_pages::legacy_pages_import_commit(&self.client, args).await,
@@ -915,6 +942,22 @@ impl McpServer {
                 // the safe reading of a disagreement is "not authorized".
                 self.reject_ownership_bearing_arguments(tool_name, args)?;
                 Ok(None)
+            }
+            PolicyScope::WorkspaceOrFlowObject => {
+                match (uuid_argument(args, "workspace_id")?, uuid_argument(args, "object_id")?) {
+                    (Some(_), None) => Ok(None),
+                    (None, Some(_)) => {
+                        let owner = self.resolve_flow_object_owner(tool_name, args).await?;
+                        match &owner {
+                            Some(project_id) => self.reject_foreign_project_claims(tool_name, args, project_id)?,
+                            None => self.reject_any_project_claim(tool_name, args)?,
+                        }
+                        Ok(owner)
+                    }
+                    _ => Err(format!(
+                        "Tool '{tool_name}' requires exactly one of workspace_id or object_id"
+                    )),
+                }
             }
             PolicyScope::DeclaredProject { required } => match declared_project_id(args)? {
                 Some(project_id) => Ok(Some(project_id)),
@@ -2419,6 +2462,57 @@ mod tests {
         summarize_tool_result(result).unwrap_or_default()
     }
 
+    #[tokio::test]
+    async fn every_v08_registered_tool_has_a_real_dispatch_arm() -> TestResult {
+        let server = server("http://127.0.0.1:1".to_string())?;
+        let id = "11111111-1111-4111-8111-111111111111";
+        let calls = [
+            (
+                "objects.export",
+                json!({"object_id":id,"format":"package","idempotency_key":"k"}),
+            ),
+            (
+                "objects.export_workspace",
+                json!({"workspace_id":id,"idempotency_key":"k"}),
+            ),
+            (
+                "objects.import_artifact",
+                json!({"workspace_id":id,"package_base64":"eA==","idempotency_key":"k"}),
+            ),
+            (
+                "objects.import_preview",
+                json!({"workspace_id":id,"artifact_id":id,"external_reference_policy":"drop","conflict_policy":"new_ids","idempotency_key":"k"}),
+            ),
+            (
+                "objects.import_commit",
+                json!({"workspace_id":id,"import_id":id,"package_sha256":"h","mapping_hash":"m","conflict_policy":"new_ids","confirm":true,"idempotency_key":"k"}),
+            ),
+            ("objects.import_status", json!({"workspace_id":id,"import_id":id})),
+            ("collab.status", json!({"workspace_id":id})),
+            ("objects.integrity", json!({"workspace_id":id,"deep":false})),
+            (
+                "collab.compact",
+                json!({"object_id":id,"document_id":id,"dry_run":true,"expected_head_seq":0,"idempotency_key":"k"}),
+            ),
+            (
+                "deliveries.replay",
+                json!({"workspace_id":id,"mode":"rebuild","from":"2026-01-01T00:00:00Z","to":"2026-01-02T00:00:00Z","dry_run":true,"confirm":true,"idempotency_key":"k"}),
+            ),
+            (
+                "collab.rebuild_projection",
+                json!({"object_id":id,"dry_run":true,"expected_head_seq":0,"idempotency_key":"k"}),
+            ),
+        ];
+        for (name, args) in calls {
+            let result = server.execute_tool(name, args).await;
+            assert!(
+                !message(&result).contains("Unknown tool"),
+                "{name} is registered but undispatchable"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn tools_list_project_id_accepts_top_level_and_context_params() -> TestResult {
         assert_eq!(
@@ -2610,12 +2704,19 @@ mod tests {
     /// "workspace wide and admin only" — both address a workspace, never a project or a
     /// project-owned resource — so unlike every other branch of the derivation below this
     /// one is necessarily a name list, exactly like the `destructive` list further down.
-    const WORKSPACE_ADMIN_TOOLS: [&str; 5] = [
+    const WORKSPACE_ADMIN_TOOLS: [&str; 12] = [
         "flow.feature_set",
         "legacy_pages.inventory",
         "legacy_pages.import_preview",
         "legacy_pages.import_commit",
         "legacy_pages.import_status",
+        "objects.export_workspace",
+        "objects.import_artifact",
+        "objects.import_preview",
+        "objects.import_commit",
+        "objects.import_status",
+        "collab.status",
+        "deliveries.replay",
     ];
 
     /// The coverage gate. It re-derives the scope of every tool from the *live* registry
@@ -2639,7 +2740,11 @@ mod tests {
                 .cloned()
                 .unwrap_or_default();
 
-            let expected = if properties.contains_key("project_id") {
+            let expected = if tool.name == "objects.integrity" {
+                PolicyScope::WorkspaceOrFlowObject
+            } else if WORKSPACE_ADMIN_TOOLS.contains(&tool.name.as_str()) {
+                PolicyScope::WorkspaceWideAdmin
+            } else if properties.contains_key("project_id") {
                 // The required bit is the schema's actual contract. A required project id must
                 // always enter project policy; an optional one may resolve to no project and then
                 // use the tool's documented workspace/projectless semantics. There is no separate
@@ -2657,8 +2762,6 @@ mod tests {
                 .find(|(argument, _)| properties.contains_key(*argument))
             {
                 PolicyScope::OwnedBy(*lookup)
-            } else if WORKSPACE_ADMIN_TOOLS.contains(&tool.name.as_str()) {
-                PolicyScope::WorkspaceWideAdmin
             } else {
                 PolicyScope::WorkspaceWide
             };

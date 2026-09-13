@@ -46,6 +46,8 @@ pub enum Commands {
     Records(RecordsCmd),
     /// Flow collaboration diagnostics
     Collab(CollabCmd),
+    /// Flow delivery maintenance
+    Deliveries(DeliveriesCmd),
 }
 
 // ---- features flow get|set ----
@@ -98,6 +100,18 @@ pub struct ObjectsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ObjectsAction {
+    /// Create an object export job
+    Export {
+        id: String,
+        #[arg(long = "render", value_parser = ["json", "markdown", "csv", "package"])]
+        render: String,
+        #[arg(long = "at-seq")]
+        at_seq: Option<i64>,
+        #[arg(long)]
+        wait: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
     /// Create a page, navigator, or Collection Flow object
     Create {
         #[arg(long)]
@@ -398,11 +412,18 @@ pub struct CollabCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum CollabAction {
+    /// Read workspace health, lag, and integrity summaries
+    Status {
+        #[arg(long)]
+        workspace: String,
+    },
     /// Document metadata (engine/seq/frontier/byte size) for one Flow object; never raw bytes
     Inspect { id: String },
     /// Shallow (v0.4: `deep=false`) collaboration integrity check for one Flow object
     Verify {
         id: String,
+        #[arg(long)]
+        deep: bool,
         #[arg(long = "expected-head")]
         expected_head: Option<i64>,
     },
@@ -416,6 +437,118 @@ pub enum CollabAction {
         cursor: Option<String>,
         #[arg(long)]
         limit: Option<u64>,
+    },
+    /// Dry-run or execute compaction of one exact document
+    Compact {
+        id: String,
+        #[arg(long, conflicts_with = "execute")]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        execute: bool,
+        #[arg(long = "expected-head")]
+        expected_head: i64,
+        #[arg(long)]
+        confirm: Option<String>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Dry-run or execute projection rebuild for one exact object
+    RebuildProjection {
+        id: String,
+        #[arg(long, conflicts_with = "execute")]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        execute: bool,
+        #[arg(long = "expected-head")]
+        expected_head: i64,
+        #[arg(long)]
+        confirm: Option<String>,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Export one object as a history-bearing package
+    Export {
+        id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Export a complete workspace package
+    ExportWorkspace {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long = "include-history")]
+        include_history: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Stream a package to artifact staging and create an import preview
+    ImportPreview {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long = "package")]
+        package_file: PathBuf,
+        #[arg(long = "mapping")]
+        mapping_file: PathBuf,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Commit a frozen package import
+    ImportCommit {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long = "import")]
+        import_id: String,
+        #[arg(long = "package-hash")]
+        package_hash: String,
+        #[arg(long = "mapping-hash")]
+        mapping_hash: String,
+        #[arg(long = "conflict-policy", value_parser = ["new-ids", "reuse-import-lineage"])]
+        conflict_policy: String,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Read an import report
+    ImportStatus {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long = "import")]
+        import_id: String,
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct DeliveriesCmd {
+    #[command(subcommand)]
+    pub action: DeliveriesAction,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeliveriesAction {
+    Replay {
+        #[arg(long)]
+        workspace: String,
+        #[arg(long, value_parser = ["rebuild", "requeue-failed"])]
+        mode: String,
+        #[arg(long = "from")]
+        from_time: String,
+        #[arg(long = "to")]
+        to_time: String,
+        #[arg(long = "event-type")]
+        event_type: Option<String>,
+        #[arg(long)]
+        subscriber: Option<String>,
+        #[arg(long, conflicts_with = "execute")]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        execute: bool,
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
     },
 }
 
@@ -449,6 +582,80 @@ mod tests {
             "markdown",
         ])
         .expect("valid arguments should parse");
+    }
+
+    #[test]
+    fn parses_v08_package_and_maintenance_commands() {
+        let id = "11111111-1111-4111-8111-111111111111";
+        for args in [
+            vec![
+                "sylvode",
+                "objects",
+                "export",
+                id,
+                "--render",
+                "package",
+                "--idempotency-key",
+                "k",
+            ],
+            vec!["sylvode", "collab", "status", "--workspace", id],
+            vec![
+                "sylvode",
+                "collab",
+                "compact",
+                id,
+                "--dry-run",
+                "--expected-head",
+                "7",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "sylvode",
+                "collab",
+                "rebuild-projection",
+                id,
+                "--execute",
+                "--expected-head",
+                "7",
+                "--confirm",
+                id,
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "sylvode",
+                "collab",
+                "import-preview",
+                "--workspace",
+                id,
+                "--package",
+                "package.zip",
+                "--mapping",
+                "mapping.json",
+                "--idempotency-key",
+                "k",
+            ],
+            vec![
+                "sylvode",
+                "deliveries",
+                "replay",
+                "--workspace",
+                id,
+                "--mode",
+                "rebuild",
+                "--from",
+                "2026-01-01T00:00:00Z",
+                "--to",
+                "2026-01-02T00:00:00Z",
+                "--dry-run",
+                "--confirm",
+                "--idempotency-key",
+                "k",
+            ],
+        ] {
+            Cli::try_parse_from(args).expect("v0.8 command must parse");
+        }
     }
 
     #[test]

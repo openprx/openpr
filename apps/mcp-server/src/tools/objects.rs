@@ -108,6 +108,29 @@ async fn post_structured(client: &OpenPrClient, path: &str, body: &Value) -> Res
     send_structured(client, client.client.post(&url).json(body), path).await
 }
 
+async fn post_package_bytes_structured(
+    client: &OpenPrClient,
+    path: &str,
+    bytes: Vec<u8>,
+    idempotency_key: &str,
+) -> Result<Value, StructuredApiError> {
+    let url = format!("{}{path}", client.base_url);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name("mcp-flow-package.zip")
+        .mime_str("application/vnd.sylvode.flow-package+zip;version=1")
+        .map_err(|error| StructuredApiError::transport(format!("Failed to build package upload: {error}")))?;
+    send_structured(
+        client,
+        client
+            .client
+            .post(&url)
+            .header("Idempotency-Key", idempotency_key)
+            .multipart(reqwest::multipart::Form::new().part("package", part)),
+        path,
+    )
+    .await
+}
+
 async fn put_structured(client: &OpenPrClient, path: &str, body: &Value) -> Result<Value, StructuredApiError> {
     let url = format!("{}{path}", client.base_url);
     send_structured(client, client.client.put(&url).json(body), path).await
@@ -240,6 +263,191 @@ pub fn convert_retry_tool() -> ToolDefinition {
             "idempotency_key":{"type":"string","minLength":1,"maxLength":128}},
             "required":["job_id","confirm","idempotency_key"],"additionalProperties":false}),
     }
+}
+
+fn v08_tool(name: &str, description: &str, properties: &Value, required: &[&str]) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: description.to_string(),
+        input_schema: json!({"type":"object","properties":properties,"required":required,"additionalProperties":false}),
+    }
+}
+
+pub fn export_flow_object_tool() -> ToolDefinition {
+    v08_tool(
+        "objects.export",
+        "Create an authorized Flow object export job.",
+        &json!({
+            "object_id":{"type":"string"},"format":{"type":"string","enum":["json","markdown","csv","package"]},
+            "at_seq":{"type":"integer"},"include_history":{"type":"boolean","default":false},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &["object_id", "format", "idempotency_key"],
+    )
+}
+pub fn export_flow_workspace_tool() -> ToolDefinition {
+    v08_tool(
+        "objects.export_workspace",
+        "Create an all-or-nothing workspace package export.",
+        &json!({
+            "workspace_id":{"type":"string"},"include_history":{"type":"boolean","default":false},
+            "project_id":{"type":"string"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &["workspace_id", "idempotency_key"],
+    )
+}
+pub fn import_flow_artifact_tool() -> ToolDefinition {
+    let mut tool = v08_tool(
+        "objects.import_artifact",
+        "Stage one bounded package artifact; caller URLs and filesystem paths are forbidden.",
+        &json!({
+            "workspace_id":{"type":"string"},
+            "staged_object":{"type":"object","properties":{"object_key":{"type":"string"},"package_sha256":{"type":"string"},"size":{"type":"integer","minimum":0}},"required":["object_key","package_sha256","size"],"additionalProperties":false},
+            "package_base64":{"type":"string"},"package_sha256":{"type":"string"},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &["workspace_id", "idempotency_key"],
+    );
+    if let Some(schema) = tool.input_schema.as_object_mut() {
+        schema.insert(
+            "oneOf".to_string(),
+            json!([
+                {"required":["package_base64"],"not":{"required":["staged_object"]}},
+                {"required":["staged_object"],"not":{"required":["package_base64"]}}
+            ]),
+        );
+    }
+    tool
+}
+pub fn import_flow_preview_tool() -> ToolDefinition {
+    v08_tool(
+        "objects.import_preview",
+        "Preview a frozen package import without canonical writes.",
+        &json!({
+            "workspace_id":{"type":"string"},"artifact_id":{"type":"string"},"project_mapping":{"type":"object"},
+            "external_reference_policy":{"type":"string","enum":["drop","keep_unresolved"]},
+            "conflict_policy":{"type":"string","enum":["new_ids","reuse_import_lineage"]},
+            "include_history":{"type":"boolean","default":false},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &[
+            "workspace_id",
+            "artifact_id",
+            "external_reference_policy",
+            "conflict_policy",
+            "idempotency_key",
+        ],
+    )
+}
+pub fn import_flow_commit_tool() -> ToolDefinition {
+    v08_tool(
+        "objects.import_commit",
+        "Atomically commit a frozen package import.",
+        &json!({
+            "workspace_id":{"type":"string"},"import_id":{"type":"string"},"package_sha256":{"type":"string"},
+            "mapping_hash":{"type":"string"},"conflict_policy":{"type":"string","enum":["new_ids","reuse_import_lineage"]},
+            "confirm":{"const":true},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &[
+            "workspace_id",
+            "import_id",
+            "package_sha256",
+            "mapping_hash",
+            "conflict_policy",
+            "confirm",
+            "idempotency_key",
+        ],
+    )
+}
+pub fn import_flow_status_tool() -> ToolDefinition {
+    v08_tool(
+        "objects.import_status",
+        "Read a redacted import report.",
+        &json!({
+            "workspace_id":{"type":"string"},"import_id":{"type":"string"}
+        }),
+        &["workspace_id", "import_id"],
+    )
+}
+pub fn flow_collab_status_tool() -> ToolDefinition {
+    v08_tool(
+        "collab.status",
+        "Read workspace Flow health and lag without content bytes.",
+        &json!({
+            "workspace_id":{"type":"string"}
+        }),
+        &["workspace_id"],
+    )
+}
+pub fn flow_integrity_tool() -> ToolDefinition {
+    let mut tool = v08_tool(
+        "objects.integrity",
+        "Read workspace integrity or shallow-verify one object.",
+        &json!({
+            "workspace_id":{"type":"string"},"object_id":{"type":"string"},"deep":{"const":false},
+            "cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100}
+        }),
+        &[],
+    );
+    if let Some(schema) = tool.input_schema.as_object_mut() {
+        schema.insert(
+            "oneOf".to_string(),
+            json!([
+                {"required":["workspace_id"],"not":{"required":["object_id"]}},
+                {"required":["object_id"],"not":{"required":["workspace_id"]}}
+            ]),
+        );
+    }
+    tool
+}
+pub fn compact_flow_document_tool() -> ToolDefinition {
+    v08_tool(
+        "collab.compact",
+        "Dry-run or execute exact-scope document compaction.",
+        &json!({
+            "object_id":{"type":"string"},"document_id":{"type":"string"},"dry_run":{"type":"boolean"},
+            "expected_head_seq":{"type":"integer"},"retain_after_seq":{"type":"integer"},"confirm_document_id":{"type":"string"},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &[
+            "object_id",
+            "document_id",
+            "dry_run",
+            "expected_head_seq",
+            "idempotency_key",
+        ],
+    )
+}
+pub fn replay_flow_deliveries_tool() -> ToolDefinition {
+    v08_tool(
+        "deliveries.replay",
+        "Replay or requeue deliveries in one explicit retained window.",
+        &json!({
+            "workspace_id":{"type":"string"},"mode":{"type":"string","enum":["rebuild","requeue_failed"]},
+            "event_type":{"type":"string"},"subscriber_kind":{"type":"string"},"subscriber_id":{"type":"string"},
+            "from":{"type":"string"},"to":{"type":"string"},"dry_run":{"type":"boolean"},"confirm":{"const":true},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &[
+            "workspace_id",
+            "mode",
+            "from",
+            "to",
+            "dry_run",
+            "confirm",
+            "idempotency_key",
+        ],
+    )
+}
+pub fn rebuild_flow_projection_tool() -> ToolDefinition {
+    v08_tool(
+        "collab.rebuild_projection",
+        "Dry-run or execute an exact-object projection rebuild.",
+        &json!({
+            "object_id":{"type":"string"},"dry_run":{"type":"boolean"},"expected_head_seq":{"type":"integer"},
+            "confirm_object_id":{"type":"string"},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &["object_id", "dry_run", "expected_head_seq", "idempotency_key"],
+    )
 }
 
 #[derive(Deserialize)]
@@ -401,6 +609,319 @@ pub async fn convert_retry(client: &OpenPrClient, args: Value) -> CallToolResult
             client,
             &path,
             &json!({"confirm":true,"idempotency_key":input.idempotency_key}),
+        )
+        .await,
+    )
+}
+
+fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str, CallToolResult> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CallToolResult::error(format!("{key} must be a non-empty string")))
+}
+
+fn without_fields(args: &Value, fields: &[&str]) -> Value {
+    let mut body = args.clone();
+    if let Some(object) = body.as_object_mut() {
+        for field in fields {
+            object.remove(*field);
+        }
+    }
+    body
+}
+
+pub async fn export_flow_object(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let object_id = match required_string(&args, "object_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let body = without_fields(&args, &["object_id"]);
+    respond_data(
+        post_structured(
+            client,
+            &format!("/api/v1/flow/objects/{}/exports", encode_query_component(object_id)),
+            &body,
+        )
+        .await,
+    )
+}
+
+pub async fn export_flow_workspace(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let mut body = without_fields(&args, &["workspace_id"]);
+    body.as_object_mut()
+        .map(|object| object.insert("format".to_string(), json!("package")));
+    respond_data(
+        post_structured(
+            client,
+            &format!(
+                "/api/v1/workspaces/{}/flow/exports",
+                encode_query_component(workspace_id)
+            ),
+            &body,
+        )
+        .await,
+    )
+}
+
+pub async fn import_flow_artifact(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let inline = args.get("package_base64").and_then(Value::as_str);
+    let staged_source = args.get("staged_object").filter(|value| !value.is_null());
+    if inline.is_some() == staged_source.is_some() {
+        return CallToolResult::error("exactly one of package_base64 or staged_object is required".to_string());
+    }
+    let path = format!(
+        "/api/v1/workspaces/{}/flow/import-artifacts",
+        encode_query_component(workspace_id)
+    );
+    if let Some(package_base64) = inline {
+        let idempotency_key = match required_string(&args, "idempotency_key") {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+        let mut archive_stager = api::flow::import::BoundedImportStager::new(Vec::new(), std::io::sink());
+        if let Err(error) = archive_stager.stage_inline_base64_archive(std::io::Cursor::new(package_base64.as_bytes()))
+        {
+            return CallToolResult::error(format!("invalid bounded package_base64: {error}"));
+        }
+        if let Err(error) = archive_stager.finish_archive() {
+            return CallToolResult::error(format!("invalid bounded package_base64: {error}"));
+        }
+        let (bytes, _) = match archive_stager.into_stages() {
+            Ok(value) => value,
+            Err(error) => return CallToolResult::error(format!("invalid bounded package_base64: {error}")),
+        };
+        let result = post_package_bytes_structured(client, &path, bytes, idempotency_key).await;
+        return respond_data(result.and_then(|envelope| {
+            if let Some(expected) = args.get("package_sha256").and_then(Value::as_str)
+                && envelope.pointer("/data/package_sha256").and_then(Value::as_str) != Some(expected)
+            {
+                return Err(StructuredApiError::transport(
+                    "uploaded package hash does not match package_sha256".to_string(),
+                ));
+            }
+            Ok(envelope)
+        }));
+    }
+    let source = {
+        let mut value = staged_source.cloned().unwrap_or(Value::Null);
+        value
+            .as_object_mut()
+            .map(|object| object.insert("kind".to_string(), json!("staged_object")));
+        value
+    };
+    let body = json!({"source":source,"idempotency_key":args.get("idempotency_key")});
+    respond_data(post_structured(client, &path, &body).await)
+}
+
+pub async fn import_flow_preview(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let body = without_fields(&args, &["workspace_id"]);
+    respond_data(
+        post_structured(
+            client,
+            &format!(
+                "/api/v1/workspaces/{}/flow/imports/preview",
+                encode_query_component(workspace_id)
+            ),
+            &body,
+        )
+        .await,
+    )
+}
+
+pub async fn import_flow_commit(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let import_id = match required_string(&args, "import_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let body = without_fields(&args, &["workspace_id", "import_id"]);
+    respond_data(
+        post_structured(
+            client,
+            &format!(
+                "/api/v1/workspaces/{}/flow/imports/{}/commit",
+                encode_query_component(workspace_id),
+                encode_query_component(import_id)
+            ),
+            &body,
+        )
+        .await,
+    )
+}
+
+pub async fn import_flow_status(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let import_id = match required_string(&args, "import_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    respond_data(
+        get_structured(
+            client,
+            &format!(
+                "/api/v1/workspaces/{}/flow/imports/{}",
+                encode_query_component(workspace_id),
+                encode_query_component(import_id)
+            ),
+        )
+        .await,
+    )
+}
+
+pub async fn flow_collab_status(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let health = get_structured(
+        client,
+        &format!(
+            "/api/v1/admin/workspaces/{}/flow/health",
+            encode_query_component(workspace_id)
+        ),
+    )
+    .await;
+    let lag = get_structured(
+        client,
+        &format!(
+            "/api/v1/admin/workspaces/{}/flow/lag",
+            encode_query_component(workspace_id)
+        ),
+    )
+    .await;
+    respond_data(match (health, lag) {
+        (Ok(health), Ok(lag)) => Ok(
+            json!({"data":{"health":health.get("data").cloned().unwrap_or(Value::Null),"lag":lag.get("data").cloned().unwrap_or(Value::Null)}}),
+        ),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    })
+}
+
+pub async fn flow_integrity(client: &OpenPrClient, args: Value) -> CallToolResult {
+    match (
+        args.get("workspace_id").and_then(Value::as_str),
+        args.get("object_id").and_then(Value::as_str),
+    ) {
+        (Some(workspace_id), None) => {
+            let mut query = vec!["scope=summary".to_string()];
+            if let Some(cursor) = args.get("cursor").and_then(Value::as_str) {
+                query.push(format!("cursor={}", encode_query_component(cursor)));
+            }
+            if let Some(limit) = args.get("limit").and_then(Value::as_u64) {
+                query.push(format!("limit={limit}"));
+            }
+            respond_data(
+                get_structured(
+                    client,
+                    &format!(
+                        "/api/v1/admin/workspaces/{}/flow/integrity?{}",
+                        encode_query_component(workspace_id),
+                        query.join("&")
+                    ),
+                )
+                .await,
+            )
+        }
+        (None, Some(object_id)) => respond_data(
+            post_structured(
+                client,
+                &format!(
+                    "/api/v1/flow/objects/{}/collab/verify",
+                    encode_query_component(object_id)
+                ),
+                &json!({"deep":false,"idempotency_key":uuid::Uuid::new_v4().to_string()}),
+            )
+            .await,
+        ),
+        _ => CallToolResult::error("exactly one of workspace_id or object_id is required".to_string()),
+    }
+}
+
+pub async fn compact_flow_document(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let object_id = match required_string(&args, "object_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let document_id = match required_string(&args, "document_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let scope = get_structured(
+        client,
+        &format!("/api/v1/flow/objects/{}/collab", encode_query_component(object_id)),
+    )
+    .await;
+    match scope {
+        Ok(envelope) if envelope.pointer("/data/document_id").and_then(Value::as_str) == Some(document_id) => {}
+        Ok(_) => return CallToolResult::error("object_id does not own document_id".to_string()),
+        Err(error) => return respond(Err(error)),
+    }
+    let body = without_fields(&args, &["object_id", "document_id"]);
+    respond_data(
+        post_structured(
+            client,
+            &format!(
+                "/api/v1/admin/flow/documents/{}/compact",
+                encode_query_component(document_id)
+            ),
+            &body,
+        )
+        .await,
+    )
+}
+
+pub async fn replay_flow_deliveries(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let workspace_id = match required_string(&args, "workspace_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let body = without_fields(&args, &["workspace_id"]);
+    respond_data(
+        post_structured(
+            client,
+            &format!(
+                "/api/v1/admin/workspaces/{}/flow/deliveries/replay",
+                encode_query_component(workspace_id)
+            ),
+            &body,
+        )
+        .await,
+    )
+}
+
+pub async fn rebuild_flow_projection(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let object_id = match required_string(&args, "object_id") {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let body = without_fields(&args, &["object_id"]);
+    respond_data(
+        post_structured(
+            client,
+            &format!(
+                "/api/v1/admin/flow/objects/{}/rebuild-projection",
+                encode_query_component(object_id)
+            ),
+            &body,
         )
         .await,
     )

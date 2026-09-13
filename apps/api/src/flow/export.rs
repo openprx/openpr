@@ -55,6 +55,8 @@ pub struct ExportPrincipal {
 #[derive(Debug, Clone)]
 pub struct CreateExportRequest {
     pub scope: ExportScope,
+    pub format: String,
+    pub at_seq: Option<i64>,
     pub include_history: bool,
     pub idempotency_key: String,
     pub source_head: String,
@@ -95,6 +97,9 @@ struct ExportObjectRow {
     head_seq: i64,
     projection_seq: i64,
     projection_frontier: Vec<u8>,
+    title: String,
+    projection_state: Value,
+    plain_text: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     archived_at: Option<DateTime<Utc>>,
@@ -149,6 +154,7 @@ struct ExistingJob {
     id: Uuid,
     workspace_id: Uuid,
     object_id: Option<Uuid>,
+    format: String,
     request_hash: String,
     status: String,
     package_sha256: Option<String>,
@@ -161,6 +167,7 @@ struct ExportAccessRow {
     id: Uuid,
     workspace_id: Uuid,
     object_id: Option<Uuid>,
+    format: String,
     actor_kind: String,
     actor_id: Uuid,
     status: String,
@@ -211,7 +218,13 @@ pub async fn create_package_export(
     let mut members = Vec::new();
     let mut through_seq_by_document = BTreeMap::new();
     let mut update_count = 0u64;
+    let mut rendered_object = None;
     for object in &objects {
+        if request.at_seq.is_some_and(|at_seq| at_seq != object.head_seq) {
+            return Err(ApiError::Conflict(
+                "at_seq is not the current accepted head".to_string(),
+            ));
+        }
         let updates = load_updates(&tx, object).await?;
         let (full_snapshot, semantic_hash) = reconstruct_and_verify(object, &updates)?;
         let exported_snapshot = if request.include_history {
@@ -239,6 +252,29 @@ pub async fn create_package_export(
             "updated_at": object.updated_at.to_rfc3339(),
             "archived_at": object.archived_at.map(|value| value.to_rfc3339()),
         });
+        if matches!(request.scope, ExportScope::Object(_)) {
+            rendered_object = Some(match request.format.as_str() {
+                "json" => canonical_json(&json!({
+                    "object_id": object.id,
+                    "object_type": object.object_type,
+                    "title": object.title,
+                    "semantic_content": object.projection_state,
+                    "seq": object.head_seq,
+                    "frontier": base64::engine::general_purpose::STANDARD.encode(&object.head_frontier),
+                }))?,
+                "markdown" => format!("# {}\n\n{}\n", object.title, object.plain_text).into_bytes(),
+                "csv" => format!(
+                    "object_id,object_type,title,plain_text\n{},{},{},{}\n",
+                    csv_cell(&object.id.to_string()),
+                    csv_cell(&object.object_type),
+                    csv_cell(&object.title),
+                    csv_cell(&object.plain_text)
+                )
+                .into_bytes(),
+                "package" => Vec::new(),
+                _ => return Err(ApiError::BadRequest("unsupported export format".to_string())),
+            });
+        }
         members.push(PackageMemberInput {
             path: format!("objects/{}/object.json", object.id),
             kind: "object".to_string(),
@@ -260,6 +296,13 @@ pub async fn create_package_export(
             }
         }
         through_seq_by_document.insert(object.document_id.to_string(), object.head_seq);
+    }
+
+    if request.format != "package" {
+        let bytes = rendered_object.ok_or(ApiError::Internal)?;
+        let checksum = sha256_hex(&bytes);
+        tx.commit().await?;
+        return persist_export(db, request, workspace_id, &request_hash, bytes, checksum).await;
     }
 
     let relations = load_relations(&tx, workspace_id, &object_ids).await?;
@@ -413,7 +456,7 @@ pub async fn download_package_export(
     db: &DatabaseConnection,
     job_id: Uuid,
     principal: &ExportPrincipal,
-) -> Result<(Vec<u8>, String), ApiError> {
+) -> Result<(Vec<u8>, String, String), ApiError> {
     let row = export_access_row(db, job_id).await?;
     authorize_export_access(db, &row, principal).await?;
     if row.expires_at.is_none_or(|expires| expires <= Utc::now()) {
@@ -423,13 +466,14 @@ pub async fn download_package_export(
         row.package_bytes
             .ok_or_else(|| ApiError::NotFound("export artifact not found".to_string()))?,
         row.package_sha256.ok_or(ApiError::Internal)?,
+        row.format,
     ))
 }
 
 async fn export_access_row(db: &DatabaseConnection, job_id: Uuid) -> Result<ExportAccessRow, ApiError> {
     ExportAccessRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT j.id,j.workspace_id,j.object_id,j.actor_kind,j.actor_id,j.status,j.package_sha256,j.size_bytes,j.expires_at,a.package_bytes \
+        "SELECT j.id,j.workspace_id,j.object_id,j.format,j.actor_kind,j.actor_id,j.status,j.package_sha256,j.size_bytes,j.expires_at,a.package_bytes \
          FROM flow_export_jobs j LEFT JOIN flow_package_artifacts a ON a.id=j.artifact_id WHERE j.id=$1",
         vec![job_id.into()],
     ))
@@ -466,10 +510,10 @@ fn access_receipt(row: &ExportAccessRow) -> Result<ExportJobReceipt, ApiError> {
     Ok(ExportJobReceipt {
         job_id: row.id,
         status: row.status.clone(),
-        format: "package".to_string(),
+        format: row.format.clone(),
         workspace_id: row.workspace_id,
         object_id: row.object_id,
-        package_schema: "v1".to_string(),
+        package_schema: if row.format == "package" { "v1" } else { "" }.to_string(),
         checksum: row.package_sha256.clone().ok_or(ApiError::Internal)?,
         size: u64::try_from(row.size_bytes.ok_or(ApiError::Internal)?).map_err(|_| ApiError::Internal)?,
         expires_at: row.expires_at.ok_or(ApiError::Internal)?.to_rfc3339(),
@@ -482,6 +526,21 @@ fn validate_request(request: &CreateExportRequest) -> Result<(), ApiError> {
     }
     if !matches!(request.principal.kind.as_str(), "user" | "bot") {
         return Err(ApiError::unauthenticated("unsupported principal kind"));
+    }
+    if !matches!(request.format.as_str(), "json" | "markdown" | "csv" | "package") {
+        return Err(ApiError::BadRequest(
+            "format must be json, markdown, csv, or package".to_string(),
+        ));
+    }
+    if matches!(request.scope, ExportScope::Workspace { .. }) && request.format != "package" {
+        return Err(ApiError::BadRequest(
+            "workspace export format must be package".to_string(),
+        ));
+    }
+    if request.format != "package" && request.include_history {
+        return Err(ApiError::BadRequest(
+            "include_history is only valid for package exports".to_string(),
+        ));
     }
     Ok(())
 }
@@ -543,6 +602,7 @@ async fn load_scope<C: ConnectionTrait>(conn: &C, scope: ExportScope) -> Result<
         fo.governance_metadata,cd.id AS document_id,cd.engine,cd.format_version,cd.snapshot, \
         cd.snapshot_checksum,cd.snapshot_frontier,cd.snapshot_seq,cd.head_frontier,cd.head_seq, \
         fp.document_seq AS projection_seq,fp.document_frontier AS projection_frontier, \
+        fp.title,fp.state AS projection_state,fp.plain_text, \
         fo.created_at,fo.updated_at,fo.archived_at \
         FROM flow_objects fo JOIN collab_documents cd ON cd.object_id=fo.id \
         JOIN flow_object_projections fp ON fp.object_id=fo.id";
@@ -733,7 +793,8 @@ fn request_hash(request: &CreateExportRequest) -> Result<String, ApiError> {
     };
     Ok(sha256_hex(&canonical_json(&json!({
         "scope": scope,
-        "format": "package",
+        "format": request.format,
+        "at_seq": request.at_seq,
         "include_history": request.include_history,
     }))?))
 }
@@ -746,7 +807,7 @@ async fn find_existing_job(
 ) -> Result<Option<ExportJobReceipt>, ApiError> {
     let row = ExistingJob::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT id,workspace_id,object_id,request_hash,status,package_sha256,size_bytes,expires_at \
+        "SELECT id,workspace_id,object_id,format,request_hash,status,package_sha256,size_bytes,expires_at \
          FROM flow_export_jobs WHERE workspace_id=$1 AND actor_kind=$2 AND actor_id=$3 AND idempotency_key=$4",
         vec![
             workspace_id.into(),
@@ -767,10 +828,10 @@ fn existing_receipt(row: ExistingJob, request_hash: &str) -> Result<ExportJobRec
     Ok(ExportJobReceipt {
         job_id: row.id,
         status: row.status,
-        format: "package".to_string(),
+        format: row.format.clone(),
         workspace_id: row.workspace_id,
         object_id: row.object_id,
-        package_schema: "v1".to_string(),
+        package_schema: if row.format == "package" { "v1" } else { "" }.to_string(),
         checksum: row.package_sha256.ok_or(ApiError::Internal)?,
         size: u64::try_from(row.size_bytes.ok_or(ApiError::Internal)?).map_err(|_| ApiError::Internal)?,
         expires_at: row.expires_at.ok_or(ApiError::Internal)?.to_rfc3339(),
@@ -819,9 +880,9 @@ async fn persist_export(
         .execute(Statement::from_sql_and_values(
             DbBackend::Postgres,
             "INSERT INTO flow_export_jobs \
-             (id,workspace_id,object_id,project_id,scope_kind,format,include_history,actor_kind,actor_id, \
+             (id,workspace_id,object_id,project_id,scope_kind,format,at_seq,include_history,actor_kind,actor_id, \
               idempotency_key,request_hash,status,artifact_id,package_sha256,size_bytes,expires_at) \
-             VALUES ($1,$2,$3,$4,$5,'package',$6,$7,$8,$9,$10,'completed',$11,$12,$13,$14) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'completed',$13,$14,$15,$16) \
              ON CONFLICT (workspace_id,actor_kind,actor_id,idempotency_key) DO NOTHING",
             vec![
                 job_id.into(),
@@ -833,6 +894,8 @@ async fn persist_export(
                     ExportScope::Workspace { .. } => "workspace",
                 }
                 .into(),
+                request.format.clone().into(),
+                request.at_seq.into(),
                 request.include_history.into(),
                 request.principal.kind.clone().into(),
                 request.principal.id.into(),
@@ -855,10 +918,10 @@ async fn persist_export(
     Ok(ExportJobReceipt {
         job_id,
         status: "completed".to_string(),
-        format: "package".to_string(),
+        format: request.format.clone(),
         workspace_id,
         object_id,
-        package_schema: "v1".to_string(),
+        package_schema: if request.format == "package" { "v1" } else { "" }.to_string(),
         checksum: package_sha256,
         size,
         expires_at: expires_at.to_rfc3339(),
@@ -869,8 +932,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::items_after_statements,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::flow::command::{
@@ -1047,6 +1121,8 @@ mod tests {
                 workspace_id,
                 project_id: None,
             },
+            format: "package".to_string(),
+            at_seq: None,
             include_history: false,
             idempotency_key: "workspace-package".to_string(),
             source_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1103,6 +1179,8 @@ mod tests {
 
         let object_request = CreateExportRequest {
             scope: ExportScope::Object(page.object_id),
+            format: "package".to_string(),
+            at_seq: None,
             include_history: true,
             idempotency_key: "object-history-package".to_string(),
             source_head: request.source_head,
@@ -1121,6 +1199,48 @@ mod tests {
                 .by_name(&format!("documents/{}/updates/1.bin", page.document_id))
                 .is_ok()
         );
+
+        for (format, expected_prefix) in [
+            ("json", b"{".as_slice()),
+            ("markdown", b"# ".as_slice()),
+            ("csv", b"object_id,".as_slice()),
+        ] {
+            let request = CreateExportRequest {
+                scope: ExportScope::Object(page.object_id),
+                format: format.to_string(),
+                at_seq: Some(page.head_seq),
+                include_history: false,
+                idempotency_key: format!("object-{format}"),
+                source_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                principal: principal(owner_id, "owner"),
+            };
+            let receipt = create_package_export(&scratch.db, &request).await.unwrap();
+            assert_eq!(receipt.format, format);
+            let (bytes, checksum, persisted_format) =
+                download_package_export(&scratch.db, receipt.job_id, &request.principal)
+                    .await
+                    .unwrap();
+            assert_eq!(persisted_format, format);
+            assert_eq!(checksum, sha256_hex(&bytes));
+            assert!(
+                bytes.starts_with(expected_prefix),
+                "{format} export has the expected wire shape"
+            );
+        }
+
+        let stale = CreateExportRequest {
+            scope: ExportScope::Object(page.object_id),
+            format: "json".to_string(),
+            at_seq: Some(page.head_seq + 1),
+            include_history: false,
+            idempotency_key: "object-stale-seq".to_string(),
+            source_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            principal: principal(owner_id, "owner"),
+        };
+        assert!(matches!(
+            create_package_export(&scratch.db, &stale).await,
+            Err(ApiError::Conflict(_))
+        ));
 
         scratch.drop_self().await;
     }
@@ -1149,6 +1269,8 @@ mod tests {
                 workspace_id,
                 project_id: None,
             },
+            format: "package".to_string(),
+            at_seq: None,
             include_history: false,
             idempotency_key: "denied-workspace".to_string(),
             source_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
@@ -1161,6 +1283,8 @@ mod tests {
 
         let guest_request = CreateExportRequest {
             scope: ExportScope::Object(page.id),
+            format: "package".to_string(),
+            at_seq: None,
             include_history: false,
             idempotency_key: "denied-object".to_string(),
             source_head: workspace_request.source_head,
