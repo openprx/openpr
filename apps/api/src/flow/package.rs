@@ -916,7 +916,13 @@ mod tests {
         );
 
         let object_path = format!("objects/{OBJECT_ID}/object.json");
-        let changed_member = rewrite_member(&built.bytes, &object_path, b"{}");
+        let mut replacement = fixture_inputs()
+            .into_iter()
+            .find(|input| input.path == object_path)
+            .expect("object fixture exists")
+            .bytes;
+        replacement[0] ^= 1;
+        let changed_member = rewrite_member(&built.bytes, &object_path, &replacement);
         assert_kind(
             verify_package(Cursor::new(changed_member), None).unwrap_err(),
             ApiErrorKind::ChecksumMismatch,
