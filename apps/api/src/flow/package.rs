@@ -950,10 +950,14 @@ mod tests {
             );
         }
 
+        let collision_object = "abababab-abab-4bab-8bab-abababababab";
         let collision = raw_zip(
             vec![
-                ("relations/relations.jsonl".to_string(), Vec::new()),
-                ("RELATIONS/RELATIONS.JSONL".to_string(), Vec::new()),
+                (format!("objects/{collision_object}/object.json"), Vec::new()),
+                (
+                    format!("objects/{}/object.json", collision_object.to_ascii_uppercase()),
+                    Vec::new(),
+                ),
             ],
             true,
         );
@@ -973,10 +977,27 @@ mod tests {
     #[test]
     fn local_header_descriptor_or_encryption_flag_cannot_hide_from_central_directory() {
         let built = build_package(fixture_manifest(), fixture_inputs()).unwrap();
+        let mut archive = ZipArchive::new(Cursor::new(&built.bytes)).unwrap();
+        let file = archive.by_index(0).unwrap();
+        let local = usize::try_from(file.header_start()).unwrap();
+        let central = usize::try_from(file.central_header_start()).unwrap();
+        drop(file);
+        drop(archive);
+
+        let mut unequal = built.bytes.clone();
+        let local_flags = u16::from_le_bytes([unequal[local + 6], unequal[local + 7]]) | (1 << 2);
+        unequal[local + 6..local + 8].copy_from_slice(&local_flags.to_le_bytes());
+        assert_kind(
+            verify_package(Cursor::new(unequal), None).unwrap_err(),
+            ApiErrorKind::UnsupportedFormat,
+        );
+
         for flag in [FLAG_DATA_DESCRIPTOR, FLAG_ENCRYPTED] {
             let mut mutant = built.bytes.clone();
-            let local_flags = u16::from_le_bytes([mutant[6], mutant[7]]) | flag;
-            mutant[6..8].copy_from_slice(&local_flags.to_le_bytes());
+            let local_flags = u16::from_le_bytes([mutant[local + 6], mutant[local + 7]]) | flag;
+            let central_flags = u16::from_le_bytes([mutant[central + 8], mutant[central + 9]]) | flag;
+            mutant[local + 6..local + 8].copy_from_slice(&local_flags.to_le_bytes());
+            mutant[central + 8..central + 10].copy_from_slice(&central_flags.to_le_bytes());
             assert_kind(
                 verify_package(Cursor::new(mutant), None).unwrap_err(),
                 ApiErrorKind::UnsupportedFormat,
@@ -997,15 +1018,16 @@ mod tests {
             ApiErrorKind::UnsupportedFormat,
         );
 
+        let collision_object = "abababab-abab-4bab-8bab-abababababab";
         let collision = vec![
             PackageMemberInput {
-                path: "relations/relations.jsonl".to_string(),
-                kind: "relation".to_string(),
+                path: format!("objects/{collision_object}/object.json"),
+                kind: "object".to_string(),
                 bytes: Vec::new(),
             },
             PackageMemberInput {
-                path: "RELATIONS/RELATIONS.JSONL".to_string(),
-                kind: "relation".to_string(),
+                path: format!("objects/{}/object.json", collision_object.to_ascii_uppercase()),
+                kind: "object".to_string(),
                 bytes: Vec::new(),
             },
         ];
