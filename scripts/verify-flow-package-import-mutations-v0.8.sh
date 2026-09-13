@@ -19,6 +19,10 @@ git -C "$REPO_ROOT" worktree add --detach "$WORKTREE" HEAD >/dev/null
 IMPORT_SOURCE="$WORKTREE/$IMPORT_REL"
 EXPORT_SOURCE="$WORKTREE/$EXPORT_REL"
 
+env -u RUST_TEST_THREADS CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$TARGET_DIR" \
+  cargo build --manifest-path "$WORKTREE/Cargo.toml" -p collab-core \
+    --bin collab-isolated-apply-worker >"$LOG_DIR/isolated-worker-build.log" 2>&1
+
 restore_sources() {
   git -C "$WORKTREE" restore "$IMPORT_REL" "$EXPORT_REL"
 }
