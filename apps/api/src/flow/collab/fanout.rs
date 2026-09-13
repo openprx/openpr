@@ -1,9 +1,9 @@
 //! Cross-instance notification adapter for v0.8.
 //!
-//! Every notice is inserted in the same transaction as its already-durable document update.
-//! `pg_notify` is only a wake-up hint; each API instance polls the durable cursor and reconstructs
-//! frames from `collab_updates`. Duplicate, lost, or reordered notifications therefore cannot
-//! allocate a seq or make a subscription skip one.
+//! Every notice is inserted only after its document update commits. `collab_updates` is the
+//! durability authority; this table and `pg_notify` are wake-up hints. Each API instance
+//! reconstructs frames from the committed update rows, so duplicate, lost, or reordered notices
+//! cannot allocate a seq or make a subscription skip one.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use platform::app::AppState;
@@ -43,10 +43,11 @@ pub(crate) struct AuthorizationRevocation {
     pub(crate) subtree_root_ids: Vec<Uuid>,
 }
 
-/// Stages a pointer to one accepted update and emits a best-effort wakeup. Both statements are in
-/// the caller's head-locked transaction; `PostgreSQL` delivers the notification only on commit.
-pub async fn stage_document_update(
-    tx: &DatabaseTransaction,
+/// Records a pointer to one already-committed update and emits a best-effort wakeup. Failure is
+/// returned for observability, but the caller must not roll back or misreport the canonical write:
+/// the protocol explicitly makes committed update sequence, not the notification layer, durable.
+pub async fn publish_document_update(
+    db: &DatabaseConnection,
     workspace_id: Uuid,
     document_id: Uuid,
     document_seq: i64,
@@ -58,10 +59,10 @@ pub async fn stage_document_update(
          VALUES ($1, $2, 'document_update', $3) RETURNING id",
         vec![workspace_id.into(), document_id.into(), document_seq.into()],
     ))
-    .one(tx)
+    .one(db)
     .await?
     .ok_or(ApiError::Internal)?;
-    tx.execute(Statement::from_sql_and_values(
+    db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT pg_notify('openpr_flow_fanout', $1)",
         vec![notice.id.to_string().into()],

@@ -8,7 +8,8 @@ CACHE_ROOT=/opt/worker/.cache/openpr-v08-fanout-mutations
 WORKTREE="$CACHE_ROOT/worktree"
 TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
-ATOMIC_TEST=flow::collab::write::database_tests::fanout_notice_failure_rolls_back_the_canonical_update_and_head
+ATOMIC_TEST=flow::collab::write::database_tests::fanout_notice_failure_after_commit_keeps_the_canonical_update_and_head
+NOTICE_TEST=flow::collab::write::database_tests::accept_update_commits_and_advances_head_seq_against_a_real_database
 CURSOR_TEST=flow::collab::fanout::tests::transient_reconstruction_failure_retains_the_durable_cursor
 
 cleanup() {
@@ -54,19 +55,25 @@ run_case() {
 }
 
 run_case atomic_green_control green "$ATOMIC_TEST"
+run_case notice_green_control green "$NOTICE_TEST"
 run_case cursor_green_control green "$CURSOR_TEST"
 
 WRITE_SOURCE="$WORKTREE/apps/api/src/flow/collab/write.rs"
-perl -0pi -e 's/^    super::fanout::stage_document_update\([^\n]+\)\.await\?;\n//m' "$WRITE_SOURCE"
-if grep -Fq 'super::fanout::stage_document_update' "$WRITE_SOURCE"; then
-  echo 'FAIL: fanout staging mutation did not apply' >&2
+perl -0pi -e 's/if let Err\(error\) = super::fanout::publish_document_update\((.*?)\)\n                \.await\n                \{.*?\n                \}/super::fanout::publish_document_update($1).await?;/s' "$WRITE_SOURCE"
+grep -Fq ').await?;' "$WRITE_SOURCE"
+run_case post_commit_fanout_failure_misreported red "$ATOMIC_TEST"
+git -C "$WORKTREE" restore apps/api/src/flow/collab/write.rs
+
+perl -0pi -e 's/if let Err\(error\) = super::fanout::publish_document_update\((.*?)\)\n                \.await\n                \{.*?\n                \}//s' "$WRITE_SOURCE"
+if grep -Fq 'publish_document_update(' "$WRITE_SOURCE"; then
+  echo 'FAIL: fanout omission mutation did not apply' >&2
   exit 1
 fi
-run_case fanout_staged_after_or_outside_canonical_transaction red "$ATOMIC_TEST"
+run_case committed_update_omits_fanout_notice red "$NOTICE_TEST"
 
 FANOUT_SOURCE="$WORKTREE/apps/api/src/flow/collab/fanout.rs"
 perl -0pi -e 's/("flow fanout reconstruction failed; retaining cursor for retry"\);\n)            break;/$1            cursor = notice.id;\n            break;/' "$FANOUT_SOURCE"
 grep -Fq 'cursor = notice.id;' "$FANOUT_SOURCE"
 run_case transient_failure_advances_cursor red "$CURSOR_TEST"
 
-printf 'PASS: 2 green controls passed and 2/2 production-source mutations were detected\n'
+printf 'PASS: 3 green controls passed and 3/3 production-source mutations were detected\n'

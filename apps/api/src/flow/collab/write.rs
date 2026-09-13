@@ -12,9 +12,9 @@
 //!   -> [layer 1] SELECT authz_epoch ... FOR SHARE, held to commit; CAS against checked_epoch
 //!   -> SELECT collab_documents ... FOR UPDATE
 //!   -> if locked head != prepared head: rollback, bounded rebase outside the lock
-//!   -> allocate seq; insert update + head + projection + business event + event_dispatch + fanout notice
+//!   -> allocate seq; insert update + head + projection + business event + event_dispatch
 //!   -> commit
-//!   -> update the warm cache to the committed head
+//!   -> publish best-effort fanout notice; update the warm cache to the committed head
 //! ```
 //!
 //! Lock-content discipline (`collab-protocol-v1.md`: "锁内严禁 snapshot/tail load、CRDT apply、
@@ -909,8 +909,6 @@ pub(crate) async fn stage_one_document(
     ))
     .await?;
 
-    super::fanout::stage_document_update(tx, request.workspace_id, request.document_id, new_head_seq).await?;
-
     Ok(StagedOutcome::Ready(StagedWrite {
         event_id,
         new_head_seq,
@@ -1345,6 +1343,17 @@ pub async fn accept_update(
         .await
         {
             LockedOutcome::Committed(accepted) => {
+                if let Err(error) = super::fanout::publish_document_update(
+                    db,
+                    request.workspace_id,
+                    request.document_id,
+                    accepted.head_seq,
+                )
+                .await
+                {
+                    tracing::warn!(%error, document_id = %request.document_id, head_seq = accepted.head_seq,
+                        "committed update fanout publication failed; canonical write remains accepted");
+                }
                 return Ok(AcceptOutcome::Accepted(finish_committed(
                     cache,
                     registry,
@@ -1371,6 +1380,17 @@ pub async fn accept_update(
                 // the committed path would, including the broadcast the lost `COMMIT` response
                 // never got to send.
                 if let Some(prior) = find_prior_update(db, request.document_id, request.update_id).await? {
+                    if let Err(error) = super::fanout::publish_document_update(
+                        db,
+                        request.workspace_id,
+                        request.document_id,
+                        prior.head_seq,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, document_id = %request.document_id, head_seq = prior.head_seq,
+                            "recovered committed update fanout publication failed; canonical write remains accepted");
+                    }
                     return Ok(AcceptOutcome::Accepted(finish_committed(
                         cache,
                         registry,
@@ -2113,10 +2133,10 @@ mod database_tests {
         scratch.drop_self().await;
     }
 
-    /// The durable fanout pointer is part of the canonical write transaction, not a best-effort
-    /// after-commit side effect. A refusal at that final insert must roll back the update and head.
+    /// Fanout is a post-commit hint, never the durability authority. A refusal must be observable
+    /// but cannot turn an already-committed update into a rejection or roll its head back.
     #[tokio::test]
-    async fn fanout_notice_failure_rolls_back_the_canonical_update_and_head() {
+    async fn fanout_notice_failure_after_commit_keeps_the_canonical_update_and_head() {
         let scratch = scratch_or_skip!("fanout-atomicity");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state).await;
@@ -2182,13 +2202,12 @@ mod database_tests {
             },
         )
         .await
-        .expect("deterministic refusal is classified");
-        let AcceptOutcome::Rejected(rejected) = outcome else {
-            panic!("fanout refusal must reject the whole write");
+        .expect("post-commit fanout refusal must not replace the accepted result");
+        let AcceptOutcome::Accepted(accepted) = outcome else {
+            panic!("fanout refusal must leave the already-committed write accepted");
         };
-        assert_eq!(rejected.code, RejectedCode::ServerRejected);
-        assert_eq!(rejected.write_state, WriteState::NotApplied);
-        assert_eq!(count_collab_updates(&state, document_id, update_id).await, 0);
+        assert_eq!(accepted.head_seq, before.head_seq + 1);
+        assert_eq!(count_collab_updates(&state, document_id, update_id).await, 1);
 
         #[derive(FromQueryResult)]
         struct CountRow {
@@ -2214,8 +2233,9 @@ mod database_tests {
         .expect("document query runs")
         .expect("document exists");
         assert_eq!(
-            after.head_seq, before.head_seq,
-            "fanout failure must not advance the head"
+            after.head_seq,
+            before.head_seq + 1,
+            "fanout failure cannot undo a committed head"
         );
 
         scratch.drop_self().await;
