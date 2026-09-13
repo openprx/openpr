@@ -21,7 +21,26 @@ use super::{import::BoundedImportStager, projection, repository};
 const IMPORT_ARTIFACT_TTL_MINUTES: i64 = 30;
 
 #[cfg(test)]
-static FAIL_PROMOTION_AFTER_OBJECT: parking_lot::Mutex<Option<Uuid>> = parking_lot::Mutex::new(None);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotionFaultPoint {
+    JobStarted,
+    ObjectPromoted,
+    RelationsPromoted,
+    EventInserted,
+    ReportFinished,
+    PreviewLinked,
+}
+
+#[cfg(test)]
+static PROMOTION_FAULT: parking_lot::Mutex<Option<(Uuid, PromotionFaultPoint)>> = parking_lot::Mutex::new(None);
+
+#[cfg(test)]
+fn fail_promotion_at(preview_id: Uuid, point: PromotionFaultPoint) -> Result<(), ApiError> {
+    if PROMOTION_FAULT.lock().as_ref() == Some(&(preview_id, point)) {
+        return Err(ApiError::Internal);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct ImportPrincipal {
@@ -467,9 +486,13 @@ pub async fn commit_package_import(
     )
     .await?;
     repository::start_import_job(&tx, import_id).await?;
+    #[cfg(test)]
+    fail_promotion_at(request.preview_id, PromotionFaultPoint::JobStarted)?;
 
     let (created, reused) = promote_objects(&tx, &artifact.package_bytes, &plan, &mapping, request, import_id).await?;
     let detached = promote_relations(&tx, &plan, &mapping, request, import_id).await?;
+    #[cfg(test)]
+    fail_promotion_at(request.preview_id, PromotionFaultPoint::RelationsPromoted)?;
     let event = insert_flow_event(
         &tx,
         import_event(
@@ -489,6 +512,8 @@ pub async fn commit_package_import(
         }),
     )
     .await?;
+    #[cfg(test)]
+    fail_promotion_at(request.preview_id, PromotionFaultPoint::EventInserted)?;
     let finished_at = Utc::now();
     let report = ImportReport {
         import_id,
@@ -531,12 +556,16 @@ pub async fn commit_package_import(
         Some(event.event_id),
     )
     .await?;
+    #[cfg(test)]
+    fail_promotion_at(request.preview_id, PromotionFaultPoint::ReportFinished)?;
     tx.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "UPDATE flow_import_previews SET committed_import_id=$2 WHERE id=$1 AND committed_import_id IS NULL",
         vec![request.preview_id.into(), import_id.into()],
     ))
     .await?;
+    #[cfg(test)]
+    fail_promotion_at(request.preview_id, PromotionFaultPoint::PreviewLinked)?;
     tx.commit().await?;
     Ok(report)
 }
@@ -1074,9 +1103,7 @@ async fn promote_objects<C: ConnectionTrait>(
             inserted.insert(source_id);
             created = created.saturating_add(1);
             #[cfg(test)]
-            if FAIL_PROMOTION_AFTER_OBJECT.lock().as_ref() == Some(&request.preview_id) {
-                return Err(ApiError::Internal);
-            }
+            fail_promotion_at(request.preview_id, PromotionFaultPoint::ObjectPromoted)?;
         }
     }
     Ok((created, reused))
@@ -1554,6 +1581,24 @@ mod tests {
         let before = canonical_count(&state.db, target_workspace).await;
         let (preview, commit) = prepare_preview(&state.db, target_workspace, target_owner, package, "roundtrip").await;
         assert_eq!(canonical_count(&state.db, target_workspace).await, before);
+        let mut cross_actor = commit.clone();
+        cross_actor.principal = principal(Uuid::new_v4());
+        assert!(
+            matches!(
+                commit_package_import(&state.db, &cross_actor).await,
+                Err(ApiError::NotFound(_))
+            ),
+            "a preview is actor-bound even when the other principal claims an admin role"
+        );
+        let mut cross_workspace = commit.clone();
+        cross_workspace.workspace_id = source_workspace;
+        assert!(
+            matches!(
+                commit_package_import(&state.db, &cross_workspace).await,
+                Err(ApiError::NotFound(_))
+            ),
+            "a preview id cannot be replayed in another workspace"
+        );
         assert_ne!(
             preview.mapping.object_map.keys().collect::<Vec<_>>(),
             preview.mapping.object_map.values().collect::<Vec<_>>()
@@ -1706,22 +1751,39 @@ mod tests {
         let package = exported_fixture(&state, source_workspace, source_owner, "rollback").await;
         let before = canonical_count(&state.db, target_workspace).await;
         let (_, commit) = prepare_preview(&state.db, target_workspace, target_owner, package, "rollback").await;
-        *FAIL_PROMOTION_AFTER_OBJECT.lock() = Some(commit.preview_id);
-        let result = commit_package_import(&state.db, &commit).await;
-        *FAIL_PROMOTION_AFTER_OBJECT.lock() = None;
-        assert!(matches!(result, Err(ApiError::Internal)));
-        assert_eq!(canonical_count(&state.db, target_workspace).await, before);
-        let rows = state.db.query_one(Statement::from_sql_and_values(
-            DbBackend::Postgres,
-            "SELECT \
-               (SELECT COUNT(*) FROM flow_import_jobs WHERE workspace_id=$1 AND kind='flow_package')::bigint AS jobs, \
-               (SELECT COUNT(*) FROM flow_import_lineage WHERE target_workspace_id=$1 AND source_kind='flow_package')::bigint AS lineage, \
-               (SELECT COUNT(*) FROM business_events WHERE workspace_id=$1 AND event_type='flow.import.completed')::bigint AS completed",
-            vec![target_workspace.into()],
-        )).await.unwrap().unwrap();
-        assert_eq!(rows.try_get::<i64>("", "jobs").unwrap(), 0);
-        assert_eq!(rows.try_get::<i64>("", "lineage").unwrap(), 0);
-        assert_eq!(rows.try_get::<i64>("", "completed").unwrap(), 0);
+        for point in [
+            PromotionFaultPoint::JobStarted,
+            PromotionFaultPoint::ObjectPromoted,
+            PromotionFaultPoint::RelationsPromoted,
+            PromotionFaultPoint::EventInserted,
+            PromotionFaultPoint::ReportFinished,
+            PromotionFaultPoint::PreviewLinked,
+        ] {
+            *PROMOTION_FAULT.lock() = Some((commit.preview_id, point));
+            let result = commit_package_import(&state.db, &commit).await;
+            *PROMOTION_FAULT.lock() = None;
+            assert!(matches!(result, Err(ApiError::Internal)), "fault point {point:?}");
+            assert_eq!(
+                canonical_count(&state.db, target_workspace).await,
+                before,
+                "fault point {point:?}"
+            );
+            let rows = state.db.query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT \
+                   (SELECT COUNT(*) FROM flow_import_jobs WHERE workspace_id=$1 AND kind='flow_package')::bigint AS jobs, \
+                   (SELECT COUNT(*) FROM flow_import_lineage WHERE target_workspace_id=$1 AND source_kind='flow_package')::bigint AS lineage, \
+                   (SELECT COUNT(*) FROM business_events WHERE workspace_id=$1 AND event_type='flow.import.completed')::bigint AS completed",
+                vec![target_workspace.into()],
+            )).await.unwrap().unwrap();
+            assert_eq!(rows.try_get::<i64>("", "jobs").unwrap(), 0, "fault point {point:?}");
+            assert_eq!(rows.try_get::<i64>("", "lineage").unwrap(), 0, "fault point {point:?}");
+            assert_eq!(
+                rows.try_get::<i64>("", "completed").unwrap(),
+                0,
+                "fault point {point:?}"
+            );
+        }
         scratch.drop_self().await;
     }
 }

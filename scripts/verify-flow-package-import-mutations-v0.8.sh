@@ -78,8 +78,8 @@ grep -Fq 'let _ = member_bytes(package, path)?;' "$IMPORT_SOURCE"
 run_case accepted_tail_not_applied red
 restore_sources
 
-perl -0pi -e 's/(== Some\(&request\.preview_id\)\n            \{\n)                return Err\(ApiError::Internal\);/${1}                return Ok((created, reused));/' "$IMPORT_SOURCE"
-grep -Fq 'return Ok((created, reused));' "$IMPORT_SOURCE"
+perl -0pi -e 's/fail_promotion_at\(request\.preview_id, PromotionFaultPoint::ObjectPromoted\)\?;/let _ = fail_promotion_at(request.preview_id, PromotionFaultPoint::ObjectPromoted);/' "$IMPORT_SOURCE"
+grep -Fq 'let _ = fail_promotion_at(request.preview_id, PromotionFaultPoint::ObjectPromoted);' "$IMPORT_SOURCE"
 run_case promotion_fault_swallowed red
 restore_sources
 

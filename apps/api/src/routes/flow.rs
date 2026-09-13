@@ -66,6 +66,7 @@ pub struct PackageExportRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageArtifactSource {
     pub kind: String,
     pub package_base64: Option<String>,
@@ -75,6 +76,7 @@ pub struct PackageArtifactSource {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageArtifactRequest {
     pub source: PackageArtifactSource,
     pub idempotency_key: String,
@@ -9880,6 +9882,92 @@ mod flow_database_tests {
             upload["data"]["package_sha256"]
         );
         assert_ne!(multipart_upload["data"]["artifact_id"], upload["data"]["artifact_id"]);
+
+        let staged_key = format!("flow-package-staging/{target_workspace}/{}.zip", Uuid::new_v4());
+        let storage = crate::services::object_storage::ObjectStorage::from_runtime_config().unwrap();
+        storage.put(&staged_key, &artifact_bytes).await.unwrap();
+        let staged_response = target_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/import-artifacts"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "source": {
+                                "kind": "staged_object", "object_key": staged_key,
+                                "size": artifact_bytes.len(),
+                                "package_sha256": upload["data"]["package_sha256"],
+                            },
+                            "idempotency_key": "route-staged-upload",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let staged_upload = body_json(staged_response).await;
+        assert_eq!(staged_upload["code"], 0, "{staged_upload}");
+        assert_eq!(
+            staged_upload["data"]["package_sha256"],
+            upload["data"]["package_sha256"]
+        );
+        assert_ne!(staged_upload["data"]["artifact_id"], upload["data"]["artifact_id"]);
+
+        for (index, forbidden_field) in ["path", "url", "provider"].into_iter().enumerate() {
+            let mut source = json!({
+                "kind": "inline_base64",
+                "package_base64": base64::engine::general_purpose::STANDARD.encode(&artifact_bytes),
+            });
+            source[forbidden_field] = json!("attacker-controlled");
+            let rejected = target_app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/workspaces/{target_workspace}/flow/import-artifacts"))
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            json!({"source":source,"idempotency_key":format!("forbidden-{index}")}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let rejected = body_json(rejected).await;
+            assert_ne!(
+                rejected["code"], 0,
+                "{forbidden_field} override must be rejected: {rejected}"
+            );
+        }
+        let cross_workspace_key = format!("flow-package-staging/{}/foreign.zip", Uuid::new_v4());
+        let cross_workspace = target_app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/workspaces/{target_workspace}/flow/import-artifacts"))
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "source": {
+                                "kind":"staged_object", "object_key":cross_workspace_key,
+                                "size":artifact_bytes.len(),
+                                "package_sha256":upload["data"]["package_sha256"],
+                            },
+                            "idempotency_key":"cross-workspace-staging",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(body_json(cross_workspace).await["code"], 0);
+        storage.delete(&staged_key).await.unwrap();
+
         let preview_response = target_app
             .clone()
             .oneshot(
