@@ -9527,6 +9527,9 @@ mod flow_database_tests {
             confirm_document_id: None,
             idempotency_key: "compact-dry-key".to_string(),
         };
+        let before_negative = crate::flow::collab::integrity::document_fingerprint(&state.db, document_id)
+            .await
+            .expect("pre-negative fingerprint");
         let denied = post_flow_compact_document(
             State(state.clone()),
             claims_for(member_id),
@@ -9536,6 +9539,87 @@ mod flow_database_tests {
         )
         .await;
         assert!(denied.is_err(), "ordinary members cannot run admin maintenance");
+        assert!(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(CompactDocumentRequest {
+                    dry_run: true,
+                    expected_head_seq: None,
+                    retain_after_seq: None,
+                    confirm_document_id: None,
+                    idempotency_key: "compact-missing-head".to_string(),
+                }),
+            )
+            .await
+            .is_err(),
+            "missing expected head must fail closed"
+        );
+        assert!(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(document_id),
+                Json(CompactDocumentRequest {
+                    dry_run: true,
+                    expected_head_seq: Some(0),
+                    retain_after_seq: None,
+                    confirm_document_id: None,
+                    idempotency_key: String::new(),
+                }),
+            )
+            .await
+            .is_err(),
+            "missing idempotency key must fail closed"
+        );
+        let (foreign_workspace, foreign_owner) = seed_workspace(&state, true).await;
+        let foreign_object =
+            create_page_as_owner(&state, foreign_workspace, foreign_owner, "foreign maintenance").await;
+        let foreign_document = document_of(&state, foreign_object).await;
+        assert!(
+            post_flow_compact_document(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Path(foreign_document),
+                Json(CompactDocumentRequest {
+                    dry_run: true,
+                    expected_head_seq: Some(0),
+                    retain_after_seq: None,
+                    confirm_document_id: None,
+                    idempotency_key: "compact-foreign-scope".to_string(),
+                }),
+            )
+            .await
+            .is_err(),
+            "admin authority from another workspace must not authorize this scope"
+        );
+        let operations_after_negative = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM flow_operation_runs WHERE workspace_id=$1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("operation count runs")
+            .expect("operation count row")
+            .try_get::<i64>("", "n")
+            .expect("operation count reads");
+        assert_eq!(
+            operations_after_negative, 0,
+            "all negative requests must leave zero audit claims"
+        );
+        assert_eq!(
+            crate::flow::collab::integrity::document_fingerprint(&state.db, document_id)
+                .await
+                .expect("post-negative fingerprint"),
+            before_negative,
+            "all negative requests must leave the exact canonical document unchanged"
+        );
         let first = body_json(to_response(
             post_flow_compact_document(
                 State(state.clone()),
@@ -9632,6 +9716,71 @@ mod flow_database_tests {
         .await;
         assert_eq!(compact_execute["code"], 0, "{compact_execute}");
         assert_eq!(compact_execute["data"]["dry_run"], false);
+
+        let before_projection_negative = crate::flow::collab::integrity::document_fingerprint(&state.db, document_id)
+            .await
+            .expect("pre-projection-negative fingerprint");
+        for (target, request) in [
+            (
+                object_id,
+                RebuildProjectionRequest {
+                    dry_run: true,
+                    expected_head_seq: None,
+                    confirm_object_id: None,
+                    idempotency_key: "projection-missing-head".to_string(),
+                },
+            ),
+            (
+                object_id,
+                RebuildProjectionRequest {
+                    dry_run: true,
+                    expected_head_seq: Some(0),
+                    confirm_object_id: None,
+                    idempotency_key: String::new(),
+                },
+            ),
+            (
+                foreign_object,
+                RebuildProjectionRequest {
+                    dry_run: true,
+                    expected_head_seq: Some(0),
+                    confirm_object_id: None,
+                    idempotency_key: "projection-foreign-scope".to_string(),
+                },
+            ),
+        ] {
+            assert!(
+                post_flow_rebuild_projection(
+                    State(state.clone()),
+                    claims_for(owner_id),
+                    None,
+                    Path(target),
+                    Json(request),
+                )
+                .await
+                .is_err(),
+                "projection negative request must fail closed"
+            );
+        }
+        let operation_rows_after_projection_negative: i64 = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT count(*) AS n FROM flow_operation_runs WHERE workspace_id=$1",
+                vec![workspace_id.into()],
+            ))
+            .await
+            .expect("operation count runs")
+            .expect("operation count row")
+            .try_get("", "n")
+            .expect("operation count reads");
+        assert_eq!(operation_rows_after_projection_negative, 2);
+        assert_eq!(
+            crate::flow::collab::integrity::document_fingerprint(&state.db, document_id)
+                .await
+                .expect("post-projection-negative fingerprint"),
+            before_projection_negative
+        );
 
         let projection = body_json(to_response(
             post_flow_rebuild_projection(

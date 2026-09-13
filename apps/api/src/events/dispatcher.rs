@@ -5869,9 +5869,7 @@ mod dispatcher_database_tests {
         )
         .await;
         let document_id = Uuid::new_v4();
-        let block_ids = (0..200)
-            .map(|_| Uuid::new_v4())
-            .collect::<Vec<_>>();
+        let block_ids = (0..200).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
         let event_1 = commit_dispatch_work(
             &scratch.db,
             workspace_id,
