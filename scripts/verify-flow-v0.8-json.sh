@@ -15,6 +15,8 @@ WORKSPACE_ROOT=$(cd "$REPO/../.." && pwd)
 python3 - "$RESULT" "$EVIDENCE" "$REPO" "$CONTRACTS/gates/v0.8-gate.yaml" "$PREDECESSOR" <<'PY'
 import hashlib,json,pathlib,re,subprocess,sys,yaml
 result,evidence,repo,gate_path,predecessor_path=map(lambda p:pathlib.Path(p).resolve(),sys.argv[1:]); drift=[]
+sys.path.insert(0,str(repo/"scripts"/"lib"))
+from flow_contract_status import is_accepted_contract_status
 try: receipt=json.loads(result.read_text()); gate=yaml.safe_load(gate_path.read_text())
 except Exception as exc: print(json.dumps({"receipt_consistent":False,"errors":[str(exc)]})); raise SystemExit(2)
 def same(field,actual,expected):
@@ -51,7 +53,7 @@ failed=[key for key,value in receipt.get("hard_gates",{}).items() if value!="pas
 same("automated_gate_count",receipt.get("automated_gate_count"),len(gate.get("hard_gates",{})))
 same("automated_failed",receipt.get("automated_failed"),len(failed))
 same("automated_passed",receipt.get("automated_passed"),len(gate.get("hard_gates",{}))-len(failed))
-candidate=(not failed and gate.get("status")=="active" and predecessor.get("accepted") is True
+candidate=(not failed and is_accepted_contract_status(gate.get("status")) and predecessor.get("accepted") is True
            and receipt.get("source",{}).get("dirty") is False
            and all(value.get("status")!="unset" for value in gate.get("budgets",{}).values()))
 same("candidate_ready",receipt.get("candidate_ready"),candidate)

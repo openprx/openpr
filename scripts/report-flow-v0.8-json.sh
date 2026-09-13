@@ -86,6 +86,8 @@ run workspace_full cargo test --manifest-path "$REPO_ROOT/Cargo.toml" --workspac
 python3 - "$REPO_ROOT" "$CONTRACTS_ROOT" "$EVIDENCE_ROOT" "$GATE_YAML" "$PREDECESSOR" "$MANUAL_FROM" "$ROWS" <<'PY'
 import datetime as dt, hashlib, json, os, pathlib, re, subprocess, sys, tempfile, yaml
 repo,contracts,evidence,gate_path,predecessor_path,manual_path,rows=map(lambda p:pathlib.Path(p).resolve(),sys.argv[1:])
+sys.path.insert(0,str(repo/"scripts"/"lib"))
+from flow_contract_status import is_accepted_contract_status
 gate=yaml.safe_load(gate_path.read_text()); head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
 
 artifact_by_check={
@@ -190,7 +192,7 @@ dirty=subprocess.check_output(["git","-C",str(repo),"status","--porcelain=v1","-
  "apps","crates","frontend","migrations","scripts","testing","Cargo.toml","Cargo.lock"],text=True).splitlines()
 baseline=gate.get("source_baseline",{}); contract_status=gate.get("status")
 blockers=[]
-if contract_status!="active": blockers.append("gate_contract_not_active")
+if not is_accepted_contract_status(contract_status): blockers.append("gate_contract_not_active")
 if baseline.get("reviewed_head")!=head or str(baseline.get("rust_workspace_version"))!=rust or str(baseline.get("frontend_package_version"))!=frontend: blockers.append("source_baseline_mismatch")
 if not predecessor.get("accepted"): blockers.append("predecessor_not_accepted")
 if dirty: blockers.append("source_dirty")
