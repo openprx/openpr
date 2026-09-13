@@ -25,6 +25,10 @@ cd "$PROJECT_ROOT"
 # Keep the destructive compose lifecycle isolated from developer/demo stacks and make every
 # container created by this RC gate visibly owned by v0.9.
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-v09-openpr-rc}"
+# podman-compose 1.3 can race dependency graph construction when services are
+# created concurrently. One-at-a-time startup is also valid in Docker Compose
+# and gives this compatibility gate a deterministic dependency order.
+export SYLVODE_COMPOSE_PARALLEL=1
 
 ASSUME_YES="${OPENPR_E2E_ASSUME_YES:-0}"
 KEEP_STACK="${OPENPR_E2E_KEEP_STACK:-0}"

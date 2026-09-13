@@ -517,7 +517,11 @@ if [ -z "$SYLVODE_RUNTIME_BASE" ] && [ -r /etc/os-release ]; then
 fi
 
 echo "🔨 Building and starting services..."
-docker compose up -d --build
+if [[ -n "${SYLVODE_COMPOSE_PARALLEL:-}" ]]; then
+  docker compose --parallel "$SYLVODE_COMPOSE_PARALLEL" up -d --build
+else
+  docker compose up -d --build
+fi
 
 # Wait for the services to answer. Probing the published endpoints beats parsing
 # `docker compose ps`: that output differs between podman-compose and the docker
