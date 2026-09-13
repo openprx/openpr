@@ -87,8 +87,8 @@ perl -0pi -e 's/"flow\.import\.completed"/"flow.import.previewed"/' "$IMPORT_SOU
 run_case completion_event_misclassified red
 restore_sources
 
-perl -0pi -e 's/prior_targets\n                        \.get\(&key\)\n                        \.copied\(\)\n                        \.unwrap_or_else\(Uuid::new_v4\)/prior_targets.get(\&key).copied().unwrap_or(row.source_object_id)/' "$IMPORT_SOURCE"
-grep -Fq 'unwrap_or(row.source_object_id)' "$IMPORT_SOURCE"
+perl -0pi -e 's/prior_targets\s*\.get\(&key\)\s*\.copied\(\)\s*\.unwrap_or_else\(Uuid::new_v4\)/row.source_object_id \/\* mutation \*\//' "$IMPORT_SOURCE"
+grep -Fq 'row.source_object_id /* mutation */' "$IMPORT_SOURCE"
 run_case source_object_id_reused red
 restore_sources
 
