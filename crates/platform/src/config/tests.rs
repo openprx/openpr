@@ -1,16 +1,17 @@
 //! Behavioural tests for the file backed configuration.
 
 use std::path::{Path, PathBuf};
+use std::{fs, process};
 
 use super::{
-    AppConfig, ConfigError, DEFAULT_CONFIG_PATH, LogFormat, LogOutput, McpTransport, OpenPrConfig, REDACTED,
-    StdoutRole, StorageBackend,
+    AppConfig, ConfigError, DEFAULT_CONFIG_PATH, LEGACY_CONFIG_PATH, LogFormat, LogOutput, McpTransport, OpenPrConfig,
+    REDACTED, StdoutRole, StorageBackend, resolve_default_config_path,
 };
 
 const WORKSPACE: &str = "0f8a1b2c-3d4e-4f60-8182-93a4b5c6d7e8";
 
 fn origin() -> PathBuf {
-    PathBuf::from("config/openpr.toml")
+    PathBuf::from("config/sylvode.toml")
 }
 
 fn parse(source: &str) -> Result<OpenPrConfig, ConfigError> {
@@ -296,7 +297,7 @@ fn the_rendered_error_lists_all_issues_and_points_at_the_example() {
     assert!(rendered.contains("2 unusable values"), "{rendered}");
     assert!(rendered.contains("database.url is required"), "{rendered}");
     assert!(rendered.contains("auth.jwt_secret is required"), "{rendered}");
-    assert!(rendered.contains("config/openpr.example.toml"), "{rendered}");
+    assert!(rendered.contains("config/sylvode.example.toml"), "{rendered}");
     assert!(rendered.contains(&origin().display().to_string()), "{rendered}");
 }
 
@@ -456,7 +457,7 @@ fn placeholder_values_are_refused() {
 
 #[test]
 fn the_shipped_example_is_refused_because_it_is_all_placeholders() {
-    let example = include_str!("../../../../config/openpr.example.toml");
+    let example = include_str!("../../../../config/sylvode.example.toml");
     let reported = issues(example);
     assert!(
         reported.iter().any(|issue| issue.contains("database.url")),
@@ -472,7 +473,7 @@ fn the_shipped_example_is_refused_because_it_is_all_placeholders() {
 fn the_shipped_example_is_structurally_valid_toml_for_this_schema() {
     // Placeholders must fail *validation*, not parsing: an operator who fills them in must get a
     // working file without having to also fix the shape.
-    let example = include_str!("../../../../config/openpr.example.toml");
+    let example = include_str!("../../../../config/sylvode.example.toml");
     let filled = example
         .replace("replace_with_postgres_password", "s3cret")
         .replace("replace_with_a_64_character_hex_secret", &"a".repeat(64))
@@ -487,6 +488,24 @@ fn the_shipped_example_is_structurally_valid_toml_for_this_schema() {
         .expect("the filled in example names a database");
     assert_eq!(database.url.expose(), "postgres://openpr:s3cret@localhost:5432/openpr");
     AppConfig::from_config(&config, "api", "0.0.0.0:8081").expect("the filled in example is enough to start the api");
+}
+
+#[test]
+fn sylvode_and_legacy_shipped_examples_have_the_same_valid_schema() {
+    for example in [
+        include_str!("../../../../config/sylvode.example.toml"),
+        include_str!("../../../../config/openpr.example.toml"),
+    ] {
+        let filled = example
+            .replace("replace_with_postgres_password", "s3cret")
+            .replace("replace_with_a_64_character_hex_secret", &"a".repeat(64))
+            .replace("replace_with_s3_access_key_id", "AKIAEXAMPLE")
+            .replace("replace_with_s3_secret_access_key", "s3-secret")
+            .replace("replace_with_opr_bot_token", "opr_live_token")
+            .replace("replace_with_mcp_inbound_token", "mcp-inbound-token-value")
+            .replace("replace_with_connector_credential", "connector-credential");
+        parse(&filled).expect("both shipped names must retain the same validated TOML schema");
+    }
 }
 
 // ---- uuids ----
@@ -763,6 +782,35 @@ fn a_directory_in_place_of_the_file_is_reported_as_unreadable() {
         matches!(error, ConfigError::Unreadable { .. } | ConfigError::Malformed { .. }),
         "{error}"
     );
+}
+
+#[test]
+fn sylvode_default_legacy_discovery_and_conflict_are_explicit() {
+    let root = std::env::temp_dir().join(format!("sylvode-config-compat-{}", process::id()));
+    let config_dir = root.join("config");
+    fs::create_dir_all(&config_dir).expect("test config directory");
+    let canonical = root.join(DEFAULT_CONFIG_PATH);
+    let legacy = root.join(LEGACY_CONFIG_PATH);
+
+    assert_eq!(
+        resolve_default_config_path(&root).expect("missing files select the new default"),
+        canonical
+    );
+    fs::write(&legacy, "[logging]\nformat='json'\n").expect("legacy fixture");
+    assert_eq!(
+        resolve_default_config_path(&root).expect("legacy-only config is discovered"),
+        legacy
+    );
+    fs::write(&canonical, "[logging]\nformat='json'\n").expect("canonical fixture");
+    let conflict = resolve_default_config_path(&root).expect_err("two implicit configs must fail closed");
+    assert!(
+        conflict
+            .to_string()
+            .contains("both config/sylvode.toml and legacy config/openpr.toml exist")
+    );
+    assert!(conflict.to_string().contains("--config explicitly"));
+
+    fs::remove_dir_all(root).expect("remove test config directory");
 }
 
 // ---- projection onto AppConfig ----

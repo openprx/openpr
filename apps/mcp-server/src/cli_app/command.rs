@@ -17,7 +17,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Path to the configuration file \[default: config/openpr.toml\]
+    /// Path to the configuration file \[default: config/sylvode.toml; legacy config/openpr.toml fallback\]
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<PathBuf>,
 

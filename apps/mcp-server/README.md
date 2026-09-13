@@ -1,10 +1,10 @@
-# OpenPR MCP Server
+# Sylvode MCP Server
 
-Model Context Protocol (MCP) server for OpenPR project management system.
+Model Context Protocol (MCP) server for Sylvode project management system.
 
 ## Overview
 
-The MCP Server provides AI models with tools to interact with OpenPR's project management features, including:
+The MCP Server provides AI models with tools to interact with Sylvode's project management features, including:
 - Project management (CRUD operations)
 - Project types, scenario templates, and project resources
 - Universal forms, form records, aggregate queries, and business events
@@ -16,18 +16,18 @@ The MCP Server provides AI models with tools to interact with OpenPR's project m
 
 ## Features
 
-- **128 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, scenario toolkit, and Sylvode Flow (v0.7)
+- **140 MCP Tools**: Project, governance, universal forms, WASM plugin, operation records, release next actions, template, scenario toolkit, and Sylvode Flow
 - **Three Transport Modes**: stdio (for MCP clients), HTTP JSON-RPC, and SSE
 - **JSON Schema Validation**: All tool parameters are strongly typed
-- **OpenPR API Backend**: Calls the OpenPR API with workspace-scoped bot credentials
+- **Sylvode API Backend**: Calls the Sylvode API with workspace-scoped bot credentials
 - **Async/Await**: Built on Tokio for high performance
 
 ## Quick Start
 
 ### Prerequisites
 
-OpenPR reads no environment variables. Create a configuration file carrying the `[mcp]`
-section — `config/openpr.example.toml` is the full annotated reference:
+Sylvode reads no environment variables. Create a configuration file carrying the `[mcp]`
+section — `config/sylvode.example.toml` is the full annotated reference:
 
 ```toml
 [mcp]
@@ -37,16 +37,21 @@ bot_token = "opr_your_token_here"
 workspace_id = "your-workspace-uuid"
 ```
 
-Save it as `config/openpr.toml` (the default path the binary looks for) or anywhere else and
+Save it as `config/sylvode.toml` (the default path the binary looks for) or anywhere else and
 pass `--config <path>`:
 
 ```bash
-mcp-server serve --config config/openpr.toml
+mcp-server serve --config config/sylvode.toml
 ```
+
+New installations should invoke the `sylvode` CLI for Flow commands. The
+`mcp-server` executable, legacy `config/openpr.toml` default, and existing MCP
+tool names remain compatible in v0.9; see the
+[compatibility matrix](../../docs/sylvode-v0.9-compatibility.md).
 
 | Config key | Required | Purpose |
 | --- | --- | --- |
-| `mcp.api_url` | no, default `http://localhost:8081` | Base URL of the OpenPR API. |
+| `mcp.api_url` | no, default `http://localhost:8081` | Base URL of the Sylvode API. |
 | `mcp.bot_token` | conditional | Workspace bot token, used only by `stdio` and the CLI subcommands, which have no per-request caller to act on. Ignored by `http`/`sse`. |
 | `mcp.workspace_id` | yes | Workspace UUID the calls are scoped to. |
 
@@ -64,7 +69,7 @@ Authorization: Bearer opr_...
 ```
 
 The MCP server does not itself validate this token beyond reading it out of the header — it
-forwards it to the OpenPR API unchanged, and the API authenticates it and enforces
+forwards it to the Sylvode API unchanged, and the API authenticates it and enforces
 authorization. A request with no `Authorization` header, or a malformed one, is rejected
 with `401` and `WWW-Authenticate: Bearer` before it reaches any tool. Because every caller
 supplies their own credential, `mcp.bind_addr` can be `0.0.0.0` or any other reachable
@@ -100,22 +105,22 @@ cargo build -p mcp-server --release
 
 #### stdio Mode (for MCP clients)
 ```bash
-./target/release/mcp-server serve --transport stdio --config config/openpr.toml
+./target/release/mcp-server serve --transport stdio --config config/sylvode.toml
 ```
 
 #### HTTP Mode (for testing/debugging)
 ```bash
 # Loopback default (127.0.0.1:8090). Every request still needs its own caller bot token.
-./target/release/mcp-server serve --transport http --config config/openpr.toml
+./target/release/mcp-server serve --transport http --config config/sylvode.toml
 
 # Reachable from other hosts: no extra config needed, since there is no server-side
 # credential to expose. Each request still authenticates with its own caller bot token.
-./target/release/mcp-server serve --transport http --bind-addr 0.0.0.0:8090 --config config/openpr.toml
+./target/release/mcp-server serve --transport http --bind-addr 0.0.0.0:8090 --config config/sylvode.toml
 ```
 
 #### SSE Mode (for streaming clients)
 ```bash
-./target/release/mcp-server serve --transport sse --config config/openpr.toml
+./target/release/mcp-server serve --transport sse --config config/sylvode.toml
 ```
 
 ## Available Tools
@@ -187,11 +192,11 @@ CLI (a second `[[bin]]` in this package) shares the same client and command cont
 ```bash
 # Using stdin/stdout
 echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | \
-  ./target/release/mcp-server serve --transport stdio --config config/openpr.toml
+  ./target/release/mcp-server serve --transport stdio --config config/sylvode.toml
 
 # Project-aware capability filtering
 echo '{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"project_id": "<project-uuid>"}}' | \
-  ./target/release/mcp-server serve --transport stdio --config config/openpr.toml
+  ./target/release/mcp-server serve --transport stdio --config config/sylvode.toml
 ```
 
 ### Call a Tool
@@ -207,13 +212,13 @@ echo '{
       "workspace_id": "550e8400-e29b-41d4-a716-446655440000"
     }
   }
-}' | ./target/release/mcp-server serve --transport stdio --config config/openpr.toml
+}' | ./target/release/mcp-server serve --transport stdio --config config/sylvode.toml
 ```
 
 ### HTTP Mode Example
 ```bash
 # Start server
-./target/release/mcp-server serve --transport http --config config/openpr.toml
+./target/release/mcp-server serve --transport http --config config/sylvode.toml
 
 # Call tool via HTTP -- Authorization carries the caller's own MCP-type account token.
 curl -X POST http://localhost:8090/mcp/rpc \
@@ -257,14 +262,14 @@ mcp-server:
     - "/app/mcp-server"
     - "serve"
     - "--config"
-    - "/app/config/openpr.toml"
+    - "/app/config/sylvode.toml"
     - "--transport"
     - "http"
     - "--bind-addr"
     - "0.0.0.0:8090"
   volumes:
     # Carries [logging] and [mcp] only -- no database URL and no signing key reach this service.
-    - ./config/openpr.compose.mcp.toml:/app/config/openpr.toml:ro
+    - ./config/sylvode.compose.mcp.toml:/app/config/sylvode.toml:ro
   ports:
     - "127.0.0.1:8090:8090"
   depends_on:
@@ -274,7 +279,7 @@ mcp-server:
 
 The default compose stack uses `Dockerfile.prebuilt`, so build the release
 binary first or use `bash scripts/start.sh`, which performs that build before
-starting compose. `scripts/start.sh` also generates `config/openpr.compose.mcp.toml`
+starting compose. `scripts/start.sh` also generates `config/sylvode.compose.mcp.toml`
 from `config/openpr.example.toml`.
 
 ## Development
@@ -288,7 +293,7 @@ apps/mcp-server/
 │   ├── lib.rs            # Library exports
 │   ├── protocol.rs       # MCP protocol types
 │   ├── server.rs         # Core MCP server logic
-│   ├── client/           # OpenPR API client helpers
+│   ├── client/           # Sylvode API client helpers
 │   ├── tools/            # Tool implementations
 │   │   ├── forms.rs
 │   │   ├── plugins.rs
@@ -313,7 +318,7 @@ This outputs the currently registered MCP tools with their complete JSON Schema 
 
 ### Adding a New Tool
 
-1. Add or extend an OpenPR API client helper in `src/client/`.
+1. Add or extend a Sylvode API client helper in `src/client/`.
 2. Add tool definition and handler in `src/tools/<module>.rs`:
    ```rust
    pub fn my_tool_definition() -> ToolDefinition {
@@ -340,19 +345,19 @@ This outputs the currently registered MCP tools with their complete JSON Schema 
 ### Manual Testing
 
 ```bash
-# Start the OpenPR API stack
+# Start the Sylvode API stack
 bash scripts/start.sh
 
 # Run MCP server
-cargo run -p mcp-server -- serve --transport stdio --config config/openpr.toml
+cargo run -p mcp-server -- serve --transport stdio --config config/sylvode.toml
 
 # Test with example request
 echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | \
-  cargo run -q -p mcp-server -- serve --transport stdio --config config/openpr.toml | jq '.'
+  cargo run -q -p mcp-server -- serve --transport stdio --config config/sylvode.toml | jq '.'
 
 # Test project-aware tool discovery
 echo '{"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"project_id": "<project-uuid>"}}' | \
-  cargo run -q -p mcp-server -- serve --transport stdio --config config/openpr.toml | jq '.'
+  cargo run -q -p mcp-server -- serve --transport stdio --config config/sylvode.toml | jq '.'
 ```
 
 ### Integration with MCP Clients
@@ -397,7 +402,7 @@ workspace_id = "your-workspace-uuid"
 bot token.
 
 ### API Connection Refused
-MCP talks to the OpenPR API, not directly to PostgreSQL. Confirm the API is running, then
+MCP talks to the Sylvode API, not directly to PostgreSQL. Confirm the API is running, then
 point `mcp.api_url` at it in the configuration file:
 
 ```bash
@@ -414,7 +419,7 @@ Use `cargo run --bin list-tools` to see all available tools and their exact name
 
 ## Performance
 
-- **API Requests**: Uses the OpenPR API client and relies on API-side indexes and authorization
+- **API Requests**: Uses the Sylvode API client and relies on API-side indexes and authorization
 - **Search Limits**: Results limited to prevent large responses
   - Work item search: 50 results
   - Global search: 20 results per category
@@ -423,7 +428,7 @@ Use `cargo run --bin list-tools` to see all available tools and their exact name
 ## Security
 
 MCP is an API client. It does not accept arbitrary database credentials and it
-does not bypass OpenPR authorization. It never verifies a bot token itself — it has no
+does not bypass Sylvode authorization. It never verifies a bot token itself — it has no
 signing key and no bot registry, so it forwards the token it holds and lets the API decide.
 
 - `stdio` and the CLI subcommands act as the identity in `mcp.bot_token`, configured in the
@@ -450,5 +455,5 @@ AGPL-3.0-or-later
 ## Resources
 
 - [MCP Specification](https://modelcontextprotocol.io/)
-- [OpenPR API Documentation](../../docs/)
+- [Sylvode API Documentation](../../docs/)
 - [Database Schema](../../migrations/)

@@ -23,7 +23,7 @@ Run these in order so a client can use OpenPR MCP immediately.
 
 ### 1. Capability line (verify connectivity)
 ```
-tools/list                          → enumerate all 128 tools
+tools/list                          → enumerate all 140 tools
 tools/list { project_id }           → enumerate tools enabled by the project capability registry
 members.list                       → verify auth + workspace access
 bot_operation_logs.list            → inspect metadata-only bot operation history
@@ -201,7 +201,7 @@ comments.create {
 
 ## Scripts
 
-- Regression test: `scripts/mcp-regression.py` — tests the core tool surface across 3 transports and checks the 128-tool registry includes universal forms, plugins, and Sylvode Flow
+- Regression test: `scripts/mcp-regression.py` — tests the core tool surface across 3 transports and checks the 140-tool registry includes universal forms, plugins, and Sylvode Flow
 - Validation: `scripts/validate-mcp.sh` — quick smoke test for connectivity
 
 ## References

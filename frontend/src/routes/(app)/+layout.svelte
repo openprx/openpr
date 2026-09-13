@@ -209,7 +209,7 @@
 						<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
 					</svg>
 				</button>
-				<a href="/workspace" class="text-xl font-bold text-slate-900 dark:text-slate-100">OpenPR</a>
+				<a href="/workspace" class="text-xl font-bold text-slate-900 dark:text-slate-100">Sylvode</a>
 			</div>
 
 			<div class="hidden flex-1 justify-center md:flex">

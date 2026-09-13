@@ -21,8 +21,9 @@ const OPERATION_LOG_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration:
 
 #[derive(Debug, Parser)]
 struct WorkerArgs {
-    /// Path of the configuration file. Defaults to `config/openpr.toml` relative to the working
-    /// directory. The worker reads no environment variables, so this file is its only input.
+    /// Path of the configuration file. Defaults to `config/sylvode.toml` relative to the working
+    /// directory, with `config/openpr.toml` as a legacy fallback. The worker reads no environment
+    /// variables, so this file is its only input.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
     #[arg(long, default_value_t = 4)]

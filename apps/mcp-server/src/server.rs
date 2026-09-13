@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
+const SKILL_GUIDE_MD: &str = r"# Sylvode MCP Skill Guide
 
 ## Tools (140)
 
@@ -77,7 +77,7 @@ one: pass project_id to be governed by that project's policy, or unprojected=tru
 objects that belong to no project workspace wide.
 ";
 
-const AGENTS_GUIDE_MD: &str = r#"# OpenPR Agent Guide
+const AGENTS_GUIDE_MD: &str = r#"# Sylvode Agent Guide
 
 ## Build
 cargo build --release --bin mcp-server
@@ -1410,7 +1410,7 @@ impl McpServer {
                 }
             },
             "serverInfo": {
-                "name": "openpr-mcp-server",
+                "name": "sylvode-mcp-server",
                 "version": env!("CARGO_PKG_VERSION")
             }
         });
@@ -2682,6 +2682,17 @@ mod tests {
             .replace("{key}", "software-delivery")
             .replace("{cursor}", "cursor-1")
             .replace("{limit}", "10")
+    }
+
+    #[tokio::test]
+    async fn initialize_uses_sylvode_display_identity() -> TestResult {
+        let response = server("http://127.0.0.1:1".to_string())?
+            .handle_request(request(1, "initialize", Some(json!({}))))
+            .await
+            .and_then(|response| response.result)
+            .ok_or("initialize did not return a result")?;
+        assert_eq!(response.pointer("/serverInfo/name"), Some(&json!("sylvode-mcp-server")));
+        Ok(())
     }
 
     /// The v0.9 migration gate is deliberately enumerated from both sides: the expected table
@@ -4184,7 +4195,7 @@ mod tests {
             .handle_resources_read(Some(json!(1)), Some(json!({ "uri": "openpr://guides/agents" })))
             .await;
         let body = serde_json::to_string(&response)?;
-        assert!(body.contains("OpenPR Agent Guide"), "{body}");
+        assert!(body.contains("Sylvode Agent Guide"), "{body}");
         Ok(())
     }
 }

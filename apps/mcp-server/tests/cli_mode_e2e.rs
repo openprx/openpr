@@ -536,7 +536,7 @@ async fn a_missing_configuration_file_is_explained_and_the_environment_is_not_a_
         "the failure is not the missing file: {stderr}"
     );
     assert!(
-        stderr.contains("config/openpr.toml"),
+        stderr.contains("config/sylvode.toml"),
         "the error does not name the file it looked for: {stderr}"
     );
     assert!(
@@ -544,7 +544,7 @@ async fn a_missing_configuration_file_is_explained_and_the_environment_is_not_a_
         "the error does not close off the environment as an alternative: {stderr}"
     );
     assert!(
-        stderr.contains("config/openpr.example.toml"),
+        stderr.contains("config/sylvode.example.toml"),
         "the error does not point at the example to copy: {stderr}"
     );
     assert!(

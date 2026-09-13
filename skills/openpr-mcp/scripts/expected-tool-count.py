@@ -15,7 +15,29 @@ baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
 expected_count = baseline.get("count")
 expected_hash = baseline.get("names_sha256")
 v0_4_rebase = baseline.get("v0_4_rebase", {})
-latest_rebase = baseline.get("v0_7_rebase", v0_4_rebase)
+rebase_rows = sorted(
+    (
+        (tuple(map(int, match.groups())), value)
+        for key, value in baseline.items()
+        if (match := re.fullmatch(r"v(\d+)_(\d+)_rebase", key)) and isinstance(value, dict)
+    ),
+    key=lambda row: row[0],
+)
+latest_rebase = rebase_rows[-1][1] if rebase_rows else {}
+rebase_chain_valid = bool(rebase_rows)
+previous_after = None
+for _, row in rebase_rows:
+    before = row.get("before_count")
+    added = row.get("added")
+    removed = row.get("removed")
+    after = row.get("after_count")
+    if not all(isinstance(value, int) for value in (before, added, removed, after)):
+        rebase_chain_valid = False
+        break
+    if before + added - removed != after or (previous_after is not None and before != previous_after):
+        rebase_chain_valid = False
+        break
+    previous_after = after
 if (
     baseline.get("schema_version") != "openpr.mcp-tool-registry-baseline.v1"
     or baseline.get("source") != "mcp_server::get_all_tool_definitions"
@@ -23,12 +45,8 @@ if (
     or expected_count <= 0
     or not isinstance(expected_hash, str)
     or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
-    or v0_4_rebase.get("before_count", 0) + v0_4_rebase.get("added", 0) - v0_4_rebase.get("removed", 0)
-    != v0_4_rebase.get("after_count")
+    or not rebase_chain_valid
     or latest_rebase.get("after_count") != expected_count
-    or latest_rebase.get("before_count", 0) + latest_rebase.get("added", 0) - latest_rebase.get("removed", 0)
-    != expected_count
-    or ("v0_7_rebase" in baseline and latest_rebase.get("before_count") != v0_4_rebase.get("after_count"))
 ):
     raise SystemExit(f"invalid MCP tool registry baseline: {baseline_path}")
 

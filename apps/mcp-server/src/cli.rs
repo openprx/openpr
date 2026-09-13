@@ -19,15 +19,15 @@ pub enum OutputFormat {
     Table,
 }
 
-/// `OpenPR` MCP server and CLI tool
+/// Sylvode MCP server and CLI tool. The `mcp-server` executable remains a compatibility shim.
 #[derive(Debug, Parser)]
-#[command(name = "mcp-server", about = "OpenPR MCP server and CLI tool")]
+#[command(name = "mcp-server", about = "Sylvode MCP server and CLI tool")]
 #[command(arg_required_else_help = true)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Path to the configuration file \[default: config/openpr.toml\]
+    /// Path to the configuration file \[default: config/sylvode.toml; legacy config/openpr.toml fallback\]
     ///
     /// Global because every subcommand needs it: the settings it carries are read before
     /// the subcommand is dispatched, so `mcp-server projects list --config <path>` has to

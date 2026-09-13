@@ -193,13 +193,13 @@ contains "compose keeps pgdata volume" "$COMPOSE_FILE" "pgdata:"
 contains "PostgreSQL is exposed only to compose network" "$COMPOSE_FILE" "expose:"
 not_contains "compose does not publish PostgreSQL to host" "$COMPOSE_FILE" '"5432:5432"'
 contains "API waits for PostgreSQL health" "$COMPOSE_FILE" "condition: service_healthy"
-contains "worker reads the generated application configuration" "$COMPOSE_FILE" '"/app/worker", "--config", "/app/config/openpr.toml"'
-contains "API service reads the generated application configuration" "$COMPOSE_FILE" '"/app/api", "--config", "/app/config/openpr.toml"'
-contains "services mount the generated application configuration read-only" "$COMPOSE_FILE" './config/openpr.compose.toml:/app/config/openpr.toml:ro'
+contains "worker reads the generated application configuration" "$COMPOSE_FILE" '"/app/worker", "--config", "/app/config/sylvode.toml"'
+contains "API service reads the generated application configuration" "$COMPOSE_FILE" '"/app/api", "--config", "/app/config/sylvode.toml"'
+contains "services mount the generated application configuration read-only" "$COMPOSE_FILE" '${SYLVODE_APP_CONFIG_PATH:-./config/sylvode.compose.toml}:/app/config/sylvode.toml:ro'
 contains "services mount the upload directory their configuration names" "$COMPOSE_FILE" './uploads:/app/uploads'
-contains "API host port binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_API_PORT:-8081}:8080"'
-contains "MCP host port binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${MCP_SERVER_PORT:-8090}:8090"'
-contains "frontend host port binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_FRONTEND_PORT:-3000}:80"'
+contains "API host port binds localhost by default" "$COMPOSE_FILE" '"${SYLVODE_BIND_HOST:-127.0.0.1}:${SYLVODE_API_PORT:-8081}:8080"'
+contains "MCP host port binds localhost by default" "$COMPOSE_FILE" '"${SYLVODE_BIND_HOST:-127.0.0.1}:${SYLVODE_MCP_PORT:-8090}:8090"'
+contains "frontend host port binds localhost by default" "$COMPOSE_FILE" '"${SYLVODE_BIND_HOST:-127.0.0.1}:${SYLVODE_FRONTEND_PORT:-3000}:80"'
 not_contains "compose does not publish API on all interfaces" "$COMPOSE_FILE" '"8081:8080"'
 not_contains "compose does not publish MCP on all interfaces" "$COMPOSE_FILE" '"8090:8090"'
 not_contains "compose does not publish frontend on all interfaces" "$COMPOSE_FILE" '"3000:80"'
@@ -218,11 +218,11 @@ not_contains "env example does not enable default database URL password" "$ROOT_
 
 printf '\nOptional connector receiver coverage:\n'
 contains "webhook receiver uses connectors profile" "$COMPOSE_FILE" "profiles:"
-contains "webhook receiver image is configurable" "$COMPOSE_FILE" 'image: ${OPENPR_WEBHOOK_IMAGE:-ghcr.io/openprx/openpr-webhook:latest}'
-contains "webhook receiver config path is configurable" "$COMPOSE_FILE" '${OPENPR_WEBHOOK_CONFIG:-./config/openpr-webhook.example.toml}:/etc/openpr-webhook/config.toml:ro'
-contains "webhook receiver binds localhost by default" "$COMPOSE_FILE" '"${OPENPR_BIND_HOST:-127.0.0.1}:${OPENPR_WEBHOOK_PORT:-9090}:9090"'
-contains "env example documents webhook receiver image" "$ROOT_DIR/.env.example" "OPENPR_WEBHOOK_IMAGE=ghcr.io/openprx/openpr-webhook:latest"
-contains "env example documents webhook receiver config" "$ROOT_DIR/.env.example" "OPENPR_WEBHOOK_CONFIG=./config/openpr-webhook.example.toml"
+contains "webhook receiver image is configurable" "$COMPOSE_FILE" 'image: ${SYLVODE_WEBHOOK_IMAGE:-ghcr.io/openprx/openpr-webhook:latest}'
+contains "webhook receiver config path is configurable" "$COMPOSE_FILE" '${SYLVODE_WEBHOOK_CONFIG:-./config/openpr-webhook.example.toml}:/etc/openpr-webhook/config.toml:ro'
+contains "webhook receiver binds localhost by default" "$COMPOSE_FILE" '"${SYLVODE_BIND_HOST:-127.0.0.1}:${SYLVODE_WEBHOOK_PORT:-9090}:9090"'
+contains "env example documents webhook receiver image" "$ROOT_DIR/.env.example" "SYLVODE_WEBHOOK_IMAGE=ghcr.io/openprx/openpr-webhook:latest"
+contains "env example documents webhook receiver config" "$ROOT_DIR/.env.example" "SYLVODE_WEBHOOK_CONFIG=./config/openpr-webhook.example.toml"
 contains "webhook example listens on compose service port" "$WEBHOOK_EXAMPLE_CONFIG" 'listen = "0.0.0.0:9090"'
 contains "webhook example keeps unsigned webhooks disabled" "$WEBHOOK_EXAMPLE_CONFIG" "allow_unsigned = false"
 contains "webhook example documents secret placeholder" "$WEBHOOK_EXAMPLE_CONFIG" "replace_with_openpr_webhook_secret"
@@ -251,7 +251,7 @@ not_contains "frontend env example does not point browser at frontend port as AP
 not_contains "frontend README does not claim missing Vite proxy" "$ROOT_DIR/frontend/README.md" "Vite 的 proxy 功能"
 
 printf '\nMCP production configuration coverage:\n'
-contains "MCP server reads its own generated configuration" "$COMPOSE_FILE" './config/openpr.compose.mcp.toml'
+contains "MCP server reads its own generated configuration" "$COMPOSE_FILE" '${SYLVODE_MCP_CONFIG_PATH:-./config/sylvode.compose.mcp.toml}'
 not_contains "MCP server is handed no credential through the environment" "$COMPOSE_FILE" "OPENPR_BOT_TOKEN"
 contains "MCP server rejects unexpanded shell templates on the command line" "$ROOT_DIR/apps/mcp-server/src/main.rs" "rejects_unexpanded_shell_templates_on_the_command_line"
 contains "MCP server rejects a placeholder token and the nil workspace" "$ROOT_DIR/apps/mcp-server/src/main.rs" "rejects_placeholder_token_and_nil_workspace_on_the_command_line"
@@ -266,7 +266,7 @@ not_contains "MCP compose service does not require JWT secret" "$MCP_COMPOSE_BLO
 not_contains "MCP compose service does not inherit default author id" "$MCP_COMPOSE_BLOCK" "DEFAULT_AUTHOR_ID:"
 not_contains "MCP compose service does not depend directly on PostgreSQL" "$MCP_COMPOSE_BLOCK" "postgres:"
 not_contains "env example carries no application credential" "$ROOT_DIR/.env.example" "OPENPR_BOT_TOKEN="
-contains "README documents the MCP serve subcommand with a configuration file" "$ROOT_DIR/README.md" "mcp-server -- serve --config config/openpr.toml"
+contains "README documents the MCP serve subcommand with a configuration file" "$ROOT_DIR/README.md" "mcp-server -- serve --config config/sylvode.toml"
 contains "MCP app README local examples target API host port" "$ROOT_DIR/apps/mcp-server/README.md" 'api_url = "http://localhost:8081"'
 contains "MCP app README documents snapshot-derived tool count" "$ROOT_DIR/apps/mcp-server/README.md" "$EXPECTED_TOOL_COUNT MCP Tools"
 contains "MCP app README documents three transports" "$ROOT_DIR/apps/mcp-server/README.md" "Three Transport Modes"
@@ -275,7 +275,7 @@ contains "MCP app README documents universal forms tools" "$ROOT_DIR/apps/mcp-se
 contains "MCP app README documents plugin tools" "$ROOT_DIR/apps/mcp-server/README.md" "WASM Plugins"
 contains "MCP app README compose example uses prebuilt Dockerfile" "$ROOT_DIR/apps/mcp-server/README.md" "dockerfile: Dockerfile.prebuilt"
 contains "MCP app README manual test starts API stack" "$ROOT_DIR/apps/mcp-server/README.md" "bash scripts/start.sh"
-contains "MCP app README development guide uses API client helpers" "$ROOT_DIR/apps/mcp-server/README.md" "OpenPR API client helper"
+contains "MCP app README development guide uses API client helpers" "$ROOT_DIR/apps/mcp-server/README.md" "Sylvode API client helper"
 contains "MCP app README performance section uses API request wording" "$ROOT_DIR/apps/mcp-server/README.md" "API Requests"
 not_contains "MCP app README does not retain stale 65-tool count" "$ROOT_DIR/apps/mcp-server/README.md" "65 MCP Tools"
 not_contains "MCP app README does not retain stale two-transport wording" "$ROOT_DIR/apps/mcp-server/README.md" "Two Transport Modes"
@@ -287,7 +287,7 @@ not_contains "MCP app README manual test does not start only PostgreSQL" "$ROOT_
 not_contains "MCP app README project structure does not include direct db module" "$ROOT_DIR/apps/mcp-server/README.md" "src/db"
 not_contains "MCP app README development guide does not add database modules" "$ROOT_DIR/apps/mcp-server/README.md" "Add database function"
 not_contains "MCP app README performance section does not claim raw database queries" "$ROOT_DIR/apps/mcp-server/README.md" "Database Queries"
-contains "MCP app README states MCP talks to API not database" "$ROOT_DIR/apps/mcp-server/README.md" "MCP talks to the OpenPR API, not directly to PostgreSQL"
+contains "MCP app README states MCP talks to API not database" "$ROOT_DIR/apps/mcp-server/README.md" "MCP talks to the Sylvode API, not directly to PostgreSQL"
 contains "MCP app README documents bot token hash auth" "$ROOT_DIR/apps/mcp-server/README.md" "SHA-256 token hash"
 contains "MCP app README documents workspace-scoped bot access" "$ROOT_DIR/apps/mcp-server/README.md" "a bot token can only act inside its workspace"
 not_contains "MCP app README does not claim auth is unenforced" "$ROOT_DIR/apps/mcp-server/README.md" "Authentication infrastructure exists but is not enforced"
@@ -372,7 +372,7 @@ contains "start script generates local PostgreSQL password" "$START_SCRIPT" "POS
 contains "start script generates a local JWT secret" "$START_SCRIPT" 'jwt_secret = "$(random_hex 32)"'
 contains "start script generates a bootstrap MCP bot token" "$START_SCRIPT" 'bot_token = "opr_local_$(random_hex 24)"'
 contains "start script generates a bootstrap MCP workspace id" "$START_SCRIPT" 'workspace_id = "$(random_uuid)"'
-contains "start script documents API localhost port" "$START_SCRIPT" "http://localhost:8081"
+contains "start script derives the API probe from the compatible port" "$START_SCRIPT" 'api_probe="http://${probe_host}:${SYLVODE_API_PORT}/health"'
 contains "start script supports config-only validation" "$START_SCRIPT" "--check-config"
 contains "start script points the MCP server at the compose API service" "$START_SCRIPT" 'api_url = "http://api:8080"'
 contains "start script rejects nil workspace UUID" "$START_SCRIPT" "must not be the nil UUID placeholder"
@@ -534,7 +534,7 @@ contains "runbook links scenario catalog JSON schema" "$PRODUCTION_DOC" "docs/sc
 contains "runbook documents scenario catalog operator entrypoints" "$PRODUCTION_DOC" "operator entrypoints"
 contains "runbook documents scenario catalog connector kinds" "$PRODUCTION_DOC" "connector kinds"
 contains "runbook documents runtime scenario usage guide" "$PRODUCTION_DOC" "usage_guide"
-contains "runbook documents scenario template MCP resource" "$PRODUCTION_DOC" "openpr://scenario-templates"
+contains "runbook documents scenario template MCP resource" "$PRODUCTION_DOC" "sylvode://scenario-templates"
 contains "runbook includes implementation map JSON generation" "$PRODUCTION_DOC" "scripts/report-universal-forms-implementation-map-json.sh"
 contains "runbook includes implementation map JSON verifier" "$PRODUCTION_DOC" "scripts/verify-universal-forms-implementation-map-json.sh"
 contains "runbook includes implementation map JSON contract smoke" "$PRODUCTION_DOC" "scripts/smoke-universal-forms-implementation-map-json-contract.sh"

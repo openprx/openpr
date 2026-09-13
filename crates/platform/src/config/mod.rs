@@ -1,6 +1,6 @@
-//! File backed configuration for every `OpenPR` binary.
+//! File backed configuration for every Sylvode binary.
 //!
-//! `OpenPR` reads no environment variables. One TOML file, divided into sections, configures the
+//! Sylvode reads no environment variables. One TOML file, divided into sections, configures the
 //! API, the worker and the MCP server; each binary consumes the sections it needs and ignores the
 //! rest. The file is located by an explicit path only — a `--config <path>` flag, or
 //! [`DEFAULT_CONFIG_PATH`] relative to the process working directory — so a deployment is never
@@ -58,8 +58,11 @@ pub use secret::{REDACTED, Secret};
 /// Where a binary looks for its configuration when no `--config` path is given.
 ///
 /// Relative to the process working directory, so a container that mounts the file at
-/// `/app/config/openpr.toml` and runs with `/app` as its working directory needs no flag.
-pub const DEFAULT_CONFIG_PATH: &str = "config/openpr.toml";
+/// `/app/config/sylvode.toml` and runs with `/app` as its working directory needs no flag.
+pub const DEFAULT_CONFIG_PATH: &str = "config/sylvode.toml";
+
+/// v0.8 and older default. It is discovered only when the new default does not exist.
+pub const LEGACY_CONFIG_PATH: &str = "config/openpr.toml";
 
 /// Shortest accepted `auth.jwt_secret`.
 ///
@@ -115,7 +118,10 @@ impl OpenPrConfig {
     /// `explicit` is the path a `--config` flag carried. When it is `None`,
     /// [`DEFAULT_CONFIG_PATH`] is used, relative to the process working directory.
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
-        let path = explicit.map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), Path::to_path_buf);
+        let path = match explicit {
+            Some(path) => path.to_path_buf(),
+            None => resolve_default_config_path(Path::new("."))?,
+        };
         let source = match fs::read_to_string(&path) {
             Ok(source) => source,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -160,6 +166,22 @@ impl OpenPrConfig {
     /// load time; a value that *is* present is already known to be well formed.
     pub fn mcp_runtime(&self) -> Result<McpRuntime, ConfigError> {
         self.mcp.runtime(&self.origin)
+    }
+}
+
+fn resolve_default_config_path(base: &Path) -> Result<PathBuf, ConfigError> {
+    let canonical = base.join(DEFAULT_CONFIG_PATH);
+    let legacy = base.join(LEGACY_CONFIG_PATH);
+    match (canonical.exists(), legacy.exists()) {
+        (true, true) => Err(ConfigError::Invalid {
+            path: absolute(&canonical),
+            issues: vec![format!(
+                "both {DEFAULT_CONFIG_PATH} and legacy {LEGACY_CONFIG_PATH} exist; pass --config explicitly or remove one so configuration precedence is never silent"
+            )],
+        }),
+        (true, false) => Ok(canonical),
+        (false, true) => Ok(legacy),
+        (false, false) => Ok(canonical),
     }
 }
 

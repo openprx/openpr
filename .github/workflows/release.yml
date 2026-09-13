@@ -80,6 +80,7 @@ jobs:
           cross build --release -p api --bin api --target ${{ matrix.target }}
           cross build --release -p worker --bin worker --target ${{ matrix.target }}
           cross build --release -p mcp-server --bin mcp-server --target ${{ matrix.target }}
+          cross build --release -p mcp-server --bin sylvode --target ${{ matrix.target }}
 
       - name: Build all binaries (native)
         if: "!matrix.use_cross"
@@ -89,12 +90,16 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
-          for bin in api worker mcp-server; do
-            cp target/${{ matrix.target }}/release/$bin staging/ 2>/dev/null && chmod +x staging/$bin || true
+          for bin in api worker mcp-server sylvode; do
+            test -x target/${{ matrix.target }}/release/$bin
+            cp target/${{ matrix.target }}/release/$bin staging/
+            chmod +x staging/$bin
           done
           cd staging
-          tar czf ../openpr-${{ matrix.suffix }}.tar.gz *
+          tar czf ../sylvode-${{ matrix.suffix }}.tar.gz *
           cd ..
+          cp sylvode-${{ matrix.suffix }}.tar.gz openpr-${{ matrix.suffix }}.tar.gz
+          sha256sum sylvode-${{ matrix.suffix }}.tar.gz > sylvode-${{ matrix.suffix }}.tar.gz.sha256
           sha256sum openpr-${{ matrix.suffix }}.tar.gz > openpr-${{ matrix.suffix }}.tar.gz.sha256
 
       - name: Package (Windows)
@@ -102,18 +107,25 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force staging
-          foreach ($bin in @("api", "worker", "mcp-server")) {
+          foreach ($bin in @("api", "worker", "mcp-server", "sylvode")) {
             $src = "target/${{ matrix.target }}/release/$bin.exe"
-            if (Test-Path $src) { Copy-Item $src staging/ }
+            if (-not (Test-Path $src)) { throw "missing release binary: $src" }
+            Copy-Item $src staging/
           }
-          Compress-Archive -Path staging/* -DestinationPath openpr-${{ matrix.suffix }}.zip
+          Compress-Archive -Path staging/* -DestinationPath sylvode-${{ matrix.suffix }}.zip
+          Copy-Item sylvode-${{ matrix.suffix }}.zip openpr-${{ matrix.suffix }}.zip
+          Get-FileHash sylvode-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File sylvode-${{ matrix.suffix }}.zip.sha256
           Get-FileHash openpr-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File openpr-${{ matrix.suffix }}.zip.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openpr-${{ matrix.suffix }}
+          name: sylvode-${{ matrix.suffix }}
           path: |
+            sylvode-${{ matrix.suffix }}.tar.gz
+            sylvode-${{ matrix.suffix }}.tar.gz.sha256
+            sylvode-${{ matrix.suffix }}.zip
+            sylvode-${{ matrix.suffix }}.zip.sha256
             openpr-${{ matrix.suffix }}.tar.gz
             openpr-${{ matrix.suffix }}.tar.gz.sha256
             openpr-${{ matrix.suffix }}.zip
@@ -135,13 +147,16 @@ jobs:
           cd frontend
           bun install
           bun run build
-          tar czf ../openpr-frontend.tar.gz build/ nginx.conf
+          tar czf ../sylvode-frontend.tar.gz build/ nginx.conf
+          cp ../sylvode-frontend.tar.gz ../openpr-frontend.tar.gz
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: openpr-frontend
-          path: openpr-frontend.tar.gz
+          name: sylvode-frontend
+          path: |
+            sylvode-frontend.tar.gz
+            openpr-frontend.tar.gz
 
   release:
     needs: [build, build-frontend]
@@ -169,26 +184,27 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: OpenPR ${{ steps.tag.outputs.tag }}
+          name: Sylvode ${{ steps.tag.outputs.tag }}
           draft: false
           prerelease: false
           files: artifacts/*
           body: |
-            ## OpenPR ${{ steps.tag.outputs.tag }}
+            ## Sylvode ${{ steps.tag.outputs.tag }}
 
-            Pre-built binaries for OpenPR (API server, Worker, MCP server, Frontend).
+            Pre-built binaries for Sylvode (API server, Worker, MCP server, native CLI, Frontend).
 
             ### Downloads
 
             | Platform | Architecture | File |
             |----------|-------------|------|
-            | Linux | x86_64 | `openpr-linux-amd64.tar.gz` |
-            | Linux | ARM64 | `openpr-linux-arm64.tar.gz` |
-            | macOS | Intel | `openpr-macos-amd64.tar.gz` |
-            | macOS | Apple Silicon | `openpr-macos-arm64.tar.gz` |
-            | Windows | x86_64 | `openpr-windows-amd64.zip` |
-            | Frontend | Static | `openpr-frontend.tar.gz` |
+            | Linux | x86_64 | `sylvode-linux-amd64.tar.gz` |
+            | Linux | ARM64 | `sylvode-linux-arm64.tar.gz` |
+            | macOS | Intel | `sylvode-macos-amd64.tar.gz` |
+            | macOS | Apple Silicon | `sylvode-macos-arm64.tar.gz` |
+            | Windows | x86_64 | `sylvode-windows-amd64.zip` |
+            | Frontend | Static | `sylvode-frontend.tar.gz` |
 
-            Each archive contains: `api`, `worker`, `mcp-server` binaries.
+            Each archive contains `api`, `worker`, legacy-compatible `mcp-server`, and
+            the new `sylvode` CLI. Matching `openpr-*` archive names are retained as aliases.
 
             See [README.md](https://github.com/openprx/openpr) for setup instructions.

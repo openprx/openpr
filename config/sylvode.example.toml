@@ -1,16 +1,13 @@
-# Legacy OpenPR-named configuration example, retained for Sylvode compatibility.
+# Sylvode configuration — annotated example.
 #
-# New installs should copy config/sylvode.example.toml to config/sylvode.toml. Existing installs
-# may continue using config/openpr.toml; when both default paths exist the service fails closed
-# until --config explicitly selects one.
-#
-# To exercise the legacy path, copy this file to config/openpr.toml, replace every placeholder, and start the
+# Copy this file to config/sylvode.toml, replace every replace_with_* placeholder, and start the
 # services from the directory that holds it, or pass --config <path>.
 #
-#     cp config/openpr.example.toml config/openpr.toml
-#     $EDITOR config/openpr.toml
+#     cp config/sylvode.example.toml config/sylvode.toml
+#     $EDITOR config/sylvode.toml
 #
-# Sylvode reads NO application configuration from environment variables. This legacy-named file remains a source of configuration for the
+# Sylvode reads NO application configuration from environment variables. This file is the source
+# of runtime configuration for the
 # API, the worker and the MCP server; each binary reads the sections it needs and ignores the
 # rest. A missing file is a startup error — the services never invent defaults for a database URL
 # or a signing key.
@@ -182,7 +179,7 @@ allow_private = false
 # ---------------------------------------------------------------------------------------------
 # [mcp] — MCP server. Optional for the API and the worker.
 #
-# Every call this server makes to the OpenPR API is made with a workspace bot token, and which
+# Every call this server makes to the Sylvode API is made with a workspace bot token, and which
 # bot that is depends on the transport:
 #
 #   stdio          One person runs one process from their own MCP client, so the identity is
@@ -199,7 +196,7 @@ allow_private = false
 # decides.
 # ---------------------------------------------------------------------------------------------
 [mcp]
-# Base URL of the OpenPR API the MCP server talks to. Default: http://localhost:8081.
+# Base URL of the Sylvode API the MCP server talks to. Default: http://localhost:8081.
 # api_url = "http://localhost:8081"
 
 # REQUIRED for transport = "stdio" and for the CLI subcommands, which have no per-request

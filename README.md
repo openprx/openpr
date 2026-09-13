@@ -1,4 +1,4 @@
-# OpenPR
+# Sylvode
 
 Open-source project management platform with built-in governance, a universal
 business-form engine, WASM plugins, and a first-class MCP server for AI agents.
@@ -11,7 +11,8 @@ Built with **Rust** (Axum + SeaORM), **SvelteKit**, and **PostgreSQL 16**.
 - **Universal forms** — project-defined business data types with grid/detail views, decimal-safe amounts, record links and child tables, formulas, per-role permissions, import/export, electronic signatures.
 - **WASM plugins** — per-project sandboxed plugins for field validation, formulas, and event handlers.
 - **Events** — transactional business-event ledger and HMAC-signed webhooks.
-- **MCP server** — 128 tools, 4 static resources, 19 resource templates, 3 transports; the same binary is also a CLI.
+- **MCP server** — 140 tools (the documented v0.8 quarantine-repair rebase), 4 static resources,
+  22 resource templates, 3 transports; the legacy `mcp-server` binary remains compatible.
 - **Scenario templates** — 6 ready-to-start setups: `code_delivery_default`, `contract_review_default`, `equipment_maintenance_default`, `quality_corrective_action_default`, `customer_delivery_default`, `restaurant_ordering_default`.
 
 ## Architecture
@@ -35,14 +36,15 @@ bash scripts/start.sh
 ```
 
 `scripts/start.sh` generates the deployment's configuration on first run —
-`config/openpr.compose.toml` for the API and the worker,
-`config/openpr.compose.mcp.toml` for the MCP server, plus a compose-only `.env`
+`config/sylvode.compose.toml` for the API and the worker,
+`config/sylvode.compose.mcp.toml` for the MCP server, plus a compose-only `.env`
 — filling in random non-production bootstrap secrets without echoing any of them
 to the terminal. It then builds release binaries for `Dockerfile.prebuilt` and
 runs `docker compose up -d --build`. The generated files are `chmod 600` and
 hold real secrets: replace them before production use, and never commit them.
-Services publish on `${OPENPR_BIND_HOST:-127.0.0.1}`: frontend `:3000`, API
-`:8081`, MCP `:8090`.
+Services publish on `${SYLVODE_BIND_HOST:-127.0.0.1}`: frontend `:3000`, API
+`:8081`, MCP `:8090`. `scripts/start.sh` maps the documented legacy environment
+aliases to these canonical compose inputs.
 For demo data once healthy, `scripts/bootstrap-restaurant-demo.sh` creates a
 demo account, workspace, `restaurant_ordering_default` project with sample
 records, and a workspace-scoped bot token; it refuses non-local API URLs unless
@@ -53,15 +55,15 @@ records, and a workspace-scoped bot token; it refuses non-local API URLs unless
 ```bash
 # Prerequisites: stable Rust with edition 2024 support, Bun, PostgreSQL 16
 scripts/dev-up.sh                                  # start only PostgreSQL from compose
-cp config/openpr.example.toml config/openpr.toml
-$EDITOR config/openpr.toml                         # database.url, auth.jwt_secret, [mcp]
+cp config/sylvode.example.toml config/sylvode.toml
+$EDITOR config/sylvode.toml                        # database.url, auth.jwt_secret, [mcp]
 
-cargo run --bin api -- --config config/openpr.toml     # listens on server.bind_addr, default 0.0.0.0:8081
-cargo run --bin worker -- --config config/openpr.toml
+cargo run --bin api -- --config config/sylvode.toml     # listens on server.bind_addr, default 0.0.0.0:8081
+cargo run --bin worker -- --config config/sylvode.toml
 
 cd frontend && bun install && bun run dev
 
-cargo run --bin mcp-server -- serve --config config/openpr.toml --transport http
+cargo run --bin mcp-server -- serve --config config/sylvode.toml --transport http
 ```
 
 > A host-side run reaches PostgreSQL through the published port, so
@@ -69,19 +71,20 @@ cargo run --bin mcp-server -- serve --config config/openpr.toml --transport http
 > `mcp.api_url` follows the same rule: `http://localhost:8081` from the host,
 > the `api` service address from inside the compose network.
 >
-> `--config` is optional; every binary falls back to `config/openpr.toml`
-> relative to its working directory, which is what these commands would use
-> anyway when run from the repository root.
+> `--config` is optional; every binary first looks for `config/sylvode.toml`.
+> A legacy `config/openpr.toml` is discovered when the new path is absent. If both
+> exist, startup fails until `--config` explicitly selects one.
 
 ## Configuration
 
 **One TOML file, no environment variables.** `api`, `worker` and `mcp-server`
 read every setting from a single configuration file and **no environment
 variable at all**. The path comes from `--config <PATH>`, defaulting to
-`config/openpr.toml` relative to the process working directory. A missing file
+`config/sylvode.toml` relative to the process working directory. A missing file
 is a startup error, never a silent fallback: the binaries never invent a
-database URL or a signing key. `config/openpr.example.toml` is the annotated
-reference — copy it to `config/openpr.toml` and edit it.
+database URL or a signing key. `config/sylvode.example.toml` is the annotated
+reference. The old `config/openpr.toml` default remains a compatibility fallback,
+but never silently wins over the new path.
 
 Unknown keys are rejected, so a misspelled setting fails startup instead of
 being silently ignored.
@@ -225,9 +228,9 @@ audit-trail integrity, and can perform any read/write a workspace member can.
 ```json
 {
   "mcpServers": {
-    "openpr": {
+    "sylvode": {
       "command": "/path/to/mcp-server",
-      "args": ["serve", "--config", "/absolute/path/to/config/openpr.toml"]
+      "args": ["serve", "--config", "/absolute/path/to/config/sylvode.toml"]
     }
   }
 }
@@ -236,8 +239,12 @@ audit-trail integrity, and can perform any read/write a workspace member can.
 No `env` block: the binary reads no environment variables, so `mcp.api_url`,
 `mcp.bot_token` and `mcp.workspace_id` come from the file the `--config` path
 names. An absolute path is what makes this work — the default
-`config/openpr.toml` is relative to whatever working directory the MCP client
+`config/sylvode.toml` is relative to whatever working directory the MCP client
 happens to launch the process in.
+
+The legacy server command and `config/openpr.toml` remain supported in v0.9;
+see [the compatibility matrix](docs/sylvode-v0.9-compatibility.md) for conflict
+handling and the earliest possible removal versions.
 
 > `--api-url`, `--bot-token`, `--workspace-id`, `--transport` and `--bind-addr`
 > exist as command-line overrides and win over the file. Prefer the file for
@@ -385,7 +392,7 @@ All under `scripts/`.
 
 | Group       | Scripts                                                                   |
 | ----------- | ------------------------------------------------------------------------- |
-| Lifecycle   | `start.sh` (first-run `config/openpr.compose.toml` + `config/openpr.compose.mcp.toml` + compose `.env`, random bootstrap secrets, build release binaries, `compose up -d`), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
+| Lifecycle   | `start.sh` (first-run `config/sylvode.compose.toml` + `config/sylvode.compose.mcp.toml` + compose `.env`, random bootstrap secrets, build release binaries, `compose up -d`; legacy OpenPR filenames are discovered), `dev-up.sh` (PostgreSQL only, for host-side Rust), `stop.sh`, `clean.sh` (**tears down volumes** — destroys database data, asks to confirm) |
 | Database    | `init-db.sh` (apply migrations in order), `backup-db.sh` (gzipped dump into `backups/`), `restore-db.sh`                                                                                                                              |
 | Verification | `e2e-test.sh` (one-shot end-to-end with automatic teardown), `test-api.sh`, `test-mcp.sh` (legacy v0.4 integration checks), `verify.sh` (component health check)                                                                            |
 | Development | `dev-check.sh` (`cargo fmt --check`, `check`, `clippy -D warnings`, `test`), `ci-universal-forms-gates.sh` (reproduce the CI-only `Universal Forms Gates` bundle locally)                                                              |

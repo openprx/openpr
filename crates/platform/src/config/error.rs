@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::error::AppError;
 
 /// Path of the annotated example shipped with the repository.
-pub const EXAMPLE_CONFIG_PATH: &str = "config/openpr.example.toml";
+pub const EXAMPLE_CONFIG_PATH: &str = "config/sylvode.example.toml";
 
 /// Why a configuration file could not be turned into a usable [`super::OpenPrConfig`].
 ///
@@ -71,7 +71,7 @@ impl fmt::Display for ConfigError {
         match self {
             Self::NotFound { path } => write!(
                 f,
-                "configuration file not found at {}. OpenPR is configured by file only and reads no \
+                "configuration file not found at {}. Sylvode is configured by file only and reads no \
                  environment variables: copy {EXAMPLE_CONFIG_PATH} to {default}, replace every \
                  replace_with_* placeholder (generate secrets with `openssl rand -hex 32`), then start the \
                  service from the directory that holds it or pass --config <path>",
@@ -140,7 +140,7 @@ mod tests {
         }
         .to_string();
         assert!(rendered.contains("/srv/openpr/config/openpr.toml"), "{rendered}");
-        assert!(rendered.contains("config/openpr.example.toml"), "{rendered}");
+        assert!(rendered.contains("config/sylvode.example.toml"), "{rendered}");
         assert!(rendered.contains("--config"), "{rendered}");
     }
 

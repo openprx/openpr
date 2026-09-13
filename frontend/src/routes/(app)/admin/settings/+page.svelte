@@ -10,7 +10,7 @@
 	import Input from '$lib/components/Input.svelte';
 
 	let basicSettings = $state({
-		siteName: 'OpenPR',
+		siteName: 'Sylvode',
 		siteUrl: 'https://openpr.local',
 		allowWorkspaceCreate: 'admin_only'
 	});

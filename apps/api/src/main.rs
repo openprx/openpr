@@ -37,13 +37,13 @@ struct BuildInfo {
     source: &'static str,
 }
 
-/// Command line surface of the API binary.
+/// Sylvode API server command-line surface.
 ///
 /// The process accepts a configuration path or a side-effect-free build identity query.
 #[derive(Parser)]
-#[command(name = "api", about = "OpenPR API server")]
+#[command(name = "api", about = "Sylvode API server")]
 struct Args {
-    /// Path to the configuration file. Defaults to config/openpr.toml
+    /// Path to the configuration file. Defaults to config/sylvode.toml, with legacy fallback.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 

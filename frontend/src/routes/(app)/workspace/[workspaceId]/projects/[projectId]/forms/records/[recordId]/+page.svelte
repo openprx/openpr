@@ -632,7 +632,7 @@
 </script>
 
 <svelte:head>
-	<title>{record?.title ?? $t('forms.recordTitle')} · OpenPR</title>
+	<title>{record?.title ?? $t('forms.recordTitle')} · Sylvode</title>
 </svelte:head>
 
 <div class="min-h-screen bg-slate-50 px-4 py-6 dark:bg-slate-950 sm:px-6 lg:px-8">

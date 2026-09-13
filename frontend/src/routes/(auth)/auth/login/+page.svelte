@@ -38,7 +38,7 @@
 <div class="min-h-screen flex items-center justify-center bg-slate-50 px-4 dark:bg-slate-950">
 	<div class="max-w-md w-full space-y-8">
 		<div class="text-center">
-			<h1 class="text-3xl font-bold text-slate-900 dark:text-slate-100">OpenPR</h1>
+			<h1 class="text-3xl font-bold text-slate-900 dark:text-slate-100">Sylvode</h1>
 			<p class="mt-2 text-sm text-slate-600 dark:text-slate-400">{$t('auth.subtitle')}</p>
 		</div>
 
