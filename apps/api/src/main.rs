@@ -2388,6 +2388,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0066_flow_v08_object_retention.sql",
         include_str!("../../../migrations/0066_flow_v08_object_retention.sql"),
     ),
+    (
+        "0067_flow_package_jobs.sql",
+        include_str!("../../../migrations/0067_flow_package_jobs.sql"),
+    ),
 ];
 
 /// Newest migration an existing database may claim without executing it.
@@ -2737,6 +2741,10 @@ const MIGRATION_PROBES: &[(&str, SchemaProbe)] = &[
     (
         "0066_flow_v08_object_retention.sql",
         SchemaProbe::Relation("idx_flow_objects_permanent_cleanup"),
+    ),
+    (
+        "0067_flow_package_jobs.sql",
+        SchemaProbe::Relation("flow_package_artifacts"),
     ),
 ];
 

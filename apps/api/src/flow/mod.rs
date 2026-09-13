@@ -29,6 +29,7 @@ pub mod collections;
 pub mod command;
 pub mod event_origin;
 pub mod event_policy;
+pub mod export;
 pub mod grants;
 pub mod import;
 pub mod maintenance;
