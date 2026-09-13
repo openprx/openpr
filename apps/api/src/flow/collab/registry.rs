@@ -318,6 +318,19 @@ impl SessionRegistry {
         Self::default()
     }
 
+    /// Workspaces with live local sessions. The durable authorization listener uses this bounded
+    /// set to poll each workspace's epoch log independently, so a late commit in one workspace
+    /// cannot be hidden behind a process-global cursor.
+    #[must_use]
+    pub fn active_workspace_ids(&self) -> Vec<Uuid> {
+        let connections = self.connections.lock();
+        let mut ids: Vec<_> = connections.by_session.values().map(|meta| meta.workspace_id).collect();
+        drop(connections);
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// Atomically checks `connections_per_user_max`/`connections_per_document_max`/
     /// `connections_per_workspace_max` and, if all three have room, reserves the slot and
     /// registers the session's outbound channel in one critical section (`limits-v1.md`: "计数与

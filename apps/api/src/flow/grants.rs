@@ -1021,7 +1021,7 @@ async fn apply_in_transaction(
     // `fence_epoch_for_share` afterwards. Unconditional, including for a request that changed no
     // row: a no-op that skipped the bump would be indistinguishable on the wire from one that did
     // not, and the cost of an extra epoch is a resync, never a wrong answer.
-    let committed_epoch = authz::advance_epoch(tx, workspace_id).await?;
+    let committed_epoch = authz::advance_epoch_for_roots(tx, workspace_id, &[object_id]).await?;
 
     Ok((
         Outcome {
@@ -1781,11 +1781,12 @@ mod database_tests {
     // 1. An authorization boundary must cut the workspace baseline, not be max'd with it
     // -----------------------------------------------------------------------------------------
 
-    /// `permission_revocation_closes_subtree_sessions`: a committed boundary change is evaluated
-    /// over the shared recursive subtree query, removes revoked presence before closing, ejects
-    /// revoked recipients from later presence fan-out, and leaves a still-authorized owner alive.
+    /// `multi_instance_revocation_closes_subtree_sessions`: instance A commits the authorization
+    /// change while an independent instance B registry consumes only the durable log. B expands
+    /// the recorded root, removes revoked presence before closing, ejects revoked recipients from
+    /// later fan-out, and leaves a still-authorized owner alive.
     #[tokio::test]
-    async fn subtree_revocation_removes_presence_closes_only_insufficient_sessions_and_stops_fanout() {
+    async fn multi_instance_revocation_closes_subtree_sessions_without_skipping_log_epochs() {
         use crate::flow::collab::frame::{Frame, PROTOCOL_VERSION};
         use crate::flow::collab::registry::{OutboundEvent, SessionRegistry};
 
@@ -1885,23 +1886,15 @@ mod database_tests {
         let committed_epoch = authz::read_epoch(&scratch.db, fx.workspace_id)
             .await
             .expect("committed epoch reads");
-        let revocation_stats = crate::flow::collab::revocation::revalidate_authorization_change_with_registry(
-            &state,
-            &registry,
-            fx.workspace_id,
-            committed_epoch,
-        )
-        .await;
-        assert_eq!(revocation_stats.candidates, 3);
-        assert_eq!(revocation_stats.revoked, 2);
-        assert_eq!(
-            revocation_stats.presence_removed, 2,
-            "revocation must remove presence immediately"
-        );
-        assert_eq!(
-            revocation_stats.disconnected, 2,
-            "both insufficient sessions must leave the registry"
-        );
+        let rows = crate::flow::collab::fanout::poll_authorization_after(&scratch.db, fx.workspace_id, 0)
+            .await
+            .expect("instance B reads the durable revocation log");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].authz_epoch, committed_epoch);
+        assert_eq!(rows[0].subtree_root_ids, vec![parent]);
+        let observed_epoch =
+            crate::flow::collab::fanout::relay_authorization_batch(&state, &registry, fx.workspace_id, rows, 0).await;
+        assert_eq!(observed_epoch, committed_epoch);
         assert_eq!(registry.presence_count(parent_document), 0);
         assert_eq!(
             registry.presence_count(child_document),
@@ -1950,6 +1943,31 @@ mod database_tests {
         );
         assert_eq!(registry.session_count(parent_document), 0);
         assert_eq!(registry.session_count(child_document), 1);
+
+        // Directly manufacture the delivery-order attack from ADR-0016: E+2 becomes visible to
+        // the poller before E+1. The query must read by per-workspace epoch, never by a global
+        // sequence/cursor that could permanently skip E+1.
+        exec(
+            &scratch.db,
+            "INSERT INTO flow_authz_revocations (workspace_id, authz_epoch, subtree_root_ids) \
+             VALUES ($1, $2, $4), ($1, $3, $4)",
+            vec![
+                fx.workspace_id.into(),
+                (committed_epoch + 2).into(),
+                (committed_epoch + 1).into(),
+                vec![child].into(),
+            ],
+        )
+        .await;
+        let reordered =
+            crate::flow::collab::fanout::poll_authorization_after(&scratch.db, fx.workspace_id, committed_epoch)
+                .await
+                .expect("out-of-order delivery rows are polled");
+        assert_eq!(
+            reordered.iter().map(|row| row.authz_epoch).collect::<Vec<_>>(),
+            vec![committed_epoch + 1, committed_epoch + 2],
+            "a later observed epoch must not make an earlier durable row a permanent miss"
+        );
 
         scratch.drop_self().await;
     }

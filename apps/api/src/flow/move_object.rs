@@ -1204,7 +1204,7 @@ async fn run_locked_phase(
     // `ADR-0012` §3.1 point 1: `parent_id` is an authorization change, so this transaction
     // advances the epoch. Any content write that checked permission before this commit now fails
     // its own `FOR SHARE` fence.
-    let committed_epoch = authz::advance_epoch(tx, plan.workspace_id).await?;
+    let committed_epoch = authz::advance_epoch_for_roots(tx, plan.workspace_id, &[plan.object_id]).await?;
 
     Ok(LockedOutcome::Committed {
         event_id: outcome.event_id,

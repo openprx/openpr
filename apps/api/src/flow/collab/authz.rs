@@ -1015,15 +1015,38 @@ pub async fn fence_epoch_for_share<C: ConnectionTrait>(
 /// `NotFound` if the workspace has no `flow_workspace_settings` row. Propagates a database write
 /// failure otherwise.
 pub async fn advance_epoch<C: ConnectionTrait>(conn: &C, workspace_id: Uuid) -> Result<i64, ApiError> {
+    advance_epoch_for_roots(conn, workspace_id, &[]).await
+}
+
+/// Atomically advances the workspace epoch, appends ADR-0016's durable log row, and emits a
+/// redacted doorbell. The roots are caller-known inputs; this statement never expands a subtree
+/// while holding the epoch row's write lock.
+pub async fn advance_epoch_for_roots<C: ConnectionTrait>(
+    conn: &C,
+    workspace_id: Uuid,
+    subtree_root_ids: &[Uuid],
+) -> Result<i64, ApiError> {
     #[derive(FromQueryResult)]
     struct Row {
         authz_epoch: i64,
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1, updated_at = now() \
-         WHERE workspace_id = $1 RETURNING authz_epoch",
-        vec![workspace_id.into()],
+        "WITH advanced AS (\
+             UPDATE flow_workspace_settings \
+                SET authz_epoch = authz_epoch + 1, updated_at = now() \
+              WHERE workspace_id = $1 \
+          RETURNING workspace_id, authz_epoch\
+         ), logged AS (\
+             INSERT INTO flow_authz_revocations (workspace_id, authz_epoch, subtree_root_ids) \
+             SELECT workspace_id, authz_epoch, $2 FROM advanced \
+             RETURNING workspace_id, authz_epoch\
+         ) \
+         SELECT authz_epoch, pg_notify(\
+             'openpr_flow_authz',\
+             json_build_object('workspace_id', workspace_id, 'authz_epoch', authz_epoch)::text\
+         ) AS notified FROM logged",
+        vec![workspace_id.into(), subtree_root_ids.to_vec().into()],
     ))
     .one(conn)
     .await?;
@@ -1050,8 +1073,18 @@ pub async fn advance_epoch_if_present<C: ConnectionTrait>(
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1 \
-         WHERE workspace_id = $1 RETURNING authz_epoch",
+        "WITH advanced AS (\
+             UPDATE flow_workspace_settings SET authz_epoch = authz_epoch + 1, updated_at = now() \
+              WHERE workspace_id = $1 RETURNING workspace_id, authz_epoch\
+         ), logged AS (\
+             INSERT INTO flow_authz_revocations (workspace_id, authz_epoch, subtree_root_ids) \
+             SELECT workspace_id, authz_epoch, '{}'::uuid[] FROM advanced \
+             RETURNING workspace_id, authz_epoch\
+         ) \
+         SELECT authz_epoch, pg_notify(\
+             'openpr_flow_authz',\
+             json_build_object('workspace_id', workspace_id, 'authz_epoch', authz_epoch)::text\
+         ) AS notified FROM logged",
         vec![workspace_id.into()],
     ))
     .one(conn)

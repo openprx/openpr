@@ -5,6 +5,7 @@
 //! frames from `collab_updates`. Duplicate, lost, or reordered notifications therefore cannot
 //! allocate a seq or make a subscription skip one.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -12,6 +13,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sea_orm::{ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbBackend, FromQueryResult, Statement};
 use uuid::Uuid;
+
+use platform::app::AppState;
 
 use super::bootstrap;
 use super::frame::{Frame, PROTOCOL_VERSION};
@@ -32,6 +35,12 @@ struct Notice {
     id: i64,
     document_id: Uuid,
     document_seq: Option<i64>,
+}
+
+#[derive(Debug, FromQueryResult)]
+pub(crate) struct AuthorizationRevocation {
+    pub(crate) authz_epoch: i64,
+    pub(crate) subtree_root_ids: Vec<Uuid>,
 }
 
 /// Stages a pointer to one accepted update and emits a best-effort wakeup. Both statements are in
@@ -84,6 +93,47 @@ async fn poll_after(db: &DatabaseConnection, cursor: i64) -> Result<Vec<Notice>,
     ))
     .all(db)
     .await?)
+}
+
+pub(crate) async fn poll_authorization_after(
+    db: &DatabaseConnection,
+    workspace_id: Uuid,
+    epoch: i64,
+) -> Result<Vec<AuthorizationRevocation>, ApiError> {
+    Ok(
+        AuthorizationRevocation::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT authz_epoch, subtree_root_ids FROM flow_authz_revocations \
+          WHERE workspace_id = $1 AND authz_epoch > $2 \
+          ORDER BY authz_epoch ASC LIMIT $3",
+            vec![workspace_id.into(), epoch.into(), POLL_BATCH.into()],
+        ))
+        .all(db)
+        .await?,
+    )
+}
+
+pub(crate) async fn relay_authorization_batch(
+    state: &AppState,
+    registry: &SessionRegistry,
+    workspace_id: Uuid,
+    rows: Vec<AuthorizationRevocation>,
+    mut epoch: i64,
+) -> i64 {
+    for row in rows {
+        super::permission_cache::invalidate_workspace_after_commit(state, workspace_id);
+        let revocation = super::revocation::revalidate_logged_authorization_change(
+            state,
+            registry,
+            workspace_id,
+            row.authz_epoch,
+            &row.subtree_root_ids,
+        )
+        .await;
+        tracing::debug!(%workspace_id, authz_epoch = row.authz_epoch, ?revocation, "durable authorization revocation relayed");
+        epoch = row.authz_epoch;
+    }
+    epoch
 }
 
 async fn relay(registry: &SessionRegistry, db: &DatabaseConnection, notice: &Notice) -> Result<(), ApiError> {
@@ -155,24 +205,38 @@ async fn relay_batch(
 
 /// Starts the API-local durable cursor. Multiple calls in one process are a no-op; multiple API
 /// processes each have their own cursor and relay into only their own session registry.
-pub fn spawn_listener(db: DatabaseConnection, registry: &'static SessionRegistry) {
+pub fn spawn_listener(state: AppState, registry: &'static SessionRegistry) {
     if LISTENER_STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
     tokio::spawn(async move {
+        let db = &state.db;
         let mut cursor = loop {
-            match newest_notice_id(&db).await {
+            match newest_notice_id(db).await {
                 Ok(id) => break id,
                 Err(error) => tracing::warn!(%error, "flow fanout cursor initialization failed"),
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         };
+        let mut authorization_watermarks = HashMap::<Uuid, i64>::new();
         loop {
-            match poll_after(&db, cursor).await {
+            match poll_after(db, cursor).await {
                 Ok(notices) => {
-                    cursor = relay_batch(registry, &db, notices, cursor).await;
+                    cursor = relay_batch(registry, db, notices, cursor).await;
                 }
                 Err(error) => tracing::warn!(%error, cursor, "flow fanout durable poll failed"),
+            }
+            for workspace_id in registry.active_workspace_ids() {
+                let epoch = authorization_watermarks.get(&workspace_id).copied().unwrap_or_default();
+                match poll_authorization_after(db, workspace_id, epoch).await {
+                    Ok(rows) => {
+                        let next = relay_authorization_batch(&state, registry, workspace_id, rows, epoch).await;
+                        authorization_watermarks.insert(workspace_id, next);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %workspace_id, epoch, "authorization revocation durable poll failed")
+                    }
+                }
             }
             tokio::time::sleep(POLL_INTERVAL).await;
         }

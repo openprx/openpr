@@ -1,4 +1,4 @@
-//! Post-commit, single-instance authorization revocation for active collaboration sessions.
+//! Post-commit authorization revocation for active collaboration sessions.
 //!
 //! This is a timeliness path, not the correctness barrier: content writes remain protected by
 //! `authz_epoch` fencing in [`super::write`]. Every producer calls this only after its mutation
@@ -49,6 +49,11 @@ pub struct RevocationStats {
 struct RoleRow {
     user_id: Uuid,
     role: String,
+}
+
+#[derive(FromQueryResult)]
+struct ObjectRow {
+    id: Uuid,
 }
 
 async fn current_roles(
@@ -259,6 +264,47 @@ pub(crate) async fn revalidate_authorization_change_with_registry(
     committed_epoch: i64,
 ) -> RevocationStats {
     let candidates = registry.observe_epoch_and_workspace_sessions(workspace_id, committed_epoch);
+    revalidate_candidates(state, registry, workspace_id, candidates).await
+}
+
+/// Re-evaluates only sessions under the roots recorded by ADR-0016's durable authorization log.
+/// An empty root set is the explicit workspace-wide form used by membership, baseline, and
+/// feature changes. Root expansion happens after commit and outside every collab write lock.
+pub(crate) async fn revalidate_logged_authorization_change(
+    state: &AppState,
+    registry: &SessionRegistry,
+    workspace_id: Uuid,
+    committed_epoch: i64,
+    subtree_root_ids: &[Uuid],
+) -> RevocationStats {
+    if subtree_root_ids.is_empty() {
+        return revalidate_authorization_change_with_registry(state, registry, workspace_id, committed_epoch).await;
+    }
+    let objects = match ObjectRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "WITH RECURSIVE subtree AS (\
+             SELECT id FROM flow_objects WHERE workspace_id = $1 AND id = ANY($2) \
+             UNION ALL \
+             SELECT child.id FROM flow_objects child JOIN subtree parent ON child.parent_id = parent.id \
+              WHERE child.workspace_id = $1\
+         ) SELECT DISTINCT id FROM subtree",
+        vec![workspace_id.into(), subtree_root_ids.to_vec().into()],
+    ))
+    .all(&state.db)
+    .await
+    {
+        Ok(objects) => objects.into_iter().map(|row| row.id).collect(),
+        Err(error) => {
+            tracing::warn!(%workspace_id, %error, "authorization subtree expansion failed; draining workspace sessions");
+            let candidates = registry.observe_epoch_and_workspace_sessions(workspace_id, committed_epoch);
+            return RevocationStats {
+                candidates: candidates.len(),
+                retryable_drained: registry.drain_sessions(&candidates, CONNECTION_LIMIT_RETRY_AFTER_MS),
+                ..RevocationStats::default()
+            };
+        }
+    };
+    let candidates = registry.observe_epoch_and_subtree_sessions(workspace_id, committed_epoch, &objects);
     revalidate_candidates(state, registry, workspace_id, candidates).await
 }
 
