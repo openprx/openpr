@@ -1463,6 +1463,21 @@ mod tests {
         let report = commit_package_import(&state.db, &commit).await.unwrap();
         assert_eq!(report.counts["created"], 1);
         assert_eq!(canonical_count(&state.db, target_workspace).await, before + 1);
+        let dispatch = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT \
+                   COUNT(*) FILTER (WHERE be.event_type='flow.import.completed')::bigint AS completed, \
+                   COUNT(*) FILTER (WHERE be.event_type='flow.import.previewed')::bigint AS previewed \
+                 FROM event_dispatch ed JOIN business_events be ON be.id=ed.event_id WHERE be.workspace_id=$1",
+                vec![target_workspace.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dispatch.try_get::<i64>("", "completed").unwrap(), 1);
+        assert_eq!(dispatch.try_get::<i64>("", "previewed").unwrap(), 0);
         let replay = commit_package_import(&state.db, &commit).await.unwrap();
         assert_eq!(replay.import_id, report.import_id);
         assert_eq!(replay.audit_event_id, report.audit_event_id);
@@ -1555,6 +1570,20 @@ mod tests {
         assert!(matches!(
             commit_package_import(&state.db, &drift).await,
             Err(ApiError::Conflict(_))
+        ));
+        assert!(matches!(
+            upload_package_artifact(
+                &state.db,
+                target_workspace,
+                &ImportPrincipal {
+                    role: "member".to_string(),
+                    ..principal(target_owner)
+                },
+                Vec::new(),
+                None,
+            )
+            .await,
+            Err(ApiError::Forbidden(_))
         ));
         scratch.drop_self().await;
     }
