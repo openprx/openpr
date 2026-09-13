@@ -870,11 +870,11 @@ async fn dispatch(client: &OpenPrClient, command: &Commands) -> Result<Value, Cl
                 let external_policy = mapping
                     .get("external_reference_policy")
                     .and_then(Value::as_str)
-                    .unwrap_or("drop");
+                    .unwrap_or("reject");
                 let conflict_policy = mapping
                     .get("conflict_policy")
                     .and_then(Value::as_str)
-                    .unwrap_or("new_ids");
+                    .unwrap_or("reject_existing");
                 let include_history = mapping.get("include_history").and_then(Value::as_bool).unwrap_or(false);
                 api_data(client.post_structured::<Value, _>(&format!("/api/v1/workspaces/{workspace}/flow/imports/preview"), &json!({"artifact_id":artifact_id,"project_mapping":project_mapping,"external_reference_policy":external_policy,"conflict_policy":conflict_policy,"include_history":include_history,"idempotency_key":idempotency_key})).await)
             }

@@ -778,6 +778,7 @@ fn invalid_archive() -> ApiError {
 mod tests {
     use super::*;
     use crate::error::ApiErrorKind;
+    use base64::Engine as _;
 
     const WORKSPACE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const OBJECT_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -848,6 +849,42 @@ mod tests {
 
     fn assert_kind(error: ApiError, expected: ApiErrorKind) {
         assert_eq!(error.kind(), expected, "wrong error: {error:?}");
+    }
+
+    #[test]
+    fn locked_package_fixture_rebuilds_to_the_frozen_archive_hash() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testing/fixtures/flow-package-v1/package-fixture.json"
+        );
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("locked fixture is readable"))
+                .expect("locked fixture is valid JSON");
+        let manifest: ExportPackageManifest =
+            serde_json::from_value(fixture["manifest"].clone()).expect("fixture manifest matches the v1 schema");
+        let members = fixture["members"]
+            .as_array()
+            .expect("fixture members are an array")
+            .iter()
+            .map(|member| PackageMemberInput {
+                path: member["path"].as_str().expect("member path").to_string(),
+                kind: member["kind"].as_str().expect("member kind").to_string(),
+                bytes: base64::engine::general_purpose::STANDARD
+                    .decode(member["bytes_base64"].as_str().expect("member bytes"))
+                    .expect("member bytes are canonical base64"),
+            })
+            .collect();
+        let built = build_package(manifest, members).expect("locked fixture builds");
+        assert_eq!(
+            built.package_sha256,
+            fixture["expected_package_sha256"]
+                .as_str()
+                .expect("expected archive hash"),
+            "package codec or a locked fixture changed; rebase requires reviewed wire-corpus evidence"
+        );
+        let verified = verify_package(Cursor::new(&built.bytes), Some(&built.package_sha256))
+            .expect("the production reader accepts the locked writer output");
+        assert_eq!(verified.manifest, built.manifest);
     }
 
     fn raw_zip(entries: Vec<(String, Vec<u8>)>, large_file: bool) -> Vec<u8> {

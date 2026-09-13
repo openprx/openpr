@@ -325,8 +325,8 @@ pub fn import_flow_preview_tool() -> ToolDefinition {
         "Preview a frozen package import without canonical writes.",
         &json!({
             "workspace_id":{"type":"string"},"artifact_id":{"type":"string"},"project_mapping":{"type":"object"},
-            "external_reference_policy":{"type":"string","enum":["drop","keep_unresolved"]},
-            "conflict_policy":{"type":"string","enum":["new_ids","reuse_import_lineage"]},
+            "external_reference_policy":{"type":"string","enum":["reject","detach"]},
+            "conflict_policy":{"type":"string","enum":["reject_existing","reuse_import_lineage"]},
             "include_history":{"type":"boolean","default":false},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}
         }),
         &[
@@ -344,7 +344,7 @@ pub fn import_flow_commit_tool() -> ToolDefinition {
         "Atomically commit a frozen package import.",
         &json!({
             "workspace_id":{"type":"string"},"import_id":{"type":"string"},"package_sha256":{"type":"string"},
-            "mapping_hash":{"type":"string"},"conflict_policy":{"type":"string","enum":["new_ids","reuse_import_lineage"]},
+            "mapping_hash":{"type":"string"},"conflict_policy":{"type":"string","enum":["reject_existing","reuse_import_lineage"]},
             "confirm":{"const":true},"idempotency_key":{"type":"string","minLength":1,"maxLength":128}
         }),
         &[

@@ -1,0 +1,65 @@
+{
+  "expected_package_sha256": "e54cd08412ed8bff92cf694a518ff49f1f841f1671049ba85dccc1f36b1d5b19",
+  "manifest": {
+    "schema": "sylvode.flow.export-package.v1",
+    "package_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    "created_at": "2026-09-12T12:00:00Z",
+    "producer": {
+      "product": "sylvode",
+      "version": "0.8.0",
+      "source_head": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "source": {
+      "workspace_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "scope": "object",
+      "root_object_ids": ["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]
+    },
+    "flow_schema_version": 1,
+    "engine": {
+      "name": "loro",
+      "crate_version": "1.13.9",
+      "wire_format_version": 1
+    },
+    "history": {
+      "included": false,
+      "through_seq_by_document": {
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc": 0
+      }
+    },
+    "counts": {
+      "objects": 1,
+      "documents": 1,
+      "updates": 0,
+      "relations": 0,
+      "lineage": 0,
+      "events": 0
+    },
+    "members": [],
+    "export_policy": {
+      "complete": true,
+      "permission_snapshot_at": "2026-09-12T12:00:00Z"
+    }
+  },
+  "members": [
+    {
+      "path": "documents/cccccccc-cccc-4ccc-8ccc-cccccccccccc/snapshot.bin",
+      "kind": "snapshot",
+      "bytes_base64": "c25hcHNob3QtdjE="
+    },
+    {
+      "path": "lineage/lineage.jsonl",
+      "kind": "lineage",
+      "bytes_base64": ""
+    },
+    {
+      "path": "objects/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/object.json",
+      "kind": "object",
+      "bytes_base64": "e30="
+    },
+    {
+      "path": "relations/relations.jsonl",
+      "kind": "relation",
+      "bytes_base64": ""
+    }
+  ]
+}

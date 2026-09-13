@@ -502,7 +502,7 @@ pub enum CollabAction {
         package_hash: String,
         #[arg(long = "mapping-hash")]
         mapping_hash: String,
-        #[arg(long = "conflict-policy", value_parser = ["new-ids", "reuse-import-lineage"])]
+        #[arg(long = "conflict-policy", value_parser = ["reject-existing", "reuse-import-lineage"])]
         conflict_policy: String,
         #[arg(long)]
         confirm: bool,
