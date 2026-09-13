@@ -1835,6 +1835,7 @@ pub async fn set_flow_feature(
     clippy::indexing_slicing
 )]
 mod flow_database_tests {
+    use std::io::{Cursor, Read, Write};
     use std::time::Duration;
 
     use super::{
@@ -1853,6 +1854,8 @@ mod flow_database_tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
     use serde_json::{Value, json};
     use uuid::Uuid;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
     use super::{
         CreateFlowObjectRequest, ExecuteFlowCommandRequest, FlowCommandEnvelope, FlowObjectDiffQuery,
@@ -9937,6 +9940,348 @@ mod flow_database_tests {
         let report = body_json(report_response).await;
         assert_eq!(report["data"]["status"], "completed", "{report}");
         assert_eq!(report["data"]["counts"]["created"], 1);
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_package_import_wire_limits_accept_exact_boundary_and_reject_plus_one_with_zero_writes() {
+        use tower::ServiceExt as _;
+
+        use crate::flow::import::{ImportLimits, TEST_IMPORT_LIMITS};
+        use crate::flow::package::{
+            ENGINE_CRATE_VERSION, ENGINE_NAME, ENGINE_WIRE_FORMAT_VERSION, ExportPackageManifest, ExportPolicy,
+            PackageCounts, PackageEngine, PackageHistory, PackageMemberInput, PackageProducer, PackageSource,
+            build_package,
+        };
+
+        const IMPORT_ARTIFACT_ROUTE: &str = "/api/v1/workspaces/{workspace_id}/flow/import-artifacts";
+
+        fn rewrite_snapshot_deflated(package: &[u8]) -> Vec<u8> {
+            let mut archive = ZipArchive::new(Cursor::new(package)).expect("stored package opens");
+            let mut entries = Vec::new();
+            for index in 0..archive.len() {
+                let mut member = archive.by_index(index).expect("member opens");
+                let mut bytes = Vec::new();
+                member.read_to_end(&mut bytes).expect("member reads");
+                entries.push((member.name().to_string(), bytes));
+            }
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            for (path, bytes) in entries {
+                let compression = if path.ends_with("/snapshot.bin") {
+                    CompressionMethod::Deflated
+                } else {
+                    CompressionMethod::Stored
+                };
+                let options = SimpleFileOptions::default()
+                    .compression_method(compression)
+                    .large_file(true)
+                    .unix_permissions(0o600);
+                writer.start_file(path, options).expect("deflated member starts");
+                writer.write_all(&bytes).expect("deflated member writes");
+            }
+            writer.finish().expect("deflated package finishes").into_inner()
+        }
+
+        fn package_shape(package: &[u8]) -> (u64, u64) {
+            let mut archive = ZipArchive::new(Cursor::new(package)).expect("package opens");
+            let entries = u64::try_from(archive.len()).expect("entry count fits");
+            let mut expanded = 0u64;
+            for index in 0..archive.len() {
+                expanded = expanded.saturating_add(archive.by_index(index).expect("member opens").size());
+            }
+            (entries, expanded)
+        }
+
+        fn snapshot_ratio(package: &[u8]) -> u64 {
+            let mut archive = ZipArchive::new(Cursor::new(package)).expect("package opens");
+            for index in 0..archive.len() {
+                let member = archive.by_index(index).expect("member opens");
+                if member.name().ends_with("/snapshot.bin") {
+                    return member
+                        .size()
+                        .saturating_add(member.compressed_size().saturating_sub(1))
+                        .checked_div(member.compressed_size())
+                        .expect("compressed snapshot is nonempty");
+                }
+            }
+            panic!("snapshot member is present");
+        }
+
+        fn deterministic_bytes(length: usize) -> Vec<u8> {
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                })
+                .collect()
+        }
+
+        async fn upload(
+            app: &axum::Router,
+            workspace_id: Uuid,
+            package: &[u8],
+            key: &str,
+            limits: ImportLimits,
+        ) -> Value {
+            TEST_IMPORT_LIMITS
+                .scope(limits, async {
+                    let response = app
+                        .clone()
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .method("POST")
+                                .uri(format!("/api/v1/workspaces/{workspace_id}/flow/import-artifacts"))
+                                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                                .body(axum::body::Body::from(
+                                    json!({
+                                        "source": {
+                                            "kind": "inline_base64",
+                                            "package_base64": base64::engine::general_purpose::STANDARD.encode(package),
+                                        },
+                                        "idempotency_key": key,
+                                    })
+                                    .to_string(),
+                                ))
+                                .expect("request builds"),
+                        )
+                        .await
+                        .expect("route responds");
+                    body_json(response).await
+                })
+                .await
+        }
+
+        async fn persisted_counts(state: &AppState, workspace_id: Uuid) -> (i64, i64, i64, i64, i64) {
+            let row = state
+                .db
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    "SELECT \
+                       (SELECT count(*) FROM flow_package_artifacts WHERE workspace_id=$1) AS artifacts, \
+                       (SELECT count(*) FROM flow_objects WHERE workspace_id=$1) AS objects, \
+                       (SELECT count(*) FROM collab_documents d JOIN flow_objects o ON o.id=d.object_id \
+                          WHERE o.workspace_id=$1) AS documents, \
+                       (SELECT count(*) FROM flow_import_jobs WHERE workspace_id=$1) AS jobs, \
+                       (SELECT count(*) FROM business_events WHERE workspace_id=$1) AS events",
+                    vec![workspace_id.into()],
+                ))
+                .await
+                .expect("count query runs")
+                .expect("count row exists");
+            (
+                row.try_get("", "artifacts").expect("artifact count"),
+                row.try_get("", "objects").expect("object count"),
+                row.try_get("", "documents").expect("document count"),
+                row.try_get("", "jobs").expect("job count"),
+                row.try_get("", "events").expect("event count"),
+            )
+        }
+
+        fn assert_limit(body: &Value, kind: &str, limit: u64, observed: u64) {
+            assert_eq!(body["error_code"], "limit_exceeded", "{body}");
+            assert_eq!(body["details"]["limit_kind"], kind, "{body}");
+            assert_eq!(body["details"]["limit"], limit, "{body}");
+            assert_eq!(body["details"]["observed"], observed, "{body}");
+        }
+
+        let scratch = scratch_or_skip!("package-wire-limits");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let object_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let manifest = ExportPackageManifest {
+            schema: "sylvode.flow.export-package.v1".to_string(),
+            package_id: Uuid::new_v4().to_string(),
+            created_at: "2026-09-12T12:00:00Z".to_string(),
+            producer: PackageProducer {
+                product: "sylvode".to_string(),
+                version: "0.8.0".to_string(),
+                source_head: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            },
+            source: PackageSource {
+                workspace_id: Uuid::new_v4().to_string(),
+                scope: "object".to_string(),
+                root_object_ids: vec![object_id.to_string()],
+            },
+            flow_schema_version: 1,
+            engine: PackageEngine {
+                name: ENGINE_NAME.to_string(),
+                crate_version: ENGINE_CRATE_VERSION.to_string(),
+                wire_format_version: ENGINE_WIRE_FORMAT_VERSION,
+            },
+            history: PackageHistory {
+                included: false,
+                through_seq_by_document: std::collections::BTreeMap::from([(document_id.to_string(), 0)]),
+            },
+            counts: PackageCounts {
+                objects: 1,
+                documents: 1,
+                ..PackageCounts::default()
+            },
+            members: Vec::new(),
+            export_policy: ExportPolicy {
+                complete: true,
+                permission_snapshot_at: "2026-09-12T12:00:00Z".to_string(),
+            },
+        };
+        let package_with_snapshot = |snapshot: Vec<u8>| {
+            build_package(
+                manifest.clone(),
+                vec![
+                    PackageMemberInput {
+                        path: format!("documents/{document_id}/snapshot.bin"),
+                        kind: "snapshot".to_string(),
+                        bytes: snapshot,
+                    },
+                    PackageMemberInput {
+                        path: format!("objects/{object_id}/object.json"),
+                        kind: "object".to_string(),
+                        bytes: b"{}".to_vec(),
+                    },
+                    PackageMemberInput {
+                        path: "lineage/lineage.jsonl".to_string(),
+                        kind: "lineage".to_string(),
+                        bytes: Vec::new(),
+                    },
+                    PackageMemberInput {
+                        path: "relations/relations.jsonl".to_string(),
+                        kind: "relation".to_string(),
+                        bytes: Vec::new(),
+                    },
+                ],
+            )
+            .expect("valid stored package builds")
+            .bytes
+        };
+        let exact_base = deterministic_bytes(8 * 1024);
+        let package = package_with_snapshot([exact_base.clone(), exact_base].concat());
+        let ratio_exact_package = rewrite_snapshot_deflated(&package);
+        let plus_one_base = deterministic_bytes(6 * 1024);
+        let ratio_plus_one_package = rewrite_snapshot_deflated(&package_with_snapshot(
+            plus_one_base.iter().copied().cycle().take(16 * 1024).collect(),
+        ));
+        assert_eq!(snapshot_ratio(&ratio_exact_package), 2, "exact ratio fixture drifted");
+        assert_eq!(snapshot_ratio(&ratio_plus_one_package), 3, "+1 ratio fixture drifted");
+        let (entries, expanded) = package_shape(&package);
+        let app = axum::Router::new()
+            .route(
+                IMPORT_ARTIFACT_ROUTE,
+                axum::routing::post(super::post_flow_import_artifact),
+            )
+            .layer(claims_for(owner_id))
+            .with_state(state.clone());
+        let unrestricted = ImportLimits {
+            archive_bytes: u64::MAX,
+            expanded_bytes: u64::MAX,
+            entry_count: u64::MAX,
+            compression_ratio: u64::MAX,
+        };
+
+        let cases = [
+            (
+                "import_archive_bytes",
+                ImportLimits {
+                    archive_bytes: u64::try_from(package.len()).expect("size fits"),
+                    ..unrestricted
+                },
+                ImportLimits {
+                    archive_bytes: u64::try_from(package.len() - 1).expect("size fits"),
+                    ..unrestricted
+                },
+                u64::try_from(package.len() - 1).expect("size fits"),
+                u64::try_from(package.len()).expect("size fits"),
+            ),
+            (
+                "import_expanded_bytes",
+                ImportLimits {
+                    expanded_bytes: expanded,
+                    ..unrestricted
+                },
+                ImportLimits {
+                    expanded_bytes: expanded - 1,
+                    ..unrestricted
+                },
+                expanded - 1,
+                expanded,
+            ),
+            (
+                "import_entry_count",
+                ImportLimits {
+                    entry_count: entries,
+                    ..unrestricted
+                },
+                ImportLimits {
+                    entry_count: entries - 1,
+                    ..unrestricted
+                },
+                entries - 1,
+                entries,
+            ),
+        ];
+        for (index, (kind, exact_limits, plus_one_limits, limit, observed)) in cases.into_iter().enumerate() {
+            let exact = upload(
+                &app,
+                workspace_id,
+                &package,
+                &format!("{kind}-exact-{index}"),
+                exact_limits,
+            )
+            .await;
+            assert_eq!(exact["code"], 0, "exact boundary must pass for {kind}: {exact}");
+            let before = persisted_counts(&state, workspace_id).await;
+            let plus_one = upload(
+                &app,
+                workspace_id,
+                &package,
+                &format!("{kind}-plus-one-{index}"),
+                plus_one_limits,
+            )
+            .await;
+            assert_limit(&plus_one, kind, limit, observed);
+            assert_eq!(
+                persisted_counts(&state, workspace_id).await,
+                before,
+                "{kind} rejection must write neither staging nor canonical rows"
+            );
+        }
+
+        let ratio_exact = upload(
+            &app,
+            workspace_id,
+            &ratio_exact_package,
+            "import-compression-ratio-exact",
+            ImportLimits {
+                compression_ratio: 2,
+                ..unrestricted
+            },
+        )
+        .await;
+        assert_eq!(
+            ratio_exact["code"], 0,
+            "ratio 2 exact boundary must pass: {ratio_exact}"
+        );
+        let before = persisted_counts(&state, workspace_id).await;
+        let ratio_plus_one = upload(
+            &app,
+            workspace_id,
+            &ratio_plus_one_package,
+            "import-compression-ratio-plus-one",
+            ImportLimits {
+                compression_ratio: 2,
+                ..unrestricted
+            },
+        )
+        .await;
+        assert_limit(&ratio_plus_one, "import_compression_ratio", 2, 3);
+        assert_eq!(
+            persisted_counts(&state, workspace_id).await,
+            before,
+            "compression-ratio rejection must write neither staging nor canonical rows"
+        );
+
         scratch.drop_self().await;
     }
 }

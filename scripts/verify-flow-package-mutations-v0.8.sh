@@ -104,7 +104,7 @@ grep -Fq 'if false {' "$SOURCE"
 run_case non_zip64_entry_accepted red "$RAW_TEST" exact
 restore_source
 
-perl -0pi -e 's/if declared_entries > IMPORT_ENTRY_COUNT_MAX/if false/' "$SOURCE"
+perl -0pi -e 's/if declared_entries > entry_count_max/if false/' "$SOURCE"
 grep -Fq 'if false {' "$SOURCE"
 run_case entry_count_preflight_bypassed red "$COUNT_TEST" exact
 restore_source

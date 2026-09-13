@@ -18,8 +18,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::ApiError;
 
-use super::collab::limits::IMPORT_ENTRY_COUNT_MAX;
-use super::import::BoundedImportStager;
+use super::import::{BoundedImportStager, effective_import_limits};
 
 pub const PACKAGE_SCHEMA: &str = "sylvode.flow.export-package.v1";
 pub const FLOW_SCHEMA_VERSION: u32 = 1;
@@ -208,11 +207,12 @@ pub fn verify_package<R: Read + Seek>(
     let mut raw = Vec::new();
     reader.read_to_end(&mut raw).map_err(|_| invalid_archive())?;
     let declared_entries = preflight_entry_count(&raw)?;
-    if declared_entries > IMPORT_ENTRY_COUNT_MAX {
+    let entry_count_max = effective_import_limits().entry_count;
+    if declared_entries > entry_count_max {
         return Err(ApiError::limit_exceeded(
             "import archive contains too many entries",
             "import_entry_count",
-            Some(serde_json::json!(IMPORT_ENTRY_COUNT_MAX)),
+            Some(serde_json::json!(entry_count_max)),
             Some(serde_json::json!(declared_entries)),
             None,
         ));

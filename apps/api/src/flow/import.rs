@@ -19,6 +19,38 @@ use super::collab::limits::{
 };
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) struct ImportLimits {
+    pub archive_bytes: u64,
+    pub expanded_bytes: u64,
+    pub entry_count: u64,
+    pub compression_ratio: u64,
+}
+
+const PRODUCTION_IMPORT_LIMITS: ImportLimits = ImportLimits {
+    archive_bytes: IMPORT_ARCHIVE_BYTES_MAX,
+    expanded_bytes: IMPORT_EXPANDED_BYTES_MAX,
+    entry_count: IMPORT_ENTRY_COUNT_MAX,
+    compression_ratio: IMPORT_COMPRESSION_RATIO_MAX,
+};
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_IMPORT_LIMITS: ImportLimits;
+}
+
+#[cfg(not(test))]
+pub(crate) const fn effective_import_limits() -> ImportLimits {
+    PRODUCTION_IMPORT_LIMITS
+}
+
+#[cfg(test)]
+pub(crate) fn effective_import_limits() -> ImportLimits {
+    TEST_IMPORT_LIMITS
+        .try_with(|limits| *limits)
+        .unwrap_or(PRODUCTION_IMPORT_LIMITS)
+}
+
+#[derive(Debug, Clone, Copy)]
 struct EntryBudget {
     compressed_bytes: u64,
     expanded_bytes: u64,
@@ -80,7 +112,7 @@ impl<A: Write, E: Write> BoundedImportStager<A, E> {
         let observed = self.archive_bytes.saturating_add(chunk_bytes);
         if let Err(error) = check_limit(
             observed,
-            IMPORT_ARCHIVE_BYTES_MAX,
+            effective_import_limits().archive_bytes,
             "import_archive_bytes",
             "import archive exceeds the fixed decoded byte ceiling",
         ) {
@@ -149,7 +181,7 @@ impl<A: Write, E: Write> BoundedImportStager<A, E> {
         let observed = self.entry_count.saturating_add(1);
         if let Err(error) = check_limit(
             observed,
-            IMPORT_ENTRY_COUNT_MAX,
+            effective_import_limits().entry_count,
             "import_entry_count",
             "import archive contains too many entries",
         ) {
@@ -179,7 +211,7 @@ impl<A: Write, E: Write> BoundedImportStager<A, E> {
         let total_expanded = self.expanded_bytes.saturating_add(chunk_bytes);
         if let Err(error) = check_limit(
             total_expanded,
-            IMPORT_EXPANDED_BYTES_MAX,
+            effective_import_limits().expanded_bytes,
             "import_expanded_bytes",
             "import package exceeds the fixed expanded byte ceiling",
         ) {
@@ -271,7 +303,8 @@ fn check_limit(observed: u64, limit: u64, limit_kind: &'static str, message: &'s
 }
 
 fn check_ratio(expanded_bytes: u64, compressed_bytes: u64) -> Result<(), ApiError> {
-    let allowed = compressed_bytes.saturating_mul(IMPORT_COMPRESSION_RATIO_MAX);
+    let limit = effective_import_limits().compression_ratio;
+    let allowed = compressed_bytes.saturating_mul(limit);
     if expanded_bytes > allowed {
         let observed_ratio = expanded_bytes
             .saturating_add(compressed_bytes.saturating_sub(1))
@@ -280,7 +313,7 @@ fn check_ratio(expanded_bytes: u64, compressed_bytes: u64) -> Result<(), ApiErro
         return Err(ApiError::limit_exceeded(
             "import entry or package exceeds the fixed compression ratio ceiling",
             "import_compression_ratio",
-            Some(json!(IMPORT_COMPRESSION_RATIO_MAX)),
+            Some(json!(limit)),
             Some(json!(observed_ratio)),
             None,
         ));
