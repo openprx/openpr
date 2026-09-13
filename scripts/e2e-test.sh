@@ -22,6 +22,10 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Keep the destructive compose lifecycle isolated from developer/demo stacks and make every
+# container created by this RC gate visibly owned by v0.9.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-v09-openpr-rc}"
+
 ASSUME_YES="${OPENPR_E2E_ASSUME_YES:-0}"
 KEEP_STACK="${OPENPR_E2E_KEEP_STACK:-0}"
 
@@ -66,7 +70,8 @@ docker compose down -v --remove-orphans
 # token they carry name rows that the wipe just deleted. Leaving them in place makes the MCP
 # server authenticate as a bot that no longer exists, so drop them and let start.sh regenerate
 # a matching set. Only the generated files go; config/openpr.example.toml is untouched.
-rm -f config/openpr.compose.toml config/openpr.compose.mcp.toml
+rm -f config/sylvode.compose.toml config/sylvode.compose.mcp.toml \
+  config/openpr.compose.toml config/openpr.compose.mcp.toml
 echo "✅ Environment reset"
 echo ""
 
@@ -204,6 +209,9 @@ else
 fi
 
 echo ""
+if [ -n "${OPENPR_E2E_CONTAINER_SNAPSHOT:-}" ]; then
+  docker compose ps --format '{{.Name}}' >"$OPENPR_E2E_CONTAINER_SNAPSHOT"
+fi
 echo "🎉 All End-to-End Tests Passed!"
 echo ""
 echo "📊 Test Summary:"

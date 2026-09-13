@@ -63,7 +63,7 @@ do
       >>"$NEGATIVE_LOG" 2>&1
 done
 env -u RUST_TEST_THREADS OPENPR_TEST_DATABASE_URL="$DATABASE_URL" CARGO_BUILD_JOBS=4 \
-  cargo test --manifest-path "$REPO_ROOT/Cargo.toml" -p api \
+  cargo test --manifest-path "$REPO_ROOT/Cargo.toml" -p api --lib \
     routes::flow::flow_database_tests::flow_package_import_wire_limits_accept_exact_boundary_and_reject_plus_one_with_zero_writes \
     -- --exact --nocapture >>"$NEGATIVE_LOG" 2>&1
 
