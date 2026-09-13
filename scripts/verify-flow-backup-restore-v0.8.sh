@@ -11,7 +11,8 @@ WORK_DIR=/opt/worker/.cache/openpr-v08-backup-restore
 DUMP_PATH="$WORK_DIR/source.sql"
 BEFORE_PATH="$WORK_DIR/before.json"
 AFTER_PATH="$WORK_DIR/after.json"
-FINGERPRINT_BIN="$REPO_ROOT/target/debug/flow-document-fingerprints"
+TARGET_DIR=${CARGO_TARGET_DIR:-$REPO_ROOT/target}
+FINGERPRINT_BIN="$TARGET_DIR/debug/flow-document-fingerprints"
 
 if [[ ! $RESTORE_DATABASE_NAME =~ ^v08_restore_[a-z0-9_]+$ ]]; then
   echo "restore database name must match ^v08_restore_[a-z0-9_]+$" >&2
