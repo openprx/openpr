@@ -86,12 +86,13 @@ tests_ok = (
 expected_green = {
     "retention_green_control", "terminated_anchor_green_control",
     "admin_idempotency_green_control", "delivery_backoff_green_control",
-    "delivery_recovery_green_control",
+    "delivery_recovery_green_control", "consumer_dedupe_green_control",
 }
 expected_red = {
     "source_tombstone_expires_with_delivery", "requeue_filters_source_event_time",
     "replay_exact_oldest_boundary_allowed", "delivery_backoff_step_drift",
-    "successful_delivery_never_terminalizes", "replay_accepts_non_admin_member",
+    "successful_delivery_never_terminalizes", "delivery_crash_lease_not_reclaimed",
+    "coalesced_consumer_uses_event_id", "replay_accepts_non_admin_member",
 }
 mutation_rows = []
 mutation_executed = 0

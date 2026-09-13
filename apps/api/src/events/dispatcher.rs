@@ -1148,7 +1148,7 @@ async fn retry_or_fail_delivery(db: &DatabaseConnection, delivery: &DeliveryLeas
                 SET attempts = $2,
                     status = $3,
                     terminated_at = CASE WHEN $3 = 'failed' THEN now() ELSE NULL END,
-                    next_attempt_at = CASE WHEN $3 = 'failed' THEN next_attempt_at ELSE now() + ($4::bigint * interval '1 millisecond') END,
+                    next_attempt_at = now() + ($4::bigint * interval '1 millisecond'),
                     lease_token = NULL,
                     lease_expires_at = NULL,
                     last_error_code = $5
@@ -2658,6 +2658,121 @@ mod dispatcher_database_tests {
     }
 
     #[tokio::test]
+    async fn delivery_attempts_one_through_ten_write_the_frozen_database_backoff_and_never_attempt_eleven() {
+        async fn read_request(socket: &mut tokio::net::TcpStream) {
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.expect("request is readable");
+                assert!(read > 0, "request ended before its declared body");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content-length is numeric"))
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    return;
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let address = listener.local_addr().expect("listener address is available");
+        let receiver = tokio::spawn(async move {
+            for _ in 1..=10 {
+                let (mut socket, _) = listener.accept().await.expect("delivery connection arrives");
+                read_request(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("failure response writes");
+            }
+        });
+
+        let scratch = scratch_or_skip!("delivery-backoff-database");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            &format!("http://{address}/hook"),
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id=$1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+        let state = state_for(scratch.db.clone());
+        let client = reqwest::Client::new();
+
+        #[derive(FromQueryResult)]
+        struct RetryRow {
+            status: String,
+            attempts: i32,
+            next_attempt_at: DateTime<Utc>,
+        }
+        for attempt in 1_i64..=10 {
+            exec(
+                &scratch.db,
+                "UPDATE event_deliveries SET next_attempt_at=now() WHERE id=$1",
+                vec![delivery_id.into()],
+            )
+            .await;
+            let before: DateTime<Utc> = get_col(&scratch.db, "SELECT clock_timestamp() AS ts", vec![], "ts").await;
+            let outcome = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+                .scope(true, send_one(&state, &client))
+                .await
+                .expect("delivery attempt runs");
+            assert_eq!(outcome, Some(false), "HTTP 503 is a handled failed attempt");
+            let after: DateTime<Utc> = get_col(&scratch.db, "SELECT clock_timestamp() AS ts", vec![], "ts").await;
+            let row = RetryRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT status,attempts,next_attempt_at FROM event_deliveries WHERE id=$1",
+                vec![delivery_id.into()],
+            ))
+            .one(&scratch.db)
+            .await
+            .expect("retry row query runs")
+            .expect("retry row remains present");
+            let expected = chrono::Duration::milliseconds(delivery_backoff_ms(attempt));
+            assert!(
+                row.next_attempt_at >= before + expected && row.next_attempt_at <= after + expected,
+                "attempt {attempt} wrote {} outside the database-observed [{}, {}] schedule",
+                row.next_attempt_at,
+                before + expected,
+                after + expected
+            );
+            assert_eq!(i64::from(row.attempts), attempt);
+            assert_eq!(row.status, if attempt == 10 { "failed" } else { "pending" });
+        }
+        receiver.await.expect("receiver handled exactly ten attempts");
+        assert_eq!(
+            TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+                .scope(true, send_one(&state, &client))
+                .await
+                .expect("post-exhaustion dispatcher scan runs"),
+            None,
+            "a failed row cannot produce attempt eleven"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
     async fn flow_delivery_failure_then_fresh_dispatcher_delivers_once_with_the_same_delivery_id() {
         async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
             let mut bytes = Vec::new();
@@ -2684,17 +2799,50 @@ mod dispatcher_database_tests {
             }
         }
 
+        const CHILD_ROLE: &str = "OPENPR_DELIVERY_ATTEMPT_CHILD";
+        const CHILD_DATABASE_URL: &str = "OPENPR_DELIVERY_ATTEMPT_DATABASE_URL";
+
+        // The same libtest binary is the dispatcher executable for this fixture. The parent starts
+        // it as a separate OS process and kills that whole process after the receiver has read the
+        // request but before it responds. A fresh process then reclaims the durable lease and sends
+        // the same row again. This is deliberately not a task abort or a fresh in-process client.
+        if std::env::var_os(CHILD_ROLE).is_some() {
+            let database_url = std::env::var(CHILD_DATABASE_URL).expect("child database URL is set");
+            let db = Database::connect(database_url)
+                .await
+                .expect("child connects to scratch database");
+            let result = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+                .scope(true, send_one(&state_for(db.clone()), &reqwest::Client::new()))
+                .await
+                .expect("child dispatcher attempt runs");
+            assert!(result.is_some(), "child must lease one delivery");
+            db.close().await.expect("child closes its database pool");
+            return;
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
         let address = listener.local_addr().expect("listener address is available");
+        let (first_request_started_tx, first_request_started_rx) = tokio::sync::oneshot::channel();
         let receiver = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for status in ["503 Service Unavailable", "204 No Content"] {
-                let (mut socket, _) = listener.accept().await.expect("delivery connection arrives");
-                requests.push(read_request(&mut socket).await);
-                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                socket.write_all(response.as_bytes()).await.expect("response writes");
-                socket.flush().await.expect("response flushes");
-            }
+            let (mut first_socket, _) = listener.accept().await.expect("first delivery connection arrives");
+            requests.push(read_request(&mut first_socket).await);
+            first_request_started_tx
+                .send(())
+                .expect("parent still waits for the in-flight attempt");
+            let mut eof = [0_u8; 1];
+            assert_eq!(
+                first_socket.read(&mut eof).await.expect("killed child closes socket"),
+                0
+            );
+
+            let (mut second_socket, _) = listener.accept().await.expect("restarted delivery connection arrives");
+            requests.push(read_request(&mut second_socket).await);
+            second_socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("success response writes");
+            second_socket.flush().await.expect("success response flushes");
             requests
         });
 
@@ -2718,11 +2866,60 @@ mod dispatcher_database_tests {
         )
         .await;
 
-        let first = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
-            .scope(true, send_one(&state_for(scratch.db.clone()), &reqwest::Client::new()))
+        let test_name = "events::dispatcher::dispatcher_database_tests::flow_delivery_failure_then_fresh_dispatcher_delivers_once_with_the_same_delivery_id";
+        let mut killed_dispatcher =
+            tokio::process::Command::new(std::env::current_exe().expect("test executable exists"))
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(CHILD_ROLE, "in-flight")
+                .env(CHILD_DATABASE_URL, &scratch.url)
+                .kill_on_drop(true)
+                .spawn()
+                .expect("dispatcher child starts");
+        first_request_started_rx
             .await
-            .expect("first dispatcher runs");
-        assert_eq!(first, Some(false), "503 must schedule a retry");
+            .expect("receiver observed the in-flight attempt");
+        killed_dispatcher
+            .kill()
+            .await
+            .expect("whole dispatcher process is killed");
+        let killed_status = killed_dispatcher.wait().await.expect("killed dispatcher is reaped");
+        assert!(!killed_status.success(), "the first dispatcher really died mid-attempt");
+
+        #[derive(FromQueryResult)]
+        struct LeasedRow {
+            id: Uuid,
+            status: String,
+            lease_token: Option<String>,
+        }
+        let interrupted = LeasedRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id,status,lease_token FROM event_deliveries WHERE id=$1",
+            vec![delivery_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("interrupted row query runs")
+        .expect("interrupted delivery remains durable");
+        assert_eq!(interrupted.id, delivery_id);
+        assert_eq!(interrupted.status, "leased");
+        assert!(
+            interrupted.lease_token.is_some(),
+            "the killed attempt left its durable lease"
+        );
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET lease_expires_at=now()-interval '1 millisecond' WHERE id=$1",
+            vec![delivery_id.into()],
+        )
+        .await;
+        assert_eq!(
+            reclaim_expired_delivery_leases(&scratch.db)
+                .await
+                .expect("expired lease is reclaimed"),
+            1
+        );
         exec(
             &scratch.db,
             "UPDATE event_deliveries SET next_attempt_at=now() WHERE id=$1",
@@ -2730,12 +2927,19 @@ mod dispatcher_database_tests {
         )
         .await;
 
-        // A fresh state and HTTP client model the dispatcher process restarting between attempts.
-        let second = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
-            .scope(true, send_one(&state_for(scratch.db.clone()), &reqwest::Client::new()))
+        let restarted_status = tokio::process::Command::new(std::env::current_exe().expect("test executable exists"))
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_ROLE, "restarted")
+            .env(CHILD_DATABASE_URL, &scratch.url)
+            .status()
             .await
-            .expect("restarted dispatcher runs");
-        assert_eq!(second, Some(true), "the retry must reach a successful terminal state");
+            .expect("restarted dispatcher child runs");
+        assert!(
+            restarted_status.success(),
+            "fresh dispatcher process must deliver the reclaimed row"
+        );
 
         #[derive(FromQueryResult)]
         struct Row {
@@ -2752,17 +2956,35 @@ mod dispatcher_database_tests {
         .expect("delivery query runs")
         .expect("delivery remains visible");
         assert_eq!(row.status, "dispatched");
-        assert_eq!(row.attempts, 1, "one failed attempt is retained after success");
+        assert_eq!(
+            row.attempts, 1,
+            "lease recovery consumes exactly one crash-attempt budget slot"
+        );
 
         let requests = receiver.await.expect("receiver task completes");
         assert_eq!(requests.len(), 2);
         let expected_header = format!("x-sylvode-delivery-id: {delivery_id}");
+        let mut consumer_seen_delivery_ids = std::collections::HashSet::new();
         for request in &requests {
             assert!(
                 request.to_ascii_lowercase().contains(&expected_header),
                 "every attempt carries the immutable consumer dedupe key"
             );
+            let key = request
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("x-sylvode-delivery-id")
+                        .then(|| value.trim().to_owned())
+                })
+                .expect("consumer reads delivery_id from the required header");
+            consumer_seen_delivery_ids.insert(key);
         }
+        assert_eq!(
+            consumer_seen_delivery_ids.len(),
+            1,
+            "consumer delivery_id dedupe observes one delivery"
+        );
         let first_body = requests[0].split("\r\n\r\n").nth(1).expect("first body exists");
         let second_body = requests[1].split("\r\n\r\n").nth(1).expect("second body exists");
         assert_eq!(
@@ -3192,6 +3414,16 @@ mod dispatcher_database_tests {
             )
             .await,
             0
+        );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM business_events WHERE id = $1",
+                vec![event_id.into()],
+            )
+            .await,
+            1,
+            "no-subscriber retention must never delete the permanent audit event"
         );
 
         scratch.drop_self().await;
@@ -4803,6 +5035,16 @@ mod dispatcher_database_tests {
             .await,
             0
         );
+        assert_eq!(
+            count(
+                &scratch.db,
+                "SELECT count(*) AS n FROM business_events WHERE id = $1",
+                vec![dispatched_event.into()],
+            )
+            .await,
+            1,
+            "delivery retention must never delete the permanent audit event"
+        );
 
         // The stale pending row must have survived both reaper passes above untouched.
         assert_eq!(
@@ -5312,6 +5554,20 @@ mod dispatcher_database_tests {
         let source_ids = body["delivery"]["source_event_ids"].as_array().expect("array");
         assert_eq!(source_ids.len(), 2);
         assert!(source_ids.contains(&json!(event_1)));
+        let correct_consumer_keys = [body["delivery"]["id"].clone()]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let wrong_event_id_consumer_keys = source_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            correct_consumer_keys.len(),
+            1,
+            "one delivery_id means one consumer delivery"
+        );
+        assert_eq!(
+            wrong_event_id_consumer_keys.len(),
+            2,
+            "negative consumer fixture: treating each coalesced event_id as the dedupe key observably processes one delivery twice"
+        );
         assert_eq!(body["event"]["event_type"], json!("flow.content.accepted"));
         assert_eq!(
             body["event"]["event_id"],

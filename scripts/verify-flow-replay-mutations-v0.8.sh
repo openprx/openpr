@@ -11,8 +11,9 @@ LOG_DIR="$CACHE_ROOT/logs"
 RETENTION_TEST=events::dispatcher::dispatcher_database_tests::replay_is_windowed_deduplicated_and_crosses_delivery_retention_without_duplication
 ANCHOR_TEST=events::dispatcher::dispatcher_database_tests::requeue_failed_filters_terminated_time_and_preserves_delivery_id
 ROUTE_TEST=routes::flow::flow_database_tests::delivery_replay_route_requires_admin_and_replays_identical_idempotency_key
-BACKOFF_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_retry_backoff_matches_every_frozen_attempt
+BACKOFF_TEST=events::dispatcher::dispatcher_database_tests::delivery_attempts_one_through_ten_write_the_frozen_database_backoff_and_never_attempt_eleven
 RECOVERY_TEST=events::dispatcher::dispatcher_database_tests::flow_delivery_failure_then_fresh_dispatcher_delivers_once_with_the_same_delivery_id
+COALESCED_CONSUMER_TEST=events::dispatcher::dispatcher_database_tests::golden_wire_fixture_coalesced_delivery_body_matches_the_frozen_shape
 
 cleanup() {
   git -C "$REPO_ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
@@ -54,6 +55,7 @@ run_case terminated_anchor_green_control green "$ANCHOR_TEST"
 run_case admin_idempotency_green_control green "$ROUTE_TEST"
 run_case delivery_backoff_green_control green "$BACKOFF_TEST"
 run_case delivery_recovery_green_control green "$RECOVERY_TEST"
+run_case consumer_dedupe_green_control green "$COALESCED_CONSUMER_TEST"
 
 DISPATCHER="$WORKTREE/apps/api/src/events/dispatcher.rs"
 ROUTES="$WORKTREE/apps/api/src/routes/flow.rs"
@@ -81,9 +83,20 @@ git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
 perl -0pi -e "s/(async fn mark_delivered.*?SET status = )'dispatched'/\$1'failed'/s" "$DISPATCHER"
 sed -n '/async fn mark_delivered/,/async fn cancel_delivery/p' "$DISPATCHER" | grep -Fq "SET status = 'failed'"
 run_case successful_delivery_never_terminalizes red "$RECOVERY_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
+
+perl -0pi -e "s/(async fn reclaim_expired_delivery_leases.*?WHERE )status = 'leased' AND lease_expires_at < now\(\)/\${1}false AND status = 'leased' AND lease_expires_at < now()/s" "$DISPATCHER"
+grep -A35 -F 'async fn reclaim_expired_delivery_leases' "$DISPATCHER" | grep -Fq "WHERE false AND status = 'leased'"
+run_case delivery_crash_lease_not_reclaimed red "$RECOVERY_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
+
+perl -0pi -e 's/"source_event_ids": source_ids,/"source_event_ids": vec![first_event.id],/' "$DISPATCHER"
+grep -Fq '"source_event_ids": vec![first_event.id],' "$DISPATCHER"
+run_case coalesced_consumer_uses_event_id red "$COALESCED_CONSUMER_TEST"
+git -C "$WORKTREE" restore apps/api/src/events/dispatcher.rs
 
 perl -0pi -e 's/(pub async fn post_flow_delivery_replay.*?policy::)require_flow_workspace_admin_access/$1require_flow_workspace_access/s' "$ROUTES"
 grep -A30 -F 'pub async fn post_flow_delivery_replay' "$ROUTES" | grep -Fq 'require_flow_workspace_access'
 run_case replay_accepts_non_admin_member red "$ROUTE_TEST"
 
-printf 'PASS: 5 green controls passed and 6/6 production-source mutations were detected\n'
+printf 'PASS: 6 green controls passed and 8/8 production-source mutations were detected\n'
