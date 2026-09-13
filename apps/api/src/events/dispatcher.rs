@@ -5869,7 +5869,7 @@ mod dispatcher_database_tests {
         )
         .await;
         let document_id = Uuid::new_v4();
-        let block_ids = (0..super::CHANGED_BLOCK_IDS_PER_DELIVERY_MAX)
+        let block_ids = (0..200)
             .map(|_| Uuid::new_v4())
             .collect::<Vec<_>>();
         let event_1 = commit_dispatch_work(
@@ -5925,7 +5925,7 @@ mod dispatcher_database_tests {
         let exact_ids = exact["event"]["payload"]["changed_block_ids"]
             .as_array()
             .expect("exact union is present");
-        assert_eq!(exact_ids.len(), super::CHANGED_BLOCK_IDS_PER_DELIVERY_MAX);
+        assert_eq!(exact_ids.len(), 200);
         assert_eq!(
             exact_ids
                 .iter()
