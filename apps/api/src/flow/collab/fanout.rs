@@ -234,7 +234,7 @@ pub fn spawn_listener(state: AppState, registry: &'static SessionRegistry) {
                         authorization_watermarks.insert(workspace_id, next);
                     }
                     Err(error) => {
-                        tracing::warn!(%error, %workspace_id, epoch, "authorization revocation durable poll failed")
+                        tracing::warn!(%error, %workspace_id, epoch, "authorization revocation durable poll failed");
                     }
                 }
             }
