@@ -1655,6 +1655,15 @@ async fn main() -> anyhow::Result<()> {
             ),
         )
         .route(
+            "/api/v1/admin/flow/repairs/quarantine",
+            post(routes::flow::post_flow_repair_quarantine).route_layer(
+                axum_middleware::from_fn_with_state(
+                    auth_state.clone(),
+                    middleware::bot_auth::bot_or_user_auth_middleware,
+                ),
+            ),
+        )
+        .route(
             "/api/v1/admin/workspaces/{workspace_id}/flow/health",
             get(routes::flow::get_flow_admin_health).route_layer(axum_middleware::from_fn_with_state(
                 auth_state.clone(),

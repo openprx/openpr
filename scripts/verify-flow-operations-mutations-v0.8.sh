@@ -9,6 +9,7 @@ WORKTREE="$CACHE_ROOT/worktree"
 TARGET_DIR=/opt/worker/.cache/openpr-v08-shared-target
 LOG_DIR="$CACHE_ROOT/logs"
 ROUTE_TEST=routes::flow::flow_database_tests::flow_operations_require_exact_confirm_and_keep_dry_runs_canonical_zero_write
+REPAIR_TEST=routes::flow::flow_database_tests::flow_operations_repair_quarantine_is_explicit_authorized_audited_and_dry_run_safe
 TOOL_TEST=routes::flow::v08_admin_tool_tests::dangerous_admin_tools_require_an_exact_registered_name_without_blocking_native_users
 MCP_TEST=mcp_admin_operations_fail_closed_and_only_exact_execute_changes_canonical_state
 
@@ -70,6 +71,7 @@ run_mcp_case() {
 }
 
 run_case operations_green_control green "$ROUTE_TEST"
+run_case repair_quarantine_green_control green "$REPAIR_TEST"
 run_case exact_tool_green_control green "$TOOL_TEST"
 run_mcp_case mcp_operations_green_control green
 
@@ -79,6 +81,26 @@ OPERATIONS="$WORKTREE/apps/api/src/flow/operations.rs"
 perl -0pi -e 's/if !req\.dry_run && req\.confirm_document_id != Some\(document_id\) \{/if false {/' "$ROUTES"
 grep -Fq 'if false {' "$ROUTES"
 run_case compact_execute_ignores_exact_document_confirm red "$ROUTE_TEST"
+git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
+
+perl -0pi -e 's/    if dry_run \{\n        let candidates = repair_candidates/    if false {\n        let candidates = repair_candidates/' "$OPERATIONS"
+sed -n '/pub async fn repair_quarantine/,/pub async fn compact_document/p' "$OPERATIONS" | grep -Fq 'if false {'
+run_case repair_dry_run_writes_canonical_state red "$REPAIR_TEST"
+git -C "$WORKTREE" restore apps/api/src/flow/operations.rs
+
+perl -0pi -e 's/(pub async fn post_flow_repair_quarantine.*?PermissionLevel::)FullAccess/${1}Edit/s' "$ROUTES"
+sed -n '/pub async fn post_flow_repair_quarantine/,/pub async fn post_flow_verify_document/p' "$ROUTES" | grep -Fq 'PermissionLevel::Edit'
+run_case repair_accepts_edit_principal red "$REPAIR_TEST"
+git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
+
+perl -0pi -e 's/(pub struct RepairQuarantineRequest \{\n\s*pub dry_run: bool,\n\s*)pub scope: RepairQuarantineScopeRequest,/${1}#[serde(default = "default_repair_quarantine_scope")]\n    pub scope: RepairQuarantineScopeRequest,/s; s/(pub struct RepairQuarantineRequest)/fn default_repair_quarantine_scope() -> RepairQuarantineScopeRequest { RepairQuarantineScopeRequest::Workspace { workspace_id: Uuid::nil() } }\n\n$1/' "$ROUTES"
+grep -Fq 'default_repair_quarantine_scope' "$ROUTES"
+run_case repair_missing_scope_defaults_to_all red "$REPAIR_TEST"
+git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
+
+perl -0pi -e 's/if !req\.dry_run && req\.confirm_quarantine != Some\(true\) \{/if false {/' "$ROUTES"
+sed -n '/pub async fn post_flow_repair_quarantine/,/pub async fn post_flow_verify_document/p' "$ROUTES" | grep -Fq 'if false {'
+run_case repair_execute_ignores_confirm red "$REPAIR_TEST"
 git -C "$WORKTREE" restore apps/api/src/routes/flow.rs
 
 perl -0pi -e 's/if !req\.dry_run && req\.confirm_object_id != Some\(object_id\) \{/if false {/' "$ROUTES"
@@ -125,4 +147,4 @@ perl -0pi -e 's/(pub async fn compact_flow_document.*?pointer\("\/data\/document
 sed -n '/pub async fn compact_flow_document/,/pub async fn replay_flow_deliveries/p' "$MCP_OBJECTS" | grep -Fq '!= Some(document_id)'
 run_mcp_case mcp_compact_scope_comparison_is_inverted red
 
-printf 'PASS: 3 green controls passed and 9/9 production-source mutations were detected\n'
+printf 'PASS: 4 green controls passed and 13/13 production-source mutations were detected\n'

@@ -956,6 +956,82 @@ pub async fn post_flow_rebuild_projection(
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepairQuarantineScopeRequest {
+    Workspace { workspace_id: Uuid },
+    Document { document_id: Uuid },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepairQuarantineRequest {
+    pub dry_run: bool,
+    pub scope: RepairQuarantineScopeRequest,
+    pub confirm_quarantine: Option<bool>,
+    pub idempotency_key: String,
+}
+
+pub async fn post_flow_repair_quarantine(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    bot: Option<Extension<BotAuthContext>>,
+    Json(req): Json<RepairQuarantineRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_exact_admin_tool(bot.as_ref(), "collab.repair_quarantine")?;
+    if !req.dry_run && req.confirm_quarantine != Some(true) {
+        return Err(ApiError::Forbidden(
+            "execute requires confirm_quarantine=true".to_string(),
+        ));
+    }
+    let extensions = build_auth_extensions(claims, bot);
+    let (scope, principal_id, is_bot) = match req.scope {
+        RepairQuarantineScopeRequest::Workspace { workspace_id } => {
+            let (principal_id, _role, is_bot) =
+                policy::require_flow_workspace_admin_access(&state, &extensions, workspace_id).await?;
+            (
+                crate::flow::operations::RepairQuarantineScope::Workspace { workspace_id },
+                principal_id,
+                is_bot,
+            )
+        }
+        RepairQuarantineScopeRequest::Document { document_id } => {
+            let scope = crate::flow::operations::document_scope(&state.db, document_id).await?;
+            let (principal_id, _role, is_bot) =
+                policy::resolve_flow_principal(&state, &extensions, scope.workspace_id).await?;
+            let Some(_) = policy::require_flow_object_access(
+                &state,
+                &extensions,
+                scope.workspace_id,
+                scope.object_id,
+                crate::flow::collab::authz::PermissionLevel::FullAccess,
+            )
+            .await?
+            else {
+                return Err(policy::authorization_read_unstable());
+            };
+            (
+                crate::flow::operations::RepairQuarantineScope::Document(scope),
+                principal_id,
+                is_bot,
+            )
+        }
+    };
+    Ok(ApiResponse::success(
+        crate::flow::operations::repair_quarantine(
+            &state.db,
+            scope,
+            req.dry_run,
+            crate::flow::operations::Principal {
+                id: principal_id,
+                is_bot,
+            },
+            &req.idempotency_key,
+            request_origin(&extensions),
+        )
+        .await?,
+    ))
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct VerifyDocumentRequest {
     pub dry_run: bool,
     pub deep: bool,
@@ -1841,9 +1917,11 @@ mod flow_database_tests {
     use std::time::Duration;
 
     use super::{
-        CompactDocumentRequest, GrantRequestBody, RebuildProjectionRequest, ReplayDeliveriesRequest, SetGrantsRequest,
-        VerifyDocumentRequest, get_flow_admin_health, get_flow_admin_integrity, get_flow_admin_lag,
-        post_flow_compact_document, post_flow_delivery_replay, post_flow_rebuild_projection, post_flow_verify_document,
+        CompactDocumentRequest, GrantRequestBody, RebuildProjectionRequest, RepairQuarantineRequest,
+        RepairQuarantineScopeRequest, ReplayDeliveriesRequest, SetGrantsRequest, VerifyDocumentRequest,
+        get_flow_admin_health, get_flow_admin_integrity, get_flow_admin_lag, post_flow_compact_document,
+        post_flow_delivery_replay, post_flow_rebuild_projection, post_flow_repair_quarantine,
+        post_flow_verify_document,
     };
     use axum::body::to_bytes;
     use axum::response::{IntoResponse, Response};
@@ -9469,6 +9547,247 @@ mod flow_database_tests {
             "same key with a changed semantic body must conflict"
         );
 
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_operations_repair_quarantine_is_explicit_authorized_audited_and_dry_run_safe() {
+        let scratch = scratch_or_skip!("v08-repair-quarantine");
+        let state = state_for(scratch.db.clone());
+        let (workspace_id, owner_id) = seed_workspace(&state, true).await;
+        let member_id = seed_member(&state, workspace_id).await;
+        let object_id = create_page_as_owner(&state, workspace_id, owner_id, "quarantine target").await;
+        let document_id = document_of(&state, object_id).await;
+        exec(
+            &state,
+            "INSERT INTO flow_object_grants (workspace_id,object_id,principal_kind,principal_id,level) \
+             VALUES ($1,$2,'user',$3,'edit')",
+            vec![workspace_id.into(), object_id.into(), member_id.into()],
+        )
+        .await;
+        let integrity_id = crate::flow::repository::insert_integrity_record(
+            &state.db,
+            crate::flow::repository::IntegrityRecordInput {
+                workspace_id,
+                kind: "collab_tail_integrity_violation",
+                subject_kind: "collab_document",
+                subject_id: &document_id.to_string(),
+                detected_by: "flow.test.repair_quarantine",
+                details_redacted: json!({"reason":"fixture"}),
+            },
+        )
+        .await
+        .expect("integrity fixture inserts");
+
+        let document_request = RepairQuarantineRequest {
+            dry_run: true,
+            scope: RepairQuarantineScopeRequest::Document { document_id },
+            confirm_quarantine: None,
+            idempotency_key: "repair-document-key".to_string(),
+        };
+        assert!(
+            post_flow_repair_quarantine(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Json(document_request.clone()),
+            )
+            .await
+            .is_err(),
+            "edit is below the full_access quarantine threshold"
+        );
+        assert!(
+            serde_json::from_value::<RepairQuarantineRequest>(json!({
+                "dry_run": true,
+                "idempotency_key": "missing-explicit-scope"
+            }))
+            .is_err(),
+            "a missing scope must fail at the wire boundary"
+        );
+
+        exec(
+            &state,
+            "UPDATE flow_object_grants SET level='full_access' \
+             WHERE object_id=$1 AND principal_kind='user' AND principal_id=$2",
+            vec![object_id.into(), member_id.into()],
+        )
+        .await;
+        exec(
+            &state,
+            "UPDATE flow_workspace_settings SET authz_epoch=authz_epoch+1 WHERE workspace_id=$1",
+            vec![workspace_id.into()],
+        )
+        .await;
+        let before_fingerprint = crate::flow::collab::integrity::document_fingerprint(&state.db, document_id)
+            .await
+            .expect("fingerprint before dry-run");
+        let epoch_before = read_epoch(&state, workspace_id).await;
+        let mut audit_counts_before = Vec::new();
+        for table in ["flow_operation_runs", "business_events", "event_dispatch"] {
+            let count = state
+                .db
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("SELECT count(*) AS n FROM {table} WHERE workspace_id='{workspace_id}'"),
+                ))
+                .await
+                .expect("pre-dry-run count query runs")
+                .expect("pre-dry-run count row")
+                .try_get::<i64>("", "n")
+                .expect("pre-dry-run count reads");
+            audit_counts_before.push((table, count));
+        }
+        let dry = body_json(to_response(
+            post_flow_repair_quarantine(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Json(document_request.clone()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(dry["code"], 0, "{dry}");
+        assert_eq!(dry["data"]["affected"]["integrity_record_ids"], json!([integrity_id]));
+        assert_eq!(dry["data"]["affected"]["affected_object_ids"], json!([object_id]));
+        for (table, before_count) in audit_counts_before {
+            let count = state
+                .db
+                .query_one(Statement::from_string(
+                    DbBackend::Postgres,
+                    format!("SELECT count(*) AS n FROM {table} WHERE workspace_id='{workspace_id}'"),
+                ))
+                .await
+                .expect("dry-run count query runs")
+                .expect("dry-run count row")
+                .try_get::<i64>("", "n")
+                .expect("dry-run count reads");
+            assert_eq!(count, before_count, "dry-run must not write {table}");
+        }
+        assert_eq!(read_epoch(&state, workspace_id).await, epoch_before);
+        assert_eq!(
+            crate::flow::collab::integrity::document_fingerprint(&state.db, document_id)
+                .await
+                .expect("fingerprint after dry-run"),
+            before_fingerprint
+        );
+
+        let unconfirmed = RepairQuarantineRequest {
+            dry_run: false,
+            confirm_quarantine: Some(false),
+            ..document_request.clone()
+        };
+        assert!(
+            post_flow_repair_quarantine(State(state.clone()), claims_for(member_id), None, Json(unconfirmed),)
+                .await
+                .is_err(),
+            "irreversible execute must require the explicit confirmation bit"
+        );
+        let execute_request = RepairQuarantineRequest {
+            dry_run: false,
+            confirm_quarantine: Some(true),
+            ..document_request
+        };
+        let executed = body_json(to_response(
+            post_flow_repair_quarantine(
+                State(state.clone()),
+                claims_for(member_id),
+                None,
+                Json(execute_request.clone()),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(executed["code"], 0, "{executed}");
+        assert_eq!(dry["data"]["affected"], executed["data"]["affected"]);
+        let replayed = body_json(to_response(
+            post_flow_repair_quarantine(State(state.clone()), claims_for(member_id), None, Json(execute_request)).await,
+        ))
+        .await;
+        assert_eq!(
+            replayed["data"], executed["data"],
+            "same-key execute must replay the original receipt"
+        );
+        let integrity_status = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT status FROM flow_integrity_records WHERE id=$1",
+                vec![integrity_id.into()],
+            ))
+            .await
+            .expect("integrity status query runs")
+            .expect("integrity status row")
+            .try_get::<String>("", "status")
+            .expect("integrity status reads");
+        assert_eq!(integrity_status, "ignored");
+        let audit = state
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Postgres,
+                "SELECT metadata FROM business_events WHERE id=$1",
+                vec![
+                    Uuid::parse_str(executed["data"]["event_id"].as_str().expect("event id"))
+                        .expect("event uuid")
+                        .into(),
+                ],
+            ))
+            .await
+            .expect("audit query runs")
+            .expect("audit row")
+            .try_get::<Value>("", "metadata")
+            .expect("audit metadata reads");
+        assert_eq!(audit["affected_object_ids"], json!([object_id]));
+
+        let second_integrity_id = crate::flow::repository::insert_integrity_record(
+            &state.db,
+            crate::flow::repository::IntegrityRecordInput {
+                workspace_id,
+                kind: "collab_tail_integrity_violation",
+                subject_kind: "collab_document",
+                subject_id: &document_id.to_string(),
+                detected_by: "flow.test.workspace_quarantine",
+                details_redacted: json!({"reason":"fixture-two"}),
+            },
+        )
+        .await
+        .expect("second integrity fixture inserts");
+        let workspace_dry_request = RepairQuarantineRequest {
+            dry_run: true,
+            scope: RepairQuarantineScopeRequest::Workspace { workspace_id },
+            confirm_quarantine: None,
+            idempotency_key: "repair-workspace-key".to_string(),
+        };
+        let workspace_dry = body_json(to_response(
+            post_flow_repair_quarantine(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(workspace_dry_request.clone()),
+            )
+            .await,
+        ))
+        .await;
+        let workspace_execute = body_json(to_response(
+            post_flow_repair_quarantine(
+                State(state.clone()),
+                claims_for(owner_id),
+                None,
+                Json(RepairQuarantineRequest {
+                    dry_run: false,
+                    confirm_quarantine: Some(true),
+                    ..workspace_dry_request
+                }),
+            )
+            .await,
+        ))
+        .await;
+        assert_eq!(workspace_execute["code"], 0, "{workspace_execute}");
+        assert_eq!(workspace_dry["data"]["affected"], workspace_execute["data"]["affected"]);
+        assert_eq!(
+            workspace_execute["data"]["affected"]["integrity_record_ids"],
+            json!([second_integrity_id])
+        );
         scratch.drop_self().await;
     }
 

@@ -154,6 +154,7 @@ fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
         objects::compact_flow_document_tool(),
         objects::replay_flow_deliveries_tool(),
         objects::rebuild_flow_projection_tool(),
+        objects::repair_quarantine_tool(),
     ]
 }
 

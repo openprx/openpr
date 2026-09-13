@@ -27,7 +27,7 @@ const SKILL_GUIDE_MD: &str = r"# OpenPR MCP Skill Guide
 ### Code Scenarios: code.resources.list, code.directory.get, code.task_context.get, code.change_proposal.create
 ### Traditional Scenarios: documents.extract_summary, documents.review_risk, approval.request, inspection.report, corrective_action.propose
 ### Other: members.list, search.all, bot_operation_logs.list
-### Flow (v0.8): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, objects.reference, objects.unreference, objects.convert_preview, objects.convert_commit, objects.convert_status, objects.convert_retry, objects.export, objects.export_workspace, objects.import_artifact, objects.import_preview, objects.import_commit, objects.import_status, objects.integrity, collab.projection_lag, collab.status, collab.compact, collab.rebuild_projection, deliveries.replay, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
+### Flow (v0.8): flow.feature_get, flow.feature_set, objects.get, objects.query, objects.history, objects.create, objects.patch, objects.move, objects.link, objects.unlink, objects.diff, objects.grants_get, objects.grants_set, objects.inheritance_set, objects.relations, objects.search, objects.reference, objects.unreference, objects.convert_preview, objects.convert_commit, objects.convert_status, objects.convert_retry, objects.export, objects.export_workspace, objects.import_artifact, objects.import_preview, objects.import_commit, objects.import_status, objects.integrity, collab.projection_lag, collab.status, collab.compact, collab.rebuild_projection, collab.repair_quarantine, deliveries.replay, collections.describe, collections.query, records.create, legacy_pages.inventory, legacy_pages.import_preview, legacy_pages.import_commit, legacy_pages.import_status
 
 ## Workflow: Bug Report
 1. files.upload -> upload log/screenshot
@@ -450,6 +450,7 @@ const TOOL_POLICY_SCOPES: &[(&str, PolicyScope)] = &[
         "collab.rebuild_projection",
         PolicyScope::OwnedBy(OwnerLookup::FlowObject),
     ),
+    ("collab.repair_quarantine", PolicyScope::WorkspaceOrFlowObject),
     (
         "collab.projection_lag",
         PolicyScope::DeclaredProject { required: false },
@@ -915,6 +916,7 @@ impl McpServer {
             "collab.compact" => tools::objects::compact_flow_document(&self.client, args).await,
             "deliveries.replay" => tools::objects::replay_flow_deliveries(&self.client, args).await,
             "collab.rebuild_projection" => tools::objects::rebuild_flow_projection(&self.client, args).await,
+            "collab.repair_quarantine" => tools::objects::repair_quarantine(&self.client, args).await,
             "legacy_pages.inventory" => tools::legacy_pages::legacy_pages_inventory(&self.client, args).await,
             "legacy_pages.import_preview" => tools::legacy_pages::legacy_pages_import_preview(&self.client, args).await,
             "legacy_pages.import_commit" => tools::legacy_pages::legacy_pages_import_commit(&self.client, args).await,
@@ -2501,6 +2503,10 @@ mod tests {
             (
                 "collab.rebuild_projection",
                 json!({"object_id":id,"dry_run":true,"expected_head_seq":0,"idempotency_key":"k"}),
+            ),
+            (
+                "collab.repair_quarantine",
+                json!({"workspace_id":id,"dry_run":true,"idempotency_key":"k"}),
             ),
         ];
         for (name, args) in calls {

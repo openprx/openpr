@@ -1,14 +1,18 @@
 //! Exact-scope v0.8 maintenance application services.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+use std::collections::BTreeSet;
+
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::collab::{bootstrap, compaction, integrity, snapshot};
+use super::event_origin::CommandOrigin;
 use super::maintenance;
 use crate::error::ApiError;
+use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct DocumentScope {
@@ -34,6 +38,54 @@ pub struct OperationReceipt {
     pub document_id: Uuid,
     pub expected_head_seq: i64,
     pub result: Value,
+}
+
+#[derive(Debug, Clone)]
+pub enum RepairQuarantineScope {
+    Workspace { workspace_id: Uuid },
+    Document(DocumentScope),
+}
+
+impl RepairQuarantineScope {
+    fn workspace_id(&self) -> Uuid {
+        match self {
+            Self::Workspace { workspace_id } => *workspace_id,
+            Self::Document(scope) => scope.workspace_id,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Workspace { .. } => "workspace",
+            Self::Document(_) => "document",
+        }
+    }
+
+    fn id(&self) -> Uuid {
+        match self {
+            Self::Workspace { workspace_id } => *workspace_id,
+            Self::Document(scope) => scope.document_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RepairQuarantineReceipt {
+    pub operation_id: Option<Uuid>,
+    pub event_id: Option<Uuid>,
+    pub operation: &'static str,
+    pub status: &'static str,
+    pub dry_run: bool,
+    pub workspace_id: Uuid,
+    pub scope_kind: &'static str,
+    pub scope_id: Uuid,
+    pub affected: Value,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RepairCandidate {
+    id: Uuid,
+    object_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -207,6 +259,235 @@ async fn abandon(db: &DatabaseConnection, id: Uuid) {
             vec![id.into()],
         ))
         .await;
+}
+
+fn repair_request_hash(scope: &RepairQuarantineScope) -> String {
+    let body = json!({
+        "operation": "repair_quarantine",
+        "scope_kind": scope.kind(),
+        "scope_id": scope.id(),
+        "confirm_quarantine": true,
+    });
+    format!("{:x}", Sha256::digest(serde_json::to_vec(&body).unwrap_or_default()))
+}
+
+async fn repair_candidates<C: ConnectionTrait>(
+    conn: &C,
+    scope: &RepairQuarantineScope,
+    lock: bool,
+) -> Result<Vec<RepairCandidate>, ApiError> {
+    let (document_id, object_id) = match scope {
+        RepairQuarantineScope::Workspace { .. } => (String::new(), String::new()),
+        RepairQuarantineScope::Document(scope) => (scope.document_id.to_string(), scope.object_id.to_string()),
+    };
+    let lock_clause = if lock { " FOR UPDATE OF ir" } else { "" };
+    RepairCandidate::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        format!(
+            "SELECT ir.id,COALESCE(cd.object_id,fo.id) AS object_id \
+               FROM flow_integrity_records ir \
+               LEFT JOIN collab_documents cd ON ir.subject_kind='collab_document' AND ir.subject_id=cd.id::text \
+               LEFT JOIN flow_objects fo ON ir.subject_kind='flow_object' AND ir.subject_id=fo.id::text \
+              WHERE ir.workspace_id=$1 AND ir.status='open' \
+                AND ($2='workspace' OR ($2='document' AND \
+                     ((ir.subject_kind='collab_document' AND ir.subject_id=$3) OR \
+                      (ir.subject_kind='flow_object' AND ir.subject_id=$4)))) \
+              ORDER BY ir.id{lock_clause}"
+        ),
+        vec![
+            scope.workspace_id().into(),
+            scope.kind().into(),
+            document_id.into(),
+            object_id.into(),
+        ],
+    ))
+    .all(conn)
+    .await
+    .map_err(Into::into)
+}
+
+fn repair_affected(scope: &RepairQuarantineScope, candidates: &[RepairCandidate]) -> Value {
+    let integrity_record_ids: Vec<Uuid> = candidates.iter().map(|candidate| candidate.id).collect();
+    let object_ids: BTreeSet<Uuid> = candidates.iter().filter_map(|candidate| candidate.object_id).collect();
+    json!({
+        "scope_kind": scope.kind(),
+        "scope_id": scope.id(),
+        "integrity_record_count": integrity_record_ids.len(),
+        "integrity_record_ids": integrity_record_ids,
+        "object_count": object_ids.len(),
+        "affected_object_ids": object_ids,
+    })
+}
+
+/// Plans or irreversibly quarantines all currently-open integrity findings in one explicit
+/// workspace/document scope. A dry-run deliberately writes no operation claim: the same
+/// idempotency key remains available to execute exactly the plan the caller just inspected.
+pub async fn repair_quarantine(
+    db: &DatabaseConnection,
+    scope: RepairQuarantineScope,
+    dry_run: bool,
+    principal: Principal,
+    idempotency_key: &str,
+    origin: CommandOrigin,
+) -> Result<RepairQuarantineReceipt, ApiError> {
+    if idempotency_key.trim().is_empty() {
+        return Err(ApiError::BadRequest("idempotency_key is required".to_string()));
+    }
+    if dry_run {
+        let candidates = repair_candidates(db, &scope, false).await?;
+        return Ok(RepairQuarantineReceipt {
+            operation_id: None,
+            event_id: None,
+            operation: "repair_quarantine",
+            status: "planned",
+            dry_run: true,
+            workspace_id: scope.workspace_id(),
+            scope_kind: scope.kind(),
+            scope_id: scope.id(),
+            affected: repair_affected(&scope, &candidates),
+        });
+    }
+
+    let principal_kind = if principal.is_bot { "bot" } else { "user" };
+    let request_hash = repair_request_hash(&scope);
+    let tx = db.begin().await?;
+    let inserted = InsertedRun::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO flow_operation_runs \
+           (workspace_id,operation,scope_kind,scope_id,dry_run,status,actor_id,principal_kind,principal_id, \
+            idempotency_key,request_hash) \
+         VALUES ($1,'repair_quarantine',$2,$3,false,'running',$4,$5,$6,$7,$8) \
+         ON CONFLICT (workspace_id,operation,principal_kind,principal_id,idempotency_key) \
+           WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id",
+        vec![
+            scope.workspace_id().into(),
+            scope.kind().into(),
+            scope.id().into(),
+            (if principal.is_bot { None } else { Some(principal.id) }).into(),
+            principal_kind.into(),
+            principal.id.into(),
+            idempotency_key.into(),
+            request_hash.clone().into(),
+        ],
+    ))
+    .one(&tx)
+    .await?;
+    let Some(inserted) = inserted else {
+        let prior = PriorRun::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT id,request_hash,status,result_redacted,dry_run,expected_head_seq \
+               FROM flow_operation_runs WHERE workspace_id=$1 AND operation='repair_quarantine' \
+                 AND principal_kind=$2 AND principal_id=$3 AND idempotency_key=$4",
+            vec![
+                scope.workspace_id().into(),
+                principal_kind.into(),
+                principal.id.into(),
+                idempotency_key.into(),
+            ],
+        ))
+        .one(&tx)
+        .await?
+        .ok_or(ApiError::Internal)?;
+        if prior.request_hash.as_deref() != Some(request_hash.as_str()) {
+            return Err(ApiError::Conflict("idempotency key body drift".to_string()));
+        }
+        if prior.status != "completed" {
+            return Err(ApiError::Conflict(
+                "identical maintenance operation is still running".to_string(),
+            ));
+        }
+        let event_id = prior
+            .result_redacted
+            .get("event_id")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok());
+        let affected = prior
+            .result_redacted
+            .get("affected")
+            .cloned()
+            .ok_or(ApiError::Internal)?;
+        tx.commit().await?;
+        return Ok(RepairQuarantineReceipt {
+            operation_id: Some(prior.id),
+            event_id,
+            operation: "repair_quarantine",
+            status: "completed",
+            dry_run: false,
+            workspace_id: scope.workspace_id(),
+            scope_kind: scope.kind(),
+            scope_id: scope.id(),
+            affected,
+        });
+    };
+
+    let candidates = repair_candidates(&tx, &scope, true).await?;
+    let affected = repair_affected(&scope, &candidates);
+    if !candidates.is_empty() {
+        let ids = candidates
+            .iter()
+            .map(|candidate| candidate.id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE flow_integrity_records SET status='ignored',resolved_at=now() \
+             WHERE id=ANY(string_to_array($1,',')::uuid[]) AND status='open'",
+            vec![ids.into()],
+        ))
+        .await?;
+    }
+    let affected_object_ids = affected["affected_object_ids"].clone();
+    let event = insert_flow_event(
+        &tx,
+        BusinessEventInput {
+            workspace_id: scope.workspace_id(),
+            project_id: None,
+            event_type: "flow.repair.completed".to_string(),
+            aggregate_type: "flow_repair".to_string(),
+            aggregate_id: inserted.id.to_string(),
+            actor_id: if principal.is_bot { None } else { Some(principal.id) },
+            source: origin.source_json(),
+            payload: json!({
+                "operation_id": inserted.id,
+                "kind": "quarantine",
+                "scope_kind": scope.kind(),
+                "scope_id": scope.id(),
+                "integrity_record_count": affected["integrity_record_count"],
+            }),
+            metadata: json!({"affected_object_ids": affected_object_ids}),
+            correlation_id: Some(origin.correlation_id),
+            causation_id: origin.causation_id,
+            idempotency_key: Some(format!(
+                "repair_quarantine:{principal_kind}:{}:{idempotency_key}",
+                principal.id
+            )),
+        },
+        Some(FlowDispatchSpec {
+            max_attempts: crate::config::runtime().flow.dispatch_max_attempts,
+            document_id: None,
+            accepted_seq: None,
+        }),
+    )
+    .await?;
+    let stored = json!({"event_id": event.event_id, "affected": affected});
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE flow_operation_runs SET status='completed',result_redacted=$2,finished_at=now() WHERE id=$1",
+        vec![inserted.id.into(), stored.into()],
+    ))
+    .await?;
+    tx.commit().await?;
+    Ok(RepairQuarantineReceipt {
+        operation_id: Some(inserted.id),
+        event_id: Some(event.event_id),
+        operation: "repair_quarantine",
+        status: "completed",
+        dry_run: false,
+        workspace_id: scope.workspace_id(),
+        scope_kind: scope.kind(),
+        scope_id: scope.id(),
+        affected,
+    })
 }
 
 pub async fn compact_document(

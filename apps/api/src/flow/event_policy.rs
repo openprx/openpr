@@ -106,6 +106,16 @@ pub const FLOW_EVENT_PAYLOAD_POLICIES: &[(&str, EventPayloadPolicy)] = &[
         "flow.command.rejected",
         public_payload(&["action", "error_code", "object_id", "document_id"]),
     ),
+    (
+        "flow.repair.completed",
+        public_payload(&[
+            "operation_id",
+            "kind",
+            "scope_kind",
+            "scope_id",
+            "integrity_record_count",
+        ]),
+    ),
     // `ADR-0012`'s v0.5 authorization surface (`events-v1.md`'s `flow_permission` rows). The
     // declared keys are exactly the registry's column list: ids, the `principal_kind` enum and
     // the four grade names -- no principal display name, email or any other identifying field,

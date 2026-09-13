@@ -450,6 +450,29 @@ pub fn rebuild_flow_projection_tool() -> ToolDefinition {
     )
 }
 
+pub fn repair_quarantine_tool() -> ToolDefinition {
+    let mut tool = v08_tool(
+        "collab.repair_quarantine",
+        "Dry-run or execute quarantine of open integrity findings in one explicit workspace or document scope.",
+        &json!({
+            "workspace_id":{"type":"string"},"object_id":{"type":"string"},"document_id":{"type":"string"},
+            "dry_run":{"type":"boolean"},"confirm_quarantine":{"const":true},
+            "idempotency_key":{"type":"string","minLength":1,"maxLength":128}
+        }),
+        &["dry_run", "idempotency_key"],
+    );
+    if let Some(schema) = tool.input_schema.as_object_mut() {
+        schema.insert(
+            "oneOf".to_string(),
+            json!([
+                {"required":["workspace_id"],"not":{"anyOf":[{"required":["object_id"]},{"required":["document_id"]}]}},
+                {"required":["object_id","document_id"],"not":{"required":["workspace_id"]}}
+            ]),
+        );
+    }
+    tool
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReferenceInput {
@@ -922,6 +945,47 @@ pub async fn rebuild_flow_projection(client: &OpenPrClient, args: Value) -> Call
                 encode_query_component(object_id)
             ),
             &body,
+        )
+        .await,
+    )
+}
+
+pub async fn repair_quarantine(client: &OpenPrClient, args: Value) -> CallToolResult {
+    let scope = match (
+        args.get("workspace_id").and_then(Value::as_str),
+        args.get("object_id").and_then(Value::as_str),
+        args.get("document_id").and_then(Value::as_str),
+    ) {
+        (Some(workspace_id), None, None) => json!({"kind":"workspace","workspace_id":workspace_id}),
+        (None, Some(object_id), Some(document_id)) => {
+            let owner = get_structured(
+                client,
+                &format!("/api/v1/flow/objects/{}/collab", encode_query_component(object_id)),
+            )
+            .await;
+            match owner {
+                Ok(envelope) if envelope.pointer("/data/document_id").and_then(Value::as_str) == Some(document_id) => {}
+                Ok(_) => return CallToolResult::error("object_id does not own document_id".to_string()),
+                Err(error) => return respond(Err(error)),
+            }
+            json!({"kind":"document","document_id":document_id})
+        }
+        _ => {
+            return CallToolResult::error(
+                "exactly one explicit workspace_id or object_id+document_id scope is required".to_string(),
+            );
+        }
+    };
+    respond_data(
+        post_structured(
+            client,
+            "/api/v1/admin/flow/repairs/quarantine",
+            &json!({
+                "dry_run":args.get("dry_run"),
+                "scope":scope,
+                "confirm_quarantine":args.get("confirm_quarantine"),
+                "idempotency_key":args.get("idempotency_key"),
+            }),
         )
         .await,
     )
