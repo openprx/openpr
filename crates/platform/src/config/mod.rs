@@ -179,9 +179,8 @@ fn resolve_default_config_path(base: &Path) -> Result<PathBuf, ConfigError> {
                 "both {DEFAULT_CONFIG_PATH} and legacy {LEGACY_CONFIG_PATH} exist; pass --config explicitly or remove one so configuration precedence is never silent"
             )],
         }),
-        (true, false) => Ok(canonical),
         (false, true) => Ok(legacy),
-        (false, false) => Ok(canonical),
+        (_, false) => Ok(canonical),
     }
 }
 

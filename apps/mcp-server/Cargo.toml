@@ -37,6 +37,10 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+collab-core = { path = "../../crates/collab-core" }
+hex = "0.4"
+sea-orm.workspace = true
+serde_jcs.workspace = true
 sha2 = "0.10"
 
 [lints]
