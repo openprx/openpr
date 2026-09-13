@@ -2340,6 +2340,23 @@ mod cardinality_gate_tests {
         }
     }
 
+    #[test]
+    fn v0_9_rc_freeze_adds_no_command_cardinality_declaration() {
+        let registry = v0_8_command_cardinality_registry();
+        assert_eq!(
+            registry.len(),
+            11,
+            "the v0.8 command registry changed during the v0.9 RC freeze"
+        );
+        assert!(
+            registry.iter().all(|(name, cardinality)| {
+                (*name == "collab.compact" && *cardinality == ExistingDocumentCardinality::One)
+                    || (*name != "collab.compact" && *cardinality == ExistingDocumentCardinality::Zero)
+            }),
+            "the frozen v0.8 command cardinalities changed during the v0.9 RC"
+        );
+    }
+
     /// `command_contended_document_cardinality` (`ADR-0013` §1, v0.4): "v0.4 的竞争文档集合恒
     /// ≤ 1". Every command this package registers — content, lifecycle, and the two
     /// non-`CommandKind` write paths (`create_object`, `set_flow_feature`) — must declare a

@@ -124,7 +124,7 @@ fi
 
 # These binaries are the shipped registries. Building and executing them is
 # intentional: source grep cannot prove that a declaration reached the binary.
-(cd "$REPO_ROOT" && cargo build -p mcp-server --bin list-tools --bin sylvode) >&2
+(cd "$REPO_ROOT" && env -u RUST_TEST_THREADS CARGO_BUILD_JOBS=4 cargo build -p mcp-server --bin list-tools --bin sylvode) >&2
 MCP_OUTPUT="$(mktemp)"
 "$CARGO_OUTPUT_DIR/debug/list-tools" > "$MCP_OUTPUT"
 IMPL_OUT="$(mktemp)"
