@@ -8,7 +8,7 @@ CACHE_ROOT=/opt/worker/.cache/openpr-v08-bootstrap-compaction-mutation
 WORKTREE="$CACHE_ROOT/worktree"
 TARGET_DIR="$CACHE_ROOT/target"
 LOG_DIR="$CACHE_ROOT/logs"
-TEST_NAME=flow::collab::snapshot::database_tests::bootstrap_racing_compaction_observes_one_complete_mvcc_view_without_a_gap
+TEST_NAME=flow::collab::snapshot::database_tests::flow_bootstrap_compaction_consistency_observes_one_complete_mvcc_view_without_a_gap
 
 cleanup() {
   git -C "$REPO_ROOT" worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true

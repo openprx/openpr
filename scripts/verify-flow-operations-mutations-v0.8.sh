@@ -8,7 +8,7 @@ CACHE_ROOT=/opt/worker/.cache/openpr-v08-operations-mutations
 WORKTREE="$CACHE_ROOT/worktree"
 TARGET_DIR="$CACHE_ROOT/target"
 LOG_DIR="$CACHE_ROOT/logs"
-ROUTE_TEST=routes::flow::flow_database_tests::maintenance_routes_require_exact_confirm_and_keep_dry_runs_canonical_zero_write
+ROUTE_TEST=routes::flow::flow_database_tests::flow_operations_require_exact_confirm_and_keep_dry_runs_canonical_zero_write
 TOOL_TEST=routes::flow::v08_admin_tool_tests::dangerous_admin_tools_require_an_exact_registered_name_without_blocking_native_users
 
 cleanup() {

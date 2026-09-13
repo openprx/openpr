@@ -35,8 +35,8 @@ run_case() {
   : >"$log"
   local test_name
   for test_name in \
-    flow::package_import::tests::preview_writes_no_canonical_state_and_commit_remaps_exact_document_heads \
-    flow::package_import::tests::promotion_fault_rolls_back_every_canonical_row_and_completion_event
+    flow::package_import::tests::flow_package_import_preview_writes_no_canonical_state_and_commit_remaps_exact_document_heads \
+    flow::package_import::tests::flow_package_import_promotion_fault_rolls_back_every_canonical_row_and_completion_event
   do
     set +e
     env -u RUST_TEST_THREADS \
