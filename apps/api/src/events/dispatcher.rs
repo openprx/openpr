@@ -988,6 +988,22 @@ struct WebhookRow {
     secret: String,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_ALLOW_PRIVATE_DELIVERY_TARGET: bool;
+}
+
+async fn validate_delivery_target(raw: &str) -> Result<reqwest::Url, String> {
+    #[cfg(test)]
+    if TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+        .try_with(|allow| *allow)
+        .unwrap_or(false)
+    {
+        return reqwest::Url::parse(raw).map_err(|error| error.to_string());
+    }
+    validate_outbound_url(raw).await
+}
+
 async fn attempt_delivery(
     state: &AppState,
     client: &reqwest::Client,
@@ -1026,7 +1042,7 @@ async fn attempt_delivery(
         }
     };
 
-    let target = match validate_outbound_url(&webhook.url).await {
+    let target = match validate_delivery_target(&webhook.url).await {
         Ok(target) => target,
         Err(err) => {
             tracing::warn!(delivery_id = %delivery.id, error = %err, "dispatcher: webhook url rejected");
@@ -1689,16 +1705,19 @@ mod dispatcher_database_tests {
         ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
     };
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use uuid::Uuid;
 
     use super::{
         BusinessEventRow, DISPATCHER_LIVENESS_MAX_SILENCE_MS, ExpansionOutcome, FAIL_EXPANSION_STEP_B,
         OLDEST_PENDING_AGE_ALERT_MS, REPLAY_MAX_WINDOW_DAYS, ReplayMode, ReplayRequest, ReplayResult,
-        SUBSCRIBERS_PER_WORKSPACE_MAX, backlog_alert, build_delivery_body, delivery_backoff_ms, dispatcher_is_live,
-        dispatcher_is_live_since, ensure_workspace_subscriber_slot, envelope_json, expand_one,
-        oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms, reap_delivery_retention,
-        reap_delivery_source_tombstones, reclaim_expired_delivery_leases, reclaim_expired_dispatch_leases,
-        replay_deliveries, requeue_failed, run_tick, send_one, workspace_subscriber_count,
+        SUBSCRIBERS_PER_WORKSPACE_MAX, TEST_ALLOW_PRIVATE_DELIVERY_TARGET, backlog_alert, build_delivery_body,
+        delivery_backoff_ms, dispatcher_is_live, dispatcher_is_live_since, ensure_workspace_subscriber_slot,
+        envelope_json, expand_one, oldest_pending_delivery_age_ms, oldest_pending_dispatch_age_ms,
+        reap_delivery_retention, reap_delivery_source_tombstones, reclaim_expired_delivery_leases,
+        reclaim_expired_dispatch_leases, replay_deliveries, requeue_failed, run_tick, send_one,
+        workspace_subscriber_count,
     };
     use crate::error::ApiError;
     use crate::events::{BusinessEventInput, insert_business_event};
@@ -2633,6 +2652,126 @@ mod dispatcher_database_tests {
         assert!(
             row.lease_token.is_none(),
             "the lease must be released before the next attempt"
+        );
+
+        scratch.drop_self().await;
+    }
+
+    #[tokio::test]
+    async fn flow_delivery_failure_then_fresh_dispatcher_delivers_once_with_the_same_delivery_id() {
+        async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.expect("request is readable");
+                assert!(read > 0, "request ended before its declared body");
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content-length is numeric"))
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= header_end + 4 + content_length {
+                    return String::from_utf8(bytes).expect("delivery request is UTF-8");
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let address = listener.local_addr().expect("listener address is available");
+        let receiver = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in ["503 Service Unavailable", "204 No Content"] {
+                let (mut socket, _) = listener.accept().await.expect("delivery connection arrives");
+                requests.push(read_request(&mut socket).await);
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.expect("response writes");
+                socket.flush().await.expect("response flushes");
+            }
+            requests
+        });
+
+        let scratch = scratch_or_skip!("failure-restart-success");
+        let workspace_id = seed_workspace(&scratch.db).await;
+        seed_webhook(
+            &scratch.db,
+            workspace_id,
+            &format!("http://{address}/hook"),
+            &["flow.object.created"],
+        )
+        .await;
+        let event_id =
+            commit_dispatch_work(&scratch.db, workspace_id, "flow.object.created", None, None, json!({})).await;
+        expand_one(&scratch.db).await.expect("expansion runs");
+        let delivery_id: Uuid = get_col(
+            &scratch.db,
+            "SELECT id FROM event_deliveries WHERE event_id=$1",
+            vec![event_id.into()],
+            "id",
+        )
+        .await;
+
+        let first = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+            .scope(true, send_one(&state_for(scratch.db.clone()), &reqwest::Client::new()))
+            .await
+            .expect("first dispatcher runs");
+        assert_eq!(first, Some(false), "503 must schedule a retry");
+        exec(
+            &scratch.db,
+            "UPDATE event_deliveries SET next_attempt_at=now() WHERE id=$1",
+            vec![delivery_id.into()],
+        )
+        .await;
+
+        // A fresh state and HTTP client model the dispatcher process restarting between attempts.
+        let second = TEST_ALLOW_PRIVATE_DELIVERY_TARGET
+            .scope(true, send_one(&state_for(scratch.db.clone()), &reqwest::Client::new()))
+            .await
+            .expect("restarted dispatcher runs");
+        assert_eq!(second, Some(true), "the retry must reach a successful terminal state");
+
+        #[derive(FromQueryResult)]
+        struct Row {
+            status: String,
+            attempts: i32,
+        }
+        let row = Row::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT status,attempts FROM event_deliveries WHERE id=$1",
+            vec![delivery_id.into()],
+        ))
+        .one(&scratch.db)
+        .await
+        .expect("delivery query runs")
+        .expect("delivery remains visible");
+        assert_eq!(row.status, "dispatched");
+        assert_eq!(row.attempts, 1, "one failed attempt is retained after success");
+
+        let requests = receiver.await.expect("receiver task completes");
+        assert_eq!(requests.len(), 2);
+        let expected_header = format!("x-sylvode-delivery-id: {delivery_id}");
+        for request in &requests {
+            assert!(
+                request.to_ascii_lowercase().contains(&expected_header),
+                "every attempt carries the immutable consumer dedupe key"
+            );
+        }
+        let first_body = requests[0].split("\r\n\r\n").nth(1).expect("first body exists");
+        let second_body = requests[1].split("\r\n\r\n").nth(1).expect("second body exists");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(first_body).unwrap()["delivery"]["attempt"],
+            1
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(second_body).unwrap()["delivery"]["attempt"],
+            2
         );
 
         scratch.drop_self().await;
