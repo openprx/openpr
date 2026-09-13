@@ -31,8 +31,10 @@ artifacts={}
 for relative in required:
     path=repo/relative if relative.startswith(".flow-gate/") else evidence/pathlib.Path(relative).name
     try:
-        data=json.loads(path.read_text()); artifacts[path.name]={"passed":data.get("passed"),"executed_count":data.get("executed_count",0)}
-        if int(data.get("executed_count",0))<=0: drift.append({"field":f"artifact.{path.name}.executed_count","error":"must be nonzero"})
+        data=json.loads(path.read_text())
+        executed=int(data.get("executed_count",data.get("counts",{}).get("matrix_rows",0)))
+        artifacts[path.name]={"passed":data.get("passed"),"executed_count":executed}
+        if executed<=0: drift.append({"field":f"artifact.{path.name}.executed_count","error":"must be nonzero"})
     except Exception as exc: drift.append({"field":f"artifact.{path.name}","error":str(exc)})
 failed=[key for key,value in receipt.get("hard_gates",{}).items() if value!="passed"]
 same("automated_gate_count",receipt.get("automated_gate_count"),len(gate.get("hard_gates",{})))
