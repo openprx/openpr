@@ -81,11 +81,12 @@ grep -Fq 'if false {' "$SOURCE"
 run_case canonical_manifest_check_bypassed red "$FORMAT_TEST" exact
 restore_source
 
-perl -0pi -e 's/ \|\| !folded\.insert\(input\.path\.case_fold\(\)\.collect::<String>\(\)\)//' "$SOURCE"
-if grep -Fq '|| !folded.insert(input.path.case_fold().collect::<String>())' "$SOURCE"; then
+perl -0pi -e 's/input\.path\.case_fold\(\)\.collect::<String>\(\)/input.path.clone()/' "$SOURCE"
+if grep -Fq 'input.path.case_fold().collect::<String>()' "$SOURCE"; then
   echo 'FAIL: input casefold mutation did not apply' >&2
   exit 1
 fi
+grep -Fq '!folded.insert(input.path.clone())' "$SOURCE"
 run_case unicode_casefold_collision_accepted red "$PATH_TEST" exact
 restore_source
 
