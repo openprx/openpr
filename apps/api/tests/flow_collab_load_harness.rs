@@ -19,7 +19,7 @@
 //! A real `axum::serve` listener on `127.0.0.1:0` wired the way `apps/api/src/main.rs` wires the
 //! collab routes, backed by a **real, freshly migrated `PostgreSQL` scratch database** (never a mock
 //! or in-memory DB — `gate-commands.md` fails a run outright for that), driven by
-//! [`CONCURRENT_CLIENTS`] real `tokio-tungstenite` WebSocket clients that each produce genuine
+//! 10 or 50 real `tokio-tungstenite` WebSocket clients that each produce genuine
 //! Loro CRDT deltas from their own engine and wait for their own `accepted` frame, plus REST/WS
 //! parity probes that run *concurrently with* that write load.
 //!
@@ -127,6 +127,15 @@ use api::routes::flow::get_flow_object_bootstrap;
 /// 250 ms". The literal name the verifier greps for (`10_client`, `ten_client`,
 /// `concurrent_client`) is deliberate — this constant is that gate's subject.
 const CONCURRENT_CLIENTS: usize = 10;
+const CAPACITY_CLIENTS_ENV: &str = "OPENPR_FLOW_CAPACITY_CLIENTS";
+
+fn configured_clients() -> usize {
+    match std::env::var(CAPACITY_CLIENTS_ENV).as_deref() {
+        Ok("50") => 50,
+        Ok("10") | Err(_) => CONCURRENT_CLIENTS,
+        Ok(other) => panic!("{CAPACITY_CLIENTS_ENV} must be exactly 10 or 50, got {other}"),
+    }
+}
 
 /// `ADR-0010` §"量化接受与推翻门槛" item 2 — the 10-client accepted `round_trip_p95` ceiling.
 const ROUND_TRIP_P95_MS_MAX: f64 = 250.0;
@@ -1452,6 +1461,8 @@ fn measure_prepare_ms(snapshot: &[u8], update: &[u8]) -> (Vec<f64>, Vec<f64>) {
 
 #[derive(Default)]
 struct Report {
+    clients: usize,
+    load_elapsed_ms: f64,
     violations: Vec<String>,
     notes: Vec<String>,
     round_trip: Option<Distribution>,
@@ -1574,10 +1585,14 @@ impl Report {
                 "log_transport": "logging_collector stderr file read inside the PostgreSQL container",
             },
             "10_client": {
-                "clients": CONCURRENT_CLIENTS,
+                "clients": self.clients,
                 "warmup_rounds": WARMUP_ROUNDS,
                 "measured_rounds": MEASURED_ROUNDS,
                 "accepted_total": self.accepted_total,
+                "load_elapsed_ms": self.load_elapsed_ms,
+                "accepted_updates_per_second": if self.load_elapsed_ms > 0.0 {
+                    self.accepted_total as f64 * 1_000.0 / self.load_elapsed_ms
+                } else { 0.0 },
                 "seq_contiguous": self.seq_contiguous,
                 "head_seq": self.head_seq,
                 "round_trip_p95": self.round_trip.as_ref().map(Distribution::to_json),
@@ -1847,6 +1862,7 @@ struct CountRow {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "environment-gated heavy measurement; run explicitly through the dedicated PostgreSQL harness"]
 async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
+    let clients = configured_clients();
     if let Some((reason_code, detail)) = load_environment_problem() {
         emit_environment_not_satisfied(reason_code, &detail);
         panic!("ENVIRONMENT NOT SATISFIED [{reason_code}]: {detail}");
@@ -1855,7 +1871,7 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     // Without a real database there is nothing to measure -- `gate-commands.md` fails any run that
     // substitutes a mock or in-memory database outright. This test is ignored by ordinary workspace
     // runs; when explicitly selected, an unsatisfied environment is a failure, never an `ok`.
-    let Some(scratch) = scratch("ten_client").await else {
+    let Some(scratch) = scratch(&format!("capacity_{clients}")).await else {
         let mut skipped = Report {
             build_profile: build_profile(),
             ..Report::default()
@@ -1869,6 +1885,7 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     };
 
     let mut report = Report {
+        clients,
         build_profile: build_profile(),
         postgres_version: server_version(&scratch.db).await,
         ..Report::default()
@@ -1895,7 +1912,7 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
         .expect("application pool connects to the scratch database");
     let state = state_for(app_db);
 
-    let (workspace_id, members) = seed_workspace(&state.db, CONCURRENT_CLIENTS + 1).await;
+    let (workspace_id, members) = seed_workspace(&state.db, clients + 1).await;
     let (object_id, document_id) = create_page(&state, workspace_id, members[0]).await;
     let addr = spawn_server(state.clone()).await;
 
@@ -1906,14 +1923,14 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
         workspace_id,
         clients: members
             .iter()
-            .take(CONCURRENT_CLIENTS)
+            .take(clients)
             .enumerate()
             .map(|(index, user_id)| ClientCredentials {
                 client_id: format!("load-client-{index}"),
                 token: jwt_for(*user_id),
             })
             .collect(),
-        parity_token: jwt_for(members[CONCURRENT_CLIENTS]),
+        parity_token: jwt_for(members[clients]),
     };
 
     // The measurement window opens here: everything logged from now on belongs to the load.
@@ -1945,9 +1962,10 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
     });
 
     // ---- the 10-client load itself ----
-    let mut client_handles = Vec::with_capacity(CONCURRENT_CLIENTS);
+    let load_started = Instant::now();
+    let mut client_handles = Vec::with_capacity(clients);
     let harness = std::sync::Arc::new(harness);
-    for index in 0..CONCURRENT_CLIENTS {
+    for index in 0..clients {
         let harness = harness.clone();
         client_handles.push(tokio::spawn(async move { harness.load_generator_client(index).await }));
     }
@@ -1959,6 +1977,7 @@ async fn ten_client_load_harness_round_trip_p95_and_lock_hold_p95() {
         report.accepted_total += outcome.accepted_seqs.len();
         report.rejections.extend(outcome.rejections);
     }
+    report.load_elapsed_ms = load_started.elapsed().as_secs_f64() * 1_000.0;
     let mut parity = parity_handle.await.expect("parity probe task completes");
 
     // A quiesced final pair: with no writes in flight the two surfaces must be byte-identical, so
