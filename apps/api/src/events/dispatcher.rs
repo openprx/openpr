@@ -2748,7 +2748,7 @@ mod dispatcher_database_tests {
             .await
             .expect("retry row query runs")
             .expect("retry row remains present");
-            let expected = chrono::Duration::milliseconds(delivery_backoff_ms(attempt));
+            let expected = chrono::Duration::milliseconds((attempt * 30_000).min(300_000));
             assert!(
                 row.next_attempt_at >= before + expected && row.next_attempt_at <= after + expected,
                 "attempt {attempt} wrote {} outside the database-observed [{}, {}] schedule",
