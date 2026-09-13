@@ -65,8 +65,8 @@ run_case post_commit_fanout_failure_misreported red "$ATOMIC_TEST"
 git -C "$WORKTREE" restore apps/api/src/flow/collab/write.rs
 
 perl -0pi -e 's/if let Err\(error\) = super::fanout::publish_document_update\((.*?)\)\n                \.await\n                \{.*?\n                \}//s' "$WRITE_SOURCE"
-if grep -Fq 'publish_document_update(' "$WRITE_SOURCE"; then
-  echo 'FAIL: fanout omission mutation did not apply' >&2
+if [[ $(grep -c 'publish_document_update(' "$WRITE_SOURCE") -ne 1 ]]; then
+  echo 'FAIL: normal-commit fanout omission mutation did not leave only the commit-unknown recovery call' >&2
   exit 1
 fi
 run_case committed_update_omits_fanout_notice red "$NOTICE_TEST"
