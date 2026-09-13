@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_writes_no_canonical_state_and_commit_remaps_exact_document_heads() {
+    async fn flow_package_import_preview_writes_no_canonical_state_and_commit_remaps_exact_document_heads() {
         let Some(scratch) = scratch("flow_package_import_roundtrip").await else {
             eprintln!("SKIPPED (no database): set OPENPR_TEST_DATABASE_URL to run this test");
             return;
@@ -1695,7 +1695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promotion_fault_rolls_back_every_canonical_row_and_completion_event() {
+    async fn flow_package_import_promotion_fault_rolls_back_every_canonical_row_and_completion_event() {
         let Some(scratch) = scratch("flow_package_import_rollback").await else {
             eprintln!("SKIPPED (no database): set OPENPR_TEST_DATABASE_URL to run this test");
             return;

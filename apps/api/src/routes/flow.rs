@@ -9468,7 +9468,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn maintenance_routes_require_exact_confirm_and_keep_dry_runs_canonical_zero_write() {
+    async fn flow_operations_require_exact_confirm_and_keep_dry_runs_canonical_zero_write() {
         let scratch = scratch_or_skip!("v08-maintenance-routes");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state, true).await;
@@ -9743,7 +9743,7 @@ mod flow_database_tests {
     }
 
     #[tokio::test]
-    async fn package_export_upload_preview_commit_status_runs_through_real_http_shapes() {
+    async fn flow_package_import_export_upload_preview_commit_status_runs_through_real_http_shapes() {
         use tower::ServiceExt as _;
 
         let scratch = scratch_or_skip!("package-route-chain");

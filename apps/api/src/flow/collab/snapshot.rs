@@ -1510,7 +1510,7 @@ mod database_tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_racing_compaction_observes_one_complete_mvcc_view_without_a_gap() {
+    async fn flow_bootstrap_compaction_consistency_observes_one_complete_mvcc_view_without_a_gap() {
         let scratch = scratch_or_skip!("bootstrap-compaction-mvcc");
         let state = state_for(scratch.db.clone());
         let (workspace_id, owner_id) = seed_workspace(&state).await;
