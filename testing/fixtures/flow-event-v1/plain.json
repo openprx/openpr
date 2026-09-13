@@ -1,0 +1,18 @@
+{
+  "delivery": {"attempt": 1, "coalesced": false, "id": "<delivery_id>"},
+  "event": {
+    "actor_id": null,
+    "aggregate": {"id": "<aggregate_id>", "type": "flow_object"},
+    "causation_id": null,
+    "correlation_id": null,
+    "created_at": "<created_at>",
+    "event_id": "<event_id>",
+    "event_type": "flow.object.created",
+    "metadata": {},
+    "payload": {"object_id": "11111111-1111-1111-1111-111111111111"},
+    "project_id": null,
+    "source": {"surface": "rest"},
+    "version": "openpr.event.v1",
+    "workspace_id": "<workspace_id>"
+  }
+}

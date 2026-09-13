@@ -853,12 +853,18 @@ mod tests {
 
     #[test]
     fn locked_package_fixture_rebuilds_to_the_frozen_archive_hash() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testing/fixtures/flow-package-v1/package-fixture.json"
+        let path = std::env::var_os("OPENPR_TEST_FLOW_PACKAGE_FIXTURE_DIR").map_or_else(
+            || {
+                std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testing/fixtures/flow-package-v1"
+                ))
+            },
+            std::path::PathBuf::from,
         );
+        let path = path.join("package-fixture.json");
         let fixture: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).expect("locked fixture is readable"))
+            serde_json::from_slice(&std::fs::read(&path).expect("locked fixture is readable"))
                 .expect("locked fixture is valid JSON");
         let manifest: ExportPackageManifest =
             serde_json::from_value(fixture["manifest"].clone()).expect("fixture manifest matches the v1 schema");

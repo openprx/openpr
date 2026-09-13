@@ -1709,7 +1709,7 @@ mod dispatcher_database_tests {
     use sea_orm::{
         ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use uuid::Uuid;
@@ -1728,6 +1728,49 @@ mod dispatcher_database_tests {
     use crate::events::{BusinessEventInput, insert_business_event};
 
     const TEST_DATABASE_URL_ENV: &str = "OPENPR_TEST_DATABASE_URL";
+
+    fn frozen_delivery_fixture(name: &str) -> Value {
+        let root = std::env::var_os("OPENPR_TEST_FLOW_EVENT_FIXTURE_DIR").map_or_else(
+            || {
+                std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../testing/fixtures/flow-event-v1"
+                ))
+            },
+            std::path::PathBuf::from,
+        );
+        let path = root.join(format!("{name}.json"));
+        serde_json::from_slice(
+            &std::fs::read(&path).unwrap_or_else(|error| {
+                panic!("frozen Flow event fixture {} must be readable: {error}", path.display())
+            }),
+        )
+        .unwrap_or_else(|error| panic!("frozen Flow event fixture {} must be JSON: {error}", path.display()))
+    }
+
+    fn normalize_delivery_body(body: &Value, coalesced_sources: usize, changed_blocks: usize) -> Value {
+        let mut normalized = body.clone();
+        normalized["delivery"]["id"] = json!("<delivery_id>");
+        normalized["event"]["event_id"] = json!("<event_id>");
+        normalized["event"]["workspace_id"] = json!("<workspace_id>");
+        normalized["event"]["aggregate"]["id"] = json!("<aggregate_id>");
+        normalized["event"]["created_at"] = json!("<created_at>");
+        if coalesced_sources > 0 {
+            normalized["delivery"]["source_event_ids"] = Value::Array(
+                (1..=coalesced_sources)
+                    .map(|index| json!(format!("<source_event_{index}>")))
+                    .collect(),
+            );
+        }
+        if changed_blocks > 0 {
+            normalized["event"]["payload"]["changed_block_ids"] = Value::Array(
+                (1..=changed_blocks)
+                    .map(|index| json!(format!("<changed_block_{index}>")))
+                    .collect(),
+            );
+        }
+        normalized
+    }
 
     #[test]
     fn flow_delivery_retry_backoff_matches_every_frozen_attempt() {
@@ -5751,6 +5794,11 @@ mod dispatcher_database_tests {
         assert_eq!(body["event"]["version"], json!("openpr.event.v1"));
         assert_eq!(body["event"]["event_id"], json!(event_id));
         assert_eq!(body["event"]["event_type"], json!("flow.object.created"));
+        assert_eq!(
+            normalize_delivery_body(&body, 0, 0),
+            frozen_delivery_fixture("plain"),
+            "the real producer must remain byte-shape compatible with the frozen plain consumer fixture"
+        );
 
         scratch.drop_self().await;
     }
@@ -5778,7 +5826,7 @@ mod dispatcher_database_tests {
             json!({ "changed_block_ids": [block_a] }),
         )
         .await;
-        commit_dispatch_work(
+        let event_2 = commit_dispatch_work(
             &scratch.db,
             workspace_id,
             "flow.content.accepted",
@@ -5829,6 +5877,7 @@ mod dispatcher_database_tests {
         let source_ids = body["delivery"]["source_event_ids"].as_array().expect("array");
         assert_eq!(source_ids.len(), 2);
         assert!(source_ids.contains(&json!(event_1)));
+        assert!(source_ids.contains(&json!(event_2)));
         let correct_consumer_keys =
             std::iter::once(body["delivery"]["id"].clone()).collect::<std::collections::HashSet<_>>();
         let wrong_event_id_consumer_keys = source_ids.iter().cloned().collect::<std::collections::HashSet<_>>();
@@ -5852,6 +5901,11 @@ mod dispatcher_database_tests {
         assert_eq!(block_ids.len(), 2);
         assert!(block_ids.contains(&json!(block_a)));
         assert!(block_ids.contains(&json!(block_b)));
+        assert_eq!(
+            normalize_delivery_body(&body, 2, 2),
+            frozen_delivery_fixture("coalesced"),
+            "the real producer must remain byte-shape compatible with the frozen coalesced consumer fixture"
+        );
 
         scratch.drop_self().await;
     }
@@ -6012,6 +6066,14 @@ mod dispatcher_database_tests {
         assert_eq!(
             body_1["event"], body_4["event"],
             "the event envelope itself is identical across retries"
+        );
+        assert_eq!(
+            json!({
+                "attempt_1": normalize_delivery_body(&body_1, 0, 0),
+                "attempt_4": normalize_delivery_body(&body_4, 0, 0),
+            }),
+            frozen_delivery_fixture("retry"),
+            "the real retry producer must remain compatible with the frozen consumer fixture"
         );
 
         scratch.drop_self().await;

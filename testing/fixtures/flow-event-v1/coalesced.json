@@ -1,0 +1,25 @@
+{
+  "delivery": {
+    "attempt": 1,
+    "block_ids_truncated": false,
+    "coalesced": true,
+    "id": "<delivery_id>",
+    "range": {"first_seq": 1, "latest_seq": 2},
+    "source_event_ids": ["<source_event_1>", "<source_event_2>"]
+  },
+  "event": {
+    "actor_id": null,
+    "aggregate": {"id": "<aggregate_id>", "type": "flow_object"},
+    "causation_id": null,
+    "correlation_id": null,
+    "created_at": "<created_at>",
+    "event_id": "<event_id>",
+    "event_type": "flow.content.accepted",
+    "metadata": {},
+    "payload": {"changed_block_ids": ["<changed_block_1>", "<changed_block_2>"]},
+    "project_id": null,
+    "source": {"surface": "rest"},
+    "version": "openpr.event.v1",
+    "workspace_id": "<workspace_id>"
+  }
+}
