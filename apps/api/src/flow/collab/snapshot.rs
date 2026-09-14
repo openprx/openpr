@@ -1010,42 +1010,56 @@ mod database_tests {
         let base_frontier = engine.frontier();
         engine.set_title(label).expect("set_title succeeds");
         let bytes = engine.export_from(&base_frontier).expect("export succeeds");
-        let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+        let update_id = Uuid::new_v4();
         // A throwaway registry: this helper's callers assert on the returned `Accepted` value and
         // on database state, never on WebSocket fan-out, so there is nothing for a real session to
         // observe here.
         let registry = crate::flow::collab::registry::SessionRegistry::new();
-        let outcome = write::accept_update(
-            &state.db,
-            cache,
-            coordinator,
-            &registry,
-            advancer,
-            10,
-            None,
-            UpdateRequest {
-                origin: crate::flow::event_origin::CommandOrigin::first_request_from(
-                    crate::flow::event_origin::EventSurface::Rest,
-                ),
-                document_id,
-                update_id: Uuid::new_v4(),
-                bytes,
-                idempotency_key: None,
-                event_idempotency_key: None,
-                origin_client_id: Some("snapshot-test".to_string()),
-                message: None,
-                actor_id,
-                actor_is_bot: false,
-                workspace_id,
-                checked_epoch,
-                expected_frontier: None,
-            },
-        )
-        .await
-        .expect("accept_update does not hit a hard database error");
-        match outcome {
-            AcceptOutcome::Accepted(accepted) => accepted,
-            AcceptOutcome::Rejected(rejected) => panic!("expected Accepted, got {rejected:?}"),
+        let mut contention_retries = 0_u32;
+        loop {
+            let checked_epoch = authz::read_epoch(&state.db, workspace_id).await.expect("epoch reads");
+            let outcome = write::accept_update(
+                &state.db,
+                cache,
+                coordinator,
+                &registry,
+                advancer,
+                10,
+                None,
+                UpdateRequest {
+                    origin: crate::flow::event_origin::CommandOrigin::first_request_from(
+                        crate::flow::event_origin::EventSurface::Rest,
+                    ),
+                    document_id,
+                    update_id,
+                    bytes: bytes.clone(),
+                    idempotency_key: None,
+                    event_idempotency_key: None,
+                    origin_client_id: Some("snapshot-test".to_string()),
+                    message: None,
+                    actor_id,
+                    actor_is_bot: false,
+                    workspace_id,
+                    checked_epoch,
+                    expected_frontier: None,
+                },
+            )
+            .await
+            .expect("accept_update does not hit a hard database error");
+            match outcome {
+                AcceptOutcome::Accepted(accepted) => return accepted,
+                AcceptOutcome::Rejected(rejected) => {
+                    let Some(retry_after_ms) = contention_retry_after_ms(&rejected) else {
+                        panic!("expected Accepted, got {rejected:?}");
+                    };
+                    assert!(
+                        contention_retries < RACING_WRITE_CONTENTION_RETRIES,
+                        "expected Accepted after {contention_retries} safe contention retries, got {rejected:?}"
+                    );
+                    contention_retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms)).await;
+                }
+            }
         }
     }
 
