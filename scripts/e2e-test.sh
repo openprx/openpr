@@ -101,6 +101,8 @@ cleanup() {
   echo ""
   echo "🧹 Cleaning up..."
   docker compose down -v --remove-orphans
+  rm -f config/sylvode.compose.toml config/sylvode.compose.mcp.toml \
+    config/openpr.compose.toml config/openpr.compose.mcp.toml
   echo "✅ Cleanup complete"
 }
 
@@ -224,7 +226,9 @@ fi
 
 echo ""
 if [ -n "${OPENPR_E2E_CONTAINER_SNAPSHOT:-}" ]; then
-  docker compose ps --format '{{.Name}}' >"$OPENPR_E2E_CONTAINER_SNAPSHOT"
+  docker ps --format '{{.Names}}' | awk -v project="$COMPOSE_PROJECT_NAME" \
+    'index($0, project "_") == 1 || index($0, project "-") == 1' \
+    >"$OPENPR_E2E_CONTAINER_SNAPSHOT"
 fi
 echo "🎉 All End-to-End Tests Passed!"
 echo ""
