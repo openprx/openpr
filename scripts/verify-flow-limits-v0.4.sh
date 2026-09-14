@@ -1298,6 +1298,9 @@ if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
     echo "(skipped by --skip-cargo-test)" > "$f"
   done
 else
+  # These nine producer-local filters intentionally retain default libtest parallelism. Each was
+  # measured independently as deterministic and 5/5 green at ccd2a99; raw per-run counts, timings,
+  # logs, and hashes are in /opt/worker/evidence/v10-limits-parallel-5x-ccd2a99/summary.json.
   echo "  running: cargo test -p api routes::collab::...full_session_hello... (DB-backed)" >&2
   set +e
   ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::collab::collab_database_tests::full_session_hello_open_snapshot_update_accepted_and_two_rejections" ) > "$LOG_DIR/limits.dyn.update_bytes_e2e.log" 2>&1
