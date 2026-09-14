@@ -342,7 +342,7 @@ pub(crate) struct ObservedHead {
 }
 
 impl ObservedHead {
-    fn tail_stats(&self) -> snapshot::TailStats {
+    const fn tail_stats(&self) -> snapshot::TailStats {
         snapshot::TailStats {
             snapshot_seq: self.snapshot_seq,
             head_seq: self.head_seq,
