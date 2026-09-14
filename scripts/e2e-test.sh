@@ -164,7 +164,7 @@ echo ""
 # it presents, and that bot has to belong to the workspace the server is bound to through
 # mcp.workspace_id. Step 1 wrote placeholders for both, which name nothing. This bootstrap creates
 # the workspace and the bot through the API, writes the pair into
-# config/openpr.compose.mcp.toml, and recreates the mcp-server container so it picks them up —
+# config/sylvode.compose.mcp.toml, and restarts the mcp-server container so it picks them up —
 # after which step 4 can authenticate as that bot.
 echo "📋 Step 3b: Seeding a workspace and the MCP bot the server is reached as"
 OPENPR_DEMO_EMAIL="$E2E_ACCOUNT_EMAIL" \
