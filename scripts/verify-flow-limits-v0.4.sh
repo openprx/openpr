@@ -391,10 +391,9 @@ VERSION_BOUNDARY_REASON_CODE = "not_applicable_until_v0_8"
 # Named keys ONLY -- deliberately not a `*retention*` pattern. A pattern would have swallowed
 # `delivery_retention_days` and `dispatch_expanded_retention_days`, both v0.4-owned and frozen,
 # and would silently absorb any future retention budget nobody got round to freezing.
-V08_DEFERRED_DISPATCH_BUDGET_KEYS = {
-    "delivery_source_retention_days",
-    "replay_max_window_days",
-}
+# Both former v0.8 deferrals are now frozen in limits-v1.md and implemented in dispatcher.rs.
+# Keeping either name here would make this verifier crash instead of revalidating the frozen row.
+V08_DEFERRED_DISPATCH_BUDGET_KEYS = set()
 # Each allowlisted key must prove its own deferral from the contract row it appears in, so the
 # allowlist cannot be widened by editing this script alone: the row must still say `status: unset`
 # (a key that got frozen must leave the allowlist and be verified, not stay excused) and must name
