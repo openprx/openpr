@@ -32,7 +32,7 @@ run install install-upgrade-rollback-result.json "$ROOT/scripts/verify-flow-inst
 run backup backup-restore-result.json "$ROOT/scripts/verify-flow-backup-restore-v1.0.sh" --contracts-root "$CONTRACTS" --evidence-root "$EVIDENCE" --json
 run old_client old-client-result.json "$ROOT/scripts/verify-flow-old-client-v1.0.sh" --evidence-root "$EVIDENCE" --json
 run slo slo-result.json "$ROOT/scripts/verify-flow-slo-v1.0.sh" --evidence-root "$EVIDENCE" --json
-run security security-result.json "$ROOT/scripts/verify-flow-security-v0.8.sh" --evidence-root "$EVIDENCE" --json
+run security security-result.json "$ROOT/scripts/verify-flow-security-v1.0.sh" --evidence-root "$EVIDENCE" --json
 run forms flow-forms-signoffs-result.json "$ROOT/scripts/verify-flow-forms-signoffs-v1.0.sh" --contracts-root "$CONTRACTS" --evidence-root "$EVIDENCE" --json
 run runbook runbook-result.json "$ROOT/scripts/verify-flow-runbook-v1.0.sh" --evidence-root "$EVIDENCE" --json
 run surface surface-coverage-result.json "$ROOT/scripts/verify-flow-surface-coverage.sh" --release 1.0 --contracts-root "$CONTRACTS" --evidence-root "$EVIDENCE" --repo-root "$ROOT" --json
