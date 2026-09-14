@@ -56,8 +56,9 @@ except Exception as error:
 head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
 rust = re.search(r'\[workspace\.package\].*?version\s*=\s*"([^"]+)"', (repo / "Cargo.toml").read_text(), re.S).group(1)
 frontend = json.loads((repo / "frontend/package.json").read_text())["version"]
-dirty = subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain=v1", "--",
-    "apps", "crates", "frontend", "migrations", "scripts", "testing", "Cargo.toml", "Cargo.lock"], text=True).splitlines()
+dirty = subprocess.check_output(
+    ["git", "-C", str(repo), "status", "--porcelain=v1"], text=True
+).splitlines()
 
 same("schema_version", receipt.get("schema_version"), "sylvode.flow.gate-result.v1")
 same("release", receipt.get("release"), "0.9.0")

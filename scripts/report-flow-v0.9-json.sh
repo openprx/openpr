@@ -177,8 +177,9 @@ except Exception:
 
 rust = re.search(r'\[workspace\.package\].*?version\s*=\s*"([^"]+)"', (repo / "Cargo.toml").read_text(), re.S).group(1)
 frontend = json.loads((repo / "frontend/package.json").read_text())["version"]
-dirty = subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain=v1", "--",
-    "apps","crates","frontend","migrations","scripts","testing","Cargo.toml","Cargo.lock"], text=True).splitlines()
+dirty = subprocess.check_output(
+    ["git", "-C", str(repo), "status", "--porcelain=v1"], text=True
+).splitlines()
 baseline = gate.get("source_baseline", {})
 baseline_matches = baseline.get("reviewed_head") == head and str(baseline.get("rust_workspace_version")) == rust and str(baseline.get("frontend_package_version")) == frontend
 contract_status = gate.get("status")
