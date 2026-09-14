@@ -50,7 +50,10 @@ checks=[]; artifacts={}
 for raw in rows_path.read_text().splitlines():
  cid,code,log,artifact,command=raw.split("\t",4); code=int(code); body=(evidence/log).read_text(errors="replace"); value=load(artifact); artifacts[cid]=value
  summaries=re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;",body,re.M)
- executed=int(value.get("executed_count",0)); ignored=sum(int(x) for *_,x in summaries)
+ if cid=="surface": executed=int(value.get("counts",{}).get("matrix_rows",0))
+ elif cid=="registry": executed=int(value.get("live_registry",{}).get("enumerated_total",0))
+ else: executed=int(value.get("executed_count",0))
+ ignored=sum(int(x) for *_,x in summaries)
  ok=code==0 and executed>0 and value.get("passed") is True
  checks.append({"id":cid,"artifact":artifact,"status":"passed" if ok else "failed","exit_code":code,"executed_count":executed,"ignored_count":ignored,"command":command,"log":log,"sha256":hashlib.sha256((evidence/log).read_bytes()).hexdigest()})
 ok={r["id"]:r["status"]=="passed" for r in checks}; surface=artifacts["surface"]; registry=artifacts["registry"]
