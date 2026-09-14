@@ -26,7 +26,8 @@ Environment:
                                 configuration file. Default: auto, write only when
                                 that file already exists.
   OPENPR_DEMO_CONFIG_PATH       MCP configuration file carrying [mcp].
-                                Default: repo config/openpr.compose.mcp.toml.
+                                Default: canonical repo config/sylvode.compose.mcp.toml,
+                                with config/openpr.compose.mcp.toml as a legacy fallback.
   OPENPR_DEMO_RESTART_MCP=0     Do not recreate running compose mcp-server.
                                 Default: 1.
   OPENPR_DEMO_VERIFY_MCP_HTTP   Verify local MCP JSON-RPC after bootstrap.
@@ -55,9 +56,18 @@ require_cmd() {
 
 require_cmd node
 
-# The MCP server reads no environment variables; its settings live in a TOML file. Under compose
-# that is the file docker-compose.yml mounts into the mcp-server container.
-DEMO_CONFIG_PATH="${OPENPR_DEMO_CONFIG_PATH:-$ROOT_DIR/config/openpr.compose.mcp.toml}"
+# The MCP server reads no environment variables; its settings live in the TOML file compose
+# mounts. Use the same canonical-first, legacy-fallback decision as start.sh so credentials are
+# never written to a different file from the one the running container reads.
+# shellcheck source=scripts/lib/sylvode_compat.sh
+source "$ROOT_DIR/scripts/lib/sylvode_compat.sh"
+if [[ -n "${OPENPR_DEMO_CONFIG_PATH:-}" ]]; then
+  DEMO_CONFIG_PATH=$OPENPR_DEMO_CONFIG_PATH
+else
+  DEMO_CONFIG_PATH=$(sylvode_select_config \
+    "$ROOT_DIR/config/sylvode.compose.mcp.toml" \
+    "$ROOT_DIR/config/openpr.compose.mcp.toml")
+fi
 
 require_cmd python3
 
@@ -516,7 +526,7 @@ const fs = require('fs');
 const verifyMode = process.env.OPENPR_DEMO_VERIFY_MCP_HTTP ?? 'auto';
 const mcpUrl = process.env.OPENPR_DEMO_MCP_URL ?? 'http://localhost:8090/mcp/rpc';
 const stateFile = process.env.OPENPR_DEMO_STATE_FILE;
-const configPath = process.env.OPENPR_DEMO_CONFIG_PATH ?? 'config/openpr.compose.mcp.toml';
+const configPath = process.env.OPENPR_DEMO_CONFIG_PATH ?? 'config/sylvode.compose.mcp.toml';
 const overrideBotToken = process.env.OPENPR_MCP_BOT_TOKEN ?? '';
 
 if (verifyMode === '0' || verifyMode === 'false') {
