@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == --list-keys ]]; then
+ printf '%s\n' release_owner rollback_owner on_call_runbook stable_contract_approval
+ exit 0
+fi
 RESULT=${1:-};KEY=${2:-};STATUS=${3:-};SIGNER=${4:-};NOTE=${5:-}
 [[ -f $RESULT ]]||{ echo "usage: $0 GATE_RESULT KEY passed|failed SIGNER [NOTE]" >&2;exit 2;}
 case "$KEY" in release_owner|rollback_owner|on_call_runbook|stable_contract_approval);;*) echo 'invalid manual key' >&2;exit 2;;esac
