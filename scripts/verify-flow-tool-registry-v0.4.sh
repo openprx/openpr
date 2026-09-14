@@ -248,6 +248,33 @@ fi
 REPO_BASELINE_SHA="$(sha256sum "$REPO_BASELINE_PATH" | awk '{print $1}')"
 REPO_EXPECTED="$(jq -r '.count' <<<"$REPO_BASELINE_JSON")"
 REPO_NAMES_SHA="$(jq -r '.names_sha256' <<<"$REPO_BASELINE_JSON")"
+NAMES_MUTATION_JSON="$(python3 - "$REPO_NAMES_SHA" "$LIVE_JSON" <<'PY'
+import hashlib
+import json
+import sys
+
+baseline_hash = sys.argv[1]
+live = json.loads(sys.argv[2])
+names = list(live["names"])
+if not names:
+    raise SystemExit("cannot mutate an empty tool-name registry")
+unmutated_hash = hashlib.sha256("\n".join(names).encode()).hexdigest()
+original = names[0]
+names[0] = f"{original}.name_hash_mutation"
+names.sort()
+mutated_hash = hashlib.sha256("\n".join(names).encode()).hexdigest()
+print(json.dumps({
+    "control_green": unmutated_hash == baseline_hash,
+    "red": mutated_hash != baseline_hash,
+    "mutation": {"from": original, "to": f"{original}.name_hash_mutation"},
+    "unmutated_sha256": unmutated_hash,
+    "mutated_sha256": mutated_hash,
+}))
+PY
+)"
+if [[ $(jq -r '.control_green and .red' <<<"$NAMES_MUTATION_JSON") != true ]]; then
+  VIOLATIONS+=("tool-name hash mutation control did not prove unmutated green and perturbed red")
+fi
 REBASE_VALID="$(jq -n \
   --argjson baseline "$REPO_BASELINE_JSON" --argjson chronology "$CHRONOLOGY_JSON" \
   --argjson live_count "$LIVE_COUNT" --arg live_hash "$NAMES_SHA" '
@@ -385,6 +412,7 @@ RESULT="$(jq -n \
   --arg repo_baseline "$REPO_BASELINE_PATH" --arg repo_baseline_sha "$REPO_BASELINE_SHA" \
   --argjson live "$LIVE_JSON" --argjson contract "$CONTRACT_JSON" --argjson policy "$POLICY_JSON" \
   --argjson repo_registry_baseline "$REPO_BASELINE_JSON" --argjson chronology "$CHRONOLOGY_JSON" --argjson rebase_valid "$REBASE_VALID" \
+  --argjson names_mutation "$NAMES_MUTATION_JSON" \
   --argjson touchpoints "$TOUCHPOINTS_JSON" \
   --arg names_sha "$NAMES_SHA" \
   --argjson violations "$VIOLATIONS_JSON" --argjson passed "$PASSED" \
@@ -397,9 +425,7 @@ RESULT="$(jq -n \
     baseline_contract: {path: $baseline, sha256: $baseline_sha},
     repository_baseline: ($repo_registry_baseline + {path: $repo_baseline, sha256: $repo_baseline_sha, chronology: $chronology.entries}),
     rebase_valid: $rebase_valid,
-    mutation_controls: ($chronology.mutation_controls + {
-      names_hash_changed: {red: ($repo_registry_baseline.names_sha256 == $names_sha)}
-    }),
+    mutation_controls: ($chronology.mutation_controls + {names_hash_changed: $names_mutation}),
     live_registry: {
       source: "cargo build -p mcp-server --bin list-tools && ./list-tools (mcp_server::get_all_tool_definitions)",
       header_declared_total: $live.declared_total,
