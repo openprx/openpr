@@ -159,17 +159,14 @@ fn flow_v08_hardening_tool_definitions() -> Vec<ToolDefinition> {
 
 fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
     let mut tools = flow_v08_hardening_tool_definitions();
-    if let Err(error) = flow_v08_command_cardinality_registry(&tools) {
-        tracing::error!(%error, "refusing to register a v0.8 hardening tool without exact cardinality coverage");
-        return Vec::new();
-    }
     tools.extend([objects::repair_quarantine_tool()]);
     tools
 }
 
-/// Cardinality declarations are joined to the live v0.8 production tool registry by name.
-/// Therefore a newly registered hardening tool cannot exist without entering this match and a
-/// stale declaration cannot survive after its tool is removed.
+/// Test-only cardinality declarations joined to the live v0.8 production tool registry by name.
+/// The invariant test rejects a newly registered hardening tool without a declaration and a stale
+/// declaration after its tool is removed; runtime registration does not depend on this validator.
+#[cfg(test)]
 fn flow_v08_command_cardinality_registry(
     tools: &[ToolDefinition],
 ) -> Result<Vec<(String, api::flow::command::ExistingDocumentCardinality)>, String> {
