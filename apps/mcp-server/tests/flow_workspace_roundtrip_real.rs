@@ -159,7 +159,7 @@ async fn seed_workspace(state: &AppState, label: &str, token: &str) -> Result<(U
 
 async fn seed_source_graph(state: &AppState, workspace_id: Uuid, owner_id: Uuid) -> Result<Vec<Uuid>, Box<dyn Error>> {
     let mut objects = Vec::new();
-    for index in 0..3 {
+    for index in 0..4 {
         let object = create_object(
             state,
             CreateObjectInput {
@@ -168,7 +168,7 @@ async fn seed_source_graph(state: &AppState, workspace_id: Uuid, owner_id: Uuid)
                 actor_is_bot: false,
                 object_type: "page".to_string(),
                 project_id: None,
-                parent_object_id: None,
+                parent_object_id: objects.last().copied(),
                 title: format!("round trip page {index}"),
                 idempotency_key: format!("roundtrip-create-{index}"),
                 message: Some("v0.9 fixture".to_string()),
@@ -375,16 +375,24 @@ async fn full_workspace_roundtrip_compares_every_document_graph_lineage_and_repo
     assert_eq!(document_mapping.len(), source_states.len());
     assert_eq!(target_states.len(), source_states.len());
     let target_by_object: BTreeMap<_, _> = target_states.iter().map(|state| (state.object_id, state)).collect();
+    let mut parent_edges = Vec::with_capacity(source_states.len());
     for source_state in &source_states {
         let target_state = target_by_object[&object_mapping[&source_state.object_id]];
         assert_eq!(document_mapping[&source_state.document_id], target_state.document_id);
         assert_eq!(source_state.object_type, target_state.object_type);
         assert_eq!(source_state.lifecycle_status, target_state.lifecycle_status);
         assert_eq!(source_state.governance_metadata, target_state.governance_metadata);
-        assert_eq!(
-            source_state.parent_id.and_then(|id| object_mapping.get(&id).copied()),
-            target_state.parent_id.filter(|id| target_by_object.contains_key(id))
-        );
+        let source_parent = source_state.parent_id.filter(|id| object_mapping.contains_key(id));
+        let expected_target_parent = source_parent.and_then(|id| object_mapping.get(&id).copied());
+        let actual_target_parent = target_state.parent_id.filter(|id| target_by_object.contains_key(id));
+        assert_eq!(expected_target_parent, actual_target_parent);
+        parent_edges.push(json!({
+            "source_object_id":source_state.object_id,
+            "source_parent_id":source_parent,
+            "target_object_id":target_state.object_id,
+            "expected_target_parent_id":expected_target_parent,
+            "target_parent_id":actual_target_parent,
+        }));
         assert_eq!(source_state.head_seq, target_state.head_seq);
         assert_eq!(source_state.head_frontier, target_state.head_frontier);
         assert_eq!(source_state.projection_seq, target_state.projection_seq);
@@ -394,6 +402,14 @@ async fn full_workspace_roundtrip_compares_every_document_graph_lineage_and_repo
             semantic_hash(&scratch.db, target_state).await?
         );
     }
+    assert_eq!(
+        parent_edges
+            .iter()
+            .filter(|edge| !edge["source_parent_id"].is_null())
+            .count(),
+        3,
+        "the roundtrip fixture must contain the three non-root edges in root -> A -> B -> C"
+    );
 
     let relation_rows = scratch.db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT source_id,target_id FROM flow_import_lineage WHERE target_workspace_id=$1 AND package_sha256=$2 AND source_kind='flow_package' AND target_kind='relation'",
@@ -441,7 +457,8 @@ async fn full_workspace_roundtrip_compares_every_document_graph_lineage_and_repo
             "status":"passed","package_schema":"v1","source_workspace":source_workspace,"target_workspace":target_workspace,
             "documents_enumerated":source_states.len(),"documents_compared":source_states.len(),"objects_compared":object_mapping.len(),
             "relations_compared":1,"lineage_rows_compared":lineage_count,"report_checksum":hex::encode(Sha256::digest(serde_jcs::to_vec(&report)?)),
-            "comparison":{"head_seq":true,"head_frontier":true,"semantic_hash":true,"projection_seq":true,"projection_frontier":true,"object_metadata":true,"relation_graph":true,"lineage":true,"import_report":true},
+            "comparison":{"head_seq":true,"head_frontier":true,"semantic_hash":true,"projection_seq":true,"projection_frontier":true,"object_metadata":true,"parent_graph":true,"relation_graph":true,"lineage":true,"import_report":true},
+            "parent_edges":parent_edges,
             "mcp_import_chain":["objects.import_artifact","objects.import_preview","objects.import_commit","objects.import_status"],
             "command_trace":[
                 {"ordinal":1,"tool":"objects.import_artifact"},

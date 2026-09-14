@@ -91,6 +91,18 @@ def valid(value):
     branches = {row.get("conflict_policy"): row for row in value.get("branches", [])}
     reject = branches.get("reject_existing", {})
     reuse = branches.get("reuse_import_lineage", {})
+    parent_edges = value.get("parent_edges", [])
+    source_to_target = {row.get("source_object_id"): row.get("target_object_id") for row in parent_edges}
+    child_edges = [row for row in parent_edges if row.get("source_parent_id") is not None]
+    parent_graph_ok = bool(
+        len(parent_edges) == documents
+        and len(child_edges) == 3
+        and len({row.get("source_parent_id") for row in child_edges}) == 3
+        and sum(row.get("source_parent_id") is None for row in parent_edges) == 1
+        and all(row.get("expected_target_parent_id") == source_to_target.get(row.get("source_parent_id"))
+                and row.get("target_parent_id") == row.get("expected_target_parent_id")
+                for row in child_edges)
+    )
     return bool(
         value.get("status") == "passed"
         and value.get("package_schema") == "v1"
@@ -101,7 +113,8 @@ def valid(value):
         and value.get("lineage_rows_compared") == documents * 2 + value.get("relations_compared")
         and all(comparisons.get(key) is True for key in (
             "head_seq", "head_frontier", "semantic_hash", "projection_seq", "projection_frontier",
-            "object_metadata", "relation_graph", "lineage", "import_report"))
+            "object_metadata", "parent_graph", "relation_graph", "lineage", "import_report"))
+        and parent_graph_ok
         and value.get("mcp_import_chain") == ["objects.import_artifact", "objects.import_preview", "objects.import_commit", "objects.import_status"]
         and [row.get("ordinal") for row in value.get("command_trace", [])] == list(range(1, 8))
         and reject.get("existing_document_cardinality") in (0, 1)
@@ -119,9 +132,23 @@ reuse_write = copy.deepcopy(trace)
 for branch in reuse_write.get("branches", []):
     if branch.get("conflict_policy") == "reuse_import_lineage":
         branch["canonical_writes"] = 1
+drop_all_parents = copy.deepcopy(trace)
+for edge in drop_all_parents.get("parent_edges", []):
+    edge["source_parent_id"] = None
+    edge["expected_target_parent_id"] = None
+    edge["target_parent_id"] = None
+wrong_parent = copy.deepcopy(trace)
+wrong_parent_edges = [edge for edge in wrong_parent.get("parent_edges", []) if edge.get("source_parent_id") is not None]
+if wrong_parent_edges:
+    wrong_parent_edges[0]["target_parent_id"] = next(
+        edge.get("target_object_id") for edge in wrong_parent.get("parent_edges", [])
+        if edge.get("target_object_id") != wrong_parent_edges[0].get("expected_target_parent_id")
+    )
 mutations = {
     "missing_document_comparison": {"red": not valid(missing_document)},
     "reuse_performs_canonical_write": {"red": not valid(reuse_write)},
+    "drop_all_parent_edges": {"red": not valid(drop_all_parents)},
+    "wrong_parent_mapping": {"red": not valid(wrong_parent)},
 }
 
 negative = negative_log.read_text(errors="replace")
