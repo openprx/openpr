@@ -159,8 +159,10 @@ fn flow_v08_hardening_tool_definitions() -> Vec<ToolDefinition> {
 
 fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
     let mut tools = flow_v08_hardening_tool_definitions();
-    flow_v08_command_cardinality_registry(&tools)
-        .expect("the live v0.8 hardening tool registry must have exact cardinality coverage");
+    if let Err(error) = flow_v08_command_cardinality_registry(&tools) {
+        tracing::error!(%error, "refusing to register a v0.8 hardening tool without exact cardinality coverage");
+        return Vec::new();
+    }
     tools.extend([objects::repair_quarantine_tool()]);
     tools
 }

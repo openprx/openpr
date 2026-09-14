@@ -1931,7 +1931,9 @@ mod flow_database_tests {
         auth::{JwtClaims, TokenType},
         config::{AppConfig, Secret},
     };
-    use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement,
+    };
     use serde_json::{Value, json};
     use uuid::Uuid;
     use zip::write::SimpleFileOptions;
@@ -2043,7 +2045,10 @@ mod flow_database_tests {
 
         let (prefix, _) = admin_url.rsplit_once('/')?;
         let url = format!("{prefix}/{name}");
-        let db = Database::connect(&url)
+        drop(admin);
+        let mut options = ConnectOptions::new(url.clone());
+        options.acquire_timeout(Duration::from_mins(3));
+        let db = Database::connect(options)
             .await
             .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
 

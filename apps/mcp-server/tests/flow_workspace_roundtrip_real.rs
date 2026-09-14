@@ -6,7 +6,7 @@
     reason = "gate harness emits one machine-readable result and an explicit unavailable-environment notice"
 )]
 
-use std::{collections::BTreeMap, error::Error};
+use std::{collections::BTreeMap, error::Error, time::Duration};
 
 use api::{
     flow::{
@@ -36,7 +36,7 @@ use platform::{
     app::AppState,
     config::{AppConfig, Secret},
 };
-use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -60,7 +60,10 @@ impl Scratch {
         let (prefix, _) = admin_url
             .rsplit_once('/')
             .ok_or("test database URL has no database component")?;
-        let db = Database::connect(format!("{prefix}/{name}")).await?;
+        drop(admin);
+        let mut options = ConnectOptions::new(format!("{prefix}/{name}"));
+        options.acquire_timeout(Duration::from_mins(3));
+        let db = Database::connect(options).await?;
         let mut migrations: Vec<_> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations"))?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
