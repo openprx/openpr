@@ -1,13 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd);EVIDENCE="$ROOT/.flow-gate/evidence/v1.0";CAPACITY=${OPENPR_V10_CAPACITY_RESULT:-/opt/worker/evidence/v1.0-w1-final-cb8ee53/capacity-result.json};DECISION=;JSON=0
-while (($#));do case "$1" in --repo-root) ROOT=${2:?};shift 2;;--evidence-root) EVIDENCE=${2:?};shift 2;;--capacity-result) CAPACITY=${2:?};shift 2;;--target-environment-decision) DECISION=${2:?};shift 2;;--json) JSON=1;shift;;*) echo "FAIL: unsupported argument: $1" >&2;exit 2;;esac;done
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd);CONTRACTS=/opt/working/sylvode-flow;EVIDENCE="$ROOT/.flow-gate/evidence/v1.0";CAPACITY=${OPENPR_V10_CAPACITY_RESULT:-/opt/worker/evidence/v1.0-w1-final-cb8ee53/capacity-result.json};BACKUP=;DECISION=;JSON=0
+while (($#));do case "$1" in --repo-root) ROOT=${2:?};shift 2;;--contracts-root) CONTRACTS=${2:?};shift 2;;--evidence-root) EVIDENCE=${2:?};shift 2;;--capacity-result) CAPACITY=${2:?};shift 2;;--backup-restore-result) BACKUP=${2:?};shift 2;;--target-environment-decision) DECISION=${2:?};shift 2;;--json) JSON=1;shift;;*) echo "FAIL: unsupported argument: $1" >&2;exit 2;;esac;done
+[[ -n $BACKUP ]] || BACKUP="$EVIDENCE/backup-restore-result.json"
 [[ $JSON -eq 1 ]]||{ echo 'FAIL: --json required' >&2;exit 2;};mkdir -p "$EVIDENCE"
-python3 - "$ROOT" "$EVIDENCE" "$CAPACITY" "$DECISION" <<'PY'
-import copy,datetime as dt,json,os,pathlib,sys,tempfile
-repo,evidence,capacity_path=map(pathlib.Path,sys.argv[1:4]);decision_path=pathlib.Path(sys.argv[4]) if sys.argv[4] else None
+python3 - "$ROOT" "$CONTRACTS" "$EVIDENCE" "$CAPACITY" "$BACKUP" "$DECISION" <<'PY'
+import copy,datetime as dt,json,os,pathlib,sys,tempfile,yaml
+repo,contracts,evidence,capacity_path,backup_path=map(pathlib.Path,sys.argv[1:6]);decision_path=pathlib.Path(sys.argv[6]) if sys.argv[6] else None
 try:capacity=json.loads(capacity_path.read_text())
 except Exception as e:capacity={"runs":[],"error":str(e)}
+try:backup=json.loads(backup_path.read_text())
+except Exception as e:backup={"error":str(e)}
+try:rto_budget=yaml.safe_load((contracts/"gates/v0.8-gate.yaml").read_text()).get("budgets",{}).get("recovery_time_seconds_max",{})
+except Exception as e:rto_budget={"status":"invalid","error":str(e)}
+restore=backup.get("rto_measurement") or backup.get("base",{}).get("drill",{}).get("restore",{}) or backup.get("drill",{}).get("restore",{});elapsed=restore.get("elapsed_seconds_ceiling");budget_status=rto_budget.get("status") if isinstance(rto_budget,dict) else None
+budget_max=rto_budget.get("value") if isinstance(rto_budget,dict) else None
+if budget_status=="unset":
+ rto={"status":"not_frozen","measurement_path":str(backup_path),"measurement_seconds_ceiling":elapsed,"measurement_status":restore.get("measurement_status"),"budget_contract":str(contracts/"gates/v0.8-gate.yaml")+"#budgets.recovery_time_seconds_max","budget_status":"unset","budget_max_seconds":None,"passed":False}
+else:
+ try:rto_passed=restore.get("measurement_status")=="measured" and float(elapsed)<=float(budget_max)
+ except (TypeError,ValueError):rto_passed=False
+ rto={"status":"passed" if rto_passed else "failed","measurement_path":str(backup_path),"measurement_seconds_ceiling":elapsed,"measurement_status":restore.get("measurement_status"),"budget_contract":str(contracts/"gates/v0.8-gate.yaml")+"#budgets.recovery_time_seconds_max","budget_status":budget_status,"budget_max_seconds":budget_max,"passed":rto_passed}
 def evaluate(doc):
  runs={r.get("clients"):r for r in doc.get("runs",[])};checks={"tiers_exact":set(runs)=={10,50},"budget_frozen":True,"reconstruction_complete":True,"functional":True,"round_trip":True,"lock":True}
  for tier in (10,50):
@@ -31,8 +44,9 @@ if decision_path:
  try:
   d=json.loads(decision_path.read_text());decision={"approved":d.get("approved") is True and bool(d.get("signed_by")) and bool(d.get("environment_id")),"status":"approved" if d.get("approved") is True else "rejected","signed_by":d.get("signed_by"),"environment_id":d.get("environment_id")}
  except Exception as e:decision={"approved":False,"status":"invalid","error":str(e)}
+checks["rto_budget_frozen"]=rto["budget_status"]!="unset";checks["rto_budget_met"]=rto["passed"]
 performance=all(checks.values());passed=performance and decision["approved"] and green_ok and all(v["red"] for v in mutations.values())
-r={"schema_version":"sylvode.flow.slo-result.v1","release":"1.0.0","measurement":str(capacity_path),"measurement_source_head":capacity.get("source_head"),"checks":checks,"target_environment_decision":decision,"mutations":mutations,"executed_count":len(capacity.get("runs",[]))+len(mutations),"performance_passed":performance,"passed":passed,"generated_at":dt.datetime.now(dt.timezone.utc).isoformat()}
+r={"schema_version":"sylvode.flow.slo-result.v2","release":"1.0.0","measurement":str(capacity_path),"measurement_source_head":capacity.get("source_head"),"rto":rto,"checks":checks,"target_environment_decision":decision,"mutations":mutations,"executed_count":len(capacity.get("runs",[]))+len(mutations)+1,"performance_passed":performance,"passed":passed,"generated_at":dt.datetime.now(dt.timezone.utc).isoformat()}
 fd,tmp=tempfile.mkstemp(prefix=".slo-result.",dir=evidence)
 with os.fdopen(fd,"w") as f:json.dump(r,f,sort_keys=True,indent=2);f.write("\n")
 os.replace(tmp,evidence/"slo-result.json");print(json.dumps(r,sort_keys=True));raise SystemExit(0 if passed else 1)
