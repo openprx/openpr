@@ -499,16 +499,29 @@ if [[ "${OPENPR_DEMO_RESTART_MCP:-1}" == "1" ]] && [[ "$CONFIG_WRITTEN" == "1" ]
     # and the container was never recreated, so the verification below talked to a server
     # still holding the previous ones. Ask the container runtime directly instead.
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'mcp-server'; then
-      echo "Recreating mcp-server so it reloads the demo MCP credentials from its configuration file..."
-      # Remove before recreating instead of --force-recreate: under podman-compose that flag
-      # fails with "container name is already in use", and the failure used to go unchecked,
-      # leaving the previous container serving the previous credentials while the health probe
-      # below reported it as ready.
-      if ! docker compose rm -sf mcp-server >/dev/null 2>&1; then
-        echo "Could not remove the running mcp-server container; it may keep serving the previous credentials." >&2
+      echo "Restarting mcp-server so it reloads the demo MCP credentials from its configuration file..."
+      # The file was overwritten in place, so the existing bind mount sees the new bytes. Restart
+      # the one container directly: podman-compose 1.3 cannot reliably remove/recreate a service
+      # whose dependency containers already exist, while a process restart needs no dependency
+      # graph at all. Accept both Compose name separators.
+      compose_project=${COMPOSE_PROJECT_NAME:-openpr}
+      mapfile -t mcp_container_ids < <(docker ps --format '{{.ID}} {{.Names}}' | awk -v project="$compose_project" \
+        '$2 == project "_mcp-server_1" || $2 == project "-mcp-server-1" {print $1}')
+      if [[ ${#mcp_container_ids[@]} -ne 1 ]]; then
+        echo "Expected exactly one mcp-server container for compose project $compose_project; found ${#mcp_container_ids[@]}." >&2
+        exit 1
       fi
-      if ! docker compose up -d --no-deps mcp-server; then
-        echo "Failed to start mcp-server with the new credentials." >&2
+      docker restart "${mcp_container_ids[0]}" >/dev/null
+      mcp_reloaded=0
+      for _ in $(seq 1 30); do
+        if curl -fsS "${OPENPR_DEMO_MCP_HEALTH_URL:-http://localhost:8090/health}" >/dev/null 2>&1; then
+          mcp_reloaded=1
+          break
+        fi
+        sleep 1
+      done
+      if [[ $mcp_reloaded -ne 1 ]]; then
+        echo "mcp-server did not become healthy after credential reload." >&2
         exit 1
       fi
     fi
