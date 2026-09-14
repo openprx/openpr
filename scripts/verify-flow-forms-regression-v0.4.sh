@@ -203,7 +203,7 @@ RESULT_JSON="$(jq -n \
      source_head: $head,
      source_dirty: $dirty,
      generated_at: $generated_at,
-     forms_gate_run: {
+	     forms_gate_run: {
        command: $command,
        cwd: $cwd,
        exit_code: $exit_code,
@@ -211,14 +211,16 @@ RESULT_JSON="$(jq -n \
        evidence: $evidence,
        log_path: $log_path,
        sha256: $sha256,
-       assertions: {
+	       assertions: {
          passed: $pass_count,
          failed: $fail_count,
          completion_marker: $completion_marker,
          failed_names: $failed_assertions
-       }
-     },
-     hard_gates: { forms_regression_no_degradation: $gate_status },
+	       }
+	     },
+	     executed_count: ($pass_count + $fail_count),
+	     executed_kind: "static_audit_assertions",
+	     hard_gates: { forms_regression_no_degradation: $gate_status },
      hard_gate_reasons: { forms_regression_no_degradation: $gate_reason },
      passed: $passed
    }')"

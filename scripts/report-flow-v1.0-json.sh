@@ -55,7 +55,7 @@ for raw in rows_path.read_text().splitlines():
  else: executed=int(value.get("executed_count",0))
  ignored=sum(int(x) for *_,x in summaries)
  ok=code==0 and executed>0 and value.get("passed") is True
- checks.append({"id":cid,"artifact":artifact,"status":"passed" if ok else "failed","exit_code":code,"executed_count":executed,"ignored_count":ignored,"command":command,"log":log,"sha256":hashlib.sha256((evidence/log).read_bytes()).hexdigest()})
+ checks.append({"id":cid,"artifact":artifact,"status":"passed" if ok else "failed","exit_code":code,"executed_count":executed,"executed_kind":value.get("executed_kind","producer_defined"),"ignored_count":ignored,"command":command,"log":log,"sha256":hashlib.sha256((evidence/log).read_bytes()).hexdigest()})
 ok={r["id"]:r["status"]=="passed" for r in checks}; surface=artifacts["surface"]; registry=artifacts["registry"]
 hard_bool={
  "command_contended_document_cardinality":ok["cardinality"],"rest_mcp_cli_surface_parity":ok["surface"],

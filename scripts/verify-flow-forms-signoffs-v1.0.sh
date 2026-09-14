@@ -141,7 +141,12 @@ result = {
         "flow_only": {"exit_code": flow_sign_exit, "forms_sources_unchanged": flow_only_isolated},
     },
     "mutation": mutation,
-    "executed_count": base_executed + len(checks) + 1,
+    "execution_counts": {
+        "forms_static_audit_assertions": base_executed,
+        "signoff_independence_controls": len(checks) + 1,
+    },
+    "executed_count": len(checks) + 1,
+    "executed_kind": "signoff_independence_controls",
     "passed": all(checks.values()) and mutation["red"],
     "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
 }
