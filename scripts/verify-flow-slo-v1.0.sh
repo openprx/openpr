@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd);CONTRACTS=/opt/working/sylvode-flow;EVIDENCE="$ROOT/.flow-gate/evidence/v1.0";CAPACITY=${OPENPR_V10_CAPACITY_RESULT:-/opt/worker/evidence/v1.0-w1-final-cb8ee53/capacity-result.json};BACKUP=;DECISION=;JSON=0
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd);CONTRACTS=/opt/working/sylvode-flow;EVIDENCE="$ROOT/.flow-gate/evidence/v1.0";CAPACITY=${OPENPR_V10_CAPACITY_RESULT:-/opt/worker/evidence/v1.0-w1-final-f01d344/capacity-result.json};BACKUP=;DECISION=;JSON=0
 while (($#));do case "$1" in --repo-root) ROOT=${2:?};shift 2;;--contracts-root) CONTRACTS=${2:?};shift 2;;--evidence-root) EVIDENCE=${2:?};shift 2;;--capacity-result) CAPACITY=${2:?};shift 2;;--backup-restore-result) BACKUP=${2:?};shift 2;;--target-environment-decision) DECISION=${2:?};shift 2;;--json) JSON=1;shift;;*) echo "FAIL: unsupported argument: $1" >&2;exit 2;;esac;done
 [[ -n $BACKUP ]] || BACKUP="$EVIDENCE/backup-restore-result.json"
 [[ $JSON -eq 1 ]]||{ echo 'FAIL: --json required' >&2;exit 2;};mkdir -p "$EVIDENCE"
@@ -22,12 +22,13 @@ else:
  except (TypeError,ValueError):rto_passed=False
  rto={"status":"passed" if rto_passed else "failed","measurement_path":str(backup_path),"measurement_seconds_ceiling":elapsed,"measurement_status":restore.get("measurement_status"),"budget_contract":str(contracts/"gates/v0.8-gate.yaml")+"#budgets.recovery_time_seconds_max","budget_status":budget_status,"budget_max_seconds":budget_max,"passed":rto_passed}
 def evaluate(doc):
- runs={r.get("clients"):r for r in doc.get("runs",[])};checks={"tiers_exact":set(runs)=={10,50},"budget_frozen":True,"reconstruction_complete":True,"functional":True,"round_trip":True,"lock":True}
+ runs={r.get("clients"):r for r in doc.get("runs",[])};checks={"tiers_exact":set(runs)=={10,50},"tier_key_matches_clients":True,"budget_frozen":True,"reconstruction_complete":True,"functional":True,"round_trip":True,"lock":True}
  for tier in (10,50):
   r=runs.get(tier,{});p=r.get("result") or {};key=f"{tier}_client";tier_keys=sorted(k for k in p if __import__("re").fullmatch(r"\d+_client",k));load=p.get(key,{});lock=p.get("lock",{});recon=lock.get("reconstruction",{});hold=lock.get("lock_hold_p95",{});rt=load.get("round_trip_p95",{})
   checks["budget_frozen"] &= p.get("budgets",{}).get("round_trip_p95_ms_max")==250.0 and p.get("budgets",{}).get("lock_hold_p95_ms_max")==25.0
   checks["reconstruction_complete"] &= lock.get("committed_write_transactions")==load.get("accepted_total") and recon.get("unresolved_statements")==0 and bool(recon.get("harvested_log_files"))
-  checks["functional"] &= tier_keys==[key] and load.get("clients")==tier and not p.get("rejections") and load.get("accepted_total")==tier*15
+  checks["tier_key_matches_clients"] &= tier_keys==[key] and load.get("clients")==tier
+  checks["functional"] &= not p.get("rejections") and load.get("accepted_total")==tier*15
   checks["round_trip"] &= float(rt.get("p95_ms",1e99))<=250.0
   checks["lock"] &= float(hold.get("p95_ms",1e99))<=25.0 and float(hold.get("max_ms",1e99))<=100.0
  return checks
