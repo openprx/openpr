@@ -52,9 +52,14 @@ Thumbs.db
 /CHANGELOG.md
 .brv/
 
-# Generated runtime configuration; contains the signing key and database password.
+# Generated runtime configuration; contains the signing key, the database password and the MCP bot
+# token. Both brands are listed: scripts/start.sh writes the canonical `sylvode.*` names, while the
+# legacy `openpr.*` names are still discovered when no canonical file exists, so a repository that
+# ignores only one of them leaks the other.
 /config/openpr.compose*.toml
 /config/openpr.toml
+/config/sylvode.compose*.toml
+/config/sylvode.toml
 
 # Claude Code session state, including agent worktrees that are git repos of their own
 .claude/
