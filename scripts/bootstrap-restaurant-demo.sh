@@ -156,12 +156,13 @@ const existingBotToken = process.env.OPENPR_DEMO_EXISTING_BOT_TOKEN ?? '';
 const existingWorkspaceId = process.env.OPENPR_DEMO_EXISTING_WORKSPACE_ID ?? '';
 const stateFile = process.env.OPENPR_DEMO_STATE_FILE;
 
-async function rawRequest(method, path, body, token) {
+async function rawRequest(method, path, body, token, extraHeaders = {}) {
   const response = await fetch(`${apiUrl}${path}`, {
     method,
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      ...extraHeaders,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -245,7 +246,13 @@ async function ensureProject(token, workspaceId) {
 
 async function tokenCanAccessWorkspace(botToken, workspaceId) {
   if (!botToken || !botToken.startsWith('opr_')) return false;
-  const result = await rawRequest('GET', `/api/v1/workspaces/${workspaceId}/projects`, undefined, botToken);
+  const result = await rawRequest(
+    'GET',
+    `/api/v1/workspaces/${workspaceId}/projects`,
+    undefined,
+    botToken,
+    { 'X-OpenPR-MCP-Surface': 'mcp_http', 'X-OpenPR-MCP-Tool': 'projects.list' },
+  );
   return result.response.ok && result.payload?.code === 0;
 }
 
@@ -262,6 +269,7 @@ async function ensureMcpBot(token, workspaceId) {
   const bot = await request('POST', `/api/v1/workspaces/${workspaceId}/bots`, {
     name: 'Local Restaurant Demo MCP Bot',
     permissions: ['read', 'write', 'admin'],
+    transport_surface: 'mcp_http',
   }, token);
 
   assert(await tokenCanAccessWorkspace(bot.token, workspaceId), 'created MCP bot token cannot access demo workspace');
