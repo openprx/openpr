@@ -517,8 +517,36 @@ if [ -z "$SYLVODE_RUNTIME_BASE" ] && [ -r /etc/os-release ]; then
 fi
 
 echo "🔨 Building and starting services..."
-if [[ -n "${SYLVODE_COMPOSE_PARALLEL:-}" ]]; then
-  docker compose --parallel "$SYLVODE_COMPOSE_PARALLEL" up -d --build
+if [[ "${SYLVODE_COMPOSE_STAGED:-0}" == 1 ]]; then
+  # podman-compose 1.3 may lose an already-created dependency while building
+  # one combined start graph. Build once, then start the real services in
+  # dependency order without asking the provider to reconstruct that graph.
+  docker compose build
+  docker compose up -d postgres
+  postgres_ready=0
+  for _ in $(seq 1 60); do
+    if docker compose exec -T postgres pg_isready -U openpr -d openpr >/dev/null 2>&1; then
+      postgres_ready=1
+      break
+    fi
+    sleep 2
+  done
+  [[ $postgres_ready -eq 1 ]] || { echo "❌ PostgreSQL did not become ready during staged startup"; exit 1; }
+  docker compose up -d --no-deps api
+  api_ready=0
+  staged_probe_host=$SYLVODE_BIND_HOST
+  [[ $staged_probe_host == 0.0.0.0 ]] && staged_probe_host=127.0.0.1
+  for _ in $(seq 1 60); do
+    if curl -fsS "http://${staged_probe_host}:${SYLVODE_API_PORT}/health" >/dev/null 2>&1; then
+      api_ready=1
+      break
+    fi
+    sleep 2
+  done
+  [[ $api_ready -eq 1 ]] || { echo "❌ API did not become ready during staged startup"; exit 1; }
+  docker compose up -d --no-deps worker
+  docker compose up -d --no-deps mcp-server
+  docker compose up -d --no-deps frontend
 else
   docker compose up -d --build
 fi
