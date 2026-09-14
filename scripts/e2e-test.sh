@@ -226,8 +226,7 @@ fi
 
 echo ""
 if [ -n "${OPENPR_E2E_CONTAINER_SNAPSHOT:-}" ]; then
-  docker ps --format '{{.Names}}' | awk -v project="$COMPOSE_PROJECT_NAME" \
-    'index($0, project "_") == 1 || index($0, project "-") == 1' \
+  docker compose -p "$COMPOSE_PROJECT_NAME" ps --format '{{.Names}}' \
     >"$OPENPR_E2E_CONTAINER_SNAPSHOT"
 fi
 echo "🎉 All End-to-End Tests Passed!"

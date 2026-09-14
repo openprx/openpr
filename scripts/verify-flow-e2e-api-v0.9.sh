@@ -44,7 +44,8 @@ required = {
 }
 checks = {name: marker in log for name, marker in required.items()}
 containers = [line for line in containers_path.read_text().splitlines() if line]
-container_prefix_ok = bool(containers) and all(name.startswith("v09-") for name in containers)
+project_prefixes = ("v09-openpr-rc_", "v09-openpr-rc-")
+container_prefix_ok = bool(containers) and all(name.startswith(project_prefixes) for name in containers)
 remaining = subprocess.run(
     ["docker", "compose", "-p", "v09-openpr-rc", "ps", "-q"], cwd=repo, text=True,
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False).stdout.splitlines()
@@ -56,13 +57,23 @@ def valid(values, prefix_ok, cleaned):
 mutated = copy.deepcopy(checks)
 mutated["mcp_integration"] = False
 mutation_red = not valid(mutated, container_prefix_ok, cleanup_ok)
-passed = valid(checks, container_prefix_ok, cleanup_ok) and mutation_red
+outside_project_containers = [*containers, "v09-unrelated-api-1"]
+outside_project_red = not valid(
+    checks,
+    bool(outside_project_containers) and all(name.startswith(project_prefixes) for name in outside_project_containers),
+    cleanup_ok,
+)
+passed = valid(checks, container_prefix_ok, cleanup_ok) and mutation_red and outside_project_red
 result = {
     "schema_version":"sylvode.flow.isolated-e2e-api-result.v1", "release":"0.9.0",
     "source_head":subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip(),
-    "checks":checks, "containers":containers, "container_prefix":"v09-",
+    "checks":checks, "containers":containers, "container_prefixes":list(project_prefixes),
     "container_prefix_ok":container_prefix_ok, "remaining_container_count":len(remaining), "cleanup_passed":cleanup_ok,
-    "mutation":{"name":"mcp-leg-result-removed", "red":mutation_red},
+    "mutations":{
+        "mcp_leg_result_removed":{"red":mutation_red},
+        "container_outside_full_project_prefix":{"red":outside_project_red,"mutated_name":"v09-unrelated-api-1"},
+    },
+    "mutation":{"name":"container-outside-full-project-prefix","red":outside_project_red},
     "executed_count":len(checks) + len(containers) + 1, "log_sha256":hashlib.sha256(log_path.read_bytes()).hexdigest(),
     "passed":passed, "generated_at":dt.datetime.now(dt.timezone.utc).isoformat(),
 }
