@@ -153,7 +153,8 @@ hard_bool = {
 hard = {key:"passed" if hard_bool.get(key, False) else "failed" for key in gate.get("hard_gates", {})}
 
 required_producers = ["brand","aliases","install","roundtrip","fixtures","surface","cardinality","registry","renames","e2e","clippy_full","workspace_full"]
-producer_violations = [cid for cid in required_producers if by.get(cid, {}).get("executed_count", 0) <= 0]
+producer_violations = [cid for cid in required_producers
+    if by.get(cid, {}).get("status") != "passed" or by.get(cid, {}).get("executed_count", 0) <= 0]
 command_text = json.dumps(gate.get("required_commands", {}), sort_keys=True)
 orchestration = {name:(name in command_text) for name in ("report-flow-v0.9-json.sh", "verify-flow-v0.9-json.sh", "gate-flow-v0.9.sh", "record-flow-v0.9-manual-signoff.sh")}
 
