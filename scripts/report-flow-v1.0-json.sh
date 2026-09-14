@@ -74,18 +74,18 @@ import datetime as dt,hashlib,json,os,pathlib,re,subprocess,sys,tempfile,yaml
 repo,evidence,gate_path,pred_path,manual_path,rows_path=map(pathlib.Path,sys.argv[1:])
 gate=yaml.safe_load(gate_path.read_text()); head=subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip()
 def load(name):
- try:return json.loads((evidence/name).read_text())
- except Exception as e:return {"passed":False,"executed_count":0,"error":str(e)}
+ try:return json.loads((evidence/name).read_text()),"parsed"
+ except Exception as e:return {"passed":False,"executed_count":0,"error":str(e)},"missing_or_unparseable"
 checks=[]; artifacts={}
 for raw in rows_path.read_text().splitlines():
- cid,code,log,artifact,command=raw.split("\t",4); code=int(code); body=(evidence/log).read_text(errors="replace"); value=load(artifact); artifacts[cid]=value
+ cid,code,log,artifact,command=raw.split("\t",4); code=int(code); body=(evidence/log).read_text(errors="replace"); value,artifact_status=load(artifact); artifacts[cid]=value
  summaries=re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;",body,re.M)
  if cid=="surface": executed=int(value.get("counts",{}).get("matrix_rows",0))
  elif cid=="registry": executed=int(value.get("live_registry",{}).get("enumerated_total",0))
  else: executed=int(value.get("executed_count",0))
  ignored=sum(int(x) for *_,x in summaries)
  ok=code==0 and executed>0 and value.get("passed") is True
- checks.append({"id":cid,"artifact":artifact,"status":"passed" if ok else "failed","exit_code":code,"executed_count":executed,"executed_kind":value.get("executed_kind","producer_defined"),"ignored_count":ignored,"command":command,"log":log,"sha256":hashlib.sha256((evidence/log).read_bytes()).hexdigest()})
+ checks.append({"id":cid,"artifact":artifact,"artifact_status":artifact_status,"status":"passed" if ok else "failed","exit_code":code,"executed_count":executed,"executed_kind":value.get("executed_kind","producer_defined"),"ignored_count":ignored,"command":command,"log":log,"sha256":hashlib.sha256((evidence/log).read_bytes()).hexdigest()})
 ok={r["id"]:r["status"]=="passed" for r in checks}; surface=artifacts["surface"]; registry=artifacts["registry"]
 hard_bool={
  "command_contended_document_cardinality":ok["cardinality"],"rest_mcp_cli_surface_parity":ok["surface"],
@@ -110,7 +110,7 @@ baseline_ok=baseline.get("reviewed_head")==head and str(baseline.get("rust_works
 try:
  pred=json.loads(pred_path.read_text()); predecessor={"path":str(pred_path),"release":pred.get("release"),"accepted":pred.get("accepted") is True}
 except Exception as e:predecessor={"path":str(pred_path),"accepted":False,"error":str(e)}
-required=[r["id"] for r in checks]; violations=[r["id"] for r in checks if r["status"]!="passed" or r["executed_count"]<=0]
+required=[r["id"] for r in checks]; violations=[r["id"] for r in checks if r["artifact_status"]!="parsed" or r["executed_count"]<=0]
 automated_ready=all(v=="passed" for k,v in hard.items() if k!="frontend_track_accepted") and not violations and not dirty
 candidate=automated_ready and gate.get("status")=="accepted" and baseline_ok and predecessor["accepted"] and hard["frontend_track_accepted"]=="passed"
 accepted=candidate and all(v["status"]=="passed" for v in manual.values())

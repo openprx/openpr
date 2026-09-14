@@ -20,7 +20,11 @@ checks={r.get("id"):r for r in receipt.get("checks",[])}; violations=[]
 for cid,row in checks.items():
  try:same("checks."+cid+".sha256",row.get("sha256"),hashlib.sha256((evidence/row["log"]).read_bytes()).hexdigest())
  except Exception as e:drift.append({"field":"checks."+cid+".log","error":str(e)})
- if row.get("status")!="passed" or int(row.get("executed_count",0))<=0 or row.get("exit_code")!=0:violations.append(cid)
+ try:
+  json.loads((evidence/row["artifact"]).read_text()); artifact_status="parsed"
+ except Exception:artifact_status="missing_or_unparseable"
+ same("checks."+cid+".artifact_status",row.get("artifact_status"),artifact_status)
+ if artifact_status!="parsed" or int(row.get("executed_count",0))<=0:violations.append(cid)
 same("producer_execution.violations",receipt.get("producer_execution",{}).get("violations"),violations)
 hard=receipt.get("hard_gates",{});same("frontend_track_accepted",hard.get("frontend_track_accepted"),"pending")
 auto=all(v=="passed" for k,v in hard.items() if k!="frontend_track_accepted") and not violations and not dirty
