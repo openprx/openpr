@@ -31,7 +31,7 @@ TEST_NAME=tools::tests::live_v08_dispatch_has_exact_cardinality_coverage_and_loc
 
 run_test() {
   local root=$1 log=$2
-  env -u RUST_TEST_THREADS CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR="$REPO_ROOT/target" \
+  env -u RUST_TEST_THREADS -u CARGO_TARGET_DIR CARGO_BUILD_JOBS=4 \
     cargo test --manifest-path "$root/Cargo.toml" -p mcp-server --lib "$TEST_NAME" \
     -- --exact --nocapture >"$log" 2>&1
 }
