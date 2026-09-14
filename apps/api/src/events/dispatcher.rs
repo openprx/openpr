@@ -1707,7 +1707,8 @@ mod dispatcher_database_tests {
         config::{AppConfig, Secret},
     };
     use sea_orm::{
-        ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement, TransactionTrait,
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult, Statement,
+        TransactionTrait,
     };
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1868,7 +1869,15 @@ mod dispatcher_database_tests {
 
         let (prefix, _) = admin_url.rsplit_once('/')?;
         let url = format!("{prefix}/{name}");
-        let db = Database::connect(&url)
+        // The API lib shard creates many independent scratch databases concurrently. Once this
+        // database exists the admin pool has no more work, so release it before asking PostgreSQL
+        // for the scratch connection. Keep the wait bounded, but allow the connection peak from
+        // other database tests to drain instead of failing at SeaORM's short default acquire
+        // timeout.
+        drop(admin);
+        let mut options = ConnectOptions::new(url.clone());
+        options.acquire_timeout(std::time::Duration::from_mins(3));
+        let db = Database::connect(options)
             .await
             .unwrap_or_else(|err| panic!("could not connect to scratch database {name}: {err}"));
 
