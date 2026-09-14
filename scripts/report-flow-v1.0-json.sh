@@ -6,20 +6,50 @@ EVIDENCE="$ROOT/.flow-gate/evidence/v1.0"
 GATE="$CONTRACTS/gates/v1.0-gate.yaml"
 PREDECESSOR=/opt/worker/evidence/v0.9/gate-result.json
 MANUAL_FROM=
+ORCHESTRATION_CONFIG=${OPENPR_FLOW_V1_ORCHESTRATION_CONFIG:-/opt/worker/.cache/v10-flow-gate.toml}
 while (($#)); do
  case "$1" in
   --repo-root) ROOT=${2:?}; shift 2;; --contracts-root) CONTRACTS=${2:?}; shift 2;;
   --evidence-root) EVIDENCE=${2:?}; shift 2;; --gate-yaml) GATE=${2:?}; shift 2;;
   --predecessor-gate-result|--predecessor-evidence) PREDECESSOR=${2:?}; shift 2;;
   --manual-signoffs-from) MANUAL_FROM=${2:?}; shift 2;; --json) shift;;
+  --orchestration-config) ORCHESTRATION_CONFIG=${2:?}; shift 2;;
   *) echo "FAIL: unsupported argument: $1" >&2; exit 2;;
  esac
 done
 [[ -n $MANUAL_FROM ]] || MANUAL_FROM="$EVIDENCE/gate-result.json"
+mapfile -t ORCHESTRATION_DATABASE_URLS < <(python3 - "$ORCHESTRATION_CONFIG" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+path = pathlib.Path(sys.argv[1])
+try:
+    config = tomllib.loads(path.read_text())
+except (OSError, tomllib.TOMLDecodeError) as error:
+    print(f"FAIL: cannot read v1.0 orchestration config {path}: {error}", file=sys.stderr)
+    raise SystemExit(2)
+flow_gate = config.get("flow_gate", {})
+for key in ("test_database_url", "backup_source_database_url", "backup_restore_admin_url"):
+    value = flow_gate.get(key)
+    if not isinstance(value, str) or not value.strip():
+        print(f"FAIL: [flow_gate].{key} is required in {path}", file=sys.stderr)
+        raise SystemExit(2)
+    print(value)
+PY
+)
+[[ ${#ORCHESTRATION_DATABASE_URLS[@]} -eq 3 ]] || exit 2
+OPENPR_TEST_DATABASE_URL=${OPENPR_TEST_DATABASE_URL:-${ORCHESTRATION_DATABASE_URLS[0]}}
+OPENPR_BACKUP_SOURCE_DATABASE_URL=${OPENPR_BACKUP_SOURCE_DATABASE_URL:-${ORCHESTRATION_DATABASE_URLS[1]}}
+OPENPR_BACKUP_RESTORE_ADMIN_URL=${OPENPR_BACKUP_RESTORE_ADMIN_URL:-${ORCHESTRATION_DATABASE_URLS[2]}}
 mkdir -p "$EVIDENCE/logs"
 ROWS=$(mktemp "$EVIDENCE/.report-rows.XXXXXX"); trap 'rm -f "$ROWS"' EXIT
 run() { local id=$1 artifact=$2; shift 2; local log="$EVIDENCE/logs/report-$id.log"; set +e
- env -u RUST_TEST_THREADS CARGO_BUILD_JOBS=4 "$@" >"$log" 2>&1; local code=$?; set -e
+ env -u RUST_TEST_THREADS CARGO_BUILD_JOBS=4 \
+  OPENPR_TEST_DATABASE_URL="$OPENPR_TEST_DATABASE_URL" \
+  OPENPR_BACKUP_SOURCE_DATABASE_URL="$OPENPR_BACKUP_SOURCE_DATABASE_URL" \
+  OPENPR_BACKUP_RESTORE_ADMIN_URL="$OPENPR_BACKUP_RESTORE_ADMIN_URL" \
+  "$@" >"$log" 2>&1; local code=$?; set -e
  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$code" "${log#"$EVIDENCE/"}" "$artifact" "$*" >>"$ROWS"; }
 
 # Every declared producer is executed. None uses serial test flags.
