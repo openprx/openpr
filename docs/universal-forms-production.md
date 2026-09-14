@@ -200,11 +200,11 @@ values for the target deployment before starting OpenPR services:
 
 The api, worker and mcp-server binaries read no environment variables at all.
 Their settings live in TOML configuration files that `docker-compose.yml` mounts
-read-only at `/app/config/openpr.toml`; `bash scripts/start.sh` generates a
-working pair on first run. `config/openpr.example.toml` is the annotated
+read-only at `/app/config/sylvode.toml`; `bash scripts/start.sh` generates a
+working pair on first run. `config/sylvode.example.toml` is the annotated
 reference for every key.
 
-`config/openpr.compose.toml` — api and worker:
+`config/sylvode.compose.toml` — api and worker:
 
 ```toml
 [database]
@@ -215,7 +215,7 @@ jwt_secret = "replace_with_long_random_secret"
 # default_author_id must name a user that exists; leave it out otherwise.
 ```
 
-`config/openpr.compose.mcp.toml` — mcp-server. It carries no `[database]` and no
+`config/sylvode.compose.mcp.toml` — mcp-server. It carries no `[database]` and no
 `[auth]`: the service opens no database connection and signs no token.
 
 ```toml
@@ -358,7 +358,7 @@ against the production surface. Use `OPENPR_EXPECT_OBJECT_STORAGE_BACKEND=s3`
 when the environment is expected to use the S3-compatible backend; leave it
 unset only when the deployment intentionally uses the local backend.
 The API and worker read the backend from `[storage]` in
-`config/openpr.compose.toml`. Set `backend = "s3"` and fill in `[storage.s3]`
+`config/sylvode.compose.toml`. Set `backend = "s3"` and fill in `[storage.s3]`
 before starting the stack when using S3-compatible storage; `endpoint`,
 `bucket`, `access_key_id` and `secret_access_key` are required in that mode,
 `region` defaults to `us-east-1`, and `session_token` is optional for temporary

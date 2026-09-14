@@ -137,9 +137,36 @@ missing_surfaces = [surface for surface in required_surfaces if f"| {surface} |"
 checks.append({"name": "compatibility-matrix-complete", "status": "passed" if not missing_surfaces else "failed",
                "surface_count": len(required_surfaces), "missing": missing_surfaces})
 
+release = (repo / ".github/workflows/release.yml").read_text()
+obsolete_release = repo / ".github/workflows/release-mcp.yml"
+release_tokens = ["sylvode-${{ matrix.suffix }}", "openpr-${{ matrix.suffix }}", "Matching `openpr-*` archive names"]
+release_ok = not obsolete_release.exists() and all(token in release for token in release_tokens)
+checks.append({"name":"release-archive-companions", "status":"passed" if release_ok else "failed",
+               "obsolete_workflow_absent":not obsolete_release.exists()})
+
+production_doc = (repo / "docs/universal-forms-production.md").read_text()
+runbook_tokens = ["/app/config/sylvode.toml", "config/sylvode.example.toml",
+                  "config/sylvode.compose.toml", "config/sylvode.compose.mcp.toml"]
+runbook_ok = all(token in production_doc for token in runbook_tokens) and "/app/config/openpr.toml" not in production_doc
+checks.append({"name":"production-runbook-config-companions", "status":"passed" if runbook_ok else "failed"})
+
+operator_text = "\n".join((repo / path).read_text() for path in ("scripts/benchmark.sh", "scripts/dev-up.sh"))
+operator_ok = operator_text.count("config/sylvode.toml") == 2 and "config/openpr.toml" not in operator_text
+checks.append({"name":"operator-script-config-companions", "status":"passed" if operator_ok else "failed"})
+
+dockerignore = (repo / "frontend/.dockerignore").read_text().splitlines()
+dockerignore_required = {".env", ".env.*", "node_modules", "build", ".svelte-kit", "log"}
+dockerignore_ok = dockerignore_required.issubset(dockerignore)
+checks.append({"name":"frontend-build-context-hygiene", "status":"passed" if dockerignore_ok else "failed",
+               "classification":"builder_context_hygiene_not_production_secret_leak"})
+
 mutations = [
     {"name": "both-config-names", "exit_code": config_conflict_exit, "detected": config_conflict_exit != 0},
     {"name": "conflicting-env-aliases", "exit_code": env_conflict_exit, "detected": env_conflict_exit != 0},
+    {"name":"release-alias-companion-removed", "detected":not all(token in release.replace("openpr-${{ matrix.suffix }}", "") for token in release_tokens)},
+    {"name":"runbook-canonical-mount-reverted", "detected":not all(token in production_doc.replace("/app/config/sylvode.toml", "/app/config/openpr.toml", 1) for token in runbook_tokens)},
+    {"name":"operator-config-reverted", "detected":"config/openpr.toml" in operator_text.replace("config/sylvode.toml", "config/openpr.toml", 1)},
+    {"name":"frontend-env-ignore-removed", "detected":not dockerignore_required.issubset(set(dockerignore) - {".env"})},
 ]
 passed = all(check["status"] == "passed" for check in checks) and all(row["detected"] for row in mutations)
 result = {
