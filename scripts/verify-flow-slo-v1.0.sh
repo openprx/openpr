@@ -11,20 +11,21 @@ except Exception as e:capacity={"runs":[],"error":str(e)}
 def evaluate(doc):
  runs={r.get("clients"):r for r in doc.get("runs",[])};checks={"tiers_exact":set(runs)=={10,50},"budget_frozen":True,"reconstruction_complete":True,"functional":True,"round_trip":True,"lock":True}
  for tier in (10,50):
-  r=runs.get(tier,{});p=r.get("result") or {};load=p.get("10_client",{});lock=p.get("lock",{});recon=lock.get("reconstruction",{});hold=lock.get("lock_hold_p95",{});rt=load.get("round_trip_p95",{})
+  r=runs.get(tier,{});p=r.get("result") or {};key=f"{tier}_client";tier_keys=sorted(k for k in p if __import__("re").fullmatch(r"\d+_client",k));load=p.get(key,{});lock=p.get("lock",{});recon=lock.get("reconstruction",{});hold=lock.get("lock_hold_p95",{});rt=load.get("round_trip_p95",{})
   checks["budget_frozen"] &= p.get("budgets",{}).get("round_trip_p95_ms_max")==250.0 and p.get("budgets",{}).get("lock_hold_p95_ms_max")==25.0
   checks["reconstruction_complete"] &= lock.get("committed_write_transactions")==load.get("accepted_total") and recon.get("unresolved_statements")==0 and bool(recon.get("harvested_log_files"))
-  checks["functional"] &= load.get("clients")==tier and not p.get("rejections") and load.get("accepted_total")==tier*15
+  checks["functional"] &= tier_keys==[key] and load.get("clients")==tier and not p.get("rejections") and load.get("accepted_total")==tier*15
   checks["round_trip"] &= float(rt.get("p95_ms",1e99))<=250.0
   checks["lock"] &= float(hold.get("p95_ms",1e99))<=25.0 and float(hold.get("max_ms",1e99))<=100.0
  return checks
 checks=evaluate(capacity);known_green=copy.deepcopy(capacity)
 for r in known_green.get("runs",[]):
- p=r.get("result") or {};p["violations"]=[];p["passed"]=True;p.get("10_client",{}).get("round_trip_p95",{})["p95_ms"]=100.0
+ p=r.get("result") or {};p["violations"]=[];p["passed"]=True;p.get(f'{r.get("clients")}_client',{}).get("round_trip_p95",{})["p95_ms"]=100.0
 green_ok=all(evaluate(known_green).values());tier_mut=copy.deepcopy(known_green)
 for r in tier_mut.get("runs",[]):r["clients"]=10
-latency_mut=copy.deepcopy(known_green);latency_mut["runs"][-1]["result"]["10_client"]["round_trip_p95"]["p95_ms"]=251.0
-mutations={"same_client_label_for_both_tiers":{"red":not all(evaluate(tier_mut).values())},"round_trip_p95_over_budget":{"red":not all(evaluate(latency_mut).values())}}
+key_mut=copy.deepcopy(known_green);key_result=key_mut.get("runs",[{}])[-1].get("result") or {};key_payload=key_result.pop("50_client",{});key_result["10_client"]=key_payload
+latency_mut=copy.deepcopy(known_green);latency_result=latency_mut.get("runs",[{}])[-1].get("result") or {};latency_load=latency_result.get("50_client",{}).get("round_trip_p95",{});latency_load["p95_ms"]=251.0
+mutations={"same_client_label_for_both_tiers":{"red":not all(evaluate(tier_mut).values())},"same_result_key_for_both_tiers":{"red":not all(evaluate(key_mut).values())},"round_trip_p95_over_budget":{"red":not all(evaluate(latency_mut).values())}}
 decision={"approved":False,"status":"pending_target_environment_adjudication"}
 if decision_path:
  try:

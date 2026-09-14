@@ -52,10 +52,11 @@ for raw_row in rows.read_text().splitlines():
     summaries=re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;",body,re.M)
     executed=sum(int(p)+int(f) for _,p,f,_ in summaries)
     payload=json.loads(raw.read_text()) if raw.is_file() and raw.stat().st_size else None
-    actual=payload.get("10_client",{}).get("clients") if payload else None
-    functional=int(code)==0 and executed>0 and actual==int(clients) and payload.get("passed") is True
+    result_key=f"{clients}_client";tier_keys=sorted(k for k in payload or {} if re.fullmatch(r"\d+_client",k))
+    actual=payload.get(result_key,{}).get("clients") if payload else None
+    functional=int(code)==0 and executed>0 and tier_keys==[result_key] and actual==int(clients) and payload.get("passed") is True
     runs.append({"clients":int(clients),"exit_code":int(code),"executed_count":executed,
-      "functional_status":"passed" if functional else "failed","result":payload,
+      "result_key":result_key,"observed_result_keys":tier_keys,"functional_status":"passed" if functional else "failed","result":payload,
       "raw":str(raw),"raw_sha256":hashlib.sha256(raw.read_bytes()).hexdigest() if raw.is_file() else None,
       "log":str(log)})
 unset=["tested_websocket_connections_per_instance_min","tested_sustained_updates_per_second_min",

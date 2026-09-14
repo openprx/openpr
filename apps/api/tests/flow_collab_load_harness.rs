@@ -1677,7 +1677,7 @@ impl Report {
                 "measurement_authority": "postgresql server statement log (log_min_duration_statement=0), not an in-process timer",
                 "log_transport": "logging_collector stderr file read inside the PostgreSQL container",
             },
-            "10_client": {
+            (client_tier_key(self.clients)): {
                 "clients": self.clients,
                 "warmup_rounds": WARMUP_ROUNDS,
                 "measured_rounds": MEASURED_ROUNDS,
@@ -1752,6 +1752,10 @@ impl Report {
             let _ = std::fs::write(path, rendered);
         }
     }
+}
+
+fn client_tier_key(clients: usize) -> String {
+    format!("{clients}_client")
 }
 
 /// `ADR-0010`'s result schema requires `environment.postgres_version`; it is read from the server
@@ -2425,8 +2429,8 @@ fn round_trip_budget_violation(clients: usize, round_trip: &Distribution) -> Str
 mod harness_self_checks {
     use super::{
         Distribution, LoggedStatement, LoggedTransaction, absolute_gap_budget_resolution_status, audit_locked_phase,
-        calibrated_gap_resolution_status, drop_each_nth_log_line, group_transactions, parse_pg_log, percentile_ms,
-        reconstruct, reconstruction_covers_accepted_updates, round_trip_budget_violation,
+        calibrated_gap_resolution_status, client_tier_key, drop_each_nth_log_line, group_transactions, parse_pg_log,
+        percentile_ms, reconstruct, reconstruction_covers_accepted_updates, round_trip_budget_violation,
     };
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -2512,6 +2516,16 @@ mod harness_self_checks {
             ten, fifty,
             "different client tiers must not emit identical evidence text"
         );
+    }
+
+    #[test]
+    fn result_key_names_the_actual_client_tier() {
+        let ten = client_tier_key(10);
+        let fifty = client_tier_key(50);
+
+        assert_eq!(ten, "10_client");
+        assert_eq!(fifty, "50_client");
+        assert_ne!(ten, fifty, "different client tiers must not share a result key");
     }
 
     #[test]
