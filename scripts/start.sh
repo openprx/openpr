@@ -532,7 +532,7 @@ if [[ "${SYLVODE_COMPOSE_STAGED:-0}" == 1 ]]; then
     sleep 2
   done
   [[ $postgres_ready -eq 1 ]] || { echo "❌ PostgreSQL did not become ready during staged startup"; exit 1; }
-  docker compose up -d --no-deps api
+  docker compose up -d --no-deps --no-recreate api
   api_ready=0
   staged_probe_host=$SYLVODE_BIND_HOST
   [[ $staged_probe_host == 0.0.0.0 ]] && staged_probe_host=127.0.0.1
@@ -544,9 +544,9 @@ if [[ "${SYLVODE_COMPOSE_STAGED:-0}" == 1 ]]; then
     sleep 2
   done
   [[ $api_ready -eq 1 ]] || { echo "❌ API did not become ready during staged startup"; exit 1; }
-  docker compose up -d --no-deps worker
-  docker compose up -d --no-deps mcp-server
-  docker compose up -d --no-deps frontend
+  docker compose up -d --no-deps --no-recreate worker
+  docker compose up -d --no-deps --no-recreate mcp-server
+  docker compose up -d --no-deps --no-recreate frontend
 else
   docker compose up -d --build
 fi

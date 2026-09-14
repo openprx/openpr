@@ -28,6 +28,17 @@ export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-v09-openpr-rc}"
 # podman-compose 1.3 can lose already-created dependencies while constructing
 # one combined graph. Start the real compose services in dependency order.
 export SYLVODE_COMPOSE_STAGED=1
+# E2E builds binaries on this host, so its runtime image must carry at least
+# the host glibc. Override both names together to avoid a stale legacy value in
+# a developer .env becoming either a conflict or an older runtime.
+if [[ -r /etc/os-release ]]; then
+  e2e_host_id=$(. /etc/os-release && printf '%s' "${ID:-}")
+  e2e_host_codename=$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")
+  if [[ $e2e_host_id == debian && -n $e2e_host_codename ]]; then
+    export SYLVODE_RUNTIME_BASE="debian:${e2e_host_codename}-slim"
+    export OPENPR_RUNTIME_BASE="$SYLVODE_RUNTIME_BASE"
+  fi
+fi
 
 ASSUME_YES="${OPENPR_E2E_ASSUME_YES:-0}"
 KEEP_STACK="${OPENPR_E2E_KEEP_STACK:-0}"
