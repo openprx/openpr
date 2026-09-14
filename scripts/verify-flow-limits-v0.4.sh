@@ -1300,11 +1300,11 @@ if [[ $SKIP_CARGO_TEST -eq 1 ]]; then
 else
   echo "  running: cargo test -p api routes::collab::...full_session_hello... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::collab::collab_database_tests::full_session_hello_open_snapshot_update_accepted_and_two_rejections" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.update_bytes_e2e.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::collab::collab_database_tests::full_session_hello_open_snapshot_update_accepted_and_two_rejections" ) > "$LOG_DIR/limits.dyn.update_bytes_e2e.log" 2>&1
   set -e
   echo "  running: cargo test -p api routes::flow::...bootstrap_endpoint... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.bootstrap_wire.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::bootstrap_endpoint_returns_the_full_shape_for_a_user_and_rejects_a_bot" ) > "$LOG_DIR/limits.dyn.bootstrap_wire.log" 2>&1
   set -e
   # Call-direction proofs for the structural limits (tree_depth, container_count,
   # document_block_count, text_block_chars, document_text_chars, semantic_patch_operations):
@@ -1315,11 +1315,11 @@ else
   # apart from "wired but only ever unit-tested in isolation".
   echo "  running: cargo test -p api routes::flow::...commands_endpoint_...tree_depth/batch_count... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::commands_endpoint_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.rest_call_direction.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::commands_endpoint_" ) > "$LOG_DIR/limits.dyn.rest_call_direction.log" 2>&1
   set -e
   echo "  running: cargo test -p api flow::collab::write::database_tests::ws_structural_limit_... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::write::database_tests::ws_structural_limit_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.ws_structural_call_direction.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::write::database_tests::ws_structural_limit_" ) > "$LOG_DIR/limits.dyn.ws_structural_call_direction.log" 2>&1
   set -e
   # `page_size`'s exact/+1 boundary test lives in routes/flow.rs::flow_database_tests (a real
   # REST list-endpoint call, not a query.rs-only unit test) -- see the ROUTES_FLOW_RS static scan
@@ -1328,23 +1328,23 @@ else
   # this test's name, so it needs its own dedicated run here.
   echo "  running: cargo test -p api routes::flow::...list_objects_endpoint_...page_size... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.page_size_call_direction.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "routes::flow::flow_database_tests::list_objects_endpoint_rejects_page_size_over_page_limit_max_and_accepts_exact_boundary" ) > "$LOG_DIR/limits.dyn.page_size_call_direction.log" 2>&1
   echo "  running: cargo test -p api --lib session DB wire kind producers" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "ceiling_is_observable_as_limit_exceeded" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_observable_kinds.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "ceiling_is_observable_as_limit_exceeded" ) > "$LOG_DIR/limits.dyn.session_observable_kinds.log" 2>&1
   set -e
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "user_connections_ceiling_refuses_the_seventeenth_session_with_the_frozen_limit_kind" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_user_connections_kind.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "user_connections_ceiling_refuses_the_seventeenth_session_with_the_frozen_limit_kind" ) > "$LOG_DIR/limits.dyn.session_user_connections_kind.log" 2>&1
   set -e
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::session::database_tests::" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.session_wire_boundaries.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "flow::collab::session::database_tests::" ) > "$LOG_DIR/limits.dyn.session_wire_boundaries.log" 2>&1
   set -e
   # `workspace_subscribers` (`subscribers_per_workspace_max`, frozen 2026-08-31): the exact/+1
   # boundary on both enforcement paths -- the dispatcher expansion guard and the registration
   # ceiling -- lives in events/dispatcher.rs's DB-backed suite, which no filter above reaches.
   echo "  running: cargo test -p api events::dispatcher::...workspace_subscribers_... (DB-backed)" >&2
   set +e
-  ( cd "$REPO_ROOT" && cargo test -p api --lib "events::dispatcher::dispatcher_database_tests::workspace_subscribers_" -- --test-threads=1 ) > "$LOG_DIR/limits.dyn.workspace_subscribers_ceiling.log" 2>&1
+  ( cd "$REPO_ROOT" && cargo test -p api --lib "events::dispatcher::dispatcher_database_tests::workspace_subscribers_" ) > "$LOG_DIR/limits.dyn.workspace_subscribers_ceiling.log" 2>&1
   set -e
   if grep -q "skipped: OPENPR_TEST_DATABASE_URL is not set" "${DB_LOGS[@]}" 2>/dev/null; then
     DB_SKIPPED=1
