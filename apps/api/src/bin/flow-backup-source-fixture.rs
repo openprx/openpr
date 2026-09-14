@@ -1,4 +1,4 @@
-//! Provisions the bounded PostgreSQL source used by the Flow backup/restore gate.
+//! Provisions the bounded `PostgreSQL` source used by the Flow backup/restore gate.
 
 #![allow(clippy::print_stdout)]
 
