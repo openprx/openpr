@@ -23,7 +23,7 @@ run() { local id=$1 artifact=$2; shift 2; local log="$EVIDENCE/logs/report-$id.l
  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$code" "${log#"$EVIDENCE/"}" "$artifact" "$*" >>"$ROWS"; }
 
 # Every declared producer is executed. None uses serial test flags.
-run prior_receipts prior-receipts-manifest.json "$ROOT/scripts/verify-flow-prior-receipts-v1.0.sh" --evidence-root "$EVIDENCE" --json
+run prior_receipts prior-receipts-manifest.json "$ROOT/scripts/verify-flow-prior-receipts-v1.0.sh" --repo-root "$ROOT" --contracts-root "$CONTRACTS" --evidence-root "$EVIDENCE" --json
 run stable_contracts stable-contract-manifest.json "$ROOT/scripts/verify-flow-stable-contracts-v1.0.sh" --contracts-root "$CONTRACTS" --evidence-root "$EVIDENCE" --json
 run limits_events limits-events-result.json "$ROOT/scripts/verify-flow-limits-events-v1.0.sh" --contracts-root "$CONTRACTS" --evidence-root "$EVIDENCE" --json
 run package export-package-result.json "$ROOT/scripts/verify-flow-package-v1.0.sh" --evidence-root "$EVIDENCE" --json
