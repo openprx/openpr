@@ -2269,6 +2269,13 @@ mod database_tests {
     const RACING_MOVE_CONTENTION_RETRIES: u32 = super::MAX_REBASE_ATTEMPTS;
 
     fn move_contention_retry_after_ms(error: &ApiError) -> Option<u64> {
+        // Most lock/statement timeouts are normalized by execute_on's locked-phase branch. A
+        // timeout may also surface from transaction commit itself, after that branch but before
+        // the caller receives a result. The idempotency key makes retrying that ambiguous edge
+        // safe: a rollback reruns, while an already-committed move replays its canonical result.
+        if error.is_known_transient_database_failure() {
+            return Some(200);
+        }
         let ApiError::Typed {
             kind: ApiErrorKind::ServerDraining(ServerDrainingReason::Contention),
             details: Some(details),
