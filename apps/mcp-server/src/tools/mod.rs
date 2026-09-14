@@ -141,7 +141,7 @@ pub fn get_all_tool_definitions() -> Vec<ToolDefinition> {
     tools
 }
 
-fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
+fn flow_v08_hardening_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         objects::export_flow_object_tool(),
         objects::export_flow_workspace_tool(),
@@ -154,8 +154,45 @@ fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
         objects::compact_flow_document_tool(),
         objects::replay_flow_deliveries_tool(),
         objects::rebuild_flow_projection_tool(),
-        objects::repair_quarantine_tool(),
     ]
+}
+
+fn flow_v08_tool_definitions() -> Vec<ToolDefinition> {
+    let mut tools = flow_v08_hardening_tool_definitions();
+    flow_v08_command_cardinality_registry(&tools)
+        .expect("the live v0.8 hardening tool registry must have exact cardinality coverage");
+    tools.extend([objects::repair_quarantine_tool()]);
+    tools
+}
+
+/// Cardinality declarations are joined to the live v0.8 production tool registry by name.
+/// Therefore a newly registered hardening tool cannot exist without entering this match and a
+/// stale declaration cannot survive after its tool is removed.
+fn flow_v08_command_cardinality_registry(
+    tools: &[ToolDefinition],
+) -> Result<Vec<(String, api::flow::command::ExistingDocumentCardinality)>, String> {
+    use api::flow::command::ExistingDocumentCardinality::{One, Zero};
+
+    tools
+        .iter()
+        .map(|tool| {
+            let cardinality = match tool.name.as_str() {
+                "objects.export"
+                | "objects.export_workspace"
+                | "objects.import_artifact"
+                | "objects.import_preview"
+                | "objects.import_commit"
+                | "objects.import_status"
+                | "objects.integrity"
+                | "collab.status"
+                | "collab.rebuild_projection"
+                | "deliveries.replay" => Zero,
+                "collab.compact" => One,
+                unknown => return Err(format!("live v0.8 command '{unknown}' has no cardinality declaration")),
+            };
+            Ok((tool.name.clone(), cardinality))
+        })
+        .collect()
 }
 
 fn flow_v07_tool_definitions() -> Vec<ToolDefinition> {
@@ -200,14 +237,44 @@ fn flow_v05_tool_definitions() -> Vec<ToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::{
-        flow_v05_tool_definitions, flow_v06_tool_definitions, flow_v07_tool_definitions, flow_v08_tool_definitions,
+        flow_v05_tool_definitions, flow_v06_tool_definitions, flow_v07_tool_definitions,
+        flow_v08_command_cardinality_registry, flow_v08_hardening_tool_definitions, flow_v08_tool_definitions,
         get_all_tool_definitions,
     };
+    use api::flow::command::ExistingDocumentCardinality;
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
 
     const FLOW_V05_SURFACE_SNAPSHOT: &str = include_str!("mcp-surface-v05.snapshot.md");
     const TOOL_REGISTRY_BASELINE: &str = include_str!("../../tool-registry-baseline.json");
+
+    #[test]
+    fn live_v08_dispatch_has_exact_cardinality_coverage_and_lock_order_support() {
+        let live_names = flow_v08_hardening_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<HashSet<_>>();
+        let live_tools = flow_v08_hardening_tool_definitions();
+        let registry = flow_v08_command_cardinality_registry(&live_tools)
+            .expect("every live v0.8 hardening command must declare cardinality");
+        let declared_names = registry.iter().map(|(name, _)| name.clone()).collect::<HashSet<_>>();
+
+        assert_eq!(
+            registry.len(),
+            live_names.len(),
+            "cardinality declarations must be one-to-one"
+        );
+        assert_eq!(
+            declared_names, live_names,
+            "cardinality coverage must have no missing or extra command"
+        );
+        for (name, cardinality) in registry {
+            assert!(
+                !matches!(cardinality, ExistingDocumentCardinality::BoundedMany(_)),
+                "v0.8 command '{name}' declares BoundedMany without an ADR-0013 section 2 lock-order mechanism"
+            );
+        }
+    }
 
     #[test]
     fn flow_v08_tools_match_the_repository_registry_baseline() {

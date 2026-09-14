@@ -161,27 +161,6 @@ pub fn v0_6_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumen
     registry
 }
 
-/// v0.8 hardening command delta. Import commit currently creates only brand-new documents, so its
-/// contended *existing* document cardinality is zero; any future in-place merge or restore must
-/// change that declaration and acquire ADR-0013's bounded-many lock path first.
-#[must_use]
-pub fn v0_8_command_cardinality_registry() -> Vec<(&'static str, ExistingDocumentCardinality)> {
-    use ExistingDocumentCardinality::{One, Zero};
-    vec![
-        ("objects.export", Zero),
-        ("objects.export_workspace", Zero),
-        ("objects.import_artifact", Zero),
-        ("objects.import_preview", Zero),
-        ("objects.import_commit", Zero),
-        ("objects.import_status", Zero),
-        ("objects.integrity", Zero),
-        ("collab.status", Zero),
-        ("collab.compact", One),
-        ("collab.rebuild_projection", Zero),
-        ("deliveries.replay", Zero),
-    ]
-}
-
 /// The value a `REFERENCES users(id)` column may take for this actor: the actor's own id when it
 /// is a user, `None` when it is a bot.
 ///
@@ -2290,79 +2269,13 @@ async fn execute_lifecycle_command(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod cardinality_gate_tests {
-    use super::{
-        ExistingDocumentCardinality, v0_4_command_cardinality_registry, v0_5_command_cardinality_registry,
-        v0_8_command_cardinality_registry,
-    };
-
-    #[test]
-    fn v0_8_hardening_registry_declares_every_new_command_cardinality() {
-        let registry = v0_8_command_cardinality_registry();
-        let names = registry
-            .iter()
-            .map(|(name, _)| *name)
-            .collect::<std::collections::BTreeSet<_>>();
-        let expected = [
-            "objects.export",
-            "objects.export_workspace",
-            "objects.import_artifact",
-            "objects.import_preview",
-            "objects.import_commit",
-            "objects.import_status",
-            "objects.integrity",
-            "collab.status",
-            "collab.compact",
-            "collab.rebuild_projection",
-            "deliveries.replay",
-        ]
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(registry.len(), 11);
-        assert_eq!(
-            names, expected,
-            "a new v0.8 command is undeclared or a stale name remains"
-        );
-        assert_eq!(
-            registry
-                .iter()
-                .find(|(name, _)| *name == "collab.compact")
-                .map(|(_, cardinality)| *cardinality),
-            Some(ExistingDocumentCardinality::One)
-        );
-        for (name, cardinality) in registry {
-            if name != "collab.compact" {
-                assert_eq!(
-                    cardinality,
-                    ExistingDocumentCardinality::Zero,
-                    "{name} unexpectedly contends an existing document head"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn v0_9_rc_freeze_adds_no_command_cardinality_declaration() {
-        let registry = v0_8_command_cardinality_registry();
-        assert_eq!(
-            registry.len(),
-            11,
-            "the v0.8 command registry changed during the v0.9 RC freeze"
-        );
-        assert!(
-            registry.iter().all(|(name, cardinality)| {
-                (*name == "collab.compact" && *cardinality == ExistingDocumentCardinality::One)
-                    || (*name != "collab.compact" && *cardinality == ExistingDocumentCardinality::Zero)
-            }),
-            "the frozen v0.8 command cardinalities changed during the v0.9 RC"
-        );
-    }
+    use super::{ExistingDocumentCardinality, v0_4_command_cardinality_registry, v0_5_command_cardinality_registry};
 
     /// `command_contended_document_cardinality` (`ADR-0013` §1, v0.4): "v0.4 的竞争文档集合恒
     /// ≤ 1". Every command this package registers — content, lifecycle, and the two
     /// non-`CommandKind` write paths (`create_object`, `set_flow_feature`) — must declare a
-    /// cardinality of at most 1; a future command that needs `BoundedMany` must fail this test
-    /// until it also ships the `ADR-0013` §2 multi-document lock-order machinery, not slip in
-    /// silently.
+    /// cardinality of at most 1. This is the v0.4-only invariant; later releases validate
+    /// `BoundedMany` declarations against their production lock-order mechanism separately.
     #[test]
     fn v0_4_command_set_existing_document_cardinality_is_always_at_most_one() {
         let registry = v0_4_command_cardinality_registry();
