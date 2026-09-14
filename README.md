@@ -296,7 +296,7 @@ curl -X POST "http://localhost:8090/messages?session_id=<uuid>" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"projects.list","arguments":{}}}'
 ```
 
-### Tools (128)
+### Tools (140)
 
 Per-domain counts; the total and sorted-name hash are pinned in
 `apps/mcp-server/tool-registry-baseline.json` and checked against the live registry.
@@ -339,7 +339,7 @@ returns `_meta.canonical_uri` with the canonical identity.
 Besides `serve`, `mcp-server` exposes 9 command groups: `projects`,
 `work-items`, `comments`, `labels`, `sprints`, `search`, `files upload`,
 `operation-logs list`, and `tools call`. The global `--format json|table` selects the output shape, and
-`tools call` reaches any of the 128 tools by name — a complete escape hatch for
+`tools call` reaches any of the 140 tools by name — a complete escape hatch for
 anything without a dedicated subcommand. A second `[[bin]]` in this same
 package, `sylvode`, is the native Flow CLI (`sylvode features flow get|set`,
 `sylvode objects create|patch|move|grants|get|inheritance|link|unlink|diff|relations|search` and

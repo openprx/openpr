@@ -130,7 +130,11 @@ renames, e2e = load("no-undocumented-renames-result.json"), load("isolated-e2e-a
 passed = lambda value: value.get("passed") is True and int(value.get("executed_count", 0)) > 0
 surface_ok = surface.get("passed") is True and int(surface.get("counts", {}).get("matrix_rows", 0)) > 0
 three_exceptions = surface.get("counts", {}).get("not_exposed", {}).get("mcp") == 3
-registry_ok = registry.get("passed") is True and registry.get("live_registry", {}).get("enumerated_total") == 140
+registry_mutations = registry.get("mutation_controls", {})
+registry_ok = (registry.get("passed") is True and registry.get("live_registry", {}).get("enumerated_total") == 140
+    and registry.get("rebase_valid") is True
+    and set(registry_mutations) == {"latest_after_count_plus_one", "names_hash_changed"}
+    and all(value.get("red") is True for value in registry_mutations.values()))
 hard_bool = {
     "command_contended_document_cardinality": passed(cardinality) and cardinality.get("new_commands_found") == 0,
     "rest_mcp_cli_surface_parity": surface_ok,

@@ -113,9 +113,12 @@ roundtrip_ok = (positive(roundtrip) and roundtrip.get("roundtrip", {}).get("docu
     and all(value.get("red") is True for value in roundtrip.get("mutation_controls", {}).values()))
 surface_ok = surface.get("passed") is True and int(surface.get("counts", {}).get("matrix_rows", 0)) > 0
 registry_live = registry.get("live_registry", {})
+registry_mutations = registry.get("mutation_controls", {})
 registry_ok = (registry.get("passed") is True and registry_live.get("declared_total") == 140
     and registry_live.get("enumerated_total") == 140 and registry_live.get("unique_total") == 140
-    and not registry_live.get("duplicate_names"))
+    and not registry_live.get("duplicate_names") and registry.get("rebase_valid") is True
+    and set(registry_mutations) == {"latest_after_count_plus_one", "names_hash_changed"}
+    and all(value.get("red") is True for value in registry_mutations.values()))
 e2e_ok = (positive(e2e) and all(e2e.get("checks", {}).values()) and e2e.get("container_prefix_ok") is True
     and e2e.get("cleanup_passed") is True and e2e.get("remaining_container_count") == 0
     and e2e.get("mutation", {}).get("red") is True)

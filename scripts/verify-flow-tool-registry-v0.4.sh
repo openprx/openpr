@@ -196,20 +196,63 @@ if ! REPO_BASELINE_JSON="$(jq -e '
   | select(.source == "mcp_server::get_all_tool_definitions")
   | select((.count | type) == "number" and .count > 0)
   | select(.names_sha256 | test("^[0-9a-f]{64}$"))
-  | select(.v0_4_rebase.after_count == .count)
-  | select(.v0_4_rebase.before_count + .v0_4_rebase.added - .v0_4_rebase.removed == .count)
 ' "$REPO_BASELINE_PATH" 2>/dev/null)"; then
   echo "FAIL: invalid or missing repository tool registry baseline: $REPO_BASELINE_PATH" >&2
+  exit 2
+fi
+CHRONOLOGY_JSON="$(python3 - "$REPO_BASELINE_PATH" <<'PY'
+import copy
+import json
+import re
+import sys
+
+baseline = json.load(open(sys.argv[1], encoding="utf-8"))
+entries = []
+for key, value in baseline.items():
+    match = re.fullmatch(r"v(\d+)_(\d+)_rebase", key)
+    if match:
+        entries.append((tuple(map(int, match.groups())), key, value))
+entries.sort()
+
+def valid(rows, expected):
+    if not rows:
+        return False
+    previous = None
+    for _, _, row in rows:
+        required = ("before_count", "added", "removed", "after_count")
+        if any(not isinstance(row.get(field), int) for field in required):
+            return False
+        if row["before_count"] + row["added"] - row["removed"] != row["after_count"]:
+            return False
+        if previous is not None and row["before_count"] != previous:
+            return False
+        previous = row["after_count"]
+    return previous == expected
+
+broken = copy.deepcopy(entries)
+if broken:
+    broken[-1][2]["after_count"] += 1
+print(json.dumps({
+    "valid": valid(entries, baseline.get("count")),
+    "entries": [{"id": key, **row} for _, key, row in entries],
+    "mutation_controls": {
+        "latest_after_count_plus_one": {"red": not valid(broken, baseline.get("count"))},
+    },
+}))
+PY
+)"
+if [[ $(jq -r '.valid' <<<"$CHRONOLOGY_JSON") != true ]]; then
+  echo "FAIL: repository tool registry rebase chronology is not continuous and exact: $REPO_BASELINE_PATH" >&2
   exit 2
 fi
 REPO_BASELINE_SHA="$(sha256sum "$REPO_BASELINE_PATH" | awk '{print $1}')"
 REPO_EXPECTED="$(jq -r '.count' <<<"$REPO_BASELINE_JSON")"
 REPO_NAMES_SHA="$(jq -r '.names_sha256' <<<"$REPO_BASELINE_JSON")"
 REBASE_VALID="$(jq -n \
-  --argjson baseline "$REPO_BASELINE_JSON" --argjson contract "$CONTRACT_JSON" \
+  --argjson baseline "$REPO_BASELINE_JSON" --argjson chronology "$CHRONOLOGY_JSON" \
   --argjson live_count "$LIVE_COUNT" --arg live_hash "$NAMES_SHA" '
-  $baseline.v0_4_rebase.before_count == $contract.expected_total_for_release
-  and $baseline.v0_4_rebase.after_count == $live_count
+  $chronology.valid
+  and ($chronology.entries[-1].after_count == $live_count)
   and $baseline.count == $live_count
   and $baseline.names_sha256 == $live_hash
 ')"
@@ -341,7 +384,7 @@ RESULT="$(jq -n \
   --arg baseline "$BASELINE_PATH" --arg baseline_sha "$BASELINE_SHA" \
   --arg repo_baseline "$REPO_BASELINE_PATH" --arg repo_baseline_sha "$REPO_BASELINE_SHA" \
   --argjson live "$LIVE_JSON" --argjson contract "$CONTRACT_JSON" --argjson policy "$POLICY_JSON" \
-  --argjson repo_registry_baseline "$REPO_BASELINE_JSON" --argjson rebase_valid "$REBASE_VALID" \
+  --argjson repo_registry_baseline "$REPO_BASELINE_JSON" --argjson chronology "$CHRONOLOGY_JSON" --argjson rebase_valid "$REBASE_VALID" \
   --argjson touchpoints "$TOUCHPOINTS_JSON" \
   --arg names_sha "$NAMES_SHA" \
   --argjson violations "$VIOLATIONS_JSON" --argjson passed "$PASSED" \
@@ -352,8 +395,11 @@ RESULT="$(jq -n \
     generated_at: $generated_at,
     release: $release,
     baseline_contract: {path: $baseline, sha256: $baseline_sha},
-    repository_baseline: ($repo_registry_baseline + {path: $repo_baseline, sha256: $repo_baseline_sha}),
+    repository_baseline: ($repo_registry_baseline + {path: $repo_baseline, sha256: $repo_baseline_sha, chronology: $chronology.entries}),
     rebase_valid: $rebase_valid,
+    mutation_controls: ($chronology.mutation_controls + {
+      names_hash_changed: {red: ($repo_registry_baseline.names_sha256 == $names_sha)}
+    }),
     live_registry: {
       source: "cargo build -p mcp-server --bin list-tools && ./list-tools (mcp_server::get_all_tool_definitions)",
       header_declared_total: $live.declared_total,
