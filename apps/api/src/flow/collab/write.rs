@@ -63,7 +63,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiErrorKind};
-use crate::events::{BusinessEventInput, FlowDispatchSpec, insert_flow_event};
 use crate::flow::event_origin::CommandOrigin;
 use crate::flow::projection;
 
@@ -336,6 +335,22 @@ pub(crate) struct ObservedHead {
     pub(crate) format_version: String,
     pub(crate) head_seq: i64,
     pub(crate) head_frontier: Vec<u8>,
+    snapshot_seq: i64,
+    tail_updates: i64,
+    tail_bytes: i64,
+    snapshot_bytes: i64,
+}
+
+impl ObservedHead {
+    fn tail_stats(&self) -> snapshot::TailStats {
+        snapshot::TailStats {
+            snapshot_seq: self.snapshot_seq,
+            head_seq: self.head_seq,
+            tail_updates: self.tail_updates,
+            tail_bytes: self.tail_bytes,
+            snapshot_bytes: self.snapshot_bytes,
+        }
+    }
 }
 
 /// `collab_documents.engine` is not selected here: the `collab_documents_engine_check` CHECK
@@ -349,10 +364,19 @@ async fn read_observed_head<C: ConnectionTrait>(conn: &C, document_id: Uuid) -> 
         format_version: String,
         head_seq: i64,
         head_frontier: Vec<u8>,
+        snapshot_seq: i64,
+        tail_updates: i64,
+        tail_bytes: i64,
+        snapshot_bytes: i64,
     }
     let row = Row::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "SELECT object_id, format_version, head_seq, head_frontier FROM collab_documents WHERE id = $1",
+        "SELECT d.object_id, d.format_version, d.head_seq, d.head_frontier, d.snapshot_seq, \
+                (d.head_seq - d.snapshot_seq) AS tail_updates, \
+                COALESCE((SELECT sum(octet_length(u.bytes)) FROM collab_updates u \
+                          WHERE u.document_id = d.id AND u.seq > d.snapshot_seq), 0)::bigint AS tail_bytes, \
+                octet_length(d.snapshot)::bigint AS snapshot_bytes \
+         FROM collab_documents d WHERE d.id = $1",
         vec![document_id.into()],
     ))
     .one(conn)
@@ -362,6 +386,10 @@ async fn read_observed_head<C: ConnectionTrait>(conn: &C, document_id: Uuid) -> 
         format_version: r.format_version,
         head_seq: r.head_seq,
         head_frontier: r.head_frontier,
+        snapshot_seq: r.snapshot_seq,
+        tail_updates: r.tail_updates,
+        tail_bytes: r.tail_bytes,
+        snapshot_bytes: r.snapshot_bytes,
     }))
 }
 
@@ -801,58 +829,89 @@ pub(crate) async fn stage_one_document(
     let before_frontier = prepared.observed.head_frontier.clone();
     let after_frontier = prepared.after_frontier.clone();
 
-    let event_id = insert_flow_event(
-        tx,
-        BusinessEventInput {
-            workspace_id: request.workspace_id,
-            project_id: None,
-            event_type: "flow.content.accepted".to_string(),
-            aggregate_type: "flow_document".to_string(),
-            aggregate_id: request.document_id.to_string(),
-            actor_id: crate::flow::command::actor_user_id(request.actor_id, request.actor_is_bot),
-            source: request.origin.source_json(),
-            payload: serde_json::json!({
-                "object_id": prepared.observed.object_id,
-                "document_id": request.document_id,
-                "accepted_seq": new_head_seq,
-                "projection_seq": new_head_seq,
-                "changed_block_ids": Vec::<Uuid>::new(),
-            }),
-            metadata: serde_json::json!({
-                "message": request.message,
-                "before_frontier": encode_bytes(&before_frontier),
-                "after_frontier": encode_bytes(&after_frontier),
-                // Audit metadata is deliberately a structural summary, never document content.
-                // `events-v1.md` permits an action here and forbids CRDT bytes, snapshots,
-                // title/body/text and restricted field values from entering the envelope.
-                "semantic_summary": { "action": "content_update" },
-            }),
-            correlation_id: Some(request.origin.correlation_id),
-            causation_id: request.origin.causation_id,
-            // `UpdateRequest::event_idempotency_key`'s doc comment: the REST command surface sets
-            // this so `flow::command`'s `find_idempotent_event` replay guard actually covers
-            // content commands (it is the only command family that used to write `None` here, so
-            // that guard could never match one and a replayed key fell through to the raw
-            // `idx_collab_updates_idempotency` violation instead); the WebSocket surface leaves it
-            // `None` and relies on `update_id` for replay.
-            idempotency_key: request.event_idempotency_key.clone(),
-        },
-        Some(FlowDispatchSpec {
-            max_attempts: dispatch_max_attempts,
-            document_id: Some(request.document_id),
-            accepted_seq: Some(new_head_seq),
-        }),
-    )
-    .await?
-    .event_id;
+    #[allow(clippy::cast_possible_wrap)]
+    let new_byte_count = locked.byte_count + request.bytes.len() as i64;
+    let new_update_count = locked.update_count + 1;
+    let actor_id = crate::flow::command::actor_user_id(request.actor_id, request.actor_is_bot);
+    let event_id = Uuid::new_v4();
+    let dispatch_id = Uuid::new_v4();
+    let event_payload = serde_json::json!({
+        "object_id": prepared.observed.object_id,
+        "document_id": request.document_id,
+        "accepted_seq": new_head_seq,
+        "projection_seq": new_head_seq,
+        "changed_block_ids": Vec::<Uuid>::new(),
+    });
+    let event_metadata = serde_json::json!({
+        "message": request.message,
+        "before_frontier": encode_bytes(&before_frontier),
+        "after_frontier": encode_bytes(&after_frontier),
+        // Audit metadata is deliberately a structural summary, never document content.
+        "semantic_summary": { "action": "content_update" },
+    });
 
-    tx.execute(Statement::from_sql_and_values(
+    #[derive(FromQueryResult)]
+    struct AcceptedEventRow {
+        event_id: Uuid,
+    }
+
+    // Once the head row is locked, all five canonical writes are one fixed PostgreSQL statement.
+    // The old implementation awaited business_events, event_dispatch, collab_updates, the head
+    // update, and the projection update separately. Those round trips were tiny in isolation but
+    // sat inside the single-document coordinator, so 50 clients multiplied them into hundreds of
+    // milliseconds of queueing. The data-modifying CTE keeps the same transaction and constraints;
+    // dependencies flow through RETURNING rows, and any failing branch aborts the whole statement.
+    let accepted_event = AcceptedEventRow::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
         r"
-            INSERT INTO collab_updates
-                (document_id, seq, update_id, content_hash, idempotency_key, before_frontier, after_frontier,
-                 bytes, actor_id, origin_surface, origin_client_id, projection_seq, event_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $12, $10, $2, $11)
+            WITH inserted_event AS (
+                INSERT INTO business_events (
+                    id, workspace_id, project_id, event_type, aggregate_type, aggregate_id,
+                    actor_id, source, payload, metadata, correlation_id, causation_id,
+                    idempotency_key, created_at
+                )
+                VALUES ($23, $16, NULL, 'flow.content.accepted', 'flow_document', $1::text,
+                        $9, $17, $18, $19, $20, $21, $22, now())
+                ON CONFLICT (workspace_id, idempotency_key)
+                    WHERE idempotency_key IS NOT NULL DO NOTHING
+                RETURNING id
+            ), event_row AS (
+                SELECT id FROM inserted_event
+                UNION ALL
+                SELECT id FROM business_events
+                 WHERE workspace_id = $16 AND idempotency_key = $22
+                   AND NOT EXISTS (SELECT 1 FROM inserted_event)
+                LIMIT 1
+            ), inserted_dispatch AS (
+                INSERT INTO event_dispatch
+                    (id, event_id, workspace_id, event_type, document_id, accepted_seq, max_attempts)
+                SELECT $24, id, $16, 'flow.content.accepted', $1, $2, $25 FROM inserted_event
+                RETURNING event_id
+            ), inserted_update AS (
+                INSERT INTO collab_updates
+                    (document_id, seq, update_id, content_hash, idempotency_key,
+                     before_frontier, after_frontier, bytes, actor_id, origin_surface,
+                     origin_client_id, projection_seq, event_id)
+                SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $11, $10, $2, id
+                  FROM event_row
+                RETURNING event_id
+            ), updated_document AS (
+                UPDATE collab_documents
+                   SET head_seq = $2, head_frontier = $7, byte_count = $26,
+                       update_count = $27, updated_at = now()
+                 WHERE id = $1
+                RETURNING id
+            ), updated_projection AS (
+                UPDATE flow_object_projections
+                   SET document_seq = $2, document_frontier = $7, title = $13,
+                       state = $14, plain_text = $15, updated_at = now()
+                 WHERE object_id = $12
+                RETURNING object_id
+            )
+            SELECT iu.event_id
+              FROM inserted_update iu
+              CROSS JOIN updated_document
+              CROSS JOIN updated_projection
         ",
         vec![
             request.document_id.into(),
@@ -863,54 +922,33 @@ pub(crate) async fn stage_one_document(
             before_frontier.into(),
             after_frontier.clone().into(),
             request.bytes.clone().into(),
-            crate::flow::command::actor_user_id(request.actor_id, request.actor_is_bot).into(),
+            actor_id.into(),
             request.origin_client_id.clone().into(),
-            event_id.into(),
             request.origin.surface().as_wire().into(),
-        ],
-    ))
-    .await?;
-
-    #[allow(clippy::cast_possible_wrap)]
-    let new_byte_count = locked.byte_count + request.bytes.len() as i64;
-    let new_update_count = locked.update_count + 1;
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            UPDATE collab_documents
-            SET head_seq = $2, head_frontier = $3, byte_count = $4, update_count = $5, updated_at = now()
-            WHERE id = $1
-        ",
-        vec![
-            request.document_id.into(),
-            new_head_seq.into(),
-            after_frontier.clone().into(),
+            prepared.observed.object_id.into(),
+            prepared.title.clone().into(),
+            prepared.state_json.clone().into(),
+            prepared.plain_text.clone().into(),
+            request.workspace_id.into(),
+            request.origin.source_json().into(),
+            event_payload.into(),
+            event_metadata.into(),
+            Some(request.origin.correlation_id).into(),
+            request.origin.causation_id.into(),
+            request.event_idempotency_key.clone().into(),
+            event_id.into(),
+            dispatch_id.into(),
+            dispatch_max_attempts.into(),
             new_byte_count.into(),
             new_update_count.into(),
         ],
     ))
-    .await?;
-
-    tx.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r"
-            UPDATE flow_object_projections
-            SET document_seq = $2, document_frontier = $3, title = $4, state = $5, plain_text = $6, updated_at = now()
-            WHERE object_id = $1
-        ",
-        vec![
-            prepared.observed.object_id.into(),
-            new_head_seq.into(),
-            after_frontier.clone().into(),
-            prepared.title.clone().into(),
-            prepared.state_json.clone().into(),
-            prepared.plain_text.clone().into(),
-        ],
-    ))
-    .await?;
+    .one(tx)
+    .await?
+    .ok_or(ApiError::Internal)?;
 
     Ok(StagedOutcome::Ready(StagedWrite {
-        event_id,
+        event_id: accepted_event.event_id,
         new_head_seq,
         after_frontier,
     }))
@@ -1211,26 +1249,36 @@ pub async fn accept_update(
         ));
     };
 
-    // Gate 7 `minimal_snapshot_advancement_bounds_tail`: a single, unlocked tail-shape read taken
-    // once per accept attempt (not once per rebase iteration below) — never inside a transaction,
-    // never blocking a concurrent writer for a *different* document. `limits-v1.md`'s hard
-    // trigger ("接受下一 update 前必须先成功推进 snapshot,不能继续扩大 tail") is enforced
-    // synchronously right here, before this update is even hydrated: if the document is already
-    // at/over a hard boundary, this write waits for a real advancement to succeed (or gives up as
-    // recoverable contention) rather than growing the tail further. The soft trigger only marks
-    // `should_advance_snapshot` on the eventual `Accepted` result — it must never block this
-    // write; `flow::collab::session`/`flow::command` spawn the actual background advancement
-    // after they see that flag, once this function has already returned.
     let mut should_advance_snapshot = false;
-    if let Some(stats) = snapshot::read_tail_stats(db, request.document_id).await? {
-        match snapshot::evaluate(&stats, snapshot_advancer.last_rebuild_wall_ms(request.document_id)) {
+    let mut prepared_before_first_attempt = {
+        let prepared = match hydrate_and_apply(
+            db,
+            cache,
+            request.document_id,
+            request.update_id,
+            &request.bytes,
+            request.expected_frontier.as_deref(),
+        )
+        .await?
+        {
+            HydrateOutcome::Prepared(prepared) => prepared,
+            HydrateOutcome::Rejected(outcome) => return Ok(outcome),
+        };
+
+        // Gate 7's tail counters come from the same unlocked, consistent document-head read that
+        // prepared this update. Previously `read_tail_stats` added two serialized SQL round trips
+        // before every hot-document write and then `hydrate_and_apply` immediately read the same
+        // document head again. At 50 closed-loop clients those redundant round trips sat behind the
+        // per-document coordinator and dominated queueing latency. Keeping the trigger data on the
+        // observed head removes that N+1 seam without narrowing the safety check: a hard trigger is
+        // still handled before this update opens its write transaction.
+        match snapshot::evaluate(
+            &prepared.observed.tail_stats(),
+            snapshot_advancer.last_rebuild_wall_ms(request.document_id),
+        ) {
             Trigger::Hard => match snapshot::advance(db, request.document_id, snapshot_advancer).await {
                 Ok(snapshot::AdvanceOutcome::Advanced | snapshot::AdvanceOutcome::NothingToAdvance) => {}
                 Ok(snapshot::AdvanceOutcome::Contended) => {
-                    // Refused before this update is hydrated, let alone staged. Snapshot
-                    // advancement rewrites this document's *checkpoint*, never its canonical head
-                    // or `collab_updates` tail, so neither outcome of it can have applied this
-                    // update.
                     return Ok(contention(
                         Some(request.update_id),
                         "snapshot checkpoint required before this document's tail can grow further",
@@ -1296,7 +1344,8 @@ pub async fn accept_update(
             Trigger::Soft => should_advance_snapshot = true,
             Trigger::None => {}
         }
-    }
+        Some(prepared)
+    };
 
     let mut attempts = 0u32;
     loop {
@@ -1316,18 +1365,22 @@ pub async fn accept_update(
             return Ok(AcceptOutcome::Accepted(prior));
         }
 
-        let prepared = match hydrate_and_apply(
-            db,
-            cache,
-            request.document_id,
-            request.update_id,
-            &request.bytes,
-            request.expected_frontier.as_deref(),
-        )
-        .await?
-        {
-            HydrateOutcome::Prepared(prepared) => prepared,
-            HydrateOutcome::Rejected(outcome) => return Ok(outcome),
+        let prepared = if let Some(prepared) = prepared_before_first_attempt.take() {
+            prepared
+        } else {
+            match hydrate_and_apply(
+                db,
+                cache,
+                request.document_id,
+                request.update_id,
+                &request.bytes,
+                request.expected_frontier.as_deref(),
+            )
+            .await?
+            {
+                HydrateOutcome::Prepared(prepared) => prepared,
+                HydrateOutcome::Rejected(outcome) => return Ok(outcome),
+            }
         };
 
         #[cfg(test)]

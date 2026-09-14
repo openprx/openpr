@@ -1872,6 +1872,29 @@ fn statement_matches(sql: &str, needles: &[&str]) -> bool {
     sql.starts_with(prefix) && rest.iter().all(|needle| sql.contains(needle))
 }
 
+/// The optimized content-write batch is one statement, but it is not a blanket `WITH` escape
+/// hatch. It qualifies only when every canonical write named by ADR-0010 is present and linked by
+/// the expected data-modifying CTE shape. Removing any event, dispatch, update, head, or projection
+/// branch therefore turns the inventory red just as removing one of the former separate statements
+/// did.
+fn is_complete_canonical_write_batch(sql: &str) -> bool {
+    sql.starts_with("with inserted_event as (")
+        && [
+            "insert into business_events",
+            "inserted_dispatch as (",
+            "insert into event_dispatch",
+            "inserted_update as (",
+            "insert into collab_updates",
+            "updated_document as (",
+            "update collab_documents",
+            "updated_projection as (",
+            "update flow_object_projections",
+            "select iu.event_id from inserted_update iu cross join updated_document cross join updated_projection",
+        ]
+        .iter()
+        .all(|needle| sql.contains(needle))
+}
+
 /// Audits one write transaction's statement inventory both ways: against the named hydrate/rebase
 /// reads that must never appear inside the lock, and against the complete allowlist of statements
 /// the locked phase is permitted to run at all.
@@ -1897,9 +1920,10 @@ fn audit_locked_phase(transaction: &LoggedTransaction) -> (Vec<String>, BTreeSet
                 ));
             }
         }
-        if !LOCKED_PHASE_ALLOWED_STATEMENTS
-            .iter()
-            .any(|(_label, needles)| statement_matches(&sql, needles))
+        if !is_complete_canonical_write_batch(&sql)
+            && !LOCKED_PHASE_ALLOWED_STATEMENTS
+                .iter()
+                .any(|(_label, needles)| statement_matches(&sql, needles))
         {
             found.push(format!(
                 "unexpected_statement_inside_lock: `{sql}` is not one of the statements ADR-0010's locked \
@@ -2230,10 +2254,7 @@ fn evaluate(report: &mut Report) {
             ));
         }
         if round_trip.p95_ms > ROUND_TRIP_P95_MS_MAX {
-            report.fail(format!(
-                "10-client accepted round_trip_p95 = {:.1}ms exceeds the ADR-0010 budget of {ROUND_TRIP_P95_MS_MAX:.0}ms (p50={:.1} p99={:.1} n={})",
-                round_trip.p95_ms, round_trip.p50_ms, round_trip.p99_ms, round_trip.samples
-            ));
+            report.fail(round_trip_budget_violation(report.clients, &round_trip));
         }
     } else {
         report.fail("no round-trip distribution was produced");
@@ -2384,6 +2405,13 @@ fn evaluate(report: &mut Report) {
     }
 }
 
+fn round_trip_budget_violation(clients: usize, round_trip: &Distribution) -> String {
+    format!(
+        "{clients}-client accepted round_trip_p95 = {:.1}ms exceeds the ADR-0010 budget of {ROUND_TRIP_P95_MS_MAX:.0}ms (p50={:.1} p99={:.1} n={})",
+        round_trip.p95_ms, round_trip.p50_ms, round_trip.p99_ms, round_trip.samples
+    )
+}
+
 // ---------------------------------------------------------------------------------------------
 // Mutation checks on the harness itself
 //
@@ -2398,7 +2426,7 @@ mod harness_self_checks {
     use super::{
         Distribution, LoggedStatement, LoggedTransaction, absolute_gap_budget_resolution_status, audit_locked_phase,
         calibrated_gap_resolution_status, drop_each_nth_log_line, group_transactions, parse_pg_log, percentile_ms,
-        reconstruct, reconstruction_covers_accepted_updates,
+        reconstruct, reconstruction_covers_accepted_updates, round_trip_budget_violation,
     };
     use chrono::{DateTime, TimeZone, Utc};
 
@@ -2467,6 +2495,26 @@ mod harness_self_checks {
     }
 
     #[test]
+    fn round_trip_violation_names_the_actual_client_tier() {
+        let distribution = Distribution {
+            samples: 30,
+            p50_ms: 422.0,
+            p95_ms: 604.0,
+            p99_ms: 620.0,
+            max_ms: 630.0,
+        };
+        let ten = round_trip_budget_violation(10, &distribution);
+        let fifty = round_trip_budget_violation(50, &distribution);
+
+        assert!(ten.starts_with("10-client accepted"), "10-client text: {ten}");
+        assert!(fifty.starts_with("50-client accepted"), "50-client text: {fifty}");
+        assert_ne!(
+            ten, fifty,
+            "different client tiers must not emit identical evidence text"
+        );
+    }
+
+    #[test]
     fn the_real_locked_phase_passes_the_statement_audit_with_exactly_eleven_statements() {
         let (violations, inventory) = audit_locked_phase(&locked_phase(&[]));
         assert!(violations.is_empty(), "unexpected violations: {violations:?}");
@@ -2506,6 +2554,33 @@ mod harness_self_checks {
                 .iter()
                 .any(|violation| violation.contains("unexpected_statement_inside_lock")),
             "the allowlist must reject a statement no blacklist rule anticipates: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_write_batch_requires_every_atomic_branch() {
+        let complete = "WITH inserted_event AS (INSERT INTO business_events VALUES ($1)), \
+            inserted_dispatch AS (INSERT INTO event_dispatch SELECT 1), \
+            inserted_update AS (INSERT INTO collab_updates SELECT 1 RETURNING event_id), \
+            updated_document AS (UPDATE collab_documents SET head_seq = $2 RETURNING id), \
+            updated_projection AS (UPDATE flow_object_projections SET document_seq = $2 RETURNING object_id) \
+            SELECT iu.event_id FROM inserted_update iu CROSS JOIN updated_document CROSS JOIN updated_projection";
+        let (complete_violations, _) = audit_locked_phase(&locked_phase(&[complete]));
+        assert!(
+            complete_violations.is_empty(),
+            "complete batch: {complete_violations:?}"
+        );
+
+        let missing_projection = complete.replace(
+            "updated_projection AS (UPDATE flow_object_projections SET document_seq = $2 RETURNING object_id)",
+            "updated_projection AS (SELECT 1 AS object_id)",
+        );
+        let (mutated_violations, _) = audit_locked_phase(&locked_phase(&[&missing_projection]));
+        assert!(
+            mutated_violations
+                .iter()
+                .any(|violation| violation.contains("unexpected_statement_inside_lock")),
+            "a batch missing the projection write must be red: {mutated_violations:?}"
         );
     }
 

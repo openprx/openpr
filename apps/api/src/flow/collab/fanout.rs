@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, FromQueryResult, Statement};
+use sea_orm::{DatabaseConnection, DbBackend, FromQueryResult, Statement};
 use uuid::Uuid;
 
 use platform::app::AppState;
@@ -54,22 +54,24 @@ pub async fn publish_document_update(
     document_id: Uuid,
     document_seq: i64,
 ) -> Result<i64, ApiError> {
+    // Insert the durable pointer and emit its wake-up hint in one server round trip. These used to
+    // be two sequential autocommit statements on the per-document coordinator's critical path.
+    // `pg_notify` runs only after the INSERT has produced an id; if the statement fails, neither
+    // effect is visible, preserving the old best-effort failure semantics.
     let notice = NoticeId::find_by_statement(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "INSERT INTO flow_fanout_notices \
-             (workspace_id, document_id, notice_kind, document_seq) \
-         VALUES ($1, $2, 'document_update', $3) RETURNING id",
+        "WITH inserted AS ( \
+             INSERT INTO flow_fanout_notices \
+                 (workspace_id, document_id, notice_kind, document_seq) \
+             VALUES ($1, $2, 'document_update', $3) RETURNING id \
+         ) \
+         SELECT id FROM inserted \
+         WHERE pg_notify('openpr_flow_fanout', id::text) IS NULL",
         vec![workspace_id.into(), document_id.into(), document_seq.into()],
     ))
     .one(db)
     .await?
     .ok_or(ApiError::Internal)?;
-    db.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "SELECT pg_notify('openpr_flow_fanout', $1)",
-        vec![notice.id.to_string().into()],
-    ))
-    .await?;
     Ok(notice.id)
 }
 
