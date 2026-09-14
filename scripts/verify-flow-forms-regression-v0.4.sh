@@ -31,7 +31,7 @@ set -euo pipefail
 #   2. its output contains zero `FAIL: ` assertion lines;
 #   3. its output contains at least one `PASS: ` assertion line (a bundle that
 #      exits 0 having executed nothing is a false green, not a pass);
-#   4. its output ends with the bundle's own `Universal Forms CI Gates passed.`
+#   4. its output ends with the bundle's own current completion marker.
 #      completion marker (guards against a truncated/killed run).
 # Anything else is `failed`. There is no `not_covered` branch: the bundle
 # exists in this repository and is runnable, so "cannot be exercised here"
@@ -139,7 +139,7 @@ LOG_SHA256="$(sha256sum "$LOG_FILE" | awk '{print $1}')"
 # captured into one log so both are counted.
 PASS_COUNT="$(grep -c '^PASS: ' "$LOG_FILE" || true)"
 FAIL_COUNT="$(grep -c '^FAIL: ' "$LOG_FILE" || true)"
-if grep -qx 'Universal Forms CI Gates passed.' "$LOG_FILE"; then
+if grep -qx 'Universal Forms static and Rust regression gates passed.' "$LOG_FILE"; then
   COMPLETION_MARKER=true
 else
   COMPLETION_MARKER=false
@@ -160,7 +160,7 @@ if [[ "$PASS_COUNT" -le 0 ]]; then
   REASON_PARTS+=("zero PASS assertions executed (exit 0 with nothing run is a false green, not a pass)")
 fi
 if [[ "$COMPLETION_MARKER" != true ]]; then
-  REASON_PARTS+=("bundle completion marker 'Universal Forms CI Gates passed.' absent (run truncated?)")
+  REASON_PARTS+=("bundle completion marker 'Universal Forms static and Rust regression gates passed.' absent (run truncated?)")
 fi
 
 if [[ ${#REASON_PARTS[@]} -eq 0 ]]; then

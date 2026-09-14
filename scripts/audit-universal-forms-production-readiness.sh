@@ -387,7 +387,7 @@ contains "restaurant demo bootstrap refuses remote API by default" "$ROOT_DIR/sc
 contains "restaurant demo bootstrap is documented as local-only" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "not a production seeding tool"
 contains "restaurant demo bootstrap creates MCP bot token" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "Local Restaurant Demo MCP Bot"
 contains "restaurant demo bootstrap writes the MCP workspace into the configuration" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "mcp.workspace_id"
-contains "restaurant demo bootstrap recreates the running MCP compose service" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "docker compose rm -sf mcp-server"
+contains "restaurant demo bootstrap reloads the exact running MCP container" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" 'docker restart "${mcp_container_ids[0]}"'
 contains "restaurant demo bootstrap verifies MCP HTTP projects.list" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "projects.list"
 contains "restaurant demo bootstrap supports required MCP HTTP verification" "$ROOT_DIR/scripts/bootstrap-restaurant-demo.sh" "OPENPR_DEMO_VERIFY_MCP_HTTP=1"
 contains "restaurant demo MCP HTTP smoke uses temporary config file" "$ROOT_DIR/scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "OPENPR_DEMO_CONFIG_PATH"

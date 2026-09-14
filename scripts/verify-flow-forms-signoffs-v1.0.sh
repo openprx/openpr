@@ -12,7 +12,8 @@ except Exception as e:base={"passed":False,"executed_count":0,"error":str(e)}
 # Flow and Forms remain separately named evidence domains; exercise the same predicate on an alias mutation.
 domains=["flow","forms"];independent=lambda values: len(values)==2 and len(set(values))==2
 mutation_red=not independent(["flow","flow"])
-r={"schema_version":"sylvode.flow.forms-signoffs-result.v1","release":"1.0.0","source_head":subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip(),"domains":domains,"base":base,"mutation":{"name":"aliased_signoff_domains","red":mutation_red},"executed_count":int(base.get("executed_count",len(base.get("checks",[]))))+1,"passed":code==0 and base.get("passed") is True and independent(domains) and mutation_red,"generated_at":dt.datetime.now(dt.timezone.utc).isoformat()}
+assertions=base.get("forms_gate_run",{}).get("assertions",{});base_executed=int(base.get("executed_count",assertions.get("passed",0)+assertions.get("failed",0)))
+r={"schema_version":"sylvode.flow.forms-signoffs-result.v1","release":"1.0.0","source_head":subprocess.check_output(["git","-C",str(repo),"rev-parse","HEAD"],text=True).strip(),"domains":domains,"base":base,"mutation":{"name":"aliased_signoff_domains","red":mutation_red},"executed_count":base_executed+1,"passed":code==0 and base.get("passed") is True and base_executed>0 and independent(domains) and mutation_red,"generated_at":dt.datetime.now(dt.timezone.utc).isoformat()}
 fd,tmp=tempfile.mkstemp(prefix=".flow-forms-signoffs-result.",dir=evidence)
 with os.fdopen(fd,"w") as f:json.dump(r,f,sort_keys=True,indent=2);f.write("\n")
 os.replace(tmp,evidence/"flow-forms-signoffs-result.json");print(json.dumps(r,sort_keys=True));raise SystemExit(0 if r["passed"] else 1)

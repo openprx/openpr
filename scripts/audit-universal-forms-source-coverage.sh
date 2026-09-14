@@ -343,7 +343,7 @@ contains "MCP app README lists relation tools" "apps/mcp-server/README.md" "form
 contains "MCP app README lists child lifecycle tools" "apps/mcp-server/README.md" "form_records.child_archive"
 contains "MCP app README lists import/export tools" "apps/mcp-server/README.md" "form_records.import_commit"
 contains "MCP app README lists plugin tools" "apps/mcp-server/README.md" "plugin_invocations.list"
-contains "MCP app README uses API client structure" "apps/mcp-server/README.md" "client/           # OpenPR API client helpers"
+contains "MCP app README uses Sylvode API client structure" "apps/mcp-server/README.md" "client/           # Sylvode API client helpers"
 contains "MCP skill guide exposes snapshot-derived tool count" "skills/openpr-mcp/SKILL.md" "enumerate all $EXPECTED_TOOL_COUNT tools"
 contains "MCP skill guide lists universal forms tools" "skills/openpr-mcp/SKILL.md" "form_records.aggregate"
 contains "MCP skill guide lists scenario install" "skills/openpr-mcp/SKILL.md" "scenario_templates.install"
@@ -586,7 +586,7 @@ contains "restaurant demo bootstrap refuses remote API by default" "scripts/boot
 contains "restaurant demo bootstrap verifies formula output" "scripts/bootstrap-restaurant-demo.sh" "restaurant_calc should calculate order_line.line_total"
 contains "restaurant demo bootstrap creates MCP bot token" "scripts/bootstrap-restaurant-demo.sh" "/bots"
 contains "restaurant demo bootstrap writes MCP config credentials" "scripts/bootstrap-restaurant-demo.sh" "mcp.workspace_id"
-contains "restaurant demo bootstrap can recreate compose MCP server" "scripts/bootstrap-restaurant-demo.sh" "docker compose rm -sf mcp-server"
+contains "restaurant demo bootstrap reloads the exact running MCP container" "scripts/bootstrap-restaurant-demo.sh" 'docker restart "${mcp_container_ids[0]}"'
 contains "restaurant demo bootstrap verifies MCP HTTP projects.list" "scripts/bootstrap-restaurant-demo.sh" "projects.list"
 contains "restaurant demo bootstrap checks demo project through MCP HTTP" "scripts/bootstrap-restaurant-demo.sh" "MCP HTTP verification passed"
 contains "restaurant demo MCP HTTP smoke starts real MCP server" "scripts/smoke-restaurant-demo-bootstrap-mcp-http.sh" "/target/debug/mcp-server\" --config"

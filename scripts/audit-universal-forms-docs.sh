@@ -578,7 +578,7 @@ contains "MCP app README includes relation tools" "$ROOT_DIR/apps/mcp-server/REA
 contains "MCP app README includes child lifecycle tools" "$ROOT_DIR/apps/mcp-server/README.md" "form_records.child_archive"
 contains "MCP app README includes import/export tools" "$ROOT_DIR/apps/mcp-server/README.md" "form_records.import_commit"
 contains "MCP app README includes plugin tools" "$ROOT_DIR/apps/mcp-server/README.md" "WASM Plugins"
-contains "MCP app README project structure uses API client" "$ROOT_DIR/apps/mcp-server/README.md" "client/           # OpenPR API client helpers"
+contains "MCP app README project structure uses API client" "$ROOT_DIR/apps/mcp-server/README.md" "client/           # Sylvode API client helpers"
 not_contains "MCP app README does not retain stale 65-tool count" "$ROOT_DIR/apps/mcp-server/README.md" "65 MCP Tools"
 not_contains "MCP app README does not retain stale two-transport wording" "$ROOT_DIR/apps/mcp-server/README.md" "Two Transport Modes"
 not_contains "MCP app README project structure does not include direct db module" "$ROOT_DIR/apps/mcp-server/README.md" "src/db"
